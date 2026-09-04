@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 class GatewaySchemaError(RuntimeError):
@@ -659,6 +659,15 @@ _MIGRATION_15 = (
     "DROP TABLE gateway_schema_refresh_v15",
 )
 
+# v16: retain the provider's own sanitized explanation of a failed attempt.
+# The Rust upstream already extracts one bounded, single-line, credential- and
+# infrastructure-free sentence from a client-error body (param_attribution);
+# this column persists that text on the failed attempt so an operator can see
+# WHY a provider rejected the call without re-deriving it from logs. It is the
+# same sanitized text the caller already receives, so it does not widen the
+# ledger's content-free posture.
+_MIGRATION_16 = ("ALTER TABLE gateway_attempts ADD COLUMN failure_message TEXT",)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -675,6 +684,7 @@ _MIGRATIONS = {
     13: _MIGRATION_13,
     14: _MIGRATION_14,
     15: _MIGRATION_15,
+    16: _MIGRATION_16,
 }
 
 

@@ -56,23 +56,31 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
                 and call.provider_item_id is None
                 and call.provider_output_index is None
                 and call.provider_status is None
+                and call.provider_namespace is None
             ):
                 continue
-            retained_calls.append(
-                {
-                    "tool_call_index": tool_call_index,
-                    "call_id": call.call_id,
-                    "name": call.name,
-                    "raw_arguments": call.raw_arguments,
-                    "provider_item_id": call.provider_item_id,
-                    "provider_output_index": call.provider_output_index,
-                    "provider_status": call.provider_status,
-                }
-            )
+            retained_call: JsonObject = {
+                "tool_call_index": tool_call_index,
+                "call_id": call.call_id,
+                "name": call.name,
+                "raw_arguments": call.raw_arguments,
+                "provider_item_id": call.provider_item_id,
+                "provider_output_index": call.provider_output_index,
+                "provider_status": call.provider_status,
+            }
+            # Joins only when present so every namespace-free request keeps
+            # its exact pre-existing digest.
+            if call.provider_namespace is not None:
+                retained_call["provider_namespace"] = call.provider_namespace
+            retained_calls.append(retained_call)
         if retained_calls:
             authority["tool_calls"] = retained_calls
         if message.tool_is_error:
             authority["tool_is_error"] = True
+        if message.provider_tool_name is not None:
+            authority["provider_tool_name"] = message.provider_tool_name
+        if message.provider_tool_namespace is not None:
+            authority["provider_tool_namespace"] = message.provider_tool_namespace
         if len(authority) > 1:
             replay.append(authority)
     retained_tools: list[JsonObject] = []

@@ -848,12 +848,19 @@ def _response_input_messages(
                             "provider_item_id": item.id,
                             "provider_output_index": index,
                             "provider_status": item.status,
+                            "provider_namespace": item.namespace,
                         }
                     ),
                 )
             )
         else:
             replayed.append(
-                ReplayedFunctionOutput(index=index, call_id=item.call_id, output=item.output)
+                ReplayedFunctionOutput(
+                    index=index,
+                    call_id=item.call_id,
+                    output=item.output,
+                    name=item.name,
+                    namespace=item.namespace,
+                )
             )
     return responses_input_messages(tuple(replayed))

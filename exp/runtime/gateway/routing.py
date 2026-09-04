@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from typing import Protocol
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, stable_id
 from exp.common.models import ModelRequest
@@ -57,6 +58,41 @@ class GatewayRoute(ContractModel):
     def deployments(self) -> tuple[ExactModelDeployment, ...]:
         """Return every certified deployment in deterministic operational order."""
         return (self.deployment, *self.fallback_deployments)
+
+
+class RouteResolver(Protocol):
+    """Structural contract for the gateway's authorized route resolver.
+
+    ``CatalogRouteResolver`` is the engine's implementation; a platform wrapper
+    that composes or delegates to it annotates itself against this Protocol so
+    ``ty`` statically catches a missing or drifted resolution method instead of
+    surfacing it at runtime. It captures ONLY the public resolution seam — the
+    three ways an authorization becomes a frozen :class:`GatewayRoute`; the
+    catalog-swap, metadata, and lifecycle methods are implementation detail and
+    deliberately excluded so a wrapper need not re-expose them.
+    """
+
+    def resolve_direct(self, authorization: AuthorizationSnapshot) -> GatewayRoute:
+        """Resolve one direct-target authorization without event-loop work."""
+        ...
+
+    def resolve_deployment_hint(
+        self,
+        authorization: AuthorizationSnapshot,
+        deployment_id: str,
+    ) -> GatewayRoute:
+        """Resolve one canonical carrier-hint deployment inside current authority."""
+        ...
+
+    def resolve_project_blocking(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        episode_namespace: tuple[str, str, str, str],
+    ) -> GatewayRoute:
+        """Resolve one project target from a caller thread without an event loop."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -309,7 +345,27 @@ class CatalogRouteResolver:
         authorization: AuthorizationSnapshot,
         deployment_id: str,
     ) -> GatewayRoute:
-        """Resolve one untrusted carrier hint only inside current alias authority."""
+        """Resolve one untrusted carrier hint only inside current alias authority.
+
+        The ``deployment_id`` MUST be a CANONICAL pool member of the authorized
+        alias revision: pool membership is checked against ``pool.deployment_ids``,
+        which names canonicals only, so a BYOK or org-variant deployment id will
+        NOT resolve here. Mapping a variant back to its canonical is the CALLER
+        resolver's responsibility; this method receives an already-canonical id
+        and fails closed on anything the current authority's pools do not name.
+
+        Args:
+            authorization: Frozen authenticated alias revision and target.
+            deployment_id: Canonical deployment id carried on a reasoning
+                continuation, resolved only within the authorized revision.
+
+        Returns:
+            Frozen single-deployment route pinned to the hinted deployment.
+
+        Raises:
+            GatewayRoutingError: The snapshot is inactive, the id is not an
+                unambiguous canonical pool member, or its identity is invalid.
+        """
         view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
         if view is None:
             raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")

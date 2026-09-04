@@ -19,9 +19,20 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.common.models.model import ModelCapabilities
-from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.routing import CatalogRouteResolver, RouteResolver
 
 _REVISION = "revision-one"
+
+
+def test_catalog_route_resolver_satisfies_the_route_resolver_protocol() -> None:
+    """CatalogRouteResolver structurally satisfies the exported Protocol.
+
+    The annotated binding makes ``ty`` verify the public resolution seam at
+    type-check time, so a wrapper annotated ``RouteResolver`` catches a missing
+    or drifted resolve_* method statically.
+    """
+    resolver: RouteResolver = CatalogRouteResolver({})
+    assert resolver is not None
 
 
 def _deployment(

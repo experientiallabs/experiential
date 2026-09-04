@@ -85,3 +85,38 @@ def test_terminal_from_settlement_normalizes_failure() -> None:
     assert failure is not None
     assert failure.failure_class == GatewayFailureClass.TRANSPORT
     assert terminal.failure == failure
+
+
+def test_terminal_from_settlement_carries_the_provider_detail() -> None:
+    """A client-error settlement threads the sanitized provider sentence through."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "usage": None,
+            "tool_names": [],
+            "failure": {
+                "failure_class": "invalid_request",
+                "safe_message": "provider rejected the request",
+                "provider_detail": "max_tokens must be greater than thinking budget.",
+            },
+        }
+    )
+
+    assert failure is not None
+    assert failure.provider_detail == "max_tokens must be greater than thinking budget."
+
+    # An empty or absent detail resolves to None rather than an empty string.
+    _t, blank = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "usage": None,
+            "tool_names": [],
+            "failure": {
+                "failure_class": "invalid_request",
+                "safe_message": "provider rejected the request",
+                "provider_detail": "",
+            },
+        }
+    )
+    assert blank is not None
+    assert blank.provider_detail is None

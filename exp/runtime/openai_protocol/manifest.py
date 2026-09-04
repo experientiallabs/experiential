@@ -230,8 +230,12 @@ honoring the selector is impossible and accepting it would be silent."""
 
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
     "message": frozenset({"type", "role", "content", "id", "status", "phase"}),
-    "function_call": frozenset({"type", "call_id", "name", "arguments", "id", "status"}),
-    "function_call_output": frozenset({"type", "call_id", "output", "id", "status"}),
+    "function_call": frozenset(
+        {"type", "call_id", "name", "namespace", "arguments", "id", "status"}
+    ),
+    "function_call_output": frozenset(
+        {"type", "call_id", "output", "name", "namespace", "id", "status"}
+    ),
     "reasoning": frozenset({"type", "id", "encrypted_content", "summary", "content", "status"}),
 }
 """Echoable input-item fields the Responses decoder models per item type.
@@ -241,20 +245,23 @@ INPUT, so every field this gateway's own output items carry must decode.
 Codex echoes assistant messages with ``phase`` and reasoning items with an
 explicit ``content: null`` (both captured live 2026-08-29); the message
 ``phase`` is retained for replay identity and the null reasoning content
-is validated and dropped like its populated form.
+is validated and dropped like its populated form. ``namespace`` on a
+``function_call`` (and the ``name``/``namespace`` pair on a
+``function_call_output``) attributes the call to its declaring nested tool
+tree and round-trips verbatim: the provider rejects a namespaced call
+replayed without it ("Missing namespace for function_call ..."), which
+wedges every later turn of the session.
 """
 
 RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
     "message": frozenset(),
-    "function_call": frozenset({"caller", "namespace"}),
-    "function_call_output": frozenset({"caller", "namespace", "name"}),
+    "function_call": frozenset({"caller"}),
+    "function_call_output": frozenset({"caller"}),
     "reasoning": frozenset(),
 }
 """Echoable input-item fields consciously rejected with a named 400.
 
-``caller``/``namespace`` attribute server-tool invocations this gateway does
-not serve, and a ``name`` on a function output duplicates the call linkage
-already carried by ``call_id``.
+``caller`` attributes server-tool invocations this gateway does not serve.
 """
 
 
