@@ -736,6 +736,123 @@ def test_terminal_jobs_settle_partial_provider_results() -> None:
     assert ledger.released == [("b", "cancelled")]
 
 
+def test_cancel_landing_during_the_poll_still_ends_cancelled() -> None:
+    """A cancellation persisted after the poller read the job but before the provider
+    answered "ended" with cut lines ends CANCELLED (cancelled_at set), never COMPLETED."""
+    partial = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=200,
+            response={"usage": {"prompt_tokens": 1, "completion_tokens": 4}},
+            input_tokens=1,
+            output_tokens=4,
+        )
+    ]
+
+    class RacingClient(ScriptedClient):
+        """Client whose terminal poll lands after a cancel was persisted mid-poll."""
+
+        provider = "openai"
+        supports_cancel = True
+
+        def __init__(self, store: MemoryStore) -> None:
+            """Script in_progress, then an ended batch with one cut line."""
+            super().__init__(
+                [
+                    ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+                    ProviderBatchSnapshot(
+                        status=BatchStatus.COMPLETED,
+                        completed=1,
+                        failed=1,
+                        cancelled_lines=1,
+                        results_ready=True,
+                    ),
+                ],
+                partial,
+            )
+            self._store = store
+
+        async def poll(self, *, job: BatchJob, api_key: str) -> ProviderBatchSnapshot:
+            """Persist the caller's cancel while the provider call is in flight."""
+            snapshot = await super().poll(job=job, api_key=api_key)
+            if snapshot.status is BatchStatus.COMPLETED:
+                assert job.status is BatchStatus.IN_PROGRESS, "the poller read a stale job"
+                self._store.save_job(
+                    job=self._store.jobs[job.batch_id].model_copy(
+                        update={"status": BatchStatus.CANCELLING}
+                    )
+                )
+            return snapshot
+
+    store = MemoryStore()
+    ledger = MemoryLedger()
+    client = RacingClient(store)
+    engine = BatchEngine(
+        store=store,
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=ledger,
+        secrets_resolver=MemorySecrets(),
+        clients={"openai": client},
+    )
+    file_id = _upload(
+        engine, [_chat_line("a", model="kimi-k3-batch"), _chat_line("b", model="kimi-k3-batch")]
+    )
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())  # submit
+    asyncio.run(engine.poll_once())  # in_progress
+    asyncio.run(engine.poll_once())  # ended with a cut line; cancel lands mid-poll
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.CANCELLED and final.settled
+    rendered = final.public_object()
+    assert rendered["cancelled_at"] is not None and rendered["completed_at"] is None
+    assert ledger.settled == [("a", 4)]
+    assert ledger.released == [("b", "cancelled")]
+
+
+def test_cancelled_intent_with_no_cut_lines_completes() -> None:
+    """When the provider ran every line before the cancel took effect, nothing was
+    cancelled: the job completes and every line is billed."""
+    client = ScriptedClient(
+        [
+            ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+            ProviderBatchSnapshot(status=BatchStatus.COMPLETED, completed=1, results_ready=True),
+        ],
+        [
+            BatchLineResult(
+                custom_id="a",
+                status_code=200,
+                response={"usage": {"prompt_tokens": 1, "completion_tokens": 2}},
+                input_tokens=1,
+                output_tokens=2,
+            )
+        ],
+    )
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    store.save_job(
+        job=store.jobs[job.batch_id].model_copy(update={"status": BatchStatus.CANCELLING})
+    )
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.COMPLETED and final.settled
+    assert final.public_object()["completed_at"] is not None
+    assert ledger.settled == [("a", 2)] and ledger.released == []
+
+
 def test_inflight_cancel_without_provider_support_runs_to_terminal() -> None:
     """CANCELLING survives non-terminal polls and settles at provider end."""
     client = ScriptedClient(

@@ -98,6 +98,15 @@ def test_line_result_failure_reason_reads_the_provider_message_or_type() -> None
     assert messaged.failure_reason == "max_tokens must be >= 1"
     typed = BatchLineResult(custom_id="c", status_code=500, error={"type": "canceled"})
     assert typed.failure_reason == "canceled"
+    nested = BatchLineResult(
+        custom_id="e",
+        status_code=500,
+        error={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "max_tokens: must be >= 1"},
+        },
+    )
+    assert nested.failure_reason == "max_tokens: must be >= 1"
     bare = BatchLineResult(custom_id="d", status_code=500, error={"detail": 1})
     assert bare.failure_reason == "the provider reported an error for this line"
 

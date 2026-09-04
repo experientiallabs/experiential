@@ -46,11 +46,19 @@ OPENROUTER_HOST = "openrouter.ai"
 
 
 class ProviderBatchSnapshot(ContractModel):
-    """One poll of a provider batch job: status plus progress counts."""
+    """One poll of a provider batch job: status plus progress counts.
+
+    ``cancelled_lines`` counts the lines the provider cut short on a
+    cancellation request; it is included in ``failed``. A provider that ends
+    a cancelled batch under its ordinary completed status reports the cut
+    here, and the engine, which holds the caller's persisted cancellation
+    intent, decides whether the job ends CANCELLED or COMPLETED.
+    """
 
     status: BatchStatus
     completed: int = Field(default=0, ge=0)
     failed: int = Field(default=0, ge=0)
+    cancelled_lines: int = Field(default=0, ge=0)
     results_ready: bool = False
     failure_message: str | None = None
 
@@ -489,15 +497,11 @@ class AnthropicBatchClient:
         errored = _int_count(counts, "errored") + canceled + _int_count(counts, "expired")
         if processing == "ended":
             # Anthropic ends a canceled batch with the same "ended" status as a
-            # completed one; only the per-line counts say what happened. A job
-            # the caller asked to cancel ends CANCELLED when the provider cut at
-            # least one line short, and COMPLETED when every line had already
-            # run (nothing was cancelled, and every line is billed).
-            status = (
-                BatchStatus.CANCELLED
-                if job.status is BatchStatus.CANCELLING and canceled > 0
-                else BatchStatus.COMPLETED
-            )
+            # completed one; only the per-line counts say what happened, so
+            # the cut is reported as cancelled_lines and the engine, which
+            # holds the caller's persisted cancellation intent, picks the
+            # terminal status.
+            status = BatchStatus.COMPLETED
         elif processing == "canceling":
             status = BatchStatus.CANCELLING
         else:
@@ -506,6 +510,7 @@ class AnthropicBatchClient:
             status=status,
             completed=succeeded,
             failed=errored,
+            cancelled_lines=canceled,
             results_ready=processing == "ended",
         )
 

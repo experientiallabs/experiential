@@ -267,9 +267,9 @@ def test_anthropic_poll_maps_processing_states() -> None:
     assert snapshot.completed == 1 and snapshot.failed == 2
 
 
-def test_anthropic_ended_batch_under_a_cancel_intent_is_cancelled() -> None:
-    """A cancelling job whose provider batch ended with cut lines is CANCELLED; one
-    whose lines had all already run is COMPLETED (nothing was cancelled)."""
+def test_anthropic_ended_batch_reports_the_cancelled_line_count() -> None:
+    """An ended batch is COMPLETED at the provider seam whatever the job intent; the
+    lines Anthropic cut ride the snapshot as cancelled_lines for the engine to judge."""
 
     def ended(canceled: int) -> Callable[[httpx.Request], httpx.Response]:
         """Serve one ended batch object with the given canceled count."""
@@ -295,19 +295,23 @@ def test_anthropic_ended_batch_under_a_cancel_intent_is_cancelled() -> None:
     cut = asyncio.run(
         AnthropicBatchClient(transport=_transport(ended(1))).poll(job=cancelling, api_key="ak")
     )
-    assert cut.status is BatchStatus.CANCELLED
-    assert cut.results_ready and cut.completed == 1 and cut.failed == 1
+    assert cut.status is BatchStatus.COMPLETED and cut.results_ready
+    assert (cut.completed, cut.failed, cut.cancelled_lines) == (1, 1, 1)
     ran = asyncio.run(
         AnthropicBatchClient(transport=_transport(ended(0))).poll(job=cancelling, api_key="ak")
     )
-    assert ran.status is BatchStatus.COMPLETED and ran.completed == 2
-    # Without a cancel intent an ended batch is completed even if the provider
-    # cut lines for its own reasons; those lines settle as failures.
-    in_progress = _job("anthropic").model_copy(update={"status": BatchStatus.IN_PROGRESS})
-    plain = asyncio.run(
-        AnthropicBatchClient(transport=_transport(ended(1))).poll(job=in_progress, api_key="ak")
+    assert ran.status is BatchStatus.COMPLETED and ran.cancelled_lines == 0
+    canceling = _job("anthropic")
+
+    def mid_cancel(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"processing_status": "canceling", "request_counts": {"processing": 2}}
+        )
+
+    pending = asyncio.run(
+        AnthropicBatchClient(transport=_transport(mid_cancel)).poll(job=canceling, api_key="ak")
     )
-    assert plain.status is BatchStatus.COMPLETED and plain.failed == 1
+    assert pending.status is BatchStatus.CANCELLING and not pending.results_ready
 
 
 def test_anthropic_results_follow_only_the_exact_host() -> None:
@@ -444,8 +448,10 @@ def test_anthropic_canceled_and_expired_lines_carry_a_reason() -> None:
     assert [r.error is not None for r in results] == [True, True, True]
     assert results[0].failure_reason == "the provider canceled this request before it completed"
     assert results[1].failure_reason == "the provider expired this request before it completed"
-    # An errored result keeps the provider's error object verbatim.
+    # An errored result keeps the provider's error object verbatim, and the
+    # reason is the nested actionable message, not the outer envelope type.
     assert results[2].error is not None and results[2].error["type"] == "error"
+    assert results[2].failure_reason == "max_tokens: 0"
 
 
 def test_openai_results_carry_cached_and_reasoning_subsets() -> None:

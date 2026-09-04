@@ -118,14 +118,19 @@ class BatchLineResult(ContractModel):
     def failure_reason(self) -> str | None:
         """The provider's own reason for a failed line, or None for a served one.
 
-        Reads ``error.message`` when the provider wrote one, else the error's
-        ``type`` or ``code``, so a host ledger can record a failed attempt
-        with a reason instead of a completed attempt with zero tokens.
+        Reads the innermost ``message`` when the provider wrote one (Anthropic
+        nests the actionable cause as ``error.error.message`` under an outer
+        ``type: "error"`` envelope), else the innermost ``type`` or ``code``,
+        so a host ledger can record a failed attempt with a reason instead of
+        a completed attempt with zero tokens.
         """
         if self.error is None:
             return None
+        innermost = self.error
+        while isinstance(nested := innermost.get("error"), dict):
+            innermost = nested
         for key in ("message", "type", "code"):
-            value = self.error.get(key)
+            value = innermost.get(key)
             if isinstance(value, str) and value:
                 return value
         return "the provider reported an error for this line"

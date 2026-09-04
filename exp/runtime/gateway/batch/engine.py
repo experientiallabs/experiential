@@ -555,14 +555,28 @@ class BatchEngine:
         counts = job.counts.model_copy(
             update={"completed": snapshot.completed, "failed": snapshot.failed}
         )
+        # The caller may have persisted a cancellation between this poll's
+        # job read and the provider's answer; re-read the intent after the
+        # poll so a terminal snapshot never overwrites CANCELLING with
+        # COMPLETED for a batch the caller cancelled.
+        current = self._store.load_job(batch_id=job.batch_id, organization_id=job.organization_id)
+        cancelling = job.status is BatchStatus.CANCELLING or (
+            current is not None and current.status is BatchStatus.CANCELLING
+        )
         next_status = snapshot.status
-        if job.status is BatchStatus.CANCELLING and next_status not in TERMINAL_STATUSES:
+        if cancelling and next_status is BatchStatus.COMPLETED and snapshot.cancelled_lines > 0:
+            # A provider that ends a cancelled batch as "completed" reports
+            # the cut lines; with the caller's intent on record that job is
+            # CANCELLED. When every line had already run, nothing was
+            # cancelled and the job completes with every line billed.
+            next_status = BatchStatus.CANCELLED
+        if cancelling and next_status not in TERMINAL_STATUSES:
             # The caller's cancellation intent survives provider snapshots
             # that have not yet observed it (or providers without cancel).
             next_status = BatchStatus.CANCELLING
         job = job.model_copy(update={"status": next_status, "counts": counts})
-        if snapshot.status in TERMINAL_STATUSES:
-            await self._finalize(job, snapshot.status, snapshot.failure_message)
+        if next_status in TERMINAL_STATUSES:
+            await self._finalize(job, next_status, snapshot.failure_message)
         else:
             self._store.save_job(job=job)
 
