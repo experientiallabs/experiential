@@ -517,6 +517,7 @@ class NativeControlPlane(
                 request,
                 accounting=self._accounting,
                 authorization=authorization,
+                continuation=continuation_context,
             )
             wire_route: list[JsonObject] = []
             signers: list[GatewayDispatchSigner | None] = []
