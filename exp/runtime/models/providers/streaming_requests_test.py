@@ -3890,3 +3890,18 @@ def test_the_openai_floor_leaves_anthropic_routes_and_other_surfaces_alone() -> 
     )
     assert provider.maximum_output_tokens == 1
     assert "max_tokens->16" not in public.ignored_parameters
+
+    # A rung whose declared output ceiling sits below the provider floor
+    # keeps the caller value: the gateway never dispatches above a rung's
+    # declared capability just to satisfy the floor.
+    capped = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://api.openai.com/v1/responses",
+        model_id="tiny-cap",
+        maximum_output_tokens=8,
+    )
+    public, provider = route_generation_parameter_requests(
+        (capped,), _messages_request(maximum_output_tokens=1)
+    )
+    assert provider.maximum_output_tokens == 1
+    assert "max_tokens->16" not in public.ignored_parameters

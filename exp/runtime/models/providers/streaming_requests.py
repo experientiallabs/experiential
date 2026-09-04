@@ -364,6 +364,10 @@ def route_generation_parameter_requests(
             and any(
                 profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
             )
+            # The floored value must stay within every rung's declared output
+            # ceiling; a route capped below the floor keeps the caller value
+            # and the provider's own rejection.
+            and (not route_limits or min(route_limits) >= OPENAI_MINIMUM_OUTPUT_TOKENS)
         ):
             # Anthropic accepts max_tokens down to 1 (Claude Code probes with
             # exactly that after a /model switch) while OpenAI rejects

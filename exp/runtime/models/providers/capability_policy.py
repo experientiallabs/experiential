@@ -237,7 +237,13 @@ def _coerce_thinking_to_effort(
         )
     requested_tier = thinking_config_reasoning_effort(config)
     candidates = set(ladder)
-    if requested_tier != "none":
+    if requested_tier == "none":
+        # A disabled config asked for NO reasoning; snapping it to an active
+        # level would enable reasoning the caller explicitly turned off, so
+        # only an exact 'none' translates and anything else takes the
+        # disclosed drop (the model's own default behavior, stated openly).
+        candidates.intersection_update({"none"})
+    else:
         # An active config asked for reasoning; snapping it to 'none' would
         # silently disable reasoning while calling it a translation, so a
         # route whose only level is 'none' takes the disclosed drop instead.

@@ -835,6 +835,27 @@ def test_an_active_thinking_config_never_snaps_to_none() -> None:
     assert coercion.request.reasoning_effort is None
 
 
+def test_a_disabled_thinking_config_never_snaps_to_an_active_effort() -> None:
+    """The mirror hazard: 'disabled' asked for NO reasoning, so a ladder
+    without 'none' takes the disclosed drop rather than enabling reasoning
+    the caller explicitly turned off."""
+    coercion = coerce_generation_parameters(
+        (_openai_reasoning_profile(efforts=("low", "medium", "high")),),
+        _messages_request(provider_thinking_config={"type": "disabled"}),
+    )
+    assert coercion is not None
+    assert "thinking" in coercion.disclosures
+    assert coercion.request.reasoning_effort is None
+
+    exact = coerce_generation_parameters(
+        (_openai_reasoning_profile(),),
+        _messages_request(provider_thinking_config={"type": "disabled"}),
+    )
+    assert exact is not None
+    assert exact.disclosures == ("thinking->reasoning_effort:none",)
+    assert exact.request.reasoning_effort == "none"
+
+
 def test_the_thinking_coercion_leaves_anthropic_bearing_routes_alone() -> None:
     """A route with any Anthropic rung keeps its verbatim-service preference:
     narrowing already picks the rung that honors the config, so the coercion
