@@ -177,6 +177,7 @@ pub struct ChatSseEncoder {
     usage: Option<Usage>,
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
+    reasoning_output_exposed: bool,
 }
 
 impl ChatSseEncoder {
@@ -201,12 +202,24 @@ impl ChatSseEncoder {
             usage: None,
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
+            reasoning_output_exposed: false,
         }
     }
 
     /// Attach an authenticated carrier before the terminal is encoded.
     pub fn set_reasoning_content_carrier(&mut self, carrier: String) {
         self.reasoning_content_carrier = Some(carrier);
+    }
+
+    /// Expose the model's plaintext reasoning to the caller on output.
+    ///
+    /// Off by default so hidden-reasoning providers (OpenAI o-series, which
+    /// carry no plaintext reasoning event at all) never leak. Turned on only for
+    /// rungs the catalog marks `reasoning_output_exposed`, so a Tencent/DeepSeek
+    /// client sees the `reasoning_content` deltas it is already billed for. The
+    /// sealed round-trip carrier at the terminal is independent of this.
+    pub fn set_reasoning_output_exposed(&mut self, exposed: bool) {
+        self.reasoning_output_exposed = exposed;
     }
 
     /// Return the validated candidate accumulated by a live stream.
@@ -249,9 +262,21 @@ impl ChatSseEncoder {
             Event::ProviderRefusalDelta { delta, .. } => {
                 Ok(vec![self.chunk(json!({"refusal": delta}), None)])
             }
-            Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
-            // The Chat wire has no reasoning representation, so provider
-            // reasoning follows the summary path and is deliberately dropped.
+            Event::ReasoningContentDelta { delta, .. } => {
+                // On an exposure-gated rung (Tencent/DeepSeek), the model's
+                // plaintext reasoning is returned to the caller as
+                // `choices[].delta.reasoning_content` — the tokens are already
+                // billed. Elsewhere it stays dropped (the Chat wire has no
+                // reasoning field by default); the sealed round-trip carrier at
+                // the terminal is emitted independently regardless.
+                if self.reasoning_output_exposed && !delta.is_empty() {
+                    Ok(vec![self.chunk(json!({"reasoning_content": delta}), None)])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            // The Chat wire has no reasoning representation, so provider summary
+            // and opaque reasoning follow the summary path and are dropped.
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
@@ -487,6 +512,7 @@ pub fn completed_chat_body_with_ignored(
     created_at: i64,
     events: &[Event],
     ignored_parameters: &[String],
+    reasoning_output_exposed: bool,
 ) -> Result<AggregatedCompletion, PublicError> {
     completed_chat_body_with_carrier(
         request_id,
@@ -495,6 +521,7 @@ pub fn completed_chat_body_with_ignored(
         events,
         ignored_parameters,
         None,
+        reasoning_output_exposed,
     )
 }
 
@@ -506,6 +533,7 @@ pub fn completed_chat_body_with_carrier(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
+    reasoning_output_exposed: bool,
 ) -> Result<AggregatedCompletion, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
@@ -591,6 +619,9 @@ pub fn completed_chat_body_with_carrier(
         "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
     });
     if matches!(terminal, Event::Completed) && has_tool_calls && reasoning.is_some() {
+        // A tool turn's reasoning round-trips as the sealed opaque carrier
+        // (never raw plaintext — that would be a CoT-injection vector on the
+        // way back in), so `reasoning_content` carries the carrier.
         let carrier = reasoning_content_carrier.ok_or_else(|| {
             invalid_provider_stream(
                 "Chat reasoning content was not sealed by the gateway authority.",
@@ -603,6 +634,27 @@ pub fn completed_chat_body_with_carrier(
                 "reasoning_content".to_string(),
                 Value::String(carrier.to_string()),
             );
+    } else if reasoning_output_exposed {
+        // A non-tool reasoning turn on an exposure-gated rung
+        // (Tencent/DeepSeek) has no carrier to round-trip, so the plaintext
+        // reasoning is returned for display only. The tokens are already
+        // billed; every other rung keeps reasoning stripped.
+        let reasoning_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ReasoningContentDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !reasoning_text.is_empty() {
+            message
+                .as_object_mut()
+                .expect("chat message is an object")
+                .insert(
+                    "reasoning_content".to_string(),
+                    Value::String(reasoning_text),
+                );
+        }
     }
     let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
@@ -696,6 +748,7 @@ mod tests {
             &events,
             &[],
             Some("authenticated-carrier-v2"),
+            false,
         )
         .expect("completed body must preserve the carrier");
         assert_eq!(
@@ -717,6 +770,7 @@ mod tests {
             1_700_000_000,
             &events,
             &[],
+            false,
         )
         .is_err());
 
@@ -801,11 +855,86 @@ mod tests {
             1_700_000_000,
             &[Event::Completed],
             &ignored,
+            false,
         )
         .expect("completed body must encode");
         assert_eq!(
             completed.body["x-experiential-ignored-parameters"],
             json!(["top_p", "reasoning_effort"])
+        );
+    }
+
+    /// A non-tool reasoning turn on an exposure-gated rung returns the model's
+    /// plaintext reasoning for display, both streaming and non-streaming; an
+    /// unexposed rung keeps it stripped. There is no tool call, so no carrier.
+    #[test]
+    fn exposed_rung_returns_plaintext_reasoning_without_a_carrier() {
+        let events = vec![
+            Event::ReasoningContentDelta {
+                route_sha256: "d".repeat(64),
+                delta: "let me think: 17*23".to_string(),
+            },
+            Event::TextDelta("391".to_string()),
+            Event::Completed,
+        ];
+
+        // Streaming: the plaintext streams as reasoning_content deltas.
+        let mut exposed = ChatSseEncoder::new_with_ignored(
+            "request-1",
+            "hy4-preview",
+            1_700_000_000,
+            false,
+            Vec::new(),
+        );
+        exposed.set_reasoning_output_exposed(true);
+        let mut frames = exposed.start().expect("stream start must encode");
+        for event in &events {
+            frames.extend(exposed.feed(event).expect("event must encode"));
+        }
+        let public = frames.join("");
+        assert!(public.contains("let me think: 17*23"));
+        assert!(public.contains("\"reasoning_content\""));
+
+        // An unexposed rung drops the very same reasoning stream.
+        let mut hidden = ChatSseEncoder::new_with_ignored(
+            "request-1",
+            "hy4-preview",
+            1_700_000_000,
+            false,
+            Vec::new(),
+        );
+        let mut hidden_frames = hidden.start().expect("stream start must encode");
+        for event in &events {
+            hidden_frames.extend(hidden.feed(event).expect("event must encode"));
+        }
+        assert!(!hidden_frames.join("").contains("let me think"));
+
+        // Non-streaming: exposed returns plaintext, unexposed omits the field.
+        let shown = completed_chat_body_with_ignored(
+            "request-1",
+            "hy4-preview",
+            1_700_000_000,
+            &events,
+            &[],
+            true,
+        )
+        .expect("completed body must encode");
+        assert_eq!(
+            shown.body["choices"][0]["message"]["reasoning_content"],
+            json!("let me think: 17*23")
+        );
+        let stripped = completed_chat_body_with_ignored(
+            "request-1",
+            "hy4-preview",
+            1_700_000_000,
+            &events,
+            &[],
+            false,
+        )
+        .expect("completed body must encode");
+        assert_eq!(
+            stripped.body["choices"][0]["message"].get("reasoning_content"),
+            None
         );
     }
 }

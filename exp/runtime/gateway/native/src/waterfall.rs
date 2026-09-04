@@ -68,6 +68,12 @@ pub struct DeploymentWire {
     pub upstream_body: Option<String>,
     #[serde(default)]
     pub fireworks_reasoning_route_sha256: Option<String>,
+    /// When true, this rung returns the model's plaintext `reasoning_content`
+    /// to the caller for display (Tencent/DeepSeek think mode). The sealed
+    /// round-trip carrier is emitted independently; elsewhere reasoning stays
+    /// stripped. Defaults false so every other provider is unchanged.
+    #[serde(default)]
+    pub reasoning_output_exposed: bool,
     pub idempotency_key: String,
     /// Deployment override for the flat first-byte allowance; the serving
     /// configuration's default applies when absent.
@@ -706,6 +712,7 @@ mod tests {
             upstream_payload: Value::Null,
             upstream_body: None,
             fireworks_reasoning_route_sha256: None,
+            reasoning_output_exposed: false,
             idempotency_key: "op".to_string(),
             time_to_first_byte_base_seconds: base,
             time_to_first_byte_seconds_per_million_input_tokens: slope,

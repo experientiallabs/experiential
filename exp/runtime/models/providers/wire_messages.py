@@ -306,9 +306,14 @@ def anthropic_request_headers(
 def openai_chat_message(
     message: GatewayMessage,
     *,
-    fireworks_reasoning_route_sha256: str | None = None,
+    reasoning_route_sha256: str | None = None,
 ) -> JsonObject:
-    """Translate one gateway message to OpenAI Chat wire JSON."""
+    """Translate one gateway message to OpenAI Chat wire JSON.
+
+    ``reasoning_route_sha256`` is the active preserved-thinking route identity
+    for this rung (Fireworks or Hunyuan); an unsealed ``reasoning_content``
+    block forwards to the provider only when it names that exact route.
+    """
     if message.role == "tool":
         return {
             "role": "tool",
@@ -349,8 +354,8 @@ def openai_chat_message(
         block = message.provider_reasoning[0]
         if (
             block.kind != "reasoning_content"
-            or fireworks_reasoning_route_sha256 is None
-            or block.route_sha256 != fireworks_reasoning_route_sha256
+            or reasoning_route_sha256 is None
+            or block.route_sha256 != reasoning_route_sha256
         ):
             raise ProviderResponseError("reasoning carrier belongs to a different Chat route")
         payload["reasoning_content"] = block.content

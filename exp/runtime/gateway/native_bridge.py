@@ -109,6 +109,7 @@ from exp.runtime.gateway.reasoning_carrier import (
     parse_reasoning_carrier_tool_calls,
     reasoning_carrier_authority,
     reasoning_history_sha256,
+    scheme_for_profile,
     seal_reasoning_content,
 )
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
@@ -527,13 +528,17 @@ class NativeControlPlane(
                         body_sha256=sha256_bytes(upstream_body.encode("utf-8")),
                     )
                 )
+                carrier_scheme = scheme_for_profile(profile)
                 carrier_authorities.append(
-                    reasoning_carrier_authority(
+                    None
+                    if carrier_scheme is None
+                    else reasoning_carrier_authority(
                         authorization=authorization,
                         exact_model_id=route.snapshot.exact_model_id,
                         pool_id=route.snapshot.pool_id,
                         deployment=deployment,
                         profile=profile,
+                        scheme=carrier_scheme,
                     )
                 )
             if continuation_context is not None:
@@ -798,6 +803,7 @@ class NativeControlPlane(
                 assistant_content=assistant_content,
                 tool_calls=tool_calls,
                 content=content,
+                scheme=authority.scheme,
             )
         except Exception as exc:  # noqa: BLE001 - never disclose authority or content.
             raise NativeBridgeError(

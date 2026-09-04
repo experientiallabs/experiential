@@ -109,6 +109,21 @@ def scheme_for_carrier(value: str) -> ReasoningCarrierScheme | None:
     return None
 
 
+def scheme_for_profile(profile: GatewayWireProfile) -> ReasoningCarrierScheme | None:
+    """Return the carrier scheme a rung authorizes, or None if it is not a
+    reasoning-carrier rung.
+
+    At most one per-provider route gate is set on a rung, so this selects the
+    exact scheme whose key domain and prefix the rung's carriers use — a Hunyuan
+    rung seals/authenticates only Hunyuan carriers, a Fireworks rung only
+    Fireworks. A rung with no reasoning-carrier gate returns None (no authority).
+    """
+    for scheme in REASONING_CARRIER_SCHEMES:
+        if getattr(profile, scheme.route_sha256_field) is not None:
+            return scheme
+    return None
+
+
 class ReasoningCarrierClaims(ContractModel):
     """Authenticated plaintext held only while issuing or validating a carrier."""
 
@@ -160,6 +175,9 @@ class ReasoningCarrierAuthority:
     credential_identity_sha256: str
     reasoning_route_sha256: str
     aead_key: bytes = field(repr=False)
+    # The provider scheme this authority was derived under; carried so seal/unseal
+    # use the exact prefix + domains that match the aead_key (never a mismatch).
+    scheme: ReasoningCarrierScheme = FIREWORKS_SCHEME
 
 
 def parse_reasoning_content_carrier(
@@ -246,6 +264,7 @@ def reasoning_carrier_authority(
         credential_identity_sha256=credential_identity,
         reasoning_route_sha256=route_sha256,
         aead_key=aead_key,
+        scheme=scheme,
     )
 
 

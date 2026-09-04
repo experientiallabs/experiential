@@ -62,6 +62,13 @@ impl Admission {
         }
     }
 
+    /// Whether the rung at `depth` returns plaintext reasoning to the caller.
+    pub(crate) fn reasoning_exposed_at(&self, depth: usize) -> bool {
+        self.route
+            .get(depth)
+            .is_some_and(|wire| wire.reasoning_output_exposed)
+    }
+
     /// The per-chunk transport bound of the deployment serving `depth`.
     pub(crate) fn phase_timeout(&self, depth: usize) -> Duration {
         let seconds = self

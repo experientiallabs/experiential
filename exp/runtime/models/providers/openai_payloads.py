@@ -168,6 +168,7 @@ def openai_compatible_stream_payload(
     reasoning_effort: str | None = None,
     sampling_requires_reasoning_none: bool = False,
     fireworks_reasoning_route_sha256: str | None = None,
+    hunyuan_reasoning_route_sha256: str | None = None,
     forwards_service_tier: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
@@ -186,23 +187,27 @@ def openai_compatible_stream_payload(
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
     """
-    messages, active_fireworks_reasoning = prepare_gateway_reasoning_history(
+    # A rung is a preserved-thinking route under exactly one provider scheme;
+    # its block must name that route to forward. Fireworks additionally toggles
+    # the wire-native `reasoning_history` field, which Hunyuan does not use.
+    reasoning_route_sha256 = fireworks_reasoning_route_sha256 or hunyuan_reasoning_route_sha256
+    messages, active_reasoning = prepare_gateway_reasoning_history(
         request.messages,
-        route_sha256=fireworks_reasoning_route_sha256,
+        route_sha256=reasoning_route_sha256,
     )
     payload: JsonObject = {
         "model": model_id,
         "messages": [
             openai_chat_message(
                 message,
-                fireworks_reasoning_route_sha256=fireworks_reasoning_route_sha256,
+                reasoning_route_sha256=reasoning_route_sha256,
             )
             for message in messages
         ],
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if active_fireworks_reasoning:
+    if active_reasoning and fireworks_reasoning_route_sha256 is not None:
         payload["reasoning_history"] = "interleaved"
     add_openai_tools(payload, request, responses=False)
     if request.parallel_tool_calls is not None:

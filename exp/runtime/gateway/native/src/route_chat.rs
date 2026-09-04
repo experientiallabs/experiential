@@ -290,8 +290,9 @@ async fn settled_chat_response(
             let error = collection_public_error(&failure.clone().boundary());
             if admission.stream {
                 // The withheld refusal output and its failing terminal flush
-                // outward as the stream's only frames.
-                let body = match encode_chat_sse(admission, created_at, &events, None) {
+                // outward as the stream's only frames. This settled path never
+                // carries reasoning, so plaintext exposure is off throughout.
+                let body = match encode_chat_sse(admission, created_at, &events, None, false) {
                     Ok(body) => body,
                     Err(error) => return error_response(&error),
                 };
@@ -311,7 +312,7 @@ async fn settled_chat_response(
     let mut headers = commit_independent(admission, client_request_id.as_deref());
     headers.extend(commit_dependent(admission, settled.depth));
     if admission.stream {
-        let body = match encode_chat_sse(admission, created_at, &events, None) {
+        let body = match encode_chat_sse(admission, created_at, &events, None, false) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
@@ -337,6 +338,7 @@ async fn settled_chat_response(
         created_at,
         &events,
         &admission.ignored_parameters,
+        false,
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => return error_response(&error),
@@ -369,6 +371,7 @@ fn encode_chat_sse(
     created_at: i64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
+    reasoning_output_exposed: bool,
 ) -> Result<Vec<u8>, PublicError> {
     let mut encoder = ChatSseEncoder::new_with_ignored(
         &admission.request_id,
@@ -377,6 +380,7 @@ fn encode_chat_sse(
         admission.include_usage,
         admission.ignored_parameters.clone(),
     );
+    encoder.set_reasoning_output_exposed(reasoning_output_exposed);
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string());
     }
@@ -502,6 +506,7 @@ async fn respond_from_chat_events(
         &events,
         &admission.ignored_parameters,
         carrier.as_deref(),
+        admission.reasoning_exposed_at(depth),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
@@ -581,7 +586,13 @@ async fn respond_from_chat_events(
     let mut headers = commit_independent(&admission, client_request_id.as_deref());
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
-        let body = match encode_chat_sse(&admission, created_at, &events, carrier.as_deref()) {
+        let body = match encode_chat_sse(
+            &admission,
+            created_at,
+            &events,
+            carrier.as_deref(),
+            admission.reasoning_exposed_at(depth),
+        ) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
@@ -780,6 +791,7 @@ async fn stream_response(
             include_usage,
             admission.ignored_parameters.clone(),
         );
+        encoder.set_reasoning_output_exposed(admission.reasoning_exposed_at(committed.depth));
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;
