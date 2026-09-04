@@ -1523,3 +1523,24 @@ def test_audio_block_is_rejected_with_a_surface_hint() -> None:
         assert "audio blocks are not supported" in excinfo.value.detail.message
         assert "input_audio" not in excinfo.value.detail.message
         assert "Chat Completions" in excinfo.value.detail.message
+
+
+def test_a_screenshot_history_beyond_twenty_images_still_decodes() -> None:
+    """A long agent session's image history clears validation and route shaping.
+
+    Screenshots are baked into the transcript, so a per-request image ceiling
+    the history can grow into wedges the session: the live incident hit
+    "a request carries at most 20 images" once its screenshot history passed
+    20, and every replay failed forever. The Anthropic API itself accepts 100
+    images per request, so 21 must decode; beyond the API ceiling the named
+    rejection stays (the provider would refuse anyway, less clearly).
+    """
+    image_block: dict[str, object] = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+    }
+    decoded = decode_messages(_body(messages=[{"role": "user", "content": [image_block] * 21}]))
+    assert len(decoded.request.images) == 21
+
+    with pytest.raises(OpenAIProtocolError, match="at most 100 images"):
+        decode_messages(_body(messages=[{"role": "user", "content": [image_block] * 101}]))

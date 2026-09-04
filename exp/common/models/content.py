@@ -35,8 +35,16 @@ IMAGE_MEDIA_TYPES: dict[str, ImageMediaType] = {
 MAXIMUM_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
 """Largest encoded image this gateway forwards (the narrowest provider cap)."""
 
-MAXIMUM_IMAGES_PER_REQUEST = 20
-"""Largest number of images one request may carry across all its messages."""
+MAXIMUM_IMAGES_PER_REQUEST = 100
+"""Largest number of images one request may carry across all its messages.
+
+The Anthropic Messages API accepts 100 images per request on 200k-context
+models (20 is claude.ai's UI limit, not the API's), and OpenAI documents no
+per-request image count. Screenshots accumulate in an agent session's
+history, so a ceiling below the provider's own cap wedges the session: the
+images are baked into the transcript and every replay re-trips the ceiling.
+Bedrock Converse's narrower 20-image cap surfaces as a provider error on
+Bedrock rungs, like the narrower Bedrock Nova video limit."""
 
 VideoMediaType = Literal[
     "video/mp4",
