@@ -12,11 +12,13 @@ everywhere and carried on the surfaces the Anthropic wire caches natively
 top-level automatic marker), and dropped on wires that do not cache a marked
 block because a cache hint changes cost, not semantics; ``image`` and PDF
 ``document`` blocks are retained as canonical content parts so a route that
-declares the matching input capability carries them, while a document
-inside ``tool_result`` content is rejected loudly because the serving
-surface cannot preserve it there; ``video`` blocks are rejected because the
-wire defines none. Unknown or unsupported fields are rejected with a
-field-specific error, never silently dropped. Errors raise
+declares the matching input capability carries them — including ``image``
+sub-blocks inside ``tool_result`` content (tool screenshots), which ride the
+tool message's content parts; a document inside ``tool_result`` content is
+rejected loudly because the serving surface cannot preserve it there;
+``video`` blocks are rejected because the wire defines none. Unknown or
+unsupported fields are rejected with a field-specific error, never silently
+dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
 """
@@ -128,7 +130,10 @@ class _ToolResultBlock(AnthropicWireModel):
 
     type: Literal["tool_result"]
     tool_use_id: str = Field(min_length=1, max_length=256)
-    content: str | tuple[_TextBlock, ...] | None = None
+    # Image sub-blocks are real Anthropic wire (tool screenshots: Claude Code's
+    # Read-on-image and computer-use tools emit them routinely); rejecting them
+    # wedges the caller's session because the block is baked into history.
+    content: str | tuple[_TextBlock | ImageBlock, ...] | None = None
     is_error: bool = False
     cache_control: CacheControl | None = None
 
@@ -521,10 +526,17 @@ def _validate_wire(payload: JsonObject) -> _MessagesRequest:
     try:
         return _MessagesRequest.model_validate(payload)
     except ValidationError as exc:
-        first = exc.errors(include_url=False)[0]
         hint = _rejected_block_hint(payload)
         if hint is not None:
-            raise invalid_field("messages", hint) from exc
+            param, message = hint
+            raise invalid_field(param, message) from exc
+        # A union miss reports one error PER ARM, and the first arm is the
+        # scalar one: naming it ("content.str: Input should be a valid
+        # string") misdirects a caller whose list merely held an unsupported
+        # block. The deepest location is the arm that actually matched the
+        # payload's shape, so its error names the offending element.
+        errors = exc.errors(include_url=False)
+        first = max(errors, key=lambda error: len(error["loc"]))
         raise _validation_error(first) from exc
 
 
@@ -540,8 +552,15 @@ def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
     cleaned: list[str] = []
     for part in location:
         text = str(part)
-        # Union member class names in pydantic locations are noise for callers.
-        if isinstance(part, str) and (part.startswith("_") or "[" in text):
+        # Union arm labels in pydantic locations are noise for callers: wire
+        # model class names (private or public), scalar type names, and
+        # constrained-type spellings. Real wire fields are snake_case.
+        if isinstance(part, str) and (
+            part.startswith("_")
+            or "[" in text
+            or text[:1].isupper()
+            or text in ("str", "int", "float", "bool", "none", "list", "dict")
+        ):
             continue
         cleaned.append(text)
     param = ".".join(cleaned) or "body"
@@ -557,32 +576,43 @@ def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
     return invalid_field(param, f"Invalid value for '{param}': {first['msg']}.")
 
 
-def _rejected_block_hint(payload: JsonObject) -> str | None:
-    """Return a targeted message when a known-but-unsupported block is present."""
+def _rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
+    """Return the field path and message for a known-but-unsupported block.
+
+    The path names the exact offending block (and, for a ``tool_result``, the
+    offending sub-block), so the caller is never sent to the union's string
+    arm for a list-shaped problem.
+    """
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return None
-    for message in messages:
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict) or not isinstance(message.get("content"), list):
             continue
-        for block in cast(list[object], message["content"]):
+        for block_index, block in enumerate(cast(list[object], message["content"])):
             if not isinstance(block, dict):
                 continue
             block_object = cast(JsonObject, block)
+            param = f"messages.{message_index}.content.{block_index}"
             hint = _REJECTED_BLOCK_HINTS.get(str(block_object.get("type")))
             if hint is not None:
-                return hint
+                return param, hint
             if block_object.get("type") == "tool_result" and isinstance(
                 block_object.get("content"), list
             ):
-                for inner in cast(list[object], block_object["content"]):
+                for inner_index, inner in enumerate(cast(list[object], block_object["content"])):
                     if not isinstance(inner, dict):
                         continue
-                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(
-                        str(cast(JsonObject, inner).get("type"))
-                    )
+                    inner_type = str(cast(JsonObject, inner).get("type"))
+                    inner_param = f"{param}.content.{inner_index}"
+                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(inner_type)
                     if hint is not None:
-                        return hint
+                        return inner_param, hint
+                    if inner_type not in ("text", "image"):
+                        return inner_param, (
+                            f"unsupported block type '{inner_type}' inside tool_result "
+                            "content; only text and image sub-blocks are supported."
+                        )
     return None
 
 
@@ -826,6 +856,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 GatewayMessage(
                     role="tool",
                     content=_tool_result_text(block),
+                    content_parts=_tool_result_parts(block, f"{param}.content.{block_index}"),
                     tool_call_id=block.tool_use_id,
                     tool_is_error=block.is_error,
                     # The marker Claude Code puts on its conversation
@@ -854,4 +885,44 @@ def _tool_result_text(block: _ToolResultBlock) -> str:
         return ""
     if isinstance(block.content, str):
         return block.content
-    return "".join(part.text for part in block.content)
+    return "".join(part.text for part in block.content if isinstance(part, _TextBlock))
+
+
+def _tool_result_parts(block: _ToolResultBlock, param: str) -> tuple[MessageContentPart, ...]:
+    """Retain a tool result's ordered parts when it carries an image.
+
+    Text-only results keep the flattened ``content`` string and no parts, so
+    existing requests serialize and digest exactly as before. An image
+    sub-block (a tool screenshot) makes the result multimodal: every part is
+    retained in caller order so an image-capable Anthropic rung re-emits the
+    exact block run.
+
+    Args:
+        block: Validated tool_result wire block.
+        param: Public parameter path for reporting one invalid image.
+
+    Returns:
+        The ordered canonical parts, or ``()`` for a text-only result.
+    """
+    if isinstance(block.content, str) or block.content is None:
+        return ()
+    if not any(isinstance(part, ImageBlock) for part in block.content):
+        return ()
+    parts: list[MessageContentPart] = []
+    for index, part in enumerate(block.content):
+        if isinstance(part, ImageBlock):
+            parts.append(image_part_from_block(part, f"{param}.content.{index}"))
+        elif part.text:
+            # An empty text block adds no bytes to the flattened content and
+            # cannot ride a multimodal turn, mirroring the user-message path.
+            parts.append(
+                TextContentPart(
+                    text=part.text,
+                    cache_control=(
+                        part.cache_control.model_dump(mode="json", exclude_none=True)
+                        if part.cache_control is not None
+                        else None
+                    ),
+                )
+            )
+    return tuple(parts)

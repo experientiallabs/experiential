@@ -35,6 +35,8 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.streaming_requests import (
+    TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+    TOOL_RESULT_IMAGE_PLACEHOLDER,
     anthropic_messages_stream_payload,
     bedrock_converse_stream_payload,
     dialect_stream_payload,
@@ -402,6 +404,56 @@ def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
 
     assert raised.value.code == "unsupported_parameter"
     assert raised.value.param == "reasoning.generate_summary"
+
+
+def _tool_image_message() -> GatewayMessage:
+    """One tool message carrying a screenshot beside its text."""
+    return GatewayMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="tool said:",
+        content_parts=(
+            TextContentPart(text="tool said:"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+
+
+def test_a_mixed_route_degrades_tool_result_images_with_disclosure() -> None:
+    """A non-Anthropic rung cannot express a tool-result image, so the route
+    substitutes positional placeholder text and discloses the drop instead of
+    rejecting a block the caller cannot remove from history."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (
+        GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),
+        GatewayWireProfile(dialect="openai_compatible", url="https://b.test"),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    tool_message = provider_request.messages[-1]
+    assert tool_message.content_parts == ()
+    assert tool_message.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public_request.ignored_parameters
+    # The public request keeps the caller's original history.
+    assert public_request.messages[-1].images
+
+
+def test_an_all_anthropic_route_keeps_tool_result_images() -> None:
+    """Single-dialect Anthropic routes carry the screenshot verbatim."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),)
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.messages[-1].images
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
 
 
 def test_route_accepts_reasoning_summary_on_native_anthropic() -> None:

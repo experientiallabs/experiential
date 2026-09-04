@@ -297,6 +297,12 @@ class TextContentPart(ContractModel):
 
     kind: Literal["text"] = "text"
     text: str
+    cache_control: JsonObject | None = Field(default=None, exclude=True)
+    """Prompt-cache breakpoint the caller placed on this text block, re-emitted
+    verbatim when the block run itself re-emits (a tool_result's inner blocks
+    on Anthropic rungs) and dropped elsewhere: a cache hint changes cost, not
+    semantics. Like the other cache carriers it joins neither serialization
+    nor replay identity."""
 
 
 class ImageContentPart(ContractModel):
