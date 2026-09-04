@@ -13,18 +13,24 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
+    GatewayTarget,
     GatewayToolDefinition,
+    ProjectTarget,
 )
 from exp.runtime.gateway.native_admission import (
     _prefer_cache_capable_rungs,
+    admission_episode_namespace,
     admitted_route_requests,
     protocol_compatible_indexes,
     route_rejection,
+    sticky_cache_request,
 )
 from exp.runtime.gateway.native_dispatch import NativeWireClient
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.routing import GatewayRoute, sticky_prompt_cache_key
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.openai_protocol.state import ProtocolNamespace
 
 
 def _deployment(
@@ -453,3 +459,126 @@ def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_discl
     assert public.ignored_parameters == ("thinking.type->adaptive",)
     assert provider.provider_thinking_config is None
     assert accounting.recorded == 1
+
+
+def _project_target() -> ProjectTarget:
+    """Build one frozen project target for sticky cache-key tests."""
+    return ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256="a" * 64,
+    )
+
+
+def _sticky_authorization(target: GatewayTarget) -> AuthorizationSnapshot:
+    """Build one frozen authorization over the given target."""
+    return AuthorizationSnapshot(
+        request_id="request-one",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        virtual_key_id="key-one",
+        alias="coding",
+        alias_revision_id="revision-one",
+        target=target,
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="d" * 64,
+        deadline_monotonic=1.0,
+    )
+
+
+def _sticky_request(
+    *,
+    client_request_id: str | None = None,
+    idempotency_key: str | None = None,
+    prompt_cache_key: str | None = None,
+    safety_identifier: str | None = None,
+) -> GatewayRequest:
+    """Build one chat request with optional affinity and cache-hint fields."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        client_request_id=client_request_id,
+        idempotency_key=idempotency_key,
+        prompt_cache_key=prompt_cache_key,
+        safety_identifier=safety_identifier,
+    )
+
+
+def test_sticky_cache_request_derives_a_key_for_a_keyed_project_episode() -> None:
+    """A project request with a session key and no cache key gets a derived one."""
+    authorization = _sticky_authorization(_project_target())
+    request = _sticky_request(client_request_id="session-one")
+
+    derived = sticky_cache_request(authorization, request)
+
+    assert derived.prompt_cache_key == sticky_prompt_cache_key(
+        admission_episode_namespace(authorization, request, continuation=None),
+        policy_id="activation-one",
+    )
+    # Deterministic: the same episode derives the same key on every turn.
+    assert sticky_cache_request(authorization, request).prompt_cache_key == (
+        derived.prompt_cache_key
+    )
+    # An idempotency key alone also names a stable episode.
+    retried = sticky_cache_request(authorization, _sticky_request(idempotency_key="op-one"))
+    assert retried.prompt_cache_key is not None
+    assert retried.prompt_cache_key != derived.prompt_cache_key
+
+
+def test_sticky_cache_request_preserves_a_caller_supplied_key() -> None:
+    """A caller-supplied prompt_cache_key always wins over derivation."""
+    authorization = _sticky_authorization(_project_target())
+    request = _sticky_request(client_request_id="session-one", prompt_cache_key="caller-key")
+
+    assert sticky_cache_request(authorization, request) is request
+
+
+def test_sticky_cache_request_leaves_unkeyed_and_direct_requests_alone() -> None:
+    """No sticky episode means no derived key: unkeyed one-shots and direct targets."""
+    unkeyed = _sticky_request()
+    assert sticky_cache_request(_sticky_authorization(_project_target()), unkeyed) is unkeyed
+
+    keyed = _sticky_request(client_request_id="session-one")
+    direct = _sticky_authorization(DirectTarget(pool_id="pool-one"))
+    assert sticky_cache_request(direct, keyed) is keyed
+
+
+def test_sticky_cache_request_joins_the_continuation_episode() -> None:
+    """A continued Responses turn derives from its original turn's episode key."""
+    authorization = _sticky_authorization(_project_target())
+    continuation = ContinuationContext(
+        namespace=ProtocolNamespace(
+            organization_id="organization-one",
+            identity_id="identity-one",
+            alias_revision_id="revision-one",
+        ),
+        episode_key="b" * 64,
+        response_id="resp_one",
+        messages=(),
+    )
+
+    derived = sticky_cache_request(authorization, _sticky_request(), continuation=continuation)
+
+    assert derived.prompt_cache_key == sticky_prompt_cache_key(
+        ("organization-one", "identity-one", "revision-one", "b" * 64),
+        policy_id="activation-one",
+    )
+
+
+def test_sticky_cache_request_never_touches_attribution() -> None:
+    """The derived key is a cache hint, never an end-user identity."""
+    authorization = _sticky_authorization(_project_target())
+    request = _sticky_request(client_request_id="session-one", safety_identifier="sha256:user")
+
+    derived = sticky_cache_request(authorization, request)
+
+    assert derived.prompt_cache_key is not None
+    assert derived.attribution_label == "sha256:user"
+    assert derived.prompt_cache_key != derived.attribution_label
+
+    anonymous = sticky_cache_request(
+        authorization, _sticky_request(client_request_id="session-one")
+    )
+    assert anonymous.prompt_cache_key is not None
+    assert anonymous.attribution_label is None

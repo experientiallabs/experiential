@@ -859,3 +859,39 @@ def project_episode_identity(
             "episode_key": episode_key,
         },
     )
+
+
+def sticky_prompt_cache_key(
+    namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
+    *,
+    policy_id: str,
+) -> str:
+    """Derive one stable provider cache-routing key for a sticky episode.
+
+    The key is a content-addressed hash of the tenant namespace, the sticky
+    episode digest, and the frozen policy identity, so every request in one
+    sticky episode lands on the same provider cache bucket while the value
+    discloses none of those components. It is a cache-routing hint, never an
+    end-user identity: it must never feed ``attribution_label`` or any other
+    identity surface.
+
+    Args:
+        namespace: Organization, identity, alias revision, and sticky episode
+            digest, exactly as passed to router selection.
+        policy_id: Frozen activation reference whose selection the episode
+            sticks to; a new activation starts a fresh cache lineage.
+
+    Returns:
+        Stable content-addressed key safe to forward as ``prompt_cache_key``.
+    """
+    organization_id, identity_id, alias_revision_id, episode_key = namespace
+    return stable_id(
+        "gateway-sticky-prompt-cache",
+        {
+            "organization_id": organization_id,
+            "identity_id": identity_id,
+            "alias_revision_id": alias_revision_id,
+            "episode_key": episode_key,
+            "policy_id": policy_id,
+        },
+    )

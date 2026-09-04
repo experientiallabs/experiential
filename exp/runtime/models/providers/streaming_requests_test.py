@@ -3342,6 +3342,74 @@ def test_service_tier_route_shaping_forwards_on_byok_and_discloses_elsewhere() -
     assert foreign_provider.service_tier is None
 
 
+def _cache_keyed_request(surface: GatewayApiSurface) -> GatewayRequest:
+    """Build one streaming request carrying an explicit prompt cache key."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        prompt_cache_key="gateway-sticky-prompt-cache-0123456789abcdef0123",
+        stream=True,
+        include_usage=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "surface"),
+    (
+        ("openai_compatible", GatewayApiSurface.CHAT_COMPLETIONS),
+        ("openai_responses", GatewayApiSurface.RESPONSES),
+    ),
+)
+def test_prompt_cache_key_forwards_only_on_byok_openai_dialects(
+    dialect: str,
+    surface: GatewayApiSurface,
+) -> None:
+    """Both OpenAI wire dialects carry the cache key verbatim on BYOK rungs only.
+
+    The key (caller-supplied or derived from the sticky episode) is a
+    cache-routing hint the caller's own provider account can honor; a
+    house-funded rung omits it structurally, never a decline, so the rung
+    stays in the route as a fallback.
+    """
+    byok = GatewayWireProfile(
+        dialect=dialect,
+        url="https://provider.test",
+        model_id="model-x",
+        billing_customer_managed=True,
+    )
+    payload = dialect_stream_payload(byok, _cache_keyed_request(surface))
+    assert payload["prompt_cache_key"] == "gateway-sticky-prompt-cache-0123456789abcdef0123"
+
+    hosted = GatewayWireProfile(dialect=dialect, url="https://provider.test", model_id="model-x")
+    hosted_payload = dialect_stream_payload(hosted, _cache_keyed_request(surface))
+    assert "prompt_cache_key" not in hosted_payload
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    ("anthropic_messages", "gemini_generate_content", "bedrock_converse_stream"),
+)
+def test_prompt_cache_key_never_declines_a_foreign_dialect(dialect: str) -> None:
+    """A cache hint changes cost, not semantics: foreign wires serve without it.
+
+    Unlike ``service_tier`` (a pricing commitment that must decline where no
+    wire field preserves it), a dropped cache key only forgoes a provider
+    cache optimization, so the rung serves with the field omitted.
+    """
+    profile = GatewayWireProfile(
+        dialect=dialect,
+        url="https://provider.test",
+        model_id="model-x",
+        billing_customer_managed=True,
+    )
+
+    payload = dialect_stream_payload(
+        profile, _cache_keyed_request(GatewayApiSurface.CHAT_COMPLETIONS)
+    )
+
+    assert "prompt_cache_key" not in payload
+
+
 def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> None:
     """When no rung serves, the caller sees the first rung's own field-scoped reason."""
     anthropic = GatewayWireProfile(

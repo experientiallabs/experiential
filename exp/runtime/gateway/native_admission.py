@@ -17,7 +17,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+    GatewayRequest,
+    ProjectTarget,
+)
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import (
@@ -26,7 +31,11 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext
-from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.routing import (
+    GatewayRoute,
+    GatewayRoutingError,
+    sticky_prompt_cache_key,
+)
 from exp.runtime.models.providers import preflight_gateway_request
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
@@ -417,27 +426,100 @@ def resolve_admission_route(
     """
     if isinstance(authorization.target, DirectTarget):
         return components.routes.resolve_direct(authorization)
+    return components.routes.resolve_project_blocking(
+        authorization=authorization,
+        request=request,
+        episode_namespace=admission_episode_namespace(
+            authorization, request, continuation=continuation
+        ),
+    )
+
+
+def admission_episode_namespace(
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    *,
+    continuation: ContinuationContext | None,
+) -> tuple[str, str, str, str]:
+    """Build the tenant-isolated sticky episode identity for one admission.
+
+    A Responses continuation carries its original turn's episode key, so a
+    continued request joins the same selection episode. Every other request
+    derives its episode from the caller-supplied affinity key, falling back
+    to the request ID for unkeyed calls.
+
+    Args:
+        authorization: Frozen authenticated alias revision and target.
+        request: Canonical request carrying the caller affinity headers.
+        continuation: Resolved Responses continuation state when present.
+
+    Returns:
+        Four-part namespace shared by router selection and cache-key
+        derivation, so the two can never drift.
+    """
     if continuation is not None:
-        episode = (
+        return (
             authorization.organization_id,
             authorization.identity_id,
             authorization.alias_revision_id,
             continuation.episode_key,
         )
-    else:
-        episode = episode_namespace(
-            namespace=ProtocolNamespace(
-                organization_id=authorization.organization_id,
-                identity_id=authorization.identity_id,
-                alias_revision_id=authorization.alias_revision_id,
-            ),
-            # The session-scoped correlation id is the stronger affinity
-            # scope; a per-operation idempotency key only pins retries.
-            caller_episode_key=request.client_request_id or request.idempotency_key,
-            request_id=authorization.request_id,
-        )
-    return components.routes.resolve_project_blocking(
-        authorization=authorization,
-        request=request,
-        episode_namespace=episode,
+    return episode_namespace(
+        namespace=ProtocolNamespace(
+            organization_id=authorization.organization_id,
+            identity_id=authorization.identity_id,
+            alias_revision_id=authorization.alias_revision_id,
+        ),
+        # The session-scoped correlation id is the stronger affinity
+        # scope; a per-operation idempotency key only pins retries.
+        caller_episode_key=request.client_request_id or request.idempotency_key,
+        request_id=authorization.request_id,
+    )
+
+
+def sticky_cache_request(
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    *,
+    continuation: ContinuationContext | None = None,
+) -> GatewayRequest:
+    """Fill an omitted ``prompt_cache_key`` from the sticky episode identity.
+
+    A caller-supplied key always wins and is returned untouched. Derivation
+    applies only when the request participates in a stable sticky episode: a
+    project target (whose frozen activation is the policy the episode sticks
+    to) plus either a Responses continuation or a caller affinity key. An
+    unkeyed one-shot request stays keyless, because a per-request unique key
+    would scatter identical prefixes across provider cache buckets. The
+    derived value is a hash of the tenant namespace, episode digest, and
+    activation reference, so it discloses no identity; it never feeds
+    ``attribution_label``.
+
+    Args:
+        authorization: Frozen authenticated alias revision and target.
+        request: Canonical request produced by the public protocol decoder.
+        continuation: Resolved Responses continuation state when present.
+
+    Returns:
+        The request with a derived ``prompt_cache_key``, or unchanged.
+    """
+    if request.prompt_cache_key is not None:
+        return request
+    target = authorization.target
+    if not isinstance(target, ProjectTarget):
+        return request
+    if (
+        continuation is None
+        and request.client_request_id is None
+        and request.idempotency_key is None
+    ):
+        return request
+    namespace = admission_episode_namespace(authorization, request, continuation=continuation)
+    return request.model_copy(
+        update={
+            "prompt_cache_key": sticky_prompt_cache_key(
+                namespace,
+                policy_id=target.activation_ref,
+            )
+        }
     )

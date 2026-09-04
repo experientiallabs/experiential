@@ -812,6 +812,18 @@ def test_chat_attribution_label_falls_back_to_deprecated_user() -> None:
     assert decoded.request.attribution_label == "u-1"
 
 
+def test_chat_decoder_leaves_an_omitted_prompt_cache_key_absent() -> None:
+    """Decode never invents a cache key; sticky derivation is admission-owned."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        client_request_id="session-one",
+    )
+    assert decoded.request.prompt_cache_key is None
+
+
 def test_prompt_cache_key_is_never_an_attribution_label() -> None:
     """prompt_cache_key is a cache-routing hint, not an end-user identity."""
     decoded = decode_chat(

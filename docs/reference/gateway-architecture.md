@@ -342,7 +342,15 @@ every rung (dropping it would hand prose to a caller who asked for JSON) — and
 only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
 directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
 bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
-`service_tier` stays a recorded Messages-surface rejection. On `maximize_cache` pools, a cache-marked request dispatches
+`service_tier` stays a recorded Messages-surface rejection. `prompt_cache_key` stays a recorded
+metadata-only cache-routing hint and is never an end-user identity (it never feeds
+`attribution_label`): when a sticky project episode (a Responses continuation or a caller
+session/idempotency affinity key on a project alias) omits it, admission derives one stable
+hashed key from the tenant namespace, the episode digest, and the frozen activation reference, so
+every turn of one episode lands on the same provider cache bucket without disclosing any of those
+components; a caller-supplied key always wins. The effective key forwards only on OpenAI-family
+rungs dispatching tenant-owned (BYOK) credentials; every other rung omits it structurally, with
+no decline and no disclosure, because a cache hint changes cost, never semantics. On `maximize_cache` pools, a cache-marked request dispatches
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
 group, so a shim rung can no longer silently bill every turn's full context uncached while the
 native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the

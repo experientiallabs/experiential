@@ -404,7 +404,8 @@ class _ChatRequest(_WireModel):
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
     metadata: JsonObject = Field(default_factory=dict)
-    # End-user attribution / cache hints; captured, never forwarded to the model.
+    # End-user attribution / cache hints; attribution fields are captured and
+    # never forwarded; prompt_cache_key forwards only on BYOK OpenAI-family rungs.
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
@@ -732,7 +733,8 @@ class _ResponsesRequest(_WireModel):
     stream: bool = False
     client_metadata: JsonObject | None = None
     metadata: JsonObject = Field(default_factory=dict)
-    # End-user attribution / cache hints; captured, never forwarded to the model.
+    # End-user attribution / cache hints; attribution fields are captured and
+    # never forwarded; prompt_cache_key forwards only on BYOK OpenAI-family rungs.
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)

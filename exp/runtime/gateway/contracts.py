@@ -595,10 +595,11 @@ class GatewayRequest(ContractModel):
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: JsonObject = Field(default_factory=dict)
-    # End-user attribution / cache hints from the OpenAI request. Captured for
-    # gateway-side attribution and never forwarded to the model. `safety_identifier`
-    # is the current stable end-user identifier; `user` its deprecated predecessor;
-    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity).
+    # End-user attribution / cache hints from the OpenAI request. Attribution
+    # (`safety_identifier`, its deprecated `user` predecessor) stays gateway-side
+    # and never reaches the model. `prompt_cache_key` is a same-prefix cache-routing
+    # hint (never an identity): a sticky project episode that omitted it gets a
+    # derived hashed key at admission, forwarded only on BYOK OpenAI-family rungs.
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)

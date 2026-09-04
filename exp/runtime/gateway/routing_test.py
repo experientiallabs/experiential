@@ -19,7 +19,11 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.common.models.model import ModelCapabilities
-from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.routing import (
+    CatalogRouteResolver,
+    project_episode_identity,
+    sticky_prompt_cache_key,
+)
 
 _REVISION = "revision-one"
 
@@ -308,3 +312,46 @@ def test_index_serves_a_cross_version_catalog_under_its_pinned_digest() -> None:
     )
 
     assert metadata is not None
+
+
+def test_sticky_prompt_cache_key_is_stable_and_component_sensitive() -> None:
+    """One sticky episode derives one key; every identity component changes it."""
+    namespace = ("organization-one", "identity-one", "revision-one", "e" * 64)
+    key = sticky_prompt_cache_key(namespace, policy_id="activation-one")
+
+    assert key == sticky_prompt_cache_key(namespace, policy_id="activation-one")
+    assert key.startswith("gateway-sticky-prompt-cache-")
+    assert len(key) <= 1024
+
+    variants = {
+        sticky_prompt_cache_key(
+            ("organization-two", "identity-one", "revision-one", "e" * 64),
+            policy_id="activation-one",
+        ),
+        sticky_prompt_cache_key(
+            ("organization-one", "identity-two", "revision-one", "e" * 64),
+            policy_id="activation-one",
+        ),
+        sticky_prompt_cache_key(
+            ("organization-one", "identity-one", "revision-two", "e" * 64),
+            policy_id="activation-one",
+        ),
+        sticky_prompt_cache_key(
+            ("organization-one", "identity-one", "revision-one", "f" * 64),
+            policy_id="activation-one",
+        ),
+        sticky_prompt_cache_key(namespace, policy_id="activation-two"),
+    }
+    assert key not in variants
+    assert len(variants) == 5
+
+
+def test_sticky_prompt_cache_key_discloses_no_identity_component() -> None:
+    """The derived key is a hash: no namespace or policy component appears in it."""
+    namespace = ("orgsecret", "identitysecret", "revisionsecret", "a1b2" * 16)
+    key = sticky_prompt_cache_key(namespace, policy_id="activationsecret")
+
+    for component in (*namespace, "activationsecret"):
+        assert component not in key
+    # The cache key never collides with the selection episode identity itself.
+    assert key != project_episode_identity(namespace)

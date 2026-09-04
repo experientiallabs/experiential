@@ -3530,6 +3530,50 @@ def test_project_alias_native_selection_matches_the_python_resolver(tmp_path: Pa
         thread.join(timeout=2)
 
 
+def test_project_alias_sticky_session_derives_a_prompt_cache_key(tmp_path: Path) -> None:
+    """A keyed project session forwards one stable derived prompt_cache_key.
+
+    The caller omitted ``prompt_cache_key``, so admission derives a stable
+    hashed key from the sticky episode identity and the BYOK OpenAI-family
+    rung forwards it. The same session key derives the same cache key on the
+    next turn, an unkeyed one-shot stays keyless, and a caller-supplied key
+    forwards verbatim instead of being replaced.
+    """
+    _manager, control, raw_key = _project_control_plane(tmp_path)
+
+    first = _admit_started(control, raw_key, _chat_body(), client_request_id="session-sticky")
+    payload = first["upstream_payload"]
+    assert isinstance(payload, dict)
+    derived = payload["prompt_cache_key"]
+    assert isinstance(derived, str)
+    assert derived.startswith("gateway-sticky-prompt-cache-")
+    assert "session-sticky" not in derived
+
+    second = _admit_started(control, raw_key, _chat_body(), client_request_id="session-sticky")
+    second_payload = second["upstream_payload"]
+    assert isinstance(second_payload, dict)
+    assert second_payload["prompt_cache_key"] == derived
+
+    other = _admit_started(control, raw_key, _chat_body(), client_request_id="session-other")
+    other_payload = other["upstream_payload"]
+    assert isinstance(other_payload, dict)
+    assert other_payload["prompt_cache_key"] != derived
+
+    unkeyed = _admit_started(control, raw_key, _chat_body())
+    unkeyed_payload = unkeyed["upstream_payload"]
+    assert isinstance(unkeyed_payload, dict)
+    assert "prompt_cache_key" not in unkeyed_payload
+
+    body = json.loads(_chat_body())
+    body["prompt_cache_key"] = "caller-cache-key"
+    supplied = _admit_started(
+        control, raw_key, json.dumps(body), client_request_id="session-sticky"
+    )
+    supplied_payload = supplied["upstream_payload"]
+    assert isinstance(supplied_payload, dict)
+    assert supplied_payload["prompt_cache_key"] == "caller-cache-key"
+
+
 def test_responses_continuation_reuses_the_original_selection_episode(
     tmp_path: Path,
 ) -> None:
