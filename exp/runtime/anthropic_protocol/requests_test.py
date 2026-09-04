@@ -381,6 +381,74 @@ def test_a_tool_result_image_re_emits_as_the_exact_block_run() -> None:
     ]
 
 
+def test_a_cache_marker_on_a_tool_result_text_block_round_trips() -> None:
+    """A breakpoint on an inner text block re-emits with the block run.
+
+    Claude Code marks the last block of recent user turns; in an agent loop
+    that block can be a text sub-block inside an image-bearing tool_result,
+    and losing it would silently un-cache the conversation prefix.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "read the screenshot"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call-1", "name": "computer", "input": {}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "tool said:",
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _PNG_BASE64,
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+    )
+    _role, blocks = anthropic_blocks(decoded.request.messages[-1])
+    assert blocks == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "tool said:",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": _PNG_BASE64,
+                    },
+                },
+            ],
+        }
+    ]
+
+
 def test_malformed_image_source_is_rejected() -> None:
     """An image the gateway cannot forward is rejected at its own path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:

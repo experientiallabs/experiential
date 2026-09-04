@@ -192,7 +192,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
                 if part.kind == "image":
                     run.append(anthropic_image_block(part))
                 elif part.kind == "text":
-                    run.append({"type": "text", "text": part.text})
+                    block: JsonObject = {"type": "text", "text": part.text}
+                    if part.cache_control is not None:
+                        block["cache_control"] = part.cache_control
+                    run.append(block)
             result["content"] = run
         # Only the Anthropic wire can express a failed tool invocation; the
         # marker is emitted solely when set so existing payloads are unchanged.

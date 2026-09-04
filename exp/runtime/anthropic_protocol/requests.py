@@ -915,5 +915,14 @@ def _tool_result_parts(block: _ToolResultBlock, param: str) -> tuple[MessageCont
         elif part.text:
             # An empty text block adds no bytes to the flattened content and
             # cannot ride a multimodal turn, mirroring the user-message path.
-            parts.append(TextContentPart(text=part.text))
+            parts.append(
+                TextContentPart(
+                    text=part.text,
+                    cache_control=(
+                        part.cache_control.model_dump(mode="json", exclude_none=True)
+                        if part.cache_control is not None
+                        else None
+                    ),
+                )
+            )
     return tuple(parts)
