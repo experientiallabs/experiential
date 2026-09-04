@@ -595,7 +595,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -617,7 +617,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
     let completed = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
@@ -631,7 +631,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
     let plain = completed_responses_body(
         "request-2",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &[
             Event::ToolCallStarted {
