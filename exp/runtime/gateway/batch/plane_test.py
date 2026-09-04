@@ -144,7 +144,7 @@ def test_batch_list_paginates_with_a_truthful_has_more() -> None:
     pages: list[tuple[list[str], bool]] = []
     after: str | None = None
     for _ in range(4):
-        payload: dict[str, object] = {"limit": 1}
+        payload: dict[str, str | int] = {"limit": 1}
         if after is not None:
             payload["after"] = after
         status, listing = _call(plane, "batch_list", **payload)

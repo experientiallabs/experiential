@@ -15,6 +15,7 @@ from exp.runtime.gateway.batch.contracts import (
     BatchStatus,
     BatchSubmitError,
     parse_input_jsonl,
+    provider_error_message,
 )
 
 
@@ -109,6 +110,20 @@ def test_line_result_failure_reason_reads_the_provider_message_or_type() -> None
     assert nested.failure_reason == "max_tokens: must be >= 1"
     bare = BatchLineResult(custom_id="d", status_code=500, error={"detail": 1})
     assert bare.failure_reason == "the provider reported an error for this line"
+    # One sanitizing walker for every reader: control characters dropped,
+    # whitespace normalized, runaway text bounded.
+    noisy = BatchLineResult(
+        custom_id="f",
+        status_code=500,
+        error={"error": {"message": "bad\x1b[31m model\x00 id\r\n\ttry " + "x" * 1000}},
+    )
+    reason = noisy.failure_reason
+    assert reason is not None
+    assert reason.startswith("bad[31m model id try xxx") and len(reason) == 400
+    assert provider_error_message("  plain\x00 text  ") == "plain text"
+    assert provider_error_message({"error": {"type": "quota"}}) is None
+    assert provider_error_message({"error": {"type": "quota"}}, keys=("message", "type")) == "quota"
+    assert provider_error_message(None) is None and provider_error_message(3) is None
 
 
 def test_line_result_carries_the_usage_subsets_by_their_sync_lane_names() -> None:

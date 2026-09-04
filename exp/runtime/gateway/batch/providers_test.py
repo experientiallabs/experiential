@@ -82,6 +82,7 @@ def test_openai_submit_uploads_jsonl_then_creates_the_batch() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         seen.append(request)
         if request.url.path == "/v1/files":
             assert b'"url": "/v1/chat/completions"' in request.content
@@ -106,6 +107,7 @@ def test_openai_poll_maps_status_counts_and_failure() -> None:
     """A failed provider batch surfaces its error data content-free."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         return httpx.Response(
             200,
             json={
@@ -137,6 +139,7 @@ def test_openai_results_merge_output_and_error_files() -> None:
     error_line = {"id": "r2", "custom_id": "line-1", "response": None, "error": {"code": "bad"}}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         if request.url.path == "/v1/batches/pb_1":
             return httpx.Response(
                 200,
@@ -163,6 +166,7 @@ def test_openai_cancel_posts_the_cancel_route() -> None:
     paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         paths.append(request.url.path)
         return httpx.Response(200, json={"id": "pb_1", "status": "cancelling"})
 
@@ -175,6 +179,7 @@ def test_openai_provider_error_maps_to_submit_error() -> None:
     """A 500 from the provider raises provider_error naming the status."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         return httpx.Response(500, json={"error": "boom"})
 
     client = OpenAIBatchClient(transport=_transport(handler))
@@ -186,6 +191,7 @@ def test_provider_rejection_carries_the_provider_message() -> None:
     """A 400 on submit names the provider's own error.message, bounded."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         return httpx.Response(
             400,
             json={
@@ -238,6 +244,7 @@ def test_anthropic_submit_sends_inline_requests_with_version_header() -> None:
     """Requests carry custom_id plus params, under the versioned headers."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         assert request.url.path == "/v1/messages/batches"
         assert request.headers["anthropic-version"] == "2023-06-01"
         assert request.headers["x-api-key"] == "ak"
@@ -254,6 +261,7 @@ def test_anthropic_poll_maps_processing_states() -> None:
     """ended maps to completed; errored and expired count as failed."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         return httpx.Response(
             200,
             json={
@@ -280,6 +288,7 @@ def test_anthropic_chat_lines_submit_as_translated_messages_params() -> None:
     seen: list[JsonObject] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         seen.append(json.loads(request.content))
         return httpx.Response(200, json={"id": "mb_chat"})
 
@@ -305,6 +314,7 @@ def _anthropic_results_client(lines: list[JsonObject]) -> AnthropicBatchClient:
     rendered = "\n".join(json.dumps(line) for line in lines)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         if request.url.path == "/v1/messages/batches/pb_1":
             return httpx.Response(
                 200, json={"results_url": f"https://{ANTHROPIC_HOST}/v1/batches/pb_1/results"}
@@ -374,10 +384,11 @@ def test_anthropic_chat_job_results_render_chat_completions_with_cache_usage() -
     }
     assert (served.input_tokens, served.output_tokens) == (4516, 4)
     assert served.cached_input_tokens == 0 and served.cache_creation_input_tokens == 4501
-    # A Message the renderer cannot read fails the line with the cause, not the job.
+    # A Message the renderer cannot read fails only its line, with the sync
+    # lane's sanitized malformed-response message rather than provider text.
     broken = results["line-1"]
     assert broken.error is not None and broken.status_code == 502
-    assert broken.failure_reason is not None and "content" in broken.failure_reason
+    assert broken.failure_reason == "provider returned a malformed response; retry the request"
     # A result for a line the job never carried keeps the provider's object.
     stray = results["unknown-line"]
     assert stray.response == {"content": [{"type": "text", "text": "stray"}]}
@@ -391,6 +402,7 @@ def test_anthropic_ended_batch_reports_the_cancelled_line_count() -> None:
         """Serve one ended batch object with the given canceled count."""
 
         def handler(request: httpx.Request) -> httpx.Response:
+            """Serve the scripted provider response for this exchange."""
             return httpx.Response(
                 200,
                 json={
@@ -420,6 +432,7 @@ def test_anthropic_ended_batch_reports_the_cancelled_line_count() -> None:
     canceling = _job("anthropic")
 
     def mid_cancel(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         return httpx.Response(
             200, json={"processing_status": "canceling", "request_counts": {"processing": 2}}
         )
@@ -467,6 +480,7 @@ def test_anthropic_results_parse_succeeded_and_errored_lines() -> None:
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         if request.url.path == "/v1/messages/batches/pb_1":
             return httpx.Response(
                 200, json={"results_url": f"https://{ANTHROPIC_HOST}/v1/batches/pb_1/results"}
@@ -608,6 +622,7 @@ def test_openai_results_carry_cached_and_reasoning_subsets() -> None:
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         if request.url.path == "/v1/batches/pb_1":
             return httpx.Response(200, json={"status": "completed", "output_file_id": "fo"})
         assert request.url.path == "/v1/files/fo/content"
@@ -629,10 +644,107 @@ def test_openai_results_carry_cached_and_reasoning_subsets() -> None:
     assert by_id["line-2"].reasoning_tokens == 5
 
 
+def test_malformed_usage_values_fail_the_line_with_a_safe_message() -> None:
+    """A negative or boolean usage count is a malformed provider response: the line
+    fails (502 malformed_response) with the synchronous lane's sanitized message and
+    zero usage, never a served line settled at no cost, and never provider text."""
+    output_line = {
+        "id": "r1",
+        "custom_id": "line-0",
+        "response": {
+            "status_code": 200,
+            "body": {"usage": {"prompt_tokens": -7, "completion_tokens": 9}},
+        },
+        "error": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
+        if request.url.path == "/v1/batches/pb_1":
+            return httpx.Response(200, json={"status": "completed", "output_file_id": "fo"})
+        return httpx.Response(200, text=json.dumps(output_line))
+
+    client = OpenAIBatchClient(transport=_transport(handler))
+    results = asyncio.run(client.results(job=_job("openai"), api_key="sk"))
+    assert results[0].status_code == 502 and results[0].response is None
+    assert results[0].error == {
+        "type": "malformed_response",
+        "message": "provider returned a malformed response; retry the request",
+    }
+    assert (results[0].input_tokens, results[0].output_tokens) == (0, 0)
+    anthropic = _anthropic_results_client(
+        [
+            {
+                "custom_id": "line-0",
+                "result": {
+                    "type": "succeeded",
+                    "message": {
+                        "content": [{"type": "text", "text": "ok"}],
+                        "usage": {"input_tokens": 2, "output_tokens": True},
+                    },
+                },
+            }
+        ]
+    )
+    failed = asyncio.run(anthropic.results(job=_job("anthropic"), api_key="ak"))
+    assert failed[0].status_code == 502
+    assert failed[0].failure_reason == "provider returned a malformed response; retry the request"
+
+
+def test_unrenderable_result_error_carries_only_the_sanitized_message() -> None:
+    """A served Message the renderer cannot read fails with the synchronous lane's
+    safe message, not text derived from the provider body, and keeps its usage."""
+    client = _anthropic_results_client(
+        [
+            {
+                "custom_id": "line-0",
+                "result": {
+                    "type": "succeeded",
+                    "message": {
+                        "content": "\x1b[31mnot-a-list",
+                        "usage": {"input_tokens": 5, "output_tokens": 1},
+                    },
+                },
+            }
+        ]
+    )
+    results = asyncio.run(
+        client.results(job=_job("anthropic", surface="/v1/chat/completions"), api_key="ak")
+    )
+    assert results[0].error == {
+        "type": "malformed_response",
+        "message": "provider returned a malformed response; retry the request",
+    }
+    assert (results[0].input_tokens, results[0].output_tokens) == (5, 1)
+
+
+def test_progress_counts_read_tolerantly() -> None:
+    """request_counts only drive the public object and polling, never money, so a
+    malformed count reads as zero instead of wedging the poller."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
+        return httpx.Response(
+            200,
+            json={
+                "id": "pb_1",
+                "status": "in_progress",
+                "request_counts": {"total": 2, "completed": True, "failed": -1},
+            },
+        )
+
+    snapshot = asyncio.run(
+        OpenAIBatchClient(transport=_transport(handler)).poll(job=_job("openai"), api_key="sk")
+    )
+    assert snapshot.status is BatchStatus.IN_PROGRESS
+    assert (snapshot.completed, snapshot.failed) == (0, 0)
+
+
 def test_openrouter_submit_orders_fields_and_uses_one_model() -> None:
     """endpoint and model serialize before requests, from the first line."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         raw = request.content.decode("utf-8")
         assert raw.index('"endpoint"') < raw.index('"requests"')
         assert raw.index('"model"') < raw.index('"requests"')
@@ -649,6 +761,7 @@ def test_openrouter_results_parse_the_inline_array() -> None:
     """Completed batches carry results inline in the batch object."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the scripted provider response for this exchange."""
         return httpx.Response(
             200,
             json={

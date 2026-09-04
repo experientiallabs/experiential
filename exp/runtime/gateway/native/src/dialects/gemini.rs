@@ -34,13 +34,13 @@ impl Normalizer {
             }
         }
         if gemini_prompt_blocked(&payload)? {
-            // Google blocks the PROMPT itself as `promptFeedback.blockReason`
-            // with no candidates and no finishReason. Without this branch the
-            // frame reads as a usage-only trailer, the stream then ends with
-            // no terminal event, and a deterministic refusal is misfiled as a
-            // malformed response that retries and fails over (every lane
-            // blocks the same prompt). The provider counted the prompt, so
-            // the usage it reported settles before the refusal terminal.
+            // A candidate-less frame naming `promptFeedback.blockReason` is the
+            // provider's verdict on the PROMPT, not a usage-only trailer: no
+            // candidate follows and no finishReason will name the outcome.
+            // It is the same content-free refusal a candidate-level SAFETY
+            // finish is, so it terminates the stream as one (no retry, no
+            // failover: every lane blocks the same prompt), after the usage
+            // Google reported for the prompt it counted.
             let mut events = Vec::new();
             if let Some(usage) = self.usage.take() {
                 events.push(Event::Usage(usage));

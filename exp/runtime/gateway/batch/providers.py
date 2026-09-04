@@ -30,14 +30,18 @@ from exp.runtime.gateway.batch.contracts import (
     BatchStatus,
     BatchSubmitError,
     BatchSurface,
+    provider_error_message,
 )
 from exp.runtime.gateway.batch.line_wire import (
     anthropic_line_params,
     anthropic_result_body,
     line_usage,
 )
-from exp.runtime.gateway.contracts import GatewayUsage
-from exp.runtime.models.providers.errors import ProviderResponseError
+from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage
+from exp.runtime.models.providers.errors import (
+    ProviderResponseError,
+    normalized_provider_failure,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -164,18 +168,16 @@ def _line_result(
     )
 
 
-_PROVIDER_ERROR_DETAIL_LIMIT = 400
-
-
 def provider_error_detail(response: httpx.Response) -> str | None:
     """Return the provider's own error message from one failed response.
 
     OpenAI, Anthropic, and OpenRouter all answer failures with a JSON body
     whose ``error.message`` names the rejection (an unknown model, a
-    malformed line, an exhausted quota). Only that field is read: a body that
-    is not JSON, or that carries no message string, yields None, so an HTML
-    error page or an unexpected shape never reaches the caller. The message
-    is reduced to printable characters, whitespace-normalized, and bounded.
+    malformed line, an exhausted quota). Only that field is read, through the
+    shared :func:`provider_error_message` walker (nested envelopes, printable
+    characters, whitespace-normalized, bounded): a body that is not JSON, or
+    that carries no message string, yields None, so an HTML error page or an
+    unexpected shape never reaches the caller.
     """
     try:
         parsed = response.json()
@@ -183,18 +185,29 @@ def provider_error_detail(response: httpx.Response) -> str | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    error = parsed.get("error")
-    message = error.get("message") if isinstance(error, dict) else error
-    if not isinstance(message, str):
-        return None
-    # Printable characters only: the detail reaches the caller's batch
-    # object and the worker log, so a control character (ESC, NUL, a
-    # terminal escape) in a malformed upstream body must never pass through.
-    printable = "".join(char for char in message if char.isprintable() or char.isspace())
-    detail = " ".join(printable.split())
-    if not detail:
-        return None
-    return detail[:_PROVIDER_ERROR_DETAIL_LIMIT]
+    return provider_error_message(parsed.get("error"))
+
+
+def _unrenderable_line(
+    custom_id: str, exc: ProviderResponseError | BatchSubmitError, *, usage: GatewayUsage
+) -> BatchLineResult:
+    """Fail one served line whose result the engine could not read or render.
+
+    The caller-visible error object carries only the synchronous lane's
+    sanitized failure message for a malformed provider response, never text
+    derived from the provider body; a stored line body that no longer decodes
+    (an engine-authored message) is reported as it is. The provider served
+    the line, so its reported usage rides the result and still bills.
+    """
+    if isinstance(exc, ProviderResponseError):
+        failure = normalized_provider_failure(exc)
+        error: JsonObject = {
+            "type": GatewayFailureClass.MALFORMED_RESPONSE.value,
+            "message": failure.safe_message,
+        }
+    else:
+        error = {"type": "invalid_request", "message": exc.message}
+    return _line_result(custom_id, 502, usage=usage, error=error)
 
 
 async def _checked(response: httpx.Response, *, action: str) -> JsonObject:
@@ -243,7 +256,13 @@ def _openai_status(raw: str) -> BatchStatus:
 
 
 def _int_count(counts: JsonObject, key: str) -> int:
-    """Read one non-negative integer count field, defaulting to zero."""
+    """Read one progress count field tolerantly, defaulting to zero.
+
+    Progress counts (``request_counts``) only drive the public batch object
+    and the poller's terminal decision; money settles from the per-line
+    results, which are read strictly. A malformed count must therefore never
+    wedge polling, so a bool, negative, or non-integer value reads as zero.
+    """
     value = counts.get(key, 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
@@ -265,7 +284,15 @@ def _parse_output_line(raw: JsonObject) -> BatchLineResult | None:
             return None
         if code >= 400:
             return BatchLineResult(custom_id=custom_id, status_code=code, error=body)
-        return _line_result(custom_id, code, usage=line_usage(body), response=body)
+        try:
+            usage = line_usage(body)
+        except ProviderResponseError as exc:
+            # A malformed usage value fails the line as the synchronous lane
+            # fails a malformed response; it never settles at zero tokens.
+            return _unrenderable_line(
+                custom_id, exc, usage=GatewayUsage(input_tokens=0, output_tokens=0)
+            )
+        return _line_result(custom_id, code, usage=usage, response=body)
     if isinstance(error, dict):
         return BatchLineResult(custom_id=custom_id, status_code=500, error=error)
     return None
@@ -545,7 +572,15 @@ class AnthropicBatchClient:
                     )
                 )
                 continue
-            usage = line_usage(message)
+            try:
+                usage = line_usage(message)
+            except ProviderResponseError as exc:
+                parsed.append(
+                    _unrenderable_line(
+                        custom_id, exc, usage=GatewayUsage(input_tokens=0, output_tokens=0)
+                    )
+                )
+                continue
             line = lines_by_id.get(custom_id)
             if line is None:
                 # A result for a line this job never submitted cannot be
@@ -564,14 +599,7 @@ class AnthropicBatchClient:
                 # The provider served the line, so its reported usage rides
                 # the error result and still bills; the caller learns the
                 # result could not be rendered in their surface.
-                parsed.append(
-                    _line_result(
-                        custom_id,
-                        502,
-                        usage=usage,
-                        error={"type": "malformed_response", "message": str(exc)},
-                    )
-                )
+                parsed.append(_unrenderable_line(custom_id, exc, usage=usage))
                 continue
             parsed.append(_line_result(custom_id, 200, usage=usage, response=body))
         return parsed

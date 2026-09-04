@@ -13,7 +13,7 @@ import json
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 
@@ -29,6 +29,44 @@ BATCH_SURFACES: tuple[BatchSurface, ...] = (
     "/v1/responses",
     "/v1/messages",
 )
+
+
+PROVIDER_MESSAGE_LIMIT = 400
+
+
+def provider_error_message(
+    error: JsonValue | None, *, keys: tuple[str, ...] = ("message",)
+) -> str | None:
+    """Return the sanitized human-readable text of one provider error value.
+
+    The one message walker for every reader of provider error text (the
+    caller's batch object, the error file, the host ledger, the worker log).
+    Providers nest the actionable cause under an outer envelope (Anthropic's
+    ``{"type": "error", "error": {...}}``), so nested ``error`` objects are
+    descended to the innermost one first; a bare string error is its own
+    message. The first present string among ``keys`` is reduced to printable
+    characters, whitespace-normalized, and bounded to
+    ``PROVIDER_MESSAGE_LIMIT``, so a control character or a runaway body in a
+    malformed upstream response never passes through. Anything else yields
+    None.
+    """
+    innermost = error
+    while isinstance(innermost, dict) and isinstance(innermost.get("error"), dict):
+        innermost = innermost["error"]
+    if isinstance(innermost, dict):
+        raw = next(
+            (value for key in keys if isinstance(value := innermost.get(key), str) and value),
+            None,
+        )
+    elif isinstance(innermost, str):
+        raw = innermost
+    else:
+        raw = None
+    if raw is None:
+        return None
+    printable = "".join(char for char in raw if char.isprintable() or char.isspace())
+    detail = " ".join(printable.split())
+    return detail[:PROVIDER_MESSAGE_LIMIT] or None
 
 
 class BatchStatus(StrEnum):
@@ -126,19 +164,16 @@ class BatchLineResult(ContractModel):
         Reads the innermost ``message`` when the provider wrote one (Anthropic
         nests the actionable cause as ``error.error.message`` under an outer
         ``type: "error"`` envelope), else the innermost ``type`` or ``code``,
-        so a host ledger can record a failed attempt with a reason instead of
-        a completed attempt with zero tokens.
+        through :func:`provider_error_message` (printable, whitespace-normalized,
+        bounded), so a host ledger can record a failed attempt with a safe
+        reason instead of a completed attempt with zero tokens.
         """
         if self.error is None:
             return None
-        innermost = self.error
-        while isinstance(nested := innermost.get("error"), dict):
-            innermost = nested
-        for key in ("message", "type", "code"):
-            value = innermost.get(key)
-            if isinstance(value, str) and value:
-                return value
-        return "the provider reported an error for this line"
+        return (
+            provider_error_message(self.error, keys=("message", "type", "code"))
+            or "the provider reported an error for this line"
+        )
 
     def output_jsonl_object(self, *, line_id: str) -> JsonObject:
         """Render the OpenAI batch output line for this result."""

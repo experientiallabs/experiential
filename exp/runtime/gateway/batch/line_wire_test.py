@@ -374,6 +374,20 @@ def test_line_usage_reads_every_wire_shape() -> None:
     assert (chat.cached_input_tokens, chat.reasoning_tokens) == (60, 8)
     assert line_usage({"usage": "nope"}).input_tokens == 0
     assert line_usage(None).output_tokens == 0
+    # A present but malformed count is a malformed provider response (the
+    # synchronous require_integer contract), never a silent zero.
+    for malformed in (
+        {"prompt_tokens": -1, "completion_tokens": 2},
+        {"prompt_tokens": 1, "completion_tokens": True},
+        {"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": "3"},
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 1.5},
+        },
+    ):
+        with pytest.raises(ProviderResponseError, match="non-negative integer"):
+            line_usage({"usage": malformed})
 
 
 def test_line_without_an_output_ceiling_carries_the_reserved_ceiling() -> None:

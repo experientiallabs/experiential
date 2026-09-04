@@ -11,7 +11,7 @@ provider wire shapes lives here too, in the synchronous usage contract.
 
 from __future__ import annotations
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
@@ -36,9 +36,23 @@ from exp.runtime.openai_protocol import (
 )
 
 
-def _count(value: object) -> int | None:
-    """Read one non-negative integer count, or None for anything else."""
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+def _count(value: JsonValue | None, label: str) -> int | None:
+    """Read one optional usage count strictly: absent is unknown, malformed fails.
+
+    Mirrors ``require_integer``'s contract for a present value (a bool, a
+    negative, or a non-integer is a malformed provider response, never a
+    silent zero that would settle a served line at no cost) while keeping an
+    absent field distinguishable from a reported zero, because the callers
+    treat absence as an unknown subset rather than a count.
+
+    Raises:
+        ProviderResponseError: The value is present but not a non-negative integer.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProviderResponseError(f"{label} must be a non-negative integer")
+    return value
 
 
 def _detail_count(usage: JsonObject, detail_keys: tuple[str, ...], key: str) -> int | None:
@@ -46,7 +60,7 @@ def _detail_count(usage: JsonObject, detail_keys: tuple[str, ...], key: str) -> 
     for detail_key in detail_keys:
         details = usage.get(detail_key)
         if isinstance(details, dict):
-            return _count(details.get(key))
+            return _count(details.get(key), f"usage.{detail_key}.{key}")
     return None
 
 
@@ -67,17 +81,29 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
     it folds into the output total) or as a subset (then the output total
     passes through); without a decisive total, a reasoning count above the
     output total is additive. A body without a usage object yields zero
-    totals, so a served line always settles against known counts.
+    totals, so a served line always settles against known counts; a usage
+    object carrying a malformed count fails as a malformed provider response,
+    as it does on the synchronous lane, never as a silent zero.
+
+    Raises:
+        ProviderResponseError: A present usage count is not a non-negative integer.
     """
     if not isinstance(body, dict):
         return GatewayUsage(input_tokens=0, output_tokens=0)
     usage = body.get("usage")
     if not isinstance(usage, dict):
         return GatewayUsage(input_tokens=0, output_tokens=0)
-    reported_input = _count(usage.get("prompt_tokens", usage.get("input_tokens"))) or 0
-    reported_output = _count(usage.get("completion_tokens", usage.get("output_tokens"))) or 0
-    cache_read = _count(usage.get("cache_read_input_tokens"))
-    cache_creation = _count(usage.get("cache_creation_input_tokens"))
+    reported_input = (
+        _count(usage.get("prompt_tokens", usage.get("input_tokens")), "usage input tokens") or 0
+    )
+    reported_output = (
+        _count(usage.get("completion_tokens", usage.get("output_tokens")), "usage output tokens")
+        or 0
+    )
+    cache_read = _count(usage.get("cache_read_input_tokens"), "usage.cache_read_input_tokens")
+    cache_creation = _count(
+        usage.get("cache_creation_input_tokens"), "usage.cache_creation_input_tokens"
+    )
     cached = _detail_count(
         usage, ("prompt_tokens_details", "input_tokens_details"), "cached_tokens"
     )
@@ -104,7 +130,7 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
         cached = cache_read or 0
     output_tokens = reported_output
     if reasoning:
-        total = _count(usage.get("total_tokens"))
+        total = _count(usage.get("total_tokens"), "usage.total_tokens")
         if total == reported_input + reported_output:
             additive = False
         elif total == reported_input + reported_output + reasoning:
