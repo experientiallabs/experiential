@@ -342,6 +342,35 @@ class _ChatStreamOptions(_WireModel):
     include_usage: bool = False
 
 
+class _ChatReasoning(_WireModel):
+    """Nested ``reasoning`` object on a Chat request (the Responses shape some
+    clients also send on /v1/chat/completions). Translated to the canonical flat
+    ``reasoning_effort``; only ``effort`` is accepted here."""
+
+    effort: ReasoningEffort | None = None
+
+
+class _ThinkingConfig(_WireModel):
+    """Anthropic-style ``thinking`` enable/disable config on a Chat request.
+
+    Translated to the canonical reasoning control: ``enabled`` turns thinking on
+    at the model's default effort, ``disabled`` maps to ``reasoning_effort=none``.
+    ``budget_tokens`` has no canonical equivalent and is disclosed as not carried.
+    """
+
+    type: Literal["enabled", "disabled"]
+    budget_tokens: int | None = Field(default=None, ge=0)
+
+
+class _ChatTemplateKwargs(_WireModel):
+    """vLLM/Hunyuan-native ``chat_template_kwargs`` on a Chat request.
+
+    Only ``enable_thinking`` is recognized and translated to the canonical
+    reasoning control; the field is never forwarded verbatim to any wire."""
+
+    enable_thinking: bool | None = None
+
+
 class _ChatRequest(_WireModel):
     """Closed gateway Chat Completions request profile."""
 
@@ -381,6 +410,9 @@ class _ChatRequest(_WireModel):
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
+    reasoning: _ChatReasoning | None = None
+    thinking: _ThinkingConfig | None = None
+    chat_template_kwargs: _ChatTemplateKwargs | None = None
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None

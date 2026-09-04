@@ -1205,6 +1205,55 @@ def test_genuinely_unsupported_sampling_still_hard_rejects() -> None:
     assert raised.value.param == "temperature"
 
 
+def test_thinking_default_enable_resolves_the_required_default_effort() -> None:
+    """A level-less enable resolves to the route's required default effort."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://p.test",
+        model_id="provider/reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="medium",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+        reasoning_effort_required=True,
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    _public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert provider.reasoning_effort == "medium"
+
+
+def test_thinking_default_enable_falls_back_to_the_lowest_non_none_effort() -> None:
+    """When the model requires no default, a level-less enable picks the lowest tier."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://p.test",
+        model_id="provider/optional-reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        supported_reasoning_efforts=("none", "low", "high"),
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    _public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert provider.reasoning_effort == "low"
+
+
+def test_thinking_default_enable_on_a_non_reasoning_route_surfaces() -> None:
+    """A route that supports no reasoning effort cannot enable thinking → rejects."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible", url="https://p.test", model_id="provider/plain"
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((profile,), request)
+
+    assert raised.value.code == "unsupported_parameter"
+
+
 def test_payload_builder_rejects_conditional_sampling_without_admission() -> None:
     """Direct provider use retains the same local guard as gateway admission."""
     with pytest.raises(ProviderParameterError, match="reasoning_effort is 'none'"):

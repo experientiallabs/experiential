@@ -389,6 +389,34 @@ def route_generation_parameter_requests(
         penalty_honored(profile, presence=True) for profile in profiles
     ):
         ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
+    if request.thinking_default_enable and request.reasoning_effort is None:
+        # A level-less "enable thinking" (from a translated thinking:{enabled} or
+        # chat_template_kwargs:{enable_thinking:true}) resolves to the model's own
+        # default effort here, at the serving route: a route-wide required default
+        # when portable, else the LOWEST portable non-none tier (default-not-high
+        # avoids surprising cost). A route that supports no reasoning effort cannot
+        # enable thinking, so it surfaces rather than silently not thinking.
+        portable = set(REASONING_EFFORTS)
+        for profile in profiles:
+            portable.intersection_update(_profile_reasoning_efforts(profile))
+        portable_non_none = tuple(e for e in REASONING_EFFORTS if e in portable and e != "none")
+        if not portable_non_none:
+            raise ProviderParameterError(
+                message=(
+                    "This model route cannot enable thinking: it supports no reasoning "
+                    "effort. Remove the enable-thinking field or choose a reasoning model."
+                ),
+                param=effort_path,
+                code="unsupported_parameter",
+            )
+        required_defaults = {
+            profile.reasoning_effort
+            for profile in profiles
+            if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
+        }
+        provider_updates["reasoning_effort"] = (
+            next(iter(required_defaults)) if len(required_defaults) == 1 else portable_non_none[0]
+        )
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:

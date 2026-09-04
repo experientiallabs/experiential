@@ -55,6 +55,15 @@ CHAT_MANIFEST = CompatibilityManifest(
             "structured_output",
         ),
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        # Alternate enable-thinking shapes admitted and TRANSLATED to the canonical
+        # reasoning_effort at decode (the Responses-style nested `reasoning`, the
+        # Anthropic-style `thinking`, the vLLM-native `chat_template_kwargs`), so a
+        # caller's one payload turns thinking on in any shape.
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field(
+            "chat_template_kwargs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"
+        ),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Sampling penalties: admitted and adapted per rung — honored where the

@@ -46,6 +46,7 @@ from exp.runtime.gateway.reasoning_carrier import (
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
 )
+from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
@@ -181,6 +182,12 @@ def decode_chat(
         if isinstance(request.stop, str)
         else request.stop
     )
+    thinking = translate_enable_thinking(request)
+    json_object_disclosure = (
+        (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
+        if request.response_format is not None and request.response_format.type == "json_object"
+        else ()
+    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -189,12 +196,7 @@ def decode_chat(
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
-            ignored_parameters=(
-                (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
-                if request.response_format is not None
-                and request.response_format.type == "json_object"
-                else ()
-            ),
+            ignored_parameters=(*json_object_disclosure, *thinking.disclosures),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -211,7 +213,8 @@ def decode_chat(
             presence_penalty=request.presence_penalty,
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=thinking.reasoning_effort,
+            thinking_default_enable=thinking.thinking_default_enable,
             stream=request.stream,
             include_usage=(
                 request.stream_options is not None and request.stream_options.include_usage
