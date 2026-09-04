@@ -141,9 +141,7 @@ def validate_combined_spend(
     }
     main_operations: list[tuple[str, RoutedProviderOperation]] = []
     for event in events:
-        if isinstance(event, RuntimeAcceptedEvent):
-            operations = event.spend.operations
-        elif isinstance(event, RuntimeAttemptFailedEvent):
+        if isinstance(event, RuntimeAcceptedEvent | RuntimeAttemptFailedEvent):
             operations = event.spend.operations
         else:
             operations = event.economics.operations

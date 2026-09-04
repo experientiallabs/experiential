@@ -582,7 +582,6 @@ class _ResponseFunctionCall(_WireModel):
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     arguments: str = Field(max_length=4_000_000)
-    id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 
 
