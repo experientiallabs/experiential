@@ -574,15 +574,22 @@ class _ResponseFunctionCall(_WireModel):
     """Completed Responses function call included as assistant history.
 
     ``id`` and ``status`` arrive on verbatim echoes of prior output items
-    and are accepted and dropped; ``call_id`` is the linkage that matters.
+    and are retained for exact replay; ``call_id`` is the linkage that
+    matters. ``namespace`` attributes the call to the nested tool tree that
+    declared it (the ``namespace`` declarations carried by
+    ``GatewayProviderNativeTool``) and must round-trip verbatim: the
+    provider rejects a namespaced call replayed without it ("Missing
+    namespace for function_call .... Round-trip the model's function_call
+    item with its namespace field included."), which wedges every later
+    turn of the session because the item is baked into history.
     """
 
     type: Literal["function_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
     arguments: str = Field(max_length=4_000_000)
-    id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 
 
@@ -591,10 +598,15 @@ class _ResponseFunctionOutput(_WireModel):
 
     ``id`` and ``status`` arrive when a stored turn's input items are
     re-listed and echoed; accepted and dropped like the other echo markers.
+    ``name`` and ``namespace`` attribute the result to a namespaced tool
+    (Codex serializes both on outputs of namespaced calls) and round-trip
+    verbatim like the sibling ``function_call`` namespace.
     """
 
     type: Literal["function_call_output"]
     call_id: str = Field(min_length=1, max_length=256)
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
     output: str
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
@@ -700,13 +712,20 @@ class _AdditionalToolsItem(_WireModel):
 
 
 class _CustomToolCall(_WireModel):
-    """One freeform (custom) tool call echoed as assistant history."""
+    """One freeform (custom) tool call echoed as assistant history.
+
+    ``namespace`` attributes the call to its declaring nested tool tree and
+    forwards verbatim with the rest of the raw item (the whole item replays
+    byte-for-byte on native Responses rungs), mirroring the typed
+    ``function_call`` namespace round trip.
+    """
 
     type: Literal["custom_tool_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
     input: str = Field(max_length=4_000_000)
 
 

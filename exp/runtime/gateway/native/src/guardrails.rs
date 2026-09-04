@@ -162,6 +162,7 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 0,
                 call: CompletedToolCall {
+                    namespace: None,
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,
@@ -220,6 +221,7 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 0,
                 call: CompletedToolCall {
+                    namespace: None,
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,

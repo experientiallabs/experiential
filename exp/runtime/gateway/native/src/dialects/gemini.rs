@@ -137,6 +137,7 @@ impl Normalizer {
                 index,
                 call_id,
                 name,
+                namespace: None,
             },
             Event::ToolArgumentsDelta {
                 index,

@@ -45,12 +45,15 @@ def _restored_provider_authority(
             or message.provider_output_index is not None
             or message.provider_status is not None
             or message.provider_phase is not None
+            or message.provider_tool_name is not None
+            or message.provider_tool_namespace is not None
             or message.tool_is_error
             or any(
                 call.raw_arguments is not None
                 or call.provider_item_id is not None
                 or call.provider_output_index is not None
                 or call.provider_status is not None
+                or call.provider_namespace is not None
                 for call in message.tool_calls
             )
         )

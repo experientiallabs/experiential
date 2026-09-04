@@ -51,11 +51,17 @@ class ReplayedNativeItem:
 
 @dataclass(frozen=True)
 class ReplayedFunctionOutput:
-    """One validated function result."""
+    """One validated function result.
+
+    ``name`` and ``namespace`` are the optional tool attribution Codex
+    serializes on outputs of namespaced calls, re-emitted verbatim.
+    """
 
     index: int
     call_id: str
     output: str
+    name: str | None = None
+    namespace: str | None = None
 
 
 ReplayedInput = (
@@ -151,7 +157,13 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
         elif isinstance(item, ReplayedFunctionOutput):
             flush_segment()
             messages.append(
-                GatewayMessage(role="tool", content=item.output, tool_call_id=item.call_id)
+                GatewayMessage(
+                    role="tool",
+                    content=item.output,
+                    tool_call_id=item.call_id,
+                    provider_tool_name=item.name,
+                    provider_tool_namespace=item.namespace,
+                )
             )
         else:
             segment.append(item)
