@@ -188,6 +188,36 @@ def test_carrier_survives_a_catalog_generation_change_between_turns() -> None:
     assert block.content == "private provider reasoning"
 
 
+def test_carrier_survives_a_client_content_and_refusal_normalization() -> None:
+    """A tool-only turn round-trips whether the client echoes empty text or null.
+
+    The gateway may stream a tool-only assistant turn with empty text, and an
+    OpenAI-compatible client is free to echo that as the empty string, as ``null``,
+    or to omit it — all the same visible turn. ``refusal`` never reaches the hash:
+    the wire field is not a ``GatewayMessage`` field, so it is dropped before the
+    turn/history digest, and the digest normalizes blank text to absent. Seal with
+    the empty string, replay as null → the carrier still authenticates.
+    """
+    carrier = seal_reasoning_content(
+        _authority(),
+        issuing_request_id="issuing-request",
+        issuing_route_depth=0,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="",
+        tool_calls=_tool_calls("call-one"),
+        content="hidden reasoning",
+    )
+
+    block, _claims = unseal_reasoning_content(
+        parse_reasoning_content_carrier(carrier),
+        _authority(),
+        assistant_content=None,
+        tool_calls=_tool_calls("call-one"),
+    )
+
+    assert block.content == "hidden reasoning"
+
+
 @pytest.mark.parametrize(
     "changed",
     (
