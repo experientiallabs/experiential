@@ -68,6 +68,11 @@ pub struct DeploymentWire {
     pub upstream_body: Option<String>,
     #[serde(default)]
     pub fireworks_reasoning_route_sha256: Option<String>,
+    /// Tencent Hunyuan preserved-thinking route identity; like the Fireworks
+    /// field it turns on provider reasoning-content capture and stamps each
+    /// delta with this exact route, but seals under the Hunyuan carrier scheme.
+    #[serde(default)]
+    pub hunyuan_reasoning_route_sha256: Option<String>,
     /// When true, this rung returns the model's plaintext `reasoning_content`
     /// to the caller for display (Tencent/DeepSeek think mode). The sealed
     /// round-trip carrier is emitted independently; elsewhere reasoning stays
@@ -528,7 +533,11 @@ async fn run_attempt(
         }
     };
     guard.mark_opened();
-    let mut relay = match wire.fireworks_reasoning_route_sha256.clone() {
+    let mut relay = match wire
+        .fireworks_reasoning_route_sha256
+        .clone()
+        .or_else(|| wire.hunyuan_reasoning_route_sha256.clone())
+    {
         Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
             response,
             dialect,
@@ -712,6 +721,7 @@ mod tests {
             upstream_payload: Value::Null,
             upstream_body: None,
             fireworks_reasoning_route_sha256: None,
+            hunyuan_reasoning_route_sha256: None,
             reasoning_output_exposed: false,
             idempotency_key: "op".to_string(),
             time_to_first_byte_base_seconds: base,

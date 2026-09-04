@@ -453,6 +453,115 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     assert "reasoning_content" not in rotated_messages[1]
 
 
+def test_hunyuan_exposes_plaintext_reasoning_and_round_trips_only_as_carrier(
+    tmp_path: Path,
+) -> None:
+    """Hunyuan returns plaintext reasoning for display yet round-trips it sealed.
+
+    The rung is marked as an exposed-plaintext reasoning route on the wire (so
+    the data plane returns ``reasoning_content`` to the caller), while the
+    tool-loop round-trip token stays the domain-separated opaque carrier: a
+    second replica unseals the exact turn and forwards the plaintext upstream,
+    the Fireworks-only ``reasoning_history`` wire flag never appears, and a
+    tampered turn fails closed.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.hunyuan.cloud.tencent.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    # The rung declares plaintext exposure and a Hunyuan carrier route identity,
+    # and is not a Fireworks route.
+    assert initial["reasoning_output_exposed"] is True
+    assert initial["fireworks_reasoning_route_sha256"] is None
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+
+    hidden = "let me reason about the tool call privately"
+    seal_argument = json.dumps(
+        {
+            "request_id": initial["request_id"],
+            "route_depth": initial["route_depth"],
+            "route_sha256": route_sha256,
+            "content": hidden,
+            "assistant_content": None,
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}],
+        }
+    )
+    sealed = json.loads(control.seal_reasoning_content(seal_argument))["carrier"]
+    # The carrier is opaque under the Hunyuan scheme and leaks neither the
+    # plaintext reasoning nor the provider credential.
+    assert sealed.startswith("x-experiential-hunyuan-reasoning-v1:")
+    assert hidden not in sealed
+    assert "shared-hunyuan-secret" not in sealed
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_id": initial["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "tool_names": ["lookup"],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+
+    continuation_body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    replica = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    continued = _admit(replica, raw_key, continuation_body)
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    # The sealed carrier unseals to the exact plaintext forwarded upstream on the
+    # assistant turn, and Hunyuan omits the Fireworks-only reasoning_history flag.
+    assert messages[1]["reasoning_content"] == hidden
+    assert "reasoning_history" not in payload
+
+    # A tampered tool turn fails closed at the carrier authority.
+    modified_turn = json.loads(continuation_body)
+    modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
+    with pytest.raises(NativeBridgeError) as modified:
+        _admit(replica, raw_key, json.dumps(modified_turn))
+    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+
+
 def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
     """A fallback-issued carrier replays only to its exact deployment and credential."""
     _manager, raw_key = _configured_pool_gateway(

@@ -571,6 +571,7 @@ def deployment_wire_entry(
         "upstream_payload": None if upstream_body is not None else upstream_payload,
         "upstream_body": upstream_body,
         "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
+        "hunyuan_reasoning_route_sha256": profile.hunyuan_reasoning_route_sha256,
         "reasoning_output_exposed": profile.reasoning_output_exposed,
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
