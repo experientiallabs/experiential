@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+import json
+
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayRequest,
+)
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import resolve_route_profiles
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
+    parse_reasoning_carrier_tool_calls,
     reasoning_carrier_authority,
+    reasoning_history_sha256,
     scheme_for_carrier,
+    seal_reasoning_content,
     unseal_reasoning_content,
 )
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.openai_protocol.errors import public_failure_error
 
 
 def has_active_reasoning_content(request: GatewayRequest) -> bool:
@@ -170,3 +182,66 @@ def _process_reasoning_history(
     ):
         raise ValueError("decrypted reasoning history requires a sealed active carrier")
     return request.model_copy(update={"messages": tuple(messages)}), pinned
+
+
+def seal_reasoning_carrier_content(accounting: NativeAttemptAccounting, argument: str) -> str:
+    """Seal one winning Fireworks turn before terminal settlement.
+
+    Moved verbatim from the control plane's ``seal_reasoning_content`` bridge
+    method; the bridge delegates here with its attempt accounting.
+    """
+    try:
+        data = json.loads(argument)
+        if not isinstance(data, dict):
+            raise ValueError("reasoning carrier argument must be an object")
+        request_id = data.get("request_id")
+        route_depth = data.get("route_depth")
+        assistant_content = data.get("assistant_content")
+        route_sha256 = data.get("route_sha256")
+        content = data.get("content")
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or isinstance(route_depth, bool)
+            or not isinstance(route_depth, int)
+            or (assistant_content is not None and not isinstance(assistant_content, str))
+            or not isinstance(route_sha256, str)
+            or not isinstance(content, str)
+        ):
+            raise ValueError("reasoning carrier argument has invalid field types")
+        tool_calls = parse_reasoning_carrier_tool_calls(data.get("tool_calls"))
+        entry = accounting.entry(request_id)
+        if (
+            entry is None
+            or entry.active_attempt_id is None
+            or entry.attempt_depths.get(entry.active_attempt_id) != route_depth
+            or route_depth < 0
+            or route_depth >= len(entry.reasoning_carrier_authorities)
+        ):
+            raise ValueError("reasoning carrier attempt is not active")
+        authority = entry.reasoning_carrier_authorities[route_depth]
+        if authority is None or authority.reasoning_route_sha256 != route_sha256:
+            raise ValueError("reasoning carrier route differs from the active attempt")
+        # Carriers exist only on message-bearing surfaces: fail loud, never duck-type.
+        if not isinstance(entry.request, GatewayRequest):
+            raise ValueError("reasoning carrier is not valid for this request surface")
+        carrier = seal_reasoning_content(
+            authority,
+            issuing_request_id=request_id,
+            issuing_route_depth=route_depth,
+            issuing_history_sha256=reasoning_history_sha256(entry.request.messages),
+            assistant_content=assistant_content,
+            tool_calls=tool_calls,
+            content=content,
+            scheme=authority.scheme,
+        )
+    except Exception as exc:  # noqa: BLE001 - never disclose authority or content.
+        raise NativeBridgeError(
+            public_failure_error(
+                GatewayFailure(
+                    failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
+                    safe_message="the provider returned malformed reasoning continuation data",
+                )
+            )
+        ) from exc
+    return json.dumps({"carrier": carrier}, separators=(",", ":"))
