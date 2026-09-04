@@ -180,9 +180,10 @@ def anthropic_line_params(line: BatchLine) -> JsonObject:
 def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
     """Normalize one completed Anthropic Message object into serving events.
 
-    Text and tool-use blocks become their canonical events, thinking blocks
-    carry no gateway-visible output, a ``refusal`` stop or block becomes the
-    typed refusal signal, the usage folds the cache legs into the input total
+    Text and tool-use blocks become their canonical events, thinking and
+    provider-executed server-tool blocks carry no gateway-visible output on
+    these surfaces, a ``refusal`` stop or block becomes the typed refusal
+    signal, the usage folds the cache legs into the input total
     exactly as the streaming normalizer does, and ``max_tokens`` ends the turn
     incomplete.
 
@@ -248,6 +249,14 @@ def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
         elif block_type == "refusal":
             refused = True
         elif block_type in {"thinking", "redacted_thinking"}:
+            continue
+        elif block_type == "server_tool_use" or (
+            isinstance(block_type, str) and block_type.endswith("_tool_result")
+        ):
+            # Provider-executed tool traffic (web search and its result) is
+            # not the caller's tool history and has no slot in a
+            # chat.completion or response object; the answer text that cites
+            # it is what the caller receives, as on the synchronous lane.
             continue
         else:
             raise ProviderResponseError(

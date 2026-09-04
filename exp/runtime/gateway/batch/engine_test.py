@@ -294,6 +294,25 @@ def test_submit_quarantines_lines_the_provider_client_cannot_carry() -> None:
     assert ledger.reserved == ["a"]
 
 
+def test_rejected_lines_do_not_taint_the_provider_binding() -> None:
+    """A line rejected at the client checks never joins the provider set, so a valid
+    remainder on one provider submits instead of tripping the mixed-provider refusal."""
+    engine, _, _, ledger, _ = _engine()
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("reject-me", model="kimi-k3-batch")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert job.provider == "openrouter"
+    assert [line.custom_id for line in job.lines] == ["a"]
+    assert [(error.custom_id, error.code) for error in job.line_errors] == [
+        ("reject-me", "invalid_request")
+    ]
+    assert ledger.reserved == ["a"]
+
+
 def test_submit_refuses_unknown_endpoint_and_missing_file() -> None:
     """Non-batchable surfaces and unknown files are whole-job refusals."""
     engine, _, _, _, _ = _engine()

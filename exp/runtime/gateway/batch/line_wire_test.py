@@ -197,6 +197,33 @@ def test_message_result_maps_max_tokens_and_refusal_finish_reasons() -> None:
     assert _object(_choice(body)["message"])["content"] is None
 
 
+def test_server_tool_blocks_render_as_the_cited_answer_not_a_failure() -> None:
+    """Provider-run web search blocks are not client tool calls: the chat completion
+    carries the answer text, no tool_calls, and finish_reason stop."""
+    message = {
+        **_ANTHROPIC_MESSAGE,
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {"query": "weather"},
+            },
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+            {"type": "text", "text": "Sunny in Bern."},
+        ],
+        "stop_reason": "end_turn",
+    }
+    body = anthropic_result_body(
+        _line("/v1/chat/completions", _CHAT_BODY), message, request_id="r", created_at=0.0
+    )
+    choice = _choice(body)
+    assert choice["finish_reason"] == "stop"
+    rendered = _object(choice["message"])
+    assert rendered["content"] == "Sunny in Bern."
+    assert rendered["tool_calls"] is None
+
+
 def test_message_result_renders_as_a_response_object_on_the_responses_surface() -> None:
     """A Responses line receives the synchronous lane's response object."""
     message = {

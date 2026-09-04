@@ -279,22 +279,6 @@ class BatchEngine:
                     )
                 )
                 continue
-            providers.add(deployment.provider)
-            if binding is None:
-                binding = deployment
-            elif deployment.credential_reference != binding.credential_reference:
-                errors.append(
-                    BatchLineError(
-                        line_number=line_number,
-                        custom_id=custom_id,
-                        code="connection_mismatch",
-                        message=(
-                            f"model {model!r} is served by a different provider connection "
-                            "than this batch; split lines by connection"
-                        ),
-                    )
-                )
-                continue
             maximum_output = body.get("max_tokens", body.get("max_completion_tokens"))
             if not isinstance(maximum_output, int) or maximum_output <= 0:
                 maximum_output = deployment.default_maximum_output_tokens
@@ -340,6 +324,26 @@ class BatchEngine:
                         )
                     )
                     continue
+            # Only a line that survived every per-line check joins the job's
+            # provider set and binding, so a rejected line on another
+            # provider stays a per-line error instead of turning the valid
+            # remainder into a mixed-provider refusal.
+            providers.add(deployment.provider)
+            if binding is None:
+                binding = deployment
+            elif deployment.credential_reference != binding.credential_reference:
+                errors.append(
+                    BatchLineError(
+                        line_number=line_number,
+                        custom_id=custom_id,
+                        code="connection_mismatch",
+                        message=(
+                            f"model {model!r} is served by a different provider connection "
+                            "than this batch; split lines by connection"
+                        ),
+                    )
+                )
+                continue
             lines.append(line)
         if len(providers) > 1:
             raise BatchSubmitError(
