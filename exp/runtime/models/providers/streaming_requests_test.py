@@ -22,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     StructuredTextFormat,
+    ThinkingBlock,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
@@ -239,6 +240,88 @@ def test_anthropic_stream_payload_omits_logprobs_even_when_flagged() -> None:
     )
     assert "logprobs" not in payload
     assert "top_logprobs" not in payload
+
+
+def _budgeted_haiku_profile() -> GatewayWireProfile:
+    """Return the Anthropic budgeted-enabled reasoning profile for haiku-4-5."""
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-haiku-4-5",
+        supports_temperature=True,
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+        sampling_requires_reasoning_none=True,
+        maximum_output_tokens=64_000,
+    )
+
+
+def test_haiku_multi_turn_budgeted_thinking_is_honored_end_to_end() -> None:
+    """A caller budget config plus replayed thinking blocks survive verbatim."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(
+                role="assistant",
+                content="prior answer",
+                provider_reasoning=(ThinkingBlock(text="prior reasoning", signature="sig-1"),),
+            ),
+            GatewayMessage(role="user", content="again"),
+        ),
+        provider_thinking_config={"type": "enabled", "budget_tokens": 2_048},
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2_048}
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assistant = next(message for message in messages if message["role"] == "assistant")
+    content = assistant["content"]
+    assert isinstance(content, list)
+    # The signed thinking block re-emits byte-exact, leading the assistant turn.
+    assert content[0] == {"type": "thinking", "thinking": "prior reasoning", "signature": "sig-1"}
+
+
+def test_haiku_thinking_off_temperature_is_honored_under_the_srn_hatch() -> None:
+    """With thinking off (no config), haiku's srn hatch keeps temperature.
+
+    haiku has no "none" on its effort ladder, so the srn hatch opens on the
+    absence of any thinking budget instead — thinking-off traffic that sets
+    temperature keeps it rather than regressing to a silent drop.
+    """
+    profile = _budgeted_haiku_profile()
+    honored = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        temperature=0.5,
+        maximum_output_tokens=1_000,
+        stream=True,
+    )
+    _public, provider = route_generation_parameter_requests((profile,), honored)
+    assert provider.temperature == 0.5
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        provider,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert payload["temperature"] == 0.5
+
+    # Contrast: with thinking ENABLED, Anthropic requires temperature 1, so the
+    # same control is a disclosed drop, not a rejection — srn is per request.
+    thinking_on = honored.model_copy(
+        update={"provider_thinking_config": {"type": "enabled", "budget_tokens": 2_048}}
+    )
+    public_on, provider_on = route_generation_parameter_requests((profile,), thinking_on)
+    assert provider_on.temperature is None
+    assert "temperature->dropped(set_reasoning_effort_none)" in public_on.ignored_parameters
 
 
 def test_openai_compatible_stream_payload_omits_reasoning_without_route_capability() -> None:

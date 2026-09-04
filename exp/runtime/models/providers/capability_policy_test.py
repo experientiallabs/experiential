@@ -9,6 +9,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     StructuredTextFormat,
+    ThinkingBlock,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
@@ -17,6 +18,35 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_structured_text_schema,
 )
 from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
+
+
+def _budgeted_haiku_profile() -> GatewayWireProfile:
+    """Build one Anthropic budgeted-enabled reasoning wire profile (haiku-4-5)."""
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-haiku-4-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+
+
+def _messages_request(**overrides: object) -> GatewayRequest:
+    """Build one canonical Messages-surface request with overrides applied."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+    )
+    return request.model_copy(update=dict(overrides))
+
+
+def _replayed_thinking_turn() -> GatewayMessage:
+    """Build one assistant history turn carrying a signed thinking block."""
+    return GatewayMessage(
+        role="assistant",
+        content="answer",
+        provider_reasoning=(ThinkingBlock(text="prior reasoning", signature="sig"),),
+    )
 
 
 def _request(**overrides: object) -> GatewayRequest:
@@ -464,3 +494,108 @@ def test_disabled_thinking_drops_only_on_adaptive_only_anthropic_routes() -> Non
         coerce_generation_parameters((adaptive_only, shim), request, admits=lambda _c: False)
         is None
     )
+
+
+def test_disabled_thinking_drop_strips_stale_history_thinking_blocks() -> None:
+    """Turning thinking off also removes replayed thinking blocks, disclosed."""
+    adaptive_only = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-opus-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    request = _messages_request(
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            _replayed_thinking_turn(),
+            GatewayMessage(role="user", content="again"),
+        ),
+        provider_thinking_config={"type": "disabled"},
+    )
+    coercion = coerce_generation_parameters((adaptive_only,), request)
+    assert coercion is not None
+    assert coercion.request.provider_thinking_config is None
+    assert all(not message.provider_reasoning for message in coercion.request.messages)
+    assert coercion.disclosures == (
+        "thinking.type->adaptive",
+        "thinking_history->dropped(thinking_disabled)",
+    )
+
+
+def test_adaptive_thinking_translates_to_a_budget_on_a_budgeted_route() -> None:
+    """A no-budget adaptive config becomes a legal enabled config, disclosed."""
+    request = _messages_request(
+        provider_thinking_config={"type": "adaptive"},
+        maximum_output_tokens=8_000,
+    )
+    coercion = coerce_generation_parameters((_budgeted_haiku_profile(),), request)
+    assert coercion is not None
+    # min(max(8000 // 2, 1024), 16384) == 4000, and 1024 <= 4000 < 8000.
+    assert coercion.request.provider_thinking_config == {
+        "type": "enabled",
+        "budget_tokens": 4_000,
+    }
+    assert coercion.disclosures == ("thinking.type->enabled",)
+
+
+def test_adaptive_thinking_drops_when_no_legal_budget_fits_max_tokens() -> None:
+    """A ceiling too small for any legal budget drops thinking and its history."""
+    request = _messages_request(
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            _replayed_thinking_turn(),
+            GatewayMessage(role="user", content="again"),
+        ),
+        provider_thinking_config={"type": "adaptive"},
+        # No budget in [1024, max_tokens) exists when max_tokens <= 1024.
+        maximum_output_tokens=1_024,
+    )
+    coercion = coerce_generation_parameters((_budgeted_haiku_profile(),), request)
+    assert coercion is not None
+    assert coercion.request.provider_thinking_config is None
+    assert all(not message.provider_reasoning for message in coercion.request.messages)
+    assert coercion.disclosures == (
+        "thinking",
+        "thinking_history->dropped(untranslatable_budget)",
+    )
+
+
+def test_forced_drop_on_a_non_reasoning_anthropic_route_strips_history() -> None:
+    """A genuinely non-reasoning route drops thinking and its stale history."""
+    non_reasoning = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    request = _messages_request(
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            _replayed_thinking_turn(),
+            GatewayMessage(role="user", content="again"),
+        ),
+        reasoning_effort="high",
+        provider_thinking_config={"type": "adaptive"},
+    )
+    coercion = coerce_generation_parameters((non_reasoning,), request)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort is None
+    assert coercion.request.provider_thinking_config is None
+    assert all(not message.provider_reasoning for message in coercion.request.messages)
+    assert coercion.disclosures == (
+        "reasoning_effort",
+        "thinking",
+        "thinking_history->dropped(no_reasoning_route)",
+    )
+
+
+def test_caller_budgeted_config_is_left_verbatim_on_a_budgeted_route() -> None:
+    """A caller enabled+budget config needs no coercion; history is untouched."""
+    request = _messages_request(
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            _replayed_thinking_turn(),
+            GatewayMessage(role="user", content="again"),
+        ),
+        provider_thinking_config={"type": "enabled", "budget_tokens": 2_048},
+        maximum_output_tokens=8_000,
+    )
+    # An enabled config the route honors is not adaptive, so nothing coerces
+    # and the signed history blocks survive for byte-exact replay.
+    assert coerce_generation_parameters((_budgeted_haiku_profile(),), request) is None

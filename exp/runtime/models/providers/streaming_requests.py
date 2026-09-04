@@ -93,6 +93,23 @@ SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
 """Wire dialects with a request field that preserves the caller's service tier."""
 
 
+def _anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
+    """Whether an Anthropic dispatch will send no extended-thinking budget.
+
+    On the native Messages wire the model reasons only when the caller asks:
+    a ``thinking`` config of type ``enabled``/``adaptive`` or a reasoning
+    effort turns it on, and their absence leaves thinking OFF. This is the
+    inverse of the OpenAI effort-native models, whose default IS reasoning, so
+    it governs the srn sampling hatch ONLY for the anthropic_adaptive wire
+    (a budgeted-enabled route such as haiku-4-5): with thinking off, Anthropic
+    accepts an ordinary temperature, so srn must not drop it.
+    """
+    config = request.provider_thinking_config
+    thinking_on = config is not None and config.get("type") in {"enabled", "adaptive"}
+    effort_on = request.reasoning_effort is not None and request.reasoning_effort != "none"
+    return not thinking_on and not effort_on
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -307,6 +324,13 @@ def route_generation_parameter_requests(
         return sampling_declared(profile, top_p=top_p) and (
             not profile.sampling_requires_reasoning_none
             or profile_reasoning_effort(profile) == "none"
+            # A budgeted-enabled Anthropic rung has no "none" effort on its
+            # ladder; its srn hatch opens when the dispatch sends no thinking
+            # budget at all, so ordinary thinking-off sampling is honored.
+            or (
+                profile.reasoning_wire_format == "anthropic_adaptive"
+                and _anthropic_reasoning_disengaged(request)
+            )
         )
 
     def srn_only_block(*, top_p: bool = False) -> bool:
