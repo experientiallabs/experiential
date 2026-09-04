@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
+    GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
@@ -50,6 +51,47 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
+
+TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
+"""Disclosure recorded when tool-result images degrade to placeholder text.
+
+A tool screenshot is baked into the caller's conversation history: rejecting
+it wedges every later turn of a multi-turn session, which is strictly worse
+than a disclosed degrade. Top-level user images keep the fail-closed contract
+because the caller can re-send those differently.
+"""
+
+TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
+"""Text substituted for each dropped tool-result image, in block position."""
+
+
+def strip_tool_result_images(
+    messages: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...] | None:
+    """Replace tool-message image parts with positional placeholder text.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The degraded messages, or ``None`` when no tool message carries an
+        image (nothing to strip).
+    """
+    if not any(message.role == "tool" and message.images for message in messages):
+        return None
+    out: list[GatewayMessage] = []
+    for message in messages:
+        if message.role != "tool" or not message.images:
+            out.append(message)
+            continue
+        content = "".join(
+            part.text if part.kind == "text" else TOOL_RESULT_IMAGE_PLACEHOLDER
+            for part in message.content_parts
+        )
+        out.append(message.model_copy(update={"content": content, "content_parts": ()}))
+    return tuple(out)
+
+
 GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
 """Version of the route admission and provider wire-translation contract."""
 
@@ -500,6 +542,22 @@ def route_generation_parameter_requests(
             param=path,
             code="unsupported_parameter",
         )
+
+    # Only the Anthropic wire defines an image carrier inside a tool result.
+    # A route with any other dialect degrades tool-result images to positional
+    # placeholder text with disclosure instead of rejecting: the block is baked
+    # into the caller's history, so a rejection wedges the whole session, and a
+    # silent drop at encoding would misstate what the model saw. All-Anthropic
+    # routes keep the images; a non-vision rung then rejects at preflight and
+    # the route-wide coercion applies the same disclosed degrade.
+    if any(message.role == "tool" and message.images for message in request.messages) and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        stripped = strip_tool_result_images(request.messages)
+        if stripped is not None:
+            provider_updates["messages"] = stripped
+            if TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in ignored:
+                ignored.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
 
     if any(message.tool_is_error for message in request.messages) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles

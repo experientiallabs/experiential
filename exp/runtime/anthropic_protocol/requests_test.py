@@ -355,6 +355,32 @@ def test_an_empty_text_block_beside_an_image_never_re_emits() -> None:
     ]
 
 
+def test_a_tool_result_image_re_emits_as_the_exact_block_run() -> None:
+    """An Anthropic rung round-trips the tool screenshot losslessly."""
+    decoded = decode_messages(
+        _body(messages=_tool_result_image_messages(leading_text="tool said:"))
+    )
+    role, blocks = anthropic_blocks(decoded.request.messages[-1])
+    assert role == "user"
+    assert blocks == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "content": [
+                {"type": "text", "text": "tool said:"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": _PNG_BASE64,
+                    },
+                },
+            ],
+        }
+    ]
+
+
 def test_malformed_image_source_is_rejected() -> None:
     """An image the gateway cannot forward is rejected at its own path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:
@@ -391,6 +417,122 @@ def test_document_block_inside_tool_result_is_rejected() -> None:
             )
         )
     assert "document blocks are not supported" in excinfo.value.detail.message
+
+
+def _tool_result_image_messages(*, leading_text: str | None = None) -> list[JsonObject]:
+    """The owner-reported repro: text turn, tool_use, tool_result with an image."""
+    inner: list[JsonObject] = []
+    if leading_text is not None:
+        inner.append({"type": "text", "text": leading_text})
+    inner.append(
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        }
+    )
+    return [
+        {"role": "user", "content": "read the screenshot"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "call-1", "name": "computer", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": inner}],
+        },
+    ]
+
+
+def test_image_blocks_inside_tool_results_ride_the_tool_message_parts() -> None:
+    """A tool screenshot decodes losslessly instead of 400ing the session.
+
+    Anthropic's real API accepts image sub-blocks in tool_result content, and
+    Claude Code's Read-on-image and computer-use tools emit them routinely;
+    the block is baked into history, so rejecting it wedges every later turn.
+    """
+    decoded = decode_messages(
+        _body(messages=_tool_result_image_messages(leading_text="tool said:"))
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.content == "tool said:"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _PNG_BASE64
+
+
+def test_an_image_only_tool_result_decodes_with_empty_content() -> None:
+    """The exact wedged-session repro: content is one bare image block."""
+    decoded = decode_messages(_body(messages=_tool_result_image_messages()))
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.content == ""
+    assert [part.kind for part in tool_message.content_parts] == ["image"]
+
+
+def test_a_text_only_tool_result_retains_no_content_parts() -> None:
+    """Existing text-only results serialize and digest exactly as before."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [{"type": "text", "text": "plain"}],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.content == "plain"
+    assert tool_message.content_parts == ()
+
+
+def test_an_unknown_tool_result_sub_block_names_its_index_and_type() -> None:
+    """A union miss must name the offending block, never the string arm.
+
+    The misleading "content.str: Input should be a valid string" rendering
+    sent an entire diagnosis chain toward the caller's request shape when the
+    real problem was one unsupported sub-block in the list arm.
+    """
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": [{"type": "mystery"}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.0.content.0"
+    assert "unsupported block type 'mystery'" in excinfo.value.detail.message
+    assert ".str" not in (excinfo.value.detail.param or "")
+
+
+def test_a_union_miss_never_reports_the_string_arm() -> None:
+    """A structurally bad list block reports its own path, not content.str."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(messages=[{"role": "user", "content": [{"type": "text", "text": 7}]}])
+        )
+    param = excinfo.value.detail.param or ""
+    assert ".str" not in param
+    assert param.startswith("messages.0.content.0")
 
 
 _PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="

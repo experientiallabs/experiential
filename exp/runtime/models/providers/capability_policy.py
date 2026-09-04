@@ -37,7 +37,11 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     efforts_by_nearness,
 )
-from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.models.providers.streaming_requests import (
+    TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+    route_generation_parameter_requests,
+    strip_tool_result_images,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -217,13 +221,18 @@ def _coerce_disabled_thinking(
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
-    Two capabilities are coercible, both only here — after every rung declined
-    the verbatim request — and both only as a disclosed drop. Degrading
+    Three coercions exist, all only here — after every rung declined the
+    verbatim request — and all only as a disclosed substitution. Degrading
     ``strict: true`` tools to best-effort schemas weakens a correctness
     guarantee. Dropping ``service_tier`` changes pricing and latency
     semantics, which the caller can act on only when told, so the drop is
-    disclosed rather than silent. Every other capability names a feature with
-    no approximation and stays fail-closed.
+    disclosed rather than silent. Images inside TOOL results degrade to
+    placeholder text on an image-incapable route because the block is baked
+    into the caller's history and a rejection wedges the whole session; a
+    top-level user image keeps the fail-closed contract (the caller can
+    re-send it), so ``image_input`` coerces only when every image in the
+    request lives in a tool message. Every other capability names a feature
+    with no approximation and stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
@@ -233,6 +242,16 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         The disclosed substitution to retry with, or ``None`` when the
         capability cannot be coerced.
     """
+    if capability == "image_input":
+        if any(message.role != "tool" and message.images for message in request.messages):
+            return None
+        stripped = strip_tool_result_images(request.messages)
+        if stripped is None:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"messages": stripped}),
+            disclosures=(TOOL_RESULT_IMAGE_DROP_DISCLOSURE,),
+        )
     if capability == "service_tier":
         if request.service_tier is None:
             return None

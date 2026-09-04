@@ -183,6 +183,17 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             "tool_use_id": message.tool_call_id or "",
             "content": message.content or "",
         }
+        if message.content_parts:
+            # A tool screenshot re-emits as the caller's exact block run:
+            # image parts become image blocks in their original positions.
+            # The canonical model restricts tool messages to these two kinds.
+            run: list[JsonObject] = []
+            for part in message.content_parts:
+                if part.kind == "image":
+                    run.append(anthropic_image_block(part))
+                elif part.kind == "text":
+                    run.append({"type": "text", "text": part.text})
+            result["content"] = run
         # Only the Anthropic wire can express a failed tool invocation; the
         # marker is emitted solely when set so existing payloads are unchanged.
         if message.tool_is_error:

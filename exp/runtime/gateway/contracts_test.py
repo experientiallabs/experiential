@@ -971,3 +971,41 @@ def test_service_tier_is_serialization_inert_but_binds_replay_identity() -> None
             messages=messages,
             service_tier="flex",
         )
+
+
+def test_tool_messages_carry_text_and_image_parts_only() -> None:
+    """A tool screenshot rides the tool message; other media kinds stay out."""
+    from exp.common.models.content import (
+        DocumentContentPart,
+        ImageContentPart,
+        TextContentPart,
+    )
+
+    message = GatewayMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="tool said:",
+        content_parts=(
+            TextContentPart(text="tool said:"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+    assert [part.kind for part in message.content_parts] == ["text", "image"]
+    assert message.images
+
+    with pytest.raises(ValidationError, match="text and image parts"):
+        GatewayMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="",
+            content_parts=(DocumentContentPart(media_type="application/pdf", data="aGk="),),
+        )
+    with pytest.raises(ValidationError, match="valid only for user and tool"):
+        GatewayMessage(
+            role="assistant",
+            content="hi",
+            content_parts=(
+                TextContentPart(text="hi"),
+                ImageContentPart(media_type="image/png", data="aGk="),
+            ),
+        )

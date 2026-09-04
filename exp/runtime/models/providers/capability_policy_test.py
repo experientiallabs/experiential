@@ -464,3 +464,67 @@ def test_disabled_thinking_drops_only_on_adaptive_only_anthropic_routes() -> Non
         coerce_generation_parameters((adaptive_only, shim), request, admits=lambda _c: False)
         is None
     )
+
+
+def _tool_image_request(*, user_image: bool = False) -> GatewayRequest:
+    """One request whose only (or not only) images live in a tool result."""
+    from exp.common.models.content import ImageContentPart, TextContentPart
+
+    messages: list[GatewayMessage] = [GatewayMessage(role="user", content="go")]
+    if user_image:
+        messages[0] = GatewayMessage(
+            role="user",
+            content="go",
+            content_parts=(
+                TextContentPart(text="go"),
+                ImageContentPart(media_type="image/png", data="aGk="),
+            ),
+        )
+    messages.append(
+        GatewayMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="tool said:",
+            content_parts=(
+                TextContentPart(text="tool said:"),
+                ImageContentPart(media_type="image/png", data="aGk="),
+            ),
+        )
+    )
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=tuple(messages),
+    )
+
+
+def test_tool_result_images_degrade_with_placeholder_on_a_non_vision_route() -> None:
+    """A route-wide image_input rejection coerces when every image is a tool
+    screenshot: the block is baked into history, so a rejection wedges the
+    caller's whole session while a disclosed placeholder keeps it alive."""
+    from exp.runtime.models.providers.streaming_requests import (
+        TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+        TOOL_RESULT_IMAGE_PLACEHOLDER,
+    )
+
+    coercion = coerce_capability("image_input", _tool_image_request())
+    assert coercion is not None
+    tool_message = coercion.request.messages[-1]
+    assert tool_message.content_parts == ()
+    assert tool_message.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert coercion.disclosures == (TOOL_RESULT_IMAGE_DROP_DISCLOSURE,)
+
+
+def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
+    """A user image the caller can re-send never degrades silently."""
+    assert coerce_capability("image_input", _tool_image_request(user_image=True)) is None
+    # And a request with no images at all offers nothing to coerce.
+    assert (
+        coerce_capability(
+            "image_input",
+            GatewayRequest(
+                surface=GatewayApiSurface.MESSAGES,
+                messages=(GatewayMessage(role="user", content="go"),),
+            ),
+        )
+        is None
+    )
