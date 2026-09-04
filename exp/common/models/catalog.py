@@ -459,6 +459,23 @@ class GatewayDeploymentCapabilities(ContractModel):
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+    supports_async_tools: bool = False
+    """Whether a tool may be flagged ``async`` so the model keeps generating
+    while the caller runs it, with the result returned later on the tool call's
+    ORIGINAL ``call_id`` (GPT-6 Astra Responses). Declaration-driven and off
+    until the decoder + turn lifecycle honor it; a route that declares it must
+    not drop an async tool call. See the platform's astra_responses helpers."""
+    supports_mid_turn_steering: bool = False
+    """Whether the caller may inject additional input over the Responses
+    WebSocket WHILE the model is working, folded into a continuation that
+    preserves completed work (GPT-6 Astra). Off until the WS transport accepts
+    inbound mid-turn frames."""
+    supports_reasoning_effort_update: bool = False
+    """Whether a ``configuration_update`` input item may change reasoning effort
+    mid-conversation without invalidating the cached prompt prefix -- the
+    request-level ``reasoning.effort`` stays fixed (GPT-6 Astra). Off until the
+    decoder recognizes the item (it must not hit the unknown-item reject path)
+    and applies the effort forward."""
     time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
     """Deployment override for the lane's flat time-to-first-byte allowance.
 
