@@ -65,6 +65,7 @@ fn fireworks_tool_events() -> Vec<Event> {
             delta: "hidden provider reasoning".to_string(),
         },
         Event::ToolCallStarted {
+            namespace: None,
             index: 0,
             call_id: "call-one".to_string(),
             name: "lookup".to_string(),
@@ -76,6 +77,7 @@ fn fireworks_tool_events() -> Vec<Event> {
         Event::ToolCallCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
                 call_id: "call-one".to_string(),
                 name: "lookup".to_string(),
                 raw_arguments: "{}".to_string(),
@@ -148,11 +150,13 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
             delta: "hidden".to_string(),
         },
         Event::ToolCallStarted {
+            namespace: None,
             index: 1,
             call_id: "call-one".to_string(),
             name: "first".to_string(),
         },
         Event::ToolCallStarted {
+            namespace: None,
             index: 0,
             call_id: "call-zero".to_string(),
             name: "second".to_string(),
@@ -168,6 +172,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
         Event::ToolCallCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
                 call_id: "call-zero".to_string(),
                 name: "second".to_string(),
                 raw_arguments: "{\"order\":0}".to_string(),
@@ -179,6 +184,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
         Event::ToolCallCompleted {
             index: 1,
             call: CompletedToolCall {
+                namespace: None,
                 call_id: "call-one".to_string(),
                 name: "first".to_string(),
                 raw_arguments: "{\"order\":1}".to_string(),
@@ -356,6 +362,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
             phase: None,
         },
         Event::ToolCallStarted {
+            namespace: None,
             index: 1,
             call_id: "call-1".to_string(),
             name: "lookup".to_string(),
@@ -372,6 +379,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
         Event::ToolCallCompleted {
             index: 1,
             call: CompletedToolCall {
+                namespace: None,
                 call_id: "call-1".to_string(),
                 name: "lookup".to_string(),
                 provider_item_id: Some("fc-provider-1".to_string()),
@@ -468,6 +476,7 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
             phase: None,
         },
         Event::ToolCallStarted {
+            namespace: None,
             index: 2,
             call_id: "call-required".to_string(),
             name: "lookup".to_string(),
@@ -486,6 +495,7 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
         Event::ToolCallCompleted {
             index: 2,
             call: CompletedToolCall {
+                namespace: None,
                 call_id: "call-required".to_string(),
                 name: "lookup".to_string(),
                 provider_item_id: None,
@@ -550,4 +560,109 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
     assert!(!frames
         .iter()
         .any(|frame| frame.contains("response.function_call_arguments")));
+}
+
+#[test]
+fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
+    // The caller replays the completed function_call item verbatim, so the
+    // synthesized output items must carry the namespace or the provider
+    // rejects the next turn ("Missing namespace for function_call ...").
+    let events = vec![
+        Event::ToolCallStarted {
+            index: 0,
+            call_id: "call-ns".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: Some("collaboration".to_string()),
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "{}".to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: crate::events::CompletedToolCall {
+                call_id: "call-ns".to_string(),
+                name: "spawn_agent".to_string(),
+                namespace: Some("collaboration".to_string()),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{}".to_string(),
+                custom: false,
+            },
+        },
+        Event::Completed,
+    ];
+    let mut encoder = ResponsesSseEncoder::new(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+    );
+    encoder.start().expect("stream start must encode");
+    let mut frames = Vec::new();
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("events must encode"));
+    }
+    let added = frames
+        .iter()
+        .find(|frame| frame.contains("response.output_item.added"))
+        .expect("tool item start frame");
+    assert!(added.contains("\"namespace\":\"collaboration\""));
+    let done = frames
+        .iter()
+        .find(|frame| frame.contains("response.output_item.done"))
+        .expect("tool item done frame");
+    assert!(done.contains("\"namespace\":\"collaboration\""));
+
+    let completed = completed_responses_body(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &events,
+    )
+    .expect("completed body must encode");
+    assert_eq!(
+        completed.body["output"][0]["namespace"],
+        json!("collaboration")
+    );
+
+    // A namespace-free call keeps the exact pre-existing item shape.
+    let plain = completed_responses_body(
+        "request-2",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &[
+            Event::ToolCallStarted {
+                index: 0,
+                call_id: "call-plain".to_string(),
+                name: "lookup".to_string(),
+                namespace: None,
+            },
+            Event::ToolArgumentsDelta {
+                index: 0,
+                delta: "{}".to_string(),
+            },
+            Event::ToolCallCompleted {
+                index: 0,
+                call: crate::events::CompletedToolCall {
+                    call_id: "call-plain".to_string(),
+                    name: "lookup".to_string(),
+                    namespace: None,
+                    provider_item_id: None,
+                    provider_status: None,
+                    raw_arguments: "{}".to_string(),
+                    custom: false,
+                },
+            },
+            Event::Completed,
+        ],
+    )
+    .expect("completed body must encode");
+    assert!(plain.body["output"][0]
+        .as_object()
+        .expect("tool item object")
+        .get("namespace")
+        .is_none());
 }

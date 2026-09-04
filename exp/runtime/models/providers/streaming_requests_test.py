@@ -22,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     StructuredTextFormat,
+    ThinkingBlock,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
@@ -241,6 +242,196 @@ def test_anthropic_stream_payload_omits_logprobs_even_when_flagged() -> None:
     )
     assert "logprobs" not in payload
     assert "top_logprobs" not in payload
+
+
+def _budgeted_haiku_profile() -> GatewayWireProfile:
+    """Return the Anthropic budgeted-enabled reasoning profile for haiku-4-5."""
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-haiku-4-5",
+        supports_temperature=True,
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+        sampling_requires_reasoning_none=True,
+        maximum_output_tokens=64_000,
+    )
+
+
+def test_haiku_multi_turn_budgeted_thinking_is_honored_end_to_end() -> None:
+    """A caller budget config plus replayed thinking blocks survive verbatim."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(
+                role="assistant",
+                content="prior answer",
+                provider_reasoning=(ThinkingBlock(text="prior reasoning", signature="sig-1"),),
+            ),
+            GatewayMessage(role="user", content="again"),
+        ),
+        provider_thinking_config={"type": "enabled", "budget_tokens": 2_048},
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2_048}
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assistant = next(message for message in messages if message["role"] == "assistant")
+    content = assistant["content"]
+    assert isinstance(content, list)
+    # The signed thinking block re-emits byte-exact, leading the assistant turn.
+    assert content[0] == {"type": "thinking", "thinking": "prior reasoning", "signature": "sig-1"}
+
+
+def test_haiku_thinking_off_temperature_is_honored_under_the_srn_hatch() -> None:
+    """With thinking off (no config), haiku's srn hatch keeps temperature.
+
+    haiku has no "none" on its effort ladder, so the srn hatch opens on the
+    absence of any thinking budget instead — thinking-off traffic that sets
+    temperature keeps it rather than regressing to a silent drop.
+    """
+    profile = _budgeted_haiku_profile()
+    honored = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        temperature=0.5,
+        maximum_output_tokens=1_000,
+        stream=True,
+    )
+    _public, provider = route_generation_parameter_requests((profile,), honored)
+    assert provider.temperature == 0.5
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        provider,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert payload["temperature"] == 0.5
+
+    # Contrast: with thinking ENABLED, Anthropic requires temperature 1, so the
+    # same control is a disclosed drop, not a rejection — srn is per request.
+    thinking_on = honored.model_copy(
+        update={"provider_thinking_config": {"type": "enabled", "budget_tokens": 2_048}}
+    )
+    public_on, provider_on = route_generation_parameter_requests((profile,), thinking_on)
+    assert provider_on.temperature is None
+    assert "temperature->dropped(set_reasoning_effort_none)" in public_on.ignored_parameters
+
+
+def test_haiku_bare_effort_realizes_as_a_token_budget_at_the_payload_seam() -> None:
+    """An effort on a budgeted-enabled-only model emits enabled+budget, never adaptive.
+
+    haiku rejects ``thinking.type: adaptive`` and ``output_config.effort`` by
+    name; an effort reaching the build is the caller's depth intent (or the
+    route's pinned default), realized as the derived token budget — the same
+    wire realization the effort generation gets via the adaptive object.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_effort="medium",
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request,
+        supports_reasoning=True,
+    )
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
+    assert "output_config" not in payload
+
+    # The route's pinned catalog default (no caller effort) realizes the same way.
+    pinned = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request.model_copy(update={"reasoning_effort": None}),
+        supports_reasoning=True,
+        reasoning_effort="medium",
+    )
+    assert pinned["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
+    assert "output_config" not in pinned
+
+    # Effort "none" keeps thinking off entirely.
+    off = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request.model_copy(update={"reasoning_effort": "none"}),
+        supports_reasoning=True,
+    )
+    assert "thinking" not in off
+
+    # A ceiling too small for any legal budget keeps thinking off rather than
+    # emitting an illegal budget the provider would reject.
+    tight = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request.model_copy(update={"maximum_output_tokens": 1_024}),
+        supports_reasoning=True,
+    )
+    assert "thinking" not in tight
+
+
+def test_haiku_caller_output_config_effort_is_stripped_at_the_payload_seam() -> None:
+    """A caller-seeded output_config.effort never reaches a budgeted-only model."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_effort="medium",
+        provider_output_config={"effort": "medium", "format": {"type": "text"}},
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request,
+        supports_reasoning=True,
+    )
+    # The depth intent rides the budget; the by-name-rejected key is gone and
+    # unrelated output_config keys survive verbatim.
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
+    assert payload["output_config"] == {"format": {"type": "text"}}
+
+    # An UNRECOGNIZED effort never mapped to reasoning_effort, so it has no
+    # budget realization; it stays verbatim and the provider's own by-name
+    # rejection is the honest outcome, never a silent thinking-off answer.
+    future = request.model_copy(
+        update={
+            "reasoning_effort": None,
+            "provider_output_config": {"effort": "hyperdrive"},
+        }
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        future,
+        supports_reasoning=True,
+    )
+    assert "thinking" not in payload
+    assert payload["output_config"] == {"effort": "hyperdrive"}
+
+
+def test_haiku_adaptive_config_is_rejected_by_name_before_dispatch() -> None:
+    """An adaptive config on a budgeted-only route raises pre-dispatch.
+
+    The named rejection is what lets the admit loop offer the disclosed
+    adaptive->enabled(budget) coercion; forwarding verbatim would surface the
+    provider's own opaque 400 instead (which never fails over).
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        provider_thinking_config={"type": "adaptive"},
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    with pytest.raises(ProviderParameterError) as excinfo:
+        route_generation_parameter_requests((_budgeted_haiku_profile(),), request)
+    assert excinfo.value.param == "thinking.type"
 
 
 def test_openai_compatible_stream_payload_omits_reasoning_without_route_capability() -> None:

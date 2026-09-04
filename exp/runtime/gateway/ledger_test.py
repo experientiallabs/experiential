@@ -524,6 +524,82 @@ def test_failed_attempt_terminalizes_its_parent_request(tmp_path: Path) -> None:
     assert attempt_state == "failed"
 
 
+def test_failed_attempt_records_the_sanitized_provider_error_text(tmp_path: Path) -> None:
+    """A provider client-error rejection keeps its sanitized sentence on the row."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("rejected-request"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message="provider rejected the request; verify the request fields",
+        # The sanitized provider sentence: no headers, no request echo, no
+        # credentials (the Rust upstream already enforced that shape).
+        provider_detail="max_tokens must be greater than thinking budget_tokens.",
+    )
+
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=None, failure=failure)
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        failure_class, failure_message = connection.execute(
+            "SELECT failure_class, failure_message FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert failure_class == "invalid_request"
+    assert failure_message == "max_tokens must be greater than thinking budget_tokens."
+
+
+def test_failed_attempt_without_provider_detail_leaves_the_message_null(tmp_path: Path) -> None:
+    """A failure carrying no provider explanation records a NULL message."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("bare-failure"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            safe_message="provider service failed",
+        ),
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        failure_message = connection.execute(
+            "SELECT failure_message FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert failure_message is None
+
+
 def test_predispatch_failure_terminalizes_real_sqlite_request(tmp_path: Path) -> None:
     """Accepted routing failures cannot remain unterminated without an attempt row."""
     clock = FakeLedgerClock()

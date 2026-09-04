@@ -2942,3 +2942,111 @@ def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values
         with pytest.raises(OpenAIProtocolError) as captured:
             decoder(payload)
         assert captured.value.detail.param == "service_tier"
+
+
+def test_a_namespaced_function_call_round_trips_its_namespace_verbatim() -> None:
+    """The exact Codex namespaced wire shape reaches the provider unchanged.
+
+    OpenAI rejects a namespaced call replayed without its namespace ("Missing
+    namespace for function_call 'spawn_agent'. It does not exist in the
+    default namespace. Round-trip the model's function_call item with its
+    namespace field included."), and the item is baked into the caller's
+    history, so dropping or rejecting the field wedges every later turn.
+    """
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "spawn a worker"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_x",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_x",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "output": "spawned",
+                },
+            ],
+        }
+    )
+    call = decoded.request.messages[1].tool_calls[0]
+    assert call.provider_namespace == "collaboration"
+    tool_message = decoded.request.messages[2]
+    assert tool_message.provider_tool_name == "spawn_agent"
+    assert tool_message.provider_tool_namespace == "collaboration"
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-2] == {
+        "type": "function_call",
+        "call_id": "call_x",
+        "name": "spawn_agent",
+        "arguments": "{}",
+        "namespace": "collaboration",
+    }
+    assert payload_input[-1] == {
+        "type": "function_call_output",
+        "call_id": "call_x",
+        "output": "spawned",
+        "name": "spawn_agent",
+        "namespace": "collaboration",
+    }
+
+
+def test_a_namespace_free_function_call_keeps_its_exact_wire_shape() -> None:
+    """Histories from before namespaced tools re-emit byte-identically."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "function_call", "call_id": "call_p", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_p", "output": "ok"},
+            ],
+        }
+    )
+    assert decoded.request.messages[0].tool_calls[0].provider_namespace is None
+    assert decoded.request.messages[1].provider_tool_name is None
+    assert decoded.request.messages[1].provider_tool_namespace is None
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-2] == {
+        "type": "function_call",
+        "call_id": "call_p",
+        "name": "f",
+        "arguments": "{}",
+    }
+    assert payload_input[-1] == {
+        "type": "function_call_output",
+        "call_id": "call_p",
+        "output": "ok",
+    }
+
+
+def test_a_malformed_function_call_namespace_names_its_field() -> None:
+    """An unusable namespace value reports its own input location."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_x",
+                        "name": "spawn_agent",
+                        "namespace": "",
+                        "arguments": "{}",
+                    }
+                ],
+            }
+        )
+    assert error.value.detail.param == "input.0.namespace"

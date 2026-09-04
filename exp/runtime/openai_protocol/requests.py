@@ -848,6 +848,7 @@ def _response_input_messages(
                             "provider_item_id": item.id,
                             "provider_output_index": index,
                             "provider_status": item.status,
+                            "provider_namespace": item.namespace,
                         }
                     ),
                 )
@@ -863,6 +864,8 @@ def _response_input_messages(
                     call_id=item.call_id,
                     output=output or "",
                     content_parts=output_parts,
+                    name=item.name,
+                    namespace=item.namespace,
                 )
             )
     return responses_input_messages(tuple(replayed))

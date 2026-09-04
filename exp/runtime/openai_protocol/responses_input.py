@@ -56,12 +56,16 @@ class ReplayedFunctionOutput:
 
     ``content_parts`` is populated only for a result that carries an image
     (a tool screenshot), in which case ``output`` holds its flattened text.
+    ``name`` and ``namespace`` are the optional tool attribution Codex
+    serializes on outputs of namespaced calls, re-emitted verbatim.
     """
 
     index: int
     call_id: str
     output: str
     content_parts: tuple[MessageContentPart, ...] = ()
+    name: str | None = None
+    namespace: str | None = None
 
 
 ReplayedInput = (
@@ -162,6 +166,8 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
                     content=item.output,
                     content_parts=item.content_parts,
                     tool_call_id=item.call_id,
+                    provider_tool_name=item.name,
+                    provider_tool_namespace=item.namespace,
                 )
             )
         else:

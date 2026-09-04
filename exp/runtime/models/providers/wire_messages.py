@@ -46,13 +46,18 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
                 elif part.kind == "text":
                     parts.append({"type": "input_text", "text": part.text})
             output = parts
-        return [
-            {
-                "type": "function_call_output",
-                "call_id": message.tool_call_id or "",
-                "output": output,
-            }
-        ]
+        output_item: JsonObject = {
+            "type": "function_call_output",
+            "call_id": message.tool_call_id or "",
+            "output": output,
+        }
+        # Tool attribution round-trips verbatim: present stays present and
+        # absent stays absent, so pre-namespace histories are unchanged.
+        if message.provider_tool_name is not None:
+            output_item["name"] = message.provider_tool_name
+        if message.provider_tool_namespace is not None:
+            output_item["namespace"] = message.provider_tool_namespace
+        return [output_item]
     if message.role == "user":
         if message.content_parts:
             return [
@@ -135,6 +140,11 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             "name": call.name,
             "arguments": call.arguments_json(),
         }
+        # The provider rejects a namespaced call replayed without its
+        # namespace ("Missing namespace for function_call ..."), so the
+        # retained value re-emits verbatim; absent stays absent.
+        if call.provider_namespace is not None:
+            item["namespace"] = call.provider_namespace
         if call.provider_item_id is not None:
             item["id"] = call.provider_item_id
         if call.provider_status is not None:

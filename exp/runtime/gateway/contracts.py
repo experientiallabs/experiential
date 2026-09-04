@@ -209,6 +209,26 @@ class GatewayMessage(ContractModel):
         exclude=True,
     )
     """OpenAI Responses assistant-message phase retained for exact replay."""
+    provider_tool_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        exclude=True,
+    )
+    provider_tool_namespace: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        exclude=True,
+    )
+    """Tool-result attribution replayed on a Responses ``function_call_output``.
+
+    Codex serializes an optional ``name`` and ``namespace`` on the outputs of
+    namespaced tool calls; both re-emit verbatim on the rebuilt item
+    (mirroring ``ToolCall.provider_namespace`` on the call side) and are
+    excluded from serialization like the other replay carriers, joining
+    replay identity explicitly through :func:`canonical_request_sha256`.
+    """
     provider_native_item: JsonObject | None = Field(default=None, exclude=True)
     """One verbatim OpenAI Responses input item the gateway carries opaquely.
 
@@ -331,6 +351,10 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "tool" and (
+            self.provider_tool_name is not None or self.provider_tool_namespace is not None
+        ):
+            raise ValueError("tool-result attribution is valid only for tool messages")
         if self.role != "tool" and self.tool_is_error:
             raise ValueError("tool_is_error is valid only for tool messages")
         if self.cache_control is not None and self.role != "tool":

@@ -222,6 +222,22 @@ class ToolCall(ContractModel):
         default=None,
         exclude=True,
     )
+    provider_namespace: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        exclude=True,
+    )
+    """Nested tool tree (OpenAI Responses ``namespace``) that declared this call.
+
+    Set when a Responses caller replays a ``function_call`` item carrying
+    ``namespace``, or when the provider emits one; the field must round-trip
+    verbatim because the provider rejects a namespaced call replayed without
+    it. The tree itself is declared through ``GatewayProviderNativeTool``
+    ``namespace`` entries; this is the per-item linkage back to it. Excluded
+    from serialization like the other replay fields, and joins gateway replay
+    identity explicitly.
+    """
 
     @model_validator(mode="after")
     def _require_matching_raw_arguments(self) -> ToolCall:

@@ -764,3 +764,22 @@ def test_declared_foundry_endpoint_spellings_keep_their_stored_identity() -> Non
 
     assert root.identity_sha256() == with_models.identity_sha256()
     assert root.identity_sha256() != with_v1_root.identity_sha256()
+
+
+def test_astra_responses_capability_slots_default_off() -> None:
+    """The three GPT-6 Astra Responses capability slots exist and default off.
+
+    These are declaration slots for async function calling, mid-turn steering,
+    and mid-conversation reasoning-effort updates. They default False (no
+    deployment advertises a behavior the decoder/turn lifecycle does not yet
+    honor) and, being defaulted, stay identity-invisible (see
+    gateway_catalog_test's identity-digest pin). The platform's
+    generation-capability vocabulary is drift-locked to these field names, so
+    they must remain present for that projection to admit the keys.
+    """
+    caps = GatewayDeploymentCapabilities()
+    assert caps.supports_async_tools is False
+    assert caps.supports_mid_turn_steering is False
+    assert caps.supports_reasoning_effort_update is False
+    # Defaulted addition contributes zero identity bytes.
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}

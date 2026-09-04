@@ -620,3 +620,98 @@ fn unparsable_tool_arguments_stay_malformed_on_a_normal_finish() {
         .expect_err("a dangling fragment on a normal finish is malformed");
     assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
 }
+
+#[test]
+fn namespaced_function_call_round_trips_namespace_through_the_stream() {
+    // Codex agent tools (e.g. spawn_agent) arrive as namespaced function
+    // calls; the provider rejects a replay of the item without its
+    // namespace, so the field must survive normalization verbatim.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "in_progress",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "collaboration", "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&added)
+        .expect("namespaced start must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ProviderOutputItemStarted { .. },
+            Event::ToolCallStarted { name, namespace: Some(namespace), .. },
+        ] if name == "spawn_agent" && namespace == "collaboration"
+    ));
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "completed",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "collaboration", "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&item_done)
+        .expect("namespaced completion must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ToolArgumentsDelta { .. },
+            Event::ProviderOutputItemCompleted { .. },
+            Event::ToolCallCompleted { call, .. },
+        ] if call.namespace.as_deref() == Some("collaboration") && !call.custom
+    ));
+}
+
+#[test]
+fn a_function_call_namespace_changed_at_completion_is_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "collaboration", "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    normalizer.feed(&added).expect("start must normalize");
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "other", "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let failure = normalizer
+        .feed(&item_done)
+        .expect_err("a changed namespace must fail closed");
+    assert!(failure
+        .safe_message
+        .contains("changed identity at completion"));
+}

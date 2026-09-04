@@ -424,3 +424,101 @@ def test_remember_turn_retains_an_output_less_turn_as_the_conversation_so_far() 
     )
     assert state.messages == context.messages
     assert state.episode_key == context.episode_key
+
+
+def test_remember_turn_retains_and_replays_a_tool_call_namespace() -> None:
+    """A namespaced call retained for continuation re-emits its namespace.
+
+    The provider rejects a namespaced function_call replayed without the
+    field, so the boundary payload's namespace must survive retention into
+    the rebuilt input item verbatim (a custom call keeps it on the verbatim
+    native item).
+    """
+    store = BoundedContinuationStore()
+    context = _context()
+    remember_turn(
+        store,
+        context=context,
+        route_binding=_binding(),
+        data={
+            "text": "",
+            "refusal": False,
+            "tool_calls": [
+                {
+                    "output_index": 0,
+                    "item_id": "fc-ns",
+                    "call_id": "call-ns",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "output_index": 1,
+                    "item_id": "ctc-ns",
+                    "call_id": "call-custom",
+                    "name": "exec",
+                    "namespace": "code",
+                    "arguments": "const r = 1;",
+                    "status": "completed",
+                    "custom": True,
+                },
+            ],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    call = state.messages[0].tool_calls[0]
+    assert call.provider_namespace == "collaboration"
+    native = state.messages[1].provider_native_item
+    assert native is not None and native["namespace"] == "code"
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=state.messages,
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[0] == {
+        "id": "fc-ns",
+        "type": "function_call",
+        "call_id": "call-ns",
+        "name": "spawn_agent",
+        "arguments": "{}",
+        "namespace": "collaboration",
+        "status": "completed",
+    }
+    assert payload_input[1]["namespace"] == "code"
+
+
+def test_remember_turn_rejects_a_coerced_tool_call_namespace() -> None:
+    """A non-text or empty namespace is a boundary contract violation."""
+    for value in (7, ""):
+        with pytest.raises(ValueError, match="tool call fields"):
+            remember_turn(
+                BoundedContinuationStore(),
+                context=_context(),
+                route_binding=_binding(),
+                data={
+                    "text": "",
+                    "refusal": False,
+                    "tool_calls": [
+                        {
+                            "output_index": 0,
+                            "item_id": "fc-ns",
+                            "call_id": "call-ns",
+                            "name": "spawn_agent",
+                            "namespace": cast(JsonValue, value),
+                            "arguments": "{}",
+                            "status": "completed",
+                        }
+                    ],
+                },
+            )

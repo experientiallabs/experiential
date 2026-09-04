@@ -10,6 +10,10 @@ pub(super) struct ToolState {
     pub(super) output_index: usize,
     pub(super) call_id: String,
     pub(super) name: String,
+    /// Nested tool tree (Responses `namespace`) that declared this call;
+    /// re-emitted verbatim so the caller can round-trip the item (the
+    /// provider rejects a namespaced call replayed without it).
+    pub(super) namespace: Option<String>,
     pub(super) arguments: String,
     pub(super) status: Option<ProviderOutputItemStatus>,
     pub(super) done: bool,
@@ -35,6 +39,9 @@ impl ToolState {
         item.insert("type".to_string(), json!(item_type));
         item.insert("call_id".to_string(), json!(self.call_id));
         item.insert("name".to_string(), json!(self.name));
+        if let Some(namespace) = &self.namespace {
+            item.insert("namespace".to_string(), json!(namespace));
+        }
         item.insert(payload_key.to_string(), json!(self.arguments));
         item.insert(
             "status".to_string(),
