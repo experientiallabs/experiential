@@ -137,6 +137,7 @@ def dialect_stream_payload(
             reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
             forwards_service_tier=profile.billing_customer_managed,
+            forwards_prompt_cache_key=profile.billing_customer_managed,
         )
     if profile.dialect == "anthropic_messages":
         return anthropic_messages_stream_payload(
@@ -204,6 +205,7 @@ def dialect_stream_payload(
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
             forwards_service_tier=profile.billing_customer_managed,
+            forwards_prompt_cache_key=profile.billing_customer_managed,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
 

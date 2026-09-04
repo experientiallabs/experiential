@@ -78,10 +78,13 @@ CHAT_MANIFEST = CompatibilityManifest(
         # request). Admit it only once response normalization emits logprobs.
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
-        # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
-        # gateway-side, never forwarded to the model: `safety_identifier` is the
-        # current stable end-user identifier, `user` its deprecated predecessor,
-        # `prompt_cache_key` a same-prefix cache-routing hint (not identity).
+        # End-user attribution / cache hints (OpenAI spec). `safety_identifier`
+        # (the current stable end-user identifier) and `user` (its deprecated
+        # predecessor) are accepted and recorded gateway-side, never forwarded.
+        # `prompt_cache_key` is a same-prefix cache-routing hint (not identity):
+        # recorded gateway-side, derived from the sticky episode identity when a
+        # keyed project request omits it, and forwarded only on BYOK
+        # OpenAI-family rungs; ineligible rungs omit it with no disclosure.
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
@@ -154,7 +157,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
-        # Chat surface: accepted and recorded gateway-side, never forwarded.
+        # Chat surface: attribution fields stay gateway-side, and
+        # `prompt_cache_key` (derived from the sticky episode when omitted)
+        # forwards only on BYOK OpenAI-family rungs.
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),

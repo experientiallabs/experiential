@@ -52,7 +52,11 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
-from exp.runtime.gateway.native_admission import admitted_route_requests, resolve_admission_route
+from exp.runtime.gateway.native_admission import (
+    admitted_route_requests,
+    resolve_admission_route,
+    sticky_cache_request,
+)
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
@@ -377,6 +381,10 @@ class NativeControlPlane(
             # Execution receives authenticated plaintext, but the bounded
             # continuation store keeps the post-guardrail history sealed.
             continuation_context.messages = retention_request.messages
+
+        # A sticky project episode that omitted prompt_cache_key gets a derived
+        # cache-routing key; a caller key is never touched (sticky_cache_request).
+        request = sticky_cache_request(authorization, request, continuation=continuation_context)
 
         # The ledger accepts the logical request before route selection, so a
         # keyed operation whose durable terminal already exists (or whose key
