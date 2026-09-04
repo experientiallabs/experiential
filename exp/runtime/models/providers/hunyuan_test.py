@@ -8,10 +8,21 @@ import pytest
 from exp.runtime.models.providers.hunyuan import is_hunyuan_base_url
 
 
-def test_matches_exact_public_hunyuan_root() -> None:
-    """The public OpenAI-compatible inference root is recognized."""
-    assert is_hunyuan_base_url("https://api.hunyuan.cloud.tencent.com/v1")
-    assert is_hunyuan_base_url("https://api.hunyuan.cloud.tencent.com/v1/")
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        # The mainland Hunyuan OpenAI-compatible inference root.
+        "https://api.hunyuan.cloud.tencent.com/v1",
+        "https://api.hunyuan.cloud.tencent.com/v1/",
+        # The TokenHub international MaaS origin the platform's Tencent lane
+        # dispatches through — the endpoint that must resolve a carrier route.
+        "https://tokenhub-intl.tencentcloudmaas.com/v1",
+        "https://tokenhub-intl.tencentcloudmaas.com/v1/",
+    ],
+)
+def test_matches_the_hunyuan_reasoning_roots(base_url: str) -> None:
+    """Both OpenAI-compatible reasoning origins are recognized."""
+    assert is_hunyuan_base_url(base_url)
 
 
 @pytest.mark.parametrize(
@@ -27,6 +38,14 @@ def test_matches_exact_public_hunyuan_root() -> None:
         "https://api.hunyuan.cloud.tencent.com/openai/v1",
         # A look-alike host must not match.
         "https://api.hunyuan.cloud.tencent.com.evil.test/v1",
+        # Site-bound TokenHub siblings are not served today and must not match
+        # until a lane dispatches through them.
+        "https://tokenhub-us.tencentcloudmaas.com/v1",
+        "https://tokenhub.tencentcloudmaas.com/v1",
+        # A TokenHub look-alike host must not match.
+        "https://tokenhub-intl.tencentcloudmaas.com.evil.test/v1",
+        "http://tokenhub-intl.tencentcloudmaas.com/v1",
+        "https://tokenhub-intl.tencentcloudmaas.com/openai/v1",
     ],
 )
 def test_rejects_non_canonical_endpoints(base_url: str) -> None:

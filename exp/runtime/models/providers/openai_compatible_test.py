@@ -480,3 +480,20 @@ def test_reasoning_exposure_requires_a_carrier_route_even_when_declared() -> Non
     ).gateway_wire_profile()
     assert profile.hunyuan_reasoning_route_sha256 is None
     assert profile.reasoning_output_exposed is False
+
+
+def test_tokenhub_intl_rung_resolves_a_carrier_route_and_exposes_when_declared() -> None:
+    """The TokenHub-intl origin the platform serves through is a Hunyuan route.
+
+    This is the endpoint the live Tencent lane dispatches through; recognizing
+    it is what makes the carrier route resolve so plaintext reasoning returns and
+    round-trips instead of being stripped.
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is True
