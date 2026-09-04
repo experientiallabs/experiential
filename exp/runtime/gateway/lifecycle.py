@@ -53,7 +53,6 @@ from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
 from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
 
-_DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
 _RETIRED_REVISION_RETENTION_SECONDS = 600.0
 
 _logger = logging.getLogger(__name__)

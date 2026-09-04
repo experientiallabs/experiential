@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 import secrets
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from exp.common.core.artifacts import JsonObject
@@ -677,4 +676,3 @@ class BatchEngine:
         )
 
 
-PollerFactory = Callable[[BatchEngine], asyncio.Task[None]]
