@@ -173,7 +173,11 @@ declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_sear
 `tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
 Responses route; echoed message items accept `id`/`phase` with `status`
 optional (non-assistant identity drops); and freeform custom tool calls stream end to end with
-their native event names, including continuation retention.
+their native event names, including continuation retention. The item-level `namespace` on
+`function_call` (plus the `name`/`namespace` pair on `function_call_output` and the
+`custom_tool_call` namespace) round-trips verbatim through decode, the client stream, and
+continuation retention: the provider rejects a namespaced call replayed without it, so the
+field joins replay identity when present and absent items keep their exact pre-existing shape.
 
 Provider client-errors stay sanitized: no provider error prose or body content ever reaches the
 caller. The one provider-derived fact a 4xx rejection may relay is the parameter path the provider
