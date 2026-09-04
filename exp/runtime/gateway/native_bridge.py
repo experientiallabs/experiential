@@ -140,6 +140,33 @@ from exp.runtime.openai_protocol.state import (
 
 _logger = logging.getLogger(__name__)
 
+
+def _log_reasoning_continuation_rejection(
+    authorization: AuthorizationSnapshot, stage: str, reason: object
+) -> None:
+    """Record why a reasoning-carrier continuation failed, for operators only.
+
+    The caller sees one opaque 400 (naming the differing bound claim would be an
+    authentic-continuation oracle), but an operator needs the exact reason to tell
+    a genuine tamper from a benign authority drift. Nothing here carries a
+    credential or the plaintext reasoning; the catalog-generation fields make a
+    cross-worker or post-republish drift obvious when diffed against the issuing
+    turn's admission log.
+    """
+    _logger.warning(
+        "reasoning carrier continuation rejected",
+        extra={
+            "operation": "native_reasoning_continuation",
+            "stage": stage,
+            "reason": str(reason),
+            "request_id": authorization.request_id,
+            "alias": authorization.alias,
+            "alias_revision_id": authorization.alias_revision_id,
+            "catalog_sha256": authorization.catalog_sha256,
+        },
+    )
+
+
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
@@ -329,6 +356,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
+            _log_reasoning_continuation_rejection(authorization, "authenticate", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -353,6 +381,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
+            _log_reasoning_continuation_rejection(authorization, "unseal", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -363,6 +392,9 @@ class NativeControlPlane(
             and verified_reasoning_route is not None
             and pinned_reasoning_route.deployment != verified_reasoning_route.deployment
         ):
+            _log_reasoning_continuation_rejection(
+                authorization, "route_pin", "authenticate and unseal resolved different deployments"
+            )
             raise NativeBridgeError(
                 invalid_field(
                     "messages.reasoning_content",

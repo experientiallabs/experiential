@@ -127,13 +127,11 @@ def scheme_for_profile(profile: GatewayWireProfile) -> ReasoningCarrierScheme | 
 class ReasoningCarrierClaims(ContractModel):
     """Authenticated plaintext held only while issuing or validating a carrier."""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     organization_id: str = Field(min_length=1, max_length=256)
     identity_id: str = Field(min_length=1, max_length=256)
     virtual_key_id: str = Field(min_length=1, max_length=256)
     alias: str = Field(min_length=1, max_length=256)
-    alias_revision_id: str = Field(min_length=1, max_length=256)
-    catalog_sha256: Sha256
     exact_model_id: str = Field(min_length=1, max_length=256)
     pool_id: str = Field(min_length=1, max_length=256)
     deployment_id: str = Field(min_length=1, max_length=256)
@@ -161,8 +159,6 @@ class ReasoningCarrierAuthority:
     identity_id: str
     virtual_key_id: str
     alias: str
-    alias_revision_id: str
-    catalog_sha256: str
     exact_model_id: str
     pool_id: str
     deployment_id: str
@@ -216,14 +212,21 @@ def reasoning_carrier_authority(
     if route_sha256 is None:
         return None
     credential = _bearer_credential(profile.headers)
+    # The carrier binds routing, credential, and tenant identity — NOT the
+    # catalog GENERATION. ``alias_revision_id`` and ``catalog_sha256`` bump on
+    # every catalog write (a price sync, a capability restamp) and differ across
+    # per-worker in-memory catalog generations, so binding them into the AEAD key
+    # would make a carrier undecryptable on the very next turn whenever the
+    # catalog was republished or the turn landed on another worker — orphaning
+    # every multi-turn tool loop. This is the exact hazard the continuation store
+    # avoids by keying only on stable identity; a real route change still moves
+    # ``deployment_id``/``reasoning_route_sha256`` and still fails authentication.
     key_context = {
-        "schema_version": 2,
+        "schema_version": 3,
         "organization_id": authorization.organization_id,
         "identity_id": authorization.identity_id,
         "virtual_key_id": authorization.virtual_key_id,
         "alias": authorization.alias,
-        "alias_revision_id": authorization.alias_revision_id,
-        "catalog_sha256": authorization.catalog_sha256,
         "exact_model_id": exact_model_id,
         "pool_id": pool_id,
         "deployment_id": deployment.deployment_id,
@@ -250,8 +253,6 @@ def reasoning_carrier_authority(
         identity_id=authorization.identity_id,
         virtual_key_id=authorization.virtual_key_id,
         alias=authorization.alias,
-        alias_revision_id=authorization.alias_revision_id,
-        catalog_sha256=authorization.catalog_sha256,
         exact_model_id=exact_model_id,
         pool_id=pool_id,
         deployment_id=deployment.deployment_id,
@@ -438,13 +439,11 @@ def parse_reasoning_carrier_tool_calls(value: object) -> tuple[ToolCall, ...]:
 def _authority_claims(authority: ReasoningCarrierAuthority) -> dict[str, object]:
     """Return the canonical claim fields shared by issuance and verification."""
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "organization_id": authority.organization_id,
         "identity_id": authority.identity_id,
         "virtual_key_id": authority.virtual_key_id,
         "alias": authority.alias,
-        "alias_revision_id": authority.alias_revision_id,
-        "catalog_sha256": authority.catalog_sha256,
         "exact_model_id": authority.exact_model_id,
         "pool_id": authority.pool_id,
         "deployment_id": authority.deployment_id,
