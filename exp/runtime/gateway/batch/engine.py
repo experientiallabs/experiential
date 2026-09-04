@@ -674,5 +674,3 @@ class BatchEngine:
                 }
             )
         )
-
-
