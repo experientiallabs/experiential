@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.batch.contracts import (
     BatchDeployment,
     BatchFile,
@@ -15,6 +16,7 @@ from exp.runtime.gateway.batch.contracts import (
     BatchLineResult,
     BatchStatus,
     BatchSubmitError,
+    BatchSurface,
 )
 from exp.runtime.gateway.batch.engine import BatchEngine
 from exp.runtime.gateway.batch.providers import ProviderBatchSnapshot
@@ -41,9 +43,14 @@ class MemoryStore:
         self.jobs[job.batch_id] = job
 
     def list_jobs(self, *, organization_id: str, limit: int, after: str | None) -> list[BatchJob]:
-        """Return owned jobs newest first."""
+        """Return owned jobs newest first, starting strictly after ``after``."""
         owned = [job for job in self.jobs.values() if job.organization_id == organization_id]
-        owned.sort(key=lambda job: job.created_at, reverse=True)
+        owned.sort(key=lambda job: (job.created_at, job.batch_id), reverse=True)
+        if after is not None:
+            position = next(
+                (index for index, job in enumerate(owned) if job.batch_id == after), None
+            )
+            owned = [] if position is None else owned[position + 1 :]
         return owned[:limit]
 
     def open_jobs(self) -> list[BatchJob]:
@@ -123,6 +130,7 @@ class MemoryLedger:
         """Optionally reject the Nth reservation onward."""
         self.reserved: list[str] = []
         self.settled: list[tuple[str, int]] = []
+        self.settled_results: list[BatchLineResult] = []
         self.released: list[tuple[str, str]] = []
         self._reject_after = reject_after
 
@@ -136,6 +144,7 @@ class MemoryLedger:
     def settle_line(self, *, job: BatchJob, line: BatchLine, result: BatchLineResult) -> None:
         """Record one settlement."""
         self.settled.append((line.custom_id, result.output_tokens))
+        self.settled_results.append(result)
 
     def release_line(self, *, job: BatchJob, line: BatchLine, reason: str) -> None:
         """Record one release."""
@@ -156,6 +165,7 @@ class ScriptedClient:
     provider = "openrouter"
     supports_cancel = False
     requires_uniform_model = True
+    surfaces: tuple[BatchSurface, ...] = ("/v1/chat/completions", "/v1/responses")
 
     def __init__(
         self, snapshots: list[ProviderBatchSnapshot], results: list[BatchLineResult]
@@ -165,6 +175,12 @@ class ScriptedClient:
         self._results = results
         self.submitted: list[str] = []
         self.cancelled = 0
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """Pass the caller's body through; a line named 'reject-me' is untranslatable."""
+        if line.custom_id == "reject-me":
+            raise BatchSubmitError("line 'reject-me' cannot be expressed on this wire")
+        return dict(line.body)
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Record the submit and mint a provider id."""
@@ -247,6 +263,54 @@ def test_submit_accepts_valid_lines_and_reserves_each() -> None:
     assert job.reserved_micro_usd == 2_000
     assert ledger.reserved == ["a", "b"]
     assert store.jobs[job.batch_id].provider == "openrouter"
+
+
+def test_submit_quarantines_lines_the_provider_client_cannot_carry() -> None:
+    """A surface the client does not serve, or a body it cannot shape for its wire,
+    is a per-line rejection at submit, never a provider-side failure later."""
+    engine, _, _, ledger, client = _engine()
+    client.surfaces = ("/v1/responses",)
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b")])
+    with pytest.raises(BatchSubmitError, match="do not serve /v1/chat/completions"):
+        engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+    client.surfaces = ("/v1/chat/completions", "/v1/responses")
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("reject-me")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert [line.custom_id for line in job.lines] == ["a"]
+    assert [(error.custom_id, error.code) for error in job.line_errors] == [
+        ("reject-me", "invalid_request")
+    ]
+    assert "cannot be expressed" in job.line_errors[0].message
+    assert ledger.reserved == ["a"]
+
+
+def test_rejected_lines_do_not_taint_the_provider_binding() -> None:
+    """A line rejected at the client checks never joins the provider set, so a valid
+    remainder on one provider submits instead of tripping the mixed-provider refusal."""
+    engine, _, _, ledger, _ = _engine()
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("reject-me", model="kimi-k3-batch")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert job.provider == "openrouter"
+    assert [line.custom_id for line in job.lines] == ["a"]
+    assert [(error.custom_id, error.code) for error in job.line_errors] == [
+        ("reject-me", "invalid_request")
+    ]
+    assert ledger.reserved == ["a"]
 
 
 def test_submit_refuses_unknown_endpoint_and_missing_file() -> None:
@@ -416,8 +480,79 @@ def test_list_jobs_is_owner_scoped() -> None:
         input_file_id=file_id,
         endpoint="/v1/chat/completions",
     )
-    assert len(engine.list_jobs(organization_id="org_a")) == 1
-    assert engine.list_jobs(organization_id="org_b") == []
+    assert len(engine.list_jobs(organization_id="org_a").jobs) == 1
+    assert engine.list_jobs(organization_id="org_b").jobs == ()
+
+
+def test_list_jobs_reports_has_more_and_pages_by_cursor() -> None:
+    """has_more is true exactly while jobs remain after the page; the cursor walks them all."""
+    engine, _, _, _, _ = _engine()
+    submitted: list[str] = []
+    for custom_id in ("a", "b", "c"):
+        file_id = _upload(engine, [_chat_line(custom_id)])
+        job = engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+        submitted.append(job.batch_id)
+    seen: list[str] = []
+    after: str | None = None
+    flags: list[bool] = []
+    for _ in range(4):
+        page = engine.list_jobs(organization_id="org_a", limit=1, after=after)
+        if not page.jobs:
+            break
+        assert len(page.jobs) == 1
+        seen.append(page.jobs[0].batch_id)
+        flags.append(page.has_more)
+        after = page.jobs[0].batch_id
+    assert seen == list(reversed(submitted))
+    assert flags == [True, True, False]
+    whole = engine.list_jobs(organization_id="org_a", limit=3)
+    assert len(whole.jobs) == 3 and whole.has_more is False
+
+
+def test_settlement_hands_the_host_failed_lines_with_their_reason() -> None:
+    """A per-line provider error settles as a failure carrying the reason, not as served."""
+    results = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=200,
+            response={"usage": {"prompt_tokens": 3, "completion_tokens": 5}},
+            input_tokens=3,
+            output_tokens=5,
+        ),
+        BatchLineResult(
+            custom_id="b",
+            status_code=500,
+            error={"type": "invalid_request_error", "message": "max_tokens must be at least 1"},
+        ),
+    ]
+    client = ScriptedClient(
+        [ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True)], results
+    )
+    engine, store, files, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.COMPLETED and final.settled
+    assert final.counts.completed == 1 and final.counts.failed == 1
+    by_id = {result.custom_id: result for result in ledger.settled_results}
+    assert by_id["a"].failure_reason is None
+    assert by_id["b"].failure_reason == "max_tokens must be at least 1"
+    assert ledger.released == []
+    assert final.error_file_id is not None
+    error_file = files.records[final.error_file_id][1].decode("utf-8")
+    assert "max_tokens must be at least 1" in error_file
 
 
 def test_interrupted_dispatch_fails_closed_without_resubmitting() -> None:
@@ -658,6 +793,123 @@ def test_terminal_jobs_settle_partial_provider_results() -> None:
     assert ledger.released == [("b", "cancelled")]
 
 
+def test_cancel_landing_during_the_poll_still_ends_cancelled() -> None:
+    """A cancellation persisted after the poller read the job but before the provider
+    answered "ended" with cut lines ends CANCELLED (cancelled_at set), never COMPLETED."""
+    partial = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=200,
+            response={"usage": {"prompt_tokens": 1, "completion_tokens": 4}},
+            input_tokens=1,
+            output_tokens=4,
+        )
+    ]
+
+    class RacingClient(ScriptedClient):
+        """Client whose terminal poll lands after a cancel was persisted mid-poll."""
+
+        provider = "openai"
+        supports_cancel = True
+
+        def __init__(self, store: MemoryStore) -> None:
+            """Script in_progress, then an ended batch with one cut line."""
+            super().__init__(
+                [
+                    ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+                    ProviderBatchSnapshot(
+                        status=BatchStatus.COMPLETED,
+                        completed=1,
+                        failed=1,
+                        cancelled_lines=1,
+                        results_ready=True,
+                    ),
+                ],
+                partial,
+            )
+            self._store = store
+
+        async def poll(self, *, job: BatchJob, api_key: str) -> ProviderBatchSnapshot:
+            """Persist the caller's cancel while the provider call is in flight."""
+            snapshot = await super().poll(job=job, api_key=api_key)
+            if snapshot.status is BatchStatus.COMPLETED:
+                assert job.status is BatchStatus.IN_PROGRESS, "the poller read a stale job"
+                self._store.save_job(
+                    job=self._store.jobs[job.batch_id].model_copy(
+                        update={"status": BatchStatus.CANCELLING}
+                    )
+                )
+            return snapshot
+
+    store = MemoryStore()
+    ledger = MemoryLedger()
+    client = RacingClient(store)
+    engine = BatchEngine(
+        store=store,
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=ledger,
+        secrets_resolver=MemorySecrets(),
+        clients={"openai": client},
+    )
+    file_id = _upload(
+        engine, [_chat_line("a", model="kimi-k3-batch"), _chat_line("b", model="kimi-k3-batch")]
+    )
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())  # submit
+    asyncio.run(engine.poll_once())  # in_progress
+    asyncio.run(engine.poll_once())  # ended with a cut line; cancel lands mid-poll
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.CANCELLED and final.settled
+    rendered = final.public_object()
+    assert rendered["cancelled_at"] is not None and rendered["completed_at"] is None
+    assert ledger.settled == [("a", 4)]
+    assert ledger.released == [("b", "cancelled")]
+
+
+def test_cancelled_intent_with_no_cut_lines_completes() -> None:
+    """When the provider ran every line before the cancel took effect, nothing was
+    cancelled: the job completes and every line is billed."""
+    client = ScriptedClient(
+        [
+            ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+            ProviderBatchSnapshot(status=BatchStatus.COMPLETED, completed=1, results_ready=True),
+        ],
+        [
+            BatchLineResult(
+                custom_id="a",
+                status_code=200,
+                response={"usage": {"prompt_tokens": 1, "completion_tokens": 2}},
+                input_tokens=1,
+                output_tokens=2,
+            )
+        ],
+    )
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    store.save_job(
+        job=store.jobs[job.batch_id].model_copy(update={"status": BatchStatus.CANCELLING})
+    )
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.COMPLETED and final.settled
+    assert final.public_object()["completed_at"] is not None
+    assert ledger.settled == [("a", 2)] and ledger.released == []
+
+
 def test_inflight_cancel_without_provider_support_runs_to_terminal() -> None:
     """CANCELLING survives non-terminal polls and settles at provider end."""
     client = ScriptedClient(
@@ -852,3 +1104,204 @@ def test_direct_cancel_on_an_unsupported_provider_refuses_honestly() -> None:
     unchanged = store.jobs[job.batch_id]
     assert unchanged.status is BatchStatus.IN_PROGRESS
     assert ledger.released == []
+
+
+def test_responses_lines_reserve_at_their_own_output_ceiling() -> None:
+    """A Responses body names its ceiling as max_output_tokens; the reservation reads
+    it exactly as it reads a chat body's max_tokens, never falling to the default."""
+    engine, _, _, _, _ = _engine()
+    line = (
+        '{"custom_id": "a", "method": "POST", "url": "/v1/responses",'
+        ' "body": {"model": "kimi-k3-batch", "input": "hi", "max_output_tokens": 77}}'
+    )
+    unbounded = (
+        '{"custom_id": "b", "method": "POST", "url": "/v1/responses",'
+        ' "body": {"model": "kimi-k3-batch", "input": "hi"}}'
+    )
+    file_id = _upload(engine, [line, unbounded])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/responses",
+    )
+    ceilings = {line.custom_id: line.maximum_output_tokens for line in job.lines}
+    assert ceilings == {"a": 77, "b": 4096}
+
+
+def test_provider_without_a_client_is_a_whole_job_refusal() -> None:
+    """A catalog model on a provider this engine has no client for cannot be shaped
+    or dispatched, so the submit is refused up front."""
+    engine = BatchEngine(
+        store=MemoryStore(),
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=MemoryLedger(),
+        secrets_resolver=MemorySecrets(),
+        clients={
+            "openrouter": ScriptedClient(
+                [ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True)], []
+            )
+        },
+    )
+    file_id = _upload(engine, [_chat_line("a", model="kimi-k3-batch")])
+    with pytest.raises(BatchSubmitError, match="openai has no batch client enabled"):
+        engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+
+
+def test_job_with_only_failed_provider_rows_retries_a_failed_results_fetch() -> None:
+    """A terminal batch whose provider counted only FAILED rows still has result rows
+    (their failure reasons); a fetch failure keeps settlement open, and the retry lands
+    the provider's own reasons rather than a generic job-status error."""
+    provider_rows = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=500,
+            error={"type": "invalid_request_error", "message": "max_tokens: 0"},
+        )
+    ]
+
+    class FlakyFailedRows(ScriptedClient):
+        """Ends cancelled with one failed row and no served lines; first fetch fails."""
+
+        provider = "openai"
+        supports_cancel = True
+
+        def __init__(self) -> None:
+            """Script in_progress, then a cancelled batch with one failed row."""
+            super().__init__(
+                [
+                    ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+                    ProviderBatchSnapshot(
+                        status=BatchStatus.CANCELLED, completed=0, failed=1, results_ready=True
+                    ),
+                ],
+                provider_rows,
+            )
+            self.fetches = 0
+
+        async def results(self, *, job: BatchJob, api_key: str) -> list[BatchLineResult]:
+            """Fail the first download definitively, succeed afterwards."""
+            self.fetches += 1
+            if self.fetches == 1:
+                raise BatchSubmitError(
+                    "provider result download failed with status 503", code="provider_error"
+                )
+            return list(self._results)
+
+    store = MemoryStore()
+    ledger = MemoryLedger()
+    engine = BatchEngine(
+        store=store,
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=ledger,
+        secrets_resolver=MemorySecrets(),
+        clients={"openai": FlakyFailedRows()},
+    )
+    file_id = _upload(
+        engine, [_chat_line("a", model="kimi-k3-batch"), _chat_line("b", model="kimi-k3-batch")]
+    )
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())  # submit
+    asyncio.run(engine.poll_once())  # in_progress
+    asyncio.run(engine.poll_once())  # cancelled with one failed row; fetch fails
+    pending = store.jobs[job.batch_id]
+    assert pending.status is BatchStatus.CANCELLED and pending.settled is False
+    assert ledger.settled == [] and ledger.released == []
+    asyncio.run(engine.poll_once())  # retry lands the provider's rows
+    final = store.jobs[job.batch_id]
+    assert final.settled is True
+    assert [result.failure_reason for result in ledger.settled_results] == ["max_tokens: 0"]
+    assert ledger.released == [("b", "cancelled")]
+
+
+def test_cancelled_job_with_served_lines_retries_a_failed_results_fetch() -> None:
+    """A cancelled batch whose provider counted served lines has results; a fetch
+    failure keeps settlement open instead of releasing the lines that ran."""
+    served = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=200,
+            response={"usage": {"prompt_tokens": 1, "completion_tokens": 4}},
+            input_tokens=1,
+            output_tokens=4,
+        )
+    ]
+
+    class FlakyCancelledResults(ScriptedClient):
+        """Ends cancelled with one served line; the first results fetch fails."""
+
+        provider = "openai"
+        supports_cancel = True
+
+        def __init__(self) -> None:
+            """Script in_progress, then an ended batch with one cut line."""
+            super().__init__(
+                [
+                    ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+                    ProviderBatchSnapshot(
+                        status=BatchStatus.COMPLETED,
+                        completed=1,
+                        failed=1,
+                        cancelled_lines=1,
+                        results_ready=True,
+                    ),
+                ],
+                served,
+            )
+            self.fetches = 0
+
+        async def results(self, *, job: BatchJob, api_key: str) -> list[BatchLineResult]:
+            """Fail the first download definitively, succeed afterwards."""
+            self.fetches += 1
+            if self.fetches == 1:
+                raise BatchSubmitError(
+                    "provider result download failed with status 503", code="provider_error"
+                )
+            return list(self._results)
+
+    client = FlakyCancelledResults()
+    store = MemoryStore()
+    ledger = MemoryLedger()
+    engine = BatchEngine(
+        store=store,
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=ledger,
+        secrets_resolver=MemorySecrets(),
+        clients={"openai": client},
+    )
+    file_id = _upload(
+        engine, [_chat_line("a", model="kimi-k3-batch"), _chat_line("b", model="kimi-k3-batch")]
+    )
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())  # submit
+    asyncio.run(engine.poll_once())  # in_progress
+    store.save_job(
+        job=store.jobs[job.batch_id].model_copy(update={"status": BatchStatus.CANCELLING})
+    )
+    asyncio.run(engine.poll_once())  # ended with a cut line; results fetch fails
+    pending = store.jobs[job.batch_id]
+    assert pending.status is BatchStatus.CANCELLED and pending.settled is False
+    assert ledger.settled == [] and ledger.released == []
+    asyncio.run(engine.poll_once())  # settlement retries and lands
+    final = store.jobs[job.batch_id]
+    assert final.settled is True
+    assert ledger.settled == [("a", 4)]
+    assert ledger.released == [("b", "cancelled")]

@@ -102,6 +102,38 @@ GEMINI_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
 
 GEMINI_REFUSAL_CHUNKS: tuple[bytes, ...] = (_sse({"candidates": [{"finishReason": "SAFETY"}]}),)
 
+# A prompt-level block as Google delivers it (production capture shape,
+# 2026-09-04): one frame, no candidates, the block named on promptFeedback,
+# and usageMetadata counting the processed prompt.
+GEMINI_PROMPT_BLOCK_CHUNKS: tuple[bytes, ...] = (
+    _sse(
+        {
+            "promptFeedback": {
+                "blockReason": "PROHIBITED_CONTENT",
+                "safetyRatings": [
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}
+                ],
+            },
+            "usageMetadata": {"promptTokenCount": 42, "totalTokenCount": 42},
+        }
+    ),
+)
+
+GEMINI_PROMPT_BLOCK_EVENTS: tuple[JsonObject, ...] = (
+    {
+        "kind": "usage",
+        "input_tokens": 42,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": None,
+    },
+    {
+        "kind": "failed",
+        "failure_class": "refusal",
+        "safe_message": "provider refused the request",
+    },
+)
+
 GEMINI_INCOMPLETE_CHUNKS: tuple[bytes, ...] = (
     _sse({"candidates": [{"content": {"parts": [{"text": "cut"}]}}]}),
     _sse(
@@ -224,6 +256,44 @@ def test_native_gemini_normalizer_matches_the_golden_fixture() -> None:
             "safe_message": "provider refused the request",
         }
     ]
+
+
+def test_native_gemini_normalizer_classifies_googles_error_envelope() -> None:
+    """Google's error envelope on the stream is the provider declaring failure:
+    provider_internal (retry, then fail over), never a malformed stream end and
+    never a synthesized completion after prior output."""
+    envelope = _sse(
+        {
+            "error": {
+                "code": 503,
+                "message": "The model is overloaded. Please try again later.",
+                "status": "UNAVAILABLE",
+            }
+        }
+    )
+    failed = {
+        "kind": "failed",
+        "failure_class": "provider_internal",
+        "safe_message": "provider stream failed",
+    }
+    alone = _native_normalized("gemini_generate_content", (envelope,))
+    assert alone["failure"] is None
+    assert alone["events"] == [failed]
+    after_output = _native_normalized(
+        "gemini_generate_content", (GEMINI_GOLDEN_CHUNKS[0], envelope)
+    )
+    assert after_output["failure"] is None
+    assert after_output["events"] == [{"kind": "text_delta", "text": "Hel"}, failed]
+
+
+def test_native_gemini_normalizer_refuses_a_blocked_prompt() -> None:
+    """A prompt Google blocks arrives with no candidates at all. It is the
+    provider's refusal (the same terminal a SAFETY finish produces, after the
+    usage it reported), never a stream that "ended without a terminal event"
+    to be retried and failed over."""
+    result = _native_normalized("gemini_generate_content", GEMINI_PROMPT_BLOCK_CHUNKS)
+    assert result["failure"] is None
+    assert result["events"] == list(GEMINI_PROMPT_BLOCK_EVENTS)
 
 
 def test_native_gemini_normalizer_completes_a_clean_end_after_content() -> None:
