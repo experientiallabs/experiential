@@ -23,6 +23,7 @@ class HashingRAGEmbedder:
     """Provider-free signed hashing embedder used by default for local RAG builds."""
 
     def __init__(self, dimensions: int = DEFAULT_HASHING_DIMENSIONS) -> None:
+        """Fix the output dimensionality, requiring at least 8 dimensions."""
         if dimensions < 8:
             raise ValueError("the local RAG hashing embedder needs at least 8 dimensions")
         self.dimensions = dimensions

@@ -61,6 +61,7 @@ class TextSimulationError(RuntimeError):
     """A text simulator boundary failed with an artifact-safe terminal classification."""
 
     def __init__(self, stop_reason: StopReason, failure: StructuredFailure) -> None:
+        """Bind the terminal stop reason and its structured failure."""
         super().__init__(failure.message)
         self.stop_reason = stop_reason
         self.failure = failure
