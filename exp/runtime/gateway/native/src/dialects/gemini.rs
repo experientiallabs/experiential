@@ -388,7 +388,13 @@ mod gemini_tests {
         // block named on promptFeedback, and usageMetadata counting the
         // prompt Google processed. It must terminate the stream as a refusal
         // (400, no retry, no failover), never as a malformed stream end.
-        for reason in ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "OTHER", "IMAGE_SAFETY"] {
+        for reason in [
+            "SAFETY",
+            "PROHIBITED_CONTENT",
+            "BLOCKLIST",
+            "OTHER",
+            "IMAGE_SAFETY",
+        ] {
             let chunks = [sse(&json!({
                 "promptFeedback": {
                     "blockReason": reason,
@@ -400,7 +406,10 @@ mod gemini_tests {
             }))];
             let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
             let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-            assert!(failure.is_none(), "{reason}: a prompt block is a terminal, not a failure");
+            assert!(
+                failure.is_none(),
+                "{reason}: a prompt block is a terminal, not a failure"
+            );
             assert_eq!(
                 events,
                 vec![
