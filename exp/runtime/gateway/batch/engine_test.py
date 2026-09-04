@@ -1154,6 +1154,78 @@ def test_provider_without_a_client_is_a_whole_job_refusal() -> None:
         )
 
 
+def test_job_with_only_failed_provider_rows_retries_a_failed_results_fetch() -> None:
+    """A terminal batch whose provider counted only FAILED rows still has result rows
+    (their failure reasons); a fetch failure keeps settlement open, and the retry lands
+    the provider's own reasons rather than a generic job-status error."""
+    provider_rows = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=500,
+            error={"type": "invalid_request_error", "message": "max_tokens: 0"},
+        )
+    ]
+
+    class FlakyFailedRows(ScriptedClient):
+        """Ends cancelled with one failed row and no served lines; first fetch fails."""
+
+        provider = "openai"
+        supports_cancel = True
+
+        def __init__(self) -> None:
+            """Script in_progress, then a cancelled batch with one failed row."""
+            super().__init__(
+                [
+                    ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+                    ProviderBatchSnapshot(
+                        status=BatchStatus.CANCELLED, completed=0, failed=1, results_ready=True
+                    ),
+                ],
+                provider_rows,
+            )
+            self.fetches = 0
+
+        async def results(self, *, job: BatchJob, api_key: str) -> list[BatchLineResult]:
+            """Fail the first download definitively, succeed afterwards."""
+            self.fetches += 1
+            if self.fetches == 1:
+                raise BatchSubmitError(
+                    "provider result download failed with status 503", code="provider_error"
+                )
+            return list(self._results)
+
+    store = MemoryStore()
+    ledger = MemoryLedger()
+    engine = BatchEngine(
+        store=store,
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=ledger,
+        secrets_resolver=MemorySecrets(),
+        clients={"openai": FlakyFailedRows()},
+    )
+    file_id = _upload(
+        engine, [_chat_line("a", model="kimi-k3-batch"), _chat_line("b", model="kimi-k3-batch")]
+    )
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())  # submit
+    asyncio.run(engine.poll_once())  # in_progress
+    asyncio.run(engine.poll_once())  # cancelled with one failed row; fetch fails
+    pending = store.jobs[job.batch_id]
+    assert pending.status is BatchStatus.CANCELLED and pending.settled is False
+    assert ledger.settled == [] and ledger.released == []
+    asyncio.run(engine.poll_once())  # retry lands the provider's rows
+    final = store.jobs[job.batch_id]
+    assert final.settled is True
+    assert [result.failure_reason for result in ledger.settled_results] == ["max_tokens: 0"]
+    assert ledger.released == [("b", "cancelled")]
+
+
 def test_cancelled_job_with_served_lines_retries_a_failed_results_fetch() -> None:
     """A cancelled batch whose provider counted served lines has results; a fetch
     failure keeps settlement open instead of releasing the lines that ran."""

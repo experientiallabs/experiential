@@ -663,16 +663,22 @@ class BatchEngine:
             try:
                 fetched = await client.results(job=job, api_key=self._api_key(job))
             except BatchSubmitError:
-                if job.status is BatchStatus.COMPLETED or job.counts.completed > 0:
-                    # Results exist: a completed job, or a cancelled, expired,
-                    # or failed one whose provider counted served lines. A
-                    # fetch failure is retryable, so settlement stays open
-                    # for a later poll instead of releasing lines whose work
-                    # already ran.
+                if (
+                    job.status is BatchStatus.COMPLETED
+                    or job.counts.completed > 0
+                    or job.counts.failed > 0
+                ):
+                    # Result rows exist: a completed job, or a cancelled,
+                    # expired, or failed one whose provider counted served OR
+                    # failed lines (a provider's per-line failure rows carry
+                    # the reasons the caller is owed). A fetch failure is
+                    # retryable, so settlement stays open for a later poll
+                    # instead of releasing lines whose work already ran and
+                    # replacing provider reasons with a generic job error.
                     raise
                 # A definitive provider response on a failed, expired, or
-                # cancelled job that served nothing means no per-line results
-                # are available.
+                # cancelled job that counted no result rows means no per-line
+                # results are available.
                 _LOGGER.warning(
                     "batch %s: no results retrievable for %s job; releasing all lines",
                     job.batch_id,

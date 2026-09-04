@@ -203,6 +203,10 @@ def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
         if not isinstance(block, dict):
             raise ProviderResponseError(f"Anthropic content[{index}] must be an object")
         block_type = block.get("type")
+        if not isinstance(block_type, str) or not block_type:
+            # The discriminator is the one field every block must carry; a
+            # block without it is malformed output, never a hidden kind.
+            raise ProviderResponseError(f"Anthropic content[{index}].type must be text")
         if block_type == "text":
             text = block.get("text")
             if not isinstance(text, str):
@@ -253,9 +257,10 @@ def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
             if text is not None and not isinstance(text, str):
                 raise ProviderResponseError(f"Anthropic content[{index}].refusal must be text")
             refusal = (refusal or "") + (text or "")
-        # Every other block kind (thinking, redacted_thinking, server_tool_use,
-        # *_tool_result, and kinds this surface cannot show) carries no
-        # gateway-visible output here and is skipped, never rejected.
+        # Every other NAMED block kind (thinking, redacted_thinking,
+        # server_tool_use, *_tool_result, and kinds this surface cannot show)
+        # carries no gateway-visible output here and is skipped, as the
+        # streaming normalizer skips it; only an unnamed block is rejected.
     if refusal is not None:
         # The synchronous lane delivers no content on a refusal; the public
         # surfaces cannot mix text with a refusal either, so the refusal is

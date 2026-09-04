@@ -375,3 +375,11 @@ def test_malformed_blocks_are_a_typed_rendering_failure() -> None:
         anthropic_result_body(
             _line("/v1/chat/completions", _CHAT_BODY), bad_refusal, request_id="r", created_at=0.0
         )
+    # A block with no discriminator is malformed output, not a hidden kind:
+    # it must never render as a successful (possibly empty) completion.
+    for untyped in ({"text": "lost"}, {"type": 7, "text": "lost"}, {"type": "", "text": "lost"}):
+        unnamed = {**_ANTHROPIC_MESSAGE, "content": [untyped]}
+        with pytest.raises(ProviderResponseError, match="type must be text"):
+            anthropic_result_body(
+                _line("/v1/chat/completions", _CHAT_BODY), unnamed, request_id="r", created_at=0.0
+            )
