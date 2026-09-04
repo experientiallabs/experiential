@@ -386,13 +386,16 @@ class GatewayRequest(ContractModel):
     tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
-    json_object_output: bool = False
+    json_object_output: bool = Field(default=False, exclude=True)
     """Caller ``response_format: {"type": "json_object"}`` from the Chat surface.
 
     A schema-free "answer with one JSON object" mode, distinct from
     ``structured_text``: no schema exists to enforce, so each wire dialect
     honors it its own way (a native JSON mode where the provider has one, a
     system instruction otherwise). Mutually exclusive with ``structured_text``.
+    Excluded from serialization like the other optional carriers so
+    mode-free digests are unperturbed; an enabled mode joins replay identity
+    through :func:`canonical_request_sha256`.
     """
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens_parameter: (
