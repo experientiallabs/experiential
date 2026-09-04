@@ -10,6 +10,7 @@ from exp.common.models.content import (
     MAXIMUM_AUDIOS_PER_REQUEST,
     MAXIMUM_DOCUMENT_BASE64_BYTES,
     MAXIMUM_IMAGE_BASE64_BYTES,
+    MAXIMUM_IMAGES_PER_REQUEST,
     MAXIMUM_VIDEO_BASE64_BYTES,
     AudioContentPart,
     DocumentContentPart,
@@ -427,6 +428,20 @@ def test_attachment_ceilings_count_each_kind_separately() -> None:
         require_attachment_ceilings(
             [DocumentContentPart(url="https://example.com/a.pdf") for _ in range(6)]
         )
+
+
+def test_the_image_ceiling_matches_the_provider_api_not_a_ui_limit() -> None:
+    """A long agent session's screenshot history stays under the ceiling.
+
+    The Anthropic API accepts 100 images per request (20 is claude.ai's UI
+    limit); screenshots are baked into the transcript, so a lower gateway
+    ceiling wedges the session because every replay re-trips it.
+    """
+    image = ImageContentPart(media_type="image/png", data=_PNG_BASE64)
+    require_attachment_ceilings([image] * 21)
+    require_attachment_ceilings([image] * MAXIMUM_IMAGES_PER_REQUEST)
+    with pytest.raises(ValueError, match="at most 100 images"):
+        require_attachment_ceilings([image] * (MAXIMUM_IMAGES_PER_REQUEST + 1))
 
 
 def test_audio_clips_share_one_request_wide_encoded_budget() -> None:
