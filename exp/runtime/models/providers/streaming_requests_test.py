@@ -4099,12 +4099,24 @@ def test_plaintext_reasoning_replays_only_on_an_exposing_rung() -> None:
     assert anthropic_messages[1]["content"] == [{"type": "text", "text": '{"command": "ls"}'}]
 
 
-def test_plaintext_reasoning_route_gate_rejects_discloses_or_forwards() -> None:
-    """No exposing rung -> named 400; mixed -> disclosed drop; all exposing -> silent."""
+def test_plaintext_reasoning_route_gate_discloses_or_forwards() -> None:
+    """No exposing rung -> disclosed drop; mixed -> disclosed drop; all exposing -> silent.
+
+    Plaintext reasoning is baked into the transcript (an earlier exposed-rung
+    turn or a client re-serialization), so a route that cannot replay it
+    degrades instead of rejecting — previously a 400 that killed every
+    session the moment it switched from an exposed model to any other.
+    """
     request = _exposed_reasoning_request()
-    with pytest.raises(ProviderParameterError) as rejected:
-        route_generation_parameter_requests((_exposed_profile(exposed=False),), request)
-    assert rejected.value.param == "messages.reasoning_content"
+    public, provider = route_generation_parameter_requests(
+        (_exposed_profile(exposed=False),), request
+    )
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)" in public.ignored_parameters
+    )
+    payload = openai_compatible_stream_payload("hy4-preview", provider)
+    payload_messages = cast("list[JsonObject]", payload["messages"])
+    assert all("reasoning_content" not in message for message in payload_messages)
 
     public, _provider = route_generation_parameter_requests(
         (
