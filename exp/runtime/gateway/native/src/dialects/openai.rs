@@ -39,6 +39,17 @@ fn optional_openai_identity(
     }
 }
 
+fn optional_openai_caller(
+    object: &serde_json::Map<String, Value>,
+    label: &str,
+) -> Result<Option<Value>, Failure> {
+    match object.get("caller") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value @ Value::Object(_)) => Ok(Some(value.clone())),
+        Some(_) => Err(malformed(&format!("{label} must be an object"))),
+    }
+}
+
 fn openai_status(
     object: &serde_json::Map<String, Value>,
 ) -> Result<Option<ProviderOutputItemStatus>, Failure> {
@@ -297,6 +308,7 @@ impl Normalizer {
                         "namespace",
                         "OpenAI function call namespace",
                     )?;
+                    let caller = optional_openai_caller(item, "OpenAI function call caller")?;
                     let item_id =
                         optional_openai_identity(item, "id", "OpenAI function call item ID")?;
                     if !self.bind_openai_output_item(
@@ -309,6 +321,7 @@ impl Normalizer {
                     self.reserve_tool_entry(index)?;
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
                     tool.namespace = namespace.clone();
+                    tool.caller = caller.clone();
                     tool.provider_item_id = item_id.clone();
                     tool.provider_status = status;
                     events.push(Event::ProviderOutputItemStarted {
@@ -323,6 +336,7 @@ impl Normalizer {
                         call_id,
                         name,
                         namespace,
+                        caller,
                     });
                     if let Some(Value::String(initial)) = item.get("arguments") {
                         if !initial.is_empty() {
@@ -358,6 +372,7 @@ impl Normalizer {
                         "namespace",
                         "OpenAI custom tool call namespace",
                     )?;
+                    let caller = optional_openai_caller(item, "OpenAI custom tool call caller")?;
                     let item_id =
                         optional_openai_identity(item, "id", "OpenAI custom tool call item ID")?;
                     if !self.bind_openai_output_item(
@@ -371,6 +386,7 @@ impl Normalizer {
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
                     tool.custom = true;
                     tool.namespace = namespace.clone();
+                    tool.caller = caller.clone();
                     tool.provider_item_id = item_id.clone();
                     tool.provider_status = status;
                     events.push(Event::ProviderOutputItemStarted {
@@ -385,6 +401,7 @@ impl Normalizer {
                         call_id,
                         name,
                         namespace,
+                        caller,
                     });
                     if let Some(Value::String(initial)) = item.get("input") {
                         if !initial.is_empty() {
@@ -601,6 +618,7 @@ impl Normalizer {
                             "namespace",
                             "OpenAI function call namespace",
                         )?;
+                        let caller = optional_openai_caller(item, "OpenAI function call caller")?;
                         let arguments =
                             require_string(item, "arguments", "OpenAI function call arguments")
                                 .map_err(|message| malformed(&message))?;
@@ -611,6 +629,7 @@ impl Normalizer {
                             || tool.call_id != call_id
                             || tool.name != name
                             || tool.namespace != namespace
+                            || tool.caller != caller
                         {
                             return Err(malformed(
                                 "OpenAI function call changed identity at completion",
@@ -650,6 +669,8 @@ impl Normalizer {
                             "namespace",
                             "OpenAI custom tool call namespace",
                         )?;
+                        let caller =
+                            optional_openai_caller(item, "OpenAI custom tool call caller")?;
                         let input = require_string(item, "input", "OpenAI custom tool call input")
                             .map_err(|message| malformed(&message))?;
                         let tool = self.tools.get(&index).ok_or_else(|| {
@@ -660,6 +681,7 @@ impl Normalizer {
                             || tool.call_id != call_id
                             || tool.name != name
                             || tool.namespace != namespace
+                            || tool.caller != caller
                         {
                             return Err(malformed(
                                 "OpenAI custom tool call changed identity at completion",
@@ -924,6 +946,7 @@ impl Normalizer {
                             call_id,
                             name,
                             namespace: None,
+                            caller: None,
                         });
                     }
                     if let Some(fragment) = function.get("arguments") {

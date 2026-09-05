@@ -240,7 +240,16 @@ def route_generation_parameter_requests(
         provider_updates["maximum_output_tokens"] = min(
             (_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT, *route_limits)
         )
-    effort_path = "reasoning.effort" if request.surface.value == "responses" else "reasoning_effort"
+    # The rejection names the field the CALLER sent: Claude Code carries its
+    # effort as Messages output_config.effort and auto-recovers (drops the
+    # field and retries) only when the 400 names that channel, so naming the
+    # translated internal field wedges every turn instead (issue #795).
+    if request.surface == GatewayApiSurface.RESPONSES:
+        effort_path = "reasoning.effort"
+    elif request.surface == GatewayApiSurface.MESSAGES:
+        effort_path = "output_config.effort"
+    else:
+        effort_path = "reasoning_effort"
 
     def profile_reasoning_effort(profile: GatewayWireProfile) -> str | None:
         """Return the caller effort or this wire's required provider default."""
@@ -456,15 +465,19 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
-    # Only the Anthropic wire defines an image carrier inside a tool result.
-    # A route with any other dialect degrades tool-result images to positional
-    # placeholder text with disclosure instead of rejecting: the block is baked
-    # into the caller's history, so a rejection wedges the whole session, and a
-    # silent drop at encoding would misstate what the model saw. All-Anthropic
-    # routes keep the images; a non-vision rung then rejects at preflight and
-    # the route-wide coercion applies the same disclosed degrade.
-    if any(message.role == "tool" and message.images for message in request.messages) and not all(
-        profile.dialect == "anthropic_messages" for profile in profiles
+    # Two wires define an image carrier inside a tool result: Anthropic
+    # (tool_result image blocks) and native Responses (the SDK
+    # function_call_output part list). A homogeneous route on either keeps
+    # the images; a route with any rung that has no carrier degrades them to
+    # positional placeholder text with disclosure instead of rejecting: the
+    # block is baked into the caller's history, so a rejection wedges the
+    # whole session, and a silent drop at encoding would misstate what the
+    # model saw. A non-vision rung on a keeping route still rejects at
+    # preflight and the route-wide coercion applies the same disclosed
+    # degrade.
+    if any(message.role == "tool" and message.images for message in request.messages) and not (
+        all(profile.dialect == "anthropic_messages" for profile in profiles)
+        or all(profile.dialect == "openai_responses" for profile in profiles)
     ):
         stripped = strip_tool_result_images(request.messages)
         if stripped is not None:
@@ -610,6 +623,45 @@ def route_generation_parameter_requests(
             ),
         )
         for path, present in tool_annotation_paths:
+            if present and path not in ignored:
+                ignored.append(path)
+
+    # Responses tool-call attribution (the nested-tool `namespace` and the
+    # SDK 3.0 programmatic `caller`, on calls and on their results) exists
+    # only on the native Responses wire; every other rung rebuilds the call
+    # or result without it. The call still executes with its exact name and
+    # arguments, so the omission is disclosed per field rather than
+    # rejected — but only the caller's attribution is dropped, never the
+    # call itself.
+    if not all(profile.dialect == "openai_responses" for profile in profiles):
+        attribution_paths = (
+            (
+                "messages.tool_calls.namespace->dropped(unsupported_by_provider)",
+                any(
+                    call.provider_namespace is not None
+                    for message in request.messages
+                    for call in message.tool_calls
+                ),
+            ),
+            (
+                "messages.tool_calls.caller->dropped(unsupported_by_provider)",
+                any(
+                    call.provider_caller is not None
+                    for message in request.messages
+                    for call in message.tool_calls
+                ),
+            ),
+            (
+                "messages.tool_results.attribution->dropped(unsupported_by_provider)",
+                any(
+                    message.provider_tool_name is not None
+                    or message.provider_tool_namespace is not None
+                    or message.provider_tool_caller is not None
+                    for message in request.messages
+                ),
+            ),
+        )
+        for path, present in attribution_paths:
             if present and path not in ignored:
                 ignored.append(path)
 

@@ -178,6 +178,18 @@ their native event names, including continuation retention. The item-level `name
 `custom_tool_call` namespace) round-trips verbatim through decode, the client stream, and
 continuation retention: the provider rejects a namespaced call replayed without it, so the
 field joins replay identity when present and absent items keep their exact pre-existing shape.
+The SDK 3.0 programmatic tool-calling `caller` object on `function_call`,
+`function_call_output`, and `custom_tool_call` gets the same verbatim round trip (validated only
+as an object; its internal shape is the provider's). `function_call_output.output` accepts the
+SDK list form: text and image parts map onto the canonical tool message and re-emit typed, an
+all-text list keeps the plain-string wire shape, and any other part kind is a named 400. A
+reasoning input item without `encrypted_content` (a `store: true` replay by item id) carries
+verbatim to homogeneous native Responses routes and the provider judges resolvability. Off the
+native Responses wire, tool-call and tool-result attribution (`namespace`/`caller`/output
+`name`) drops with per-field disclosure — the call itself always survives — and a
+Messages-surface effort the route cannot serve rejects as `output_config.effort` with
+"effort parameter … not supported" phrasing, the exact predicate Claude Code's built-in
+drop-and-retry recovery latches on.
 
 Provider client-errors stay sanitized: no provider error prose or body content ever reaches the
 caller. The one provider-derived fact a 4xx rejection may relay is the parameter path the provider

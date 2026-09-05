@@ -82,6 +82,7 @@ impl Normalizer {
                             call_id,
                             name,
                             namespace: None,
+                            caller: None,
                         });
                     }
                     Some("server_tool_use") => {

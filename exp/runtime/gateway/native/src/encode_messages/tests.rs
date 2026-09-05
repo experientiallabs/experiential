@@ -73,6 +73,7 @@ fn completed_body_orders_text_before_tool_use_blocks() {
         Event::TextDelta("hi".to_string()),
         Event::ToolCallStarted {
             namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
@@ -85,6 +86,7 @@ fn completed_body_orders_text_before_tool_use_blocks() {
             index: 0,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
@@ -112,6 +114,7 @@ fn completed_body_preserves_interleaved_block_order() {
     let events = vec![
         Event::ToolCallStarted {
             namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
@@ -120,6 +123,7 @@ fn completed_body_preserves_interleaved_block_order() {
             index: 0,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
@@ -147,6 +151,7 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
     let events = vec![
         Event::ToolCallStarted {
             namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
@@ -160,6 +165,7 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
             index: 0,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
@@ -195,6 +201,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
     let events = vec![
         Event::ToolCallStarted {
             namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-a".to_string(),
             name: "alpha".to_string(),
@@ -205,6 +212,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
         },
         Event::ToolCallStarted {
             namespace: None,
+            caller: None,
             index: 1,
             call_id: "call-b".to_string(),
             name: "beta".to_string(),
@@ -221,6 +229,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
             index: 0,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "call-a".to_string(),
                 name: "alpha".to_string(),
                 provider_item_id: None,
@@ -233,6 +242,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
             index: 1,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "call-b".to_string(),
                 name: "beta".to_string(),
                 provider_item_id: None,
@@ -402,6 +412,7 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
         },
         Event::ToolCallStarted {
             namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
@@ -414,6 +425,7 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
             index: 0,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
@@ -472,6 +484,7 @@ fn web_search_events() -> Vec<Event> {
             index: 0,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "srvtoolu_1".to_string(),
                 name: "web_search".to_string(),
                 provider_item_id: None,
@@ -597,6 +610,7 @@ fn paused_turn_keeps_its_stop_reason_on_both_paths() {
             index: 0,
             call: CompletedToolCall {
                 namespace: None,
+                caller: None,
                 call_id: "srvtoolu_1".to_string(),
                 name: "web_search".to_string(),
                 provider_item_id: None,

@@ -64,6 +64,11 @@ pub struct CompletedToolCall {
     /// preserved verbatim through retention and the client stream because
     /// the provider rejects a namespaced call replayed without it.
     pub namespace: Option<String>,
+    /// Opaque SDK 3.0 `caller` attribution (for example
+    /// `{"type": "program", "id": ...}`) naming the program that invoked
+    /// this call; carried verbatim like `namespace` so the item
+    /// round-trips exactly as the provider emitted it.
+    pub caller: Option<Value>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     /// Raw provider-order argument text: a validated JSON object for
@@ -208,6 +213,9 @@ pub enum Event {
         /// present only on native Responses streams and preserved verbatim
         /// because the provider rejects a namespaced call replayed without it.
         namespace: Option<String>,
+        /// Opaque SDK 3.0 `caller` attribution carried verbatim like
+        /// `namespace`.
+        caller: Option<Value>,
     },
     ToolArgumentsDelta {
         index: u32,
@@ -463,6 +471,7 @@ pub fn simplified_event(event: &Event) -> Value {
             call_id,
             name,
             namespace,
+            caller,
         } => {
             let mut payload = serde_json::json!({
                 "kind": "tool_call_started",
@@ -472,6 +481,9 @@ pub fn simplified_event(event: &Event) -> Value {
             });
             if let Some(namespace) = namespace {
                 payload["namespace"] = Value::String(namespace.clone());
+            }
+            if let Some(caller) = caller {
+                payload["caller"] = caller.clone();
             }
             payload
         }
@@ -490,6 +502,9 @@ pub fn simplified_event(event: &Event) -> Value {
             });
             if let Some(namespace) = &call.namespace {
                 payload["namespace"] = Value::String(namespace.clone());
+            }
+            if let Some(caller) = &call.caller {
+                payload["caller"] = caller.clone();
             }
             if let Some(item_id) = &call.provider_item_id {
                 payload["item_id"] = Value::String(item_id.clone());
@@ -648,6 +663,8 @@ pub struct ToolAccumulator {
     pub name: String,
     /// Nested tool tree (Responses `namespace`) that declared this call.
     pub namespace: Option<String>,
+    /// Opaque SDK 3.0 `caller` attribution carried verbatim.
+    pub caller: Option<Value>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     pub raw_arguments: String,
@@ -665,6 +682,7 @@ impl ToolAccumulator {
             call_id,
             name,
             namespace: None,
+            caller: None,
             provider_item_id: None,
             provider_status: None,
             raw_arguments: String::new(),
@@ -699,6 +717,7 @@ impl ToolAccumulator {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
             namespace: self.namespace.clone(),
+            caller: self.caller.clone(),
             provider_item_id: self.provider_item_id.clone(),
             provider_status: self.provider_status,
             raw_arguments: self.raw_arguments.clone(),
