@@ -4225,6 +4225,26 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
     assert rejected.value.param == "messages"
     assert "empty content" in str(rejected.value)
 
+    # An all-empty cache-marked block run is the same empty turn (the blocks
+    # must flatten to the content, so all-empty blocks imply empty content)
+    # and takes the same refusal instead of falling through to the builder.
+    marked = request.model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="user", content="hello"),
+                GatewayMessage(role="assistant", content="hi"),
+                GatewayMessage(
+                    role="user",
+                    content="",
+                    provider_text_blocks=({"type": "text", "text": ""},),
+                ),
+            )
+        }
+    )
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((anthropic,), marked)
+    assert rejected.value.param == "messages"
+
     # A non-Anthropic route keeps serving the shape it can carry.
     chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
     public, _provider = route_generation_parameter_requests((chat,), request)
