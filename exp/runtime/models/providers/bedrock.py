@@ -497,18 +497,17 @@ class BedrockClient:
             if self._client is None:
                 if self._runtime_factory is not None:
                     self._client = self._runtime_factory(region_name=self._region_name())
+                elif self._bearer_token is not None:
+                    self._client = create_bedrock_runtime_client(
+                        region_name=self._region_name(),
+                        bearer_token=self._bearer_token,
+                    )
                 else:
-                    if self._bearer_token is not None:
-                        self._client = create_bedrock_runtime_client(
-                            region_name=self._region_name(),
-                            bearer_token=self._bearer_token,
-                        )
-                    else:
-                        self._client = create_bedrock_runtime_client(
-                            region_name=self._region_name(),
-                            aws_access_key_id=self._aws_access_key_id,
-                            aws_secret_access_key=self._aws_secret_access_key,
-                        )
+                    self._client = create_bedrock_runtime_client(
+                        region_name=self._region_name(),
+                        aws_access_key_id=self._aws_access_key_id,
+                        aws_secret_access_key=self._aws_secret_access_key,
+                    )
             return self._client
 
     def _region_name(self) -> str:
