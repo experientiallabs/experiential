@@ -485,12 +485,16 @@ def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
     )
 
     class _CoercionCounter:
+        """Count coercion recordings without a live ledger."""
+
         recorded = 0
 
         def record_admission_coercions(self, count: int) -> None:
+            """Accumulate one admission's coercion count."""
             self.recorded += count
 
     def admit(messages: tuple[GatewayMessage, ...], key: str | None) -> GatewayRequest:
+        """Admit one request and return the provider-side request it dispatches."""
         request = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             messages=messages,

@@ -13,6 +13,7 @@ _SYSTEM = GatewayMessage(role="system", content="You are Terminus. " * 40)
 
 
 def _request(*messages: GatewayMessage, prompt_cache_key: str | None = None) -> GatewayRequest:
+    """Build a Chat-surface request from ordered messages and an optional caller key."""
     return GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=tuple(messages),
