@@ -3,7 +3,7 @@
 Split from ``streaming_requests`` for the module line budget, mirroring the
 Messages-family split in ``messages_payloads``: the native Responses and
 OpenAI-compatible Chat builders live here; ``dialect_stream_payload`` in
-``streaming_requests`` remains the single dispatch seam.
+``dialect_dispatch`` remains the single dispatch seam.
 """
 
 from __future__ import annotations
