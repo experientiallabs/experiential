@@ -4358,7 +4358,17 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
     with pytest.raises(ProviderParameterError) as rejected:
         route_generation_parameter_requests((anthropic,), request)
     assert rejected.value.param == "messages"
-    assert "empty content" in str(rejected.value)
+    assert "empty or whitespace-only content" in str(rejected.value)
+
+    # A whitespace-only user turn is the same refusal: the wire rejects it
+    # ("text content blocks must contain non-whitespace text", live
+    # 2026-09-05) and a user message cannot dispatch as an empty array.
+    whitespace = request.model_copy(
+        update={"messages": (*request.messages[:2], GatewayMessage(role="user", content="\n "))}
+    )
+    with pytest.raises(ProviderParameterError) as rejected_whitespace:
+        route_generation_parameter_requests((anthropic,), whitespace)
+    assert rejected_whitespace.value.param == "messages"
 
     # An all-empty cache-marked block run is the same empty turn (the blocks
     # must flatten to the content, so all-empty blocks imply empty content)

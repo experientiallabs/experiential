@@ -179,7 +179,7 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     return items
 
 
-def _retained_cache_marked_blocks(
+def retained_cache_marked_blocks(
     blocks: tuple[JsonObject, ...] | list[JsonObject],
 ) -> list[JsonObject]:
     """Drop empty text blocks while keeping their cache breakpoints.
@@ -227,7 +227,7 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     Returns:
         The ordered Anthropic content blocks for the turn.
     """
-    marked = _retained_cache_marked_blocks(message.provider_text_blocks)
+    marked = retained_cache_marked_blocks(message.provider_text_blocks)
     blocks: list[JsonObject] = []
     text_index = 0
     for part in message.content_parts:
@@ -295,7 +295,7 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # The caller's exact interleaving is preserved: an image before
             # its question reads differently from one after it.
             return "user", _anthropic_multimodal_blocks(message)
-        marked_run = _retained_cache_marked_blocks(message.provider_text_blocks)
+        marked_run = retained_cache_marked_blocks(message.provider_text_blocks)
         if marked_run:
             # The cache-marked run re-emits the caller's blocks with empty
             # ones dropped loss-free (the wire rejects them and they carry
@@ -329,15 +329,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # route admission rejects the combination before dispatch.
             raise ProviderResponseError("encrypted reasoning cannot replay on the Anthropic wire")
     if message.provider_text_blocks:
-        blocks.extend(message.provider_text_blocks)
+        # Empty marked blocks drop with their breakpoints migrated, exactly
+        # as on user turns; the wire rejects an empty text block anywhere.
+        blocks.extend(retained_cache_marked_blocks(message.provider_text_blocks))
     elif message.content:
-        blocks.append({"type": "text", "text": message.content})
-    elif message.content is not None and not blocks and not message.tool_calls:
-        # An empty assistant text block is rejected by this wire, and an
-        # agent that answers with a tool call alone sends exactly that
-        # (OpenCode 1.18.26, captured live 2026-09-02). The block re-emits
-        # only when it is the entire turn, where dropping it would leave an
-        # empty content array the wire also rejects.
         blocks.append({"type": "text", "text": message.content})
     for call in message.tool_calls:
         tool_use: JsonObject = {
@@ -351,6 +346,21 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         if call.cache_control is not None:
             tool_use["cache_control"] = call.cache_control
         blocks.append(tool_use)
+    if blocks and all(
+        block.get("type") == "text" and not str(block.get("text", "")).strip() for block in blocks
+    ):
+        # The wire rejects a text block that is empty ("text content blocks
+        # must be non-empty") and a turn whose text is all whitespace ("must
+        # contain non-whitespace text"), while it accepts an EMPTY assistant
+        # content array in any position and whitespace text beside a
+        # tool_use or another text block (all verified live 2026-09-05 on
+        # fable-5-1 and sonnet-4-6). An assistant turn that carries only
+        # empty or whitespace text therefore dispatches as an empty array:
+        # the turn stays in place, so conversation structure is preserved,
+        # and nothing the model could read is lost. A cache marker on the
+        # dropped run is re-homed by the payload builder onto the closest
+        # retained block of a neighboring turn.
+        blocks = []
     return "assistant", blocks
 
 
@@ -422,6 +432,19 @@ def openai_chat_message(
 ) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON.
 
+    A canonical ``developer`` message is emitted as ``system`` on this wire.
+    OpenAI's Chat Completions reference gives the two roles one definition
+    ("Developer-provided instructions that the model should follow, regardless
+    of messages sent by the user"), distinguished only by the model generation
+    each was introduced for (``developer`` replaces ``system`` from o1 on, and
+    those models accept ``system`` by converting it), so the fold is lossless
+    and needs no disclosure. It applies to every provider on the Chat wire
+    because this dialect never carries direct OpenAI traffic (that is the
+    Responses dialect) and the third-party OpenAI-compatible servers behind
+    it (Azure AI Foundry, DeepSeek, vLLM, and the like) enumerate the classic
+    roles only and 400 on ``developer`` by name. The Responses builder keeps
+    ``developer`` verbatim, since that wire defines the role.
+
     ``reasoning_route_sha256`` is the active preserved-thinking route identity
     for this rung (Fireworks or Hunyuan); an unsealed ``reasoning_content``
     block forwards to the provider only when it names that exact route.
@@ -442,7 +465,7 @@ def openai_chat_message(
             tool_payload["name"] = message.provider_tool_name
         return tool_payload
     payload: JsonObject = {
-        "role": message.role,
+        "role": "system" if message.role == "developer" else message.role,
         "content": (
             [
                 {"type": "text", "text": part.text}

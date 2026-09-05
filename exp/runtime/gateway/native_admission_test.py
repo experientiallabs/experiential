@@ -26,9 +26,11 @@ from exp.runtime.gateway.contracts import (
     ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
+    GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_admission import (
     _prefer_cache_capable_rungs,
     admitted_route_requests,
@@ -1010,3 +1012,210 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
         authorization=byok_route.snapshot.authorization,
     )
     assert provider.service_tier == "priority"
+
+
+class _CoercionCounter:
+    """Count coercion recordings without a live ledger."""
+
+    def __init__(self) -> None:
+        """Start at zero recorded coercions."""
+        self.recorded = 0
+
+    def record_admission_coercions(self, count: int) -> None:
+        """Accumulate one admission's disclosure count."""
+        self.recorded += count
+
+
+_TOOL_CAPABLE = GatewayDeploymentMetadata(
+    capabilities=GatewayDeploymentCapabilities(
+        supports_streaming=True,
+        supports_strict_tools=True,
+        supports_streaming_tool_arguments=True,
+    )
+)
+"""One rung declaration that admits every tool control these tests send."""
+
+
+def _fable_and_shim_wires(
+    *, shim_model: str = "anthropic/claude-fable-5-1"
+) -> tuple[tuple[GatewayWireProfile, NativeWireClient], ...]:
+    """Pair a native fable-5-1 rung with an OpenAI-compatible aggregator rung."""
+    client = cast(NativeWireClient, object())
+    return (
+        (
+            GatewayWireProfile(
+                dialect="anthropic_messages",
+                url="https://anthropic.test",
+                model_id="claude-fable-5-1",
+            ),
+            client,
+        ),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible", url="https://shim.test", model_id=shim_model
+            ),
+            client,
+        ),
+    )
+
+
+def _forced_choice_request(
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+) -> GatewayRequest:
+    """Build one streaming request forcing the lookup tool on ``surface``."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(GatewayMessage(role="user", content="weather in Paris"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        tool_choice=choice,
+        stream=True,
+        include_usage=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("surface", "choice"),
+    (
+        (GatewayApiSurface.CHAT_COMPLETIONS, "required"),
+        (GatewayApiSurface.RESPONSES, GatewayNamedToolChoice(name="lookup")),
+        (GatewayApiSurface.MESSAGES, "required"),
+    ),
+)
+def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+) -> None:
+    """fable-5-1 declines ``any``/``tool`` by name, so a waterfall with an
+    aggregator rung serves the caller's forced choice VERBATIM on that rung
+    and discloses nothing."""
+    deployments = (
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
+        _deployment("shim", gateway=_TOOL_CAPABLE),
+    )
+    route = _mixed_route("maximize_availability", deployments, surface)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires(),
+        _forced_choice_request(surface, choice),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("shim",)
+    assert provider.tool_choice == choice
+    assert public.ignored_parameters == ()
+    assert accounting.recorded == 0
+
+
+@pytest.mark.parametrize(
+    ("surface", "choice"),
+    (
+        (GatewayApiSurface.CHAT_COMPLETIONS, GatewayNamedToolChoice(name="lookup")),
+        (GatewayApiSurface.RESPONSES, "required"),
+        (GatewayApiSurface.MESSAGES, GatewayNamedToolChoice(name="lookup")),
+    ),
+)
+def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+) -> None:
+    """An all-fable-5-1 route (production shape: ~45 requests in 6h failed
+    post-dispatch across all three surfaces) serves under ``auto`` and tells
+    the caller through ``ignored_parameters``."""
+    deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
+    route = _mixed_route("maximize_availability", deployments, surface)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires()[:1],
+        _forced_choice_request(surface, choice),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert provider.tool_choice == "auto"
+    assert public.tool_choice == "auto"
+    assert public.ignored_parameters == ("tool_choice->auto",)
+    assert accounting.recorded == 1
+
+
+_MAX_ITEMS_SCHEMA: JsonObject = {
+    "type": "object",
+    "properties": {"cities": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
+    "required": ["cities"],
+    "additionalProperties": False,
+}
+
+
+def _strict_tool_request(parameters: JsonObject) -> GatewayRequest:
+    """Build one streaming Chat request carrying a single strict tool."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="list cities"),),
+        tools=(GatewayToolDefinition(name="list", parameters=parameters, strict=True),),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_a_strict_schema_the_anthropic_validator_rejects_prefers_a_strict_capable_rung() -> None:
+    """``maxItems`` under ``strict`` is a known Anthropic 400 (18 requests in
+    6h in production), so the waterfall narrows to the OpenAI-compatible rung
+    that honors strict verbatim and nothing is disclosed."""
+    deployments = (
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
+        _deployment("shim", gateway=_TOOL_CAPABLE),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires(),
+        _strict_tool_request(_MAX_ITEMS_SCHEMA),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("shim",)
+    assert provider.tools[0].strict is True
+    assert provider.tools[0].parameters == _MAX_ITEMS_SCHEMA
+    assert public.ignored_parameters == ()
+    assert accounting.recorded == 0
+
+
+def test_a_strict_schema_no_rung_can_honor_drops_strict_and_keeps_the_schema() -> None:
+    """On an all-Anthropic route the disclosed degrade drops only ``strict``;
+    the schema, ``maxItems`` included, still reaches the model as guidance."""
+    deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires()[:1],
+        _strict_tool_request(_MAX_ITEMS_SCHEMA),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert provider.tools[0].strict is False
+    assert provider.tools[0].parameters == _MAX_ITEMS_SCHEMA
+    assert public.ignored_parameters == ("tools.strict->false",)
+    assert accounting.recorded == 1
+
+
+def test_an_open_strict_schema_is_closed_for_the_anthropic_rung_with_disclosure() -> None:
+    """A strict tool whose objects leave ``additionalProperties`` open is a
+    400 by name on Anthropic ("must be explicitly set to false"); admission
+    closes the objects, keeps ``strict``, and discloses the tightening."""
+    deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    accounting = _CoercionCounter()
+    open_schema: JsonObject = {"type": "object", "properties": {"city": {"type": "string"}}}
+    _narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        _fable_and_shim_wires()[:1],
+        _strict_tool_request(open_schema),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.tools[0].strict is True
+    assert provider.tools[0].parameters == {**open_schema, "additionalProperties": False}
+    assert public.ignored_parameters == ("tools.parameters.additionalProperties->false",)
+    assert accounting.recorded == 1

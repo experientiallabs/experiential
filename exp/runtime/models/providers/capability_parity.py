@@ -18,6 +18,9 @@ from exp.common.core.artifacts import ContractModel
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.content import MEDIA_HANDLE_PROVIDERS
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_rejects_forced_tool_choice,
+)
 from exp.runtime.models.providers.audios import AUDIO_DIALECTS
 from exp.runtime.models.providers.documents import PDF_URL_DIALECTS
 from exp.runtime.models.providers.images import IMAGE_URL_DIALECTS
@@ -27,7 +30,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.videos import VIDEO_DIALECTS, VIDEO_URL_DIALECTS
 
-CAPABILITY_PARITY_SCHEMA_VERSION = 5
+CAPABILITY_PARITY_SCHEMA_VERSION = 6
 """Version of the parity-row contract; bump on any field change."""
 
 
@@ -41,6 +44,13 @@ class DeploymentCapabilityParity(ContractModel):
     supports_streaming: bool
     supports_developer_messages: bool
     supports_strict_tools: bool
+    supports_forced_tool_choice: bool
+    """Whether this rung can force a tool (``tool_choice`` ``required`` or a
+    named tool) on any request. Engine ground truth, not a declaration: the
+    Anthropic releases that answer a forced choice with a 400 by name (Fable
+    5.1, Mythos 5.1) report ``False``; every other rung reports ``True``. The
+    per-request rule that a budgeted ``thinking: enabled`` config cannot ride
+    beside a forced choice is not a rung fact and is not reflected here."""
     supports_parallel_tool_calls: bool
     supports_structured_text: bool
     supports_stop_sequences: bool
@@ -138,6 +148,9 @@ def deployment_capability_parity(
         supports_streaming=capabilities.supports_streaming,
         supports_developer_messages=capabilities.supports_developer_messages,
         supports_strict_tools=capabilities.supports_strict_tools,
+        supports_forced_tool_choice=not (
+            dialect == "anthropic_messages" and anthropic_rejects_forced_tool_choice(model_id)
+        ),
         supports_parallel_tool_calls=capabilities.supports_parallel_tool_calls,
         supports_structured_text=capabilities.supports_structured_text,
         supports_stop_sequences=capabilities.supports_stop_sequences,

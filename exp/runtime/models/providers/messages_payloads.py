@@ -12,6 +12,10 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_rejects_forced_tool_choice,
+    anthropic_strict_schema_unsupported,
+)
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -24,7 +28,10 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_reasoning_effort,
     anthropic_thinking_budget_tokens,
 )
-from exp.runtime.models.providers.wire_messages import anthropic_blocks
+from exp.runtime.models.providers.wire_messages import (
+    anthropic_blocks,
+    retained_cache_marked_blocks,
+)
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 
@@ -49,6 +56,11 @@ def anthropic_messages_stream_payload(
         Native Messages request with streaming enabled.
 
     Raises:
+        ProviderCapabilityError: A ``strict`` tool schema uses a keyword the
+            provider's strict validator rejects (``strict_tools``), or the
+            request forces a tool the model or its thinking mode cannot force
+            (``forced_tool_choice``); both let route admission prefer a rung
+            that honors the request and otherwise coerce with disclosure.
         ProviderResponseError: Instruction or message content is malformed.
     """
     # Anthropic Messages has no compatible logprob request/response surface in
@@ -57,6 +69,7 @@ def anthropic_messages_stream_payload(
     del supports_logprobs
     system_parts: list[tuple[str, tuple[JsonObject, ...]]] = []
     messages: list[JsonObject] = []
+    displaced_marker: JsonObject | None = None
     for message in request.messages:
         if message.role in {"system", "developer"}:
             if message.content is None:
@@ -80,6 +93,20 @@ def anthropic_messages_stream_payload(
                 system_parts.append((message.content, message.provider_text_blocks))
             continue
         role, blocks = anthropic_blocks(message)
+        if not blocks:
+            # An assistant turn with no readable text dispatches as an empty
+            # array (accepted live) and so has no block of its own to carry a
+            # caller cache marker. The breakpoint migrates across the turn
+            # boundary by the same rule the block-run helper applies within a
+            # turn: onto the closest retained block before it (the empty turn
+            # adds no readable bytes, so the cached prefix is the same one),
+            # else onto the first retained block after it.
+            marker = _cache_marker(message.provider_text_blocks)
+            if marker is not None and not _mark_last_block(messages, marker):
+                displaced_marker = marker
+        elif displaced_marker is not None:
+            blocks = _mark_first_block(blocks, displaced_marker)
+            displaced_marker = None
         if messages and messages[-1].get("role") == role:
             existing = messages[-1].get("content")
             if not isinstance(existing, list):
@@ -126,9 +153,19 @@ def anthropic_messages_stream_payload(
                         dict(block),
                         separated=(part_leads if position == 0 else inner_separated),
                     )
-            payload["system"] = system_blocks
+            # The wire rejects an empty system text block anywhere and a
+            # system prompt whose text is all whitespace ("system: text
+            # content blocks must be non-empty" / "must contain non-whitespace
+            # text", verified live 2026-09-05). Empty blocks drop with their
+            # breakpoints migrated; a prompt left with no readable text is
+            # omitted, since an absent system field is what it says.
+            retained_system = retained_cache_marked_blocks(system_blocks)
+            if any(str(block.get("text", "")).strip() for block in retained_system):
+                payload["system"] = retained_system
         else:
-            payload["system"] = "\n\n".join(content for content, _ in system_parts)
+            joined_system = "\n\n".join(content for content, _ in system_parts)
+            if joined_system.strip():
+                payload["system"] = joined_system
     if request.tools:
         tools: list[JsonObject] = []
         for tool in request.tools:
@@ -141,6 +178,13 @@ def anthropic_messages_stream_payload(
             if tool.description is not None:
                 translated["description"] = tool.description
             if tool.strict:
+                # The strict validator compiles the schema into a grammar and
+                # 400s by name on keywords it cannot express (verified live
+                # 2026-09-05: ``maxItems`` on every current model). Declining
+                # here keeps the schema intact and lets admission drop only
+                # ``strict`` when no rung can honor it.
+                if anthropic_strict_schema_unsupported(tool.parameters) is not None:
+                    raise ProviderCapabilityError(capability="strict_tools")
                 translated["strict"] = True
             # Anthropic-native tool annotations forward verbatim on this
             # wire only; the provider owns their validity rules. An absent
@@ -264,7 +308,89 @@ def anthropic_messages_stream_payload(
         payload["output_config"] = output_config
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
+    _require_forced_tool_choice_support(model_id, request, payload)
     return payload
+
+
+_UNMARKABLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+"""Content block types the wire refuses to carry a ``cache_control`` marker on."""
+
+
+def _cache_marker(blocks: tuple[JsonObject, ...]) -> JsonObject | None:
+    """Return the first caller cache marker in a block run, if any."""
+    for block in blocks:
+        marker = block.get("cache_control")
+        if isinstance(marker, dict):
+            return marker
+    return None
+
+
+def _mark_last_block(messages: list[JsonObject], marker: JsonObject) -> bool:
+    """Attach ``marker`` to the closest earlier emitted block that can carry one.
+
+    Collapsed (empty) turns are skipped on the way back: consecutive empty
+    assistant turns all sit on the same cache boundary, so every marker they
+    carried collapses onto the same retained block instead of deferring to a
+    later one, which would cache a larger prefix than the caller asked for.
+
+    Returns:
+        Whether a block took the marker; a block already marked counts, since
+        one marker per boundary suffices.
+    """
+    for emitted in reversed(messages):
+        content = emitted.get("content")
+        if not isinstance(content, list):
+            return False
+        if not content:
+            continue
+        last = content[-1]
+        if not isinstance(last, dict) or last.get("type") in _UNMARKABLE_BLOCK_TYPES:
+            return False
+        if "cache_control" not in last:
+            content[-1] = {**last, "cache_control": marker}
+        return True
+    return False
+
+
+def _mark_first_block(blocks: list[JsonObject], marker: JsonObject) -> list[JsonObject]:
+    """Return ``blocks`` with ``marker`` on the first block that can carry one."""
+    for index, block in enumerate(blocks):
+        if block.get("type") in _UNMARKABLE_BLOCK_TYPES:
+            continue
+        if "cache_control" not in block:
+            return [*blocks[:index], {**block, "cache_control": marker}, *blocks[index + 1 :]]
+        return blocks
+    return blocks
+
+
+def _require_forced_tool_choice_support(
+    model_id: str,
+    request: GatewayRequest,
+    payload: JsonObject,
+) -> None:
+    """Decline a forced ``tool_choice`` this rung is known to reject.
+
+    Two provider rules apply (both verified live 2026-09-05). Fable 5.1 and
+    Mythos 5.1 answer ``any`` and ``tool`` with a 400 on every request, even
+    with no thinking config. Every model rejects a forced choice beside a
+    budgeted ``thinking: enabled`` config ("Thinking may not be enabled when
+    tool_choice forces tool use"), whether the caller sent that config or the
+    rung derived it from an effort; adaptive thinking carries a forced choice
+    fine. ``auto`` and ``none`` are never affected.
+
+    Raises:
+        ProviderCapabilityError: ``forced_tool_choice`` when the built payload
+            would be rejected.
+    """
+    forced = request.tool_choice == "required" or isinstance(
+        request.tool_choice, GatewayNamedToolChoice
+    )
+    if not forced:
+        return
+    thinking = payload.get("thinking")
+    budgeted_thinking = isinstance(thinking, dict) and thinking.get("type") == "enabled"
+    if budgeted_thinking or anthropic_rejects_forced_tool_choice(model_id):
+        raise ProviderCapabilityError(capability="forced_tool_choice")
 
 
 def gemini_generate_content_stream_payload(

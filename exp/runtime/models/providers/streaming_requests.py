@@ -837,7 +837,7 @@ def route_generation_parameter_requests(
 
     if any(profile.dialect == "anthropic_messages" for profile in profiles) and any(
         message.role == "user"
-        and not message.content
+        and not (message.content or "").strip()
         and not message.content_parts
         and message.provider_anthropic_block is None
         and message.provider_native_item is None
@@ -845,15 +845,18 @@ def route_generation_parameter_requests(
     ):
         # The Anthropic wire rejects empty text content blocks post-dispatch
         # ("text content blocks must be non-empty"; 2026-09-05, six orgs on
-        # claude-fable routes). Empty blocks inside a richer turn drop
-        # loss-free at conversion, but a user turn that is entirely empty
-        # has nothing to send and dropping the whole message would change
-        # conversation structure, so it is refused by name pre-dispatch.
+        # claude-fable routes) and a user turn whose text is all whitespace
+        # ("text content blocks must contain non-whitespace text"; a user
+        # message must have non-empty content, so unlike an assistant turn
+        # it cannot dispatch as an empty array). Empty blocks inside a richer
+        # turn drop loss-free at conversion, but a user turn with no readable
+        # text has nothing to send and dropping the whole message would
+        # change conversation structure, so it is refused by name pre-dispatch.
         raise ProviderParameterError(
             message=(
-                "A user message with empty content cannot be served by this "
-                "model route: the provider rejects empty text content blocks. "
-                "Add content to the message or remove it."
+                "A user message with empty or whitespace-only content cannot be "
+                "served by this model route: the provider rejects empty text "
+                "content blocks. Add content to the message or remove it."
             ),
             param="messages",
             code="invalid_parameter",

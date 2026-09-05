@@ -3555,3 +3555,44 @@ def test_a_name_on_a_non_tool_message_stays_a_named_400() -> None:
     assert error.value.status_code == 400
     assert error.value.detail.param == "messages.0"
     assert "name is valid only for tool messages" in str(error.value.detail.message)
+
+
+def test_forced_tool_choice_decodes_canonically_on_both_openai_surfaces() -> None:
+    """Chat ``required``/named-function and Responses ``required``/named-function
+    both reach the canonical forced forms admission narrows and coerces on."""
+    tools_chat = [
+        {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    ]
+    chat_required = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": tools_chat,
+            "tool_choice": "required",
+        }
+    )
+    assert chat_required.request.tool_choice == "required"
+    chat_named = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": tools_chat,
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }
+    )
+    assert chat_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")
+
+    tools_responses = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    responses_required = decode_responses(
+        {"model": "coding", "input": "go", "tools": tools_responses, "tool_choice": "required"}
+    )
+    assert responses_required.request.tool_choice == "required"
+    responses_named = decode_responses(
+        {
+            "model": "coding",
+            "input": "go",
+            "tools": tools_responses,
+            "tool_choice": {"type": "function", "name": "lookup"},
+        }
+    )
+    assert responses_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")

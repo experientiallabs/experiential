@@ -1713,3 +1713,18 @@ def test_decode_names_a_duplicate_tool_use_id_instead_of_crashing() -> None:
         )
     assert rejected.value.status_code == 400
     assert rejected.value.detail.param == "messages.1"
+
+
+def test_forced_tool_choice_decodes_to_the_canonical_forced_forms() -> None:
+    """``any`` and a named ``tool`` reach the canonical forced forms admission
+    narrows and coerces on; ``auto`` and ``none`` stay open selectors."""
+    tools = [{"name": "lookup", "input_schema": {"type": "object"}}]
+    forced_any = decode_messages(_body(tool_choice={"type": "any"}, tools=tools))
+    assert forced_any.request.tool_choice == "required"
+    forced_named = decode_messages(
+        _body(tool_choice={"type": "tool", "name": "lookup"}, tools=tools)
+    )
+    assert forced_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")
+    assert decode_messages(
+        _body(tool_choice={"type": "auto"}, tools=tools)
+    ).request.tool_choice == ("auto")

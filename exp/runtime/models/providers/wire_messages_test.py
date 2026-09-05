@@ -110,3 +110,56 @@ def test_empty_text_blocks_drop_loss_free_on_the_anthropic_wire() -> None:
     run = blocks[0]["content"]
     assert isinstance(run, list)
     assert [block["type"] for block in run if isinstance(block, dict)] == ["image"]
+
+
+def test_assistant_turns_with_no_readable_text_dispatch_as_an_empty_array() -> None:
+    """The wire rejects an empty text block anywhere and an all-whitespace
+    assistant turn, yet accepts an empty assistant content array in any
+    position and whitespace text beside another block (verified live
+    2026-09-05 on fable-5-1 and sonnet-4-6). Production kept hitting
+    "text content blocks must be non-empty" about once a minute on
+    chat_completions after the tool-call-only shape was fixed; these are the
+    remaining Chat shapes."""
+    from exp.runtime.gateway.contracts import ThinkingBlock, ToolCall
+
+    call = ToolCall(call_id="call-1", name="lookup", arguments={}, raw_arguments="{}")
+    # An empty assistant turn alone (a replayed cut-off or refused turn).
+    _role, blocks = anthropic_blocks(GatewayMessage(role="assistant", content=""))
+    assert blocks == []
+    # A whitespace-only assistant turn alone.
+    _role, blocks = anthropic_blocks(GatewayMessage(role="assistant", content=" \n"))
+    assert blocks == []
+    # Whitespace beside a tool call is accepted by the wire and kept verbatim
+    # (the bytes a caller echoes back from the model's own output).
+    _role, blocks = anthropic_blocks(
+        GatewayMessage(role="assistant", content="\n\n", tool_calls=(call,))
+    )
+    assert [block["type"] for block in blocks] == ["text", "tool_use"]
+    assert blocks[0]["text"] == "\n\n"
+    # An empty string beside a tool call still drops (empty is rejected anywhere).
+    _role, blocks = anthropic_blocks(
+        GatewayMessage(role="assistant", content="", tool_calls=(call,))
+    )
+    assert [block["type"] for block in blocks] == ["tool_use"]
+    # A thinking block is readable content, so the turn is not empty.
+    _role, blocks = anthropic_blocks(
+        GatewayMessage(
+            role="assistant",
+            content="",
+            provider_reasoning=(ThinkingBlock(text="hmm", signature="sig"),),
+        )
+    )
+    assert [block["type"] for block in blocks] == ["thinking"]
+    # Cache-marked assistant runs drop their empty blocks with the breakpoint
+    # migrated, exactly like user runs.
+    _role, blocks = anthropic_blocks(
+        GatewayMessage(
+            role="assistant",
+            content="real",
+            provider_text_blocks=(
+                {"type": "text", "text": "real"},
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+            ),
+        )
+    )
+    assert blocks == [{"type": "text", "text": "real", "cache_control": {"type": "ephemeral"}}]
