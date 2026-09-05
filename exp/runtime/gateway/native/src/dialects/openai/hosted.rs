@@ -159,12 +159,20 @@ impl Normalizer {
     }
 
     /// Pass one per-type hosted lifecycle or delta frame through verbatim.
+    ///
+    /// A frame arriving after the item's `done` is dropped rather than
+    /// relayed or rejected: the final item already reached the caller and is
+    /// the authority, so a provider trailing a late status frame must not
+    /// fail an otherwise healthy stream.
     pub(in crate::dialects) fn openai_hosted_progress(
         &mut self,
         event_type: &str,
         payload: &Map<String, Value>,
     ) -> Result<Vec<Event>, Failure> {
         let index = openai_index(payload, "output_index", "OpenAI output_index")?;
+        if self.openai_completed_output_items.contains(&index) {
+            return Ok(Vec::new());
+        }
         let state = self.openai_hosted_items.get(&index).ok_or_else(|| {
             malformed(&format!(
                 "OpenAI hosted tool event arrived before its output item ({})",

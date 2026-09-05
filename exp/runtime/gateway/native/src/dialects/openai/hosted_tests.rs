@@ -352,3 +352,32 @@ fn a_failed_terminal_reports_its_billed_usage() {
         other => panic!("unexpected events: {other:?}"),
     }
 }
+
+/// A status frame trailing the item's `done` is dropped, never a failed
+/// stream: the final item already reached the caller and is the authority.
+#[test]
+fn hosted_progress_after_done_is_dropped_not_fatal() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = hosted_frame(serde_json::json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"},
+    }));
+    normalizer.feed(&added).expect("start normalizes");
+    let done = hosted_frame(serde_json::json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {"id": "ws_1", "type": "web_search_call", "status": "completed"},
+    }));
+    normalizer.feed(&done).expect("done normalizes");
+    let late = hosted_frame(serde_json::json!({
+        "type": "response.web_search_call.completed",
+        "item_id": "ws_1",
+        "output_index": 0,
+        "sequence_number": 11,
+    }));
+    assert!(normalizer
+        .feed(&late)
+        .expect("a trailing status frame is dropped")
+        .is_empty());
+}
