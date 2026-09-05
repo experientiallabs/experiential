@@ -192,16 +192,25 @@ def _failure_from_payload(payload: object) -> GatewayFailure | None:
 def _deployment_priced_for_service_tier(
     deployment: ExactModelDeployment,
     service_tier: str | None,
+    *,
+    forwards_tier: bool,
 ) -> ExactModelDeployment:
     """Reprice one deployment for a requested flex/priority processing tier.
 
-    v1 bills the REQUESTED tier: when the caller names a tier the deployment
-    carries a pass-through card for, the card's rates replace the base schedule
-    on a copy used only for THIS reservation, so the ceiling, the stored
-    per-token rates, and settlement all bill the tier transparently. No tier (or
-    no card) returns the deployment unchanged. The copy stays Python-side and
-    never crosses the native boundary.
+    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
+    the tier to its provider and carries a pass-through card for it, the card's
+    rates replace the base schedule on a copy used only for THIS reservation, so
+    the ceiling, the stored per-token rates, and settlement all bill the tier
+    transparently. ``forwards_tier`` is the admission-time forwarding decision
+    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
+    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
+    wire would strip the tier (non-tier dialect, tier disabled) — such a depth
+    runs the provider's base schedule, so it must bill the base schedule too. No
+    tier, no forwarding, or no card returns the deployment unchanged. The copy
+    stays Python-side and never crosses the native boundary.
     """
+    if not forwards_tier:
+        return deployment
     effective = deployment.gateway.prices.for_service_tier(service_tier)
     if effective is deployment.gateway.prices:
         return deployment
@@ -393,6 +402,10 @@ class NativeAttemptAccounting:
             deployment = _deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
+                forwards_tier=(
+                    candidate < len(entry.tier_forwarded_by_depth)
+                    and entry.tier_forwarded_by_depth[candidate]
+                ),
             )
             try:
                 attempt_id = self._write_ledger.start_attempt(

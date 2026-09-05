@@ -35,7 +35,6 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_route_rejections,
     coerce_structured_text_schema,
 )
-from exp.runtime.models.providers.dialect_dispatch import SERVICE_TIER_DIALECTS
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -121,10 +120,7 @@ def admitted_route_requests(
     # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
     if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
-        if not any(
-            profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_tier(tier)
-            for profile, _client in resolved_wires
-        ):
+        if not any(profile.forwards_tier(tier) for profile, _client in resolved_wires):
             raise ProviderCapabilityError(
                 capability="service_tier",
                 detail=(

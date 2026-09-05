@@ -515,8 +515,7 @@ def route_generation_parameter_requests(
     # bill catalog rates while the tier changes provider pricing: flex
     # discounted, priority premium) but stay in the route as untiered fallbacks.
     if request.service_tier is not None and not any(
-        profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_tier(request.service_tier)
-        for profile in profiles
+        profile.forwards_tier(request.service_tier) for profile in profiles
     ):
         ignore("service_tier")
         provider_updates["service_tier"] = None

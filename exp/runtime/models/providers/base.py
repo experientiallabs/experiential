@@ -79,6 +79,16 @@ def completion_timeout_seconds(
     return max(configured_timeout_seconds, min(scaled, MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
 
 
+SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
+"""Wire dialects with a request field that preserves the caller's service tier.
+
+Canonical here (the lowest module both the wire dispatch and the profile share);
+``dialect_dispatch`` re-exports it so existing import paths are unchanged. A tier
+on any other dialect is stripped or declined, so ``forwards_tier`` gates on it to
+keep FORWARD and BILL consistent by construction.
+"""
+
+
 @dataclass(frozen=True)
 class GatewayWireProfile:
     """Everything a gateway data plane needs to dispatch one provider call.
@@ -339,13 +349,16 @@ class GatewayWireProfile:
     def forwards_tier(self, tier: str | None) -> bool:
         """Whether this rung emits and can BILL the SPECIFIC requested ``tier``.
 
-        Forwarding is per-tier so forward and bill agree on whichever candidate
-        is selected: a BYOK rung forwards any tier (the caller pays the provider
-        directly), while a host-funded rung forwards a tier only when it carries
-        a pass-through card for THAT tier (else it strips the tier and runs the
-        provider default at the base rate — billing-safe and disclosed).
+        The single source of truth for FORWARD == BILL: forwarding is per-tier
+        AND requires a tier-capable wire dialect, so the accounting reprice and
+        the payload emission can never diverge. No tier -> False; a dialect with
+        no ``service_tier`` wire field -> False (it would strip or decline);
+        BYOK -> True (the caller pays the provider directly); otherwise the
+        host-funded rung must carry a pass-through card for THAT tier (else it
+        strips the tier and runs the provider default at the base rate —
+        billing-safe and disclosed).
         """
-        if tier is None:
+        if tier is None or self.dialect not in SERVICE_TIER_DIALECTS:
             return False
         if self.billing_customer_managed:
             return True

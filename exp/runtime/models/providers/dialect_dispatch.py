@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.base import SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.fireworks import (
     require_responses_continuation_channel,
@@ -78,10 +79,6 @@ def fireworks_continuation_required(profile: GatewayWireProfile, request: Gatewa
         and bool(request.tools)
         and request.tool_choice != "none"
     )
-
-
-SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
-"""Wire dialects with a request field that preserves the caller's service tier."""
 
 
 def dialect_stream_payload(
