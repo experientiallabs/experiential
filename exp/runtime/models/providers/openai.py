@@ -295,6 +295,8 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             reasoning_wire_format="openai_responses",
             reasoning_effort=self._reasoning_effort,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+            # OpenAI documents prompt_cache_key as its prefix-cache routing hint.
+            forwards_prompt_cache_key=True,
         )
 
     def _completion_path(self) -> str:

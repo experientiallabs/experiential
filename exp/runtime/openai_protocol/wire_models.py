@@ -256,6 +256,15 @@ class _Message(_WireModel):
     keys even when they are empty. Callers echo those messages back verbatim
     on tool-call continuations, so the empty forms are accepted here; only a
     populated value is rejected as unsupported.
+
+    LiteLLM's ``Message.model_dump()`` adds ``provider_specific_fields``,
+    ``thinking_blocks``, ``reasoning_items``, and ``images`` to every
+    assistant message, and agent loops built on it (a Terminus-2 port that
+    keeps the LiteLLM message object) echo the whole dump back each turn.
+    ``provider_specific_fields`` is accepted with any object value and never
+    forwarded (a populated one is disclosed as dropped: it is LiteLLM's own
+    bookkeeping, not model input); the other three are accepted only empty,
+    exactly like the SDK keys above.
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
@@ -276,6 +285,10 @@ class _Message(_WireModel):
     annotations: tuple[()] | None = None
     audio: None = None
     function_call: None = None
+    provider_specific_fields: JsonObject | None = None
+    thinking_blocks: tuple[()] | None = None
+    reasoning_items: tuple[()] | None = None
+    images: tuple[()] | None = None
     reasoning_content: str | None = Field(
         default=None,
         max_length=MAXIMUM_REASONING_CARRIER_BYTES,

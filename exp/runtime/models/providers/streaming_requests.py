@@ -573,6 +573,14 @@ def route_generation_parameter_requests(
         if "messages.content.cache_control" not in ignored:
             ignored.append("messages.content.cache_control")
 
+    # LiteLLM stamps ``provider_specific_fields`` on every assistant message it
+    # returns, and naive agent loops echo the dump back verbatim. No wire takes
+    # the object, so it is dropped on every route with disclosure, never a
+    # rejection (the 400 wedged whole Terminus-2 sessions, 2026-09-05).
+    if any(message.provider_specific_fields for message in request.messages):
+        if "messages.provider_specific_fields" not in ignored:
+            ignored.append("messages.provider_specific_fields")
+
     # Anthropic-native tool-definition annotations exist only on that wire;
     # every other rung drops each one with a per-field disclosure, never a
     # rejection (Claude Code sends eager_input_streaming conditionally).

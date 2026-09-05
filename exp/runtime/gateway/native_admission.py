@@ -26,6 +26,7 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers import preflight_gateway_request
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -51,6 +52,29 @@ from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespa
 _logger = logging.getLogger(__name__)
 
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
+
+
+def _dispatch_request(
+    provider_request: GatewayRequest, authorization: AuthorizationSnapshot
+) -> GatewayRequest:
+    """Force streaming and attach the tenant's cache-affinity key for dispatch.
+
+    Cache affinity is per tenant and per session, so it is derived once here
+    with the frozen authority and read by every rung's payload builder that
+    forwards it; the public request keeps the caller's own ``prompt_cache_key``
+    untouched.
+    """
+    return provider_request.model_copy(
+        update={
+            "stream": True,
+            "include_usage": True,
+            "provider_prompt_cache_key": provider_prompt_cache_key(
+                provider_request,
+                organization_id=str(authorization.organization_id),
+                identity_id=str(authorization.identity_id),
+            ),
+        }
+    )
 
 
 def admitted_route_requests(
@@ -120,7 +144,7 @@ def admitted_route_requests(
         tuple(profile for profile, _client in resolved_wires),
         admitted_request,
     )
-    provider_request = provider_request.model_copy(update={"stream": True, "include_usage": True})
+    provider_request = _dispatch_request(provider_request, authorization)
     protocol_indexes, protocol_errors = protocol_compatible_indexes(
         route,
         resolved_wires,
@@ -141,9 +165,7 @@ def admitted_route_requests(
                 tuple(profile for profile, _client in resolved_wires),
                 admitted_request,
             )
-            provider_request = provider_request.model_copy(
-                update={"stream": True, "include_usage": True}
-            )
+            provider_request = _dispatch_request(provider_request, authorization)
             protocol_indexes, protocol_errors = protocol_compatible_indexes(
                 route,
                 resolved_wires,

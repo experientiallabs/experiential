@@ -108,6 +108,14 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    forwards_prompt_cache_key: bool = False
+    """Whether this rung's provider routes by ``prompt_cache_key``.
+
+    True where the field is documented (OpenAI) or verified live to pin a
+    request to one prefix-cache node (Tencent TokenHub, 2026-09-05: shared-stem
+    hit rate 2/8 without the key, 7/8 with it). BYOK rungs forward it
+    regardless (the caller pays that provider directly).
+    """
     """Whether this rung dispatches on tenant-owned (BYOK) credentials.
 
     Tier selectors (``service_tier``) forward only where the caller pays the

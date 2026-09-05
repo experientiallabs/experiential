@@ -470,6 +470,33 @@ def test_hunyuan_rung_without_the_capability_stays_stripped_but_keeps_its_carrie
     assert profile.reasoning_output_exposed is False
 
 
+def test_only_the_hunyuan_endpoint_routes_by_prompt_cache_key_among_compatible_rungs() -> None:
+    """Tencent's per-node prefix cache honors the hint; other shims may reject it.
+
+    Measured live 2026-09-05 on TokenHub: shared-stem hits 2/8 without the
+    key, 7/8 with it. A generic OpenAI-compatible server gets no unknown
+    field unless the rung is BYOK (decided at dispatch, not here).
+    """
+    hunyuan = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_HUNYUAN_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert hunyuan.forwards_prompt_cache_key is True
+    tokenhub = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert tokenhub.forwards_prompt_cache_key is True
+    generic = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert generic.forwards_prompt_cache_key is False
+
+
 def test_reasoning_exposure_requires_a_carrier_route_even_when_declared() -> None:
     """A declared capability without a carrier route exposes nothing (both gates)."""
     profile = OpenAICompatibleClient(

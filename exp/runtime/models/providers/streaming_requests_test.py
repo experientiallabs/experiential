@@ -3101,6 +3101,82 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     assert "messages.content.cache_control" in foreign_public.ignored_parameters
 
 
+def test_litellm_provider_specific_fields_are_dropped_with_disclosure_on_every_route() -> None:
+    """A populated LiteLLM stamp never reaches a provider and is always disclosed.
+
+    No wire has a field for it, so unlike cache markers the disclosure does
+    not depend on the route's dialects; an empty stamp decodes to nothing and
+    discloses nothing.
+    """
+    stamped = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="Reply with a command."),
+            GatewayMessage(
+                role="assistant",
+                content='{"command": "ls"}',
+                provider_specific_fields={"refusal": None},
+            ),
+            GatewayMessage(role="user", content="Output: a.txt"),
+        ),
+    )
+    compatible = GatewayWireProfile(dialect="openai_compatible", url="https://hy4.test")
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    for profiles in ((compatible,), (anthropic,), (compatible, anthropic)):
+        public, provider = route_generation_parameter_requests(profiles, stamped)
+        assert "messages.provider_specific_fields" in public.ignored_parameters
+        payload = openai_compatible_stream_payload("hy4-preview", provider)
+        messages = cast(list[JsonObject], payload["messages"])
+        assert all("provider_specific_fields" not in message for message in messages)
+    plain = stamped.model_copy(
+        update={
+            "messages": tuple(
+                message.model_copy(update={"provider_specific_fields": None})
+                for message in stamped.messages
+            )
+        }
+    )
+    public, _provider = route_generation_parameter_requests((compatible,), plain)
+    assert "messages.provider_specific_fields" not in public.ignored_parameters
+
+
+def test_prompt_cache_affinity_key_is_forwarded_only_where_the_rung_routes_by_it() -> None:
+    """The derived key rides ``prompt_cache_key`` on flagged rungs and nowhere else.
+
+    The caller's own ``prompt_cache_key`` is never the dispatched value: only
+    the admission-derived ``provider_prompt_cache_key`` is, and only when the
+    builder is told the rung's provider routes by it.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        prompt_cache_key="caller-session",
+        provider_prompt_cache_key="xpl-derived",
+        stream=True,
+        include_usage=True,
+    )
+    forwarded = openai_compatible_stream_payload(
+        "hy4-preview", request, forwards_prompt_cache_key=True
+    )
+    assert forwarded["prompt_cache_key"] == "xpl-derived"
+    withheld = openai_compatible_stream_payload("hy4-preview", request)
+    assert "prompt_cache_key" not in withheld
+    responses = openai_responses_stream_payload(
+        "gpt-5.5", request, supports_temperature=True, forwards_prompt_cache_key=True
+    )
+    assert responses["prompt_cache_key"] == "xpl-derived"
+    responses_withheld = openai_responses_stream_payload(
+        "gpt-5.5", request, supports_temperature=True
+    )
+    assert "prompt_cache_key" not in responses_withheld
+    # No derived key (admission found neither a caller key nor a stem): nothing
+    # is dispatched even on a flagged rung.
+    unkeyed = request.model_copy(update={"provider_prompt_cache_key": None})
+    assert "prompt_cache_key" not in openai_compatible_stream_payload(
+        "hy4-preview", unkeyed, forwards_prompt_cache_key=True
+    )
+
+
 def test_block_cache_markers_survive_a_multimodal_user_turn() -> None:
     """An image in the marked turn must not cost the caller its cache prefix.
 
