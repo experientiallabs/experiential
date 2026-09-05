@@ -186,6 +186,12 @@ pub struct Failure {
     /// failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<String>,
+    /// Known wait before a retry can dispatch (a throttle window's
+    /// remainder). When present on a throttled failure, the public mapping
+    /// advertises this value as `Retry-After` (floored at the fixed default)
+    /// so the header never contradicts the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u32>,
 }
 
 impl Failure {
@@ -197,6 +203,7 @@ impl Failure {
             failover_eligible: false,
             rejected_parameter: None,
             provider_detail: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -300,7 +307,10 @@ impl Failure {
             }
         }
         error.retry_after_seconds = match self.failure_class {
-            FailureClass::Throttled => Some(5),
+            // A failure carrying its known throttle window advertises that
+            // wait (floored at the fixed default) so the Retry-After header a
+            // client honors never contradicts the message it reads.
+            FailureClass::Throttled => Some(self.retry_after_seconds.map_or(5, |wait| wait.max(5))),
             FailureClass::QuotaExceeded => Some(3600),
             FailureClass::Unavailable => Some(2),
             _ => None,
@@ -413,6 +423,23 @@ mod tests {
             let back: FailureClass = serde_json::from_value(wire).expect("round trip");
             assert_eq!(back.as_str(), class.as_str());
         }
+    }
+
+    #[test]
+    fn a_throttled_failure_advertises_its_known_window_floored_at_the_default() {
+        // The throttled-exhaustion message names the remaining window, so the
+        // Retry-After header must advertise the same wait: a fixed 5s header
+        // beside a "retry in 30s" body sends honoring clients straight back
+        // into the window.
+        let mut throttled = Failure::new(FailureClass::Throttled, "retry in 30s");
+        throttled.retry_after_seconds = Some(30);
+        assert_eq!(throttled.public_error().retry_after_seconds, Some(30));
+        // A shorter-than-default window keeps the default floor.
+        throttled.retry_after_seconds = Some(2);
+        assert_eq!(throttled.public_error().retry_after_seconds, Some(5));
+        // Without a known window the fixed default backoff applies.
+        let bare = Failure::new(FailureClass::Throttled, "provider throttled the request");
+        assert_eq!(bare.public_error().retry_after_seconds, Some(5));
     }
 
     #[test]

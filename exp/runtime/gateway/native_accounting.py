@@ -48,7 +48,11 @@ from exp.runtime.gateway.native_settlement import (
     first_token_at_from_settlement,
     terminal_from_settlement,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.errors import (
+    THROTTLED_RETRY_AFTER_SECONDS,
+    OpenAIProtocolError,
+    public_failure_error,
+)
 
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
@@ -124,9 +128,10 @@ def all_routes_throttled_failure(remaining_seconds: float) -> GatewayFailure:
     rate limiting (the provider answered 429 and asked for backoff), not
     platform deadness: classing it provider_internal misfiled 429 storms as
     outages and paged operators for caller-driven load (2026-09-04 ledger,
-    deepseek-v4-flash-vision-exp). The remaining window rides the message so
-    the caller knows when a retry can dispatch; the public mapping already
-    answers 429 with a Retry-After header.
+    deepseek-v4-flash-vision-exp). One computed wait (the remaining window,
+    floored at the default throttle backoff) rides both the message and
+    ``retry_after_seconds`` so the Retry-After header a client honors never
+    disagrees with the sentence it reads.
 
     Args:
         remaining_seconds: Longest remaining throttle window across the route.
@@ -134,12 +139,14 @@ def all_routes_throttled_failure(remaining_seconds: float) -> GatewayFailure:
     Returns:
         Sanitized throttled failure naming the retry window.
     """
+    seconds = max(THROTTLED_RETRY_AFTER_SECONDS, math.ceil(remaining_seconds))
     return GatewayFailure(
         failure_class=GatewayFailureClass.THROTTLED,
         safe_message=(
             "all exact-model deployments are inside a provider throttle window; "
-            f"retry in {max(1, math.ceil(remaining_seconds))}s"
+            f"retry in {seconds}s"
         ),
+        retry_after_seconds=seconds,
     )
 
 
@@ -444,6 +451,8 @@ class NativeAttemptAccounting:
             failure_payload["rejected_parameter"] = exhaustion.rejected_parameter
         if exhaustion.provider_detail is not None:
             failure_payload["provider_detail"] = exhaustion.provider_detail
+        if exhaustion.retry_after_seconds is not None:
+            failure_payload["retry_after_seconds"] = exhaustion.retry_after_seconds
         return json.dumps(
             {"exhausted": True, "failure": failure_payload},
             separators=(",", ":"),

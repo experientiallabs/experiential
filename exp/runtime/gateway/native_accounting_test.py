@@ -33,6 +33,10 @@ from exp.runtime.gateway.native_accounting import (
 )
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.openai_protocol.errors import (
+    THROTTLED_RETRY_AFTER_SECONDS,
+    public_failure_error,
+)
 
 _DIGEST = "a" * 64
 
@@ -377,7 +381,16 @@ def test_a_fully_throttled_route_exhausts_as_throttled_not_provider_internal() -
     assert failure_payload["failure_class"] == "throttled"
     message = str(failure_payload["safe_message"])
     assert "throttle window" in message
-    assert "retry in" in message
+    retry_after = failure_payload["retry_after_seconds"]
+    assert isinstance(retry_after, int)
+    # The advertised Retry-After covers the whole remaining window (floored
+    # at the default backoff) and the message names the same wait, so a
+    # client honoring the header never retries into the window it was told
+    # to sit out.
+    assert THROTTLED_RETRY_AFTER_SECONDS <= retry_after <= 30
+    assert f"retry in {retry_after}s" in message
+    public = public_failure_error(GatewayFailure.model_validate(failure_payload))
+    assert public.retry_after_seconds == retry_after
     assert [failure.failure_class.value for failure in ledger.finished_requests] == ["throttled"]
     assert registry.entry("request-one") is None
 
