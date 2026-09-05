@@ -28,6 +28,9 @@ from exp.runtime.gateway.reasoning_blocks import (
     EncryptedReasoningBlock as EncryptedReasoningBlock,
 )
 from exp.runtime.gateway.reasoning_blocks import (
+    ExposedReasoningContentBlock as ExposedReasoningContentBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
     OpaqueReasoningContentBlock as OpaqueReasoningContentBlock,
 )
 from exp.runtime.gateway.reasoning_blocks import (

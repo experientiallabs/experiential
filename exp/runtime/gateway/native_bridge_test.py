@@ -495,14 +495,15 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     assert "reasoning_content" not in rotated_messages[1]
 
 
-def test_hunyuan_exposes_plaintext_reasoning_and_round_trips_only_as_carrier(
+def test_hunyuan_tool_turn_reasoning_round_trips_as_a_sealed_carrier(
     tmp_path: Path,
 ) -> None:
-    """Hunyuan returns plaintext reasoning for display yet round-trips it sealed.
+    """A Hunyuan TOOL turn round-trips its reasoning as the sealed carrier.
 
     The rung is marked as an exposed-plaintext reasoning route on the wire (so
-    the data plane returns ``reasoning_content`` to the caller), while the
-    tool-loop round-trip token stays the domain-separated opaque carrier: a
+    the data plane returns ``reasoning_content`` to the caller on plain turns,
+    which replay as plaintext — see the plain-turn test), while a tool turn's
+    round-trip token stays the domain-separated opaque carrier: a
     second replica unseals the exact turn and forwards the plaintext upstream,
     the Fireworks-only ``reasoning_history`` wire flag never appears, and a
     tampered turn fails closed.
@@ -602,6 +603,150 @@ def test_hunyuan_exposes_plaintext_reasoning_and_round_trips_only_as_carrier(
     with pytest.raises(NativeBridgeError) as modified:
         _admit(replica, raw_key, json.dumps(modified_turn))
     assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+
+
+def test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim(tmp_path: Path) -> None:
+    """A Terminus-shaped loop round-trips the plaintext the rung itself returned.
+
+    Terminus-2 parses commands out of assistant TEXT and feeds the output back
+    as a user message, so every turn is a non-tool turn: the exposing rung
+    returns plaintext ``reasoning_content`` and the caller echoes it. The
+    provider's wire accepts that text verbatim and validates nothing about it,
+    so the gateway forwards it to the exposing rung — no carrier, no route
+    pin, no disclosure.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    thinking = "The user wants a directory listing; ls is the command."
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "List the files."},
+                {
+                    "role": "assistant",
+                    "content": '{"command": "ls"}',
+                    "reasoning_content": thinking,
+                },
+                {"role": "user", "content": "a.txt b.txt"},
+            ],
+        }
+    )
+    admitted = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", admitted["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert messages[1]["reasoning_content"] == thinking
+    assert admitted["route_reason"] != "reasoning_continuation"
+    assert "reasoning_history" not in payload
+    assert admitted.get("ignored_parameters", []) == []
+
+
+def test_hunyuan_mixed_carrier_and_plaintext_history_round_trips(tmp_path: Path) -> None:
+    """Harbor with interleaved thinking echoes BOTH shapes and both replay.
+
+    A tool turn carries the sealed carrier (unsealed to its plaintext and
+    pinned to the issuing rung); a later plain turn carries the plaintext the
+    rung returned. One history, both forwarded verbatim.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    hidden = "reason about the lookup privately"
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": route_sha256,
+                    "content": hidden,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    plain = "now summarize what the tool said"
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                {"role": "assistant", "content": "It said done.", "reasoning_content": plain},
+                {"role": "user", "content": "thanks, and now?"},
+            ],
+        }
+    )
+    admitted = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", admitted["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    # The carrier precedes the latest user turn, so it is stale history and
+    # is stripped exactly as before; the plaintext plain turn replays.
+    assert "reasoning_content" not in messages[1]
+    assert messages[3]["reasoning_content"] == plain
+
+
+def test_plaintext_reasoning_is_rejected_on_a_route_without_exposure(tmp_path: Path) -> None:
+    """A rung that never issued plaintext reasoning rejects it by name."""
+    _manager, raw_key = _configured_gateway(tmp_path, capabilities=ModelCapabilities())
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "reasoning_content": "private"},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit(control, raw_key, body)
+    assert json.loads(rejected.value.public_error_json)["param"] == "messages.reasoning_content"
 
 
 def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(

@@ -413,10 +413,45 @@ def test_chat_decoder_rejects_duplicate_assistant_tool_call_ids() -> None:
     assert captured.value.detail.param == "messages.0"
 
 
+def test_chat_decoder_accepts_plaintext_reasoning_as_exposed_history() -> None:
+    """Plaintext ``reasoning_content`` decodes as caller-owned exposed history.
+
+    An exposure-gated rung (Tencent/DeepSeek) returns plaintext reasoning on
+    every non-tool turn; a Terminus/Harbor loop echoes it back verbatim. The
+    decoder carries it as an ``exposed_reasoning_content`` block — route
+    admission, not the decoder, decides which rungs may replay it.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "run ls"},
+                {
+                    "role": "assistant",
+                    "content": '{"command": "ls"}',
+                    "reasoning_content": "The user wants a directory listing.",
+                },
+                {"role": "user", "content": "a.txt b.txt"},
+            ],
+        }
+    )
+    block = decoded.request.messages[1].provider_reasoning[0]
+    assert block.kind == "exposed_reasoning_content"
+    assert block.content == "The user wants a directory listing."
+    # An empty string is not reasoning; it names its field.
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "assistant", "content": "x", "reasoning_content": ""}],
+            }
+        )
+    assert raised.value.detail.param == "messages.0.reasoning_content"
+
+
 @pytest.mark.parametrize(
     "reasoning_content",
     (
-        "raw provider reasoning",
         FIREWORKS_REASONING_CONTENT_PREFIX,
         f"{FIREWORKS_REASONING_CONTENT_PREFIX}not-base64:payload",
     ),
@@ -424,7 +459,7 @@ def test_chat_decoder_rejects_duplicate_assistant_tool_call_ids() -> None:
 def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
     reasoning_content: str,
 ) -> None:
-    """Public Chat input accepts only a bounded gateway-issued carrier."""
+    """A value under a known carrier prefix must parse as that carrier."""
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_chat(
             {
