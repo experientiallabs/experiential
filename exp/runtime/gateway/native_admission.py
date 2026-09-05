@@ -108,6 +108,27 @@ def admitted_route_requests(
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
+    # flex/priority are the tiers we price as an OPT-IN pass-through, so they
+    # fail CLOSED before any reservation when no rung can BILL the requested one:
+    # a BYOK rung forwards any tier (customer pays the provider directly, no
+    # platform card needed), while a house rung must carry a per-tier card for
+    # THIS tier (`forwards_tier`). A model carded for flex only therefore rejects
+    # a priority request instead of forwarding it and silently billing the base
+    # rate while the provider charges the priority premium (underbill). Every
+    # OTHER tier (auto/default carry no price; scale and any future value) is
+    # never rejected here — a non-billable candidate simply strips it at payload
+    # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
+    if request.service_tier in ("flex", "priority"):
+        tier = request.service_tier
+        if not any(profile.forwards_tier(tier) for profile, _client in resolved_wires):
+            raise ProviderCapabilityError(
+                capability="service_tier",
+                detail=(
+                    "This model does not offer a flex or priority processing tier. "
+                    "Remove service_tier, or choose a model with tiered pricing enabled."
+                ),
+            )
+
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = ()
     full_route = route

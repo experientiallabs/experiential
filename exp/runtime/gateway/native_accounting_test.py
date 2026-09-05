@@ -512,3 +512,145 @@ def test_provider_detail_crosses_the_boundary_only_as_a_string() -> None:
         {"failure_class": "invalid_request", "safe_message": "x", "provider_detail": ""}
     )
     assert empty_detail is not None and empty_detail.provider_detail is None
+
+
+def test_deployment_priced_for_service_tier_overrides_only_for_a_carried_tier() -> None:
+    """A requested tier with a pass-through card reprices the deployment copy;
+    no tier, or a tier the deployment lacks, returns the deployment unchanged."""
+    from exp.common.models.catalog import (
+        GatewayDeploymentMetadata,
+        GatewayServiceTierPrices,
+        GatewayTokenPrices,
+    )
+    from exp.common.models.gateway_catalog import ExactModelDeployment
+    from exp.runtime.gateway.native_accounting import _deployment_priced_for_service_tier
+
+    deployment = ExactModelDeployment(
+        deployment_id="d1",
+        source_alias="d1",
+        exact_model_id="exact-one",
+        connection="connection-d1",
+        provider="openai",
+        provider_model="provider-model",
+        connection_sha256="b" * 64,
+        capabilities_sha256="c" * 64,
+        gateway=GatewayDeploymentMetadata(
+            prices=GatewayTokenPrices(
+                input_micro_usd_per_million_tokens=1_000_000,
+                output_micro_usd_per_million_tokens=4_000_000,
+                flex=GatewayServiceTierPrices(
+                    input_micro_usd_per_million_tokens=500_000,
+                    output_micro_usd_per_million_tokens=2_000_000,
+                ),
+            )
+        ),
+    )
+
+    flex = _deployment_priced_for_service_tier(deployment, "flex", forwards_tier=True)
+    assert flex is not deployment
+    assert flex.gateway.prices.input_micro_usd_per_million_tokens == 500_000
+    assert flex.gateway.prices.output_micro_usd_per_million_tokens == 2_000_000
+    # Identity and everything else is preserved on the copy.
+    assert flex.deployment_id == "d1" and flex.exact_model_id == "exact-one"
+
+    # No tier, default/auto, and a tier the deployment does not carry: unchanged.
+    assert _deployment_priced_for_service_tier(deployment, None, forwards_tier=False) is deployment
+    assert (
+        _deployment_priced_for_service_tier(deployment, "default", forwards_tier=False)
+        is deployment
+    )
+    assert (
+        _deployment_priced_for_service_tier(deployment, "priority", forwards_tier=False)
+        is deployment
+    )
+
+    # A carded tier that the SELECTED depth does not forward (a card on a lane
+    # whose wire would strip the tier) bills the BASE schedule, never the card:
+    # forwards_tier=False returns the deployment unchanged even though the flex
+    # card exists.
+    assert (
+        _deployment_priced_for_service_tier(deployment, "flex", forwards_tier=False) is deployment
+    )
+
+
+def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier() -> None:
+    """The reservation applies the tier card ONLY on a depth that forwards it.
+
+    Regression for the forward/bill divergence: a flex CARD on a lane the
+    selected depth does not forward reserves the BASE schedule, never the card,
+    so the gateway can never reserve the tier rate while the provider runs the
+    base schedule.
+    """
+    from exp.common.models.catalog import GatewayServiceTierPrices, GatewayTokenPrices
+
+    class _PriceCapturingLedger(_RecordingLedger):
+        """Recording ledger that also captures each reserved input rate."""
+
+        def __init__(self) -> None:
+            """Track the per-attempt reserved input rate alongside the base log."""
+            super().__init__()
+            self.reserved_input_micro: list[int | None] = []
+
+        def start_attempt(
+            self,
+            *,
+            snapshot: object,
+            deployment: ExactModelDeployment,
+            attempt_ordinal: int,
+            route_depth: int,
+            maximum_cost_micro_usd: int | None = None,
+            route_reason: str | None = None,
+            fallback_reason: str | None = None,
+        ) -> str:
+            """Record the reserved input rate, then reserve as the base fake does."""
+            self.reserved_input_micro.append(
+                deployment.gateway.prices.input_micro_usd_per_million_tokens
+            )
+            return super().start_attempt(
+                snapshot=snapshot,
+                deployment=deployment,
+                attempt_ordinal=attempt_ordinal,
+                route_depth=route_depth,
+                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                route_reason=route_reason,
+                fallback_reason=fallback_reason,
+            )
+
+    carded = _deployment("deployment-a", connection_sha256="b" * 64).model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                prices=GatewayTokenPrices(
+                    input_micro_usd_per_million_tokens=1_000_000,
+                    output_micro_usd_per_million_tokens=4_000_000,
+                    flex=GatewayServiceTierPrices(
+                        input_micro_usd_per_million_tokens=500_000,
+                        output_micro_usd_per_million_tokens=2_000_000,
+                    ),
+                ),
+            )
+        }
+    )
+    route = _route((carded,))
+    flex_request = _request().model_copy(update={"service_tier": "flex"})
+
+    def _reserved_rate(*, forwards: bool) -> int | None:
+        ledger = _PriceCapturingLedger()
+        registry = NativeAttemptAccounting(ledger)  # type: ignore[arg-type]
+        registry.register(
+            InflightRequest(
+                authorization=route.snapshot.authorization,
+                route=route,
+                request=flex_request,
+                deadline_monotonic=time.monotonic() + 30,
+                tier_forwarded_by_depth=(forwards,),
+            )
+        )
+        _start(registry, ordinal=0)
+        assert len(ledger.reserved_input_micro) == 1
+        return ledger.reserved_input_micro[0]
+
+    # The selected depth forwards flex -> reserve at the flex card rate.
+    assert _reserved_rate(forwards=True) == 500_000
+    # Same flex card, but the selected depth strips the tier -> reserve at BASE.
+    assert _reserved_rate(forwards=False) == 1_000_000

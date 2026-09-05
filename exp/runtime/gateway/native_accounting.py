@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
@@ -185,6 +186,36 @@ def _failure_from_payload(payload: object) -> GatewayFailure | None:
         provider_detail=(
             provider_detail if isinstance(provider_detail, str) and provider_detail else None
         ),
+    )
+
+
+def _deployment_priced_for_service_tier(
+    deployment: ExactModelDeployment,
+    service_tier: str | None,
+    *,
+    forwards_tier: bool,
+) -> ExactModelDeployment:
+    """Reprice one deployment for a requested flex/priority processing tier.
+
+    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
+    the tier to its provider and carries a pass-through card for it, the card's
+    rates replace the base schedule on a copy used only for THIS reservation, so
+    the ceiling, the stored per-token rates, and settlement all bill the tier
+    transparently. ``forwards_tier`` is the admission-time forwarding decision
+    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
+    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
+    wire would strip the tier (non-tier dialect, tier disabled) — such a depth
+    runs the provider's base schedule, so it must bill the base schedule too. No
+    tier, no forwarding, or no card returns the deployment unchanged. The copy
+    stays Python-side and never crosses the native boundary.
+    """
+    if not forwards_tier:
+        return deployment
+    effective = deployment.gateway.prices.for_service_tier(service_tier)
+    if effective is deployment.gateway.prices:
+        return deployment
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"prices": effective})}
     )
 
 
@@ -368,7 +399,14 @@ class NativeAttemptAccounting:
             candidate = claim_route_from(self._health, keys, 0)
             last_failure = None
         while candidate is not None:
-            deployment = route.deployments[candidate]
+            deployment = _deployment_priced_for_service_tier(
+                route.deployments[candidate],
+                getattr(entry.request, "service_tier", None),
+                forwards_tier=(
+                    candidate < len(entry.tier_forwarded_by_depth)
+                    and entry.tier_forwarded_by_depth[candidate]
+                ),
+            )
             try:
                 attempt_id = self._write_ledger.start_attempt(
                     snapshot=route.snapshot,

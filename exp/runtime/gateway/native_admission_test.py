@@ -6,7 +6,12 @@ from typing import Literal, cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
+from exp.common.models.catalog import (
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayServiceTierPrices,
+    GatewayTokenPrices,
+)
 from exp.common.models.content import (
     AudioContentPart,
     ImageContentPart,
@@ -416,8 +421,6 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
         tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
         parallel_tool_calls=True,
         service_tier="flex",
-        stream=True,
-        include_usage=True,
     )
 
     class _CoercionCounter:
@@ -803,3 +806,207 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
     assert provider.provider_thinking_config is None
     assert provider.reasoning_effort == "medium"
     assert accounting.recorded == 1
+
+
+def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
+    """A flex/priority request rejects fail-closed before reservation when no
+    rung can honor it: a host lane without per-tier pass-through pricing and no
+    BYOK rung. auto/default never reject."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    # House rung: billing_customer_managed False and no tier pricing, so it does
+    # not forward service_tier.
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
+    accounting = cast(NativeAttemptAccounting, object())
+
+    for tier in ("flex", "priority"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="go"),),
+            service_tier=tier,
+        )
+        with pytest.raises(ProviderCapabilityError) as exc:
+            admitted_route_requests(
+                route,
+                wires,
+                request,
+                accounting=accounting,
+                authorization=route.snapshot.authorization,
+            )
+        assert exc.value.capability == "service_tier"
+
+    # auto/default carry no price, and `scale` (a valid OpenAI tier we do not
+    # price as opt-in) is stripped downstream, not rejected: only flex/priority
+    # gate at admission.
+    for tier in ("auto", "default", "scale"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="go"),),
+            service_tier=tier,
+        )
+        admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+        )
+
+
+def test_tier_priced_host_lane_admits_the_named_tier() -> None:
+    """A host rung whose model carries per-tier pricing forwards the tier, so a
+    flex request is admitted (not rejected)."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                    prices=GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        output_micro_usd_per_million_tokens=4_000_000,
+                        flex=GatewayServiceTierPrices(
+                            input_micro_usd_per_million_tokens=500_000,
+                            output_micro_usd_per_million_tokens=2_000_000,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://house.test",
+                service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"flex"}),
+            ),
+            client,
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="flex",
+    )
+    _narrowed, _wires_out, _public, provider = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, object()),
+        authorization=route.snapshot.authorization,
+    )
+    # The tier survives to the provider request on the tier-priced house lane.
+    assert provider.service_tier == "flex"
+
+
+def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
+    """The reject keys on the SPECIFIC requested tier's card, not just the lane:
+    a house model carded for flex only rejects a priority request (no card ->
+    would underbill), while a BYOK rung forwards any tier with no platform card
+    (the customer pays the provider directly)."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    accounting = cast(NativeAttemptAccounting, object())
+    client = cast(NativeWireClient, object())
+    streaming = GatewayDeploymentCapabilities(supports_streaming=True)
+
+    # House model carries a FLEX card only.
+    flex_only_route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=streaming,
+                    prices=GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        output_micro_usd_per_million_tokens=4_000_000,
+                        flex=GatewayServiceTierPrices(
+                            input_micro_usd_per_million_tokens=500_000,
+                            output_micro_usd_per_million_tokens=2_000_000,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    house_wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://house.test",
+                service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"flex"}),
+            ),
+            client,
+        ),
+    )
+    priority_request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="priority",
+    )
+    with pytest.raises(ProviderCapabilityError) as exc:
+        admitted_route_requests(
+            flex_only_route,
+            house_wires,
+            priority_request,
+            accounting=accounting,
+            authorization=flex_only_route.snapshot.authorization,
+        )
+    assert exc.value.capability == "service_tier"
+
+    # A BYOK rung (billing_customer_managed) forwards ANY tier with no card.
+    byok_route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "byok",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(capabilities=streaming),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    byok_wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://byok.test",
+                billing_customer_managed=True,
+            ),
+            client,
+        ),
+    )
+    _n, _w, _p, provider = admitted_route_requests(
+        byok_route,
+        byok_wires,
+        priority_request,
+        accounting=accounting,
+        authorization=byok_route.snapshot.authorization,
+    )
+    assert provider.service_tier == "priority"

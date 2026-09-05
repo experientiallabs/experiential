@@ -79,6 +79,16 @@ def completion_timeout_seconds(
     return max(configured_timeout_seconds, min(scaled, MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
 
 
+SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
+"""Wire dialects with a request field that preserves the caller's service tier.
+
+Canonical here (the lowest module both the wire dispatch and the profile share);
+``dialect_dispatch`` re-exports it so existing import paths are unchanged. A tier
+on any other dialect is stripped or declined, so ``forwards_tier`` gates on it to
+keep FORWARD and BILL consistent by construction.
+"""
+
+
 @dataclass(frozen=True)
 class GatewayWireProfile:
     """Everything a gateway data plane needs to dispatch one provider call.
@@ -108,6 +118,24 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    service_tier_pricing_enabled: bool = False
+    """Whether this HOST-funded rung may still forward ``service_tier``.
+
+    Normally a host-funded rung strips the tier (the gateway bills catalog
+    rates while a tier changes provider pricing). A model whose catalog carries
+    per-tier PASS-THROUGH pricing sets this so the tier reaches the provider on
+    the house lane too, and settlement bills the REQUESTED tier at that card's
+    cost. BYOK rungs forward regardless (``billing_customer_managed``); this
+    only widens the host-funded case for opted-in models.
+    """
+    service_tier_cards: frozenset[str] = frozenset()
+    """The named tiers this host-funded rung carries a pass-through card for.
+
+    Forwarding is PER-TIER, not lane-level: a mixed route may pair a rung
+    carded for ``flex`` with one that is not, and the tier is emitted only on
+    the candidate that can also BILL it. Populated from the deployment's
+    per-tier price cards; BYOK ignores it (it forwards every tier).
+    """
     forwards_prompt_cache_key: bool = False
     """Whether this rung's provider routes by ``prompt_cache_key``.
 
@@ -308,6 +336,33 @@ class GatewayWireProfile:
             or self.maximum_output_tokens <= 0
         ):
             raise ValueError("gateway wire maximum_output_tokens must be a positive integer")
+
+    @property
+    def forwards_service_tier(self) -> bool:
+        """Whether this rung emits ``service_tier`` to the provider.
+
+        True on BYOK rungs (the caller pays the provider directly) and on
+        host-funded rungs whose model carries per-tier pass-through pricing.
+        """
+        return self.billing_customer_managed or self.service_tier_pricing_enabled
+
+    def forwards_tier(self, tier: str | None) -> bool:
+        """Whether this rung emits and can BILL the SPECIFIC requested ``tier``.
+
+        The single source of truth for FORWARD == BILL: forwarding is per-tier
+        AND requires a tier-capable wire dialect, so the accounting reprice and
+        the payload emission can never diverge. No tier -> False; a dialect with
+        no ``service_tier`` wire field -> False (it would strip or decline);
+        BYOK -> True (the caller pays the provider directly); otherwise the
+        host-funded rung must carry a pass-through card for THAT tier (else it
+        strips the tier and runs the provider default at the base rate —
+        billing-safe and disclosed).
+        """
+        if tier is None or self.dialect not in SERVICE_TIER_DIALECTS:
+            return False
+        if self.billing_customer_managed:
+            return True
+        return self.service_tier_pricing_enabled and tier in self.service_tier_cards
 
 
 class ProviderHttpClient(abc.ABC):
