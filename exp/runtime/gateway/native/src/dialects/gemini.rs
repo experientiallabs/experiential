@@ -537,7 +537,7 @@ mod gemini_tests {
             events,
             vec![json!({"kind": "text_delta", "text": "partial"}), failed]
         );
-        let classified = provider_stream_failed();
+        let classified = crate::dialects::provider_stream_failed();
         assert_eq!(classified.failure_class, FailureClass::ProviderInternal);
         assert!(classified.retryable_same_deployment);
         assert!(classified.failover_eligible);
