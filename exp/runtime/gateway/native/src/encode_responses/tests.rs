@@ -676,7 +676,7 @@ fn hosted_tool_items_reemit_verbatim_at_remapped_indexes() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -767,7 +767,7 @@ fn completed_body_serves_hosted_items_in_order() {
     let aggregated = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
@@ -786,7 +786,7 @@ fn provider_annotations_attach_to_the_message_text_part() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -856,7 +856,7 @@ fn hosted_non_call_items_never_join_the_ledger_tool_names() {
     let aggregated = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
