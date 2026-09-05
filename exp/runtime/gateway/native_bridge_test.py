@@ -5107,3 +5107,26 @@ def test_internal_admission_failures_log_the_real_exception(
     assert str(fields["request_id"]).startswith("request-")
     assert fields["exception_type"] == "KeyError"
     assert fields["operation"] == "native_admit"
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_claim_scope_rejects_route_policy_before_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapped: bool
+) -> None:
+    """A cached operation cannot skip a fresh geographic/organization refusal."""
+    control, raw_key = _control_plane(tmp_path)
+    _claim_scope(control, raw_key, _chat_body(), idempotency_key="policy-operation")
+
+    def deny(*args: object, **kwargs: object) -> None:
+        """Model a resolver's typed policy refusal."""
+        error = OpenAIProtocolError(
+            status_code=403, code="model_location_not_supported", message="Location not supported."
+        )
+        if wrapped:
+            raise NativeBridgeError(error)
+        raise error
+
+    monkeypatch.setattr(type(control._components.routes), "resolve_direct", deny)
+    with pytest.raises(NativeBridgeError) as error:
+        _claim_scope(control, raw_key, _chat_body(), idempotency_key="policy-operation")
+    assert json.loads(error.value.public_error_json)["status_code"] == 403

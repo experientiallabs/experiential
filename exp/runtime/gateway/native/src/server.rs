@@ -179,7 +179,12 @@ pub async fn run(
     } else {
         app
     };
-    let app = app.fallback(unknown_route).with_state(state);
+    let app = app
+        .fallback(unknown_route)
+        .layer(axum::middleware::from_fn(
+            crate::request_context::scope_request,
+        ))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?

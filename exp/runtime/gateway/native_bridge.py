@@ -861,6 +861,14 @@ class NativeControlPlane(
                 resolve_route_profiles(self._components.runtime_catalogs, route)
             except NativeDialectUnavailableError as exc:
                 return _escalation(str(exc))
+            except NativeBridgeError as exc:
+                if json.loads(exc.public_error_json)["status_code"] == 403:
+                    raise
+            except OpenAIProtocolError as exc:
+                # Authorization policy must run before an existing replay can
+                # return content, not only before a new upstream dispatch.
+                if exc.status_code == 403:
+                    raise NativeBridgeError(exc) from exc
             except Exception:  # noqa: BLE001 - the owner's admission records this failure.
                 pass
         key = replay_key(

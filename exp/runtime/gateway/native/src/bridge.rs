@@ -27,6 +27,7 @@ use crate::errors::PublicError;
 struct Job {
     method: &'static str,
     argument: String,
+    context: Option<String>,
     responder: oneshot::Sender<Result<String, PublicError>>,
 }
 
@@ -89,6 +90,7 @@ impl Bridge {
                     .send(Job {
                         method,
                         argument,
+                        context: crate::request_context::current(),
                         responder,
                     })
                     .is_ok(),
@@ -154,7 +156,7 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
             // the receive lock, so one poisoned call cannot take down the
             // pool.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control_plane_call(py, object, job.method, job.argument)
+                control_plane_call(py, object, job.method, job.argument, job.context)
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
             let _ = job.responder.send(outcome);
@@ -178,9 +180,17 @@ fn control_plane_call(
     object: &Py<PyAny>,
     method: &'static str,
     argument: String,
+    context: Option<String>,
 ) -> Result<String, PublicError> {
     let bound = object.bind(py);
-    match bound.call_method1(method, (argument,)) {
+    // Opt-in host hook runs even when context is absent, allowing fail-closed
+    // policies. Ordinary local control planes retain their exact callback API.
+    let result = match bound.hasattr("call_with_context") {
+        Ok(true) => bound.call_method1("call_with_context", (method, argument, context)),
+        Ok(false) => bound.call_method1(method, (argument,)),
+        Err(error) => return Err(public_error_from_pyerr(py, &error)),
+    };
+    match result {
         Ok(result) => result
             .extract::<String>()
             .map_err(|_| PublicError::internal()),
@@ -336,5 +346,28 @@ class Plane:
             serde_json::to_value(&error).expect("error serializes"),
             serde_json::to_value(PublicError::internal()).expect("error serializes"),
         );
+    }
+    #[test]
+    fn request_context_reaches_host_hook_and_missing_context_stays_missing() {
+        Python::initialize();
+        let object = Python::attach(|py| {
+            pyo3::types::PyModule::from_code(py, c"class Plane:\n def call_with_context(self, method, argument, context):\n  return method + ':' + (context or 'unknown')\n", c"context.py", c"context")
+                .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+        });
+        let bridge = Bridge::new(object, 2).unwrap();
+        block_on(async {
+            let (left, right) = tokio::join!(
+                crate::request_context::REQUEST_CONTEXT
+                    .scope(Some("US".into()), bridge.call("admit", "{}".into())),
+                crate::request_context::REQUEST_CONTEXT
+                    .scope(Some("BY".into()), bridge.call("claim_scope", "{}".into()))
+            );
+            assert_eq!(left.unwrap(), "admit:US");
+            assert_eq!(right.unwrap(), "claim_scope:BY");
+            assert_eq!(
+                bridge.call("batch_create", "{}".into()).await.unwrap(),
+                "batch_create:unknown"
+            );
+        });
     }
 }

@@ -445,3 +445,21 @@ Azure, and OpenRouter share compatible-stream coverage; Gemini and Bedrock have 
 fixtures. Live provider cells remain explicitly `not_run_requires_credentials` until a separately
 authorized run supplies dated evidence. Deterministic fixtures do not imply hosted-provider
 availability, billing, or account-specific behavior.
+
+
+### Hosted request policy context
+
+A trusted host ingress may set `X-Exp-Request-Context` to an opaque value of
+at most 1,024 bytes. The engine does not authenticate it. Hosts must overwrite
+all public copies and keep the native listener private before using it for
+policy. Missing, duplicated, invalid, or oversized values become `None`.
+
+A control plane can implement `call_with_context(method, argument, context)` to
+wrap native callbacks. It runs on the same Python worker thread as admission,
+including model discovery, batch submission, and the claim before idempotency
+replay. Implementations must restore per-request state in `finally`. HTTP
+contexts are task scoped; Responses WebSocket frames retain the upgrade's
+context. Detached settlement work has no request context. No context is added
+to provider payloads or durable ledger records. Existing control planes without
+the hook retain their callback signatures. A typed 403 from route resolution
+is propagated before replay lookup so a saved response cannot bypass policy.

@@ -20,6 +20,7 @@ mod metrics;
 mod param_attribution;
 mod relay;
 mod replay;
+mod request_context;
 mod respond;
 mod responses_retention;
 mod route_batches;
@@ -684,5 +685,6 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(normalize_stream_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add("supports_request_context", true)?;
     Ok(())
 }

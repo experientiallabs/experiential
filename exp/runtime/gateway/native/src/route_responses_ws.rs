@@ -73,7 +73,11 @@ pub(crate) async fn responses_ws(
         return error_response(&error);
     }
     let connection_headers = request_headers(&headers);
-    upgrade.on_upgrade(move |socket| serve_socket(state, connection_headers, socket))
+    let context = crate::request_context::current();
+    upgrade.on_upgrade(move |socket| {
+        crate::request_context::REQUEST_CONTEXT
+            .scope(context, serve_socket(state, connection_headers, socket))
+    })
 }
 
 /// The 426 answered for a GET that is not a well-formed WebSocket upgrade.
