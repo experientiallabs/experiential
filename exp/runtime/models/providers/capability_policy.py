@@ -538,8 +538,8 @@ def _without_clear_thinking_edits(context_management: JsonObject) -> JsonObject 
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
-    Four coercions exist, all only here — after every rung declined the
-    verbatim request — and all only as a disclosed substitution. Degrading
+    Four coercions exist, all only here (after every rung declined the
+    verbatim request) and all only as a disclosed substitution. Degrading
     ``strict: true`` tools to best-effort schemas weakens a correctness
     guarantee. Relaxing a forced ``tool_choice`` to ``auto`` weakens a
     structural guarantee the same way (the model still sees the tools and the
