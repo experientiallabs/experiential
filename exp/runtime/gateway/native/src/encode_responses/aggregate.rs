@@ -82,11 +82,14 @@ pub fn completed_responses_body_with_carrier(
                     tool_names.push(call.name.clone());
                 }
             }
-            // Hosted tool invocations are provider-executed but still
+            // Hosted tool INVOCATIONS are provider-executed but still
             // invoked tools; their item type names the activity for the
-            // ledger, mirroring `track_event`.
+            // ledger, mirroring `track_event`. Results, approvals, and
+            // opaque conversation items never record a call.
             Event::HostedToolItemCompleted { item_type, .. } => {
-                if !tool_names.contains(item_type) {
+                if crate::events::hosted_item_type_is_invocation(item_type)
+                    && !tool_names.contains(item_type)
+                {
                     tool_names.push(item_type.clone());
                 }
             }

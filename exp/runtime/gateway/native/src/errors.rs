@@ -179,7 +179,11 @@ pub struct Failure {
     pub rejected_parameter: Option<String>,
     /// The provider's own bounded single-line explanation of a client error,
     /// relayed only for that class so the caller sees what was actually
-    /// refused. Every other class stays content-free.
+    /// refused; every other class stays caller-content-free. On a coerced
+    /// malformed-response boundary it instead carries the gateway's own
+    /// static parse-reject reason, which never reaches the caller but does
+    /// reach settlement so the ledger can name the exact wire shape that
+    /// failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<String>,
 }
@@ -236,11 +240,16 @@ impl Failure {
                     "reason": self.safe_message,
                 });
                 eprintln!("exp-gateway-native: {line}");
+                // The reason also rides provider_detail into settlement so
+                // the ledger names the exact wire shape that failed; the
+                // public error never relays it (that path is scoped to the
+                // invalid-request class).
                 Failure::new(
                     FailureClass::MalformedResponse,
                     "provider returned a malformed response; retry the request",
                 )
                 .with_retry(self.retryable_same_deployment, self.failover_eligible)
+                .with_provider_detail(Some(self.safe_message))
             }
             _ => self,
         }
@@ -378,8 +387,17 @@ mod tests {
             coerced.safe_message,
             "provider returned a malformed response; retry the request"
         );
+        // The specific reason survives as the settlement-facing detail so the
+        // ledger names the wire shape that failed, while the public error
+        // stays generic (detail relay is scoped to invalid requests).
+        assert_eq!(coerced.provider_detail.as_deref(), Some("specific detail"));
+        assert_eq!(
+            coerced.public_error().message,
+            "provider returned a malformed response; retry the request"
+        );
         let transport = Failure::new(FailureClass::Transport, "kept").boundary();
         assert_eq!(transport.safe_message, "kept");
+        assert_eq!(transport.provider_detail, None);
     }
 
     #[test]

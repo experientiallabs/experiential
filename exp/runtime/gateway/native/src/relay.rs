@@ -123,9 +123,14 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
             // (and price) per-invocation server tool activity.
             tool_names.push(call.name.clone());
         }
-        // Hosted Responses tool items are provider-executed too; the item
-        // type ("web_search_call", "mcp_call", ...) names the activity.
-        Event::HostedToolItemCompleted { item_type, .. } if !tool_names.contains(item_type) => {
+        // Hosted Responses tool INVOCATIONS are provider-executed too; the
+        // item type ("web_search_call", "mcp_call", ...) names the activity.
+        // Results, approvals, and opaque conversation items never record a
+        // call that did not occur.
+        Event::HostedToolItemCompleted { item_type, .. }
+            if crate::events::hosted_item_type_is_invocation(item_type)
+                && !tool_names.contains(item_type) =>
+        {
             tool_names.push(item_type.clone());
         }
         _ => {}

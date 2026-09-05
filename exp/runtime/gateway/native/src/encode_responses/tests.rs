@@ -816,3 +816,56 @@ fn provider_annotations_attach_to_the_message_text_part() {
         "the final message part must keep its annotations: {last}"
     );
 }
+
+/// Results, approvals, and opaque conversation items are served in the
+/// output but never recorded as invoked tools: only `*_call` item types
+/// name an invocation that actually occurred.
+#[test]
+fn hosted_non_call_items_never_join_the_ledger_tool_names() {
+    let events = vec![
+        Event::HostedToolItemStarted {
+            output_index: 0,
+            item_id: "cmp_1".to_string(),
+            item_type: "compaction".to_string(),
+            item: "{\"id\":\"cmp_1\",\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}"
+                .to_string(),
+        },
+        Event::HostedToolItemCompleted {
+            output_index: 0,
+            item_id: "cmp_1".to_string(),
+            item_type: "compaction".to_string(),
+            item: "{\"id\":\"cmp_1\",\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}"
+                .to_string(),
+        },
+        Event::HostedToolItemStarted {
+            output_index: 1,
+            item_id: "ws_1".to_string(),
+            item_type: "web_search_call".to_string(),
+            item: "{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"completed\"}"
+                .to_string(),
+        },
+        Event::HostedToolItemCompleted {
+            output_index: 1,
+            item_id: "ws_1".to_string(),
+            item_type: "web_search_call".to_string(),
+            item: "{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"completed\"}"
+                .to_string(),
+        },
+        Event::Completed,
+    ];
+    let aggregated = completed_responses_body(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &events,
+    )
+    .expect("completed body must encode");
+    assert_eq!(aggregated.tool_names, vec!["web_search_call".to_string()]);
+    let mut usage = None;
+    let mut tool_names = Vec::new();
+    for event in &events {
+        crate::relay::track_event(event, &mut usage, &mut tool_names);
+    }
+    assert_eq!(tool_names, vec!["web_search_call".to_string()]);
+}

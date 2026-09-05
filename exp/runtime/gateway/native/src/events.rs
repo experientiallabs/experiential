@@ -622,6 +622,16 @@ fn add_provider_item_metadata(
     }
 }
 
+/// Whether one hosted Responses item type names a tool INVOCATION.
+///
+/// Only invocations join the ledger's tool names: the hosted union also
+/// carries results (`*_call_output`), approvals, listings, and opaque
+/// conversation items (`additional_tools`, `compaction`), and recording one
+/// of those would report a tool call that never occurred.
+pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
+    item_type.ends_with("_call")
+}
+
 /// Validate one raw tool-argument accumulation as a single JSON object.
 pub fn require_json_object_text(raw: &str) -> Result<(), String> {
     match serde_json::from_str::<Value>(raw) {

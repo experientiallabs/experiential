@@ -203,6 +203,34 @@ class DeploymentHealthRegistry:
                 if state.consecutive_failures >= self._failure_threshold:
                     state.open_until = now + self._open_seconds
 
+    def throttled_remaining_seconds(self, keys: tuple[DeploymentHealthKey, ...]) -> float | None:
+        """Return the longest remaining throttle window when EVERY key is inside one.
+
+        A route with no claimable deployment and no classified failure of its
+        own can only be throttle-suppressed (forced claims admit any
+        non-throttled circuit), so this names that condition explicitly: the
+        provider asked for backoff, which is caller-facing rate limiting, not
+        platform deadness.
+
+        Args:
+            keys: One health key per ordered route deployment.
+
+        Returns:
+            The longest remaining window in seconds, or ``None`` when the
+            route is empty or any deployment is outside a throttle window.
+        """
+        if not keys:
+            return None
+        now = self._clock()
+        remaining = 0.0
+        with self._lock:
+            for key in keys:
+                state = self._states.get(key)
+                if state is None or state.throttle_until <= now:
+                    return None
+                remaining = max(remaining, state.throttle_until - now)
+        return remaining
+
     def release_probe(self, key: DeploymentHealthKey) -> None:
         """Release a claimed half-open probe that never reached provider dispatch.
 
