@@ -53,6 +53,11 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         }
         Event::ServerToolResult { block, .. } => block.len(),
         Event::CitationDelta { citation, .. } => citation.len(),
+        Event::HostedToolItemStarted { item, .. } | Event::HostedToolItemCompleted { item, .. } => {
+            item.len()
+        }
+        Event::HostedToolItemProgress { payload, .. } => payload.len(),
+        Event::ProviderTextAnnotation { annotation, .. } => annotation.len(),
         _ => 64,
     }
 }
@@ -117,6 +122,11 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
             // invoked tools: their names join usage so operators can see
             // (and price) per-invocation server tool activity.
             tool_names.push(call.name.clone());
+        }
+        // Hosted Responses tool items are provider-executed too; the item
+        // type ("web_search_call", "mcp_call", ...) names the activity.
+        Event::HostedToolItemCompleted { item_type, .. } if !tool_names.contains(item_type) => {
+            tool_names.push(item_type.clone());
         }
         _ => {}
     }

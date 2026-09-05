@@ -227,7 +227,9 @@ impl Failure {
                 // The generic boundary message is about to erase the specific
                 // parse-reject reason, so emit it once as a structured,
                 // content-free operator line (the crate's stderr idiom) before
-                // it is lost. The reason is always a static parser label, never
+                // it is lost. The reason is a static parser label, optionally
+                // carrying one provider discriminator (an item or event type)
+                // already reduced to a bounded identifier-shaped token, never
                 // provider payload, so it is safe to log.
                 let line = json!({
                     "event": "malformed_response_boundary",

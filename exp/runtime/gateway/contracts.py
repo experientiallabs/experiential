@@ -237,12 +237,14 @@ class GatewayMessage(ContractModel):
 
     Codex ships tool definitions and freeform tool history as native input
     items (``additional_tools``, ``custom_tool_call``,
-    ``custom_tool_call_output``) whose shapes cannot be expressed on any
-    other wire; the item is validated shallowly at decode and re-emitted
-    byte-for-byte at its position on native Responses rungs only. A message
-    carrying it carries nothing else. Excluded from serialization like the
-    other carriers so item-free digests are unperturbed; a present item
-    joins replay identity through :func:`canonical_request_sha256`.
+    ``custom_tool_call_output``), and hosted-tool turns echo their
+    provider-executed items (``web_search_call``, ``mcp_call``,
+    ``code_interpreter_call``, their outputs, ...); every such shape exists
+    on no other wire, so the item is validated shallowly at decode and
+    re-emitted byte-for-byte at its position on native Responses rungs only.
+    A message carrying it carries nothing else. Excluded from serialization
+    like the other carriers so item-free digests are unperturbed; a present
+    item joins replay identity through :func:`canonical_request_sha256`.
     """
     provider_anthropic_block: JsonObject | None = Field(default=None, exclude=True)
     """One verbatim Anthropic content block the gateway carries opaquely.

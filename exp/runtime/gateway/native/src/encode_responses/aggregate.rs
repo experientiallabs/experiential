@@ -12,7 +12,12 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     let output = usage.output_tokens.unwrap_or(0);
     json!({
         "input_tokens": input,
-        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens.unwrap_or(0)},
+        // `cache_write_tokens` joined the official shape (openai-python 3.x
+        // marks it required), so SDK-strict callers need it present.
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens.unwrap_or(0),
+            "cache_write_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
+        },
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
         "total_tokens": input + output,
@@ -71,10 +76,21 @@ pub fn completed_responses_body_with_carrier(
     }
     let mut tool_names = Vec::new();
     for event in events {
-        if let Event::ToolCallCompleted { call, .. } = event {
-            if !tool_names.contains(&call.name) {
-                tool_names.push(call.name.clone());
+        match event {
+            Event::ToolCallCompleted { call, .. } => {
+                if !tool_names.contains(&call.name) {
+                    tool_names.push(call.name.clone());
+                }
             }
+            // Hosted tool invocations are provider-executed but still
+            // invoked tools; their item type names the activity for the
+            // ledger, mirroring `track_event`.
+            Event::HostedToolItemCompleted { item_type, .. } => {
+                if !tool_names.contains(item_type) {
+                    tool_names.push(item_type.clone());
+                }
+            }
+            _ => {}
         }
     }
     if let Event::Failed(failure) = terminal {

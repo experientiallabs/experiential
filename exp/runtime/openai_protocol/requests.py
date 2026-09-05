@@ -62,6 +62,8 @@ from exp.runtime.openai_protocol.structured_text import (
     responses_structured_text,
 )
 from exp.runtime.openai_protocol.wire_models import (
+    HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
+    HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
     _AssistantToolCall,
     _ChatRequest,
@@ -70,6 +72,7 @@ from exp.runtime.openai_protocol.wire_models import (
     _CustomToolCallOutput,
     _EmbeddingsRequest,
     _FunctionCall,
+    _HostedToolItemEcho,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
@@ -480,6 +483,9 @@ _OUTPUT_ITEM_VARIANTS = {
     "additional_tools",
     "custom_tool_call",
     "custom_tool_call_output",
+    # Hosted-tool echo variants share the same union-branch label shape.
+    *HOSTED_TOOL_ITEM_TYPES_TOOL,
+    *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
 }
 
 
@@ -815,10 +821,15 @@ def _response_input_messages(
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(item, (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput)):
+        if isinstance(
+            item,
+            (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput, _HostedToolItemEcho),
+        ):
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
-            if isinstance(item, _CustomToolCall):
+            if isinstance(item, _HostedToolItemEcho):
+                native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
+            elif isinstance(item, _CustomToolCall):
                 native_role = "assistant"
             elif isinstance(item, _CustomToolCallOutput):
                 native_role = "tool"

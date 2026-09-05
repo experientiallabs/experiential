@@ -270,6 +270,12 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
     payloads_lock = threading.Lock()
     raw_arguments = '{ "query" : "λ" }'
     encrypted_content = "provider-opaque-state"
+    web_search_item: JsonObject = {
+        "id": "ws_provider",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract.
         """Return a tool turn first and visible text after its function output."""
@@ -292,10 +298,130 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
             isinstance(item, dict) and item.get("type") == "additional_tools"
             for item in input_items
         )
+        raw_tools = payload.get("tools", [])
+        web_search_declared = any(
+            isinstance(tool, dict) and tool.get("type") == "web_search"
+            for tool in (raw_tools if isinstance(raw_tools, list) else ())
+        )
+        hosted_echoed = any(
+            isinstance(item, dict) and item.get("type") == "web_search_call" for item in input_items
+        )
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if hosted_echoed:
+                # Turn 2 of the hosted lane: the continuation replayed the
+                # verbatim web_search_call item, so answer with plain text.
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_hosted_continued",
+                            "content_index": 0,
+                            "delta": "hosted-continued",
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "usage": {"input_tokens": 21, "output_tokens": 3},
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            if web_search_declared:
+                # Documented Responses web_search lifecycle: the added item,
+                # its status frames, the final item with its action, and a
+                # cited answer (openai-python 3.x stream-event union).
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": "ws_provider",
+                                "type": "web_search_call",
+                                "status": "in_progress",
+                            },
+                        }
+                    )
+                )
+                for status_event in (
+                    "response.web_search_call.in_progress",
+                    "response.web_search_call.searching",
+                    "response.web_search_call.completed",
+                ):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": status_event,
+                                "item_id": "ws_provider",
+                                "output_index": 0,
+                                "sequence_number": 3,
+                            }
+                        )
+                    )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": self.web_search_item,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 1,
+                            "item_id": "msg_cited",
+                            "content_index": 0,
+                            "delta": "Python 3.14.7.",
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.annotation.added",
+                            "output_index": 1,
+                            "item_id": "msg_cited",
+                            "content_index": 0,
+                            "annotation_index": 0,
+                            "annotation": {
+                                "type": "url_citation",
+                                "url": "https://www.python.org/doc/versions/",
+                                "title": "Python versions",
+                                "start_index": 0,
+                                "end_index": 14,
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "usage": {"input_tokens": 320, "output_tokens": 41},
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             if custom_tools:
                 # Exact live event shapes for a freeform custom tool call
                 # (captured from api.openai.com, 2026-08-30).
@@ -1528,3 +1654,89 @@ def test_custom_tool_calls_round_trip_through_the_native_responses_lane(
     assert len(upstream) == 1
     upstream_input = cast(list[JsonObject], upstream[0]["input"])
     assert upstream_input[0] == additional_tools
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_hosted_web_search_serves_and_continues_through_the_native_responses_lane(
+    responses_engine: _ServingEngine,
+    stream: bool,
+) -> None:
+    """Hosted web search serves end to end: the native web_search declaration
+    forwards verbatim, the provider's web_search_call item and its lifecycle
+    frames reach the caller intact with the answer's URL citation attached,
+    and a previous_response_id continuation replays the verbatim item.
+
+    Production incident (2026-09-04): the web_search_call output item killed
+    the stream as malformed_response post-dispatch across three orgs."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    headers = {"authorization": f"Bearer {responses_engine.raw_key}"}
+    first = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "input": "what is the current stable Python?",
+            "stream": stream,
+            "tools": [{"type": "web_search"}],
+        },
+        timeout=30.0,
+    )
+    first_body, first_events = _responses_result(first, stream=stream)
+    assert first_body["status"] == "completed"
+    first_output = cast(list[JsonObject], first_body["output"])
+    assert first_output[0] == _ResponsesUpstream.web_search_item
+    message = next(item for item in first_output if item["type"] == "message")
+    content = cast(list[JsonObject], message["content"])[0]
+    assert content["text"] == "Python 3.14.7."
+    annotations = cast(list[JsonObject], content["annotations"])
+    assert annotations[0]["type"] == "url_citation"
+    usage = cast(JsonObject, first_body["usage"])
+    assert usage["input_tokens"] == 320
+    if stream:
+        types = [payload["type"] for payload in first_events]
+        for lifecycle in (
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+            "response.web_search_call.completed",
+            "response.output_text.annotation.added",
+        ):
+            assert lifecycle in types, types
+        searching = next(
+            payload
+            for payload in first_events
+            if payload["type"] == "response.web_search_call.searching"
+        )
+        assert searching["item_id"] == "ws_provider"
+
+    second = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "previous_response_id": first_body["id"],
+            "input": "thanks, summarize",
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    second_body, _second_events = _responses_result(second, stream=stream)
+    assert second_body["status"] == "completed"
+    second_output = cast(list[JsonObject], second_body["output"])
+    assert any(
+        content.get("text") == "hosted-continued"
+        for item in second_output
+        if item["type"] == "message"
+        for content in cast(list[JsonObject], item["content"])
+    )
+    with _ResponsesUpstream.payloads_lock:
+        upstream = tuple(_ResponsesUpstream.payloads)
+    assert len(upstream) == 2
+    assert cast(list[JsonObject], upstream[0]["tools"])[-1] == {"type": "web_search"}
+    replay = cast(list[JsonObject], upstream[1]["input"])
+    hosted_replays = [item for item in replay if item.get("type") == "web_search_call"]
+    assert hosted_replays == [_ResponsesUpstream.web_search_item]
+    hosted_position = replay.index(_ResponsesUpstream.web_search_item)
+    message_echo = cast(JsonObject, replay[hosted_position + 1])
+    assert message_echo["type"] == "message"
+    assert message_echo["id"] == "msg_cited"

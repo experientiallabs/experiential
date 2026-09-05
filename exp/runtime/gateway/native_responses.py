@@ -380,6 +380,33 @@ def remember_turn(
                 ),
             )
         )
+    raw_hosted = data.get("hosted_items", [])
+    if not isinstance(raw_hosted, list):
+        raise ValueError("Responses hosted items must be an array")
+    for item in raw_hosted:
+        if not isinstance(item, dict):
+            raise ValueError("Responses hosted item must be an object")
+        output_index = item.get("output_index")
+        hosted_item = item.get("item")
+        if (
+            not isinstance(output_index, int)
+            or isinstance(output_index, bool)
+            or output_index < 0
+            or output_index in indexes
+            or not isinstance(hosted_item, dict)
+            or not isinstance(hosted_item.get("type"), str)
+            or not hosted_item["type"]
+        ):
+            raise ValueError("Responses hosted item identity is invalid")
+        indexes.add(output_index)
+        # A hosted tool item replays as the verbatim native item at its exact
+        # provider output position; only a native Responses rung can serve it.
+        indexed_natives.append(
+            (
+                output_index,
+                GatewayMessage(role="assistant", provider_native_item=hosted_item),
+            )
+        )
     raw_carrier = data.get("reasoning_content_carrier")
     sealed_carrier = None
     if raw_carrier is not None:

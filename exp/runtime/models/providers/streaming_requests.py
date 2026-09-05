@@ -843,12 +843,30 @@ def route_generation_parameter_requests(
     ):
         raise ProviderParameterError(
             message=(
-                "The request carries native Responses input items (tool namespaces or "
-                "custom tool calls) that only a native OpenAI Responses route can serve. "
+                "The request carries native Responses input items (tool namespaces, "
+                "custom tool calls, or hosted tool items such as web_search_call and "
+                "mcp_call echoes) that only a native OpenAI Responses route can serve. "
                 "Choose a different model alias."
             ),
             param="input",
             code="unsupported_parameter",
+        )
+    if (
+        request.maximum_output_tokens is not None
+        and request.maximum_output_tokens < 16
+        and all(profile.dialect == "openai_responses" for profile in profiles)
+    ):
+        # The provider's own 400 for this is post-dispatch and opaque on some
+        # relays; the documented Responses minimum is a request fact, so it is
+        # rejected at admission with the bound named.
+        parameter = request.maximum_output_tokens_parameter or "max_output_tokens"
+        raise ProviderParameterError(
+            message=(
+                f"The parameter {parameter!r} must be at least 16 on this model route "
+                "(the OpenAI Responses minimum). Raise the value and resend the request."
+            ),
+            param=parameter,
+            code="invalid_parameter",
         )
     if request.provider_native_tools and not all(
         profile.dialect == "openai_responses" for profile in profiles

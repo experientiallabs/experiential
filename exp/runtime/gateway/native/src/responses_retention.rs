@@ -31,6 +31,12 @@ struct RetainedReasoning {
     done: bool,
 }
 
+/// One hosted tool output item retained as its verbatim compact JSON so a
+/// `previous_response_id` continuation can replay it byte-for-byte.
+struct RetainedHostedItem {
+    item: String,
+}
+
 /// Aggregated assistant output tracked while relaying one Responses stream.
 #[derive(Default)]
 pub(crate) struct ResponsesRetention {
@@ -42,6 +48,7 @@ pub(crate) struct ResponsesRetention {
     completed_tools: BTreeSet<u32>,
     tool_statuses: BTreeMap<u32, ProviderOutputItemStatus>,
     reasoning: BTreeMap<u32, RetainedReasoning>,
+    hosted: BTreeMap<u32, RetainedHostedItem>,
     pub(crate) carrier_events: Vec<Event>,
     retained_bytes: usize,
     pub(crate) overflowed: bool,
@@ -61,6 +68,7 @@ impl ResponsesRetention {
             self.messages.clear();
             self.tool_calls.clear();
             self.reasoning.clear();
+            self.hosted.clear();
             self.carrier_events.clear();
             return;
         }
@@ -182,6 +190,17 @@ impl ResponsesRetention {
                 reasoning.item_id = item_id.clone();
                 reasoning.encrypted_content = encrypted_content.clone();
             }
+            // The final verbatim item (the `done` shape when it arrived, else
+            // the last-seen one) is what a continuation replays.
+            Event::HostedToolItemStarted {
+                output_index, item, ..
+            }
+            | Event::HostedToolItemCompleted {
+                output_index, item, ..
+            } => {
+                self.hosted
+                    .insert(*output_index, RetainedHostedItem { item: item.clone() });
+            }
             Event::Completed => self.finish_open_items(ProviderOutputItemStatus::Completed),
             Event::Incomplete | Event::Failed(_) => {
                 self.finish_open_items(ProviderOutputItemStatus::Incomplete);
@@ -241,6 +260,10 @@ pub(crate) fn remember_argument(
         })).collect::<Vec<Value>>(),
         "refusal": retention.refusal,
         "reasoning_content_carrier": reasoning_content_carrier,
+        "hosted_items": retention.hosted.iter().map(|(output_index, hosted)| json!({
+            "output_index": output_index,
+            "item": serde_json::from_str::<Value>(&hosted.item).unwrap_or(Value::Null),
+        })).collect::<Vec<Value>>(),
         "encrypted_reasoning": retention.reasoning.iter()
             .filter(|(_, reasoning)| !reasoning.encrypted_content.is_empty())
             .map(|(output_index, reasoning)| json!({
@@ -427,6 +450,51 @@ mod tests {
                 .expect("retention payload is JSON");
         assert_eq!(payload["tool_calls"][0]["namespace"], "collaboration");
         assert_eq!(payload["tool_calls"][0]["name"], "spawn_agent");
+    }
+
+    #[test]
+    fn hosted_items_retain_their_final_verbatim_json_at_their_index() {
+        let events = [
+            Event::HostedToolItemStarted {
+                output_index: 0,
+                item_id: "ws_1".to_string(),
+                item_type: "web_search_call".to_string(),
+                item: "{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}"
+                    .to_string(),
+            },
+            Event::HostedToolItemCompleted {
+                output_index: 0,
+                item_id: "ws_1".to_string(),
+                item_type: "web_search_call".to_string(),
+                item: "{\"id\":\"ws_1\",\"type\":\"web_search_call\",\"status\":\"completed\",\
+                       \"action\":{\"type\":\"search\",\"query\":\"pi\"}}"
+                    .to_string(),
+            },
+            Event::ProviderOutputItemStarted {
+                output_index: 1,
+                item_id: Some("msg_1".to_string()),
+                kind: ProviderOutputItemKind::Message,
+                status: None,
+                phase: None,
+            },
+            Event::ProviderTextDelta {
+                output_index: 1,
+                item_id: "msg_1".to_string(),
+                delta: "3.14159".to_string(),
+            },
+            Event::Completed,
+        ];
+        let mut retention = ResponsesRetention::default();
+        for event in &events {
+            retention.track(event);
+        }
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-ws", &retention, None))
+                .expect("retention payload is JSON");
+        assert_eq!(payload["hosted_items"][0]["output_index"], 0);
+        // The done-frame item (not the added one) is what a continuation replays.
+        assert_eq!(payload["hosted_items"][0]["item"]["action"]["query"], "pi");
+        assert_eq!(payload["message_outputs"][0]["item_id"], "msg_1");
     }
 
     #[test]
