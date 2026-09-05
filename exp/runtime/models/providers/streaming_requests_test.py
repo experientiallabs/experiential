@@ -4227,23 +4227,31 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
 
     # An all-empty cache-marked block run is the same empty turn (the blocks
     # must flatten to the content, so all-empty blocks imply empty content)
-    # and takes the same refusal instead of falling through to the builder.
-    marked = request.model_copy(
-        update={
-            "messages": (
-                GatewayMessage(role="user", content="hello"),
-                GatewayMessage(role="assistant", content="hi"),
-                GatewayMessage(
-                    role="user",
-                    content="",
-                    provider_text_blocks=({"type": "text", "text": ""},),
-                ),
-            )
-        }
-    )
-    with pytest.raises(ProviderParameterError) as rejected:
-        route_generation_parameter_requests((anthropic,), marked)
-    assert rejected.value.param == "messages"
+    # and takes the same refusal instead of falling through to the builder:
+    # the admission check keys on empty content alone, so cache markers on
+    # the empty blocks change nothing. The breakpoint migration cannot save
+    # this turn either (there is no retained block to carry the marker), so
+    # refusal is the only honest outcome.
+    for blocks in (
+        ({"type": "text", "text": ""},),
+        ({"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},),
+        (
+            {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": ""},
+        ),
+    ):
+        marked = request.model_copy(
+            update={
+                "messages": (
+                    GatewayMessage(role="user", content="hello"),
+                    GatewayMessage(role="assistant", content="hi"),
+                    GatewayMessage(role="user", content="", provider_text_blocks=blocks),
+                )
+            }
+        )
+        with pytest.raises(ProviderParameterError) as rejected:
+            route_generation_parameter_requests((anthropic,), marked)
+        assert rejected.value.param == "messages"
 
     # A non-Anthropic route keeps serving the shape it can carry.
     chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
