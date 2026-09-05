@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 __version__: str
+supports_request_context: bool
 
 class _ControlPlane(Protocol):
     """The callback surface the data plane requires (see NativeControlPlane)."""
@@ -26,6 +27,11 @@ class _ControlPlane(Protocol):
     def readiness(self, argument: str) -> str: ...
     def close_thread_resources(self, argument: str) -> str: ...
 
+class _ContextControlPlane(Protocol):
+    """Optional host wrapper for native callbacks, including absent context."""
+
+    def call_with_context(self, method: str, argument: str, context: str | None) -> str: ...
+
 class ShutdownHandle:
     """Embedder-owned stop signal for one `serve` call."""
 
@@ -33,7 +39,7 @@ class ShutdownHandle:
 
 def shutdown_handle() -> ShutdownHandle: ...
 def serve(
-    control_plane: _ControlPlane,
+    control_plane: _ControlPlane | _ContextControlPlane,
     config_json: str,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
