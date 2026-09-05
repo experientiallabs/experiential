@@ -3779,6 +3779,8 @@ def test_plaintext_reasoning_prefers_the_exposing_rung_on_a_mixed_waterfall() ->
     # Without plaintext history both rungs are exact and the order is preserved.
     plain = request.model_copy(update={"messages": (GatewayMessage(role="user", content="hi"),)})
     assert compatible_generation_parameter_profile_indexes(profiles, plain) == (0, 1)
+
+
 def test_hosted_tool_echoes_require_a_homogeneous_responses_route_and_reemit_verbatim() -> None:
     """Echoed hosted-tool items (web_search_call, mcp_call, their outputs)
     forward byte-for-byte on native Responses rungs at their exact position;
