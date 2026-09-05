@@ -382,7 +382,7 @@ The `capability_parity` row reports the per-release forced-choice fact as
 `developer` message is emitted as `system` without disclosure: OpenAI defines the two roles
 identically (developer-provided instructions the model follows regardless of user messages),
 while the third-party servers behind that dialect enumerate only the classic roles and reject
-`developer` by name; the native Responses wire keeps the role it defines. On a reasoning route that accepts sampling only at `reasoning_effort=none`
+`developer` by name; the native Responses wire keeps the role it defines. The Anthropic wire also rejects an empty text block anywhere and a turn whose text is all whitespace, while it accepts an empty assistant content array in any position (verified live 2026-09-05): an assistant turn with no readable text dispatches as an empty array, a system prompt with none is omitted, empty blocks inside richer turns drop with their cache breakpoints migrated, and an empty or whitespace-only user turn (which no array form can carry) is refused by name before dispatch. On a reasoning route that accepts sampling only at `reasoning_effort=none`
 (`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
 reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the

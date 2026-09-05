@@ -28,7 +28,10 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_reasoning_effort,
     anthropic_thinking_budget_tokens,
 )
-from exp.runtime.models.providers.wire_messages import anthropic_blocks
+from exp.runtime.models.providers.wire_messages import (
+    anthropic_blocks,
+    retained_cache_marked_blocks,
+)
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 
@@ -135,9 +138,19 @@ def anthropic_messages_stream_payload(
                         dict(block),
                         separated=(part_leads if position == 0 else inner_separated),
                     )
-            payload["system"] = system_blocks
+            # The wire rejects an empty system text block anywhere and a
+            # system prompt whose text is all whitespace ("system: text
+            # content blocks must be non-empty" / "must contain non-whitespace
+            # text", verified live 2026-09-05). Empty blocks drop with their
+            # breakpoints migrated; a prompt left with no readable text is
+            # omitted, since an absent system field is what it says.
+            retained_system = retained_cache_marked_blocks(system_blocks)
+            if any(str(block.get("text", "")).strip() for block in retained_system):
+                payload["system"] = retained_system
         else:
-            payload["system"] = "\n\n".join(content for content, _ in system_parts)
+            joined_system = "\n\n".join(content for content, _ in system_parts)
+            if joined_system.strip():
+                payload["system"] = joined_system
     if request.tools:
         tools: list[JsonObject] = []
         for tool in request.tools:

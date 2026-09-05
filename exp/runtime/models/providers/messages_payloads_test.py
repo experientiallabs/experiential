@@ -148,3 +148,57 @@ def test_strict_tools_with_unsupported_keywords_decline_as_strict_tools() -> Non
     tools = payload["tools"]
     assert isinstance(tools, list)
     assert tools[0]["strict"] is True
+
+
+def test_system_prompts_with_no_readable_text_are_omitted() -> None:
+    """The wire rejects an empty system text block and an all-whitespace
+    system prompt ("system: text content blocks must be non-empty" / "must
+    contain non-whitespace text", live 2026-09-05); a prompt with nothing to
+    read is omitted, and a readable one keeps its exact bytes."""
+
+    def payload_for(*system: GatewayMessage) -> JsonObject:
+        """Build the Anthropic payload for ``system`` turns plus one user turn."""
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(*system, GatewayMessage(role="user", content="hi")),
+            stream=True,
+            include_usage=True,
+        )
+        return anthropic_messages_stream_payload("claude-fable-5-1", request)
+
+    assert "system" not in payload_for(GatewayMessage(role="system", content=""))
+    assert "system" not in payload_for(GatewayMessage(role="system", content="  \n"))
+    assert "system" not in payload_for(
+        GatewayMessage(role="system", content="  "), GatewayMessage(role="system", content="")
+    )
+    # Whitespace beside real instructions is accepted, so the joined bytes stay exact.
+    assert (
+        payload_for(
+            GatewayMessage(role="system", content="  "),
+            GatewayMessage(role="system", content="rules"),
+        )["system"]
+        == "  \n\nrules"
+    )
+    # A cache-marked run drops its empty blocks with the breakpoint migrated.
+    marked = payload_for(
+        GatewayMessage(
+            role="system",
+            content="rules",
+            provider_text_blocks=(
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "rules"},
+            ),
+        )
+    )
+    assert marked["system"] == [
+        {"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert "system" not in payload_for(
+        GatewayMessage(
+            role="system",
+            content="",
+            provider_text_blocks=(
+                {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+            ),
+        )
+    )
