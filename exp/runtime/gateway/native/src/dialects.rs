@@ -263,15 +263,25 @@ fn complete_streamed_tool(
         });
     }
     let call = tool.complete().map_err(|message| {
-        // The offending bytes never join the failure (they flow to the
-        // ledger through provider_detail); one bounded escaped prefix goes
-        // to the operator log so the next unparsable argument shape is
-        // diagnosable without a live capture.
+        // The offending bytes are never logged (tool arguments are model
+        // output and can carry tenant content): the reason keeps serde's
+        // positional parse description, and the operator line adds the tool
+        // name, size, and a non-reversible digest so identical unparsable
+        // shapes correlate across requests without a live capture.
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(tool.raw_arguments.as_bytes());
+            hash.iter().take(8).fold(String::new(), |mut out, byte| {
+                out.push_str(&format!("{byte:02x}"));
+                out
+            })
+        };
         let line = serde_json::json!({
             "event": "malformed_tool_arguments",
             "name": tool.name,
             "bytes": tool.raw_arguments.len(),
-            "prefix": tool.raw_arguments.chars().take(48).collect::<String>(),
+            "digest": digest,
+            "reason": message,
         });
         eprintln!("exp-gateway-native: {line}");
         malformed(&format!("{message} ({} bytes)", tool.raw_arguments.len()))

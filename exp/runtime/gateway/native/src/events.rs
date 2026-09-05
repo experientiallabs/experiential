@@ -648,11 +648,17 @@ pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
 }
 
 /// Validate one raw tool-argument accumulation as a single JSON object.
+///
+/// The parse-failure reason carries serde's positional description (token
+/// category and line/column, never input bytes), so an unparsable shape is
+/// diagnosable from the boundary log without ever logging payload.
 pub fn require_json_object_text(raw: &str) -> Result<(), String> {
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Object(_)) => Ok(()),
         Ok(_) => Err("streamed tool arguments must decode to an object".to_string()),
-        Err(_) => Err("streamed tool arguments are not valid JSON".to_string()),
+        Err(error) => Err(format!(
+            "streamed tool arguments are not valid JSON: {error}"
+        )),
     }
 }
 

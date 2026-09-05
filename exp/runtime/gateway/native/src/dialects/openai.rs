@@ -755,9 +755,17 @@ impl Normalizer {
                     });
                 }
                 events.extend(self.openai_sweep_hosted_items());
-                // An incomplete terminal is the provider's own output-budget
-                // cut, mirroring the Chat lane's finish_reason=length: a call
-                // still open mid-fragment is dropped, never a 502.
+                // Every incomplete terminal is the provider declaring it cut
+                // the output early, so a call still open mid-fragment is
+                // legitimately partial for ANY of its reasons: a budget cut
+                // surfaces Incomplete (the Chat lane's finish_reason=length
+                // contract), and a content_filter/safety or unknown-reason
+                // cut still reaches its own refusal or provider_internal
+                // terminal below instead of being pre-empted here as a
+                // malformed 502 (which would misclassify a refusal and churn
+                // the ladder). Only a COMPLETED response keeps the strict
+                // argument contract, so corruption in a served answer stays
+                // fail-closed.
                 events.extend(if is_incomplete {
                     finish_open_tools_truncated(&mut self.tools)?
                 } else {
