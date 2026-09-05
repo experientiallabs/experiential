@@ -260,7 +260,7 @@ class ResponsesSseEncoder:
         *,
         request_id: str,
         model: str,
-        created_at: float,
+        created_at: int,
         request: GatewayRequest,
     ) -> None:
         """Initialize one Responses stream and its request-reflecting envelope."""

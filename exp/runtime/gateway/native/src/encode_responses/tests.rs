@@ -10,14 +10,14 @@ fn ignored_generation_controls_are_disclosed_by_responses_encoder() {
         ..ResponsesEnvelope::default()
     };
     let mut encoder =
-        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000.0, envelope.clone());
+        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000, envelope.clone());
     let frames = encoder.start().expect("stream start must encode");
     assert!(frames[0].contains("\"x-experiential-ignored-parameters\":[\"top_k\"]"));
 
     let completed = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         envelope,
         &[Event::Completed],
     )
@@ -33,7 +33,7 @@ fn thinking_deltas_project_onto_reasoning_summary_parts() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -100,7 +100,7 @@ fn fireworks_responses_reasoning_round_trips_as_encrypted_content() {
         ..ResponsesEnvelope::default()
     };
     let mut encoder =
-        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000.0, envelope.clone());
+        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000, envelope.clone());
     encoder.start().expect("stream start must encode");
     encoder
         .set_reasoning_content_carrier("authenticated-carrier-v2".to_string())
@@ -116,7 +116,7 @@ fn fireworks_responses_reasoning_round_trips_as_encrypted_content() {
     let completed = completed_responses_body_with_carrier(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         envelope,
         &events,
         Some("authenticated-carrier-v2"),
@@ -137,7 +137,7 @@ fn fireworks_responses_reasoning_fails_closed_without_a_sealed_carrier() {
     assert!(completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &fireworks_tool_events(),
     )
@@ -207,7 +207,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
     let completed = completed_responses_body_with_carrier(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
         Some("authenticated-carrier-v2"),
@@ -240,7 +240,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
     let completed = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         public_envelope.clone(),
         &[
             Event::ReasoningSummaryDelta {
@@ -272,7 +272,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
     let bare = completed_responses_body(
         "request-2",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         public_envelope,
         &[
             Event::EncryptedReasoning {
@@ -292,7 +292,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
     let hidden = completed_responses_body(
         "request-3",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &[
             Event::EncryptedReasoning {
@@ -312,7 +312,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
         let mut encoder = ResponsesSseEncoder::new(
             "request-stream",
             "coding",
-            1_700_000_000.0,
+            1_700_000_000,
             ResponsesEnvelope {
                 include_encrypted_reasoning,
                 ..ResponsesEnvelope::default()
@@ -401,7 +401,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
     let completed = completed_responses_body(
         "request-provider-order",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
@@ -415,7 +415,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-provider-order",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream starts");
@@ -538,7 +538,7 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
     let completed = completed_responses_body(
         "request-provider-fields",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope {
             include_encrypted_reasoning: true,
             ..ResponsesEnvelope::default()
@@ -560,7 +560,7 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-provider-fields",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     let mut frames = encoder.start().expect("stream starts");
@@ -607,7 +607,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -629,7 +629,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
     let completed = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
@@ -643,7 +643,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
     let plain = completed_responses_body(
         "request-2",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &[
             Event::ToolCallStarted {
@@ -690,7 +690,7 @@ fn hosted_tool_items_reemit_verbatim_at_remapped_indexes() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -781,7 +781,7 @@ fn completed_body_serves_hosted_items_in_order() {
     let aggregated = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
@@ -800,7 +800,7 @@ fn provider_annotations_attach_to_the_message_text_part() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -870,7 +870,7 @@ fn hosted_non_call_items_never_join_the_ledger_tool_names() {
     let aggregated = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
@@ -920,7 +920,7 @@ fn caller_attributed_tool_call_items_re_emit_caller_to_the_caller() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -942,7 +942,7 @@ fn caller_attributed_tool_call_items_re_emit_caller_to_the_caller() {
     let completed = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
