@@ -7,6 +7,32 @@ use super::{complete_streamed_tool, malformed, parse_object, refusal_failure, No
 use crate::errors::{Failure, FailureClass};
 use crate::events::{bedrock_usage, require_string, require_u64, Event, ToolAccumulator};
 
+/// The bounded single-line detail of one Bedrock exception frame.
+///
+/// Exception messages name the mechanism (model stream errors, service
+/// unavailability) that the typed class alone cannot; the detail is attached
+/// only to stream-failure classes that never relay `provider_detail` to
+/// callers, so it reaches the ledger without widening the caller-facing
+/// sanitization boundary.
+fn bedrock_exception_detail(frame: &crate::sse::SseEvent) -> Option<String> {
+    let message = serde_json::from_str::<Value>(&frame.data)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let detail = super::provider_error_detail(None, message.as_deref());
+    if let Some(detail) = &detail {
+        // The same structured operator line the other dialects emit, so a
+        // Bedrock-declared failure is equally visible in the immediate
+        // diagnostic stream.
+        super::log_provider_declared_failure("bedrock_converse_stream", detail);
+    }
+    detail
+}
+
 impl Normalizer {
     /// Normalize one Bedrock ConverseStream frame, mirroring the python
     /// `BedrockProviderStream._decode` mapper: tool calls stream as indexed
@@ -32,20 +58,20 @@ impl Normalizer {
                 Ok(Vec::new())
             }
             "metadata" => self.bedrock_metadata(frame),
-            "throttlingException" => Ok(vec![Event::Failed(Failure::new(
-                FailureClass::Throttled,
-                "provider throttled the request",
-            ))]),
-            "modelTimeoutException" => Ok(vec![Event::Failed(Failure::new(
-                FailureClass::Timeout,
-                "provider request timed out",
-            ))]),
+            "throttlingException" => Ok(vec![Event::Failed(
+                Failure::new(FailureClass::Throttled, "provider throttled the request")
+                    .with_provider_detail(bedrock_exception_detail(frame)),
+            )]),
+            "modelTimeoutException" => Ok(vec![Event::Failed(
+                Failure::new(FailureClass::Timeout, "provider request timed out")
+                    .with_provider_detail(bedrock_exception_detail(frame)),
+            )]),
             "internalServerException"
             | "modelStreamErrorException"
-            | "serviceUnavailableException" => Ok(vec![Event::Failed(Failure::new(
-                FailureClass::ProviderInternal,
-                "provider stream failed",
-            ))]),
+            | "serviceUnavailableException" => Ok(vec![Event::Failed(
+                Failure::new(FailureClass::ProviderInternal, "provider stream failed")
+                    .with_provider_detail(bedrock_exception_detail(frame)),
+            )]),
             "validationException" => Ok(vec![Event::Failed(Failure::new(
                 FailureClass::InvalidRequest,
                 "provider rejected the request",
