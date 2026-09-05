@@ -69,6 +69,7 @@ def anthropic_messages_stream_payload(
     del supports_logprobs
     system_parts: list[tuple[str, tuple[JsonObject, ...]]] = []
     messages: list[JsonObject] = []
+    displaced_marker: JsonObject | None = None
     for message in request.messages:
         if message.role in {"system", "developer"}:
             if message.content is None:
@@ -92,6 +93,20 @@ def anthropic_messages_stream_payload(
                 system_parts.append((message.content, message.provider_text_blocks))
             continue
         role, blocks = anthropic_blocks(message)
+        if not blocks:
+            # An assistant turn with no readable text dispatches as an empty
+            # array (accepted live) and so has no block of its own to carry a
+            # caller cache marker. The breakpoint migrates across the turn
+            # boundary by the same rule the block-run helper applies within a
+            # turn: onto the closest retained block before it (the empty turn
+            # adds no readable bytes, so the cached prefix is the same one),
+            # else onto the first retained block after it.
+            marker = _cache_marker(message.provider_text_blocks)
+            if marker is not None and not _mark_last_block(messages, marker):
+                displaced_marker = marker
+        elif displaced_marker is not None:
+            blocks = _mark_first_block(blocks, displaced_marker)
+            displaced_marker = None
         if messages and messages[-1].get("role") == role:
             existing = messages[-1].get("content")
             if not isinstance(existing, list):
@@ -295,6 +310,50 @@ def anthropic_messages_stream_payload(
         payload["stop_sequences"] = list(request.stop)
     _require_forced_tool_choice_support(model_id, request, payload)
     return payload
+
+
+_UNMARKABLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+"""Content block types the wire refuses to carry a ``cache_control`` marker on."""
+
+
+def _cache_marker(blocks: tuple[JsonObject, ...]) -> JsonObject | None:
+    """Return the first caller cache marker in a block run, if any."""
+    for block in blocks:
+        marker = block.get("cache_control")
+        if isinstance(marker, dict):
+            return marker
+    return None
+
+
+def _mark_last_block(messages: list[JsonObject], marker: JsonObject) -> bool:
+    """Attach ``marker`` to the last emitted block that can carry one.
+
+    Returns:
+        Whether a block took the marker; a block already marked counts, since
+        one marker per boundary suffices.
+    """
+    if not messages:
+        return False
+    content = messages[-1].get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    last = content[-1]
+    if not isinstance(last, dict) or last.get("type") in _UNMARKABLE_BLOCK_TYPES:
+        return False
+    if "cache_control" not in last:
+        content[-1] = {**last, "cache_control": marker}
+    return True
+
+
+def _mark_first_block(blocks: list[JsonObject], marker: JsonObject) -> list[JsonObject]:
+    """Return ``blocks`` with ``marker`` on the first block that can carry one."""
+    for index, block in enumerate(blocks):
+        if block.get("type") in _UNMARKABLE_BLOCK_TYPES:
+            continue
+        if "cache_control" not in block:
+            return [*blocks[:index], {**block, "cache_control": marker}, *blocks[index + 1 :]]
+        return blocks
+    return blocks
 
 
 def _require_forced_tool_choice_support(

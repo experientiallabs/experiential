@@ -245,11 +245,15 @@ def _definition_name(reference: str) -> str | None:
 
     A pointer that descends past the definition (``#/$defs/node/properties/child``)
     still depends on that definition, so only the first path segment names the
-    graph node; a self-reference through such a pointer is a cycle too.
+    graph node; a self-reference through such a pointer is a cycle too. The
+    segment is a JSON Pointer token (RFC 6901), so ``~1`` and ``~0`` decode to
+    ``/`` and ``~`` after the split, and the result matches the raw
+    ``$defs`` key of a definition whose name carries those characters.
     """
     for prefix in ("#/$defs/", "#/definitions/"):
         if reference.startswith(prefix):
-            name = reference[len(prefix) :].split("/", 1)[0]
+            token = reference[len(prefix) :].split("/", 1)[0]
+            name = token.replace("~1", "/").replace("~0", "~")
             return name or None
     return None
 

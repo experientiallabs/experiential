@@ -172,6 +172,35 @@ def test_strict_validator_limitations_are_found_structurally(
     assert anthropic_strict_schema_unsupported(schema) == reason
 
 
+def test_escaped_pointer_tokens_resolve_to_their_definitions() -> None:
+    """RFC 6901 escapes (``~1`` for ``/``, ``~0`` for ``~``) decode after the
+    split, so a recursive definition whose name carries those characters is
+    still a cycle; a non-recursive escaped name passes."""
+    slash_cycle = _object(
+        {"v": {"$ref": "#/$defs/a~1b"}},
+        **{
+            "$defs": {
+                "a/b": {
+                    "type": "object",
+                    "properties": {"again": {"$ref": "#/$defs/a~1b/properties/again"}},
+                    "additionalProperties": False,
+                }
+            }
+        },
+    )
+    assert anthropic_strict_schema_unsupported(slash_cycle) == "recursive $ref"
+    tilde_cycle = _object(
+        {"v": {"$ref": "#/definitions/x~0y"}},
+        definitions={"x~y": {"anyOf": [{"type": "string"}, {"$ref": "#/definitions/x~0y"}]}},
+    )
+    assert anthropic_strict_schema_unsupported(tilde_cycle) == "recursive $ref"
+    acyclic = _object(
+        {"v": {"$ref": "#/$defs/a~1b"}},
+        **{"$defs": {"a/b": {"type": "string"}}},
+    )
+    assert anthropic_strict_schema_unsupported(acyclic) is None
+
+
 def test_limitations_are_found_inside_nested_containers() -> None:
     """The walk reaches properties, items, $defs, anyOf/allOf, and additionalProperties."""
     nested = _object(

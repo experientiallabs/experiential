@@ -202,3 +202,85 @@ def test_system_prompts_with_no_readable_text_are_omitted() -> None:
             ),
         )
     )
+
+
+def test_a_marker_on_a_collapsed_assistant_turn_moves_to_a_neighboring_block() -> None:
+    """A whitespace-only assistant run that carried a cache breakpoint has no
+    block of its own once it dispatches as an empty array, so the marker lands
+    on the closest retained block before it, or on the first block after it
+    when nothing precedes, and never on a thinking block."""
+    marked_blank: tuple[JsonObject, ...] = (
+        {"type": "text", "text": " \n", "cache_control": {"type": "ephemeral"}},
+    )
+
+    def payload_for(*messages: GatewayMessage) -> list[JsonObject]:
+        """Return the emitted Anthropic messages for ``messages``."""
+        request = GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=messages,
+            stream=True,
+            include_usage=True,
+        )
+        built = anthropic_messages_stream_payload("claude-fable-5-1", request)["messages"]
+        assert isinstance(built, list)
+        return built
+
+    before = payload_for(
+        GatewayMessage(role="user", content="hello"),
+        GatewayMessage(role="assistant", content=" \n", provider_text_blocks=marked_blank),
+        GatewayMessage(role="user", content="continue"),
+    )
+    assert before[0]["content"] == [
+        {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert before[1] == {"role": "assistant", "content": []}
+    assert before[2]["content"] == [{"type": "text", "text": "continue"}]
+
+    after = payload_for(
+        GatewayMessage(role="assistant", content=" \n", provider_text_blocks=marked_blank),
+        GatewayMessage(role="user", content="continue"),
+    )
+    assert after[0] == {"role": "assistant", "content": []}
+    assert after[1]["content"] == [
+        {"type": "text", "text": "continue", "cache_control": {"type": "ephemeral"}}
+    ]
+
+    # A block that already carries a marker keeps its own (one per boundary),
+    # and a whitespace run beside a tool call is not collapsed at all, so its
+    # marker stays where the caller put it.
+    already = payload_for(
+        GatewayMessage(
+            role="user",
+            content="hello",
+            provider_text_blocks=(
+                {
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ),
+        ),
+        GatewayMessage(role="assistant", content=" \n", provider_text_blocks=marked_blank),
+        GatewayMessage(role="user", content="continue"),
+    )
+    assert already[0]["content"] == [
+        {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    ]
+    from exp.runtime.gateway.contracts import ToolCall
+
+    beside_tool = payload_for(
+        GatewayMessage(role="user", content="hello"),
+        GatewayMessage(
+            role="assistant",
+            content=" \n",
+            provider_text_blocks=marked_blank,
+            tool_calls=(
+                ToolCall(call_id="call-1", name="lookup", arguments={}, raw_arguments="{}"),
+            ),
+        ),
+        GatewayMessage(role="tool", content="found", tool_call_id="call-1"),
+    )
+    assert beside_tool[1]["content"] == [
+        {"type": "text", "text": " \n", "cache_control": {"type": "ephemeral"}},
+        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+    ]

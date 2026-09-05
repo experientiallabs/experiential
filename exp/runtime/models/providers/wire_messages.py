@@ -357,7 +357,9 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         # fable-5-1 and sonnet-4-6). An assistant turn that carries only
         # empty or whitespace text therefore dispatches as an empty array:
         # the turn stays in place, so conversation structure is preserved,
-        # and nothing the model could read is lost.
+        # and nothing the model could read is lost. A cache marker on the
+        # dropped run is re-homed by the payload builder onto the closest
+        # retained block of a neighboring turn.
         blocks = []
     return "assistant", blocks
 
