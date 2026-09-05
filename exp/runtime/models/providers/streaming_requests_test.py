@@ -4232,14 +4232,15 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
     # the empty blocks change nothing. The breakpoint migration cannot save
     # this turn either (there is no retained block to carry the marker), so
     # refusal is the only honest outcome.
-    for blocks in (
+    block_runs: tuple[tuple[JsonObject, ...], ...] = (
         ({"type": "text", "text": ""},),
         ({"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},),
         (
             {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": ""},
         ),
-    ):
+    )
+    for blocks in block_runs:
         marked = request.model_copy(
             update={
                 "messages": (
