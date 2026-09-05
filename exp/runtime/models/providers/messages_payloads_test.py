@@ -245,6 +245,23 @@ def test_a_marker_on_a_collapsed_assistant_turn_moves_to_a_neighboring_block() -
         {"type": "text", "text": "continue", "cache_control": {"type": "ephemeral"}}
     ]
 
+    # Consecutive collapsed turns sit on one boundary: both markers land on
+    # the same earlier block, none defers forward to a later, larger prefix.
+    consecutive = payload_for(
+        GatewayMessage(role="user", content="hello"),
+        GatewayMessage(role="assistant", content=" \n", provider_text_blocks=marked_blank),
+        GatewayMessage(role="assistant", content=" \n", provider_text_blocks=marked_blank),
+        GatewayMessage(role="user", content="continue"),
+    )
+    assert consecutive == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}],
+        },
+        {"role": "assistant", "content": []},
+        {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+    ]
+
     # A block that already carries a marker keeps its own (one per boundary),
     # and a whitespace run beside a tool call is not collapsed at all, so its
     # marker stays where the caller put it.

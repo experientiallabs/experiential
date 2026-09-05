@@ -326,23 +326,30 @@ def _cache_marker(blocks: tuple[JsonObject, ...]) -> JsonObject | None:
 
 
 def _mark_last_block(messages: list[JsonObject], marker: JsonObject) -> bool:
-    """Attach ``marker`` to the last emitted block that can carry one.
+    """Attach ``marker`` to the closest earlier emitted block that can carry one.
+
+    Collapsed (empty) turns are skipped on the way back: consecutive empty
+    assistant turns all sit on the same cache boundary, so every marker they
+    carried collapses onto the same retained block instead of deferring to a
+    later one, which would cache a larger prefix than the caller asked for.
 
     Returns:
         Whether a block took the marker; a block already marked counts, since
         one marker per boundary suffices.
     """
-    if not messages:
-        return False
-    content = messages[-1].get("content")
-    if not isinstance(content, list) or not content:
-        return False
-    last = content[-1]
-    if not isinstance(last, dict) or last.get("type") in _UNMARKABLE_BLOCK_TYPES:
-        return False
-    if "cache_control" not in last:
-        content[-1] = {**last, "cache_control": marker}
-    return True
+    for emitted in reversed(messages):
+        content = emitted.get("content")
+        if not isinstance(content, list):
+            return False
+        if not content:
+            continue
+        last = content[-1]
+        if not isinstance(last, dict) or last.get("type") in _UNMARKABLE_BLOCK_TYPES:
+            return False
+        if "cache_control" not in last:
+            content[-1] = {**last, "cache_control": marker}
+        return True
+    return False
 
 
 def _mark_first_block(blocks: list[JsonObject], marker: JsonObject) -> list[JsonObject]:
