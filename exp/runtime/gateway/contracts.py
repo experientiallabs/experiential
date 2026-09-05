@@ -247,6 +247,17 @@ class GatewayMessage(ContractModel):
     excluded from serialization like the other replay carriers, joining
     replay identity explicitly through :func:`canonical_request_sha256`.
     """
+    provider_tool_caller: JsonObject | None = Field(default=None, exclude=True)
+    """Opaque SDK 3.0 ``caller`` attribution on a ``function_call_output``.
+
+    Programmatic tool calling attributes the result to the program that
+    invoked the call; the object's internal shape is an evolving provider
+    surface, so it is validated only as an object and re-emitted verbatim on
+    the rebuilt item (mirroring ``ToolCall.provider_caller`` on the call
+    side). Excluded from serialization like the other replay carriers,
+    joining replay identity explicitly through
+    :func:`canonical_request_sha256`.
+    """
     provider_native_item: JsonObject | None = Field(default=None, exclude=True)
     """One verbatim OpenAI Responses input item the gateway carries opaquely.
 
@@ -372,7 +383,9 @@ class GatewayMessage(ContractModel):
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
         if self.role != "tool" and (
-            self.provider_tool_name is not None or self.provider_tool_namespace is not None
+            self.provider_tool_name is not None
+            or self.provider_tool_namespace is not None
+            or self.provider_tool_caller is not None
         ):
             raise ValueError("tool-result attribution is valid only for tool messages")
         if self.role != "tool" and self.tool_is_error:

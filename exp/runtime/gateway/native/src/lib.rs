@@ -452,6 +452,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("namespace")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                caller: object
+                    .get("caller")
+                    .filter(|value| value.is_object())
+                    .cloned(),
             },
             "tool_arguments_delta" => events::Event::ToolArgumentsDelta { index, delta: text },
             "tool_call_completed" => events::Event::ToolCallCompleted {
@@ -471,6 +475,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .get("namespace")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string),
+                    caller: object
+                        .get("caller")
+                        .filter(|value| value.is_object())
+                        .cloned(),
                     provider_item_id: object
                         .get("item_id")
                         .and_then(serde_json::Value::as_str)
@@ -526,6 +534,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .unwrap_or("")
                         .to_string(),
                     namespace: None,
+                    caller: None,
                     name: object
                         .get("name")
                         .and_then(serde_json::Value::as_str)

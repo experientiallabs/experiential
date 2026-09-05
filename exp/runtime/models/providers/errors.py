@@ -95,15 +95,20 @@ class UnsupportedReasoningEffortError(ProviderParameterError):
             supported_efforts: Ordered effort values accepted by every route deployment.
             param: Public request path carrying the unsupported value.
         """
+        # "effort parameter" + "not supported" is deliberate phrasing: Claude
+        # Code's built-in recovery latch drops output_config.effort and
+        # retries only when the 400 message matches that predicate; any other
+        # wording turns a gracefully degradable condition into a wedged
+        # session (issue #795).
         if supported_efforts:
             choices = ", ".join(repr(value) for value in supported_efforts)
             message = (
-                f"Reasoning effort {effort!r} is not supported by this model route. "
-                f"Supported values: {choices}."
+                f"The effort parameter value {effort!r} is not supported by this model "
+                f"route. Supported values: {choices}."
             )
         else:
             message = (
-                f"The parameter {param!r} is not supported by this model route. "
+                f"The effort parameter ({param!r}) is not supported by this model route. "
                 "Remove the field or choose a different model."
             )
         super().__init__(message=message, param=param, code="unsupported_parameter")

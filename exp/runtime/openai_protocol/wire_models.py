@@ -612,6 +612,11 @@ class _ResponseFunctionCall(_WireModel):
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 programmatic tool-calling attribution (for example
+    ``{"type": "program", "id": ...}``); an evolving provider surface, so it
+    is validated only as an object and round-trips verbatim like
+    ``namespace``."""
     arguments: str = Field(max_length=4_000_000)
     status: _EchoedItemStatus | None = None
 
@@ -624,13 +629,23 @@ class _ResponseFunctionOutput(_WireModel):
     ``name`` and ``namespace`` attribute the result to a namespaced tool
     (Codex serializes both on outputs of namespaced calls) and round-trip
     verbatim like the sibling ``function_call`` namespace.
+
+    ``output`` is the SDK union: plain text, or an ordered list of content
+    parts for tools that return images beside text. The decoder maps a part
+    list onto the canonical tool message's content parts (text and image
+    only, the tool-message contract); any other part kind is rejected by
+    name rather than dropped.
     """
 
     type: Literal["function_call_output"]
     call_id: str = Field(min_length=1, max_length=256)
     name: str | None = Field(default=None, min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
-    output: str
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 attribution of this result to the program that invoked
+    the call; validated only as an object and round-tripped verbatim like the
+    sibling ``function_call`` caller."""
+    output: str | tuple[_ContentPart, ...]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 
@@ -659,11 +674,20 @@ class _ResponseReasoningItem(_WireModel):
     reasoning output items with an explicit ``content: null`` (captured
     live 2026-08-29); the provider accepts that null while rejecting a
     null ``summary``, so exactly ``content`` is nullable here.
+
+    ``encrypted_content`` itself is OPTIONAL, as the SDK marks it: a
+    ``store: true`` flow replays reasoning by item id alone and the
+    provider resolves it from stored state. An id-only item is carried
+    verbatim to homogeneous native Responses routes (the only wire that
+    can resolve the id) and the provider judges resolvability with its own
+    error — the hosted-item posture. That provider behavior is documented
+    from the SDK contract, not verified live (no key in the development
+    environment, 2026-09-05).
     """
 
     type: Literal["reasoning"]
     id: str = Field(min_length=1, max_length=256)
-    encrypted_content: str = Field(min_length=1)
+    encrypted_content: str | None = Field(default=None, min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
     content: tuple[_ReasoningTextPart, ...] | None = None
     status: _EchoedItemStatus | None = None
@@ -749,6 +773,9 @@ class _CustomToolCall(_WireModel):
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 programmatic tool-calling attribution, forwarded
+    verbatim with the rest of the raw item like ``namespace``."""
     input: str = Field(max_length=4_000_000)
 
 

@@ -7,6 +7,7 @@ from typing import Literal
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
+from exp.common.models.content import MessageContentPart
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayMessage,
@@ -54,7 +55,9 @@ class ReplayedFunctionOutput:
     """One validated function result.
 
     ``name`` and ``namespace`` are the optional tool attribution Codex
-    serializes on outputs of namespaced calls, re-emitted verbatim.
+    serializes on outputs of namespaced calls, re-emitted verbatim; ``caller``
+    is SDK 3.0's opaque programmatic tool-calling attribution, re-emitted the
+    same way.
     """
 
     index: int
@@ -62,6 +65,11 @@ class ReplayedFunctionOutput:
     output: str
     name: str | None = None
     namespace: str | None = None
+    caller: JsonObject | None = None
+    content_parts: tuple[MessageContentPart, ...] = ()
+    """Ordered canonical parts when the SDK list form carried an image
+    beside text; empty for the plain-text form, whose message shape is
+    unchanged."""
 
 
 ReplayedInput = (
@@ -160,9 +168,11 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
                 GatewayMessage(
                     role="tool",
                     content=item.output,
+                    content_parts=item.content_parts,
                     tool_call_id=item.call_id,
                     provider_tool_name=item.name,
                     provider_tool_namespace=item.namespace,
+                    provider_tool_caller=item.caller,
                 )
             )
         else:

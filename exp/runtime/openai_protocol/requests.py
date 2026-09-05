@@ -847,6 +847,17 @@ def _response_input_messages(
                 ReplayedNativeItem(index=index, role=native_role, item=raw_items[index])
             )
         elif isinstance(item, _ResponseReasoningItem):
+            if item.encrypted_content is None:
+                # A store=true flow replays reasoning by item id alone (the
+                # SDK marks encrypted_content optional); only the issuing
+                # native Responses wire can resolve the id, so the item is
+                # carried verbatim like a hosted-tool item and the provider
+                # judges resolvability, rather than rejecting SDK-legal
+                # input the provider itself may serve.
+                replayed.append(
+                    ReplayedNativeItem(index=index, role="assistant", item=raw_items[index])
+                )
+                continue
             if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
                 try:
                     block: EncryptedReasoningBlock | SealedReasoningContentBlock = (
@@ -894,18 +905,43 @@ def _response_input_messages(
                             "provider_output_index": index,
                             "provider_status": item.status,
                             "provider_namespace": item.namespace,
+                            "provider_caller": item.caller,
                         }
                     ),
                 )
             )
         else:
+            if isinstance(item.output, str):
+                output_text, output_parts = item.output, ()
+            else:
+                # The SDK list form: text and image parts map onto the
+                # canonical tool message (the tool-message contract carries
+                # exactly those two kinds); any other kind is a named 400
+                # because a tool result has no canonical carrier for it and
+                # dropping it would misstate what the tool returned.
+                output_text, output_parts = message_content(item.output, f"input.{index}.output")
+                unsupported = next(
+                    (part for part in output_parts if part.kind not in ("text", "image")),
+                    None,
+                )
+                if unsupported is not None:
+                    raise unsupported_field(
+                        f"input.{index}.output",
+                        message=(
+                            "function_call_output.output supports text and image parts "
+                            f"only; this list carries a {unsupported.kind!r} part."
+                        ),
+                    )
+                output_text = output_text or ""
             replayed.append(
                 ReplayedFunctionOutput(
                     index=index,
                     call_id=item.call_id,
-                    output=item.output,
+                    output=output_text,
                     name=item.name,
                     namespace=item.namespace,
+                    caller=item.caller,
+                    content_parts=output_parts,
                 )
             )
     return responses_input_messages(tuple(replayed))

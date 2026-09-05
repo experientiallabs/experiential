@@ -878,7 +878,8 @@ def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:
 
     assert raised.value.param == "reasoning.effort"
     assert str(raised.value) == (
-        "Reasoning effort 'minimal' is not supported by this model route. Supported values: 'high'."
+        "The effort parameter value 'minimal' is not supported by this model route. "
+        "Supported values: 'high'."
     )
 
 
@@ -4066,3 +4067,136 @@ def test_route_rejects_max_output_tokens_below_the_responses_minimum() -> None:
     anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://a.test")
     public, _provider = route_generation_parameter_requests((responses, anthropic), request)
     assert public.ignored_parameters == ()
+
+
+def test_an_all_responses_route_keeps_tool_result_images() -> None:
+    """The native Responses wire carries tool-result images itself (the SDK
+    function_call_output part list), so a homogeneous Responses route keeps
+    the screenshot verbatim like an all-Anthropic route does."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (GatewayWireProfile(dialect="openai_responses", url="https://r.test"),)
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.messages[-1].images
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
+
+
+def test_a_responses_and_chat_route_still_degrades_tool_result_images() -> None:
+    """A chat fallback rung has no tool-image carrier, so the mixed route
+    keeps the disclosed placeholder degrade."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (
+        GatewayWireProfile(dialect="openai_responses", url="https://r.test"),
+        GatewayWireProfile(dialect="openai_compatible", url="https://c.test"),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.messages[-1].content_parts == ()
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public_request.ignored_parameters
+
+
+def _attributed_history_request() -> GatewayRequest:
+    """One replayed turn whose call, and result, carry Responses attribution."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-1",
+                        name="spawn_agent",
+                        arguments={},
+                        provider_namespace="collaboration",
+                        provider_caller={"type": "program", "caller_id": "call_prog"},
+                    ),
+                ),
+            ),
+            GatewayMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="done",
+                provider_tool_name="spawn_agent",
+                provider_tool_namespace="collaboration",
+            ),
+        ),
+    )
+
+
+def test_tool_call_attribution_drops_with_disclosure_off_the_responses_wire() -> None:
+    """A chat rung rebuilds the call without its namespace/caller attribution;
+    the call still executes with its exact name and arguments, so the route
+    discloses the per-field drop instead of rejecting a history the caller
+    cannot rewrite."""
+    profiles = (GatewayWireProfile(dialect="openai_compatible", url="https://c.test"),)
+
+    public_request, _provider = route_generation_parameter_requests(
+        profiles, _attributed_history_request()
+    )
+
+    assert (
+        "messages.tool_calls.namespace->dropped(unsupported_by_provider)"
+        in public_request.ignored_parameters
+    )
+    assert (
+        "messages.tool_calls.caller->dropped(unsupported_by_provider)"
+        in public_request.ignored_parameters
+    )
+    assert (
+        "messages.tool_results.attribution->dropped(unsupported_by_provider)"
+        in public_request.ignored_parameters
+    )
+
+
+def test_tool_call_attribution_is_undisclosed_on_a_homogeneous_responses_route() -> None:
+    """The native wire re-emits the attribution verbatim: nothing is dropped."""
+    profiles = (GatewayWireProfile(dialect="openai_responses", url="https://r.test"),)
+
+    public_request, _provider = route_generation_parameter_requests(
+        profiles, _attributed_history_request()
+    )
+
+    assert not any("attribution" in path for path in public_request.ignored_parameters)
+    assert not any("tool_calls.namespace" in path for path in public_request.ignored_parameters)
+    assert not any("tool_calls.caller" in path for path in public_request.ignored_parameters)
+
+
+def test_a_messages_surface_effort_rejection_matches_the_client_recovery_latch() -> None:
+    """The 400 names output_config.effort and phrases the miss recoverably.
+
+    Claude Code sends output_config.effort on every request and auto-recovers
+    (drops the field and retries) only when the message contains "effort
+    parameter" and "not support" or the param names output_config.effort; any
+    other phrasing wedges every turn on an effort-constrained route (#795).
+    """
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://c.test",
+            model_id="hermes-4-405b",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning_effort",
+            supported_reasoning_efforts=("medium",),
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        reasoning_effort="high",
+    )
+
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.param == "output_config.effort"
+    assert "effort parameter" in str(raised.value)
+    assert "not supported" in str(raised.value)

@@ -595,3 +595,68 @@ def test_remember_turn_rejects_malformed_hosted_items(item: JsonObject) -> None:
             context=_context(),
             data={"text": "", "refusal": False, "hosted_items": [item], "tool_calls": []},
         )
+
+
+def test_remember_turn_retains_and_replays_a_tool_call_caller() -> None:
+    """A caller-attributed call retained for continuation re-emits it verbatim.
+
+    SDK 3.0 programmatic tool calling attributes a call to the program that
+    invoked it; the item must replay exactly as emitted, so the boundary
+    payload's caller must survive retention into the rebuilt input item (a
+    custom call keeps it on the verbatim native item).
+    """
+    store = BoundedContinuationStore()
+    context = _context()
+    caller = {"type": "program", "caller_id": "call_prog"}
+    remember_turn(
+        store,
+        context=context,
+        route_binding=_binding(),
+        data={
+            "text": "",
+            "refusal": False,
+            "tool_calls": [
+                {
+                    "output_index": 0,
+                    "item_id": "fc-caller",
+                    "call_id": "call-caller",
+                    "name": "lookup",
+                    "caller": caller,
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "output_index": 1,
+                    "item_id": "ctc-caller",
+                    "call_id": "call-custom",
+                    "name": "exec",
+                    "caller": caller,
+                    "arguments": "const r = 1;",
+                    "status": "completed",
+                    "custom": True,
+                },
+            ],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    call = state.messages[0].tool_calls[0]
+    assert call.provider_caller == caller
+    native = state.messages[1].provider_native_item
+    assert native is not None and native["caller"] == caller
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=state.messages,
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[0]["caller"] == caller
+    assert payload_input[1]["caller"] == caller
