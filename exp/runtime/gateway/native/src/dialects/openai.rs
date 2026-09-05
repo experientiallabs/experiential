@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use super::{
     bounded_wire_token, complete_streamed_tool, finish_open_tools, finish_open_tools_truncated,
-    malformed, optional_text, parse_object, provider_stream_failed, refusal_failure, Normalizer,
+    malformed, optional_text, parse_object, provider_error_detail,
+    provider_stream_failed_with_detail, refusal_failure, Normalizer,
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
@@ -770,12 +771,15 @@ impl Normalizer {
                     } else if reason == "content_filter" || reason == "safety" {
                         events.push(Event::Failed(refusal_failure()));
                     } else {
+                        // The undocumented reason is the only diagnostic this
+                        // terminal carries; it rides as the bounded detail.
                         events.push(Event::Failed(
                             Failure::new(
                                 FailureClass::ProviderInternal,
                                 "provider ended the stream incompletely",
                             )
-                            .with_retry(true, true),
+                            .with_retry(true, true)
+                            .with_provider_detail(provider_error_detail(Some(reason), None)),
                         ));
                     }
                 }
@@ -783,22 +787,40 @@ impl Normalizer {
             "response.failed" => {
                 // A failed terminal still reports the usage the provider
                 // billed for the processed legs; fold it so settlement
-                // accounts the charged tokens instead of zero.
+                // accounts the charged tokens instead of zero. Its error
+                // object names the mechanism, so a bounded detail rides the
+                // failure into the ledger (2026-09-05: gpt-6-astra kills
+                // ~120ms post-dispatch were undiagnosable without it).
+                let mut code = None;
+                let mut message = None;
                 if let Some(response) = payload.get("response").and_then(Value::as_object) {
                     if let Some(usage) = openai_usage(response.get("usage"))
                         .map_err(|message| malformed(&message))?
                     {
                         events.push(Event::Usage(usage));
                     }
+                    if let Some(error) = response.get("error").and_then(Value::as_object) {
+                        code = error.get("code").and_then(Value::as_str);
+                        message = error.get("message").and_then(Value::as_str);
+                    }
                 }
-                events.push(Event::Failed(provider_stream_failed()));
+                events.push(Event::Failed(provider_stream_failed_with_detail(
+                    "openai_responses",
+                    code,
+                    message,
+                )));
             }
             "error" => {
                 // The in-stream error frame is the provider declaring its own
                 // failure mid-stream, mirroring the Anthropic dialect's error
                 // event: provider_internal (retry, then fail over), never a
-                // stream that "ended without a terminal event".
-                events.push(Event::Failed(provider_stream_failed()));
+                // stream that "ended without a terminal event". Its code and
+                // message ride the failure as the bounded ledger detail.
+                events.push(Event::Failed(provider_stream_failed_with_detail(
+                    "openai_responses",
+                    payload.get("code").and_then(Value::as_str),
+                    payload.get("message").and_then(Value::as_str),
+                )));
             }
             other if is_openai_hosted_progress_event(other) => {
                 events.extend(self.openai_hosted_progress(other, &payload)?);
@@ -840,8 +862,30 @@ impl Normalizer {
             return Ok(events);
         }
         let payload = parse_object(&frame.data)?;
-        if payload.get("error").is_some_and(|value| !value.is_null()) {
-            return Ok(vec![Event::Failed(provider_stream_failed())]);
+        if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
+            // An OpenAI-compatible relay declaring failure inside the stream
+            // names the mechanism only here; the bounded detail rides the
+            // failure into the ledger.
+            let (code, message) = match error.as_object() {
+                Some(error) => (
+                    error.get("code").and_then(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .or_else(|| value.as_i64().map(|numeric| numeric.to_string()))
+                    }),
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                ),
+                None => (None, None),
+            };
+            return Ok(vec![Event::Failed(provider_stream_failed_with_detail(
+                "openai_compatible",
+                code.as_deref(),
+                message.as_deref(),
+            ))]);
         }
         let mut events = Vec::new();
         if let Some(raw_usage) = payload.get("usage") {

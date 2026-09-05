@@ -129,11 +129,88 @@ fn provider_stream_failed() -> Failure {
     Failure::new(FailureClass::ProviderInternal, "provider stream failed").with_retry(true, true)
 }
 
+/// Longest provider-declared error detail retained for the ledger, matching
+/// the python `GatewayFailure.provider_detail` bound.
+const MAXIMUM_STREAM_ERROR_DETAIL_CHARS: usize = 240;
+
+/// Reduce one provider-declared stream error to a bounded single-line detail.
+///
+/// A provider that opens the stream and then declares its own failure names
+/// the mechanism only inside that frame; dropping it left every such kill an
+/// undiagnosable "provider stream failed" (2026-09-05: gpt-6-astra streams
+/// dying ~120ms post-dispatch with the reason discarded). The code reduces
+/// to an identifier-shaped token and the message to one bounded line (cut at
+/// the first control character, whitespace collapsed). This detail is
+/// attached only to failure classes that never relay `provider_detail` to
+/// callers (the stream-failure family), so it reaches the ledger and alert
+/// samples without widening the caller-facing sanitization boundary.
+fn provider_error_detail(code: Option<&str>, message: Option<&str>) -> Option<String> {
+    let code = code
+        .filter(|value| !value.is_empty())
+        .map(bounded_wire_token);
+    let line = message.and_then(|message| {
+        let cut: String = message
+            .chars()
+            .take_while(|character| !character.is_control())
+            .collect();
+        let collapsed = cut.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!collapsed.is_empty()).then_some(collapsed)
+    });
+    let detail = match (code, line) {
+        (None, None) => return None,
+        (Some(code), None) => code,
+        (None, Some(line)) => line,
+        (Some(code), Some(line)) => format!("{code}: {line}"),
+    };
+    Some(
+        detail
+            .chars()
+            .take(MAXIMUM_STREAM_ERROR_DETAIL_CHARS)
+            .collect(),
+    )
+}
+
+/// Build the provider-declared stream failure carrying its bounded detail,
+/// and emit the structured operator line naming it.
+fn provider_stream_failed_with_detail(
+    dialect: &str,
+    code: Option<&str>,
+    message: Option<&str>,
+) -> Failure {
+    let detail = provider_error_detail(code, message);
+    if let Some(detail) = &detail {
+        let line = serde_json::json!({
+            "event": "provider_declared_failure",
+            "dialect": dialect,
+            "detail": detail,
+        });
+        eprintln!("exp-gateway-native: {line}");
+    }
+    provider_stream_failed().with_provider_detail(detail)
+}
+
 fn parse_object(data: &str) -> Result<Map<String, Value>, Failure> {
     match serde_json::from_str::<Value>(data) {
         Ok(Value::Object(object)) => Ok(object),
         Ok(_) => Err(malformed("provider stream event must be a JSON object")),
-        Err(_) => Err(malformed("provider stream event is not valid JSON")),
+        Err(error) => {
+            // The frame bytes are never logged, hashed, or otherwise derived
+            // from (a frame is provider payload, and even an unkeyed digest
+            // of low-entropy content invites dictionary guessing): the size
+            // and serde's positional description (token category and
+            // line/column, never input bytes) name the parse failure and
+            // correlate identical malformed frames across requests.
+            let line = serde_json::json!({
+                "event": "malformed_stream_frame",
+                "bytes": data.len(),
+                "reason": error.to_string(),
+            });
+            eprintln!("exp-gateway-native: {line}");
+            Err(malformed(&format!(
+                "provider stream event is not valid JSON: {error} ({} bytes)",
+                data.len()
+            )))
+        }
     }
 }
 
@@ -654,5 +731,154 @@ mod recover_abnormal_end_tests {
             .recover_abnormal_end(incoming())
             .expect_err("a terminated stream does not re-recover");
         assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    }
+}
+
+#[cfg(test)]
+mod stream_error_detail_tests {
+    use super::*;
+
+    fn frame(payload: serde_json::Value) -> SseEvent {
+        SseEvent {
+            event: None,
+            data: payload.to_string(),
+        }
+    }
+
+    fn failed_detail(events: &[Event]) -> Option<String> {
+        match events.last() {
+            Some(Event::Failed(failure)) => failure.provider_detail.clone(),
+            other => panic!("expected a failed terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_error_detail_is_one_bounded_line() {
+        assert_eq!(provider_error_detail(None, None), None);
+        assert_eq!(
+            provider_error_detail(Some("server_error"), None).as_deref(),
+            Some("server_error")
+        );
+        assert_eq!(
+            provider_error_detail(Some("server_error"), Some("The model failed  to respond."))
+                .as_deref(),
+            Some("server_error: The model failed to respond.")
+        );
+        // The line cuts at the first control character: a payload dump never
+        // rides past its first row.
+        assert_eq!(
+            provider_error_detail(None, Some("first line\nsecond line")).as_deref(),
+            Some("first line")
+        );
+        // A hostile code reduces to the shared identifier token.
+        assert_eq!(
+            provider_error_detail(Some("weird code!{}"), None).as_deref(),
+            Some("non-identifier")
+        );
+        // The composed detail never exceeds the python provider_detail bound.
+        let long = "x".repeat(400);
+        let bounded = provider_error_detail(Some("code"), Some(&long)).expect("bounded");
+        assert_eq!(bounded.chars().count(), 240);
+    }
+
+    /// Every dialect's provider-declared stream failure carries its bounded
+    /// mechanism into `provider_detail` (ledger-only for these classes), so
+    /// the next post-open kill is diagnosable from the ledger instead of an
+    /// opaque "provider stream failed" (2026-09-05: gpt-6-astra kills ~120ms
+    /// post-dispatch across 20 orgs with the reason discarded on the wire).
+    #[test]
+    fn responses_failed_terminal_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": "server_error", "message": "The model failed."},
+                },
+            })))
+            .expect("failed terminal normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("server_error: The model failed.")
+        );
+    }
+
+    #[test]
+    fn responses_error_frame_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "type": "error",
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached for gpt-6-astra.",
+                "param": null,
+                "sequence_number": 1,
+            })))
+            .expect("error frame normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("rate_limit_exceeded: Rate limit reached for gpt-6-astra.")
+        );
+    }
+
+    #[test]
+    fn compatible_error_frame_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "error": {"code": 502, "message": "upstream connect error"},
+            })))
+            .expect("error frame normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("502: upstream connect error")
+        );
+    }
+
+    #[test]
+    fn anthropic_error_frame_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"},
+            })))
+            .expect("error frame normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("overloaded_error: Overloaded")
+        );
+    }
+
+    #[test]
+    fn gemini_error_envelope_carries_its_error_detail() {
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({
+                "error": {"code": 503, "status": "UNAVAILABLE", "message": "Overloaded."},
+            })))
+            .expect("error envelope normalizes");
+        assert_eq!(
+            failed_detail(&events).as_deref(),
+            Some("UNAVAILABLE: Overloaded.")
+        );
+    }
+
+    #[test]
+    fn unparsable_stream_frames_name_size_and_parse_position() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let failure = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: "<html>502 Bad Gateway</html>".to_string(),
+            })
+            .expect_err("a non-JSON frame is malformed");
+        assert!(
+            failure.safe_message.contains("not valid JSON")
+                && failure.safe_message.contains("(28 bytes)"),
+            "reason must carry the parse diagnosis: {}",
+            failure.safe_message
+        );
     }
 }

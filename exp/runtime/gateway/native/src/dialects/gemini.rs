@@ -19,14 +19,24 @@ impl Normalizer {
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
-        if payload.get("error").is_some_and(|value| !value.is_null()) {
+        if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
             // Google's error envelope ({"error":{"code":503,"status":"UNAVAILABLE"}})
             // arrives as a candidate-less frame; without this branch it reads
             // as a usage-only trailer and the stream ends malformed (or, after
             // prior output, as a synthesized completion of a failed answer).
             // It is the provider declaring failure, so it takes the shared
-            // retry-then-failover classification the other dialects give it.
-            return Ok(vec![Event::Failed(provider_stream_failed())]);
+            // retry-then-failover classification the other dialects give it,
+            // with its status and message riding as the bounded ledger detail.
+            let (code, message) = match error.as_object() {
+                Some(error) => (
+                    error.get("status").and_then(Value::as_str),
+                    error.get("message").and_then(Value::as_str),
+                ),
+                None => (None, None),
+            };
+            return Ok(vec![Event::Failed(
+                super::provider_stream_failed_with_detail("gemini_generate_content", code, message),
+            )]);
         }
         if let Some(raw_usage) = payload.get("usageMetadata") {
             if !raw_usage.is_null() {
