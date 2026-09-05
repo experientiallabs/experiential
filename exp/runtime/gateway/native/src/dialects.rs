@@ -765,6 +765,30 @@ mod stream_error_detail_tests {
     }
 
     #[test]
+    fn secret_shaped_words_drop_the_whole_detail_line() {
+        // The identifier screen treats any letter+digit label as a handle,
+        // which covers key and token shapes: a sentence carrying one drops
+        // entirely (never partially redacted), for every dialect that feeds
+        // the shared detail path, Bedrock exception messages included.
+        for message in [
+            "Invalid key sk-abc123def provided.",
+            "The access key AKIA9X7EXAMPLE is not authorized for this model.",
+            "Bearer eyJhbGciOi9 was rejected.",
+        ] {
+            assert_eq!(
+                provider_error_detail(None, Some(message)),
+                None,
+                "a credential-shaped word must drop the sentence: {message}"
+            );
+            assert_eq!(
+                provider_error_detail(Some("validation_error"), Some(message)).as_deref(),
+                Some("validation_error"),
+                "the safe code token alone survives: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_error_detail_is_one_bounded_line() {
         assert_eq!(provider_error_detail(None, None), None);
         assert_eq!(
