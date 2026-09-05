@@ -330,12 +330,20 @@ def decode_responses(
                     tool=cast("JsonObject", raw_tools[tool_index]),
                 )
             )
-    messages = list(
-        _response_input_messages(
-            request.input,
-            raw_items=cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else (),
-        )
-    )
+    replayed_items = cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else ()
+    try:
+        messages = list(_response_input_messages(request.input, raw_items=replayed_items))
+    except ValidationError as exc:
+        # History reconstruction folds echoed items into canonical messages,
+        # so a canonical-contract violation (such as duplicate call_ids in one
+        # assistant segment) first surfaces here, past the wire models. It is
+        # caller-shaped input all the same: name the rule instead of letting
+        # the exception escape as an unclassified 500.
+        detail = exc.errors(include_url=False)[0]
+        raise invalid_field(
+            "input",
+            "Invalid value for 'input': " + detail["msg"].removeprefix("Value error, ") + ".",
+        ) from exc
     if request.instructions is not None:
         messages.insert(0, GatewayMessage(role="developer", content=request.instructions))
     try:

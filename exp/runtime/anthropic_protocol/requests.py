@@ -341,7 +341,21 @@ def decode_messages(
             )
         )
     for index, message in enumerate(request.messages):
-        messages.extend(_gateway_messages(message, index))
+        try:
+            messages.extend(_gateway_messages(message, index))
+        except ValidationError as exc:
+            # Turn translation builds canonical messages, so a canonical-
+            # contract violation (such as duplicate tool_use ids in one
+            # assistant turn) first surfaces here, past the wire models. It
+            # is caller-shaped input all the same: name the offending turn
+            # instead of letting the exception escape as an unclassified 500.
+            detail = exc.errors(include_url=False)[0]
+            raise invalid_field(
+                f"messages.{index}",
+                f"Invalid value for 'messages.{index}': "
+                + detail["msg"].removeprefix("Value error, ")
+                + ".",
+            ) from exc
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
