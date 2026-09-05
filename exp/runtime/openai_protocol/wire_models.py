@@ -269,8 +269,16 @@ class _Message(_WireModel):
     @model_validator(mode="after")
     def _require_role_fields(self) -> _Message:
         """Require tool linkage and assistant calls on their legal roles."""
-        if self.role == "assistant" and self.content is None and not self.history_tool_calls:
-            raise ValueError("assistant messages need content or tool calls")
+        if (
+            self.role == "assistant"
+            and self.content is None
+            and not self.history_tool_calls
+            and self.reasoning_content is None
+        ):
+            # A reasoning-only assistant turn is a shape the gateway itself
+            # returns (an exposed rung's length-cut thinking turn: content null,
+            # plaintext reasoning_content) and the provider accepts back.
+            raise ValueError("assistant messages need content, tool calls, or reasoning_content")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
