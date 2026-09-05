@@ -920,7 +920,7 @@ fn caller_attributed_tool_call_items_re_emit_caller_to_the_caller() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
     );
     encoder.start().expect("stream start must encode");
@@ -942,7 +942,7 @@ fn caller_attributed_tool_call_items_re_emit_caller_to_the_caller() {
     let completed = completed_responses_body(
         "request-1",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         ResponsesEnvelope::default(),
         &events,
     )
