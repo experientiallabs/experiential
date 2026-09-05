@@ -22,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
     GatewayFailure,
+    GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
 )
@@ -30,8 +31,12 @@ from exp.runtime.gateway.native_accounting import (
     NativeBridgeError,
     _failure_from_payload,
 )
-from exp.runtime.gateway.native_execution import InflightRequest
+from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.openai_protocol.errors import (
+    THROTTLED_RETRY_AFTER_SECONDS,
+    public_failure_error,
+)
 
 _DIGEST = "a" * 64
 
@@ -349,6 +354,62 @@ def test_exhaustion_finalizes_the_request_with_the_last_failure() -> None:
         "invalid_request"
     ]
     assert registry.entry("request-one") is None
+
+
+def test_a_fully_throttled_route_exhausts_as_throttled_not_provider_internal() -> None:
+    """Pre-dispatch exhaustion caused only by provider throttle windows is
+    caller-facing rate limiting, never platform deadness.
+
+    Production signal (2026-09-04): a single-rung alias whose rung sat inside
+    the 30s throttle window after provider 429s reported every shadowed
+    request as provider_internal "all exact-model deployments are
+    unavailable", misfiling a 429 storm as an outage.
+    """
+    registry, ledger, entry = _registry()
+    throttle = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED,
+        safe_message="provider throttled the request",
+    )
+    for deployment in entry.route.deployments:
+        registry.health.failed(deployment_health_key(entry.authorization, deployment), throttle)
+
+    exhausted = _start(registry, ordinal=0)
+
+    assert exhausted["exhausted"] is True
+    failure_payload = exhausted["failure"]
+    assert isinstance(failure_payload, dict)
+    assert failure_payload["failure_class"] == "throttled"
+    message = str(failure_payload["safe_message"])
+    assert "throttle window" in message
+    retry_after = failure_payload["retry_after_seconds"]
+    assert isinstance(retry_after, int)
+    # The advertised Retry-After covers the whole remaining window (floored
+    # at the default backoff) and the message names the same wait, so a
+    # client honoring the header never retries into the window it was told
+    # to sit out.
+    assert THROTTLED_RETRY_AFTER_SECONDS <= retry_after <= 30
+    assert f"retry in {retry_after}s" in message
+    public = public_failure_error(GatewayFailure.model_validate(failure_payload))
+    assert public.retry_after_seconds == retry_after
+    assert [failure.failure_class.value for failure in ledger.finished_requests] == ["throttled"]
+    assert registry.entry("request-one") is None
+
+
+def test_an_open_circuit_route_still_dispatches_and_never_reports_throttled() -> None:
+    """Circuit-open deployments stay dispatchable through forced claims, so
+    the throttled exhaustion class is reserved for real throttle windows."""
+    registry, ledger, entry = _registry()
+    dead = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        safe_message="provider authentication failed",
+    )
+    for deployment in entry.route.deployments:
+        registry.health.failed(deployment_health_key(entry.authorization, deployment), dead)
+
+    started = _start(registry, ordinal=0)
+
+    assert started["route_depth"] == 0
+    assert ledger.finished_requests == []
 
 
 def test_ordinal_mismatch_is_a_wire_contract_failure() -> None:

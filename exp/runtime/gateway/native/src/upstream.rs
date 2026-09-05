@@ -191,9 +191,17 @@ pub async fn open_stream(
         let parameter = body
             .as_deref()
             .and_then(|body| rejected_parameter(dialect, body));
+        // The payload's own model id is a caller-known word: a provider
+        // sentence naming it unquoted (Anthropic's client-version gate does)
+        // must not be redacted as infrastructure.
+        let request_words: Vec<&str> = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect();
         let detail = body
             .as_deref()
-            .and_then(|body| rejected_detail(dialect, body));
+            .and_then(|body| rejected_detail(dialect, body, &request_words));
         return Err(failure
             .with_rejected_parameter(parameter)
             .with_provider_detail(detail));

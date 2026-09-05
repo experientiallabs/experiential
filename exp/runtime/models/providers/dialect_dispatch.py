@@ -1,4 +1,10 @@
-"""Per-dialect provider wire payload dispatch for canonical gateway requests."""
+"""Provider wire dispatch: one canonical request to one dialect payload.
+
+Split from ``streaming_requests`` for the module line budget: the single
+dispatch seam (:func:`dialect_stream_payload`) and the pre-dispatch
+tool-result image degrade live here; ``streaming_requests`` re-exports both
+so import paths are unchanged, and route admission shaping stays there.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.fireworks import (
     require_responses_continuation_channel,
@@ -24,11 +30,47 @@ from exp.runtime.models.providers.openai_payloads import (
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
-SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
-"""Wire dialects with a request field that preserves the caller's service tier."""
+TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
+"""Disclosure recorded when tool-result images degrade to placeholder text.
+
+A tool screenshot is baked into the caller's conversation history: rejecting
+it wedges every later turn of a multi-turn session, which is strictly worse
+than a disclosed degrade. Top-level user images keep the fail-closed contract
+because the caller can re-send those differently.
+"""
+
+TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
+"""Text substituted for each dropped tool-result image, in block position."""
 
 
-def _fireworks_continuation_required(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
+def strip_tool_result_images(
+    messages: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...] | None:
+    """Replace tool-message image parts with positional placeholder text.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The degraded messages, or ``None`` when no tool message carries an
+        image (nothing to strip).
+    """
+    if not any(message.role == "tool" and message.images for message in messages):
+        return None
+    out: list[GatewayMessage] = []
+    for message in messages:
+        if message.role != "tool" or not message.images:
+            out.append(message)
+            continue
+        content = "".join(
+            part.text if part.kind == "text" else TOOL_RESULT_IMAGE_PLACEHOLDER
+            for part in message.content_parts
+        )
+        out.append(message.model_copy(update={"content": content, "content_parts": ()}))
+    return tuple(out)
+
+
+def fireworks_continuation_required(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
     """Return whether a Fireworks Responses turn can emit an unretained tool call."""
     return (
         request.surface == GatewayApiSurface.RESPONSES
@@ -36,6 +78,10 @@ def _fireworks_continuation_required(profile: GatewayWireProfile, request: Gatew
         and bool(request.tools)
         and request.tool_choice != "none"
     )
+
+
+SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
+"""Wire dialects with a request field that preserves the caller's service tier."""
 
 
 def dialect_stream_payload(
@@ -55,7 +101,7 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
-    if _fireworks_continuation_required(profile, provider_request):
+    if fireworks_continuation_required(profile, provider_request):
         require_responses_continuation_channel(provider_request)
     if provider_request.service_tier is not None and profile.dialect not in SERVICE_TIER_DIALECTS:
         # A processing-tier hint changes pricing and latency semantics, so a
@@ -149,6 +195,7 @@ def dialect_stream_payload(
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
             hunyuan_reasoning_route_sha256=profile.hunyuan_reasoning_route_sha256,
+            reasoning_output_exposed=profile.reasoning_output_exposed,
             forwards_service_tier=profile.billing_customer_managed,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")

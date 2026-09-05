@@ -20,6 +20,7 @@ from exp.runtime.gateway.compatibility import (
 )
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
+    ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
@@ -61,6 +62,8 @@ from exp.runtime.openai_protocol.structured_text import (
     responses_structured_text,
 )
 from exp.runtime.openai_protocol.wire_models import (
+    HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
+    HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
     _AssistantToolCall,
     _ChatRequest,
@@ -69,6 +72,7 @@ from exp.runtime.openai_protocol.wire_models import (
     _CustomToolCallOutput,
     _EmbeddingsRequest,
     _FunctionCall,
+    _HostedToolItemEcho,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
@@ -479,6 +483,9 @@ _OUTPUT_ITEM_VARIANTS = {
     "additional_tools",
     "custom_tool_call",
     "custom_tool_call_output",
+    # Hosted-tool echo variants share the same union-branch label shape.
+    *HOSTED_TOOL_ITEM_TYPES_TOOL,
+    *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
 }
 
 
@@ -647,21 +654,46 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
             for call_index, call in enumerate(message.history_tool_calls)
         )
-        provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
+        provider_reasoning: tuple[
+            SealedReasoningContentBlock | ExposedReasoningContentBlock, ...
+        ] = ()
         if message.reasoning_content is not None:
-            # The scheme is fixed by the carrier's own opaque prefix; raw client
-            # text (no known prefix) matches none and is rejected here. Each
-            # provider's carrier only parses under its own scheme.
+            param = f"{prefix}.{message_index}.reasoning_content"
+            # The scheme is fixed by the carrier's own opaque prefix. A known
+            # prefix MUST parse as that provider's carrier. Text under no known
+            # prefix is the plaintext an exposure-gated rung itself returned on
+            # a non-tool turn (Tencent/DeepSeek): it decodes as caller-owned
+            # history and route admission decides which rungs may carry it.
             scheme = scheme_for_carrier(message.reasoning_content)
-            try:
-                if scheme is None:
-                    raise ValueError("reasoning_content is not a gateway-issued carrier")
-                provider_reasoning = (
-                    parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
-                )
-            except ValueError as exc:
-                param = f"{prefix}.{message_index}.reasoning_content"
-                raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
+            if scheme is None:
+                if calls:
+                    # A tool turn's reasoning is only ever issued as the sealed
+                    # carrier that binds it to its calls and issuing rung;
+                    # plaintext here was never ours and would bypass that bond.
+                    raise invalid_field(
+                        param,
+                        f"'{param}' must be a gateway-issued carrier on an assistant "
+                        "tool-call turn.",
+                    )
+                try:
+                    provider_reasoning = (
+                        ExposedReasoningContentBlock(content=message.reasoning_content),
+                    )
+                except ValidationError as exc:
+                    raise invalid_field(
+                        param,
+                        f"'{param}' must be non-empty plaintext reasoning within the size bound "
+                        "or a gateway-issued carrier.",
+                    ) from exc
+            else:
+                try:
+                    provider_reasoning = (
+                        parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
+                    )
+                except ValueError as exc:
+                    raise invalid_field(
+                        param, f"'{param}' must be a gateway-issued carrier."
+                    ) from exc
         content, content_parts = message_content(
             message.content, f"{prefix}.{message_index}.content"
         )
@@ -789,10 +821,15 @@ def _response_input_messages(
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(item, (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput)):
+        if isinstance(
+            item,
+            (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput, _HostedToolItemEcho),
+        ):
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
-            if isinstance(item, _CustomToolCall):
+            if isinstance(item, _HostedToolItemEcho):
+                native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
+            elif isinstance(item, _CustomToolCall):
                 native_role = "assistant"
             elif isinstance(item, _CustomToolCallOutput):
                 native_role = "tool"

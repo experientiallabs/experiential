@@ -208,6 +208,10 @@ fn is_semantic(event: &Event) -> bool {
             | Event::ServerToolArgumentsDelta { .. }
             | Event::ServerToolUseCompleted { .. }
             | Event::ServerToolResult { .. }
+            | Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. }
+            | Event::ProviderTextAnnotation { .. }
     )
 }
 

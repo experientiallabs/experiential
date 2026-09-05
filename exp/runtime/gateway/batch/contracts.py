@@ -13,7 +13,7 @@ import json
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 
@@ -29,6 +29,44 @@ BATCH_SURFACES: tuple[BatchSurface, ...] = (
     "/v1/responses",
     "/v1/messages",
 )
+
+
+PROVIDER_MESSAGE_LIMIT = 400
+
+
+def provider_error_message(
+    error: JsonValue | None, *, keys: tuple[str, ...] = ("message",)
+) -> str | None:
+    """Return the sanitized human-readable text of one provider error value.
+
+    The one message walker for every reader of provider error text (the
+    caller's batch object, the error file, the host ledger, the worker log).
+    Providers nest the actionable cause under an outer envelope (Anthropic's
+    ``{"type": "error", "error": {...}}``), so nested ``error`` objects are
+    descended to the innermost one first; a bare string error is its own
+    message. The first present string among ``keys`` is reduced to printable
+    characters, whitespace-normalized, and bounded to
+    ``PROVIDER_MESSAGE_LIMIT``, so a control character or a runaway body in a
+    malformed upstream response never passes through. Anything else yields
+    None.
+    """
+    innermost = error
+    while isinstance(innermost, dict) and isinstance(innermost.get("error"), dict):
+        innermost = innermost["error"]
+    if isinstance(innermost, dict):
+        raw = next(
+            (value for key in keys if isinstance(value := innermost.get(key), str) and value),
+            None,
+        )
+    elif isinstance(innermost, str):
+        raw = innermost
+    else:
+        raw = None
+    if raw is None:
+        return None
+    printable = "".join(char for char in raw if char.isprintable() or char.isspace())
+    detail = " ".join(printable.split())
+    return detail[:PROVIDER_MESSAGE_LIMIT] or None
 
 
 class BatchStatus(StrEnum):
@@ -60,8 +98,11 @@ class BatchLine(ContractModel):
     ``custom_id`` is the caller's per-line correlation key, unique inside one
     job. ``model`` is the catalog batch model the line explicitly requested,
     and ``provider_model`` is the provider wire id the job's provider serves
-    it under. ``body`` is the surface-shaped request body passed through to
-    the provider without dialect translation.
+    it under. ``body`` is the caller's surface-shaped request body; the job's
+    provider client shapes it for its wire at dispatch, verbatim where the
+    provider serves the surface natively and translated where it does not.
+    ``maximum_output_tokens`` is the output ceiling the line was reserved
+    at: the caller's own value, else the deployment default.
     """
 
     custom_id: str = Field(min_length=1, max_length=256)
@@ -86,8 +127,16 @@ class BatchLineError(ContractModel):
 class BatchLineResult(ContractModel):
     """One settled output line, OpenAI batch output JSONL compatible.
 
-    Exactly one of ``response`` and ``error`` is populated. ``usage`` carries
-    the provider-reported token counts the host settles against.
+    Exactly one of ``response`` and ``error`` is populated. The token fields
+    carry the provider-reported usage the host settles against, named exactly
+    as the synchronous lane's usage contract names them: ``cached_input_tokens``
+    and ``cache_creation_input_tokens`` are subsets of ``input_tokens`` and
+    ``reasoning_tokens`` is a subset of ``output_tokens``; they price portions
+    of the totals and are never added a second time. A result carrying
+    ``error`` is a line the provider terminally failed, canceled, or expired
+    (zero usage), or one the provider served whose result the engine could
+    not render in the caller's surface (the provider's reported usage rides
+    the result and bills like a served line's); ``failure_reason`` names why.
     """
 
     custom_id: str
@@ -96,6 +145,9 @@ class BatchLineResult(ContractModel):
     error: JsonObject | None = None
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
     settled_micro_usd: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
@@ -104,6 +156,24 @@ class BatchLineResult(ContractModel):
         if (self.response is None) == (self.error is None):
             raise ValueError("exactly one of response or error must be set")
         return self
+
+    @property
+    def failure_reason(self) -> str | None:
+        """The provider's own reason for a failed line, or None for a served one.
+
+        Reads the innermost ``message`` when the provider wrote one (Anthropic
+        nests the actionable cause as ``error.error.message`` under an outer
+        ``type: "error"`` envelope), else the innermost ``type`` or ``code``,
+        through :func:`provider_error_message` (printable, whitespace-normalized,
+        bounded), so a host ledger can record a failed attempt with a safe
+        reason instead of a completed attempt with zero tokens.
+        """
+        if self.error is None:
+            return None
+        return (
+            provider_error_message(self.error, keys=("message", "type", "code"))
+            or "the provider reported an error for this line"
+        )
 
     def output_jsonl_object(self, *, line_id: str) -> JsonObject:
         """Render the OpenAI batch output line for this result."""
@@ -213,6 +283,13 @@ class BatchJob(ContractModel):
             },
             "metadata": self.metadata or None,
         }
+
+
+class BatchJobPage(ContractModel):
+    """One page of an organization's jobs plus whether a further page exists."""
+
+    jobs: tuple[BatchJob, ...]
+    has_more: bool
 
 
 class BatchFile(ContractModel):

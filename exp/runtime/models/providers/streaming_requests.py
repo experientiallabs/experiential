@@ -8,16 +8,26 @@ from typing import TYPE_CHECKING
 
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
-    GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
-    SERVICE_TIER_DIALECTS,
-    _fireworks_continuation_required,
+    SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS,
+)
+from exp.runtime.models.providers.dialect_dispatch import (
+    TOOL_RESULT_IMAGE_DROP_DISCLOSURE as TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+)
+from exp.runtime.models.providers.dialect_dispatch import (
+    TOOL_RESULT_IMAGE_PLACEHOLDER as TOOL_RESULT_IMAGE_PLACEHOLDER,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
     dialect_stream_payload as dialect_stream_payload,
+)
+from exp.runtime.models.providers.dialect_dispatch import (
+    fireworks_continuation_required as fireworks_continuation_required,
+)
+from exp.runtime.models.providers.dialect_dispatch import (
+    strip_tool_result_images as strip_tool_result_images,
 )
 from exp.runtime.models.providers.errors import (
     ProviderParameterError,
@@ -63,18 +73,6 @@ _logger = logging.getLogger(__name__)
 
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
 
-TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
-"""Disclosure recorded when tool-result images degrade to placeholder text.
-
-A tool screenshot is baked into the caller's conversation history: rejecting
-it wedges every later turn of a multi-turn session, which is strictly worse
-than a disclosed degrade. Top-level user images keep the fail-closed contract
-because the caller can re-send those differently.
-"""
-
-TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
-"""Text substituted for each dropped tool-result image, in block position."""
-
 TOOL_ERROR_FOLD_DISCLOSURE = "messages.content.is_error->content"
 """Disclosure recorded when a tool-result error flag folds into result text.
 
@@ -92,34 +90,6 @@ The provider rejects lower values by name ("Expected a value >= 16"), while
 the Anthropic surface legally carries ``max_tokens`` down to 1, so
 Messages-surface requests below the floor are raised to it with disclosure.
 """
-
-
-def strip_tool_result_images(
-    messages: tuple[GatewayMessage, ...],
-) -> tuple[GatewayMessage, ...] | None:
-    """Replace tool-message image parts with positional placeholder text.
-
-    Args:
-        messages: The request's canonical messages.
-
-    Returns:
-        The degraded messages, or ``None`` when no tool message carries an
-        image (nothing to strip).
-    """
-    if not any(message.role == "tool" and message.images for message in messages):
-        return None
-    out: list[GatewayMessage] = []
-    for message in messages:
-        if message.role != "tool" or not message.images:
-            out.append(message)
-            continue
-        content = "".join(
-            part.text if part.kind == "text" else TOOL_RESULT_IMAGE_PLACEHOLDER
-            for part in message.content_parts
-        )
-        out.append(message.model_copy(update={"content": content, "content_parts": ()}))
-    return tuple(out)
-
 
 GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
 """Version of the route admission and provider wire-translation contract."""
@@ -208,7 +178,7 @@ def route_generation_parameter_requests(
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
     for profile in profiles:
-        if _fireworks_continuation_required(profile, request):
+        if fireworks_continuation_required(profile, request):
             require_responses_continuation_channel(request)
 
     ignored = list(request.ignored_parameters)
@@ -645,6 +615,32 @@ def route_generation_parameter_requests(
 
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.
+    # Plaintext reasoning an exposure-gated rung itself returned (Tencent/
+    # DeepSeek) replays only to rungs that expose their reasoning: the
+    # provider's wire accepts it verbatim there, and nowhere else was it ever
+    # issued. A route with no exposing rung rejects by name; a mixed waterfall
+    # keeps it on the exposing rungs and discloses the drop on the others.
+    exposed_reasoning_present = any(
+        block.kind == "exposed_reasoning_content"
+        for message in request.messages
+        for block in message.provider_reasoning
+    )
+    if exposed_reasoning_present:
+        if not any(profile.reasoning_output_exposed for profile in profiles):
+            raise ProviderParameterError(
+                message=(
+                    "The parameter 'messages.reasoning_content' carries plaintext reasoning, "
+                    "which only a model that exposes its reasoning can replay. Remove the "
+                    "field or choose a reasoning-exposed model alias."
+                ),
+                param="messages.reasoning_content",
+                code="unsupported_parameter",
+            )
+        if not all(profile.reasoning_output_exposed for profile in profiles):
+            ignore(
+                "messages.reasoning_content",
+                "messages.reasoning_content->dropped(unsupported_by_provider)",
+            )
     history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}
         for message in request.messages
@@ -751,12 +747,37 @@ def route_generation_parameter_requests(
     ):
         raise ProviderParameterError(
             message=(
-                "The request carries native Responses input items (tool namespaces or "
-                "custom tool calls) that only a native OpenAI Responses route can serve. "
+                "The request carries native Responses input items (tool namespaces, "
+                "custom tool calls, or hosted tool items such as web_search_call and "
+                "mcp_call echoes) that only a native OpenAI Responses route can serve. "
                 "Choose a different model alias."
             ),
             param="input",
             code="unsupported_parameter",
+        )
+    outbound_maximum_output_tokens = provider_updates.get(
+        "maximum_output_tokens", request.maximum_output_tokens
+    )
+    if (
+        isinstance(outbound_maximum_output_tokens, int)
+        and outbound_maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
+        and all(profile.dialect == "openai_responses" for profile in profiles)
+    ):
+        # The provider's own 400 for this is post-dispatch and opaque on some
+        # relays; the documented Responses minimum is a request fact, so it is
+        # rejected at admission with the bound named. The value judged is the
+        # one that would dispatch: a Messages-surface probe already floored
+        # with disclosure above never reaches this rejection, while a route
+        # whose declared ceiling sits below the floor cannot ride it and gets
+        # the named minimum instead of the provider's opaque 400.
+        parameter = request.maximum_output_tokens_parameter or "max_output_tokens"
+        raise ProviderParameterError(
+            message=(
+                f"The parameter {parameter!r} must be at least 16 on this model route "
+                "(the OpenAI Responses minimum). Raise the value and resend the request."
+            ),
+            param=parameter,
+            code="invalid_parameter",
         )
     if request.provider_native_tools and not all(
         profile.dialect == "openai_responses" for profile in profiles

@@ -3,7 +3,7 @@
 Split from ``streaming_requests`` for the module line budget, mirroring the
 Messages-family split in ``messages_payloads``: the native Responses and
 OpenAI-compatible Chat builders live here; ``dialect_stream_payload`` in
-``streaming_requests`` remains the single dispatch seam.
+``dialect_dispatch`` remains the single dispatch seam.
 """
 
 from __future__ import annotations
@@ -169,6 +169,7 @@ def openai_compatible_stream_payload(
     sampling_requires_reasoning_none: bool = False,
     fireworks_reasoning_route_sha256: str | None = None,
     hunyuan_reasoning_route_sha256: str | None = None,
+    reasoning_output_exposed: bool = False,
     forwards_service_tier: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
@@ -183,6 +184,8 @@ def openai_compatible_stream_payload(
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
         reasoning_effort: Optional catalog-pinned reasoning effort.
+        reasoning_output_exposed: Whether this rung replays the caller's plaintext
+            ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -201,6 +204,7 @@ def openai_compatible_stream_payload(
             openai_chat_message(
                 message,
                 reasoning_route_sha256=reasoning_route_sha256,
+                reasoning_output_exposed=reasoning_output_exposed,
             )
             for message in messages
         ],

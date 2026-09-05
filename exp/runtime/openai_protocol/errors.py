@@ -231,7 +231,13 @@ def public_failure_error(
             )
     retry_after_seconds: int | None = None
     if failure.failure_class is GatewayFailureClass.THROTTLED:
-        retry_after_seconds = THROTTLED_RETRY_AFTER_SECONDS
+        # A failure carrying its known throttle window advertises that wait
+        # (floored at the default) so the header never contradicts the
+        # message; without one the fixed default backoff applies.
+        retry_after_seconds = max(
+            THROTTLED_RETRY_AFTER_SECONDS,
+            failure.retry_after_seconds or THROTTLED_RETRY_AFTER_SECONDS,
+        )
     elif failure.failure_class is GatewayFailureClass.UNAVAILABLE:
         retry_after_seconds = UNAVAILABLE_RETRY_AFTER_SECONDS
     elif failure.failure_class is GatewayFailureClass.QUOTA_EXCEEDED:

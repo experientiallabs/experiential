@@ -25,6 +25,7 @@ from exp.runtime.gateway.batch.contracts import (
     BatchDeployment,
     BatchFile,
     BatchJob,
+    BatchJobPage,
     BatchLine,
     BatchLineError,
     BatchLineResult,
@@ -50,6 +51,10 @@ _LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_POLL_INTERVAL_SECONDS = 30.0
 _LIST_LIMIT_MAXIMUM = 100
+# The output-ceiling field of each batchable surface, in the order the
+# reservation reads them: Chat Completions (legacy and current names), then
+# Responses. The first positive integer present is the line's ceiling.
+_OUTPUT_CEILING_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
 
 
 def _now() -> datetime:
@@ -278,6 +283,62 @@ class BatchEngine:
                     )
                 )
                 continue
+            client = self._clients.get(deployment.provider)
+            if client is None:
+                raise BatchSubmitError(
+                    f"provider {deployment.provider} has no batch client enabled"
+                )
+            # The catalog says the model serves this surface; the client is
+            # the engine's truth of what its provider wire can carry.
+            if surface not in client.surfaces:
+                errors.append(
+                    BatchLineError(
+                        line_number=line_number,
+                        custom_id=custom_id,
+                        code="surface_unsupported",
+                        message=(
+                            f"{deployment.provider} batches do not serve {surface}; "
+                            f"this client serves {', '.join(client.surfaces)}"
+                        ),
+                    )
+                )
+                continue
+            maximum_output = deployment.default_maximum_output_tokens
+            for key in _OUTPUT_CEILING_KEYS:
+                value = body.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    maximum_output = value
+                    break
+            clean_body = {key: value for key, value in body.items() if key != "model"}
+            line = BatchLine(
+                custom_id=custom_id,
+                surface=surface,
+                model=model,
+                provider_model=deployment.provider_model,
+                body=clean_body,
+                estimated_input_tokens=_approximate_tokens(clean_body),
+                maximum_output_tokens=maximum_output,
+            )
+            # Shaping the line now catches every body the engine itself can
+            # refuse for this wire, as a per-line 400 at submit rather than a
+            # whole failed batch at dispatch; the provider's own per-model
+            # admission still applies when the batch runs.
+            try:
+                client.line_request(line)
+            except BatchSubmitError as rejection:
+                errors.append(
+                    BatchLineError(
+                        line_number=line_number,
+                        custom_id=custom_id,
+                        code="invalid_request",
+                        message=rejection.message,
+                    )
+                )
+                continue
+            # Only a line that survived every per-line check joins the job's
+            # provider set and binding, so a rejected line on another
+            # provider stays a per-line error instead of turning the valid
+            # remainder into a mixed-provider refusal.
             providers.add(deployment.provider)
             if binding is None:
                 binding = deployment
@@ -294,28 +355,12 @@ class BatchEngine:
                     )
                 )
                 continue
-            maximum_output = body.get("max_tokens", body.get("max_completion_tokens"))
-            if not isinstance(maximum_output, int) or maximum_output <= 0:
-                maximum_output = deployment.default_maximum_output_tokens
-            clean_body = {key: value for key, value in body.items() if key != "model"}
-            lines.append(
-                BatchLine(
-                    custom_id=custom_id,
-                    surface=surface,
-                    model=model,
-                    provider_model=deployment.provider_model,
-                    body=clean_body,
-                    estimated_input_tokens=_approximate_tokens(clean_body),
-                    maximum_output_tokens=maximum_output,
-                )
-            )
+            lines.append(line)
         if len(providers) > 1:
             raise BatchSubmitError(
                 "one batch is served by exactly one provider; split lines by provider "
                 f"(saw {', '.join(sorted(providers))})"
             )
-        if binding is not None and binding.provider not in self._clients:
-            raise BatchSubmitError(f"provider {binding.provider} has no batch client enabled")
         if binding is not None and self._clients[binding.provider].requires_uniform_model:
             models = {line.provider_model for line in lines}
             if len(models) > 1:
@@ -353,10 +398,18 @@ class BatchEngine:
 
     def list_jobs(
         self, *, organization_id: str, limit: int = 20, after: str | None = None
-    ) -> list[BatchJob]:
-        """Return the organization's jobs, newest first, bounded per page."""
+    ) -> BatchJobPage:
+        """Return one page of the organization's jobs, newest first.
+
+        The store is asked for one job beyond the page, so ``has_more`` is
+        the truth of whether a further page exists rather than a guess from
+        a full page; the extra job is never rendered.
+        """
         bounded = max(1, min(limit, _LIST_LIMIT_MAXIMUM))
-        return self._store.list_jobs(organization_id=organization_id, limit=bounded, after=after)
+        fetched = self._store.list_jobs(
+            organization_id=organization_id, limit=bounded + 1, after=after
+        )
+        return BatchJobPage(jobs=tuple(fetched[:bounded]), has_more=len(fetched) > bounded)
 
     async def cancel(self, *, organization_id: str, batch_id: str) -> BatchJob:
         """Request cancellation of one owned, non-terminal job.
@@ -414,6 +467,19 @@ class BatchEngine:
         only the secret value itself is late-bound through the resolver.
         """
         return self._secrets.resolve(job.credential_reference)
+
+    def _cancel_requested(self, job: BatchJob) -> bool:
+        """Whether the caller's cancellation intent is on record for this job.
+
+        The poller works from a job read before its provider call, so a
+        cancel persisted while that call was in flight is visible only by
+        re-reading the store; a snapshot already marked CANCELLING needs no
+        read.
+        """
+        if job.status is BatchStatus.CANCELLING:
+            return True
+        current = self._store.load_job(batch_id=job.batch_id, organization_id=job.organization_id)
+        return current is not None and current.status is BatchStatus.CANCELLING
 
     async def poll_once(self) -> int:
         """Advance every open job one step; returns how many jobs progressed."""
@@ -514,10 +580,7 @@ class BatchEngine:
                     "status": BatchStatus.IN_PROGRESS,
                 }
             )
-            current = self._store.load_job(
-                batch_id=job.batch_id, organization_id=job.organization_id
-            )
-            if current is not None and current.status is BatchStatus.CANCELLING:
+            if self._cancel_requested(job):
                 # Cancellation arrived while the submit was in flight: keep
                 # the provider id and the CANCELLING intent. Providers with
                 # cancellation get the request; without it the job runs to
@@ -546,14 +609,27 @@ class BatchEngine:
         counts = job.counts.model_copy(
             update={"completed": snapshot.completed, "failed": snapshot.failed}
         )
+        # The caller may have persisted a cancellation between this poll's
+        # job read and the provider's answer; the intent is re-read after the
+        # poll so a terminal snapshot never overwrites CANCELLING with
+        # COMPLETED for a batch the caller cancelled.
         next_status = snapshot.status
-        if job.status is BatchStatus.CANCELLING and next_status not in TERMINAL_STATUSES:
-            # The caller's cancellation intent survives provider snapshots
-            # that have not yet observed it (or providers without cancel).
-            next_status = BatchStatus.CANCELLING
+        if self._cancel_requested(job):
+            if next_status is BatchStatus.COMPLETED and snapshot.cancelled_lines > 0:
+                # A provider that ends a cancelled batch as "completed"
+                # reports the cut lines; with the caller's intent on record
+                # that job is CANCELLED. When every line had already run,
+                # nothing was cancelled and the job completes, every line
+                # billed.
+                next_status = BatchStatus.CANCELLED
+            elif next_status not in TERMINAL_STATUSES:
+                # The caller's cancellation intent survives provider
+                # snapshots that have not yet observed it (or providers
+                # without cancel).
+                next_status = BatchStatus.CANCELLING
         job = job.model_copy(update={"status": next_status, "counts": counts})
-        if snapshot.status in TERMINAL_STATUSES:
-            await self._finalize(job, snapshot.status, snapshot.failure_message)
+        if next_status in TERMINAL_STATUSES:
+            await self._finalize(job, next_status, snapshot.failure_message)
         else:
             self._store.save_job(job=job)
 
@@ -587,13 +663,22 @@ class BatchEngine:
             try:
                 fetched = await client.results(job=job, api_key=self._api_key(job))
             except BatchSubmitError:
-                if job.status is BatchStatus.COMPLETED:
-                    # A completed job's results exist; a fetch failure is
+                if (
+                    job.status is BatchStatus.COMPLETED
+                    or job.counts.completed > 0
+                    or job.counts.failed > 0
+                ):
+                    # Result rows exist: a completed job, or a cancelled,
+                    # expired, or failed one whose provider counted served OR
+                    # failed lines (a provider's per-line failure rows carry
+                    # the reasons the caller is owed). A fetch failure is
                     # retryable, so settlement stays open for a later poll
-                    # instead of releasing lines whose work already ran.
+                    # instead of releasing lines whose work already ran and
+                    # replacing provider reasons with a generic job error.
                     raise
                 # A definitive provider response on a failed, expired, or
-                # cancelled job means no per-line results are available.
+                # cancelled job that counted no result rows means no per-line
+                # results are available.
                 _LOGGER.warning(
                     "batch %s: no results retrievable for %s job; releasing all lines",
                     job.batch_id,

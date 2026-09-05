@@ -1,1 +1,2 @@
-"""The dialect dispatch seam is exercised in streaming_requests_test.py."""
+"""Inline tests for the dialect dispatch seam (currently exercised through
+``streaming_requests_test`` and every payload-builder suite)."""

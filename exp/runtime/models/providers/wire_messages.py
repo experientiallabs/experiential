@@ -69,6 +69,10 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     items: list[JsonObject] = []
     indexed_items: list[tuple[int, JsonObject]] = []
     for block in message.provider_reasoning:
+        if block.kind == "exposed_reasoning_content":
+            # Plaintext reasoning replays only on an exposure-gated Chat rung;
+            # route narrowing disclosed the drop for this wire.
+            continue
         if block.kind != "encrypted_reasoning":
             # Anthropic thinking cannot replay on the OpenAI wire; route
             # admission rejects the combination before dispatch.
@@ -234,6 +238,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         return "assistant", [message.provider_anthropic_block]
     blocks: list[JsonObject] = []
     for reasoning in message.provider_reasoning:
+        if reasoning.kind == "exposed_reasoning_content":
+            # Plaintext reasoning replays only on an exposure-gated Chat rung;
+            # route narrowing disclosed the drop for this wire.
+            continue
         # Thinking blocks lead the assistant turn (the Anthropic contract)
         # and re-emit verbatim: the signature must round-trip byte-exact.
         if reasoning.kind == "thinking":
@@ -337,12 +345,16 @@ def openai_chat_message(
     message: GatewayMessage,
     *,
     reasoning_route_sha256: str | None = None,
+    reasoning_output_exposed: bool = False,
 ) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON.
 
     ``reasoning_route_sha256`` is the active preserved-thinking route identity
     for this rung (Fireworks or Hunyuan); an unsealed ``reasoning_content``
     block forwards to the provider only when it names that exact route.
+    ``reasoning_output_exposed`` marks a rung whose plaintext reasoning the
+    caller may replay verbatim (an ``exposed_reasoning_content`` block); any
+    other rung omits that block, which route narrowing already disclosed.
     """
     if message.role == "tool":
         return {
@@ -382,6 +394,10 @@ def openai_chat_message(
         if len(message.provider_reasoning) != 1:
             raise ProviderResponseError("Chat reasoning history requires exactly one carrier")
         block = message.provider_reasoning[0]
+        if block.kind == "exposed_reasoning_content":
+            if reasoning_output_exposed:
+                payload["reasoning_content"] = block.content
+            return payload
         if (
             block.kind != "reasoning_content"
             or reasoning_route_sha256 is None

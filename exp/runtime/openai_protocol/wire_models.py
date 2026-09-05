@@ -38,15 +38,30 @@ _EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
 class _TextPart(_WireModel):
     """One supported text-only content part.
 
-    Echoed ``output_text`` parts carry empty ``annotations`` and ``logprobs``
-    arrays (this gateway emits them and callers resend prior output verbatim
-    on continuations); only a populated value is rejected as unsupported.
+    Echoed ``output_text`` parts carry ``annotations`` and ``logprobs``
+    arrays: this gateway emits them and callers resend prior output verbatim
+    on continuations. Hosted web-search answers carry populated annotation
+    objects (URL citations), which are validated shallowly and dropped on
+    replay: the provider derives nothing from echoed display metadata, and
+    the cited text itself rides ``text``. A populated ``logprobs`` echo stays
+    rejected because this gateway never emits one.
     """
 
     type: Literal["text", "input_text", "output_text"]
     text: str
-    annotations: tuple[()] | None = None
+    annotations: tuple[JsonObject, ...] | None = None
     logprobs: tuple[()] | None = None
+
+    @field_validator("annotations")
+    @classmethod
+    def _require_typed_annotations(
+        cls, value: tuple[JsonObject, ...] | None
+    ) -> tuple[JsonObject, ...] | None:
+        """Require each echoed annotation to be a typed object."""
+        for annotation in value or ():
+            if not isinstance(annotation.get("type"), str) or not annotation["type"]:
+                raise ValueError("each annotation must carry a non-empty type")
+        return value
 
 
 _ImageDetail = Literal["auto", "low", "high"]
@@ -269,8 +284,16 @@ class _Message(_WireModel):
     @model_validator(mode="after")
     def _require_role_fields(self) -> _Message:
         """Require tool linkage and assistant calls on their legal roles."""
-        if self.role == "assistant" and self.content is None and not self.history_tool_calls:
-            raise ValueError("assistant messages need content or tool calls")
+        if (
+            self.role == "assistant"
+            and self.content is None
+            and not self.history_tool_calls
+            and self.reasoning_content is None
+        ):
+            # A reasoning-only assistant turn is a shape the gateway itself
+            # returns (an exposed rung's length-cut thinking turn: content null,
+            # plaintext reasoning_content) and the provider accepts back.
+            raise ValueError("assistant messages need content, tool calls, or reasoning_content")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
@@ -739,13 +762,87 @@ class _CustomToolCallOutput(_WireModel):
     output: JsonValue
 
 
+HOSTED_TOOL_ITEM_TYPES_ASSISTANT = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "image_generation_call",
+        "local_shell_call",
+        "shell_call",
+        "apply_patch_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    }
+)
+"""Provider-authored hosted-tool and opaque conversation output items."""
+
+HOSTED_TOOL_ITEM_TYPES_TOOL = frozenset(
+    {
+        "computer_call_output",
+        "local_shell_call_output",
+        "shell_call_output",
+        "apply_patch_call_output",
+        "mcp_approval_response",
+    }
+)
+"""Caller-authored results answering a hosted or locally executed call."""
+
+
+class _HostedToolItemEcho(BaseModel):
+    """One hosted-tool Responses item echoed as input history.
+
+    Hosted tools (web search, MCP, code interpreter, ...) execute at the
+    provider, whose item vocabulary exists on no other wire, so validation is
+    deliberately shallow (mirroring ``_AdditionalToolsItem``) and the raw
+    caller item forwards byte-for-byte on native Responses rungs only; every
+    other rung rejects it by name. The type set is the documented output-item
+    union beyond the typed models above (openai-python 3.x, 2026-09-04).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal[
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "computer_call_output",
+        "image_generation_call",
+        "local_shell_call",
+        "local_shell_call_output",
+        "shell_call",
+        "shell_call_output",
+        "apply_patch_call",
+        "apply_patch_call_output",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "mcp_approval_response",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    ]
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+
+
 _ResponsesOutputItem = Annotated[
     _ResponseFunctionCall
     | _ResponseFunctionOutput
     | _ResponseReasoningItem
     | _AdditionalToolsItem
     | _CustomToolCall
-    | _CustomToolCallOutput,
+    | _CustomToolCallOutput
+    | _HostedToolItemEcho,
     Field(discriminator="type"),
 ]
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem

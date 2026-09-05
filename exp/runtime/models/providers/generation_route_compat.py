@@ -51,7 +51,9 @@ def compatible_generation_parameter_profile_indexes(
             rejections.append(exc)
             continue
         serviceable.append(index)
-        if _honors_requested_sampling(request, provider):
+        if _honors_requested_sampling(request, provider) and _carries_exposed_reasoning(
+            profile, request
+        ):
             exact.append(index)
     if exact:
         return tuple(exact)
@@ -75,3 +77,20 @@ def _honors_requested_sampling(request: GatewayRequest, provider_request: Gatewa
     if request.top_p is not None and provider_request.top_p is None:
         return False
     return not (request.top_k is not None and provider_request.top_k is None)
+
+
+def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
+    """Return whether a rung forwards the request's plaintext reasoning history.
+
+    Replayed plaintext ``reasoning_content`` reaches the provider only on an
+    exposure-gated rung; any other rung serves the turn by dropping it (a
+    disclosed drop), so it is only a fallback behind a rung that carries it —
+    the same preference rule sampling controls follow.
+    """
+    if profile.reasoning_output_exposed:
+        return True
+    return not any(
+        block.kind == "exposed_reasoning_content"
+        for message in request.messages
+        for block in message.provider_reasoning
+    )

@@ -28,6 +28,9 @@ from exp.runtime.gateway.reasoning_blocks import (
     EncryptedReasoningBlock as EncryptedReasoningBlock,
 )
 from exp.runtime.gateway.reasoning_blocks import (
+    ExposedReasoningContentBlock as ExposedReasoningContentBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
     OpaqueReasoningContentBlock as OpaqueReasoningContentBlock,
 )
 from exp.runtime.gateway.reasoning_blocks import (
@@ -42,19 +45,19 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import (
     ThinkingBlock as ThinkingBlock,
 )
-from exp.runtime.gateway.stream_events import (
+from exp.runtime.gateway.stream_contracts import (
     GatewayEvent as GatewayEvent,
 )
-from exp.runtime.gateway.stream_events import (
+from exp.runtime.gateway.stream_contracts import (
     GatewayEventKind as GatewayEventKind,
 )
-from exp.runtime.gateway.stream_events import (
+from exp.runtime.gateway.stream_contracts import (
     GatewayFailure as GatewayFailure,
 )
-from exp.runtime.gateway.stream_events import (
+from exp.runtime.gateway.stream_contracts import (
     GatewayFailureClass as GatewayFailureClass,
 )
-from exp.runtime.gateway.stream_events import (
+from exp.runtime.gateway.stream_contracts import (
     GatewayUsage as GatewayUsage,
 )
 
@@ -249,12 +252,14 @@ class GatewayMessage(ContractModel):
 
     Codex ships tool definitions and freeform tool history as native input
     items (``additional_tools``, ``custom_tool_call``,
-    ``custom_tool_call_output``) whose shapes cannot be expressed on any
-    other wire; the item is validated shallowly at decode and re-emitted
-    byte-for-byte at its position on native Responses rungs only. A message
-    carrying it carries nothing else. Excluded from serialization like the
-    other carriers so item-free digests are unperturbed; a present item
-    joins replay identity through :func:`canonical_request_sha256`.
+    ``custom_tool_call_output``), and hosted-tool turns echo their
+    provider-executed items (``web_search_call``, ``mcp_call``,
+    ``code_interpreter_call``, their outputs, ...); every such shape exists
+    on no other wire, so the item is validated shallowly at decode and
+    re-emitted byte-for-byte at its position on native Responses rungs only.
+    A message carrying it carries nothing else. Excluded from serialization
+    like the other carriers so item-free digests are unperturbed; a present
+    item joins replay identity through :func:`canonical_request_sha256`.
     """
     provider_anthropic_block: JsonObject | None = Field(default=None, exclude=True)
     """One verbatim Anthropic content block the gateway carries opaquely.

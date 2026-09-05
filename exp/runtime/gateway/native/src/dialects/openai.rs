@@ -4,8 +4,8 @@
 use serde_json::Value;
 
 use super::{
-    complete_streamed_tool, finish_open_tools, finish_open_tools_truncated, malformed,
-    optional_text, parse_object, provider_stream_failed, refusal_failure, Normalizer,
+    bounded_wire_token, complete_streamed_tool, finish_open_tools, finish_open_tools_truncated,
+    malformed, optional_text, parse_object, provider_stream_failed, refusal_failure, Normalizer,
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
@@ -15,6 +15,9 @@ use crate::events::{
 };
 
 const MAXIMUM_OPENAI_ID_CHARS: usize = 256;
+
+mod hosted;
+use hosted::{is_openai_hosted_item_type, is_openai_hosted_progress_event};
 
 fn openai_identity(
     object: &serde_json::Map<String, Value>,
@@ -167,6 +170,9 @@ impl Normalizer {
                     delta,
                 });
             }
+            "response.output_text.annotation.added" => {
+                events.extend(self.openai_text_annotation(&payload)?);
+            }
             "response.reasoning_summary_text.delta" => {
                 let output_index =
                     openai_index(&payload, "output_index", "OpenAI reasoning output_index")?;
@@ -266,6 +272,10 @@ impl Normalizer {
                     .ok_or_else(|| malformed("OpenAI output item must be an object"))?;
                 let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
                 let index = openai_index(&payload, "output_index", "OpenAI output_index")?;
+                if is_openai_hosted_item_type(item_type) {
+                    events.extend(self.openai_hosted_item_added(index, item_type, item)?);
+                    return Ok(events);
+                }
                 let status = openai_status(item)?;
                 if item_type == "function_call" {
                     if self.tools.contains_key(&index) {
@@ -421,9 +431,10 @@ impl Normalizer {
                         phase,
                     });
                 } else {
-                    return Err(malformed(
-                        "OpenAI stream emitted an unsupported output item",
-                    ));
+                    return Err(malformed(&format!(
+                        "OpenAI stream emitted an unsupported output item (type {})",
+                        bounded_wire_token(item_type),
+                    )));
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -505,6 +516,11 @@ impl Normalizer {
                     .get("item")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("OpenAI completed output item must be an object"))?;
+                let done_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                if is_openai_hosted_item_type(done_type) {
+                    events.extend(self.openai_hosted_item_done(index, done_type, item)?);
+                    return Ok(events);
+                }
                 let status = openai_status(item)?;
                 match item.get("type").and_then(Value::as_str) {
                     Some("reasoning") => {
@@ -665,9 +681,10 @@ impl Normalizer {
                         complete_streamed_tool(index, tool, &mut events)?;
                     }
                     _ => {
-                        return Err(malformed(
-                            "OpenAI stream emitted an unsupported completed output item",
-                        ))
+                        return Err(malformed(&format!(
+                            "OpenAI stream emitted an unsupported completed output item (type {})",
+                            bounded_wire_token(done_type),
+                        )))
                     }
                 }
             }
@@ -704,6 +721,7 @@ impl Normalizer {
                         phase: None,
                     });
                 }
+                events.extend(self.openai_sweep_hosted_items());
                 events.extend(finish_open_tools(&mut self.tools)?);
                 if let Some(usage) =
                     openai_usage(response.get("usage")).map_err(|message| malformed(&message))?
@@ -741,7 +759,27 @@ impl Normalizer {
                 }
             }
             "response.failed" => {
+                // A failed terminal still reports the usage the provider
+                // billed for the processed legs; fold it so settlement
+                // accounts the charged tokens instead of zero.
+                if let Some(response) = payload.get("response").and_then(Value::as_object) {
+                    if let Some(usage) = openai_usage(response.get("usage"))
+                        .map_err(|message| malformed(&message))?
+                    {
+                        events.push(Event::Usage(usage));
+                    }
+                }
                 events.push(Event::Failed(provider_stream_failed()));
+            }
+            "error" => {
+                // The in-stream error frame is the provider declaring its own
+                // failure mid-stream, mirroring the Anthropic dialect's error
+                // event: provider_internal (retry, then fail over), never a
+                // stream that "ended without a terminal event".
+                events.push(Event::Failed(provider_stream_failed()));
+            }
+            other if is_openai_hosted_progress_event(other) => {
+                events.extend(self.openai_hosted_progress(other, &payload)?);
             }
             _ => {}
         }
@@ -928,3 +966,7 @@ mod tests;
 #[cfg(test)]
 #[path = "openai/identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+#[path = "openai/hosted_tests.rs"]
+mod hosted_tests;

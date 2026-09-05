@@ -1,4 +1,8 @@
-"""Immutable gateway stream event, usage, and failure contracts."""
+"""Provider-neutral stream outcome contracts: usage, events, and failures.
+
+Split from :mod:`exp.runtime.gateway.contracts` for the module line budget;
+that module re-exports every name here, so import paths are unchanged.
+"""
 
 from __future__ import annotations
 
@@ -191,3 +195,10 @@ class GatewayFailure(ContractModel):
     """Validated provider-named parameter path; never provider prose."""
     provider_detail: str | None = Field(default=None, min_length=1, max_length=240)
     """Provider explanation of a client error, relayed only for that class."""
+    retry_after_seconds: int | None = Field(default=None, ge=1)
+    """Known wait before a retry can dispatch (a throttle window's remainder).
+
+    When present on a throttled failure, the public mapping advertises this
+    value as ``Retry-After`` instead of its fixed default, so the header and
+    the message never tell the caller two different waits.
+    """
