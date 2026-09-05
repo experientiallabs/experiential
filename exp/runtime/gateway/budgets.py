@@ -641,7 +641,9 @@ def _completion_attempt_cost_micro_usd(
         for rate in (
             schedule.input_micro_usd_per_million_tokens,
             schedule.cached_input_micro_usd_per_million_tokens,
-            schedule.cache_creation_input_micro_usd_per_million_tokens,
+            schedule.cache_creation_input_micro_usd_per_million_tokens
+            if capabilities.reports_cache_creation_input_tokens
+            else None,
         )
         if rate is not None
     )

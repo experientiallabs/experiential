@@ -218,7 +218,7 @@ def test_identity_digest_is_pinned_until_a_deliberate_schema_version_bump() -> N
     """
     normalized = normalize_gateway_catalog(_identity_fixture_catalog())
     assert (SNAPSHOT_SCHEMA_VERSION, normalized.identity_sha256()) == (
-        3,
+        4,
         "f9e74a42f5b47ec0a0739836ef15bbfa36df4eaa7c34efee10c421d46962529f",
     )
 
@@ -321,7 +321,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 3,
+        "schema_version": 4,
         "normalized": ["deployments", "pools", "schema_version"],
         "deployment": [
             "billing_source",
