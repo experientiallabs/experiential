@@ -3162,3 +3162,32 @@ def test_hosted_tool_echo_annotations_require_a_typed_object() -> None:
             }
         )
     assert rejected.value.status_code == 400
+
+
+def test_responses_decoder_names_a_duplicate_call_id_instead_of_crashing() -> None:
+    """A canonical-contract violation in replayed history is a named 400.
+
+    Two echoed ``function_call`` items sharing one ``call_id`` violate the
+    canonical assistant-message contract during history reconstruction,
+    after the wire models have already passed. That exception must map to
+    the field-specific protocol error every other invalid shape gets: before
+    the mapping it escaped decode as an unclassified 500 whose "retry the
+    request" guidance is wrong for caller-shaped input.
+    """
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_responses(
+            {
+                "model": "gpt-5.6-sol",
+                "tools": [{"type": "function", "name": "a", "parameters": {"type": "object"}}],
+                "input": [
+                    {"role": "user", "content": "t"},
+                    {"type": "function_call", "call_id": "dup", "name": "a", "arguments": "{}"},
+                    {"type": "function_call", "call_id": "dup", "name": "a", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "dup", "output": "x"},
+                    {"type": "function_call_output", "call_id": "dup", "output": "y"},
+                ],
+            }
+        )
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == "input"
+    assert "tool call IDs must be unique" in rejected.value.detail.message
