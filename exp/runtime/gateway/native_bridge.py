@@ -647,6 +647,10 @@ class NativeControlPlane(
                 signers=tuple(signers),
                 dispatch_bindings=tuple(dispatch_bindings),
                 reasoning_carrier_authorities=tuple(carrier_authorities),
+                tier_forwarded_by_depth=tuple(
+                    profile.forwards_tier(provider_request.service_tier)
+                    for profile, _client in resolved_wires
+                ),
             )
         )
         response: JsonObject = {

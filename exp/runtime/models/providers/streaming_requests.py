@@ -502,18 +502,20 @@ def route_generation_parameter_requests(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("inference_geo")
-    # A provider tier forwards only where the caller pays that provider
-    # directly (BYOK) on a tier-preserving wire; a route with no such rung
-    # strips the tier up front with the same 'service_tier' disclosure the
-    # capability_policy drop path uses, so every rung serves and waterfalls
-    # stay deterministic. Host-funded rungs never emit it (they bill catalog
-    # rates while the tier changes provider pricing: flex discounted,
-    # priority premium) but stay in the route as untiered fallbacks; the
-    # dialect decline in dialect_stream_payload still guards mixed routes
-    # where an eligible rung keeps the tier alive.
+    # A provider tier forwards where the caller pays that provider directly
+    # (BYOK) OR on a host-funded rung that carries a per-tier pass-through card
+    # for THIS SPECIFIC tier (profile.forwards_tier), on a tier-preserving wire.
+    # Forwarding is per-tier, not lane-level: the shared request keeps the tier
+    # as long as ANY candidate can bill it, and each non-billable candidate
+    # strips it at its own payload build (openai_payloads gated on
+    # forwards_tier), so forward and bill agree on whichever candidate is
+    # selected. A route where NO candidate can bill the tier strips it up front
+    # with the same 'service_tier' disclosure the capability_policy drop path
+    # uses. Host-funded rungs without a card for this tier never emit it (they
+    # bill catalog rates while the tier changes provider pricing: flex
+    # discounted, priority premium) but stay in the route as untiered fallbacks.
     if request.service_tier is not None and not any(
-        profile.dialect in SERVICE_TIER_DIALECTS and profile.billing_customer_managed
-        for profile in profiles
+        profile.forwards_tier(request.service_tier) for profile in profiles
     ):
         ignore("service_tier")
         provider_updates["service_tier"] = None
@@ -572,6 +574,14 @@ def route_generation_parameter_requests(
     ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
         if "messages.content.cache_control" not in ignored:
             ignored.append("messages.content.cache_control")
+
+    # LiteLLM stamps ``provider_specific_fields`` on every assistant message it
+    # returns, and naive agent loops echo the dump back verbatim. No wire takes
+    # the object, so it is dropped on every route with disclosure, never a
+    # rejection (the 400 wedged whole Terminus-2 sessions, 2026-09-05).
+    if any(message.provider_specific_fields for message in request.messages):
+        if "messages.provider_specific_fields" not in ignored:
+            ignored.append("messages.provider_specific_fields")
 
     # Anthropic-native tool-definition annotations exist only on that wire;
     # every other rung drops each one with a per-field disclosure, never a

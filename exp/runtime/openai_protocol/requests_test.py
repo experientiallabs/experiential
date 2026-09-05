@@ -347,6 +347,56 @@ def test_chat_decoder_accepts_echoed_assistant_message_with_empty_sdk_fields() -
     assert decoded.request.messages[3].tool_calls == ()
 
 
+def test_chat_decoder_accepts_a_verbatim_litellm_message_dump() -> None:
+    """A LiteLLM ``Message.model_dump()`` echoed back on the next turn decodes.
+
+    LiteLLM stamps ``provider_specific_fields`` (an object), plus null
+    ``thinking_blocks``, ``reasoning_items`` and ``images``, on every assistant
+    message; a Terminus-2 port that keeps the message object resends all of
+    them (Akhara, 2026-09-05). The object is carried for disclosure and never
+    forwarded; the empty forms decode like the SDK's own empty keys.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Reply with a command."},
+                {
+                    "content": '{"command": "ls"}',
+                    "role": "assistant",
+                    "tool_calls": None,
+                    "function_call": None,
+                    "provider_specific_fields": {"refusal": None},
+                    "reasoning_content": "The user wants a listing.",
+                    "thinking_blocks": None,
+                    "reasoning_items": None,
+                    "annotations": None,
+                    "audio": None,
+                    "images": None,
+                },
+                {"role": "user", "content": "Output: a.txt"},
+            ],
+        }
+    )
+    echoed = decoded.request.messages[1]
+    assert echoed.content == '{"command": "ls"}'
+    assert echoed.provider_specific_fields == {"refusal": None}
+    assert "provider_specific_fields" not in echoed.model_dump(mode="json")
+
+    # An empty object is the common stamp and carries nothing to disclose.
+    empty = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "provider_specific_fields": {}},
+                {"role": "user", "content": "next"},
+            ],
+        }
+    )
+    assert empty.request.messages[1].provider_specific_fields is None
+
+
 def test_chat_decoder_preserves_only_a_gateway_issued_reasoning_carrier() -> None:
     """A Fireworks continuation stays encrypted until authorized admission."""
     deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
@@ -518,8 +568,15 @@ def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
 
 
 def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:
-    """A populated refusal or annotation in request history stays rejected."""
-    for extra in ({"refusal": "no"}, {"annotations": [{"type": "url_citation"}]}):
+    """A populated refusal, annotation, or LiteLLM carrier in history stays rejected."""
+    for extra in (
+        {"refusal": "no"},
+        {"annotations": [{"type": "url_citation"}]},
+        {"thinking_blocks": [{"type": "thinking", "thinking": "x", "signature": "y"}]},
+        {"reasoning_items": [{"type": "reasoning"}]},
+        {"images": [{"image_url": {"url": "https://example.test/a.png"}}]},
+        {"provider_specific_fields": "not-an-object"},
+    ):
         with pytest.raises(OpenAIProtocolError) as captured:
             decode_chat(
                 {

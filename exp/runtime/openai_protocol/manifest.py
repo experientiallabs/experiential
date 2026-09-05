@@ -87,13 +87,16 @@ CHAT_MANIFEST = CompatibilityManifest(
         # request). Admit it only once response normalization emits logprobs.
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
-        # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
-        # gateway-side, never forwarded to the model: `safety_identifier` is the
-        # current stable end-user identifier, `user` its deprecated predecessor,
-        # `prompt_cache_key` a same-prefix cache-routing hint (not identity).
+        # End-user attribution (OpenAI spec). Accepted and recorded gateway-side,
+        # never forwarded to the model: `safety_identifier` is the current
+        # stable end-user identifier, `user` its deprecated predecessor.
+        # `prompt_cache_key` is a same-prefix cache-routing hint (not identity):
+        # the caller's value never leaves the gateway, but a tenant-namespaced
+        # digest of it (or of the conversation stem) dispatches to rungs whose
+        # provider routes by the field (prompt_cache_affinity.py).
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
-        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
@@ -166,7 +169,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # Chat surface: accepted and recorded gateway-side, never forwarded.
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
-        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (

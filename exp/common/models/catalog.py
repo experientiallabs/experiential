@@ -558,6 +558,21 @@ class GatewayLongContextTier(ContractModel):
     reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
 
 
+class GatewayServiceTierPrices(ContractModel):
+    """PASS-THROUGH rates for one provider processing tier (flex / priority).
+
+    OpenAI's ``service_tier`` reprices the WHOLE request (``flex`` discounted,
+    ``priority`` premium): these rates replace the base schedule for every
+    dimension at cost, no markup. ``None`` on a dimension is unknown exactly as
+    on the base schedule (never the base rate). v1 bills the REQUESTED tier.
+    """
+
+    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+
+
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
@@ -578,6 +593,34 @@ class GatewayTokenPrices(ContractModel):
     the full 1M window at standard pricing (no tier), so current Anthropic
     deployments leave this ``None``.
     """
+    flex: GatewayServiceTierPrices | None = None
+    """Pass-through rates when the caller requests ``service_tier='flex'``."""
+    priority: GatewayServiceTierPrices | None = None
+    """Pass-through rates when the caller requests ``service_tier='priority'``."""
+
+    def service_tier(self, tier: str | None) -> GatewayServiceTierPrices | None:
+        """The pass-through card for a requested tier, or ``None`` (default/auto
+        and unknown tiers bill the base schedule; only flex/priority card)."""
+        if tier == "flex":
+            return self.flex
+        if tier == "priority":
+            return self.priority
+        return None
+
+    def for_service_tier(self, tier: str | None) -> GatewayTokenPrices:
+        """The effective schedule when the caller requests ``tier``: a flex/
+        priority card replaces the base rates whole-request (pass-through, no
+        markup) and drops long-context; any other tier returns ``self``."""
+        card = self.service_tier(tier)
+        if card is None:
+            return self
+        return GatewayTokenPrices(
+            input_micro_usd_per_million_tokens=card.input_micro_usd_per_million_tokens,
+            cached_input_micro_usd_per_million_tokens=card.cached_input_micro_usd_per_million_tokens,
+            output_micro_usd_per_million_tokens=card.output_micro_usd_per_million_tokens,
+            reasoning_micro_usd_per_million_tokens=card.reasoning_micro_usd_per_million_tokens,
+            long_context=None,
+        )
 
 
 class GatewayDeploymentMetadata(ContractModel):

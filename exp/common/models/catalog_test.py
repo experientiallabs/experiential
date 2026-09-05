@@ -783,3 +783,42 @@ def test_astra_responses_capability_slots_default_off() -> None:
     assert caps.supports_reasoning_effort_update is False
     # Defaulted addition contributes zero identity bytes.
     assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+
+
+def test_for_service_tier_reprices_whole_request_for_flex_and_priority() -> None:
+    """A requested flex/priority card replaces the base schedule whole-request;
+    other tiers (and no card) leave the base schedule unchanged."""
+    from exp.common.models.catalog import GatewayServiceTierPrices, GatewayTokenPrices
+
+    prices = GatewayTokenPrices(
+        input_micro_usd_per_million_tokens=1_000_000,
+        cached_input_micro_usd_per_million_tokens=100_000,
+        output_micro_usd_per_million_tokens=4_000_000,
+        reasoning_micro_usd_per_million_tokens=4_000_000,
+        flex=GatewayServiceTierPrices(
+            input_micro_usd_per_million_tokens=500_000,
+            output_micro_usd_per_million_tokens=2_000_000,
+        ),
+        priority=GatewayServiceTierPrices(
+            input_micro_usd_per_million_tokens=2_000_000,
+            output_micro_usd_per_million_tokens=8_000_000,
+        ),
+    )
+
+    flex = prices.for_service_tier("flex")
+    assert flex.input_micro_usd_per_million_tokens == 500_000
+    assert flex.output_micro_usd_per_million_tokens == 2_000_000
+    # A dimension absent on the card stays honestly unpriced, never the base.
+    assert flex.cached_input_micro_usd_per_million_tokens is None
+    assert flex.long_context is None
+
+    priority = prices.for_service_tier("priority")
+    assert priority.input_micro_usd_per_million_tokens == 2_000_000
+    assert priority.output_micro_usd_per_million_tokens == 8_000_000
+
+    # default/auto/None and an unpriced tier carry no override.
+    assert prices.for_service_tier("default") is prices
+    assert prices.for_service_tier("auto") is prices
+    assert prices.for_service_tier(None) is prices
+    no_card = GatewayTokenPrices(input_micro_usd_per_million_tokens=1)
+    assert no_card.for_service_tier("flex") is no_card
