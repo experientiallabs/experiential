@@ -183,6 +183,8 @@ def _coerce_adaptive_budget(
 def _coerce_thinking_to_effort(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
+    *,
+    admits: Callable[[GatewayRequest], bool] | None = None,
 ) -> RequestCoercion | None:
     """Translate a thinking config for an all-non-Anthropic route.
 
@@ -190,28 +192,39 @@ def _coerce_thinking_to_effort(
     rejection at route shaping would make whole sessions unusable against
     OpenAI-family reasoning models the provider itself serves fine. On a
     route with NO Anthropic rung the config translates to the nearest effort
-    the route's ladder supports (the table in
-    :func:`thinking_config_reasoning_effort`), disclosed as
-    ``thinking->reasoning_effort:<tier>``; a route with no reasoning rung
-    drops every reasoning signal with disclosure instead. An explicit caller
-    effort is the same channel already stated in the route's own vocabulary,
-    so it wins verbatim and the config drops with one disclosure. Routes with
-    an Anthropic rung are left alone: narrowing already prefers the rung that
-    honors the config verbatim, and stealing that preference here would trade
-    real thinking for a translation. Replayed thinking blocks are signed
-    provider state no translation can carry, so their presence declines the
-    coercion (and the gateway never fabricates unsigned blocks on the
-    response side: our own decode routes replayed blocks to Anthropic-only
-    routes, so a fabricated block would wedge the caller's next turn).
+    the route actually serves (the tier table in
+    :func:`thinking_config_reasoning_effort`, then nearest-first over the
+    route's ladder), disclosed as ``thinking->reasoning_effort:<tier>``.
+    The combined ladder is a union of per-rung ladders, so the naive nearest
+    tier may be served only by rungs that reject some other control;
+    candidates are therefore tried in nearness order (ties prefer the lower
+    tier) and the translation is the closest tier that survives full route
+    construction and the caller's admission probe, mirroring the
+    explicit-effort snap in :func:`coerce_generation_parameters`. A route
+    with no reasoning rung drops every reasoning signal with disclosure
+    instead. An explicit caller effort is the same channel already stated in
+    the route's own vocabulary, so it wins verbatim and the config drops
+    with one disclosure. Routes with an Anthropic rung are left alone:
+    narrowing already prefers the rung that honors the config verbatim, and
+    stealing that preference here would trade real thinking for a
+    translation. Replayed thinking blocks are signed provider state no
+    translation can carry, so their presence declines the coercion (and the
+    gateway never fabricates unsigned blocks on the response side: our own
+    decode routes replayed blocks to Anthropic-only routes, so a fabricated
+    block would wedge the caller's next turn).
 
     Args:
         profiles: Ordered wire profiles for every live route deployment.
         request: Decoded public request that no rung accepted verbatim.
+        admits: Optional caller probe that must accept a candidate before it
+            is offered, threaded through so a nearer tier that dies one
+            layer later never blocks a farther tier that serves.
 
     Returns:
         The disclosed translation or drop, or ``None`` when the request
-        carries no thinking config, the route has an Anthropic rung, or
-        replayed thinking blocks make the route unservable regardless.
+        carries no thinking config, the route has an Anthropic rung,
+        replayed thinking blocks make the route unservable regardless, or no
+        translatable tier serves the request end to end.
     """
     config = request.provider_thinking_config
     if config is None or not profiles:
@@ -224,16 +237,25 @@ def _coerce_thinking_to_effort(
         for block in message.provider_reasoning
     ):
         return None
+
+    def admitted(coercion: RequestCoercion) -> RequestCoercion | None:
+        """Offer one coercion only when the caller's probe accepts it."""
+        if admits is not None and not admits(coercion.request):
+            return None
+        return coercion
+
     ladder: set[str] = set()
     for profile in profiles:
         ladder.update(profile_reasoning_efforts(profile))
     if not ladder:
         dropped, disclosures = _drop_thinking_and_effort(request)
-        return RequestCoercion(request=dropped, disclosures=disclosures)
+        return admitted(RequestCoercion(request=dropped, disclosures=disclosures))
     if request.reasoning_effort is not None:
-        return RequestCoercion(
-            request=request.model_copy(update={"provider_thinking_config": None}),
-            disclosures=(THINKING_DROP_DISCLOSURE,),
+        return admitted(
+            RequestCoercion(
+                request=request.model_copy(update={"provider_thinking_config": None}),
+                disclosures=(THINKING_DROP_DISCLOSURE,),
+            )
         )
     requested_tier = thinking_config_reasoning_effort(config)
     candidates = set(ladder)
@@ -248,16 +270,34 @@ def _coerce_thinking_to_effort(
         # silently disable reasoning while calling it a translation, so a
         # route whose only level is 'none' takes the disclosed drop instead.
         candidates.discard("none")
-    translated = next(iter(efforts_by_nearness(requested_tier, candidates)), None)
-    if translated is None:
-        dropped, disclosures = _drop_thinking_and_effort(request)
-        return RequestCoercion(request=dropped, disclosures=disclosures)
-    return RequestCoercion(
-        request=request.model_copy(
-            update={"provider_thinking_config": None, "reasoning_effort": translated}
-        ),
-        disclosures=(f"{THINKING_EFFORT_DISCLOSURE_PREFIX}{translated}",),
-    )
+    for candidate in efforts_by_nearness(requested_tier, candidates):
+        translated_request = request.model_copy(
+            update={"provider_thinking_config": None, "reasoning_effort": candidate}
+        )
+        try:
+            indexes = compatible_generation_parameter_profile_indexes(profiles, translated_request)
+            # Per-rung admission is not enough here either: only a candidate
+            # whose narrowed rung set survives full route construction is a
+            # real translation (see the explicit-effort snap below).
+            route_generation_parameter_requests(
+                tuple(profiles[index] for index in indexes),
+                translated_request,
+            )
+        except (ProviderParameterError, ProviderCapabilityError):
+            continue
+        if admits is not None and not admits(translated_request):
+            continue
+        return RequestCoercion(
+            request=translated_request,
+            disclosures=(f"{THINKING_EFFORT_DISCLOSURE_PREFIX}{candidate}",),
+        )
+    if candidates:
+        # Active tiers exist but none serves this request end to end, so the
+        # original rejection stands: dropping the config here would silently
+        # disable reasoning the caller asked for.
+        return None
+    dropped, disclosures = _drop_thinking_and_effort(request)
+    return admitted(RequestCoercion(request=dropped, disclosures=disclosures))
 
 
 def _drop_thinking_and_effort(
@@ -331,10 +371,8 @@ def coerce_generation_parameters(
         if admits is not None and not admits(adaptive_budget.request):
             return None
         return adaptive_budget
-    thinking_effort = _coerce_thinking_to_effort(profiles, request)
+    thinking_effort = _coerce_thinking_to_effort(profiles, request, admits=admits)
     if thinking_effort is not None:
-        if admits is not None and not admits(thinking_effort.request):
-            return None
         return thinking_effort
     ladder: set[str] = set()
     for profile in profiles:

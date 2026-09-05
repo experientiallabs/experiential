@@ -835,6 +835,49 @@ def test_an_active_thinking_config_never_snaps_to_none() -> None:
     assert coercion.request.reasoning_effort is None
 
 
+def test_the_thinking_translation_tries_farther_tiers_when_the_nearest_cannot_serve() -> None:
+    """Two rungs whose ladders do not overlap at the naive nearest tier.
+
+    An 8192-token budget maps to 'medium'; the combined ladder {low, high}
+    puts 'low' nearest (ties prefer the lower tier), but the only rung
+    serving 'low' rejects the request's output ceiling, so a single-pick
+    translation would select an effort no rung serves end to end and the
+    route would reject a servable request. The coercion must keep walking
+    the ladder nearest-first and land on 'high', the closest tier that
+    survives full route construction.
+    """
+    low_rung = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://low.test/v1/responses",
+        model_id="low-reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        supported_reasoning_efforts=("low",),
+        maximum_output_tokens=64,
+    )
+    high_rung = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://high.test/v1/responses",
+        model_id="high-reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        supported_reasoning_efforts=("high",),
+    )
+
+    coercion = coerce_generation_parameters(
+        (low_rung, high_rung),
+        _messages_request(
+            provider_thinking_config={"type": "enabled", "budget_tokens": 8192},
+            maximum_output_tokens=256,
+        ),
+    )
+
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:high",)
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.request.reasoning_effort == "high"
+
+
 def test_a_disabled_thinking_config_never_snaps_to_an_active_effort() -> None:
     """The mirror hazard: 'disabled' asked for NO reasoning, so a ladder
     without 'none' takes the disclosed drop rather than enabling reasoning
