@@ -4200,3 +4200,83 @@ def test_a_messages_surface_effort_rejection_matches_the_client_recovery_latch()
     assert raised.value.param == "output_config.effort"
     assert "effort parameter" in str(raised.value)
     assert "not supported" in str(raised.value)
+
+
+def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() -> None:
+    """The Anthropic wire rejects empty text content blocks post-dispatch
+    ("text content blocks must be non-empty"; 2026-09-05, six orgs on
+    claude-fable routes); a user turn that is entirely empty has nothing to
+    send and dropping the whole message would change conversation structure,
+    so it is refused by name pre-dispatch."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="hello"),
+            GatewayMessage(role="assistant", content="hi"),
+            GatewayMessage(role="user", content=""),
+        ),
+        maximum_output_tokens=256,
+        stream=True,
+        include_usage=True,
+    )
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://a.test")
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((anthropic,), request)
+    assert rejected.value.param == "messages"
+    assert "empty content" in str(rejected.value)
+
+    # An all-empty cache-marked block run is the same empty turn (the blocks
+    # must flatten to the content, so all-empty blocks imply empty content)
+    # and takes the same refusal instead of falling through to the builder.
+    marked = request.model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="user", content="hello"),
+                GatewayMessage(role="assistant", content="hi"),
+                GatewayMessage(
+                    role="user",
+                    content="",
+                    provider_text_blocks=({"type": "text", "text": ""},),
+                ),
+            )
+        }
+    )
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((anthropic,), marked)
+    assert rejected.value.param == "messages"
+
+    # A non-Anthropic route keeps serving the shape it can carry.
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    public, _provider = route_generation_parameter_requests((chat,), request)
+    assert public.ignored_parameters == ()
+
+
+def test_chat_surface_sub_16_output_ceiling_rides_the_openai_floor() -> None:
+    """A Chat-surface max_tokens below OpenAI's minimum translated onto an
+    OpenAI rung rides the disclosed 16-token floor (the Messages-surface
+    contract), instead of dispatching a value the provider 400s opaquely
+    post-commit (2026-09-05 stragglers)."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=1,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    chat_rung = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    # The floor applies on all-OpenAI routes AND mixed OpenAI routes, so no
+    # rung dispatches the sub-minimum value.
+    for route in ((responses,), (responses, chat_rung)):
+        public, provider = route_generation_parameter_requests(route, request)
+        assert provider.maximum_output_tokens == 16
+        assert "max_tokens->16" in public.ignored_parameters
+
+    # The disclosure names the caller's own parameter.
+    completion_request = request.model_copy(
+        update={"maximum_output_tokens_parameter": "max_completion_tokens"}
+    )
+    public, provider = route_generation_parameter_requests((responses,), completion_request)
+    assert provider.maximum_output_tokens == 16
+    assert "max_completion_tokens->16" in public.ignored_parameters
