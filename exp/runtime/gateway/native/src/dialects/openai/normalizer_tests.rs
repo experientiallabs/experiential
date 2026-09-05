@@ -1064,3 +1064,50 @@ fn completed_item_with_invalid_arguments_stays_malformed_with_byte_count() {
         failure.safe_message
     );
 }
+
+/// A content_filter (or safety) cut with a mid-fragment call keeps its
+/// refusal classification: the sweep tolerates the provider-declared cut so
+/// the stream reaches the refusal terminal instead of being pre-empted as a
+/// malformed 502, and the dropped call is never served (the terminal is a
+/// failure, so no output reaches the caller).
+#[test]
+fn content_filter_truncation_surfaces_the_refusal_not_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1", "type": "function_call", "status": "in_progress",
+                "arguments": "{\"ci", "call_id": "call_1", "name": "get_weather",
+            },
+        })
+        .to_string(),
+    };
+    normalizer.feed(&added).expect("start normalizes");
+    let terminal = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "usage": {"input_tokens": 9, "output_tokens": 4},
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&terminal)
+        .expect("a filtered cut must reach its own refusal terminal");
+    match events.last() {
+        Some(Event::Failed(failure)) => {
+            assert_eq!(failure.failure_class, crate::errors::FailureClass::Refusal);
+        }
+        other => panic!("expected the refusal terminal, got {other:?}"),
+    }
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, Event::ToolCallCompleted { .. })));
+}
