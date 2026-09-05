@@ -3752,6 +3752,65 @@ def test_service_tier_route_shaping_forwards_on_byok_and_discloses_elsewhere() -
     assert foreign_provider.service_tier is None
 
 
+def test_service_tier_forwarding_is_per_card_not_lane_level() -> None:
+    """A mixed route emits the tier only on the candidate that can BILL it.
+
+    Regression for the underbill window: the route admits because ONE host rung
+    carries a flex card, but a fallback host rung carded only for `priority`
+    must NOT forward the flex tier (its `service_tier_pricing_enabled` is True).
+    If it did and were selected, the provider would run flex (discounted) while
+    the gateway billed the base rate. Route shaping keeps the tier alive for the
+    flex-carded rung; the priority-only rung strips it at its own payload build,
+    so forward and bill agree on whichever candidate is selected.
+    """
+    request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS)
+    flex_carded = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://flex.test",
+        model_id="model-x",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"flex"}),
+    )
+    priority_only = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://priority.test",
+        model_id="model-x",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"priority"}),
+    )
+    public, provider = route_generation_parameter_requests((flex_carded, priority_only), request)
+    # The tier survives route shaping (the flex-carded rung can bill it).
+    assert "service_tier" not in public.ignored_parameters
+    assert provider.service_tier == "flex"
+    # The selected candidate decides emission: flex-carded emits, priority-only
+    # strips (no flex card -> no underbill if it is the one that serves).
+    assert dialect_stream_payload(flex_carded, provider)["service_tier"] == "flex"
+    assert "service_tier" not in dialect_stream_payload(priority_only, provider)
+
+
+def test_service_tier_scale_strips_on_host_lane_without_rejecting() -> None:
+    """`scale` (a valid tier we do not price as opt-in) strips on a host lane.
+
+    A flex-carded host rung carries a card for flex only; a `scale` request is
+    not rejected and not forwarded — it is stripped with disclosure and the
+    provider runs its default at the base rate (billing-safe).
+    """
+    scale_request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS).model_copy(
+        update={"service_tier": "scale"}
+    )
+    flex_carded = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://flex.test",
+        model_id="model-x",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"flex"}),
+    )
+    public, provider = route_generation_parameter_requests((flex_carded,), scale_request)
+    assert "service_tier" in public.ignored_parameters
+    assert provider.service_tier is None
+    assert "service_tier" not in dialect_stream_payload(flex_carded, provider)
+
+
 def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> None:
     """When no rung serves, the caller sees the first rung's own field-scoped reason.
 

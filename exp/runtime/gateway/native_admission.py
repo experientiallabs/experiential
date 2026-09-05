@@ -109,31 +109,21 @@ def admitted_route_requests(
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
-    # A named processing tier (flex/priority) is a paid pricing choice, not a
-    # best-effort hint: it fails CLOSED before any reservation when no rung can
-    # honor it. Honoring means the SPECIFIC requested tier is billable on a
-    # forwarding rung: a BYOK rung forwards any tier (customer pays the provider
-    # directly, no platform card needed), while a house rung must carry a
-    # per-tier pass-through card for THIS tier (`prices.service_tier(tier)`).
-    # A model carded for flex only therefore rejects a priority request instead
-    # of forwarding it and silently billing the base rate while the provider
-    # charges the priority premium (underbill). auto/default carry no price and
-    # never reject; they still drop with disclosure downstream where a rung
-    # declines them.
-    if request.service_tier is not None and request.service_tier not in ("auto", "default"):
+    # flex/priority are the tiers we price as an OPT-IN pass-through, so they
+    # fail CLOSED before any reservation when no rung can BILL the requested one:
+    # a BYOK rung forwards any tier (customer pays the provider directly, no
+    # platform card needed), while a house rung must carry a per-tier card for
+    # THIS tier (`forwards_tier`). A model carded for flex only therefore rejects
+    # a priority request instead of forwarding it and silently billing the base
+    # rate while the provider charges the priority premium (underbill). Every
+    # OTHER tier (auto/default carry no price; scale and any future value) is
+    # never rejected here — a non-billable candidate simply strips it at payload
+    # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
+    if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
         if not any(
-            profile.dialect in SERVICE_TIER_DIALECTS
-            and (
-                profile.billing_customer_managed
-                or (
-                    profile.service_tier_pricing_enabled
-                    and deployment.gateway.prices.service_tier(tier) is not None
-                )
-            )
-            for deployment, (profile, _client) in zip(
-                route.deployments, resolved_wires, strict=True
-            )
+            profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_tier(tier)
+            for profile, _client in resolved_wires
         ):
             raise ProviderCapabilityError(
                 capability="service_tier",

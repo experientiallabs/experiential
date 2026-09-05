@@ -114,9 +114,17 @@ class GatewayWireProfile:
     Normally a host-funded rung strips the tier (the gateway bills catalog
     rates while a tier changes provider pricing). A model whose catalog carries
     per-tier PASS-THROUGH pricing sets this so the tier reaches the provider on
-    the house lane too, and settlement bills the served tier at cost. BYOK
-    rungs forward regardless (``billing_customer_managed``); this only widens
-    the host-funded case for opted-in models.
+    the house lane too, and settlement bills the REQUESTED tier at that card's
+    cost. BYOK rungs forward regardless (``billing_customer_managed``); this
+    only widens the host-funded case for opted-in models.
+    """
+    service_tier_cards: frozenset[str] = frozenset()
+    """The named tiers this host-funded rung carries a pass-through card for.
+
+    Forwarding is PER-TIER, not lane-level: a mixed route may pair a rung
+    carded for ``flex`` with one that is not, and the tier is emitted only on
+    the candidate that can also BILL it. Populated from the deployment's
+    per-tier price cards; BYOK ignores it (it forwards every tier).
     """
     forwards_prompt_cache_key: bool = False
     """Whether this rung's provider routes by ``prompt_cache_key``.
@@ -327,6 +335,21 @@ class GatewayWireProfile:
         host-funded rungs whose model carries per-tier pass-through pricing.
         """
         return self.billing_customer_managed or self.service_tier_pricing_enabled
+
+    def forwards_tier(self, tier: str | None) -> bool:
+        """Whether this rung emits and can BILL the SPECIFIC requested ``tier``.
+
+        Forwarding is per-tier so forward and bill agree on whichever candidate
+        is selected: a BYOK rung forwards any tier (the caller pays the provider
+        directly), while a host-funded rung forwards a tier only when it carries
+        a pass-through card for THAT tier (else it strips the tier and runs the
+        provider default at the base rate — billing-safe and disclosed).
+        """
+        if tier is None:
+            return False
+        if self.billing_customer_managed:
+            return True
+        return self.service_tier_pricing_enabled and tier in self.service_tier_cards
 
 
 class ProviderHttpClient(abc.ABC):

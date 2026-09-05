@@ -57,6 +57,11 @@ def _resolved_wire_profile(
             model_id=profile.model_id or runtime_model.snapshot.model_id,
             billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
             service_tier_pricing_enabled=capabilities.service_tier_pricing_enabled,
+            service_tier_cards=frozenset(
+                tier
+                for tier in ("flex", "priority")
+                if deployment.gateway.prices.service_tier(tier) is not None
+            ),
             minimum_temperature=(
                 max(profile.minimum_temperature, capabilities.minimum_temperature)
                 if capabilities.minimum_temperature is not None

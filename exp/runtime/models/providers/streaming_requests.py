@@ -503,17 +503,19 @@ def route_generation_parameter_requests(
     ):
         ignore("inference_geo")
     # A provider tier forwards where the caller pays that provider directly
-    # (BYOK) OR on a host-funded rung whose model carries per-tier pass-through
-    # pricing (profile.forwards_service_tier folds both), on a tier-preserving
-    # wire; a route with no such rung strips the tier up front with the same
-    # 'service_tier' disclosure the capability_policy drop path uses, so every
-    # rung serves and waterfalls stay deterministic. Host-funded rungs WITHOUT
-    # tier pricing never emit it (they bill catalog rates while the tier changes
-    # provider pricing: flex discounted, priority premium) but stay in the route
-    # as untiered fallbacks; the dialect decline in dialect_stream_payload still
-    # guards mixed routes where an eligible rung keeps the tier alive.
+    # (BYOK) OR on a host-funded rung that carries a per-tier pass-through card
+    # for THIS SPECIFIC tier (profile.forwards_tier), on a tier-preserving wire.
+    # Forwarding is per-tier, not lane-level: the shared request keeps the tier
+    # as long as ANY candidate can bill it, and each non-billable candidate
+    # strips it at its own payload build (openai_payloads gated on
+    # forwards_tier), so forward and bill agree on whichever candidate is
+    # selected. A route where NO candidate can bill the tier strips it up front
+    # with the same 'service_tier' disclosure the capability_policy drop path
+    # uses. Host-funded rungs without a card for this tier never emit it (they
+    # bill catalog rates while the tier changes provider pricing: flex
+    # discounted, priority premium) but stay in the route as untiered fallbacks.
     if request.service_tier is not None and not any(
-        profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_service_tier
+        profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_tier(request.service_tier)
         for profile in profiles
     ):
         ignore("service_tier")

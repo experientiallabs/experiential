@@ -849,8 +849,10 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
             )
         assert exc.value.capability == "service_tier"
 
-    # auto/default are not paid tiers and never reject here.
-    for tier in ("auto", "default"):
+    # auto/default carry no price, and `scale` (a valid OpenAI tier we do not
+    # price as opt-in) is stripped downstream, not rejected: only flex/priority
+    # gate at admission.
+    for tier in ("auto", "default", "scale"):
         request = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             messages=(GatewayMessage(role="user", content="go"),),
@@ -898,6 +900,7 @@ def test_tier_priced_host_lane_admits_the_named_tier() -> None:
                 dialect="openai_compatible",
                 url="https://house.test",
                 service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"flex"}),
             ),
             client,
         ),
@@ -957,6 +960,7 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
                 dialect="openai_compatible",
                 url="https://house.test",
                 service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"flex"}),
             ),
             client,
         ),

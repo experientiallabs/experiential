@@ -486,12 +486,14 @@ class ModelCapabilities(ContractModel):
     service_tier_pricing_enabled: bool = False
     """Whether this model carries per-provider-tier PASS-THROUGH pricing.
 
-    When set, a HOST-funded rung forwards ``service_tier`` to the provider (see
-    ``GatewayWireProfile.forwards_service_tier``) and settlement bills the SERVED
-    tier at the price card's per-tier rates; a tier request to a model without
-    this fails closed at the reservation seam (platform ``P1034``). BYOK rungs
-    forward regardless. Additive and excluded from the capability identity
-    digest: tier pricing propagates through the catalog publish, not the digest.
+    When set, a HOST-funded rung forwards ``service_tier`` to the provider for a
+    tier it carries a card for (see ``GatewayWireProfile.forwards_tier``) and
+    settlement bills the REQUESTED tier at that card's per-tier rates (v1 prices
+    the requested tier; billing the served tier the provider reports back is a
+    follow-up). A flex/priority request to a model with no card for that tier
+    fails closed at admission. BYOK rungs forward regardless. Additive and
+    excluded from the capability identity digest: tier pricing propagates
+    through the catalog publish, not the digest.
     """
 
     @field_validator(
