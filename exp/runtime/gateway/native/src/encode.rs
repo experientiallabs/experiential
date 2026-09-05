@@ -296,6 +296,16 @@ impl ChatSseEncoder {
             | Event::ServerToolResult { .. } => Err(invalid_provider_stream(
                 "Chat cannot represent a provider server tool.",
             )),
+            // Hosted tool items enter only through Responses-native tool
+            // declarations, which never admit on the Chat surface.
+            Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. } => Err(invalid_provider_stream(
+                "Chat cannot represent a provider-hosted Responses tool item.",
+            )),
+            // OpenAI text annotations have no Chat representation; the text
+            // itself streams through its delta events.
+            Event::ProviderTextAnnotation { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,

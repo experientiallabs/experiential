@@ -3779,3 +3779,71 @@ def test_plaintext_reasoning_prefers_the_exposing_rung_on_a_mixed_waterfall() ->
     # Without plaintext history both rungs are exact and the order is preserved.
     plain = request.model_copy(update={"messages": (GatewayMessage(role="user", content="hi"),)})
     assert compatible_generation_parameter_profile_indexes(profiles, plain) == (0, 1)
+
+
+def test_hosted_tool_echoes_require_a_homogeneous_responses_route_and_reemit_verbatim() -> None:
+    """Echoed hosted-tool items (web_search_call, mcp_call, their outputs)
+    forward byte-for-byte on native Responses rungs at their exact position;
+    any other rung in the route is a named rejection, mirroring the Anthropic
+    server-tool rule: silently dropping provider-executed history would wedge
+    the session."""
+    hosted_item: JsonObject = {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(role="assistant", provider_native_item=hosted_item),
+            GatewayMessage(role="user", content="and now?"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.6-sol", request, supports_temperature=False)
+    assert payload["input"] == [
+        {"role": "user", "content": "go"},
+        hosted_item,
+        {"role": "user", "content": "and now?"},
+    ]
+
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    public, _provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    with pytest.raises(ProviderParameterError) as mixed:
+        route_generation_parameter_requests((responses, chat), request)
+    assert mixed.value.param == "input"
+    assert "hosted tool items" in str(mixed.value)
+
+
+def test_route_rejects_max_output_tokens_below_the_responses_minimum() -> None:
+    """A sub-16 output ceiling on a homogeneous native Responses route fails
+    at admission with the documented minimum named, instead of dispatching a
+    request the provider will 400 opaquely post-commit."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        maximum_output_tokens=5,
+        maximum_output_tokens_parameter="max_output_tokens",
+        stream=True,
+        include_usage=True,
+    )
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((responses,), request)
+    assert rejected.value.param == "max_output_tokens"
+    assert "at least 16" in str(rejected.value)
+
+    # The documented minimum itself dispatches.
+    at_minimum = request.model_copy(update={"maximum_output_tokens": 16})
+    public, _provider = route_generation_parameter_requests((responses,), at_minimum)
+    assert public.ignored_parameters == ()
+
+    # A mixed route keeps dispatching: the bound is OpenAI's, not the route's.
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://a.test")
+    public, _provider = route_generation_parameter_requests((responses, anthropic), request)
+    assert public.ignored_parameters == ()

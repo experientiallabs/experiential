@@ -102,6 +102,24 @@ fn malformed(message: &str) -> Failure {
     Failure::new(FailureClass::MalformedResponse, message).with_retry(false, true)
 }
 
+/// One provider-supplied discriminator (an item or event type) reduced to a
+/// token safe to embed in a malformed-stream reason. The reason crosses into
+/// the operator log at the failure boundary, so anything but a short
+/// identifier-shaped token is replaced rather than relayed: the next unknown
+/// wire shape must be diagnosable from logs without ever logging payload.
+fn bounded_wire_token(candidate: &str) -> String {
+    let identifier = !candidate.is_empty()
+        && candidate.len() <= 64
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if identifier {
+        candidate.to_string()
+    } else {
+        "non-identifier".to_string()
+    }
+}
+
 fn refusal_failure() -> Failure {
     Failure::new(FailureClass::Refusal, "provider refused the request")
 }
@@ -202,6 +220,15 @@ fn finish_open_tools_truncated(
     Ok(events)
 }
 
+/// One open OpenAI Responses hosted-tool output item, bound by exact
+/// provider identity and carrying its last-seen verbatim JSON so a stream
+/// whose terminal arrives before the item's `done` can still close it.
+struct OpenAiHostedItem {
+    item_type: String,
+    item_id: String,
+    item: String,
+}
+
 /// Incremental normalizer of one upstream SSE stream into gateway events.
 pub struct Normalizer {
     dialect: Dialect,
@@ -216,6 +243,7 @@ pub struct Normalizer {
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
     openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, Option<String>)>,
+    openai_hosted_items: BTreeMap<u32, OpenAiHostedItem>,
     openai_completed_output_items: BTreeSet<u32>,
     // Anthropic accumulation.
     input_tokens: u64,
@@ -253,6 +281,7 @@ impl Normalizer {
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
             openai_output_items: BTreeMap::new(),
+            openai_hosted_items: BTreeMap::new(),
             openai_completed_output_items: BTreeSet::new(),
             input_tokens: 0,
             output_tokens: 0,
@@ -306,6 +335,7 @@ impl Normalizer {
                 .len()
                 .saturating_add(self.reasoning_summaries.len())
                 .saturating_add(self.openai_output_items.len())
+                .saturating_add(self.openai_hosted_items.len())
                 >= MAXIMUM_RETAINED_PROVIDER_ENTRIES
         {
             return Err(Failure::new(
@@ -333,6 +363,11 @@ impl Normalizer {
         kind: ProviderOutputItemKind,
         item_id: Option<String>,
     ) -> Result<bool, Failure> {
+        if self.openai_hosted_items.contains_key(&output_index) {
+            return Err(malformed(
+                "OpenAI output item changed identity or type during streaming",
+            ));
+        }
         if let Some(existing) = self.openai_output_items.get(&output_index) {
             return if existing == &(kind, item_id) {
                 Ok(false)

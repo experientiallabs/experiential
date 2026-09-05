@@ -179,9 +179,19 @@ pub struct Failure {
     pub rejected_parameter: Option<String>,
     /// The provider's own bounded single-line explanation of a client error,
     /// relayed only for that class so the caller sees what was actually
-    /// refused. Every other class stays content-free.
+    /// refused; every other class stays caller-content-free. On a coerced
+    /// malformed-response boundary it instead carries the gateway's own
+    /// static parse-reject reason, which never reaches the caller but does
+    /// reach settlement so the ledger can name the exact wire shape that
+    /// failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<String>,
+    /// Known wait before a retry can dispatch (a throttle window's
+    /// remainder). When present on a throttled failure, the public mapping
+    /// advertises this value as `Retry-After` (floored at the fixed default)
+    /// so the header never contradicts the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u32>,
 }
 
 impl Failure {
@@ -193,6 +203,7 @@ impl Failure {
             failover_eligible: false,
             rejected_parameter: None,
             provider_detail: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -227,18 +238,25 @@ impl Failure {
                 // The generic boundary message is about to erase the specific
                 // parse-reject reason, so emit it once as a structured,
                 // content-free operator line (the crate's stderr idiom) before
-                // it is lost. The reason is always a static parser label, never
+                // it is lost. The reason is a static parser label, optionally
+                // carrying one provider discriminator (an item or event type)
+                // already reduced to a bounded identifier-shaped token, never
                 // provider payload, so it is safe to log.
                 let line = json!({
                     "event": "malformed_response_boundary",
                     "reason": self.safe_message,
                 });
                 eprintln!("exp-gateway-native: {line}");
+                // The reason also rides provider_detail into settlement so
+                // the ledger names the exact wire shape that failed; the
+                // public error never relays it (that path is scoped to the
+                // invalid-request class).
                 Failure::new(
                     FailureClass::MalformedResponse,
                     "provider returned a malformed response; retry the request",
                 )
                 .with_retry(self.retryable_same_deployment, self.failover_eligible)
+                .with_provider_detail(Some(self.safe_message))
             }
             _ => self,
         }
@@ -289,7 +307,10 @@ impl Failure {
             }
         }
         error.retry_after_seconds = match self.failure_class {
-            FailureClass::Throttled => Some(5),
+            // A failure carrying its known throttle window advertises that
+            // wait (floored at the fixed default) so the Retry-After header a
+            // client honors never contradicts the message it reads.
+            FailureClass::Throttled => Some(self.retry_after_seconds.map_or(5, |wait| wait.max(5))),
             FailureClass::QuotaExceeded => Some(3600),
             FailureClass::Unavailable => Some(2),
             _ => None,
@@ -376,8 +397,17 @@ mod tests {
             coerced.safe_message,
             "provider returned a malformed response; retry the request"
         );
+        // The specific reason survives as the settlement-facing detail so the
+        // ledger names the wire shape that failed, while the public error
+        // stays generic (detail relay is scoped to invalid requests).
+        assert_eq!(coerced.provider_detail.as_deref(), Some("specific detail"));
+        assert_eq!(
+            coerced.public_error().message,
+            "provider returned a malformed response; retry the request"
+        );
         let transport = Failure::new(FailureClass::Transport, "kept").boundary();
         assert_eq!(transport.safe_message, "kept");
+        assert_eq!(transport.provider_detail, None);
     }
 
     #[test]
@@ -393,6 +423,23 @@ mod tests {
             let back: FailureClass = serde_json::from_value(wire).expect("round trip");
             assert_eq!(back.as_str(), class.as_str());
         }
+    }
+
+    #[test]
+    fn a_throttled_failure_advertises_its_known_window_floored_at_the_default() {
+        // The throttled-exhaustion message names the remaining window, so the
+        // Retry-After header must advertise the same wait: a fixed 5s header
+        // beside a "retry in 30s" body sends honoring clients straight back
+        // into the window.
+        let mut throttled = Failure::new(FailureClass::Throttled, "retry in 30s");
+        throttled.retry_after_seconds = Some(30);
+        assert_eq!(throttled.public_error().retry_after_seconds, Some(30));
+        // A shorter-than-default window keeps the default floor.
+        throttled.retry_after_seconds = Some(2);
+        assert_eq!(throttled.public_error().retry_after_seconds, Some(5));
+        // Without a known window the fixed default backoff applies.
+        let bare = Failure::new(FailureClass::Throttled, "provider throttled the request");
+        assert_eq!(bare.public_error().retry_after_seconds, Some(5));
     }
 
     #[test]

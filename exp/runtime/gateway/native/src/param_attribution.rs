@@ -112,7 +112,15 @@ pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
 /// site to the client-error class. Provider messages for authentication,
 /// not-found, and server-side failures are operator-facing and can name
 /// deployments or accounts, so they stay content-free.
-pub fn rejected_detail(dialect: Dialect, body: &str) -> Option<String> {
+///
+/// `request_words` are label-shaped values the dispatched request itself
+/// carried (today: the payload's own `model`). The caller already knows
+/// them, so a provider sentence naming one verbatim is prose about the
+/// request, never infrastructure to redact: Anthropic's client-version gate
+/// names the rejected model unquoted ("claude-fable-5-1 requires Claude Code
+/// 2.1.251 or later"), and dropping that sentence left callers with a
+/// generic 400 for a client-side fix (2026-09-04 ledger).
+pub fn rejected_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> Option<String> {
     let value: Value = serde_json::from_str(body).ok()?;
     let message = match dialect {
         Dialect::OpenAiResponses
@@ -122,7 +130,7 @@ pub fn rejected_detail(dialect: Dialect, body: &str) -> Option<String> {
         // Bedrock reports a modeling error as a bare top-level `message`.
         Dialect::BedrockConverseStream => value.get("message")?.as_str()?,
     };
-    sanitized_detail(message)
+    sanitized_detail(message, request_words)
 }
 
 /// One provider sentence reduced to bounded, single-line, printable text.
@@ -131,8 +139,8 @@ pub fn rejected_detail(dialect: Dialect, body: &str) -> Option<String> {
 /// presence means the field carries a payload, not a sentence. Interior runs
 /// of spaces and tabs collapse so the relayed text stays one readable line,
 /// and [`carries_provider_identifier`] then rejects any sentence naming
-/// provider-side infrastructure.
-fn sanitized_detail(message: &str) -> Option<String> {
+/// provider-side infrastructure, except words the request itself carried.
+fn sanitized_detail(message: &str, request_words: &[&str]) -> Option<String> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAXIMUM_DETAIL_LENGTH {
         return None;
@@ -144,7 +152,11 @@ fn sanitized_detail(message: &str) -> Option<String> {
         return None;
     }
     let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() || collapsed.split(' ').any(carries_provider_identifier) {
+    if collapsed.is_empty()
+        || collapsed
+            .split(' ')
+            .any(|word| carries_provider_identifier(word, request_words))
+    {
         return None;
     }
     Some(collapsed)
@@ -158,14 +170,23 @@ fn sanitized_detail(message: &str) -> Option<String> {
 /// a partially redacted explanation reads as fact while hiding what was cut,
 /// and the caller keeps the generic message instead. A quoted word is the
 /// value the caller sent back to them, so only the unambiguous network and
-/// resource shapes disqualify it.
-fn carries_provider_identifier(word: &str) -> bool {
+/// resource shapes disqualify it; a word matching one of `request_words`
+/// (label-shaped values the dispatched payload itself carried, such as its
+/// `model`) is the same caller-known exception without the quotes, though
+/// the unambiguous network and resource shapes still disqualify it.
+fn carries_provider_identifier(word: &str, request_words: &[&str]) -> bool {
     let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
     if word.contains("://") || word.contains('@') || bare.to_ascii_lowercase().starts_with("arn:") {
         return true;
     }
     if bare.len() == 36 && bare.chars().filter(|c| *c == '-').count() == 4 {
         return true;
+    }
+    if request_words
+        .iter()
+        .any(|known| bare.eq_ignore_ascii_case(known))
+    {
+        return false;
     }
     let dotted: Vec<&str> = bare.split('.').collect();
     if dotted.len() == 4
@@ -490,18 +511,18 @@ mod tests {
         let openai = r#"{"error": {"message": "Unknown parameter: 'top_k'.",
             "type": "invalid_request_error"}}"#;
         assert_eq!(
-            rejected_detail(Dialect::OpenAiCompatible, openai).as_deref(),
+            rejected_detail(Dialect::OpenAiCompatible, openai, &[]).as_deref(),
             Some("Unknown parameter: 'top_k'.")
         );
         let anthropic = r#"{"type": "error", "error": {"type": "invalid_request_error",
             "message": "`top_p` is deprecated for this model."}}"#;
         assert_eq!(
-            rejected_detail(Dialect::AnthropicMessages, anthropic).as_deref(),
+            rejected_detail(Dialect::AnthropicMessages, anthropic, &[]).as_deref(),
             Some("`top_p` is deprecated for this model.")
         );
         let bedrock = r#"{"message": "The provided model does not support tool use."}"#;
         assert_eq!(
-            rejected_detail(Dialect::BedrockConverseStream, bedrock).as_deref(),
+            rejected_detail(Dialect::BedrockConverseStream, bedrock, &[]).as_deref(),
             Some("The provided model does not support tool use.")
         );
     }
@@ -509,16 +530,25 @@ mod tests {
     #[test]
     fn provider_explanation_is_dropped_when_it_is_not_one_bounded_sentence() {
         let multiline = r#"{"error": {"message": "failed\n  at deployment-7\n"}}"#;
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, multiline), None);
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, multiline, &[]),
+            None
+        );
         let oversized = format!(
             r#"{{"error": {{"message": "{}"}}}}"#,
             "x".repeat(MAXIMUM_DETAIL_LENGTH + 1)
         );
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, &oversized), None);
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "{}"), None);
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "<html>"), None);
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, &oversized, &[]),
+            None
+        );
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "{}", &[]), None);
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, "<html>", &[]),
+            None
+        );
         let blank = r#"{"error": {"message": "   "}}"#;
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, blank), None);
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, blank, &[]), None);
     }
 
     #[test]
@@ -539,7 +569,7 @@ mod tests {
         ] {
             let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
             assert_eq!(
-                rejected_detail(Dialect::OpenAiCompatible, &body),
+                rejected_detail(Dialect::OpenAiCompatible, &body, &[]),
                 None,
                 "relayed an identifier-bearing sentence: {message}"
             );
@@ -555,7 +585,7 @@ mod tests {
         ] {
             let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
             assert_eq!(
-                rejected_detail(Dialect::OpenAiCompatible, &body).as_deref(),
+                rejected_detail(Dialect::OpenAiCompatible, &body, &[]).as_deref(),
                 Some(message),
                 "dropped a caller-actionable sentence: {message}"
             );
@@ -566,7 +596,7 @@ mod tests {
     fn relayed_explanation_collapses_interior_whitespace_runs() {
         let padded = r#"{"error": {"message": "  Unknown   parameter:\t'top_k'.  "}}"#;
         assert_eq!(
-            rejected_detail(Dialect::OpenAiCompatible, padded).as_deref(),
+            rejected_detail(Dialect::OpenAiCompatible, padded, &[]).as_deref(),
             Some("Unknown parameter: 'top_k'.")
         );
     }
@@ -614,5 +644,59 @@ mod tests {
         ] {
             assert!(!extraction_classification(dialect).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod request_word_tests {
+    use super::*;
+    use crate::dialects::Dialect;
+
+    #[test]
+    fn a_sentence_naming_the_requests_own_model_is_relayed() {
+        // The Anthropic client-version gate names the rejected model unquoted;
+        // the caller sent that id, so redacting the sentence hid the one
+        // actionable fact (upgrade the client) behind a generic 400.
+        let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "claude-fable-5-1 requires Claude Code version 2.1.251 or later. Please upgrade Claude Code to continue."}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, body, &[]),
+            None,
+            "without the request's own words the label-shaped model id still redacts"
+        );
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]).as_deref(),
+            Some(
+                "claude-fable-5-1 requires Claude Code version 2.1.251 or later. \
+                 Please upgrade Claude Code to continue."
+            )
+        );
+    }
+
+    #[test]
+    fn request_words_do_not_admit_other_identifiers_in_the_same_sentence() {
+        let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "claude-fable-5-1 is retired on deployment prod-7f2a; contact your operator."}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]),
+            None,
+            "an infrastructure label beside the known word still redacts the sentence"
+        );
+    }
+
+    #[test]
+    fn request_words_never_admit_network_or_resource_shapes() {
+        // Even a caller-supplied value keeps the unambiguous network and
+        // resource shapes redacted: relaying an ARN or address helps nobody.
+        let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "Model arn:aws:bedrock:us-east-1:123:model/x is unavailable."}}"#;
+        assert_eq!(
+            rejected_detail(
+                Dialect::AnthropicMessages,
+                body,
+                &["arn:aws:bedrock:us-east-1:123:model/x"],
+            ),
+            None
+        );
     }
 }
