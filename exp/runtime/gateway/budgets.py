@@ -629,6 +629,8 @@ def _completion_attempt_cost_micro_usd(
         ]
         if capabilities.reports_cached_input_tokens:
             required_rates.append(schedule.cached_input_micro_usd_per_million_tokens)
+        if capabilities.reports_cache_creation_input_tokens:
+            required_rates.append(schedule.cache_creation_input_micro_usd_per_million_tokens)
         if capabilities.reports_reasoning_tokens:
             required_rates.append(schedule.reasoning_micro_usd_per_million_tokens)
         if any(rate is None for rate in required_rates):
@@ -639,6 +641,7 @@ def _completion_attempt_cost_micro_usd(
         for rate in (
             schedule.input_micro_usd_per_million_tokens,
             schedule.cached_input_micro_usd_per_million_tokens,
+            schedule.cache_creation_input_micro_usd_per_million_tokens,
         )
         if rate is not None
     )

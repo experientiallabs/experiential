@@ -301,6 +301,7 @@ class AttemptReservationRecord(ContractModel):
     billing_source: BillingSource
     input_rate: int | None = Field(default=None, ge=0)
     cached_input_rate: int | None = Field(default=None, ge=0)
+    cache_creation_input_rate: int | None = Field(default=None, ge=0)
     output_rate: int | None = Field(default=None, ge=0)
     reasoning_rate: int | None = Field(default=None, ge=0)
     long_context_threshold_tokens: int | None = Field(default=None, gt=0)
@@ -311,6 +312,7 @@ class AttemptReservationRecord(ContractModel):
     """
     long_context_input_rate: int | None = Field(default=None, ge=0)
     long_context_cached_input_rate: int | None = Field(default=None, ge=0)
+    long_context_cache_creation_input_rate: int | None = Field(default=None, ge=0)
     long_context_output_rate: int | None = Field(default=None, ge=0)
     long_context_reasoning_rate: int | None = Field(default=None, ge=0)
     attempt_ordinal: int = Field(ge=0)

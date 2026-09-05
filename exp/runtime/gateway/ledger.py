@@ -366,14 +366,15 @@ class SQLiteAttemptLedger:
                 deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
                 billing_source,
                 pricing_source, pricing_effective_at,
-                input_rate, cached_input_rate, output_rate, reasoning_rate,
+                input_rate, cached_input_rate, cache_creation_input_rate,
+                output_rate, reasoning_rate,
                 long_context_threshold_tokens, long_context_input_rate,
-                long_context_cached_input_rate, long_context_output_rate,
-                long_context_reasoning_rate,
+                long_context_cached_input_rate, long_context_cache_creation_input_rate,
+                long_context_output_rate, long_context_reasoning_rate,
                 route_reason, fallback_reason,
                 state, started_at, budget_period_start, budget_reserved_micro_usd
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 'dispatched', ?, ?, ?
             )
             """,
@@ -397,6 +398,7 @@ class SQLiteAttemptLedger:
                 ),
                 prices.input_micro_usd_per_million_tokens,
                 prices.cached_input_micro_usd_per_million_tokens,
+                prices.cache_creation_input_micro_usd_per_million_tokens,
                 prices.output_micro_usd_per_million_tokens,
                 prices.reasoning_micro_usd_per_million_tokens,
                 (
@@ -413,6 +415,11 @@ class SQLiteAttemptLedger:
                     None
                     if prices.long_context is None
                     else prices.long_context.cached_input_micro_usd_per_million_tokens
+                ),
+                (
+                    None
+                    if prices.long_context is None
+                    else prices.long_context.cache_creation_input_micro_usd_per_million_tokens
                 ),
                 (
                     None
@@ -498,10 +505,11 @@ class SQLiteAttemptLedger:
         row = connection.execute(
             """
             SELECT request_id, state, input_rate, cached_input_rate,
-                   output_rate, reasoning_rate,
+                   cache_creation_input_rate, output_rate, reasoning_rate,
                    long_context_threshold_tokens, long_context_input_rate,
-                   long_context_cached_input_rate, long_context_output_rate,
-                   long_context_reasoning_rate, budget_reserved_micro_usd
+                   long_context_cached_input_rate, long_context_cache_creation_input_rate,
+                   long_context_output_rate, long_context_reasoning_rate,
+                   budget_reserved_micro_usd
             FROM gateway_attempts WHERE attempt_id = ?
             """,
             (attempt_id,),
@@ -528,6 +536,7 @@ class SQLiteAttemptLedger:
             usage,
             input_rate=optional_int(row[f"{prefix}input_rate"]),
             cached_input_rate=optional_int(row[f"{prefix}cached_input_rate"]),
+            cache_creation_input_rate=optional_int(row[f"{prefix}cache_creation_input_rate"]),
             output_rate=optional_int(row[f"{prefix}output_rate"]),
             reasoning_rate=optional_int(row[f"{prefix}reasoning_rate"]),
         )
@@ -542,9 +551,9 @@ class SQLiteAttemptLedger:
             UPDATE gateway_attempts
             SET state = ?, terminal_at = ?, first_token_at = ?, failure_class = ?,
                 failure_message = ?,
-                input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
-                reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
-                budget_settled_micro_usd = ?
+                input_tokens = ?, cached_input_tokens = ?, cache_creation_input_tokens = ?,
+                output_tokens = ?, reasoning_tokens = ?, usage_source = ?,
+                estimated_cost_micro_usd = ?, budget_settled_micro_usd = ?
             WHERE attempt_id = ? AND state = 'dispatched'
             """,
             (
@@ -555,6 +564,7 @@ class SQLiteAttemptLedger:
                 failure_message,
                 None if usage is None else usage.input_tokens,
                 None if usage is None else usage.cached_input_tokens,
+                None if usage is None else usage.cache_creation_input_tokens,
                 None if usage is None else usage.output_tokens,
                 None if usage is None else usage.reasoning_tokens,
                 "unknown" if usage is None else "observed",

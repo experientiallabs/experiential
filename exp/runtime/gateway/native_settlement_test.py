@@ -45,6 +45,51 @@ def test_usage_from_payload_handles_tokens_and_tool_names() -> None:
     assert complete.cached_input_tokens == 2
 
 
+def test_usage_from_payload_preserves_cache_write_leg() -> None:
+    """Cache-write tokens survive settlement even when cache-read is absent."""
+    usage = _usage_from_payload(
+        {
+            "input_tokens": 1_000,
+            "output_tokens": 10,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 1_000,
+        },
+        [],
+    )
+    assert usage is not None
+    assert usage.input_tokens == 1_000
+    assert usage.cached_input_tokens == 0
+    assert usage.cache_creation_input_tokens == 1_000
+
+    # Fresh and cache-write streams must not collapse to the same usage.
+    fresh = _usage_from_payload(
+        {"input_tokens": 1_000, "output_tokens": 10},
+        [],
+    )
+    assert fresh is not None
+    assert fresh.cache_creation_input_tokens is None
+    assert usage != fresh
+    assert usage.model_dump(exclude_none=True) != fresh.model_dump(exclude_none=True)
+
+
+def test_terminal_from_settlement_preserves_cache_write_usage() -> None:
+    """Terminal events carry the cache-write leg end-to-end."""
+    terminal, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": {
+                "input_tokens": 1_000,
+                "output_tokens": 10,
+                "cache_creation_input_tokens": 1_000,
+            },
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    assert terminal.usage is not None
+    assert terminal.usage.cache_creation_input_tokens == 1_000
+
+
 def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:
     """Completed payloads retain token counts and ordered tool names."""
     terminal, failure = terminal_from_settlement(

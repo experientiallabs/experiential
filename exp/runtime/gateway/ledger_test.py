@@ -1207,3 +1207,165 @@ def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
     usage = ledger.usage(organization_id="org-one")
     assert usage[0].known_estimated_cost_micro_usd == 0
     assert usage[0].unknown_cost_attempts == 1
+
+
+def test_cache_write_bills_at_frozen_surcharge_and_persists_count(tmp_path: Path) -> None:
+    """A cache-write leg bills disjointly and persists its observed count."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_micro_usd_per_million_tokens=3_000_000,
+                    cached_input_micro_usd_per_million_tokens=300_000,
+                    cache_creation_input_micro_usd_per_million_tokens=3_750_000,
+                    output_micro_usd_per_million_tokens=15_000_000,
+                ),
+                pricing_source="operator-authored",
+                pricing_effective_at=datetime(2026, 8, 18, tzinfo=UTC),
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("cache-write-surcharge"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(
+                input_tokens=1_000,
+                cached_input_tokens=200,
+                cache_creation_input_tokens=300,
+                output_tokens=10,
+            ),
+        ),
+        failure=None,
+    )
+    usage = ledger.usage(organization_id="org-one")
+    # 500 fresh @ 3/M + 200 cached @ 0.3/M + 300 creation @ 3.75/M + 10 output @ 15/M = 2_835.
+    assert usage[0].known_estimated_cost_micro_usd == 2_835
+    assert usage[0].unknown_cost_attempts == 0
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT cache_creation_input_rate, cache_creation_input_tokens "
+            "FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+    assert row["cache_creation_input_rate"] == 3_750_000
+    assert row["cache_creation_input_tokens"] == 300
+
+
+def test_long_context_cache_write_reprices_at_tier_rate(tmp_path: Path) -> None:
+    """Above threshold the tier cache-write rate replaces the base rate."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_micro_usd_per_million_tokens=1_250_000,
+                    cached_input_micro_usd_per_million_tokens=125_000,
+                    cache_creation_input_micro_usd_per_million_tokens=1_500_000,
+                    output_micro_usd_per_million_tokens=10_000_000,
+                    long_context=GatewayLongContextTier(
+                        input_threshold_tokens=200_000,
+                        input_micro_usd_per_million_tokens=2_500_000,
+                        cached_input_micro_usd_per_million_tokens=250_000,
+                        cache_creation_input_micro_usd_per_million_tokens=3_000_000,
+                        output_micro_usd_per_million_tokens=15_000_000,
+                    ),
+                ),
+                pricing_source="operator-authored",
+                pricing_effective_at=datetime(2026, 8, 18, tzinfo=UTC),
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("long-context-cache-write"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(
+                input_tokens=200_000,
+                cached_input_tokens=10_000,
+                cache_creation_input_tokens=20_000,
+                output_tokens=1_000,
+            ),
+        ),
+        failure=None,
+    )
+    usage = ledger.usage(organization_id="org-one")
+    # Tier active: 170k fresh @ 2.5/M + 10k cached @ 0.25/M + 20k creation @ 3/M + 1k output @ 15/M.
+    expected = (
+        170_000 * 2_500_000 + 10_000 * 250_000 + 20_000 * 3_000_000 + 1_000 * 15_000_000 + 500_000
+    ) // 1_000_000
+    assert usage[0].known_estimated_cost_micro_usd == expected
+    assert usage[0].unknown_cost_attempts == 0
+
+
+def test_cache_write_without_rate_stays_unknown(tmp_path: Path) -> None:
+    """A reported cache-write without a rate keeps the attempt unpriced."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_micro_usd_per_million_tokens=3_000_000,
+                    output_micro_usd_per_million_tokens=15_000_000,
+                ),
+                pricing_source="operator-authored",
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("cache-write-unknown"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=100, cache_creation_input_tokens=10, output_tokens=5),
+        ),
+        failure=None,
+    )
+    usage = ledger.usage(organization_id="org-one")
+    assert usage[0].known_estimated_cost_micro_usd == 0
+    assert usage[0].unknown_cost_attempts == 1

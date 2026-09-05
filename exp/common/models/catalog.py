@@ -468,6 +468,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
+    reports_cache_creation_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
     supports_async_tools: bool = False
     """Whether a tool may be flagged ``async`` so the model keeps generating
@@ -554,6 +555,7 @@ class GatewayLongContextTier(ContractModel):
     input_threshold_tokens: int = Field(gt=0)
     input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
 
@@ -563,10 +565,16 @@ class GatewayTokenPrices(ContractModel):
 
     Values are micro-USD per million provider-reported tokens. ``None`` means the rate is unknown;
     it must never be interpreted as zero. Existing optimizer float pricing remains unchanged.
+    ``cache_creation_input_micro_usd_per_million_tokens`` prices the Anthropic
+    cache-write subset of ``input_tokens`` (``cache_creation_input_tokens``);
+    fresh input is ``input_tokens - cached_input_tokens - cache_creation_input_tokens``
+    at the base input rate, so a missing cache-write rate preserves unknown pricing
+    rather than silently falling back to the base rate.
     """
 
     input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     long_context: GatewayLongContextTier | None = None

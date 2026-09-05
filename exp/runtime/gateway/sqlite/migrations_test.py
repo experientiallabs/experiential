@@ -1083,6 +1083,116 @@ def test_v14_migration_widens_api_surface_to_embeddings_and_preserves_rows(
         migrated.close()
 
 
+def test_v17_migration_adds_cache_write_columns_once_and_preserves_rows(tmp_path: Path) -> None:
+    """v17 adds the cache-write surcharge columns exactly once and preserves v16 data."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 17):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 16")
+        connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
+        connection.execute(
+            "INSERT INTO identities VALUES ('id', 'org', 'Identity', NULL, 1, 't', 't')"
+        )
+        connection.execute(
+            "INSERT INTO virtual_keys (key_id, organization_id, identity_id, prefix, "
+            "fingerprint_version, fingerprint_sha256, created_at) "
+            "VALUES ('key', 'org', 'id', 'pfx', 1, '{fingerprint}', 't')".format(
+                fingerprint="a" * 64
+            )
+        )
+        connection.execute(
+            "INSERT INTO catalog_snapshot_refs VALUES ('snap', 'org', '{digest}', 't')".format(
+                digest="b" * 64
+            )
+        )
+        connection.execute(
+            "INSERT INTO gateway_aliases (alias_id, organization_id, alias_name, "
+            "active_revision_id, created_at, updated_at) "
+            "VALUES ('alias', 'org', 'alias', NULL, 't', 't')"
+        )
+        connection.execute(
+            "INSERT INTO alias_revisions (revision_id, organization_id, alias_id, "
+            "revision_number, target_kind, pool_id, catalog_sha256, snapshot_ref, created_at) "
+            "VALUES ('rev', 'org', 'alias', 1, 'direct', 'pool', '{digest}', 'snap', 't')".format(
+                digest="b" * 64
+            )
+        )
+        connection.execute(
+            "INSERT INTO gateway_requests (request_id, organization_id, identity_id, key_id, "
+            "alias_id, alias_revision_id, api_surface, canonical_request_sha256, "
+            "accepted_at, deadline_at) VALUES ('req-1', 'org', 'id', 'key', 'alias', 'rev', "
+            "'chat_completions', '{digest}', 't', 't')".format(digest="b" * 64)
+        )
+        connection.execute(
+            "INSERT INTO gateway_attempts (attempt_id, request_id, organization_id, "
+            "attempt_ordinal, route_depth, deployment_id, provider, exact_model_id, pool_id, "
+            "catalog_sha256, state, started_at, budget_period_start) "
+            "VALUES ('att-1', 'req-1', 'org', 0, 0, 'deploy', 'provider', 'exact', "
+            "'pool', '{digest}', 'completed', 't', '2026-08-01T00:00:00+00:00')".format(
+                digest="b" * 64
+            )
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    assert initialize_database(path) is not None
+    migrated = connect_database(path)
+    try:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        columns = {
+            row[1] for row in migrated.execute("PRAGMA table_info(gateway_attempts)").fetchall()
+        }
+        assert "cache_creation_input_rate" in columns
+        assert "long_context_cache_creation_input_rate" in columns
+        assert "cache_creation_input_tokens" in columns
+        cols = [
+            row[1] for row in migrated.execute("PRAGMA table_info(gateway_attempts)").fetchall()
+        ]
+        assert cols.count("cache_creation_input_rate") == 1
+        assert cols.count("long_context_cache_creation_input_rate") == 1
+        assert cols.count("cache_creation_input_tokens") == 1
+        row = migrated.execute(
+            "SELECT attempt_id FROM gateway_attempts WHERE attempt_id = 'att-1'"
+        ).fetchone()
+        assert row[0] == "att-1"
+        migrated.execute(
+            "UPDATE gateway_attempts SET cache_creation_input_rate = 3750000, "
+            "long_context_cache_creation_input_rate = 3000000, "
+            "cache_creation_input_tokens = 42 WHERE attempt_id = 'att-1'"
+        )
+        updated = migrated.execute(
+            "SELECT cache_creation_input_rate, long_context_cache_creation_input_rate, "
+            "cache_creation_input_tokens FROM gateway_attempts WHERE attempt_id = 'att-1'"
+        ).fetchone()
+        assert tuple(updated) == (3750000, 3000000, 42)
+    finally:
+        migrated.close()
+
+
+def test_fresh_schema_contains_v17_cache_write_columns_exactly_once(tmp_path: Path) -> None:
+    """A fresh database already carries the v17 cache-write columns exactly once."""
+    path = tmp_path / "fresh.db"
+    initialize_database(path)
+    connection = connect_database(path)
+    try:
+        cols = [
+            row[1] for row in connection.execute("PRAGMA table_info(gateway_attempts)").fetchall()
+        ]
+        assert cols.count("cache_creation_input_rate") == 1
+        assert cols.count("long_context_cache_creation_input_rate") == 1
+        assert cols.count("cache_creation_input_tokens") == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+    finally:
+        connection.close()
+
+
 def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
     tmp_path: Path,
 ) -> None:
