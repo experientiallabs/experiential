@@ -416,8 +416,6 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
         tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
         parallel_tool_calls=True,
         service_tier="flex",
-        stream=True,
-        include_usage=True,
     )
 
     class _CoercionCounter:
@@ -803,3 +801,105 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
     assert provider.provider_thinking_config is None
     assert provider.reasoning_effort == "medium"
     assert accounting.recorded == 1
+
+
+def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
+    """A flex/priority request rejects fail-closed before reservation when no
+    rung can honor it: a host lane without per-tier pass-through pricing and no
+    BYOK rung. auto/default never reject."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    # House rung: billing_customer_managed False and no tier pricing, so it does
+    # not forward service_tier.
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
+    accounting = cast(NativeAttemptAccounting, object())
+
+    for tier in ("flex", "priority"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="go"),),
+            service_tier=tier,
+        )
+        with pytest.raises(ProviderCapabilityError) as exc:
+            admitted_route_requests(
+                route,
+                wires,
+                request,
+                accounting=accounting,
+                authorization=route.snapshot.authorization,
+            )
+        assert exc.value.capability == "service_tier"
+
+    # auto/default are not paid tiers and never reject here.
+    for tier in ("auto", "default"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="go"),),
+            service_tier=tier,
+        )
+        admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+        )
+
+
+def test_tier_priced_host_lane_admits_the_named_tier() -> None:
+    """A host rung whose model carries per-tier pricing forwards the tier, so a
+    flex request is admitted (not rejected)."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment(
+                "house",
+                provider="openai",
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                ),
+            ),
+        ),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://house.test",
+                service_tier_pricing_enabled=True,
+            ),
+            client,
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="flex",
+    )
+    _narrowed, _wires_out, _public, provider = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, object()),
+        authorization=route.snapshot.authorization,
+    )
+    # The tier survives to the provider request on the tier-priced house lane.
+    assert provider.service_tier == "flex"

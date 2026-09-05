@@ -35,6 +35,7 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_route_rejections,
     coerce_structured_text_schema,
 )
+from exp.runtime.models.providers.dialect_dispatch import SERVICE_TIER_DIALECTS
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -108,6 +109,24 @@ def admitted_route_requests(
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
+    # A named processing tier (flex/priority) is a paid pricing choice, not a
+    # best-effort hint: it fails CLOSED before any reservation when no rung can
+    # honor it (a host lane whose model has no per-tier pass-through pricing, and
+    # no BYOK rung). auto/default carry no price and never reject; they still
+    # drop with disclosure downstream where a rung declines them.
+    if request.service_tier is not None and request.service_tier not in ("auto", "default"):
+        if not any(
+            profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_service_tier
+            for profile, _client in resolved_wires
+        ):
+            raise ProviderCapabilityError(
+                capability="service_tier",
+                detail=(
+                    "This model does not offer a flex or priority processing tier. "
+                    "Remove service_tier, or choose a model with tiered pricing enabled."
+                ),
+            )
+
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = ()
     full_route = route

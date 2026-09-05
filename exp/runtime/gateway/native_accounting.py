@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
@@ -185,6 +186,27 @@ def _failure_from_payload(payload: object) -> GatewayFailure | None:
         provider_detail=(
             provider_detail if isinstance(provider_detail, str) and provider_detail else None
         ),
+    )
+
+
+def _deployment_priced_for_service_tier(
+    deployment: ExactModelDeployment,
+    service_tier: str | None,
+) -> ExactModelDeployment:
+    """Reprice one deployment for a requested flex/priority processing tier.
+
+    v1 bills the REQUESTED tier: when the caller names a tier the deployment
+    carries a pass-through card for, the card's rates replace the base schedule
+    on a copy used only for THIS reservation, so the ceiling, the stored
+    per-token rates, and settlement all bill the tier transparently. No tier (or
+    no card) returns the deployment unchanged. The copy stays Python-side and
+    never crosses the native boundary.
+    """
+    effective = deployment.gateway.prices.for_service_tier(service_tier)
+    if effective is deployment.gateway.prices:
+        return deployment
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"prices": effective})}
     )
 
 
@@ -368,7 +390,10 @@ class NativeAttemptAccounting:
             candidate = claim_route_from(self._health, keys, 0)
             last_failure = None
         while candidate is not None:
-            deployment = route.deployments[candidate]
+            deployment = _deployment_priced_for_service_tier(
+                route.deployments[candidate],
+                getattr(entry.request, "service_tier", None),
+            )
             try:
                 attempt_id = self._write_ledger.start_attempt(
                     snapshot=route.snapshot,

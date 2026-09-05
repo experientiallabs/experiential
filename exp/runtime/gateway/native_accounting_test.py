@@ -512,3 +512,48 @@ def test_provider_detail_crosses_the_boundary_only_as_a_string() -> None:
         {"failure_class": "invalid_request", "safe_message": "x", "provider_detail": ""}
     )
     assert empty_detail is not None and empty_detail.provider_detail is None
+
+
+def test_deployment_priced_for_service_tier_overrides_only_for_a_carried_tier() -> None:
+    """A requested tier with a pass-through card reprices the deployment copy;
+    no tier, or a tier the deployment lacks, returns the deployment unchanged."""
+    from exp.common.models.catalog import (
+        GatewayDeploymentMetadata,
+        GatewayServiceTierPrices,
+        GatewayTokenPrices,
+    )
+    from exp.common.models.gateway_catalog import ExactModelDeployment
+    from exp.runtime.gateway.native_accounting import _deployment_priced_for_service_tier
+
+    deployment = ExactModelDeployment(
+        deployment_id="d1",
+        source_alias="d1",
+        exact_model_id="exact-one",
+        connection="connection-d1",
+        provider="openai",
+        provider_model="provider-model",
+        connection_sha256="b" * 64,
+        capabilities_sha256="c" * 64,
+        gateway=GatewayDeploymentMetadata(
+            prices=GatewayTokenPrices(
+                input_micro_usd_per_million_tokens=1_000_000,
+                output_micro_usd_per_million_tokens=4_000_000,
+                flex=GatewayServiceTierPrices(
+                    input_micro_usd_per_million_tokens=500_000,
+                    output_micro_usd_per_million_tokens=2_000_000,
+                ),
+            )
+        ),
+    )
+
+    flex = _deployment_priced_for_service_tier(deployment, "flex")
+    assert flex is not deployment
+    assert flex.gateway.prices.input_micro_usd_per_million_tokens == 500_000
+    assert flex.gateway.prices.output_micro_usd_per_million_tokens == 2_000_000
+    # Identity and everything else is preserved on the copy.
+    assert flex.deployment_id == "d1" and flex.exact_model_id == "exact-one"
+
+    # No tier, default/auto, and a tier the deployment does not carry: unchanged.
+    assert _deployment_priced_for_service_tier(deployment, None) is deployment
+    assert _deployment_priced_for_service_tier(deployment, "default") is deployment
+    assert _deployment_priced_for_service_tier(deployment, "priority") is deployment

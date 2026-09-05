@@ -72,6 +72,10 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
 
 
 _ATTACHMENT_CAPABILITY_MESSAGES = {
+    "service_tier": (
+        "This model does not offer a flex or priority processing tier. "
+        "Remove service_tier, or choose a model with tiered pricing enabled."
+    ),
     "image_input": (
         "The selected model route cannot accept image input. "
         "Send text only or choose an image-capable model alias."
