@@ -108,6 +108,16 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    forwards_prompt_cache_key: bool = False
+    """Whether this rung's provider routes by ``prompt_cache_key``.
+
+    True where the field is documented (OpenAI) or verified live to pin a
+    request to one prefix-cache node (Tencent TokenHub, 2026-09-05: shared-stem
+    hit rate 4/10 without the key, 10/10 with it). Every other endpoint,
+    BYOK included, stays untouched: an unknown top-level field is a 400 on a
+    strict OpenAI-compatible server, and the wire profile is the only place
+    that knows.
+    """
     """Whether this rung dispatches on tenant-owned (BYOK) credentials.
 
     Tier selectors (``service_tier``) forward only where the caller pays the

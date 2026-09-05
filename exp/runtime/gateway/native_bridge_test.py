@@ -925,6 +925,9 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
 
     decoded = decode_chat(json.loads(_chat_body()))
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    # A generic OpenAI-compatible shim never receives the cache-affinity key
+    # (only OpenAI and Tencent endpoints route by it), so the payload is the
+    # plain build.
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )

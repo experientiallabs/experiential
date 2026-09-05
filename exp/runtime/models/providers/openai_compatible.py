@@ -503,6 +503,11 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_output_exposed=(
                 self._reasoning_output_exposed and self._hunyuan_reasoning_route_sha256 is not None
             ),
+            # Tencent's prefix cache is per node behind its load balancer;
+            # prompt_cache_key pins a session to one node (verified live
+            # 2026-09-05). Other compatible servers may reject unknown fields,
+            # so the hint stays off them, BYOK or not.
+            forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
         )
 
     def _completion_path(self) -> str:

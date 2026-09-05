@@ -26,6 +26,7 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers import preflight_gateway_request
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -51,6 +52,29 @@ from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespa
 _logger = logging.getLogger(__name__)
 
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
+
+
+def _with_cache_affinity(
+    provider_request: GatewayRequest, authorization: AuthorizationSnapshot
+) -> GatewayRequest:
+    """Attach the tenant's cache-affinity key to the final dispatch request.
+
+    Cache affinity is per tenant and per session, so it is derived once, from
+    the request admission settled on and the frozen authority, and read by
+    every rung's payload builder that forwards it. It is applied last so no
+    admission-time rebuild (route narrowing, capability or schema coercion)
+    can drop it; the public request keeps the caller's own ``prompt_cache_key``
+    untouched.
+    """
+    return provider_request.model_copy(
+        update={
+            "provider_prompt_cache_key": provider_prompt_cache_key(
+                provider_request,
+                organization_id=str(authorization.organization_id),
+                identity_id=str(authorization.identity_id),
+            ),
+        }
+    )
 
 
 def admitted_route_requests(
@@ -193,6 +217,7 @@ def admitted_route_requests(
                 )
             }
         )
+    provider_request = _with_cache_affinity(provider_request, authorization)
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
     return route, resolved_wires, public_request, provider_request
 

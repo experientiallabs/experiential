@@ -39,6 +39,7 @@ def openai_responses_stream_payload(
     reasoning_effort: str | None = None,
     sampling_requires_reasoning_none: bool = False,
     forwards_service_tier: bool = False,
+    forwards_prompt_cache_key: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
 
@@ -132,6 +133,11 @@ def openai_responses_stream_payload(
         # BYOK-only: the caller pays this provider directly, so their tier
         # selection (and its pricing) is between them and the provider.
         payload["service_tier"] = request.service_tier
+    if request.provider_prompt_cache_key is not None and forwards_prompt_cache_key:
+        # Tenant-namespaced cache-affinity key (derived at admission): it
+        # changes cache-hit cost, never semantics, so rungs that do not route
+        # by it omit it structurally with no decline and no disclosure.
+        payload["prompt_cache_key"] = request.provider_prompt_cache_key
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
     del supports_top_k
@@ -171,6 +177,7 @@ def openai_compatible_stream_payload(
     hunyuan_reasoning_route_sha256: str | None = None,
     reasoning_output_exposed: bool = False,
     forwards_service_tier: bool = False,
+    forwards_prompt_cache_key: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -253,6 +260,9 @@ def openai_compatible_stream_payload(
     if request.service_tier is not None and forwards_service_tier:
         # BYOK-only, matching the native Responses lane.
         payload["service_tier"] = request.service_tier
+    if request.provider_prompt_cache_key is not None and forwards_prompt_cache_key:
+        # Cache-affinity key, matching the native Responses lane.
+        payload["prompt_cache_key"] = request.provider_prompt_cache_key
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}

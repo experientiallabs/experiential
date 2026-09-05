@@ -457,6 +457,87 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
     assert public.ignored_parameters == ("service_tier",)
     assert provider.service_tier is None
     assert accounting.recorded == 1
+    # The rebuild after the capability coercion must not lose the affinity
+    # key: it is attached to the request admission finally settled on.
+    assert provider.provider_prompt_cache_key is not None
+    assert public.provider_prompt_cache_key is None
+
+
+def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
+    """The provider request carries the derived key; the public request does not.
+
+    The key is derived from the frozen authority plus the caller's
+    ``prompt_cache_key`` (or the conversation stem), so it is stable across
+    the turns of one session, never the caller's raw value, and never
+    part of the public request or its serialized identity.
+    """
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("shim", gateway=streaming),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    wires = (
+        (
+            GatewayWireProfile(dialect="openai_compatible", url="https://shim.test"),
+            cast(NativeWireClient, object()),
+        ),
+    )
+
+    class _CoercionCounter:
+        """Count coercion recordings without a live ledger."""
+
+        recorded = 0
+
+        def record_admission_coercions(self, count: int) -> None:
+            """Accumulate one admission's coercion count."""
+            self.recorded += count
+
+    def admit(messages: tuple[GatewayMessage, ...], key: str | None) -> GatewayRequest:
+        """Admit one request and return the provider-side request it dispatches."""
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            prompt_cache_key=key,
+            stream=True,
+            include_usage=True,
+        )
+        _narrowed, _wires_out, public, provider = admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=route.snapshot.authorization,
+        )
+        assert public.provider_prompt_cache_key is None
+        assert public.prompt_cache_key == key
+        return provider
+
+    stem = (
+        GatewayMessage(role="system", content="You are Terminus."),
+        GatewayMessage(role="user", content="Task: list files."),
+    )
+    turn_1 = admit(stem, None)
+    turn_2 = admit(
+        (
+            *stem,
+            GatewayMessage(role="assistant", content='{"command": "ls"}'),
+            GatewayMessage(role="user", content="Output: a.txt"),
+        ),
+        None,
+    )
+    assert turn_1.provider_prompt_cache_key is not None
+    assert turn_1.provider_prompt_cache_key == turn_2.provider_prompt_cache_key
+    keyed = admit(stem, "session-7")
+    assert keyed.provider_prompt_cache_key is not None
+    assert "session-7" not in keyed.provider_prompt_cache_key
+    assert keyed.provider_prompt_cache_key != turn_1.provider_prompt_cache_key
+    # The affinity key is dispatch state only: it never enters serialization.
+    assert "provider_prompt_cache_key" not in keyed.model_dump(mode="json")
 
 
 def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_disclosure() -> None:

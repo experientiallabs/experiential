@@ -307,6 +307,25 @@ carriers, server tools replay only on the Anthropic wire, so a route with any ot
 them by name instead of dropping a requested capability. The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
+
+OpenAI-family prefix caches are keyed per cache node behind the provider's load balancer, so
+an identical prompt hits but the same stem with a new tail (every turn of an agent loop) is
+routed by the whole prompt and usually misses (Tencent TokenHub, measured 2026-09-05: 2 of 8
+shared-stem turns hit with no hint, 10 of 10 with one). The gateway therefore dispatches a
+`prompt_cache_key` on rungs whose wire profile says the provider routes by it (OpenAI, Tencent
+TokenHub; other OpenAI-compatible servers may reject unknown fields, so they never receive it,
+BYOK or not): never the caller's raw value, which shares a house account across tenants, but a
+digest namespaced by organization and identity (`exp/runtime/gateway/prompt_cache_affinity.py`).
+A caller `prompt_cache_key` is the material when present; otherwise the conversation stem (the
+leading system/developer messages, which every turn of a session and every request sharing that
+system prompt repeat verbatim; the first user turn when there is no system prompt) stands in, so
+a Terminus-style loop is pinned to the node holding its cached stem for its whole session with
+no client change (measured through the gateway on a hot stem: 9/10 hits keyed vs 4/10 unkeyed). The derived key is dispatch state on the provider request only;
+the public request, its digests, and replay identity never carry it. LiteLLM message dumps
+(`provider_specific_fields`, null `thinking_blocks` / `reasoning_items` / `images`) decode when
+echoed back verbatim: the object is dropped with a `messages.provider_specific_fields`
+disclosure and the empty forms are accepted like the SDK's own empty keys, while populated
+carriers stay rejected by name.
 Thinking carriers replay only on the Anthropic wire, so route admission requires every waterfall
 rung to speak the `anthropic_messages` dialect; on the Responses surface over Anthropic routes,
 thinking text is projected onto the reasoning-summary channel (signatures deliberately dropped)
