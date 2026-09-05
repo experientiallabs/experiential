@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.reasoning_compat import supported_reasoning_efforts
@@ -68,3 +69,52 @@ def require_route_numeric_parameter(
         param=param,
         code="invalid_parameter",
     )
+
+
+REASONING_SUMMARY_DIALECTS = frozenset({"openai_responses", "anthropic_messages"})
+
+
+def serves_reasoning_summary(profile: GatewayWireProfile) -> bool:
+    """Return whether one rung's reasoning reaches Responses summary parts.
+
+    Native Responses deployments carry summary parts on the wire, and
+    Anthropic thinking text is projected onto the same parts by the
+    Responses encoder. Every other dialect either has no reasoning text or
+    surfaces a reasoning item the summary channel cannot carry.
+
+    Args:
+        profile: One certified deployment wire profile from the route.
+
+    Returns:
+        Whether this deployment can serve a requested reasoning summary.
+    """
+    return profile.supports_reasoning and profile.dialect in REASONING_SUMMARY_DIALECTS
+
+
+def anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
+    """Whether an Anthropic dispatch will send no extended-thinking budget.
+
+    On the native Messages wire the model reasons only when the caller asks:
+    a ``thinking`` config of type ``enabled``/``adaptive`` or a reasoning
+    effort turns it on, and their absence leaves thinking OFF. This is the
+    inverse of the OpenAI effort-native models, whose default IS reasoning, so
+    it governs the srn sampling hatch ONLY for the anthropic_adaptive wire
+    (a budgeted-enabled route such as haiku-4-5): with thinking off, Anthropic
+    accepts an ordinary temperature, so srn must not drop it.
+    """
+    config = request.provider_thinking_config
+    thinking_on = config is not None and config.get("type") in {"enabled", "adaptive"}
+    effort_on = request.reasoning_effort is not None and request.reasoning_effort != "none"
+    return not thinking_on and not effort_on
+
+
+def mid_conversation_system_present(request: GatewayRequest) -> bool:
+    """Whether a system turn appears after the conversation has begun."""
+    conversation_started = False
+    for message in request.messages:
+        if message.role in {"system", "developer"} and message.provider_native_item is None:
+            if conversation_started:
+                return True
+        else:
+            conversation_started = True
+    return False

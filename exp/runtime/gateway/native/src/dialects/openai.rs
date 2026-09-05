@@ -4,9 +4,9 @@
 use serde_json::Value;
 
 use super::{
-    bounded_wire_token, complete_streamed_tool, finish_open_tools, malformed, optional_text,
-    parse_object, provider_error_detail, provider_stream_failed_with_detail, refusal_failure,
-    Normalizer,
+    bounded_wire_token, complete_streamed_tool, complete_streamed_tool_truncated,
+    finish_open_tools, finish_open_tools_truncated, malformed, optional_text, parse_object,
+    provider_error_detail, provider_stream_failed_with_detail, refusal_failure, Normalizer,
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
@@ -649,7 +649,17 @@ impl Normalizer {
                             phase: None,
                         });
                         let tool = self.tools.get_mut(&index).expect("tool just checked");
-                        complete_streamed_tool(index, tool, &mut events)?;
+                        if status == Some(ProviderOutputItemStatus::Incomplete) {
+                            // The provider itself marked this call truncated
+                            // by the output budget: gpt-6-astra ends the item
+                            // with status "incomplete" and the partial
+                            // argument bytes (captured live 2026-09-05), so a
+                            // mid-fragment call is the caller's budget to
+                            // raise, never a malformed stream.
+                            complete_streamed_tool_truncated(index, tool, &mut events)?;
+                        } else {
+                            complete_streamed_tool(index, tool, &mut events)?;
+                        }
                     }
                     Some("custom_tool_call") => {
                         let item_id = optional_openai_identity(
@@ -745,7 +755,22 @@ impl Normalizer {
                     });
                 }
                 events.extend(self.openai_sweep_hosted_items());
-                events.extend(finish_open_tools(&mut self.tools)?);
+                // Every incomplete terminal is the provider declaring it cut
+                // the output early, so a call still open mid-fragment is
+                // legitimately partial for ANY of its reasons: a budget cut
+                // surfaces Incomplete (the Chat lane's finish_reason=length
+                // contract), and a content_filter/safety or unknown-reason
+                // cut still reaches its own refusal or provider_internal
+                // terminal below instead of being pre-empted here as a
+                // malformed 502 (which would misclassify a refusal and churn
+                // the ladder). Only a COMPLETED response keeps the strict
+                // argument contract, so corruption in a served answer stays
+                // fail-closed.
+                events.extend(if is_incomplete {
+                    finish_open_tools_truncated(&mut self.tools)?
+                } else {
+                    finish_open_tools(&mut self.tools)?
+                });
                 if let Some(usage) =
                     openai_usage(response.get("usage")).map_err(|message| malformed(&message))?
                 {
@@ -844,3 +869,7 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "openai/hosted_tests.rs"]
 mod hosted_tests;
+
+#[cfg(test)]
+#[path = "openai/truncation_tests.rs"]
+mod truncation_tests;

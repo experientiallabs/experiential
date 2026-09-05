@@ -262,6 +262,16 @@ class _Message(_WireModel):
     content: str | tuple[_ContentPart, ...] | None = None
     tool_calls: tuple[_AssistantToolCall, ...] | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    """Tool function name on a ``role: "tool"`` message.
+
+    The legacy ``role: "function"`` attribution many agent frameworks
+    (hermes-agent among them) still send on every tool result; the provider
+    serves it (probed live 2026-09-05, api.openai.com), and the field is
+    baked into caller history, so rejecting it wedges whole sessions. It
+    round-trips verbatim on OpenAI-family wires and drops with disclosure
+    elsewhere. Other roles keep the named rejection.
+    """
     refusal: None = None
     annotations: tuple[()] | None = None
     audio: None = None
@@ -298,6 +308,8 @@ class _Message(_WireModel):
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "tool" and self.name is not None:
+            raise ValueError("name is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
@@ -680,9 +692,10 @@ class _ResponseReasoningItem(_WireModel):
     provider resolves it from stored state. An id-only item is carried
     verbatim to homogeneous native Responses routes (the only wire that
     can resolve the id) and the provider judges resolvability with its own
-    error — the hosted-item posture. That provider behavior is documented
-    from the SDK contract, not verified live (no key in the development
-    environment, 2026-09-05).
+    error — the hosted-item posture. Verified live 2026-09-05
+    (api.openai.com, gpt-5.1): a stored response's reasoning item replayed
+    by id with no encrypted_content completed with 200 under BOTH
+    ``store: true`` and ``store: false``.
     """
 
     type: Literal["reasoning"]

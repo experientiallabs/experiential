@@ -1219,3 +1219,100 @@ def test_native_responses_serves_hosted_tool_items_end_to_end() -> None:
         if payload["type"] == "response.output_text.annotation.added"
     )
     assert annotation_added["annotation"]["url"] == "https://www.python.org/doc/versions/"
+
+
+def test_native_responses_serves_a_budget_truncated_function_call_as_incomplete() -> None:
+    """A function call the provider itself cut at max_output_tokens serves as
+    an incomplete response with the truncated item intact, never a 502.
+
+    Frame shapes captured live from api.openai.com (gpt-6-astra, 2026-09-05):
+    `function_call_arguments.done` carries the PARTIAL bytes, the item's own
+    status is `incomplete`, and the terminal is `response.incomplete`.
+    Production incident (2026-09-05, ~5/min): the partial arguments failed the
+    strict JSON completion contract and killed the stream post-dispatch.
+    """
+    from openai.types.responses.response import Response
+
+    truncated_args = '{"city":"Paris","country":"France","units":"metric'
+    chunks = (
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_astra",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "arguments": "",
+                    "call_id": "call_astra",
+                    "name": "get_weather",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_astra",
+                "output_index": 0,
+                "delta": truncated_args,
+            }
+        ),
+        _sse(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_astra",
+                "output_index": 0,
+                "arguments": truncated_args,
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_astra",
+                    "type": "function_call",
+                    "status": "incomplete",
+                    "arguments": truncated_args,
+                    "call_id": "call_astra",
+                    "name": "get_weather",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 62, "output_tokens": 24, "total_tokens": 86},
+                },
+            }
+        ),
+    )
+    normalized = _native_normalized("openai_responses", chunks)
+    assert normalized["failure"] is None
+    events = cast(list[JsonObject], normalized["events"])
+    kinds = [event["kind"] for event in events]
+    assert "tool_call_completed" not in kinds, kinds
+    assert kinds[-1] == "incomplete"
+
+    native = pytest.importorskip("exp_gateway_native")
+    events_json = json.dumps(events)
+    body = json.loads(
+        native.completed_responses_fixture(
+            "request-astra",
+            "gpt-6-astra",
+            1_700_000_000,
+            "{}",
+            events_json,
+        )
+    )
+    parsed = Response.model_validate(body)
+    assert parsed.status == "incomplete"
+    item = body["output"][0]
+    # The caller sees the provider's honest truncation: the item at its own
+    # incomplete status with the partial argument bytes, like OpenAI's wire.
+    assert item["type"] == "function_call"
+    assert item["status"] == "incomplete"
+    assert item["arguments"] == truncated_args

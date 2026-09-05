@@ -37,6 +37,11 @@ from exp.runtime.models.providers.fireworks import (
     require_responses_continuation_channel,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
+    anthropic_reasoning_disengaged,
+    mid_conversation_system_present,
+    serves_reasoning_summary,
+)
+from exp.runtime.models.providers.generation_parameter_validation import (
     effective_profile_reasoning_effort as _effective_profile_reasoning_effort,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -100,53 +105,6 @@ _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
 _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
     {"gemini_generate_content", "bedrock_converse_stream"}
 )
-_REASONING_SUMMARY_DIALECTS = frozenset({"openai_responses", "anthropic_messages"})
-
-
-def _serves_reasoning_summary(profile: GatewayWireProfile) -> bool:
-    """Return whether one rung's reasoning reaches Responses summary parts.
-
-    Native Responses deployments carry summary parts on the wire, and
-    Anthropic thinking text is projected onto the same parts by the
-    Responses encoder. Every other dialect either has no reasoning text or
-    surfaces a reasoning item the summary channel cannot carry.
-
-    Args:
-        profile: One certified deployment wire profile from the route.
-
-    Returns:
-        Whether this deployment can serve a requested reasoning summary.
-    """
-    return profile.supports_reasoning and profile.dialect in _REASONING_SUMMARY_DIALECTS
-
-
-def _anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
-    """Whether an Anthropic dispatch will send no extended-thinking budget.
-
-    On the native Messages wire the model reasons only when the caller asks:
-    a ``thinking`` config of type ``enabled``/``adaptive`` or a reasoning
-    effort turns it on, and their absence leaves thinking OFF. This is the
-    inverse of the OpenAI effort-native models, whose default IS reasoning, so
-    it governs the srn sampling hatch ONLY for the anthropic_adaptive wire
-    (a budgeted-enabled route such as haiku-4-5): with thinking off, Anthropic
-    accepts an ordinary temperature, so srn must not drop it.
-    """
-    config = request.provider_thinking_config
-    thinking_on = config is not None and config.get("type") in {"enabled", "adaptive"}
-    effort_on = request.reasoning_effort is not None and request.reasoning_effort != "none"
-    return not thinking_on and not effort_on
-
-
-def _mid_conversation_system_present(request: GatewayRequest) -> bool:
-    """Whether a system turn appears after the conversation has begun."""
-    conversation_started = False
-    for message in request.messages:
-        if message.role in {"system", "developer"} and message.provider_native_item is None:
-            if conversation_started:
-                return True
-        else:
-            conversation_started = True
-    return False
 
 
 def route_generation_parameter_requests(
@@ -209,23 +167,36 @@ def route_generation_parameter_requests(
                 code="invalid_parameter",
             )
         if (
-            request.surface == GatewayApiSurface.MESSAGES
-            and request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
-            and any(
-                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
+            request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
+            and (
+                request.surface == GatewayApiSurface.MESSAGES
+                and any(
+                    profile.dialect in {"openai_responses", "openai_compatible"}
+                    for profile in profiles
+                )
+                # A Chat value keeps native semantics on a chat wire (some
+                # compatible providers accept an output ceiling of 1); only
+                # the TRANSLATED Responses wire imposes OpenAI's minimum, so
+                # the floor covers exactly the routes that translate.
+                or request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+                and any(profile.dialect == "openai_responses" for profile in profiles)
             )
             # The floored value must stay within every rung's declared output
             # ceiling; a route capped below the floor keeps the caller value
             # and the provider's own rejection.
             and (not route_limits or min(route_limits) >= OPENAI_MINIMUM_OUTPUT_TOKENS)
         ):
-            # Anthropic accepts max_tokens down to 1 (Claude Code probes with
-            # exactly that after a /model switch) while OpenAI rejects
-            # max_output_tokens below 16, so the translated value rides the
-            # provider floor with disclosure instead of surfacing a provider
-            # 400 the caller cannot act on.
+            # Anthropic and Chat Completions accept output ceilings down to
+            # 1 (Claude Code probes with exactly that after a /model switch)
+            # while OpenAI rejects max_output_tokens below 16, so a Messages
+            # or Chat value translated onto an OpenAI Responses rung rides
+            # the provider floor with disclosure instead of surfacing a
+            # provider 400 the caller cannot act on (2026-09-05 stragglers).
+            # A native Responses caller keeps the named admission rejection
+            # below: sub-16 is invalid on its own surface.
             provider_updates["maximum_output_tokens"] = OPENAI_MINIMUM_OUTPUT_TOKENS
-            path = f"max_tokens->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
+            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            path = f"{parameter}->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
             if path not in ignored:
                 ignored.append(path)
     elif any(profile.dialect == "anthropic_messages" for profile in profiles):
@@ -269,7 +240,7 @@ def route_generation_parameter_requests(
             # budget at all, so ordinary thinking-off sampling is honored.
             or (
                 profile.reasoning_wire_format == "anthropic_adaptive"
-                and _anthropic_reasoning_disengaged(request)
+                and anthropic_reasoning_disengaged(request)
             )
         )
 
@@ -419,7 +390,7 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
     if request.reasoning_summary is not None and not all(
-        _serves_reasoning_summary(profile) for profile in profiles
+        serves_reasoning_summary(profile) for profile in profiles
     ):
         path = next(
             iter(request.reasoning_summary_parameters),
@@ -654,8 +625,7 @@ def route_generation_parameter_requests(
             (
                 "messages.tool_results.attribution->dropped(unsupported_by_provider)",
                 any(
-                    message.provider_tool_name is not None
-                    or message.provider_tool_namespace is not None
+                    message.provider_tool_namespace is not None
                     or message.provider_tool_caller is not None
                     for message in request.messages
                 ),
@@ -664,6 +634,16 @@ def route_generation_parameter_requests(
         for path, present in attribution_paths:
             if present and path not in ignored:
                 ignored.append(path)
+
+    # The legacy tool-result name has a slot on BOTH OpenAI wires (Chat tool
+    # messages and Responses function_call_output), so it drops with
+    # disclosure only when some rung is on neither.
+    if any(message.provider_tool_name is not None for message in request.messages) and not all(
+        profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
+    ):
+        name_path = "messages.tool_results.name->dropped(unsupported_by_provider)"
+        if name_path not in ignored:
+            ignored.append(name_path)
 
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.
@@ -845,9 +825,33 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    if any(profile.dialect == "anthropic_messages" for profile in profiles) and any(
+        message.role == "user"
+        and not message.content
+        and not message.content_parts
+        and message.provider_anthropic_block is None
+        and message.provider_native_item is None
+        for message in request.messages
+    ):
+        # The Anthropic wire rejects empty text content blocks post-dispatch
+        # ("text content blocks must be non-empty"; 2026-09-05, six orgs on
+        # claude-fable routes). Empty blocks inside a richer turn drop
+        # loss-free at conversion, but a user turn that is entirely empty
+        # has nothing to send and dropping the whole message would change
+        # conversation structure, so it is refused by name pre-dispatch.
+        raise ProviderParameterError(
+            message=(
+                "A user message with empty content cannot be served by this "
+                "model route: the provider rejects empty text content blocks. "
+                "Add content to the message or remove it."
+            ),
+            param="messages",
+            code="invalid_parameter",
+        )
+
     # A system turn after conversation began has positional semantics that
     # instruction-hoisting wires cannot preserve; those rungs narrow out.
-    if _mid_conversation_system_present(request) and any(
+    if mid_conversation_system_present(request) and any(
         profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
         for profile in profiles
     ):

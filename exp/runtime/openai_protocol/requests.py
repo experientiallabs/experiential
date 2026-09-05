@@ -712,6 +712,7 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
                 content_parts=content_parts,
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
+                provider_tool_name=message.name,
                 provider_reasoning=provider_reasoning,
             )
         )

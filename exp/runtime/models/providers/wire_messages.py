@@ -179,6 +179,39 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     return items
 
 
+def _retained_cache_marked_blocks(
+    blocks: tuple[JsonObject, ...] | list[JsonObject],
+) -> list[JsonObject]:
+    """Drop empty text blocks while keeping their cache breakpoints.
+
+    The wire rejects empty text blocks, but Claude Code lands its
+    prompt-cache marker on the LAST block of a turn, which can be empty;
+    dropping the block must not drop the breakpoint or the whole prefix
+    bills uncached (the block-cache incident class). A displaced marker
+    lands on the closest retained block before it (an empty block adds no
+    bytes, so that boundary is byte-identical), or on the first retained
+    block after it when nothing precedes (a slightly wider, still valid
+    breakpoint). Adjacent duplicate markers collapse: one marker per
+    boundary suffices.
+    """
+    retained: list[JsonObject] = []
+    displaced: object | None = None
+    for block in blocks:
+        if block.get("text"):
+            kept = dict(block)
+            if displaced is not None and "cache_control" not in kept:
+                kept["cache_control"] = displaced
+            displaced = None
+            retained.append(kept)
+        elif "cache_control" in block:
+            if retained:
+                if "cache_control" not in retained[-1]:
+                    retained[-1] = {**retained[-1], "cache_control": block["cache_control"]}
+            else:
+                displaced = block["cache_control"]
+    return retained
+
+
 def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     """Emit one multimodal user turn in caller order, markers intact.
 
@@ -194,7 +227,7 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     Returns:
         The ordered Anthropic content blocks for the turn.
     """
-    marked = [block for block in message.provider_text_blocks if block.get("text")]
+    marked = _retained_cache_marked_blocks(message.provider_text_blocks)
     blocks: list[JsonObject] = []
     text_index = 0
     for part in message.content_parts:
@@ -209,6 +242,12 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
             continue
         if part.kind == "document":
             blocks.append(anthropic_document_block(part))
+            continue
+        if not part.text:
+            # This wire rejects empty text content blocks post-dispatch
+            # ("text content blocks must be non-empty"), and an empty part
+            # carries nothing, so it drops loss-free; the turn's attachment
+            # guarantees the content array stays non-empty.
             continue
         blocks.append(
             marked[text_index] if text_index < len(marked) else {"type": "text", "text": part.text}
@@ -229,16 +268,19 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # A tool screenshot re-emits as the caller's exact block run:
             # image parts become image blocks in their original positions.
             # The canonical model restricts tool messages to these two kinds.
+            # Empty text parts drop loss-free (the wire rejects empty text
+            # blocks); an all-empty run keeps the flattened string content.
             run: list[JsonObject] = []
             for part in message.content_parts:
                 if part.kind == "image":
                     run.append(anthropic_image_block(part))
-                elif part.kind == "text":
+                elif part.kind == "text" and part.text:
                     block: JsonObject = {"type": "text", "text": part.text}
                     if part.cache_control is not None:
                         block["cache_control"] = part.cache_control
                     run.append(block)
-            result["content"] = run
+            if run:
+                result["content"] = run
         # Only the Anthropic wire can express a failed tool invocation; the
         # marker is emitted solely when set so existing payloads are unchanged.
         if message.tool_is_error:
@@ -253,10 +295,13 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # The caller's exact interleaving is preserved: an image before
             # its question reads differently from one after it.
             return "user", _anthropic_multimodal_blocks(message)
-        if message.provider_text_blocks:
-            # The cache-marked run re-emits the caller's exact blocks; the
-            # flattened content stays canonical for every other wire.
-            return "user", list(message.provider_text_blocks)
+        marked_run = _retained_cache_marked_blocks(message.provider_text_blocks)
+        if marked_run:
+            # The cache-marked run re-emits the caller's blocks with empty
+            # ones dropped loss-free (the wire rejects them and they carry
+            # nothing) and their breakpoints migrated to a retained
+            # neighbor; the flattened content stays canonical elsewhere.
+            return "user", marked_run
         return "user", [{"type": "text", "text": message.content or ""}]
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Anthropic message role")
@@ -385,11 +430,17 @@ def openai_chat_message(
     other rung omits that block, which route narrowing already disclosed.
     """
     if message.role == "tool":
-        return {
+        tool_payload: JsonObject = {
             "role": "tool",
             "content": message.folded_tool_error_content(),
             "tool_call_id": message.tool_call_id or "",
         }
+        # Legacy tool-result name attribution round-trips on the OpenAI
+        # wires: present stays present (the provider serves it) and absent
+        # stays absent, so name-free histories keep their exact wire bytes.
+        if message.provider_tool_name is not None:
+            tool_payload["name"] = message.provider_tool_name
+        return tool_payload
     payload: JsonObject = {
         "role": message.role,
         "content": (
