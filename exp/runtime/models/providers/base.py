@@ -108,6 +108,16 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    service_tier_pricing_enabled: bool = False
+    """Whether this HOST-funded rung may still forward ``service_tier``.
+
+    Normally a host-funded rung strips the tier (the gateway bills catalog
+    rates while a tier changes provider pricing). A model whose catalog carries
+    per-tier PASS-THROUGH pricing sets this so the tier reaches the provider on
+    the house lane too, and settlement bills the served tier at cost. BYOK
+    rungs forward regardless (``billing_customer_managed``); this only widens
+    the host-funded case for opted-in models.
+    """
     forwards_prompt_cache_key: bool = False
     """Whether this rung's provider routes by ``prompt_cache_key``.
 
@@ -308,6 +318,15 @@ class GatewayWireProfile:
             or self.maximum_output_tokens <= 0
         ):
             raise ValueError("gateway wire maximum_output_tokens must be a positive integer")
+
+    @property
+    def forwards_service_tier(self) -> bool:
+        """Whether this rung emits ``service_tier`` to the provider.
+
+        True on BYOK rungs (the caller pays the provider directly) and on
+        host-funded rungs whose model carries per-tier pass-through pricing.
+        """
+        return self.billing_customer_managed or self.service_tier_pricing_enabled
 
 
 class ProviderHttpClient(abc.ABC):

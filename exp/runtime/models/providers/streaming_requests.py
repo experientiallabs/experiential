@@ -502,17 +502,18 @@ def route_generation_parameter_requests(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("inference_geo")
-    # A provider tier forwards only where the caller pays that provider
-    # directly (BYOK) on a tier-preserving wire; a route with no such rung
-    # strips the tier up front with the same 'service_tier' disclosure the
-    # capability_policy drop path uses, so every rung serves and waterfalls
-    # stay deterministic. Host-funded rungs never emit it (they bill catalog
-    # rates while the tier changes provider pricing: flex discounted,
-    # priority premium) but stay in the route as untiered fallbacks; the
-    # dialect decline in dialect_stream_payload still guards mixed routes
-    # where an eligible rung keeps the tier alive.
+    # A provider tier forwards where the caller pays that provider directly
+    # (BYOK) OR on a host-funded rung whose model carries per-tier pass-through
+    # pricing (profile.forwards_service_tier folds both), on a tier-preserving
+    # wire; a route with no such rung strips the tier up front with the same
+    # 'service_tier' disclosure the capability_policy drop path uses, so every
+    # rung serves and waterfalls stay deterministic. Host-funded rungs WITHOUT
+    # tier pricing never emit it (they bill catalog rates while the tier changes
+    # provider pricing: flex discounted, priority premium) but stay in the route
+    # as untiered fallbacks; the dialect decline in dialect_stream_payload still
+    # guards mixed routes where an eligible rung keeps the tier alive.
     if request.service_tier is not None and not any(
-        profile.dialect in SERVICE_TIER_DIALECTS and profile.billing_customer_managed
+        profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_service_tier
         for profile in profiles
     ):
         ignore("service_tier")

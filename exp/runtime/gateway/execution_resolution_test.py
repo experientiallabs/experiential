@@ -212,3 +212,21 @@ def test_profile_resolution_binds_the_deployment_billing_source() -> None:
     hosted = _deployment(None).model_copy(update={"billing_source": BillingSource.HOST_MANAGED})
     house = _resolved_wire_profile(hosted, _resolved(_NativeClient(base), ModelCapabilities()))
     assert house.billing_customer_managed is False
+    # A house rung stays untiered by default, so service_tier is not forwarded.
+    assert house.service_tier_pricing_enabled is False
+    assert house.forwards_service_tier is False
+
+
+def test_profile_resolution_forwards_service_tier_on_a_tier_priced_house_lane() -> None:
+    """A host-funded rung whose model carries per-tier pass-through pricing
+    forwards service_tier even though the caller does not pay the provider
+    directly; settlement bills the served tier at cost."""
+    base = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    hosted = _deployment(None).model_copy(update={"billing_source": BillingSource.HOST_MANAGED})
+    tiered = _resolved_wire_profile(
+        hosted,
+        _resolved(_NativeClient(base), ModelCapabilities(service_tier_pricing_enabled=True)),
+    )
+    assert tiered.billing_customer_managed is False
+    assert tiered.service_tier_pricing_enabled is True
+    assert tiered.forwards_service_tier is True

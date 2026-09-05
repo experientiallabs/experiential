@@ -131,6 +131,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "output_cost_per_million_tokens_usd": None,
         "cached_input_cost_per_million_tokens_usd": None,
         "cache_write_cost_per_million_tokens_usd": None,
+        "service_tier_pricing_enabled": False,
     }
     with pytest.raises(ValidationError, match="named tool_choice"):
         ModelRequest(
