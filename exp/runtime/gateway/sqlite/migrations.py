@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 class GatewaySchemaError(RuntimeError):
@@ -668,6 +668,23 @@ _MIGRATION_15 = (
 # ledger's content-free posture.
 _MIGRATION_16 = ("ALTER TABLE gateway_attempts ADD COLUMN failure_message TEXT",)
 
+# v17: price Anthropic cache writes at their own surcharge rate. The ledger
+# already carried `cache_creation_input_tokens` on `GatewayUsage` but never
+# froze its rate or persisted the count, so a cache-write was billed at the
+# base input rate. The new columns freeze the cache-write rate at dispatch
+# (base + long-context tier) and persist the observed count at settlement,
+# keeping the existing disjoint-subset semantics:
+#   fresh = input - cached - cache_creation
+_MIGRATION_17 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN cache_creation_input_rate INTEGER "
+    "CHECK (cache_creation_input_rate IS NULL OR cache_creation_input_rate >= 0)",
+    "ALTER TABLE gateway_attempts ADD COLUMN long_context_cache_creation_input_rate INTEGER "
+    "CHECK (long_context_cache_creation_input_rate IS NULL "
+    "OR long_context_cache_creation_input_rate >= 0)",
+    "ALTER TABLE gateway_attempts ADD COLUMN cache_creation_input_tokens INTEGER "
+    "CHECK (cache_creation_input_tokens IS NULL OR cache_creation_input_tokens >= 0)",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -685,6 +702,7 @@ _MIGRATIONS = {
     14: _MIGRATION_14,
     15: _MIGRATION_15,
     16: _MIGRATION_16,
+    17: _MIGRATION_17,
 }
 
 

@@ -602,6 +602,11 @@ class SQLiteGatewayPlatform:
                 cached_input_tokens=(
                     None if row["cached_input_tokens"] is None else int(row["cached_input_tokens"])
                 ),
+                cache_creation_input_tokens=(
+                    None
+                    if row["cache_creation_input_tokens"] is None
+                    else int(row["cache_creation_input_tokens"])
+                ),
                 output_tokens=int(row["output_tokens"]),
                 reasoning_tokens=(
                     None if row["reasoning_tokens"] is None else int(row["reasoning_tokens"])

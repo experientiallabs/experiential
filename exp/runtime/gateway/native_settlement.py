@@ -95,6 +95,7 @@ def _usage_from_payload(
         input_tokens=_optional_count(payload.get("input_tokens")),
         output_tokens=_optional_count(payload.get("output_tokens")),
         cached_input_tokens=_optional_count(payload.get("cached_input_tokens")),
+        cache_creation_input_tokens=_optional_count(payload.get("cache_creation_input_tokens")),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         tool_names=names,
     )

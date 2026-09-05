@@ -131,11 +131,15 @@ def reservation_record(
         billing_source=BillingSource(str(row["billing_source"])),
         input_rate=optional_int(row["input_rate"]),
         cached_input_rate=optional_int(row["cached_input_rate"]),
+        cache_creation_input_rate=optional_int(row["cache_creation_input_rate"]),
         output_rate=optional_int(row["output_rate"]),
         reasoning_rate=optional_int(row["reasoning_rate"]),
         long_context_threshold_tokens=optional_int(row["long_context_threshold_tokens"]),
         long_context_input_rate=optional_int(row["long_context_input_rate"]),
         long_context_cached_input_rate=optional_int(row["long_context_cached_input_rate"]),
+        long_context_cache_creation_input_rate=optional_int(
+            row["long_context_cache_creation_input_rate"]
+        ),
         long_context_output_rate=optional_int(row["long_context_output_rate"]),
         long_context_reasoning_rate=optional_int(row["long_context_reasoning_rate"]),
         attempt_ordinal=int(row["attempt_ordinal"]),

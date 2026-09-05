@@ -17,9 +17,12 @@ from exp.common.models.model import ToolCall
 class GatewayUsage(ContractModel):
     """Normalized token counts and invoked tool names from one provider attempt.
 
-    Cached-input and reasoning counts are subsets of the total input and output counts when
-    present. They identify differently priced portions of those totals and must not be added a
-    second time by callers.
+    Cached-input, cache-write, and reasoning counts are disjoint subsets of
+    the total input and output counts when present. They identify differently
+    priced portions of those totals and must not be added a second time by
+    callers. ``cache_creation_input_tokens`` is the Anthropic cache-write
+    surcharge leg; it is disjoint from ``cached_input_tokens`` inside
+    ``input_tokens``, so ``fresh = input - cached - cache_creation``.
 
     A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
     case both token totals remain unknown instead of being represented as zero.
@@ -30,8 +33,8 @@ class GatewayUsage(ContractModel):
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
     """Cache-write tokens inside the input total (Anthropic-only today),
-    present only when the provider reported a nonzero count; billing keeps
-    using the folded input total."""
+    disjoint from the cache-read leg; present only when the provider reported
+    a nonzero count."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""

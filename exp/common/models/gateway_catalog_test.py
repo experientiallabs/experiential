@@ -218,7 +218,7 @@ def test_identity_digest_is_pinned_until_a_deliberate_schema_version_bump() -> N
     """
     normalized = normalize_gateway_catalog(_identity_fixture_catalog())
     assert (SNAPSHOT_SCHEMA_VERSION, normalized.identity_sha256()) == (
-        3,
+        4,
         "f9e74a42f5b47ec0a0739836ef15bbfa36df4eaa7c34efee10c421d46962529f",
     )
 
@@ -251,6 +251,58 @@ def test_added_defaulted_fields_and_explicit_defaults_do_not_perturb_identity() 
     )
 
 
+def test_defaulted_cache_write_fields_do_not_perturb_identity_but_populated_ones_do() -> None:
+    """Defaulted cache-write fields stay identity-invisible; populated ones change the digest."""
+    # Defaulted cache-write pricing and capability stay excluded from identity.
+    assert (
+        GatewayDeploymentCapabilities(reports_cache_creation_input_tokens=False).model_dump(
+            mode="json", by_alias=True, exclude_defaults=True
+        )
+        == {}
+    )
+    assert GatewayTokenPrices().model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+    assert GatewayLongContextTier(input_threshold_tokens=200_000).model_dump(
+        mode="json", by_alias=True, exclude_defaults=True
+    ) == {"input_threshold_tokens": 200000}
+
+    base = _identity_fixture_catalog()
+    base_digest = normalize_gateway_catalog(base).identity_sha256()
+
+    # Populated cache-write pricing changes the deployment digest and thus the catalog identity.
+    priced = base.model_copy(deep=True)
+    priced.models["bare"] = priced.models["bare"].model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    cache_creation_input_micro_usd_per_million_tokens=3_750_000,
+                    long_context=GatewayLongContextTier(
+                        input_threshold_tokens=200_000,
+                        cache_creation_input_micro_usd_per_million_tokens=3_000_000,
+                    ),
+                ),
+                capabilities=GatewayDeploymentCapabilities(
+                    reports_cache_creation_input_tokens=True
+                ),
+            )
+        }
+    )
+    assert normalize_gateway_catalog(priced).identity_sha256() != base_digest
+
+    # Explicit defaults still hash identically to leaving them unset.
+    explicit = base.model_copy(deep=True)
+    explicit.models["bare"] = explicit.models["bare"].model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(cache_creation_input_micro_usd_per_million_tokens=None),
+                capabilities=GatewayDeploymentCapabilities(
+                    reports_cache_creation_input_tokens=False
+                ),
+            )
+        }
+    )
+    assert normalize_gateway_catalog(explicit).identity_sha256() == base_digest
+
+
 def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     """Anti-regression change-detector for the roll-safety contract.
 
@@ -269,7 +321,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 3,
+        "schema_version": 4,
         "normalized": ["deployments", "pools", "schema_version"],
         "deployment": [
             "billing_source",

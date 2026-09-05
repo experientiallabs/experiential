@@ -1060,3 +1060,98 @@ def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -
     # threshold even though the visible serialization stays below it.
     expected = (bound * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
     assert maximum_attempt_cost_micro_usd(carried, tiered) == expected
+
+
+def test_cache_write_surcharge_raises_reservation_ceiling() -> None:
+    """A cache-write surcharge raises the conservative reservation ceiling."""
+    base = _deployment()
+    surcharged = base.model_copy(
+        update={
+            "gateway": base.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        cache_creation_input_micro_usd_per_million_tokens=5_000_000,
+                        output_micro_usd_per_million_tokens=2_000_000,
+                    ),
+                    "capabilities": base.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    ),
+                }
+            )
+        }
+    )
+    request = _request("cache-write-ceiling")
+    surcharged_cost = maximum_attempt_cost_micro_usd(request, surcharged)
+    base_cost = maximum_attempt_cost_micro_usd(request, base)
+    assert surcharged_cost is not None
+    assert base_cost is not None
+    assert surcharged_cost > base_cost
+
+
+def test_cache_write_capability_requires_its_rate() -> None:
+    """A deployment reporting cache creation without a rate fails closed."""
+    missing = _deployment().model_copy(
+        update={
+            "gateway": _deployment()
+            .gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        output_micro_usd_per_million_tokens=2_000_000,
+                    )
+                }
+            )
+            .model_copy(
+                update={
+                    "capabilities": _deployment().gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    )
+                }
+            )
+        }
+    )
+    assert maximum_attempt_cost_micro_usd(_request("needs-cache-write-rate"), missing) is None
+
+
+def test_long_context_cache_write_surcharge_governs_above_threshold() -> None:
+    """Above threshold the worst-case rate includes the tier cache-write surcharge."""
+    from exp.common.models.catalog import GatewayLongContextTier
+
+    tier = GatewayLongContextTier(
+        input_threshold_tokens=10,
+        input_micro_usd_per_million_tokens=1_000_000,
+        cache_creation_input_micro_usd_per_million_tokens=9_000_000,
+        output_micro_usd_per_million_tokens=2_000_000,
+    )
+    base = _deployment().model_copy(
+        update={
+            "gateway": _deployment()
+            .gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        cache_creation_input_micro_usd_per_million_tokens=1_500_000,
+                        output_micro_usd_per_million_tokens=2_000_000,
+                        long_context=tier,
+                    )
+                }
+            )
+            .model_copy(
+                update={
+                    "capabilities": _deployment().gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    )
+                }
+            )
+        }
+    )
+    # Short input stays below threshold: base surcharge governs.
+    short = _request("x")
+    # Long input crosses the threshold: tier surcharge governs the worst case.
+    long = _request("x" * 2_048)
+    short_cost = maximum_attempt_cost_micro_usd(short, base)
+    long_cost = maximum_attempt_cost_micro_usd(long, base)
+    assert short_cost is not None
+    assert long_cost is not None
+    assert long_cost > short_cost
