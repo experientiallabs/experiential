@@ -209,23 +209,36 @@ def route_generation_parameter_requests(
                 code="invalid_parameter",
             )
         if (
-            request.surface == GatewayApiSurface.MESSAGES
-            and request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
-            and any(
-                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
+            request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
+            and (
+                request.surface == GatewayApiSurface.MESSAGES
+                and any(
+                    profile.dialect in {"openai_responses", "openai_compatible"}
+                    for profile in profiles
+                )
+                # A Chat value keeps native semantics on a chat wire (some
+                # compatible providers accept an output ceiling of 1); only
+                # the TRANSLATED Responses wire imposes OpenAI's minimum, so
+                # the floor covers exactly the routes that translate.
+                or request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+                and any(profile.dialect == "openai_responses" for profile in profiles)
             )
             # The floored value must stay within every rung's declared output
             # ceiling; a route capped below the floor keeps the caller value
             # and the provider's own rejection.
             and (not route_limits or min(route_limits) >= OPENAI_MINIMUM_OUTPUT_TOKENS)
         ):
-            # Anthropic accepts max_tokens down to 1 (Claude Code probes with
-            # exactly that after a /model switch) while OpenAI rejects
-            # max_output_tokens below 16, so the translated value rides the
-            # provider floor with disclosure instead of surfacing a provider
-            # 400 the caller cannot act on.
+            # Anthropic and Chat Completions accept output ceilings down to
+            # 1 (Claude Code probes with exactly that after a /model switch)
+            # while OpenAI rejects max_output_tokens below 16, so a Messages
+            # or Chat value translated onto an OpenAI Responses rung rides
+            # the provider floor with disclosure instead of surfacing a
+            # provider 400 the caller cannot act on (2026-09-05 stragglers).
+            # A native Responses caller keeps the named admission rejection
+            # below: sub-16 is invalid on its own surface.
             provider_updates["maximum_output_tokens"] = OPENAI_MINIMUM_OUTPUT_TOKENS
-            path = f"max_tokens->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
+            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            path = f"{parameter}->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
             if path not in ignored:
                 ignored.append(path)
     elif any(profile.dialect == "anthropic_messages" for profile in profiles):
@@ -843,6 +856,30 @@ def route_generation_parameter_requests(
             ),
             param="tools",
             code="unsupported_parameter",
+        )
+
+    if any(profile.dialect == "anthropic_messages" for profile in profiles) and any(
+        message.role == "user"
+        and not message.content
+        and not message.content_parts
+        and message.provider_anthropic_block is None
+        and message.provider_native_item is None
+        for message in request.messages
+    ):
+        # The Anthropic wire rejects empty text content blocks post-dispatch
+        # ("text content blocks must be non-empty"; 2026-09-05, six orgs on
+        # claude-fable routes). Empty blocks inside a richer turn drop
+        # loss-free at conversion, but a user turn that is entirely empty
+        # has nothing to send and dropping the whole message would change
+        # conversation structure, so it is refused by name pre-dispatch.
+        raise ProviderParameterError(
+            message=(
+                "A user message with empty content cannot be served by this "
+                "model route: the provider rejects empty text content blocks. "
+                "Add content to the message or remove it."
+            ),
+            param="messages",
+            code="invalid_parameter",
         )
 
     # A system turn after conversation began has positional semantics that

@@ -210,6 +210,12 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
         if part.kind == "document":
             blocks.append(anthropic_document_block(part))
             continue
+        if not part.text:
+            # This wire rejects empty text content blocks post-dispatch
+            # ("text content blocks must be non-empty"), and an empty part
+            # carries nothing, so it drops loss-free; the turn's attachment
+            # guarantees the content array stays non-empty.
+            continue
         blocks.append(
             marked[text_index] if text_index < len(marked) else {"type": "text", "text": part.text}
         )
@@ -229,16 +235,19 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # A tool screenshot re-emits as the caller's exact block run:
             # image parts become image blocks in their original positions.
             # The canonical model restricts tool messages to these two kinds.
+            # Empty text parts drop loss-free (the wire rejects empty text
+            # blocks); an all-empty run keeps the flattened string content.
             run: list[JsonObject] = []
             for part in message.content_parts:
                 if part.kind == "image":
                     run.append(anthropic_image_block(part))
-                elif part.kind == "text":
+                elif part.kind == "text" and part.text:
                     block: JsonObject = {"type": "text", "text": part.text}
                     if part.cache_control is not None:
                         block["cache_control"] = part.cache_control
                     run.append(block)
-            result["content"] = run
+            if run:
+                result["content"] = run
         # Only the Anthropic wire can express a failed tool invocation; the
         # marker is emitted solely when set so existing payloads are unchanged.
         if message.tool_is_error:
@@ -253,10 +262,12 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # The caller's exact interleaving is preserved: an image before
             # its question reads differently from one after it.
             return "user", _anthropic_multimodal_blocks(message)
-        if message.provider_text_blocks:
-            # The cache-marked run re-emits the caller's exact blocks; the
-            # flattened content stays canonical for every other wire.
-            return "user", list(message.provider_text_blocks)
+        marked_run = [block for block in message.provider_text_blocks if block.get("text")]
+        if marked_run:
+            # The cache-marked run re-emits the caller's exact blocks (empty
+            # blocks drop loss-free: the wire rejects them and they carry
+            # nothing); the flattened content stays canonical elsewhere.
+            return "user", marked_run
         return "user", [{"type": "text", "text": message.content or ""}]
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Anthropic message role")
