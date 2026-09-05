@@ -1544,3 +1544,40 @@ def test_a_screenshot_history_beyond_twenty_images_still_decodes() -> None:
 
     with pytest.raises(OpenAIProtocolError, match="at most 100 images"):
         decode_messages(_body(messages=[{"role": "user", "content": [image_block] * 101}]))
+
+
+def test_decode_names_a_duplicate_tool_use_id_instead_of_crashing() -> None:
+    """A canonical-contract violation in a replayed turn is a named 400.
+
+    Two ``tool_use`` blocks sharing one id in a single assistant turn violate
+    the canonical assistant-message contract during turn translation, after
+    the wire models have already passed. That exception must map to the
+    turn-specific protocol error every other invalid shape gets: before the
+    mapping it escaped decode as an unclassified 500 whose "retry the
+    request" guidance is wrong for caller-shaped input.
+    """
+    with pytest.raises(OpenAIProtocolError, match="messages.1.*unique") as rejected:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "t"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "dup", "name": "a", "input": {}},
+                            {"type": "tool_use", "id": "dup", "name": "a", "input": {}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "dup", "content": "x"},
+                            {"type": "tool_result", "tool_use_id": "dup", "content": "y"},
+                        ],
+                    },
+                ],
+                tools=[{"name": "a", "description": "d", "input_schema": {"type": "object"}}],
+            )
+        )
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == "messages.1"
