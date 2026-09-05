@@ -263,24 +263,16 @@ fn complete_streamed_tool(
         });
     }
     let call = tool.complete().map_err(|message| {
-        // The offending bytes are never logged (tool arguments are model
-        // output and can carry tenant content): the reason keeps serde's
-        // positional parse description, and the operator line adds the tool
-        // name, size, and a non-reversible digest so identical unparsable
-        // shapes correlate across requests without a live capture.
-        let digest = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(tool.raw_arguments.as_bytes());
-            hash.iter().take(8).fold(String::new(), |mut out, byte| {
-                out.push_str(&format!("{byte:02x}"));
-                out
-            })
-        };
+        // The offending bytes are never logged, hashed, or otherwise derived
+        // from (tool arguments are model output and can carry tenant
+        // content, and even an unkeyed digest of low-entropy arguments
+        // invites dictionary guessing): the operator line carries only the
+        // tool name, the size, and the parse reason, which together
+        // correlate identical unparsable shapes across requests.
         let line = serde_json::json!({
             "event": "malformed_tool_arguments",
             "name": tool.name,
             "bytes": tool.raw_arguments.len(),
-            "digest": digest,
             "reason": message,
         });
         eprintln!("exp-gateway-native: {line}");
