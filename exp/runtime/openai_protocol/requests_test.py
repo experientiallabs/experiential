@@ -3024,3 +3024,141 @@ def test_a_malformed_function_call_namespace_names_its_field() -> None:
             }
         )
     assert error.value.detail.param == "input.0.namespace"
+
+
+def test_hosted_tool_item_echoes_decode_as_verbatim_native_items() -> None:
+    """A stateless turn-2 request echoes prior hosted-tool output items
+    (web_search_call, mcp_call, ...) and their caller-authored outputs; each
+    decodes as a shallow native item carried byte-for-byte at its position,
+    with provider-authored items on the assistant role and caller-authored
+    outputs on the tool role."""
+    web_search = {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
+    mcp_call = {
+        "type": "mcp_call",
+        "id": "mcp_1",
+        "server_label": "deepwiki",
+        "name": "ask_question",
+        "arguments": '{"q": "pi"}',
+        "output": "3.14159",
+        "status": "completed",
+    }
+    computer_output = {
+        "type": "computer_call_output",
+        "call_id": "call_c1",
+        "output": {"type": "computer_screenshot", "image_url": "https://example.com/shot.png"},
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "search then act"},
+                web_search,
+                mcp_call,
+                computer_output,
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    )
+    messages = decoded.request.messages
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    natives = [
+        message.provider_native_item
+        for message in messages
+        if message.provider_native_item is not None
+    ]
+    assert natives == [web_search, mcp_call, computer_output]
+
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    assert payload["input"] == [
+        {"role": "user", "content": "search then act"},
+        web_search,
+        mcp_call,
+        computer_output,
+        {"role": "user", "content": "continue"},
+    ]
+
+
+def test_annotation_bearing_assistant_echoes_decode_and_drop_on_replay() -> None:
+    """A cited web-search answer served by this gateway carries populated
+    ``annotations`` on its ``output_text`` part; the caller resends it
+    verbatim on turn 2 and the echo must decode (a 400 here wedges every
+    later turn of the session). The display-only annotations are validated
+    and dropped on replay, like echoed reasoning summary parts."""
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "search"},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Python 3.14.7.",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://www.python.org/doc/versions/",
+                                    "title": "Python versions",
+                                    "start_index": 0,
+                                    "end_index": 14,
+                                }
+                            ],
+                            "logprobs": [],
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    echo = decoded.request.messages[1]
+    assert echo.role == "assistant"
+    assert echo.content == "Python 3.14.7."
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    replayed = cast("list[JsonObject]", payload["input"])[1]
+    content = cast("list[JsonObject]", replayed["content"])
+    assert content[0]["annotations"] == []
+
+
+def test_hosted_tool_echo_annotations_require_a_typed_object() -> None:
+    """Malformed annotation echoes stay a named 400, never a silent accept."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_responses(
+            {
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "x",
+                                "annotations": [{"url": "https://example.com"}],
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+    assert rejected.value.status_code == 400

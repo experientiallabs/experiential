@@ -115,3 +115,26 @@ def test_forced_claim_still_respects_the_throttle_window() -> None:
     assert not registry.claim_forced(_KEY)
     now[0] += 31
     assert registry.claim_forced(_KEY)
+
+
+def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:
+    """The longest remaining window is reported only when EVERY key is inside
+    a throttle window; any dispatchable deployment (or an empty route) yields
+    None so the caller-facing throttled class is never invented."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    first: DeploymentHealthKey = ("catalog", "deployment-one", "connection")
+    second: DeploymentHealthKey = ("catalog", "deployment-two", "connection")
+
+    assert registry.throttled_remaining_seconds(()) is None
+    assert registry.throttled_remaining_seconds((first,)) is None
+
+    registry.failed(first, _failure(GatewayFailureClass.THROTTLED))
+    now[0] += 10.0
+    registry.failed(second, _failure(GatewayFailureClass.THROTTLED))
+    remaining = registry.throttled_remaining_seconds((first, second))
+    assert remaining == 30.0
+
+    # One key outside its window makes the route dispatchable again.
+    now[0] += 21.0
+    assert registry.throttled_remaining_seconds((first, second)) is None

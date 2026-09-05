@@ -522,3 +522,76 @@ def test_remember_turn_rejects_a_coerced_tool_call_namespace() -> None:
                     ],
                 },
             )
+
+
+def test_remember_turn_replays_hosted_items_at_their_provider_positions() -> None:
+    """A hosted-tool turn retained for continuation replays its verbatim
+    items (web_search_call and friends) at their exact output positions, so
+    a ``previous_response_id`` turn re-serves the provider's own history
+    byte-for-byte on a native Responses rung."""
+    store = BoundedContinuationStore()
+    context = _context()
+    web_search: JsonObject = {
+        "id": "ws_1",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
+    remember_turn(
+        store,
+        context=context,
+        data={
+            "text": "",
+            "refusal": False,
+            "hosted_items": [{"output_index": 0, "item": web_search}],
+            "message_outputs": [
+                {
+                    "output_index": 1,
+                    "item_id": "msg_1",
+                    "text": "Python 3.14.7.",
+                    "status": "completed",
+                }
+            ],
+            "tool_calls": [],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    assert state.messages[0].provider_native_item == web_search
+    assert state.messages[1].content == "Python 3.14.7."
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=state.messages,
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[0] == web_search
+    assert payload_input[1]["id"] == "msg_1"
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"output_index": 0, "item": {"id": "x"}},
+        {"output_index": -1, "item": {"id": "x", "type": "web_search_call"}},
+        {"output_index": 0, "item": "not-an-object"},
+        {"item": {"id": "x", "type": "web_search_call"}},
+    ],
+)
+def test_remember_turn_rejects_malformed_hosted_items(item: JsonObject) -> None:
+    """Hosted-item retention fails closed on identity it cannot replay."""
+    store = BoundedContinuationStore()
+    with pytest.raises(ValueError, match="hosted item"):
+        remember_turn(
+            store,
+            context=_context(),
+            data={"text": "", "refusal": False, "hosted_items": [item], "tool_calls": []},
+        )

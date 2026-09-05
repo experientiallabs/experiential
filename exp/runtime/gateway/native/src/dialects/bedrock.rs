@@ -50,7 +50,10 @@ impl Normalizer {
                 FailureClass::InvalidRequest,
                 "provider rejected the request",
             ))]),
-            _ => Err(malformed("Bedrock stream emitted an unsupported event")),
+            other => Err(malformed(&format!(
+                "Bedrock stream emitted an unsupported event (type {})",
+                super::bounded_wire_token(other),
+            ))),
         }
     }
 
@@ -76,7 +79,10 @@ impl Normalizer {
                 if start.is_empty() || start.contains_key("reasoningContent") {
                     return Ok(Vec::new());
                 }
-                return Err(malformed("Bedrock content block start is unsupported"));
+                return Err(malformed(&format!(
+                    "Bedrock content block start is unsupported (key {})",
+                    super::bounded_wire_token(start.keys().next().map_or("", String::as_str)),
+                )));
             }
             Some(value) => value,
         };
@@ -129,7 +135,10 @@ impl Normalizer {
                 if delta.contains_key("reasoningContent") {
                     return Ok(Vec::new());
                 }
-                return Err(malformed("Bedrock content block delta is unsupported"));
+                return Err(malformed(&format!(
+                    "Bedrock content block delta is unsupported (key {})",
+                    super::bounded_wire_token(delta.keys().next().map_or("", String::as_str)),
+                )));
             }
             Some(value) => value,
         };

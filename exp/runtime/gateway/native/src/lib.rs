@@ -549,6 +549,85 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .unwrap_or("")
                     .to_string(),
             },
+            "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item_type: object
+                    .get("item_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item: object
+                    .get("item")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "hosted_tool_item_progress" => events::Event::HostedToolItemProgress {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                event_type: object
+                    .get("event_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                payload: object
+                    .get("payload")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "hosted_tool_item_completed" => events::Event::HostedToolItemCompleted {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item_type: object
+                    .get("item_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item: object
+                    .get("item")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "provider_text_annotation" => events::Event::ProviderTextAnnotation {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                annotation: object
+                    .get("annotation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
             "text_block_started" => events::Event::TextBlockStarted { index },
             "citation_delta" => events::Event::CitationDelta {
                 index,

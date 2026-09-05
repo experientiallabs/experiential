@@ -24,6 +24,8 @@ impl ResponsesSseEncoder {
                     self.messages[key].item(include_content, fallback_status)
                 }
                 OutputSlot::Tool(index) => self.tools[index].item(fallback_status),
+                // Hosted tool items re-serve the provider's verbatim JSON.
+                OutputSlot::HostedTool(index) => self.hosted[index].item.clone(),
                 OutputSlot::Reasoning(index) => self.reasoning[index].item(
                     include_content,
                     fallback_status,

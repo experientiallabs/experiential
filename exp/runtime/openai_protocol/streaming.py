@@ -894,7 +894,12 @@ def _responses_usage(usage: GatewayUsage | None) -> JsonObject | None:
     assert usage.output_tokens is not None
     return {
         "input_tokens": usage.input_tokens,
-        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens or 0},
+        # `cache_write_tokens` joined the official shape (openai-python 3.x
+        # marks it required), so SDK-strict callers need it present.
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens or 0,
+            "cache_write_tokens": usage.cache_creation_input_tokens or 0,
+        },
         "output_tokens": usage.output_tokens,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
         "total_tokens": usage.input_tokens + usage.output_tokens,

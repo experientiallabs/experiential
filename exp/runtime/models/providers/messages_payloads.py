@@ -2,7 +2,7 @@
 
 Split from ``streaming_requests`` for the module line budget: the Anthropic,
 Gemini, and Bedrock builders live here; ``dialect_stream_payload`` in
-``streaming_requests`` remains the single dispatch seam.
+``dialect_dispatch`` remains the single dispatch seam.
 """
 
 from __future__ import annotations

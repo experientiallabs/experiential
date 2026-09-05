@@ -307,7 +307,10 @@ impl Normalizer {
             }
             "ping" => {}
             _ => {
-                return Err(malformed("Anthropic stream emitted an unsupported event"));
+                return Err(malformed(&format!(
+                    "Anthropic stream emitted an unsupported event (type {})",
+                    super::bounded_wire_token(&event_type),
+                )));
             }
         }
         Ok(events)
