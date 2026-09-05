@@ -86,12 +86,11 @@ pub fn completed_responses_body_with_carrier(
             // invoked tools; their item type names the activity for the
             // ledger, mirroring `track_event`. Results, approvals, and
             // opaque conversation items never record a call.
-            Event::HostedToolItemCompleted { item_type, .. } => {
+            Event::HostedToolItemCompleted { item_type, .. }
                 if crate::events::hosted_item_type_is_invocation(item_type)
-                    && !tool_names.contains(item_type)
-                {
-                    tool_names.push(item_type.clone());
-                }
+                    && !tool_names.contains(item_type) =>
+            {
+                tool_names.push(item_type.clone());
             }
             _ => {}
         }
