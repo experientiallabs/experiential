@@ -8,6 +8,9 @@ engines cannot drift at the message boundary.
 
 from __future__ import annotations
 
+import hashlib
+import re
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     TOOL_ERROR_TEXT_PREFIX,
@@ -28,6 +31,51 @@ from exp.runtime.models.providers.images import (
     responses_image_part,
 )
 from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
+
+_ANTHROPIC_TOOL_ID_UNSAFE = re.compile(r"[^a-zA-Z0-9_-]")
+"""Characters outside the wire's documented tool-id pattern ``^[a-zA-Z0-9_-]+$``."""
+
+_OPENAI_MAXIMUM_CALL_ID_CHARS = 64
+"""Longest ``call_id`` the Responses API accepts (probed live 2026-09-05:
+65 characters answers "Invalid 'input[N].call_id': string too long")."""
+
+
+def _collision_suffix(call_id: str) -> str:
+    """One short deterministic suffix distinguishing rewritten originals."""
+    return hashlib.sha256(call_id.encode()).hexdigest()[:8]
+
+
+def anthropic_tool_use_id(call_id: str) -> str:
+    """Deterministically rewrite one caller-minted tool id for this wire.
+
+    The public OpenAI surfaces accept arbitrary id bytes while this wire
+    rejects anything outside ``^[a-zA-Z0-9_-]+$`` post-dispatch (probed live
+    2026-09-05: "tool_use.id: String should match pattern"). A conforming id
+    passes through byte-identical; a non-conforming one maps to its cleaned
+    form plus an 8-hex suffix of the original, so distinct originals that
+    clean to the same bytes stay distinct, and the same mapping applied to
+    the paired ``tool_result.tool_use_id`` keeps history linked. The rewrite
+    never reaches the caller: responses only carry provider-minted ids.
+    """
+    if call_id and not _ANTHROPIC_TOOL_ID_UNSAFE.search(call_id):
+        return call_id
+    cleaned = _ANTHROPIC_TOOL_ID_UNSAFE.sub("_", call_id) or "call"
+    return f"{cleaned}-{_collision_suffix(call_id)}"
+
+
+def responses_call_id(call_id: str) -> str:
+    """Deterministically bound one caller-minted call id for the Responses wire.
+
+    The wire accepts arbitrary bytes but caps ``call_id`` at 64 characters
+    (probed live 2026-09-05); a longer caller-minted id maps to its prefix
+    plus an 8-hex suffix of the original so distinct originals stay distinct
+    and call/output pairs stay linked. The rewrite never reaches the caller:
+    responses only carry provider-minted ids.
+    """
+    if len(call_id) <= _OPENAI_MAXIMUM_CALL_ID_CHARS:
+        return call_id
+    prefix = call_id[: _OPENAI_MAXIMUM_CALL_ID_CHARS - 9]
+    return f"{prefix}-{_collision_suffix(call_id)}"
 
 
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
@@ -56,7 +104,7 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             output_value = message.folded_tool_error_content()
         output_item: JsonObject = {
             "type": "function_call_output",
-            "call_id": message.tool_call_id or "",
+            "call_id": responses_call_id(message.tool_call_id or ""),
             "output": output_value,
         }
         # Tool attribution round-trips verbatim: present stays present and
@@ -150,7 +198,7 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     for call in message.tool_calls:
         item: JsonObject = {
             "type": "function_call",
-            "call_id": call.call_id,
+            "call_id": responses_call_id(call.call_id),
             "name": call.name,
             "arguments": call.arguments_json(),
         }
@@ -261,7 +309,7 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
     if message.role == "tool":
         result: JsonObject = {
             "type": "tool_result",
-            "tool_use_id": message.tool_call_id or "",
+            "tool_use_id": anthropic_tool_use_id(message.tool_call_id or ""),
             "content": message.content or "",
         }
         if message.content_parts:
@@ -342,7 +390,7 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
     for call in message.tool_calls:
         tool_use: JsonObject = {
             "type": "tool_use",
-            "id": call.call_id,
+            "id": anthropic_tool_use_id(call.call_id),
             "name": call.name,
             "input": call.arguments,
         }
