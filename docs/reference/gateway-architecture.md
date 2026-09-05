@@ -311,9 +311,10 @@ fetched results as input and the start-frame count severely undercounts the bill
 OpenAI-family prefix caches are keyed per cache node behind the provider's load balancer, so
 an identical prompt hits but the same stem with a new tail (every turn of an agent loop) is
 routed by the whole prompt and usually misses (Tencent TokenHub, measured 2026-09-05: 2 of 8
-shared-stem turns hit with no hint, 7 of 8 with one). The gateway therefore dispatches a
-`prompt_cache_key` on rungs whose provider routes by it (OpenAI, Tencent TokenHub, and every
-BYOK rung): never the caller's raw value, which shares a house account across tenants, but a
+shared-stem turns hit with no hint, 10 of 10 with one). The gateway therefore dispatches a
+`prompt_cache_key` on rungs whose wire profile says the provider routes by it (OpenAI, Tencent
+TokenHub; other OpenAI-compatible servers may reject unknown fields, so they never receive it,
+BYOK or not): never the caller's raw value, which shares a house account across tenants, but a
 digest namespaced by organization and identity (`exp/runtime/gateway/prompt_cache_affinity.py`).
 A caller `prompt_cache_key` is the material when present; otherwise the conversation stem (the
 leading system/developer messages, which every turn of a session and every request sharing that

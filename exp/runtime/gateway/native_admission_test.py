@@ -457,6 +457,10 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
     assert public.ignored_parameters == ("service_tier",)
     assert provider.service_tier is None
     assert accounting.recorded == 1
+    # The rebuild after the capability coercion must not lose the affinity
+    # key: it is attached to the request admission finally settled on.
+    assert provider.provider_prompt_cache_key is not None
+    assert public.provider_prompt_cache_key is None
 
 
 def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:

@@ -54,20 +54,20 @@ _logger = logging.getLogger(__name__)
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
 
 
-def _dispatch_request(
+def _with_cache_affinity(
     provider_request: GatewayRequest, authorization: AuthorizationSnapshot
 ) -> GatewayRequest:
-    """Force streaming and attach the tenant's cache-affinity key for dispatch.
+    """Attach the tenant's cache-affinity key to the final dispatch request.
 
-    Cache affinity is per tenant and per session, so it is derived once here
-    with the frozen authority and read by every rung's payload builder that
-    forwards it; the public request keeps the caller's own ``prompt_cache_key``
+    Cache affinity is per tenant and per session, so it is derived once, from
+    the request admission settled on and the frozen authority, and read by
+    every rung's payload builder that forwards it. It is applied last so no
+    admission-time rebuild (route narrowing, capability or schema coercion)
+    can drop it; the public request keeps the caller's own ``prompt_cache_key``
     untouched.
     """
     return provider_request.model_copy(
         update={
-            "stream": True,
-            "include_usage": True,
             "provider_prompt_cache_key": provider_prompt_cache_key(
                 provider_request,
                 organization_id=str(authorization.organization_id),
@@ -144,7 +144,7 @@ def admitted_route_requests(
         tuple(profile for profile, _client in resolved_wires),
         admitted_request,
     )
-    provider_request = _dispatch_request(provider_request, authorization)
+    provider_request = provider_request.model_copy(update={"stream": True, "include_usage": True})
     protocol_indexes, protocol_errors = protocol_compatible_indexes(
         route,
         resolved_wires,
@@ -165,7 +165,9 @@ def admitted_route_requests(
                 tuple(profile for profile, _client in resolved_wires),
                 admitted_request,
             )
-            provider_request = _dispatch_request(provider_request, authorization)
+            provider_request = provider_request.model_copy(
+                update={"stream": True, "include_usage": True}
+            )
             protocol_indexes, protocol_errors = protocol_compatible_indexes(
                 route,
                 resolved_wires,
@@ -215,6 +217,7 @@ def admitted_route_requests(
                 )
             }
         )
+    provider_request = _with_cache_affinity(provider_request, authorization)
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
     return route, resolved_wires, public_request, provider_request
 

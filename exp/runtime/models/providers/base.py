@@ -113,8 +113,10 @@ class GatewayWireProfile:
 
     True where the field is documented (OpenAI) or verified live to pin a
     request to one prefix-cache node (Tencent TokenHub, 2026-09-05: shared-stem
-    hit rate 2/8 without the key, 7/8 with it). BYOK rungs forward it
-    regardless (the caller pays that provider directly).
+    hit rate 4/10 without the key, 10/10 with it). Every other endpoint,
+    BYOK included, stays untouched: an unknown top-level field is a 400 on a
+    strict OpenAI-compatible server, and the wire profile is the only place
+    that knows.
     """
     """Whether this rung dispatches on tenant-owned (BYOK) credentials.
 

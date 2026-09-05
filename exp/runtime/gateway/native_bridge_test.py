@@ -925,12 +925,12 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
 
     decoded = decode_chat(json.loads(_chat_body()))
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
-    upstream = dict(cast(JsonObject, admission["upstream_payload"]))
-    # The BYOK shim rung forwards the admission-derived cache-affinity key
-    # (a tenant digest, never the caller's value); the rest is the plain build.
-    affinity = upstream.pop("prompt_cache_key")
-    assert isinstance(affinity, str) and affinity.startswith("xpl-")
-    assert upstream == openai_compatible_stream_payload("provider-model-exact", provider_request)
+    # A generic OpenAI-compatible shim never receives the cache-affinity key
+    # (only OpenAI and Tencent endpoints route by it), so the payload is the
+    # plain build.
+    assert admission["upstream_payload"] == openai_compatible_stream_payload(
+        "provider-model-exact", provider_request
+    )
 
     settled = control.settle(
         json.dumps(
@@ -3295,14 +3295,11 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert admission["ignored_parameters"] == []
     assert admission["envelope"] == responses_envelope(public_request)
     provider_request = public_request.model_copy(update={"stream": True, "include_usage": True})
-    upstream_payload = admission["upstream_payload"]
-    assert isinstance(upstream_payload, dict)
-    without_affinity = dict(upstream_payload)
-    affinity = without_affinity.pop("prompt_cache_key")
-    assert isinstance(affinity, str) and affinity.startswith("xpl-")
-    assert without_affinity == openai_compatible_stream_payload(
+    assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )
+    upstream_payload = admission["upstream_payload"]
+    assert isinstance(upstream_payload, dict)
     assert "reasoning" not in upstream_payload
     assert "reasoning_effort" not in upstream_payload
     settled = control.settle(

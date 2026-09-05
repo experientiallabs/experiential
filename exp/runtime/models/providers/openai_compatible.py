@@ -506,7 +506,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
             # 2026-09-05). Other compatible servers may reject unknown fields,
-            # so the hint stays off them unless the rung is BYOK.
+            # so the hint stays off them, BYOK or not.
             forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
         )
 
