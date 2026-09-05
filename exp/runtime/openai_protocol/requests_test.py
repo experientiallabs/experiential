@@ -438,6 +438,31 @@ def test_chat_decoder_accepts_plaintext_reasoning_as_exposed_history() -> None:
     block = decoded.request.messages[1].provider_reasoning[0]
     assert block.kind == "exposed_reasoning_content"
     assert block.content == "The user wants a directory listing."
+    # A tool-call turn's reasoning is only ever issued as the sealed carrier,
+    # so plaintext there was never ours and is rejected by name.
+    with pytest.raises(OpenAIProtocolError) as tool_turn:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "look it up"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "plaintext on a tool turn",
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                ],
+            }
+        )
+    assert tool_turn.value.detail.param == "messages.1.reasoning_content"
     # An empty string is not reasoning; it names its field.
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_chat(

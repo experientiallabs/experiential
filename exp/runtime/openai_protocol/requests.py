@@ -660,6 +660,15 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             # history and route admission decides which rungs may carry it.
             scheme = scheme_for_carrier(message.reasoning_content)
             if scheme is None:
+                if calls:
+                    # A tool turn's reasoning is only ever issued as the sealed
+                    # carrier that binds it to its calls and issuing rung;
+                    # plaintext here was never ours and would bypass that bond.
+                    raise invalid_field(
+                        param,
+                        f"'{param}' must be a gateway-issued carrier on an assistant "
+                        "tool-call turn.",
+                    )
                 try:
                     provider_reasoning = (
                         ExposedReasoningContentBlock(content=message.reasoning_content),
