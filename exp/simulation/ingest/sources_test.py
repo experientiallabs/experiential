@@ -81,6 +81,20 @@ _MINIMAL_VENDOR_EXPORTS: dict[str, JsonValue] = {
             }
         ]
     },
+    "opik": [
+        {
+            "trace_id": "trace-1",
+            "id": "span-0",
+            "name": "answer",
+            "type": "llm",
+            "start_time": "2026-09-04T12:00:00+00:00",
+            "end_time": "2026-09-04T12:00:01+00:00",
+            "input": {"messages": [_USER]},
+            "output": {"content": "here is the plan"},
+            "model": "gpt-test",
+            "provider": "openai",
+        }
+    ],
     "otel-genai": [
         {
             "trace_id": "9" * 32,
@@ -150,6 +164,7 @@ def test_declared_sources_are_the_supported_set() -> None:
         "langfuse",
         "langsmith",
         "mastra",
+        "opik",
         "otel-genai",
         "otlp",
         "phoenix",
