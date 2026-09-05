@@ -111,13 +111,29 @@ def admitted_route_requests(
     """
     # A named processing tier (flex/priority) is a paid pricing choice, not a
     # best-effort hint: it fails CLOSED before any reservation when no rung can
-    # honor it (a host lane whose model has no per-tier pass-through pricing, and
-    # no BYOK rung). auto/default carry no price and never reject; they still
-    # drop with disclosure downstream where a rung declines them.
+    # honor it. Honoring means the SPECIFIC requested tier is billable on a
+    # forwarding rung: a BYOK rung forwards any tier (customer pays the provider
+    # directly, no platform card needed), while a house rung must carry a
+    # per-tier pass-through card for THIS tier (`prices.service_tier(tier)`).
+    # A model carded for flex only therefore rejects a priority request instead
+    # of forwarding it and silently billing the base rate while the provider
+    # charges the priority premium (underbill). auto/default carry no price and
+    # never reject; they still drop with disclosure downstream where a rung
+    # declines them.
     if request.service_tier is not None and request.service_tier not in ("auto", "default"):
+        tier = request.service_tier
         if not any(
-            profile.dialect in SERVICE_TIER_DIALECTS and profile.forwards_service_tier
-            for profile, _client in resolved_wires
+            profile.dialect in SERVICE_TIER_DIALECTS
+            and (
+                profile.billing_customer_managed
+                or (
+                    profile.service_tier_pricing_enabled
+                    and deployment.gateway.prices.service_tier(tier) is not None
+                )
+            )
+            for deployment, (profile, _client) in zip(
+                route.deployments, resolved_wires, strict=True
+            )
         ):
             raise ProviderCapabilityError(
                 capability="service_tier",
