@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
@@ -71,6 +72,24 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
+
+TOOL_ERROR_FOLD_DISCLOSURE = "messages.content.is_error->content"
+"""Disclosure recorded when a tool-result error flag folds into result text.
+
+Only the Anthropic wire has a ``tool_result.is_error`` field; every other
+wire receives the flag as a fixed text prefix on the result (see
+``folded_tool_error_content``). The flag is baked into the caller's history
+on every failed tool call, so a rejection wedges the whole session, and a
+silent drop would misstate that the invocation failed.
+"""
+
+OPENAI_MINIMUM_OUTPUT_TOKENS = 16
+"""Smallest ``max_output_tokens`` the OpenAI wires accept.
+
+The provider rejects lower values by name ("Expected a value >= 16"), while
+the Anthropic surface legally carries ``max_tokens`` down to 1, so
+Messages-surface requests below the floor are raised to it with disclosure.
+"""
 
 GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
 """Version of the route admission and provider wire-translation contract."""
@@ -189,6 +208,26 @@ def route_generation_parameter_requests(
                 param=param,
                 code="invalid_parameter",
             )
+        if (
+            request.surface == GatewayApiSurface.MESSAGES
+            and request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
+            and any(
+                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
+            )
+            # The floored value must stay within every rung's declared output
+            # ceiling; a route capped below the floor keeps the caller value
+            # and the provider's own rejection.
+            and (not route_limits or min(route_limits) >= OPENAI_MINIMUM_OUTPUT_TOKENS)
+        ):
+            # Anthropic accepts max_tokens down to 1 (Claude Code probes with
+            # exactly that after a /model switch) while OpenAI rejects
+            # max_output_tokens below 16, so the translated value rides the
+            # provider floor with disclosure instead of surfacing a provider
+            # 400 the caller cannot act on.
+            provider_updates["maximum_output_tokens"] = OPENAI_MINIMUM_OUTPUT_TOKENS
+            path = f"max_tokens->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
+            if path not in ignored:
+                ignored.append(path)
     elif any(profile.dialect == "anthropic_messages" for profile in profiles):
         # Anthropic requires max_tokens even when the public surface does not.
         # Pin one route-wide default so every waterfall rung sees the same
@@ -433,17 +472,18 @@ def route_generation_parameter_requests(
             if TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in ignored:
                 ignored.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
 
+    # Only the Anthropic wire has a tool-result error flag. Every other wire
+    # folds the flag into the result text at encoding (a fixed prefix, see
+    # ``folded_tool_error_content``) so the model still learns the invocation
+    # failed: rejecting wedges the session (the flag is baked into history and
+    # Claude Code sets it on every failed tool call), and dropping it silently
+    # would misstate what the tool did. Anthropic rungs keep the flag
+    # verbatim; the route-level disclosure records the fold.
     if any(message.tool_is_error for message in request.messages) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'messages.content.is_error' is not supported by this model "
-                "route. Remove the field or choose a native Anthropic-only route."
-            ),
-            param="messages.content.is_error",
-            code="unsupported_parameter",
-        )
+        if TOOL_ERROR_FOLD_DISCLOSURE not in ignored:
+            ignored.append(TOOL_ERROR_FOLD_DISCLOSURE)
 
     # Context editing is Anthropic-native; any other rung cannot honor it,
     # so the omission is disclosed and the field dropped from dispatch,
@@ -601,23 +641,39 @@ def route_generation_parameter_requests(
                 "messages.reasoning_content",
                 "messages.reasoning_content->dropped(unsupported_by_provider)",
             )
-    anthropic_reasoning_present = request.provider_thinking_config is not None or any(
+    history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}
         for message in request.messages
         for block in message.provider_reasoning
     )
-    if anthropic_reasoning_present and not all(
-        profile.dialect == "anthropic_messages" for profile in profiles
-    ):
+    non_anthropic_route = not all(profile.dialect == "anthropic_messages" for profile in profiles)
+    if history_thinking_present and non_anthropic_route:
         raise ProviderParameterError(
             message=(
-                "The parameter 'thinking' is not supported by this model route. "
-                "Remove extended-thinking content or choose a native Anthropic-only route."
+                "The request replays Anthropic extended-thinking blocks that only a "
+                "native Anthropic route can carry. Remove extended-thinking content "
+                "or choose a native Anthropic-only route."
             ),
             param="thinking",
             code="unsupported_parameter",
         )
-    if request.provider_thinking_config is not None:
+    if request.provider_thinking_config is not None and non_anthropic_route:
+        # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
+        # cross-wire reading. The named rejection here is what lets the admit
+        # loop offer the disclosed thinking->reasoning_effort translation (or
+        # the disclosed drop) in ``coerce_thinking_config``: the substitution
+        # is semantic, so it lives in the coercion layer, where it runs only
+        # after every rung declined verbatim and never steals narrowing
+        # preference from an Anthropic rung that could honor the config.
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'thinking' is not supported by this model route. "
+                "Remove the field or choose a native Anthropic-only route."
+            ),
+            param="thinking",
+            code="unsupported_parameter",
+        )
+    if request.provider_thinking_config is not None and not non_anthropic_route:
         # The adaptive-thinking generation rejects caller enabled/disabled
         # configs outright, so verbatim forwarding is family-gated (a route
         # is one exact-model pool, so the answer is uniform across rungs).
@@ -699,14 +755,21 @@ def route_generation_parameter_requests(
             param="input",
             code="unsupported_parameter",
         )
+    outbound_maximum_output_tokens = provider_updates.get(
+        "maximum_output_tokens", request.maximum_output_tokens
+    )
     if (
-        request.maximum_output_tokens is not None
-        and request.maximum_output_tokens < 16
+        isinstance(outbound_maximum_output_tokens, int)
+        and outbound_maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
         and all(profile.dialect == "openai_responses" for profile in profiles)
     ):
         # The provider's own 400 for this is post-dispatch and opaque on some
         # relays; the documented Responses minimum is a request fact, so it is
-        # rejected at admission with the bound named.
+        # rejected at admission with the bound named. The value judged is the
+        # one that would dispatch: a Messages-surface probe already floored
+        # with disclosure above never reaches this rejection, while a route
+        # whose declared ceiling sits below the floor cannot ride it and gets
+        # the named minimum instead of the provider's opaque 400.
         parameter = request.maximum_output_tokens_parameter or "max_output_tokens"
         raise ProviderParameterError(
             message=(

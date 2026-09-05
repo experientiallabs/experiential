@@ -35,7 +35,7 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
         output_item: JsonObject = {
             "type": "function_call_output",
             "call_id": message.tool_call_id or "",
-            "output": message.content or "",
+            "output": message.folded_tool_error_content(),
         }
         # Tool attribution round-trips verbatim: present stays present and
         # absent stays absent, so pre-namespace histories are unchanged.
@@ -359,7 +359,7 @@ def openai_chat_message(
     if message.role == "tool":
         return {
             "role": "tool",
-            "content": message.content or "",
+            "content": message.folded_tool_error_content(),
             "tool_call_id": message.tool_call_id or "",
         }
     payload: JsonObject = {
