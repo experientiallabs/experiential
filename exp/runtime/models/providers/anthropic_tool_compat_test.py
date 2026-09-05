@@ -144,6 +144,25 @@ def _object(properties: JsonObject, **extra: JsonValue) -> JsonObject:
             "recursive $ref",
         ),
         (_object({"v": {"$ref": "#"}}), "recursive $ref"),
+        (
+            # A pointer that descends into the definition still depends on it.
+            _object(
+                {"v": {"$ref": "#/$defs/node"}},
+                **{
+                    "$defs": {
+                        "node": {
+                            "type": "object",
+                            "properties": {
+                                "child": {"type": "string"},
+                                "again": {"$ref": "#/$defs/node/properties/child"},
+                            },
+                            "additionalProperties": False,
+                        }
+                    }
+                },
+            ),
+            "recursive $ref",
+        ),
     ),
 )
 def test_strict_validator_limitations_are_found_structurally(

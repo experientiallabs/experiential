@@ -241,10 +241,16 @@ def _has_circular_definitions(schema: JsonObject) -> bool:
 
 
 def _definition_name(reference: str) -> str | None:
-    """Return the local definition a ``#/$defs/<name>`` style reference names."""
+    """Return the local definition a ``#/$defs/<name>...`` reference points into.
+
+    A pointer that descends past the definition (``#/$defs/node/properties/child``)
+    still depends on that definition, so only the first path segment names the
+    graph node; a self-reference through such a pointer is a cycle too.
+    """
     for prefix in ("#/$defs/", "#/definitions/"):
         if reference.startswith(prefix):
-            return reference[len(prefix) :]
+            name = reference[len(prefix) :].split("/", 1)[0]
+            return name or None
     return None
 
 
