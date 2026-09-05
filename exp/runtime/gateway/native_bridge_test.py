@@ -728,8 +728,13 @@ def test_hunyuan_mixed_carrier_and_plaintext_history_round_trips(tmp_path: Path)
     assert messages[3]["reasoning_content"] == plain
 
 
-def test_plaintext_reasoning_is_rejected_on_a_route_without_exposure(tmp_path: Path) -> None:
-    """A rung that never issued plaintext reasoning rejects it by name."""
+def test_plaintext_reasoning_degrades_on_a_route_without_exposure(tmp_path: Path) -> None:
+    """A rung that cannot replay plaintext reasoning drops it with disclosure.
+
+    The block is baked into the caller's transcript (an earlier exposed-rung
+    turn or a client re-serialization), so admission serves the request and
+    discloses the drop — previously a named 400 that killed every session
+    the moment it switched from a reasoning-exposed model to any other."""
     _manager, raw_key = _configured_gateway(tmp_path, capabilities=ModelCapabilities())
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -744,9 +749,15 @@ def test_plaintext_reasoning_is_rejected_on_a_route_without_exposure(tmp_path: P
             ],
         }
     )
-    with pytest.raises(NativeBridgeError) as rejected:
-        _admit(control, raw_key, body)
-    assert json.loads(rejected.value.public_error_json)["param"] == "messages.reasoning_content"
+    admitted = _admit(control, raw_key, body)
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)"
+        in admitted["ignored_parameters"]
+    )
+    route = cast("list[JsonObject]", admitted["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    sent_messages = cast("list[JsonObject]", payload["messages"])
+    assert all("reasoning_content" not in message for message in sent_messages)
 
 
 def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(

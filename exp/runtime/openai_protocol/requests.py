@@ -695,15 +695,15 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             # history and route admission decides which rungs may carry it.
             scheme = scheme_for_carrier(message.reasoning_content)
             if scheme is None:
-                if calls:
-                    # A tool turn's reasoning is only ever issued as the sealed
-                    # carrier that binds it to its calls and issuing rung;
-                    # plaintext here was never ours and would bypass that bond.
-                    raise invalid_field(
-                        param,
-                        f"'{param}' must be a gateway-issued carrier on an assistant "
-                        "tool-call turn.",
-                    )
+                # Plaintext reasoning is caller-owned history on ANY assistant
+                # turn, tool-call turns included: AI-SDK clients re-serialize a
+                # reasoning part onto the same assistant message as its tool
+                # calls, and exposure-gated providers themselves emit
+                # reasoning_content on tool turns. The field is baked into the
+                # transcript, so rejecting it wedges every session that ever
+                # touched a reasoning-exposed model (the sealed-carrier bond
+                # applies only to text presented AS a gateway-issued carrier,
+                # which keeps its strict path below).
                 try:
                     provider_reasoning = (
                         ExposedReasoningContentBlock(content=message.reasoning_content),

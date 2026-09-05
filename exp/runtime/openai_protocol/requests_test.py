@@ -504,31 +504,36 @@ def test_chat_decoder_accepts_plaintext_reasoning_as_exposed_history() -> None:
     assert (
         reasoning_only.request.messages[1].provider_reasoning[0].kind == "exposed_reasoning_content"
     )
-    # A tool-call turn's reasoning is only ever issued as the sealed carrier,
-    # so plaintext there was never ours and is rejected by name.
-    with pytest.raises(OpenAIProtocolError) as tool_turn:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {"role": "user", "content": "look it up"},
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "reasoning_content": "plaintext on a tool turn",
-                        "tool_calls": [
-                            {
-                                "id": "call-one",
-                                "type": "function",
-                                "function": {"name": "lookup", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
-                ],
-            }
-        )
-    assert tool_turn.value.detail.param == "messages.1.reasoning_content"
+    # Plaintext on a tool-call turn is caller-owned history too: AI-SDK
+    # clients re-serialize a reasoning part onto the same assistant message
+    # as its tool calls, and exposure-gated providers emit reasoning_content
+    # on tool turns. It decodes like any other plaintext (previously a 400
+    # that wedged every cross-model session); the sealed-carrier bond keeps
+    # its strict path for text presented AS a carrier.
+    tool_turn = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "look it up"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "plaintext on a tool turn",
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    tool_turn_message = tool_turn.request.messages[1]
+    assert tool_turn_message.provider_reasoning[0].kind == "exposed_reasoning_content"
+    assert tool_turn_message.tool_calls[0].name == "lookup"
     # An empty string is not reasoning; it names its field.
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_chat(
@@ -3555,3 +3560,113 @@ def test_a_name_on_a_non_tool_message_stays_a_named_400() -> None:
     assert error.value.status_code == 400
     assert error.value.detail.param == "messages.0"
     assert "name is valid only for tool messages" in str(error.value.detail.message)
+
+
+def test_replayed_reasoning_content_degrades_instead_of_wedging_cross_model_sessions() -> None:
+    """The prod OpenCode + gpt-6-astra wedge: rc in history serves everywhere.
+
+    A session that touched a reasoning-exposed rung (or whose AI-SDK client
+    re-serializes reasoning parts) carries plaintext reasoning_content in its
+    transcript — on tool-call turns too. A non-exposed route now drops the
+    block with disclosure and dispatches without it; an exposed route
+    forwards it verbatim beside the tool calls. Previously both repro shapes
+    400d ("must be a gateway-issued carrier on an assistant tool-call turn" /
+    "carries plaintext reasoning"), killing the session the moment it
+    switched models.
+    """
+    from exp.runtime.models.providers.base import GatewayWireProfile
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    astra = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://astra.test/v1",
+        model_id="gpt-6-astra",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+    exposed = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        model_id="hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_output_exposed=True,
+    )
+
+    # Repro A (the exact prod screenshot shape): rc beside tool_calls.
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "what time is it"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "The user wants the time; call get_time.",
+                    "tool_calls": [
+                        {
+                            "id": "call_rc1",
+                            "type": "function",
+                            "function": {"name": "get_time", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_rc1", "content": "12:00"},
+                {"role": "user", "content": "thanks, and the date?"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "description": "d",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+    public, provider = route_generation_parameter_requests((astra,), decoded.request)
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)" in public.ignored_parameters
+    )
+    payload = dialect_stream_payload(astra, provider.model_copy(update={"stream": True}))
+    astra_messages = cast(list[JsonObject], payload["messages"])
+    assert all("reasoning_content" not in message for message in astra_messages)
+    assert astra_messages[1]["tool_calls"]
+
+    # The same history onto an exposed route forwards the plaintext verbatim
+    # beside the tool calls (the provider's own wire shape) — no demand for a
+    # sealed carrier on history the gateway never issued.
+    public_exposed, provider_exposed = route_generation_parameter_requests(
+        (exposed,), decoded.request
+    )
+    assert not any("reasoning_content" in path for path in public_exposed.ignored_parameters)
+    exposed_payload = dialect_stream_payload(
+        exposed, provider_exposed.model_copy(update={"stream": True})
+    )
+    exposed_messages = cast(list[JsonObject], exposed_payload["messages"])
+    assert exposed_messages[1]["reasoning_content"] == "The user wants the time; call get_time."
+    assert exposed_messages[1]["tool_calls"]
+
+    # Repro B: rc on a plain assistant turn, non-exposed route.
+    decoded_b = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "A", "reasoning_content": "thinking..."},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    public_b, provider_b = route_generation_parameter_requests((astra,), decoded_b.request)
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)"
+        in public_b.ignored_parameters
+    )
+    payload_b = dialect_stream_payload(astra, provider_b.model_copy(update={"stream": True}))
+    plain_messages = cast(list[JsonObject], payload_b["messages"])
+    assert all("reasoning_content" not in message for message in plain_messages)

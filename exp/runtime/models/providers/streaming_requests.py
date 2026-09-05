@@ -667,22 +667,21 @@ def route_generation_parameter_requests(
         for message in request.messages
         for block in message.provider_reasoning
     )
-    if exposed_reasoning_present:
-        if not any(profile.reasoning_output_exposed for profile in profiles):
-            raise ProviderParameterError(
-                message=(
-                    "The parameter 'messages.reasoning_content' carries plaintext reasoning, "
-                    "which only a model that exposes its reasoning can replay. Remove the "
-                    "field or choose a reasoning-exposed model alias."
-                ),
-                param="messages.reasoning_content",
-                code="unsupported_parameter",
-            )
-        if not all(profile.reasoning_output_exposed for profile in profiles):
-            ignore(
-                "messages.reasoning_content",
-                "messages.reasoning_content->dropped(unsupported_by_provider)",
-            )
+    if exposed_reasoning_present and not all(
+        profile.reasoning_output_exposed for profile in profiles
+    ):
+        # Plaintext reasoning is baked into the caller's transcript (an
+        # earlier turn on a reasoning-exposed rung, or a client-side AI-SDK
+        # re-serialization), so a route that cannot replay it drops the block
+        # with disclosure instead of rejecting: "remove the field" is not
+        # actionable for a framework-managed history, and a session that ever
+        # touched an exposed model would otherwise die the moment it switches
+        # models. Exposing rungs — when the route has any — still forward the
+        # plaintext verbatim; the others omit it at encoding.
+        ignore(
+            "messages.reasoning_content",
+            "messages.reasoning_content->dropped(unsupported_by_provider)",
+        )
     history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}
         for message in request.messages
