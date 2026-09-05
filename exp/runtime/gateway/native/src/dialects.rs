@@ -262,13 +262,52 @@ fn complete_streamed_tool(
             }
         });
     }
-    let call = tool.complete().map_err(|message| malformed(&message))?;
+    let call = tool.complete().map_err(|message| {
+        // The offending bytes never join the failure (they flow to the
+        // ledger through provider_detail); one bounded escaped prefix goes
+        // to the operator log so the next unparsable argument shape is
+        // diagnosable without a live capture.
+        let line = serde_json::json!({
+            "event": "malformed_tool_arguments",
+            "name": tool.name,
+            "bytes": tool.raw_arguments.len(),
+            "prefix": tool.raw_arguments.chars().take(48).collect::<String>(),
+        });
+        eprintln!("exp-gateway-native: {line}");
+        malformed(&format!("{message} ({} bytes)", tool.raw_arguments.len()))
+    })?;
     events.push(if tool.server {
         Event::ServerToolUseCompleted { index, call }
     } else {
         Event::ToolCallCompleted { index, call }
     });
     Ok(())
+}
+
+/// Complete one streamed tool call the provider itself marked truncated.
+///
+/// A call whose accumulated arguments still parse as a JSON object completes
+/// normally; one left mid-fragment by the output budget is DROPPED (marked
+/// completed without a `ToolCallCompleted`), because the provider never
+/// finished it and the caller's remedy is a larger budget, not a retry of a
+/// "malformed" provider. Only a provider-declared truncation (a Chat
+/// `finish_reason == "length"` terminal, or a Responses function item whose
+/// own status is `incomplete`) may use this; every other completion keeps the
+/// strict object contract.
+fn complete_streamed_tool_truncated(
+    index: u32,
+    tool: &mut ToolAccumulator,
+    events: &mut Vec<Event>,
+) -> Result<(), Failure> {
+    let parses = tool.custom
+        || tool.raw_arguments.is_empty()
+        || require_json_object_text(&tool.raw_arguments).is_ok();
+    if parses {
+        complete_streamed_tool(index, tool, events)
+    } else {
+        tool.completed = true;
+        Ok(())
+    }
 }
 
 fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<Event>, Failure> {
@@ -281,29 +320,15 @@ fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<E
     Ok(events)
 }
 
-/// Finish open tools on a stream the provider cut off at its output budget.
-///
-/// A call whose accumulated arguments still parse as a JSON object completes
-/// normally; one left mid-fragment by the truncation is DROPPED (marked
-/// completed without a `ToolCallCompleted`), because the provider never
-/// finished it and the caller's remedy is a larger budget, not a retry of a
-/// "malformed" provider. Only the `finish_reason == "length"` terminal may use
-/// this; every other terminal keeps the strict object contract.
+/// Finish open tools on a stream the provider cut off at its output budget,
+/// applying the truncated-call contract of [`complete_streamed_tool_truncated`].
 fn finish_open_tools_truncated(
     tools: &mut BTreeMap<u32, ToolAccumulator>,
 ) -> Result<Vec<Event>, Failure> {
     let mut events = Vec::new();
     for (index, tool) in tools.iter_mut() {
-        if tool.completed {
-            continue;
-        }
-        let parses = tool.custom
-            || tool.raw_arguments.is_empty()
-            || require_json_object_text(&tool.raw_arguments).is_ok();
-        if parses {
-            complete_streamed_tool(*index, tool, &mut events)?;
-        } else {
-            tool.completed = true;
+        if !tool.completed {
+            complete_streamed_tool_truncated(*index, tool, &mut events)?;
         }
     }
     Ok(events)
