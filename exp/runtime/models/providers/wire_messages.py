@@ -179,6 +179,39 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     return items
 
 
+def _retained_cache_marked_blocks(
+    blocks: tuple[JsonObject, ...] | list[JsonObject],
+) -> list[JsonObject]:
+    """Drop empty text blocks while keeping their cache breakpoints.
+
+    The wire rejects empty text blocks, but Claude Code lands its
+    prompt-cache marker on the LAST block of a turn, which can be empty;
+    dropping the block must not drop the breakpoint or the whole prefix
+    bills uncached (the block-cache incident class). A displaced marker
+    lands on the closest retained block before it (an empty block adds no
+    bytes, so that boundary is byte-identical), or on the first retained
+    block after it when nothing precedes (a slightly wider, still valid
+    breakpoint). Adjacent duplicate markers collapse: one marker per
+    boundary suffices.
+    """
+    retained: list[JsonObject] = []
+    displaced: object | None = None
+    for block in blocks:
+        if block.get("text"):
+            kept = dict(block)
+            if displaced is not None and "cache_control" not in kept:
+                kept["cache_control"] = displaced
+            displaced = None
+            retained.append(kept)
+        elif "cache_control" in block:
+            if retained:
+                if "cache_control" not in retained[-1]:
+                    retained[-1] = {**retained[-1], "cache_control": block["cache_control"]}
+            else:
+                displaced = block["cache_control"]
+    return retained
+
+
 def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     """Emit one multimodal user turn in caller order, markers intact.
 
@@ -194,7 +227,7 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     Returns:
         The ordered Anthropic content blocks for the turn.
     """
-    marked = [block for block in message.provider_text_blocks if block.get("text")]
+    marked = _retained_cache_marked_blocks(message.provider_text_blocks)
     blocks: list[JsonObject] = []
     text_index = 0
     for part in message.content_parts:
@@ -262,11 +295,12 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # The caller's exact interleaving is preserved: an image before
             # its question reads differently from one after it.
             return "user", _anthropic_multimodal_blocks(message)
-        marked_run = [block for block in message.provider_text_blocks if block.get("text")]
+        marked_run = _retained_cache_marked_blocks(message.provider_text_blocks)
         if marked_run:
-            # The cache-marked run re-emits the caller's exact blocks (empty
-            # blocks drop loss-free: the wire rejects them and they carry
-            # nothing); the flattened content stays canonical elsewhere.
+            # The cache-marked run re-emits the caller's blocks with empty
+            # ones dropped loss-free (the wire rejects them and they carry
+            # nothing) and their breakpoints migrated to a retained
+            # neighbor; the flattened content stays canonical elsewhere.
             return "user", marked_run
         return "user", [{"type": "text", "text": message.content or ""}]
     if message.role != "assistant":

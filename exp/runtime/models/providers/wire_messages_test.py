@@ -37,6 +37,54 @@ def test_empty_text_blocks_drop_loss_free_on_the_anthropic_wire() -> None:
     _role, blocks = anthropic_blocks(marked)
     assert blocks == [{"type": "text", "text": "real", "cache_control": {"type": "ephemeral"}}]
 
+    # A breakpoint on a dropped TRAILING empty block migrates to the retained
+    # neighbor: an empty block adds no bytes, so the cache boundary is
+    # byte-identical and the prefix keeps billing cached (the block-cache
+    # incident class).
+    trailing_marker = GatewayMessage(
+        role="user",
+        content="real",
+        provider_text_blocks=(
+            {"type": "text", "text": "real"},
+            {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+        ),
+    )
+    _role, blocks = anthropic_blocks(trailing_marker)
+    assert blocks == [{"type": "text", "text": "real", "cache_control": {"type": "ephemeral"}}]
+
+    # A marker on a dropped LEADING empty block lands on the first retained
+    # block (a wider, still valid breakpoint), and never overwrites one the
+    # retained block already carries.
+    leading_marker = GatewayMessage(
+        role="user",
+        content="real",
+        provider_text_blocks=(
+            {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "real"},
+        ),
+    )
+    _role, blocks = anthropic_blocks(leading_marker)
+    assert blocks == [{"type": "text", "text": "real", "cache_control": {"type": "ephemeral"}}]
+
+    # The same migration applies on the multimodal path, where Claude Code's
+    # turn-final marker can land on an empty trailing block.
+    multimodal_marker = GatewayMessage(
+        role="user",
+        content="look",
+        content_parts=(
+            TextContentPart(text="look"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+            TextContentPart(text=""),
+        ),
+        provider_text_blocks=(
+            {"type": "text", "text": "look"},
+            {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
+        ),
+    )
+    _role, blocks = anthropic_blocks(multimodal_marker)
+    assert blocks[0] == {"type": "text", "text": "look", "cache_control": {"type": "ephemeral"}}
+    assert [block["type"] for block in blocks] == ["text", "image"]
+
     # An all-empty marked run can only exist on an all-empty turn (the model
     # requires the blocks to flatten to the content); it falls back to the
     # flattened string, and route admission refuses the whole-empty user turn
