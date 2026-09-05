@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import (
+    GatewayNamedToolChoice,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -52,6 +56,15 @@ if TYPE_CHECKING:
 
 STRICT_TOOLS_DISCLOSURE = "tools.strict->false"
 """Disclosure recorded when strict tools degrade to best-effort schemas."""
+
+FORCED_TOOL_CHOICE_DISCLOSURE = "tool_choice->auto"
+"""Disclosure recorded when a forced tool choice relaxes to ``auto`` because no
+rung can force a tool (the model rejects it by name, or a budgeted thinking
+config forbids it)."""
+
+STRICT_TOOL_SCHEMA_CLOSED_DISCLOSURE = "tools.parameters.additionalProperties->false"
+"""Disclosure recorded when strict tool schemas have their objects closed for a
+rung whose strict validator requires it."""
 
 EFFORT_DROP_DISCLOSURE = "reasoning_effort"
 """Disclosure recorded when a zero-reasoning route drops the caller effort."""
@@ -525,10 +538,15 @@ def _without_clear_thinking_edits(context_management: JsonObject) -> JsonObject 
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
-    Three coercions exist, all only here — after every rung declined the
+    Four coercions exist, all only here — after every rung declined the
     verbatim request — and all only as a disclosed substitution. Degrading
     ``strict: true`` tools to best-effort schemas weakens a correctness
-    guarantee. Dropping ``service_tier`` changes pricing and latency
+    guarantee. Relaxing a forced ``tool_choice`` to ``auto`` weakens a
+    structural guarantee the same way (the model still sees the tools and the
+    prompt, so it usually calls one, but nothing forces it); a named
+    rejection instead would fail every forced-choice request against a model
+    the provider serves fine under ``auto``. Dropping ``service_tier``
+    changes pricing and latency
     semantics, which the caller can act on only when told, so the drop is
     disclosed rather than silent. Images inside TOOL results degrade to
     placeholder text on an image-incapable route because the block is baked
@@ -562,6 +580,15 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         return RequestCoercion(
             request=request.model_copy(update={"service_tier": None}),
             disclosures=(SERVICE_TIER_DROP_DISCLOSURE,),
+        )
+    if capability == "forced_tool_choice":
+        if request.tool_choice != "required" and not isinstance(
+            request.tool_choice, GatewayNamedToolChoice
+        ):
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"tool_choice": "auto"}),
+            disclosures=(FORCED_TOOL_CHOICE_DISCLOSURE,),
         )
     if capability != "strict_tools" or not any(tool.strict for tool in request.tools):
         return None
@@ -693,6 +720,52 @@ def coerce_structured_text_schema(
             }
         ),
         disclosures=(CLOSED_SCHEMA_DISCLOSURE,),
+    )
+
+
+def coerce_strict_tool_schemas(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Close every object in each ``strict`` tool schema for a rung that needs it.
+
+    The Anthropic strict validator requires ``additionalProperties: false``
+    on every object of a strict tool's ``input_schema`` (verified live
+    2026-09-05: an absent or ``true`` value is a 400 by name), exactly as it
+    does for structured-output schemas. Closing the objects tightens the
+    input contract the caller already asked to have enforced, so it is a
+    disclosed coercion rather than a reason to drop ``strict``. Non-strict
+    tools, schemas already closed everywhere, and routes with no rung on such
+    a dialect pass through untouched.
+
+    Args:
+        profiles: Ordered wire profiles for the rungs the request will reach.
+        request: Admitted request, after generation-parameter narrowing.
+
+    Returns:
+        The disclosed substitution to dispatch, or ``None`` when nothing
+        needs closing.
+    """
+    if not any(tool.strict for tool in request.tools):
+        return None
+    if not any(
+        profile.dialect in _SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS for profile in profiles
+    ):
+        return None
+    changed_any = False
+    tools: list[GatewayToolDefinition] = []
+    for tool in request.tools:
+        if not tool.strict:
+            tools.append(tool)
+            continue
+        closed, changed = _close_schema_objects(tool.parameters)
+        changed_any = changed_any or changed
+        tools.append(tool.model_copy(update={"parameters": closed}) if changed else tool)
+    if not changed_any:
+        return None
+    return RequestCoercion(
+        request=request.model_copy(update={"tools": tuple(tools)}),
+        disclosures=(STRICT_TOOL_SCHEMA_CLOSED_DISCLOSURE,),
     )
 
 

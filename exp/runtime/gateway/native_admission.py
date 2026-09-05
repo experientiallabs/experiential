@@ -33,6 +33,7 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
     coerce_generation_parameters,
     coerce_route_rejections,
+    coerce_strict_tool_schemas,
     coerce_structured_text_schema,
 )
 from exp.runtime.models.providers.errors import (
@@ -212,18 +213,18 @@ def admitted_route_requests(
         provider_request = provider_request.model_copy(
             update={"stream": True, "include_usage": True}
         )
-    # The surviving rungs decide whether the structured-output schema needs
-    # its objects closed; a route that lost every Anthropic rung above is
-    # dispatched with the caller's schema verbatim.
-    coercion = coerce_structured_text_schema(
-        tuple(profile for profile, _client in resolved_wires),
-        admitted_request,
-    )
-    if coercion is not None:
+    # The surviving rungs decide whether the structured-output schema and the
+    # strict tool schemas need their objects closed; a route that lost every
+    # Anthropic rung above is dispatched with the caller's schemas verbatim.
+    surviving_profiles = tuple(profile for profile, _client in resolved_wires)
+    for coerce_schema in (coerce_structured_text_schema, coerce_strict_tool_schemas):
+        coercion = coerce_schema(surviving_profiles, admitted_request)
+        if coercion is None:
+            continue
         admitted_request = coercion.request
         coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
         public_request, provider_request = route_generation_parameter_requests(
-            tuple(profile for profile, _client in resolved_wires),
+            surviving_profiles,
             admitted_request,
         )
         provider_request = provider_request.model_copy(

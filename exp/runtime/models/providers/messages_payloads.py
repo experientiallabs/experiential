@@ -12,6 +12,10 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_rejects_forced_tool_choice,
+    anthropic_strict_schema_unsupported,
+)
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -49,6 +53,11 @@ def anthropic_messages_stream_payload(
         Native Messages request with streaming enabled.
 
     Raises:
+        ProviderCapabilityError: A ``strict`` tool schema uses a keyword the
+            provider's strict validator rejects (``strict_tools``), or the
+            request forces a tool the model or its thinking mode cannot force
+            (``forced_tool_choice``); both let route admission prefer a rung
+            that honors the request and otherwise coerce with disclosure.
         ProviderResponseError: Instruction or message content is malformed.
     """
     # Anthropic Messages has no compatible logprob request/response surface in
@@ -141,6 +150,13 @@ def anthropic_messages_stream_payload(
             if tool.description is not None:
                 translated["description"] = tool.description
             if tool.strict:
+                # The strict validator compiles the schema into a grammar and
+                # 400s by name on keywords it cannot express (verified live
+                # 2026-09-05: ``maxItems`` on every current model). Declining
+                # here keeps the schema intact and lets admission drop only
+                # ``strict`` when no rung can honor it.
+                if anthropic_strict_schema_unsupported(tool.parameters) is not None:
+                    raise ProviderCapabilityError(capability="strict_tools")
                 translated["strict"] = True
             # Anthropic-native tool annotations forward verbatim on this
             # wire only; the provider owns their validity rules. An absent
@@ -264,7 +280,38 @@ def anthropic_messages_stream_payload(
         payload["output_config"] = output_config
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
+    _require_forced_tool_choice_support(model_id, request, payload)
     return payload
+
+
+def _require_forced_tool_choice_support(
+    model_id: str,
+    request: GatewayRequest,
+    payload: JsonObject,
+) -> None:
+    """Decline a forced ``tool_choice`` this rung is known to reject.
+
+    Two provider rules apply (both verified live 2026-09-05). Fable 5.1 and
+    Mythos 5.1 answer ``any`` and ``tool`` with a 400 on every request, even
+    with no thinking config. Every model rejects a forced choice beside a
+    budgeted ``thinking: enabled`` config ("Thinking may not be enabled when
+    tool_choice forces tool use"), whether the caller sent that config or the
+    rung derived it from an effort; adaptive thinking carries a forced choice
+    fine. ``auto`` and ``none`` are never affected.
+
+    Raises:
+        ProviderCapabilityError: ``forced_tool_choice`` when the built payload
+            would be rejected.
+    """
+    forced = request.tool_choice == "required" or isinstance(
+        request.tool_choice, GatewayNamedToolChoice
+    )
+    if not forced:
+        return
+    thinking = payload.get("thinking")
+    budgeted_thinking = isinstance(thinking, dict) and thinking.get("type") == "enabled"
+    if budgeted_thinking or anthropic_rejects_forced_tool_choice(model_id):
+        raise ProviderCapabilityError(capability="forced_tool_choice")
 
 
 def gemini_generate_content_stream_payload(

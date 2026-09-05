@@ -71,6 +71,7 @@ _PublicErrorType = Literal[
     (
         ("developer_messages", "messages", "instructions", "system"),
         ("function_tools", "tools", "tools", "tools"),
+        ("forced_tool_choice", "tool_choice", "tool_choice", "tool_choice"),
         (
             "parallel_tool_calls",
             "parallel_tool_calls",

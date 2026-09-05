@@ -362,8 +362,27 @@ on the canonical ladder (ties prefer the lower level), ANY effort on a route wit
 support at all drops (first-party clients pin effort globally, so a named rejection made whole
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
-dropped value reaches the provider through no channel), and `strict: true` tools degrade to
-best-effort schemas. On a reasoning route that accepts sampling only at `reasoning_effort=none`
+dropped value reaches the provider through no channel), `strict: true` tools degrade to
+best-effort schemas, and a forced `tool_choice` (`required`/`any`, or a named tool) relaxes to
+`auto` as `tool_choice->auto`. Two Anthropic wire facts feed those last two
+(`exp/runtime/models/providers/anthropic_tool_compat.py`, verified live 2026-09-05): Claude Fable
+5.1 and Mythos 5.1 answer a forced choice with a 400 by name on every request, and every model
+rejects a forced choice beside a budgeted `thinking: enabled` config, so the Anthropic builder
+declines those requests as `forced_tool_choice` before dispatch (narrowing prefers a rung that can
+force a tool, such as an aggregator rung of the same alias, and keeps the caller's selector
+verbatim there); and the strict validator compiles tool schemas into a grammar and 400s by name on
+keywords it cannot express (`maxItems`, `oneOf`, `minimum`, an unsupported `format`, a recursive
+`$ref`, ...), so a strict tool using one is declined as `strict_tools` on Anthropic rungs, which
+narrows to a strict-capable rung when the route has one and otherwise drops only `strict`, never
+a schema keyword. The same validator requires `additionalProperties: false` on every object, so
+strict tool schemas reaching an Anthropic rung have their objects closed with the
+`tools.parameters.additionalProperties->false` disclosure, exactly like structured-output schemas.
+The `capability_parity` row reports the per-release forced-choice fact as
+`supports_forced_tool_choice`. On the OpenAI-compatible Chat Completions wire a canonical
+`developer` message is emitted as `system` without disclosure: OpenAI defines the two roles
+identically (developer-provided instructions the model follows regardless of user messages),
+while the third-party servers behind that dialect enumerate only the classic roles and reject
+`developer` by name; the native Responses wire keeps the role it defines. On a reasoning route that accepts sampling only at `reasoning_effort=none`
 (`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
 reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the

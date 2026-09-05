@@ -934,3 +934,68 @@ def test_the_thinking_coercion_leaves_anthropic_bearing_routes_alone() -> None:
         ),
     )
     assert coerce_generation_parameters((_openai_reasoning_profile(),), with_blocks) is None
+
+
+def test_forced_tool_choice_relaxes_to_auto_only_as_a_disclosed_coercion() -> None:
+    """``required`` and a named tool relax to ``auto`` with the drop disclosed."""
+    from exp.runtime.gateway.contracts import GatewayNamedToolChoice
+
+    tools = (GatewayToolDefinition(name="lookup", parameters={"type": "object"}),)
+    for forced in ("required", GatewayNamedToolChoice(name="lookup")):
+        coercion = coerce_capability(
+            "forced_tool_choice", _request(tools=tools, tool_choice=forced)
+        )
+        assert coercion is not None
+        assert coercion.request.tool_choice == "auto"
+        assert coercion.request.tools == tools
+        assert coercion.disclosures == ("tool_choice->auto",)
+    # Nothing to relax on an open or absent selector.
+    for open_choice in ("auto", "none", None):
+        assert (
+            coerce_capability("forced_tool_choice", _request(tools=tools, tool_choice=open_choice))
+            is None
+        )
+
+
+def test_strict_tool_schemas_close_their_objects_for_a_closing_dialect() -> None:
+    """Strict tool objects gain ``additionalProperties: false`` on an Anthropic
+    route (the strict validator requires it, live 2026-09-05); non-strict tools,
+    already-closed schemas, and routes with no such rung are left alone."""
+    from exp.runtime.models.providers.capability_policy import coerce_strict_tool_schemas
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    shim = GatewayWireProfile(dialect="openai_compatible", url="https://shim.test")
+    open_schema: JsonObject = {
+        "type": "object",
+        "properties": {"inner": {"type": "object", "properties": {"x": {"type": "string"}}}},
+    }
+    request = _request(
+        tools=(
+            GatewayToolDefinition(name="strict", parameters=open_schema, strict=True),
+            GatewayToolDefinition(name="plain", parameters=open_schema),
+        )
+    )
+    coercion = coerce_strict_tool_schemas((anthropic, shim), request)
+    assert coercion is not None
+    assert coercion.disclosures == ("tools.parameters.additionalProperties->false",)
+    strict_tool, plain_tool = coercion.request.tools
+    assert strict_tool.strict is True
+    assert strict_tool.parameters == {
+        "type": "object",
+        "properties": {
+            "inner": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "additionalProperties": False,
+            }
+        },
+        "additionalProperties": False,
+    }
+    assert plain_tool.parameters == open_schema
+    # The original request is never mutated in place.
+    assert request.tools[0].parameters == open_schema
+
+    assert coerce_strict_tool_schemas((shim,), request) is None
+    closed_request = coercion.request
+    assert coerce_strict_tool_schemas((anthropic,), closed_request) is None
+    assert coerce_strict_tool_schemas((anthropic,), _request()) is None

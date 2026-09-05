@@ -422,6 +422,19 @@ def openai_chat_message(
 ) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON.
 
+    A canonical ``developer`` message is emitted as ``system`` on this wire.
+    OpenAI's Chat Completions reference gives the two roles one definition
+    ("Developer-provided instructions that the model should follow, regardless
+    of messages sent by the user"), distinguished only by the model generation
+    each was introduced for (``developer`` replaces ``system`` from o1 on, and
+    those models accept ``system`` by converting it), so the fold is lossless
+    and needs no disclosure. It applies to every provider on the Chat wire
+    because this dialect never carries direct OpenAI traffic (that is the
+    Responses dialect) and the third-party OpenAI-compatible servers behind
+    it (Azure AI Foundry, DeepSeek, vLLM, and the like) enumerate the classic
+    roles only and 400 on ``developer`` by name. The Responses builder keeps
+    ``developer`` verbatim, since that wire defines the role.
+
     ``reasoning_route_sha256`` is the active preserved-thinking route identity
     for this rung (Fireworks or Hunyuan); an unsealed ``reasoning_content``
     block forwards to the provider only when it names that exact route.
@@ -442,7 +455,7 @@ def openai_chat_message(
             tool_payload["name"] = message.provider_tool_name
         return tool_payload
     payload: JsonObject = {
-        "role": message.role,
+        "role": "system" if message.role == "developer" else message.role,
         "content": (
             [
                 {"type": "text", "text": part.text}
