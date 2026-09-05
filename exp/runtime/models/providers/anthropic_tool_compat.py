@@ -17,16 +17,24 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 
-# Exact point releases, NOT generation prefixes: the provider's tool-use
-# documentation names "Claude Fable 5.1 and Claude Mythos 5.1" as the models
-# whose `any`/`tool` selectors return a 400 (verified live 2026-09-05: fable-5-1
-# rejects with and without a thinking config, while fable-5, opus-5, sonnet-5,
-# opus-4-8, sonnet-4-6, sonnet-4-5, and haiku-4-5 all accept `any` and `tool`).
-# A dated snapshot id (`claude-fable-5-1-20260901`) inherits its release's rule.
 _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES = (
     "claude-fable-5-1",
     "claude-mythos-5-1",
 )
+"""Exact point releases whose ``tool_choice`` ``any``/``tool`` return a 400 by name.
+
+The provider's tool-use documentation ("Forcing tool use") states two rules:
+(1) "Claude Fable 5.1 and Claude Mythos 5.1: ``any`` and ``tool`` return a 400
+error", and (2) "Manual extended thinking (``thinking: {type: enabled}``):
+``any`` and ``tool`` are not supported ... Adaptive thinking supports forced
+tool use". Rule (1) is this table; rule (2) is a per-request check in the
+Anthropic payload builder. Verified live 2026-09-05: fable-5-1 rejects with no
+thinking config and under adaptive thinking, while fable-5, opus-5, sonnet-5,
+opus-4-8, sonnet-4-6, sonnet-4-5, and haiku-4-5 all accept ``any`` and ``tool``.
+Entries are therefore exact RELEASES, never generation prefixes: a new point
+release (claude-fable-5-2) matches nothing here and must be probed live and
+added deliberately, not assumed from its generation. A dated snapshot id
+(``claude-fable-5-1-20260901``) inherits its release's rule."""
 
 
 def anthropic_rejects_forced_tool_choice(model_id: str) -> bool:
