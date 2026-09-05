@@ -625,8 +625,7 @@ def route_generation_parameter_requests(
             (
                 "messages.tool_results.attribution->dropped(unsupported_by_provider)",
                 any(
-                    message.provider_tool_name is not None
-                    or message.provider_tool_namespace is not None
+                    message.provider_tool_namespace is not None
                     or message.provider_tool_caller is not None
                     for message in request.messages
                 ),
@@ -635,6 +634,16 @@ def route_generation_parameter_requests(
         for path, present in attribution_paths:
             if present and path not in ignored:
                 ignored.append(path)
+
+    # The legacy tool-result name has a slot on BOTH OpenAI wires (Chat tool
+    # messages and Responses function_call_output), so it drops with
+    # disclosure only when some rung is on neither.
+    if any(message.provider_tool_name is not None for message in request.messages) and not all(
+        profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
+    ):
+        name_path = "messages.tool_results.name->dropped(unsupported_by_provider)"
+        if name_path not in ignored:
+            ignored.append(name_path)
 
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.

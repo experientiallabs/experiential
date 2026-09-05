@@ -4289,3 +4289,56 @@ def test_chat_surface_sub_16_output_ceiling_rides_the_openai_floor() -> None:
     public, provider = route_generation_parameter_requests((responses,), completion_request)
     assert provider.maximum_output_tokens == 16
     assert "max_completion_tokens->16" in public.ignored_parameters
+
+
+def test_a_tool_result_name_is_undisclosed_on_openai_wire_routes() -> None:
+    """Both OpenAI wires carry the legacy tool-result name; nothing drops."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="ok",
+                provider_tool_name="read_file",
+            ),
+        ),
+    )
+    profiles = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://c.test"),
+        GatewayWireProfile(dialect="openai_responses", url="https://r.test"),
+    )
+
+    public_request, _provider = route_generation_parameter_requests(profiles, request)
+
+    assert not any("tool_results" in path for path in public_request.ignored_parameters)
+
+
+def test_a_tool_result_name_drops_with_disclosure_off_the_openai_wires() -> None:
+    """A rung with no name slot (Anthropic tool_result) discloses the drop."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="ok",
+                provider_tool_name="read_file",
+            ),
+        ),
+    )
+    profiles = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://c.test"),
+        GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),
+    )
+
+    public_request, _provider = route_generation_parameter_requests(profiles, request)
+
+    assert (
+        "messages.tool_results.name->dropped(unsupported_by_provider)"
+        in public_request.ignored_parameters
+    )
+    # Namespace/caller attribution stays a Responses-only concern.
+    assert not any("attribution" in path for path in public_request.ignored_parameters)

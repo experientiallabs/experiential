@@ -262,6 +262,16 @@ class _Message(_WireModel):
     content: str | tuple[_ContentPart, ...] | None = None
     tool_calls: tuple[_AssistantToolCall, ...] | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    """Tool function name on a ``role: "tool"`` message.
+
+    The legacy ``role: "function"`` attribution many agent frameworks
+    (hermes-agent among them) still send on every tool result; the provider
+    serves it (probed live 2026-09-05, api.openai.com), and the field is
+    baked into caller history, so rejecting it wedges whole sessions. It
+    round-trips verbatim on OpenAI-family wires and drops with disclosure
+    elsewhere. Other roles keep the named rejection.
+    """
     refusal: None = None
     annotations: tuple[()] | None = None
     audio: None = None
@@ -298,6 +308,8 @@ class _Message(_WireModel):
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "tool" and self.name is not None:
+            raise ValueError("name is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
