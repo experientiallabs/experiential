@@ -139,11 +139,14 @@ const MAXIMUM_STREAM_ERROR_DETAIL_CHARS: usize = 240;
 /// the mechanism only inside that frame; dropping it left every such kill an
 /// undiagnosable "provider stream failed" (2026-09-05: gpt-6-astra streams
 /// dying ~120ms post-dispatch with the reason discarded). The code reduces
-/// to an identifier-shaped token and the message to one bounded line (cut at
-/// the first control character, whitespace collapsed). This detail is
-/// attached only to failure classes that never relay `provider_detail` to
-/// callers (the stream-failure family), so it reaches the ledger and alert
-/// samples without widening the caller-facing sanitization boundary.
+/// to an identifier-shaped token; the message reduces to one bounded line
+/// (cut at the first control character, whitespace collapsed) and is then
+/// held to the same identifier screen the caller-facing attribution path
+/// uses, so a sentence naming request-specific or infrastructure handles
+/// drops while its code token survives. The detail is attached only to
+/// failure classes that never relay `provider_detail` to callers (the
+/// stream-failure family), so it reaches the ledger and alert samples
+/// without widening the caller-facing sanitization boundary.
 fn provider_error_detail(code: Option<&str>, message: Option<&str>) -> Option<String> {
     let code = code
         .filter(|value| !value.is_empty())
@@ -154,7 +157,11 @@ fn provider_error_detail(code: Option<&str>, message: Option<&str>) -> Option<St
             .take_while(|character| !character.is_control())
             .collect();
         let collapsed = cut.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!collapsed.is_empty()).then_some(collapsed)
+        (!collapsed.is_empty()
+            && !collapsed
+                .split(' ')
+                .any(|word| crate::param_attribution::carries_provider_identifier(word, &[])))
+        .then_some(collapsed)
     });
     let detail = match (code, line) {
         (None, None) => return None,
@@ -821,9 +828,12 @@ mod stream_error_detail_tests {
                 "sequence_number": 1,
             })))
             .expect("error frame normalizes");
+        // The model id trips the identifier screen (letters+digits label), so
+        // the sentence drops while the code token survives: the mechanism
+        // stays named without relaying a label-shaped word to the ledger.
         assert_eq!(
             failed_detail(&events).as_deref(),
-            Some("rate_limit_exceeded: Rate limit reached for gpt-6-astra.")
+            Some("rate_limit_exceeded")
         );
     }
 

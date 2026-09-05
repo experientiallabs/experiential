@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::{malformed, parse_object, provider_stream_failed, refusal_failure, Normalizer};
+use super::{malformed, parse_object, refusal_failure, Normalizer};
 use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
