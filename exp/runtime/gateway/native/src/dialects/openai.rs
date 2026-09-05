@@ -869,3 +869,7 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "openai/hosted_tests.rs"]
 mod hosted_tests;
+
+#[cfg(test)]
+#[path = "openai/truncation_tests.rs"]
+mod truncation_tests;
