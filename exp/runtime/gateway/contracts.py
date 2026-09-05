@@ -246,6 +246,11 @@ class GatewayMessage(ContractModel):
     (mirroring ``ToolCall.provider_namespace`` on the call side) and are
     excluded from serialization like the other replay carriers, joining
     replay identity explicitly through :func:`canonical_request_sha256`.
+    ``provider_tool_name`` also carries the Chat surface's legacy
+    ``role: "tool"`` ``name`` (the old ``role: "function"`` attribution many
+    agent frameworks still send; the provider serves it, probed live
+    2026-09-05), re-emitted on both OpenAI wires and dropped with disclosure
+    elsewhere.
     """
     provider_tool_caller: JsonObject | None = Field(default=None, exclude=True)
     """Opaque SDK 3.0 ``caller`` attribution on a ``function_call_output``.

@@ -3398,3 +3398,103 @@ def test_a_custom_tool_call_output_list_carries_verbatim() -> None:
     )
     native = decoded.request.messages[-1].provider_native_item
     assert native is not None and native["output"] == output_value
+
+
+def test_a_tool_message_name_round_trips_on_both_openai_wires() -> None:
+    """The legacy role:"function" name on a tool result serves instead of a 400.
+
+    hermes-agent (and other agent frameworks) sends name:"<function>" on
+    every tool-result message; the provider serves the shape (probed live
+    2026-09-05), and the field is baked into history, so the previous
+    "Invalid value for 'messages.N.name'" rejection wedged every session on
+    its first tool call.
+    """
+    from exp.runtime.models.providers.streaming_requests import (
+        openai_compatible_stream_payload,
+        openai_responses_stream_payload,
+    )
+
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_probe1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_probe1",
+                    "name": "read_file",
+                    "content": "contents",
+                },
+            ],
+        }
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.provider_tool_name == "read_file"
+
+    chat_payload = openai_compatible_stream_payload("chat-fixture", decoded.request)
+    chat_messages = cast(list[JsonObject], chat_payload["messages"])
+    assert chat_messages[-1] == {
+        "role": "tool",
+        "content": "contents",
+        "tool_call_id": "call_probe1",
+        "name": "read_file",
+    }
+
+    responses_payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    responses_input = cast(list[JsonObject], responses_payload["input"])
+    assert responses_input[-1]["name"] == "read_file"
+
+
+def test_a_name_free_tool_message_keeps_its_exact_chat_wire_shape() -> None:
+    """Histories without the legacy attribution re-emit byte-identically."""
+    from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
+
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            ],
+        }
+    )
+    assert decoded.request.messages[-1].provider_tool_name is None
+    chat_payload = openai_compatible_stream_payload("chat-fixture", decoded.request)
+    chat_messages = cast(list[JsonObject], chat_payload["messages"])
+    assert chat_messages[-1] == {"role": "tool", "content": "ok", "tool_call_id": "call_1"}
+
+
+def test_a_name_on_a_non_tool_message_stays_a_named_400() -> None:
+    """The participant-name field on other roles keeps the explicit rejection."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi", "name": "alice"}],
+            }
+        )
+    assert error.value.status_code == 400
+    assert error.value.detail.param == "messages.0"
+    assert "name is valid only for tool messages" in str(error.value.detail.message)

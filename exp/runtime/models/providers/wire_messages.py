@@ -430,11 +430,17 @@ def openai_chat_message(
     other rung omits that block, which route narrowing already disclosed.
     """
     if message.role == "tool":
-        return {
+        tool_payload: JsonObject = {
             "role": "tool",
             "content": message.folded_tool_error_content(),
             "tool_call_id": message.tool_call_id or "",
         }
+        # Legacy tool-result name attribution round-trips on the OpenAI
+        # wires: present stays present (the provider serves it) and absent
+        # stays absent, so name-free histories keep their exact wire bytes.
+        if message.provider_tool_name is not None:
+            tool_payload["name"] = message.provider_tool_name
+        return tool_payload
     payload: JsonObject = {
         "role": message.role,
         "content": (
