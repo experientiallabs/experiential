@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::{
     complete_streamed_tool, finish_open_tools, malformed, optional_text, parse_object,
-    provider_stream_failed, refusal_failure, Normalizer,
+    refusal_failure, Normalizer,
 };
 use crate::encode::compact_json;
 use crate::errors::Failure;
@@ -82,6 +82,7 @@ impl Normalizer {
                             call_id,
                             name,
                             namespace: None,
+                            caller: None,
                         });
                     }
                     Some("server_tool_use") => {
@@ -303,7 +304,20 @@ impl Normalizer {
                 }
             }
             "error" => {
-                events.push(Event::Failed(provider_stream_failed()));
+                // The provider names its failure mechanism only inside this
+                // frame; the bounded detail rides the failure into the ledger.
+                let (code, message) = match payload.get("error").and_then(Value::as_object) {
+                    Some(error) => (
+                        error.get("type").and_then(Value::as_str),
+                        error.get("message").and_then(Value::as_str),
+                    ),
+                    None => (None, None),
+                };
+                events.push(Event::Failed(super::provider_stream_failed_with_detail(
+                    "anthropic_messages",
+                    code,
+                    message,
+                )));
             }
             "ping" => {}
             _ => {

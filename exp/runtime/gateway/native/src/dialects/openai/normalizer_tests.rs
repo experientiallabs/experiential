@@ -715,3 +715,121 @@ fn a_function_call_namespace_changed_at_completion_is_malformed() {
         .safe_message
         .contains("changed identity at completion"));
 }
+
+#[test]
+fn a_caller_attributed_function_call_round_trips_caller_through_the_stream() {
+    // SDK 3.0 programmatic tool calling attributes a function call to the
+    // program that invoked it via an opaque `caller` object; the item must
+    // replay exactly as emitted, so the object survives normalization
+    // verbatim.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let caller = serde_json::json!({"type": "program", "id": "prog_1"});
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "in_progress",
+                "call_id": "call_live", "name": "lookup",
+                "caller": caller, "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&added)
+        .expect("caller-attributed start must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ProviderOutputItemStarted { .. },
+            Event::ToolCallStarted { name, caller: Some(value), .. },
+        ] if name == "lookup" && *value == caller
+    ));
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "completed",
+                "call_id": "call_live", "name": "lookup",
+                "caller": caller, "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&item_done)
+        .expect("caller-attributed completion must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ToolArgumentsDelta { .. },
+            Event::ProviderOutputItemCompleted { .. },
+            Event::ToolCallCompleted { call, .. },
+        ] if call.caller.as_ref() == Some(&caller)
+    ));
+}
+
+#[test]
+fn a_function_call_caller_changed_at_completion_is_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "lookup",
+                "caller": {"type": "program", "id": "prog_1"}, "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    normalizer.feed(&added).expect("start must normalize");
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "completed",
+                "call_id": "call_live", "name": "lookup",
+                "caller": {"type": "program", "id": "prog_2"}, "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let failure = normalizer
+        .feed(&item_done)
+        .expect_err("a caller changed at completion is malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+}
+
+#[test]
+fn a_non_object_function_call_caller_is_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "lookup",
+                "caller": "program", "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    let failure = normalizer
+        .feed(&added)
+        .expect_err("a non-object caller is malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+}

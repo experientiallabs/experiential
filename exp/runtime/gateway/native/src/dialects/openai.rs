@@ -4,13 +4,14 @@
 use serde_json::Value;
 
 use super::{
-    bounded_wire_token, complete_streamed_tool, finish_open_tools, finish_open_tools_truncated,
-    malformed, optional_text, parse_object, provider_stream_failed, refusal_failure, Normalizer,
+    bounded_wire_token, complete_streamed_tool, finish_open_tools, malformed, optional_text,
+    parse_object, provider_error_detail, provider_stream_failed_with_detail, refusal_failure,
+    Normalizer,
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
-    openai_compatible_usage, openai_usage, require_bounded_string, require_string, require_u64,
-    Event, ProviderAssistantMessagePhase, ProviderOutputItemKind, ProviderOutputItemStatus,
+    openai_usage, require_bounded_string, require_string, require_u64, Event,
+    ProviderAssistantMessagePhase, ProviderOutputItemKind, ProviderOutputItemStatus,
     ToolAccumulator,
 };
 
@@ -36,6 +37,17 @@ fn optional_openai_identity(
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(_) => openai_identity(object, key, label).map(Some),
+    }
+}
+
+fn optional_openai_caller(
+    object: &serde_json::Map<String, Value>,
+    label: &str,
+) -> Result<Option<Value>, Failure> {
+    match object.get("caller") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value @ Value::Object(_)) => Ok(Some(value.clone())),
+        Some(_) => Err(malformed(&format!("{label} must be an object"))),
     }
 }
 
@@ -297,6 +309,7 @@ impl Normalizer {
                         "namespace",
                         "OpenAI function call namespace",
                     )?;
+                    let caller = optional_openai_caller(item, "OpenAI function call caller")?;
                     let item_id =
                         optional_openai_identity(item, "id", "OpenAI function call item ID")?;
                     if !self.bind_openai_output_item(
@@ -309,6 +322,7 @@ impl Normalizer {
                     self.reserve_tool_entry(index)?;
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
                     tool.namespace = namespace.clone();
+                    tool.caller = caller.clone();
                     tool.provider_item_id = item_id.clone();
                     tool.provider_status = status;
                     events.push(Event::ProviderOutputItemStarted {
@@ -323,6 +337,7 @@ impl Normalizer {
                         call_id,
                         name,
                         namespace,
+                        caller,
                     });
                     if let Some(Value::String(initial)) = item.get("arguments") {
                         if !initial.is_empty() {
@@ -358,6 +373,7 @@ impl Normalizer {
                         "namespace",
                         "OpenAI custom tool call namespace",
                     )?;
+                    let caller = optional_openai_caller(item, "OpenAI custom tool call caller")?;
                     let item_id =
                         optional_openai_identity(item, "id", "OpenAI custom tool call item ID")?;
                     if !self.bind_openai_output_item(
@@ -371,6 +387,7 @@ impl Normalizer {
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
                     tool.custom = true;
                     tool.namespace = namespace.clone();
+                    tool.caller = caller.clone();
                     tool.provider_item_id = item_id.clone();
                     tool.provider_status = status;
                     events.push(Event::ProviderOutputItemStarted {
@@ -385,6 +402,7 @@ impl Normalizer {
                         call_id,
                         name,
                         namespace,
+                        caller,
                     });
                     if let Some(Value::String(initial)) = item.get("input") {
                         if !initial.is_empty() {
@@ -601,6 +619,7 @@ impl Normalizer {
                             "namespace",
                             "OpenAI function call namespace",
                         )?;
+                        let caller = optional_openai_caller(item, "OpenAI function call caller")?;
                         let arguments =
                             require_string(item, "arguments", "OpenAI function call arguments")
                                 .map_err(|message| malformed(&message))?;
@@ -611,6 +630,7 @@ impl Normalizer {
                             || tool.call_id != call_id
                             || tool.name != name
                             || tool.namespace != namespace
+                            || tool.caller != caller
                         {
                             return Err(malformed(
                                 "OpenAI function call changed identity at completion",
@@ -650,6 +670,8 @@ impl Normalizer {
                             "namespace",
                             "OpenAI custom tool call namespace",
                         )?;
+                        let caller =
+                            optional_openai_caller(item, "OpenAI custom tool call caller")?;
                         let input = require_string(item, "input", "OpenAI custom tool call input")
                             .map_err(|message| malformed(&message))?;
                         let tool = self.tools.get(&index).ok_or_else(|| {
@@ -660,6 +682,7 @@ impl Normalizer {
                             || tool.call_id != call_id
                             || tool.name != name
                             || tool.namespace != namespace
+                            || tool.caller != caller
                         {
                             return Err(malformed(
                                 "OpenAI custom tool call changed identity at completion",
@@ -748,12 +771,15 @@ impl Normalizer {
                     } else if reason == "content_filter" || reason == "safety" {
                         events.push(Event::Failed(refusal_failure()));
                     } else {
+                        // The undocumented reason is the only diagnostic this
+                        // terminal carries; it rides as the bounded detail.
                         events.push(Event::Failed(
                             Failure::new(
                                 FailureClass::ProviderInternal,
                                 "provider ended the stream incompletely",
                             )
-                            .with_retry(true, true),
+                            .with_retry(true, true)
+                            .with_provider_detail(provider_error_detail(Some(reason), None)),
                         ));
                     }
                 }
@@ -761,22 +787,40 @@ impl Normalizer {
             "response.failed" => {
                 // A failed terminal still reports the usage the provider
                 // billed for the processed legs; fold it so settlement
-                // accounts the charged tokens instead of zero.
+                // accounts the charged tokens instead of zero. Its error
+                // object names the mechanism, so a bounded detail rides the
+                // failure into the ledger (2026-09-05: gpt-6-astra kills
+                // ~120ms post-dispatch were undiagnosable without it).
+                let mut code = None;
+                let mut message = None;
                 if let Some(response) = payload.get("response").and_then(Value::as_object) {
                     if let Some(usage) = openai_usage(response.get("usage"))
                         .map_err(|message| malformed(&message))?
                     {
                         events.push(Event::Usage(usage));
                     }
+                    if let Some(error) = response.get("error").and_then(Value::as_object) {
+                        code = error.get("code").and_then(Value::as_str);
+                        message = error.get("message").and_then(Value::as_str);
+                    }
                 }
-                events.push(Event::Failed(provider_stream_failed()));
+                events.push(Event::Failed(provider_stream_failed_with_detail(
+                    "openai_responses",
+                    code,
+                    message,
+                )));
             }
             "error" => {
                 // The in-stream error frame is the provider declaring its own
                 // failure mid-stream, mirroring the Anthropic dialect's error
                 // event: provider_internal (retry, then fail over), never a
-                // stream that "ended without a terminal event".
-                events.push(Event::Failed(provider_stream_failed()));
+                // stream that "ended without a terminal event". Its code and
+                // message ride the failure as the bounded ledger detail.
+                events.push(Event::Failed(provider_stream_failed_with_detail(
+                    "openai_responses",
+                    payload.get("code").and_then(Value::as_str),
+                    payload.get("message").and_then(Value::as_str),
+                )));
             }
             other if is_openai_hosted_progress_event(other) => {
                 events.extend(self.openai_hosted_progress(other, &payload)?);
@@ -785,179 +829,9 @@ impl Normalizer {
         }
         Ok(events)
     }
-
-    pub(super) fn feed_openai_compatible(
-        &mut self,
-        frame: &crate::sse::SseEvent,
-    ) -> Result<Vec<Event>, Failure> {
-        if frame.data == "[DONE]" {
-            let finish = self.finish_reason.as_deref();
-            // A tool call cut off by the output budget (finish_reason=length,
-            // arguments still an open JSON fragment) is the provider's honest
-            // truncation, not a malformed stream: it surfaces as Incomplete
-            // with the truncated call dropped, exactly what the caller must
-            // act on (raise max_tokens), never as a 502. Live shape: Tencent
-            // TokenHub glm-5.3 at max_tokens=32 streamed `{"` + `city` then
-            // finished with length (staging, 2026-09-03). Any other finish
-            // keeps the strict contract: unparsable arguments are malformed.
-            let mut events = if finish == Some("length") {
-                finish_open_tools_truncated(&mut self.tools)?
-            } else {
-                finish_open_tools(&mut self.tools)?
-            };
-            if let Some(usage) = self.usage.take() {
-                events.push(Event::Usage(usage));
-            }
-            if self.refusal_seen || matches!(finish, Some("content_filter" | "safety")) {
-                events.push(Event::Failed(refusal_failure()));
-            } else if finish == Some("length") {
-                events.push(Event::Incomplete);
-            } else {
-                events.push(Event::Completed);
-            }
-            return Ok(events);
-        }
-        let payload = parse_object(&frame.data)?;
-        if payload.get("error").is_some_and(|value| !value.is_null()) {
-            return Ok(vec![Event::Failed(provider_stream_failed())]);
-        }
-        let mut events = Vec::new();
-        if let Some(raw_usage) = payload.get("usage") {
-            if !raw_usage.is_null() {
-                self.usage = Some(
-                    openai_compatible_usage(raw_usage).map_err(|message| malformed(&message))?,
-                );
-            }
-        }
-        let choices = payload
-            .get("choices")
-            .and_then(Value::as_array)
-            .ok_or_else(|| malformed("OpenAI-compatible choices must be an array"))?;
-        if choices.is_empty() {
-            return Ok(events);
-        }
-        if choices.len() != 1 {
-            return Err(malformed(
-                "OpenAI-compatible stream must contain one choice",
-            ));
-        }
-        let choice = choices[0]
-            .as_object()
-            .ok_or_else(|| malformed("OpenAI-compatible choice must be an object"))?;
-        let delta = choice
-            .get("delta")
-            .and_then(Value::as_object)
-            .ok_or_else(|| malformed("OpenAI-compatible delta must be an object"))?;
-        if let Some(Value::String(content)) = delta.get("content") {
-            if !content.is_empty() {
-                events.push(Event::TextDelta(content.clone()));
-            }
-        }
-        if let Some(Value::String(refusal)) = delta.get("refusal") {
-            self.refusal_seen = true;
-            events.push(Event::RefusalDelta(refusal.clone()));
-        }
-        if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
-            if let Some(value) = delta.get("reasoning_content") {
-                let reasoning = match value {
-                    Value::Null => None,
-                    Value::String(text) => Some(text),
-                    _ => return Err(malformed("Fireworks reasoning_content delta must be text")),
-                };
-                if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-                    self.reserve_summary_bytes(reasoning.len())?;
-                    events.push(Event::ReasoningContentDelta {
-                        route_sha256,
-                        delta: reasoning.clone(),
-                    });
-                }
-            }
-        }
-        if let Some(raw_tools) = delta.get("tool_calls") {
-            if !raw_tools.is_null() {
-                let items = raw_tools
-                    .as_array()
-                    .ok_or_else(|| malformed("OpenAI-compatible tool_calls must be an array"))?;
-                for value in items {
-                    let item = value.as_object().ok_or_else(|| {
-                        malformed("OpenAI-compatible tool call must be an object")
-                    })?;
-                    let index = require_u64(item, "index", "OpenAI-compatible tool index")
-                        .map_err(|message| malformed(&message))?
-                        as u32;
-                    let function =
-                        item.get("function")
-                            .and_then(Value::as_object)
-                            .ok_or_else(|| {
-                                malformed("OpenAI-compatible tool function must be an object")
-                            })?;
-                    if let Some(tool) = self.tools.get(&index) {
-                        // An identity is only restated when it is non-empty:
-                        // DashScope (Qwen) argument deltas carry `"id": ""`
-                        // (documented shape, live 2026-09-03), and an empty
-                        // placeholder names nothing, so only a different
-                        // NON-EMPTY id or name is a stream that changed identity.
-                        if let Some(Value::String(repeated_id)) = item.get("id") {
-                            if !repeated_id.is_empty() && repeated_id != &tool.call_id {
-                                return Err(malformed(
-                                    "OpenAI-compatible stream changed a tool-call ID",
-                                ));
-                            }
-                        }
-                        if let Some(Value::String(repeated_name)) = function.get("name") {
-                            if !repeated_name.is_empty() && repeated_name != &tool.name {
-                                return Err(malformed(
-                                    "OpenAI-compatible stream changed a tool-call name",
-                                ));
-                            }
-                        }
-                    } else {
-                        let call_id = require_string(item, "id", "OpenAI-compatible tool ID")
-                            .map_err(|message| malformed(&message))?;
-                        let name = require_string(function, "name", "OpenAI-compatible tool name")
-                            .map_err(|message| malformed(&message))?;
-                        self.reserve_tool_entry(index)?;
-                        self.tools
-                            .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
-                        events.push(Event::ToolCallStarted {
-                            index,
-                            call_id,
-                            name,
-                            namespace: None,
-                        });
-                    }
-                    if let Some(fragment) = function.get("arguments") {
-                        if !fragment.is_null() {
-                            let raw_fragment = match fragment {
-                                Value::String(text) => text.clone(),
-                                _ => {
-                                    return Err(malformed(
-                                        "OpenAI-compatible argument delta must be text",
-                                    ))
-                                }
-                            };
-                            self.reserve_tool_bytes(raw_fragment.len())?;
-                            let tool = self.tools.get_mut(&index).expect("tool just ensured");
-                            tool.raw_arguments.push_str(&raw_fragment);
-                            events.push(Event::ToolArgumentsDelta {
-                                index,
-                                delta: raw_fragment,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(Value::String(finish)) = choice.get("finish_reason") {
-            self.finish_reason = Some(finish.clone());
-            if matches!(finish.as_str(), "content_filter" | "safety") && !self.refusal_seen {
-                self.refusal_seen = true;
-                events.push(Event::RefusalDelta(String::new()));
-            }
-        }
-        Ok(events)
-    }
 }
+
+mod compatible;
 
 #[cfg(test)]
 #[path = "openai/normalizer_tests.rs"]

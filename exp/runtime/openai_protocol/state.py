@@ -398,6 +398,7 @@ class ContinuationState(ContractModel):
                     and call.provider_output_index is None
                     and call.provider_status is None
                     and call.provider_namespace is None
+                    and call.provider_caller is None
                 ):
                     continue
                 retained_call: dict[str, object] = {
@@ -409,6 +410,8 @@ class ContinuationState(ContractModel):
                 }
                 if call.provider_namespace is not None:
                     retained_call["provider_namespace"] = call.provider_namespace
+                if call.provider_caller is not None:
+                    retained_call["provider_caller"] = call.provider_caller
                 retained_calls.append(retained_call)
             if retained_calls:
                 authority["tool_calls"] = retained_calls
@@ -418,6 +421,8 @@ class ContinuationState(ContractModel):
                 authority["provider_tool_name"] = message.provider_tool_name
             if message.provider_tool_namespace is not None:
                 authority["provider_tool_namespace"] = message.provider_tool_namespace
+            if message.provider_tool_caller is not None:
+                authority["provider_tool_caller"] = message.provider_tool_caller
             if len(authority) > 1:
                 replay_authority.append(authority)
         if replay_authority:

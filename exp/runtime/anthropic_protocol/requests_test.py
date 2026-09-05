@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 from pydantic import JsonValue
 
@@ -14,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -1544,3 +1547,169 @@ def test_a_screenshot_history_beyond_twenty_images_still_decodes() -> None:
 
     with pytest.raises(OpenAIProtocolError, match="at most 100 images"):
         decode_messages(_body(messages=[{"role": "user", "content": [image_block] * 101}]))
+
+
+def _openai_reasoning_profile() -> GatewayWireProfile:
+    """Return one OpenAI Responses profile with the standard effort ladder."""
+    return GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://api.openai.com/v1/responses",
+        model_id="gpt-5.6-sol",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+    )
+
+
+def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
+    """The Messages thinking channel translates end to end, disclosed.
+
+    Driven through the real /v1/messages decode surface and the admission
+    sequence: route shaping still rejects the config by name, the coercion
+    layer translates it, and the coerced request reaches the OpenAI payload
+    as a reasoning effort.
+    """
+    import pytest as _pytest
+
+    from exp.runtime.models.providers.capability_policy import coerce_generation_parameters
+    from exp.runtime.models.providers.errors import ProviderParameterError
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    decoded = decode_messages(
+        _body(
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "enabled", "budget_tokens": 8192},
+        )
+    )
+    profile = _openai_reasoning_profile()
+    with _pytest.raises(ProviderParameterError, match="thinking"):
+        route_generation_parameter_requests((profile,), decoded.request)
+
+    coercion = coerce_generation_parameters((profile,), decoded.request)
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:medium",)
+    _public, provider = route_generation_parameter_requests((profile,), coercion.request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["reasoning"] == {"effort": "medium"}
+    assert "thinking" not in payload
+
+
+def test_a_failed_tool_result_serves_on_an_openai_route() -> None:
+    """The exact live repro (is_error:true on a GPT route) now serves.
+
+    Previously: "The parameter 'messages.content.is_error' is not supported
+    by this model route", which 400-killed a Claude Code session the moment
+    any tool call failed. The flag folds into the result text, disclosed.
+    """
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    decoded = decode_messages(
+        _body(
+            max_tokens=64,
+            tools=[
+                {
+                    "name": "run",
+                    "description": "run a command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+            messages=[
+                {"role": "user", "content": "run false"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01",
+                            "name": "run",
+                            "input": {"cmd": "false"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_01",
+                            "content": "exit 1",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ],
+        )
+    )
+    profile = _openai_reasoning_profile()
+    public, provider = route_generation_parameter_requests((profile,), decoded.request)
+
+    assert "messages.content.is_error->content" in public.ignored_parameters
+    payload = dialect_stream_payload(profile, provider)
+    items = [item for item in cast("list[JsonObject]", payload["input"])]
+    outputs = [item for item in items if item.get("type") == "function_call_output"]
+    assert outputs == [
+        {"type": "function_call_output", "call_id": "toolu_01", "output": "[tool error] exit 1"}
+    ]
+
+
+def test_the_claude_code_model_probe_serves_on_an_openai_route() -> None:
+    """The exact post-/model probe (max_tokens: 1) rides the provider floor."""
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    decoded = decode_messages(_body(max_tokens=1, messages=[{"role": "user", "content": "hi"}]))
+    profile = _openai_reasoning_profile()
+    public, provider = route_generation_parameter_requests((profile,), decoded.request)
+
+    assert "max_tokens->16" in public.ignored_parameters
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["max_output_tokens"] == 16
+
+
+def test_decode_names_a_duplicate_tool_use_id_instead_of_crashing() -> None:
+    """A canonical-contract violation in a replayed turn is a named 400.
+
+    Two ``tool_use`` blocks sharing one id in a single assistant turn violate
+    the canonical assistant-message contract during turn translation, after
+    the wire models have already passed. That exception must map to the
+    turn-specific protocol error every other invalid shape gets: before the
+    mapping it escaped decode as an unclassified 500 whose "retry the
+    request" guidance is wrong for caller-shaped input.
+    """
+    with pytest.raises(OpenAIProtocolError, match="messages.1.*unique") as rejected:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "t"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "dup", "name": "a", "input": {}},
+                            {"type": "tool_use", "id": "dup", "name": "a", "input": {}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "dup", "content": "x"},
+                            {"type": "tool_result", "tool_use_id": "dup", "content": "y"},
+                        ],
+                    },
+                ],
+                tools=[{"name": "a", "description": "d", "input_schema": {"type": "object"}}],
+            )
+        )
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == "messages.1"

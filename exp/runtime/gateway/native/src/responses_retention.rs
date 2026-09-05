@@ -282,6 +282,7 @@ pub(crate) fn remember_argument(
                 "call_id": call.call_id,
                 "name": call.name,
                 "namespace": call.namespace,
+                "caller": call.caller,
                 "arguments": call.raw_arguments,
                 "status": call.provider_status.map(ProviderOutputItemStatus::as_str),
                 "custom": call.custom,
@@ -379,6 +380,7 @@ mod tests {
                 index: 2,
                 call: CompletedToolCall {
                     namespace: None,
+                    caller: None,
                     call_id: "call-required".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,
@@ -431,6 +433,7 @@ mod tests {
                 index: 0,
                 call: CompletedToolCall {
                     namespace: Some("collaboration".to_string()),
+                    caller: None,
                     call_id: "call-ns".to_string(),
                     name: "spawn_agent".to_string(),
                     provider_item_id: None,
@@ -495,6 +498,35 @@ mod tests {
         // The done-frame item (not the added one) is what a continuation replays.
         assert_eq!(payload["hosted_items"][0]["item"]["action"]["query"], "pi");
         assert_eq!(payload["message_outputs"][0]["item_id"], "msg_1");
+    }
+
+    #[test]
+    fn retention_carries_a_tool_call_caller_to_the_remember_payload() {
+        let events = [
+            Event::ToolCallCompleted {
+                index: 0,
+                call: CompletedToolCall {
+                    namespace: None,
+                    caller: Some(serde_json::json!({"type": "program", "id": "prog_1"})),
+                    call_id: "call-caller".to_string(),
+                    name: "lookup".to_string(),
+                    provider_item_id: None,
+                    provider_status: None,
+                    raw_arguments: "{}".to_string(),
+                    custom: false,
+                },
+            },
+            Event::Completed,
+        ];
+        let mut retention = ResponsesRetention::default();
+        for event in &events {
+            retention.track(event);
+        }
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-caller", &retention, None))
+                .expect("retention payload is JSON");
+        assert_eq!(payload["tool_calls"][0]["caller"]["id"], "prog_1");
+        assert_eq!(payload["tool_calls"][0]["caller"]["type"], "program");
     }
 
     #[test]

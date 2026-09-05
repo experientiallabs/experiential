@@ -231,10 +231,10 @@ honoring the selector is impossible and accepting it would be silent."""
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
     "message": frozenset({"type", "role", "content", "id", "status", "phase"}),
     "function_call": frozenset(
-        {"type", "call_id", "name", "namespace", "arguments", "id", "status"}
+        {"type", "call_id", "name", "namespace", "caller", "arguments", "id", "status"}
     ),
     "function_call_output": frozenset(
-        {"type", "call_id", "output", "name", "namespace", "id", "status"}
+        {"type", "call_id", "output", "name", "namespace", "caller", "id", "status"}
     ),
     "reasoning": frozenset({"type", "id", "encrypted_content", "summary", "content", "status"}),
 }
@@ -250,19 +250,19 @@ is validated and dropped like its populated form. ``namespace`` on a
 ``function_call_output``) attributes the call to its declaring nested tool
 tree and round-trips verbatim: the provider rejects a namespaced call
 replayed without it ("Missing namespace for function_call ..."), which
-wedges every later turn of the session.
+wedges every later turn of the session. ``caller`` is SDK 3.0's opaque
+programmatic tool-calling attribution (``{"type": "program", "id": ...}``);
+its internal shape is an evolving provider surface, so it is validated only
+as an object and round-trips verbatim like ``namespace``.
 """
 
 RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
     "message": frozenset(),
-    "function_call": frozenset({"caller"}),
-    "function_call_output": frozenset({"caller"}),
+    "function_call": frozenset(),
+    "function_call_output": frozenset(),
     "reasoning": frozenset(),
 }
-"""Echoable input-item fields consciously rejected with a named 400.
-
-``caller`` attributes server-tool invocations this gateway does not serve.
-"""
+"""Echoable input-item fields consciously rejected with a named 400."""
 
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {

@@ -22,6 +22,7 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
     // A tool-only turn's first token is the tool call itself.
     assert!(Event::ToolCallStarted {
         namespace: None,
+        caller: None,
         index: 0,
         call_id: "call_1".to_string(),
         name: "get".to_string(),

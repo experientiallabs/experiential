@@ -197,7 +197,8 @@ impl ResponsesSseEncoder {
                 call_id,
                 name,
                 namespace,
-            } => self.tool_started(*index, call_id, name, namespace.as_deref()),
+                caller,
+            } => self.tool_started(*index, call_id, name, namespace.as_deref(), caller.as_ref()),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments(*index, delta),
             Event::ToolCallCompleted { index, call } => self.tool_completed(*index, call),
             // Anthropic text-block boundaries and citation metadata have no
@@ -487,6 +488,7 @@ impl ResponsesSseEncoder {
         call_id: &str,
         name: &str,
         namespace: Option<&str>,
+        caller: Option<&Value>,
     ) -> Result<Vec<String>, PublicError> {
         if self.tools.contains_key(&index) {
             return Err(invalid_provider_stream(
@@ -531,6 +533,7 @@ impl ResponsesSseEncoder {
             call_id: call_id.to_string(),
             name: name.to_string(),
             namespace: namespace.map(str::to_string),
+            caller: caller.cloned(),
             arguments: String::new(),
             status,
             done: false,
@@ -587,6 +590,7 @@ impl ResponsesSseEncoder {
         if state.call_id != call.call_id
             || state.name != call.name
             || state.namespace != call.namespace
+            || state.caller != call.caller
             || state.arguments != call.raw_arguments
             || (provider_owned_identity && call.provider_item_id != state.item_id)
         {

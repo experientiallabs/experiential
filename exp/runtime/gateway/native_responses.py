@@ -297,6 +297,7 @@ def remember_turn(
         name = call["name"]
         raw_arguments = call["arguments"]
         namespace = call.get("namespace")
+        caller = call.get("caller")
         if (
             not isinstance(call_id, str)
             or not call_id
@@ -304,6 +305,7 @@ def remember_turn(
             or not name
             or not isinstance(raw_arguments, str)
             or not (namespace is None or (isinstance(namespace, str) and namespace))
+            or not (caller is None or isinstance(caller, dict))
         ):
             raise ValueError("Responses retained tool call fields are invalid")
         if call.get("custom") is True:
@@ -318,6 +320,8 @@ def remember_turn(
             }
             if namespace is not None:
                 native_item["namespace"] = namespace
+            if caller is not None:
+                native_item["caller"] = caller
             if provider_item_id is not None:
                 native_item["id"] = provider_item_id
             status_value = call.get("status")
@@ -342,6 +346,7 @@ def remember_turn(
                 else None
             ),
             provider_namespace=namespace,
+            provider_caller=caller,
         )
         if provider_output_index is None:
             unindexed_calls.append(parsed_call)

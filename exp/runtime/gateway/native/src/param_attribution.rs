@@ -174,7 +174,7 @@ fn sanitized_detail(message: &str, request_words: &[&str]) -> Option<String> {
 /// (label-shaped values the dispatched payload itself carried, such as its
 /// `model`) is the same caller-known exception without the quotes, though
 /// the unambiguous network and resource shapes still disqualify it.
-fn carries_provider_identifier(word: &str, request_words: &[&str]) -> bool {
+pub(crate) fn carries_provider_identifier(word: &str, request_words: &[&str]) -> bool {
     let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
     if word.contains("://") || word.contains('@') || bare.to_ascii_lowercase().starts_with("arn:") {
         return true;

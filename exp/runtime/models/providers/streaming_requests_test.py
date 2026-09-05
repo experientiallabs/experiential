@@ -878,7 +878,8 @@ def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:
 
     assert raised.value.param == "reasoning.effort"
     assert str(raised.value) == (
-        "Reasoning effort 'minimal' is not supported by this model route. Supported values: 'high'."
+        "The effort parameter value 'minimal' is not supported by this model route. "
+        "Supported values: 'high'."
     )
 
 
@@ -1816,8 +1817,14 @@ def test_an_empty_assistant_text_never_reaches_the_anthropic_wire() -> None:
     assert [block["type"] for block in blocks] == ["tool_use"]
 
 
-def test_tool_error_state_requires_an_anthropic_only_waterfall() -> None:
-    """A fallback cannot discard Anthropic tool-result error semantics."""
+def test_tool_error_state_folds_with_disclosure_off_the_anthropic_wire() -> None:
+    """A fallback rung folds the error flag into text instead of rejecting.
+
+    The flag is baked into history on every failed tool call, so the old
+    named 400 wedged whole sessions; the canonical flag stays on the shared
+    request (Anthropic rungs still emit it natively) and the fold is
+    disclosed route-wide.
+    """
     request = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,
         messages=(
@@ -1832,20 +1839,20 @@ def test_tool_error_state_requires_an_anthropic_only_waterfall() -> None:
     public_request, provider_request = route_generation_parameter_requests((anthropic,), request)
     assert public_request.messages[0].tool_is_error is True
     assert provider_request.messages[0].tool_is_error is True
+    assert "messages.content.is_error->content" not in public_request.ignored_parameters
 
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests(
-            (
-                anthropic,
-                GatewayWireProfile(
-                    dialect="openai_compatible",
-                    url="https://fallback.test",
-                ),
+    mixed_public, mixed_provider = route_generation_parameter_requests(
+        (
+            anthropic,
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://fallback.test",
             ),
-            request,
-        )
-
-    assert raised.value.param == "messages.content.is_error"
+        ),
+        request,
+    )
+    assert "messages.content.is_error->content" in mixed_public.ignored_parameters
+    assert mixed_provider.messages[0].tool_is_error is True
 
 
 def test_gemini_stream_payload_matches_the_provider_client_builder() -> None:
@@ -2069,8 +2076,13 @@ def test_anthropic_payload_replays_thinking_blocks_first_and_verbatim() -> None:
     assert assistant_blocks[2] == {"type": "text", "text": "done"}
 
 
-def test_route_rejects_thinking_outside_native_anthropic() -> None:
-    """Thinking carriers require every waterfall rung to speak the Anthropic wire."""
+def test_route_shaping_rejects_thinking_by_name_so_admission_can_coerce() -> None:
+    """History thinking blocks and a live config both reject at SHAPING on a
+    non-Anthropic route: blocks are signed provider state no translation can
+    carry, and the config's named rejection is what lets the admit loop offer
+    the disclosed thinking->reasoning_effort coercion without stealing
+    narrowing preference from an Anthropic rung (coverage for the coercion
+    itself lives in capability_policy_test)."""
     anthropic = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
@@ -3665,7 +3677,12 @@ def test_service_tier_route_shaping_forwards_on_byok_and_discloses_elsewhere() -
 
 
 def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> None:
-    """When no rung serves, the caller sees the first rung's own field-scoped reason."""
+    """When no rung serves, the caller sees the first rung's own field-scoped reason.
+
+    The trigger pairs a ``disabled`` config (the adaptive-only Anthropic rung
+    rejects it by name) with replayed thinking blocks (the fallback rung
+    rejects those), so each ordering surfaces its own first rung's error.
+    """
     anthropic = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
@@ -3674,11 +3691,8 @@ def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> No
         reasoning_wire_format="anthropic_adaptive",
     )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
-    request = _chat_request().model_copy(
-        update={
-            "surface": GatewayApiSurface.MESSAGES,
-            "provider_thinking_config": {"type": "disabled"},
-        }
+    request = _thinking_history_request().model_copy(
+        update={"provider_thinking_config": {"type": "disabled"}}
     )
 
     with pytest.raises(ProviderParameterError) as raised:
@@ -3688,6 +3702,212 @@ def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> No
     with pytest.raises(ProviderParameterError) as reordered:
         compatible_generation_parameter_profile_indexes((fallback, anthropic), request)
     assert reordered.value.param == "thinking"
+
+
+def _openai_reasoning_profile(
+    efforts: tuple[ReasoningEffort, ...] = ("none", "low", "medium", "high"),
+) -> GatewayWireProfile:
+    """Return one OpenAI Responses profile with an explicit effort ladder."""
+    return GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://api.openai.com/v1/responses",
+        model_id="gpt-5.6-sol",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        supported_reasoning_efforts=efforts,
+    )
+
+
+def _messages_request(
+    *,
+    thinking: JsonObject | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
+    maximum_output_tokens: int | None = None,
+) -> GatewayRequest:
+    """Build one minimal Messages-surface request for translation fixtures."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        provider_thinking_config=thinking,
+        reasoning_effort=reasoning_effort,
+        maximum_output_tokens=maximum_output_tokens,
+        stream=True,
+    )
+
+
+def test_replayed_thinking_blocks_still_reject_on_a_non_anthropic_route() -> None:
+    """Signed history blocks replay only on the wire that issued them."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(
+                role="assistant",
+                content="prior",
+                provider_reasoning=(ThinkingBlock(text="deep", signature="sig-1"),),
+            ),
+        ),
+        stream=True,
+    )
+    with pytest.raises(ProviderParameterError, match="extended-thinking"):
+        route_generation_parameter_requests((_openai_reasoning_profile(),), request)
+
+
+def _tool_error_request(*, content: str = "exit 1") -> GatewayRequest:
+    """Build one failed-tool-turn request (the Claude Code repro shape)."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="run false"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="toolu_01", name="run", arguments={"cmd": "false"}),),
+            ),
+            GatewayMessage(
+                role="tool",
+                content=content,
+                tool_call_id="toolu_01",
+                tool_is_error=True,
+            ),
+        ),
+        tools=(GatewayToolDefinition(name="run", parameters={"type": "object"}),),
+        maximum_output_tokens=64,
+        stream=True,
+    )
+
+
+def test_a_failed_tool_result_folds_into_text_on_every_non_anthropic_wire() -> None:
+    """is_error survives as a text prefix instead of a session-killing 400.
+
+    Claude Code sets the flag on every failed tool call and the block is
+    baked into history, so a rejection wedges the session; a silent drop
+    would misstate that the invocation failed.
+    """
+    request = _tool_error_request()
+    for profile in (
+        _openai_reasoning_profile(),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://api.example.test/v1/chat/completions",
+            model_id="plain-chat",
+        ),
+        GatewayWireProfile(
+            dialect="gemini_generate_content",
+            url="https://generativelanguage.googleapis.com/v1beta/models/g:streamGenerateContent",
+            model_id="gemini-3.4-pro",
+        ),
+        GatewayWireProfile(
+            dialect="bedrock_converse_stream",
+            url="https://bedrock.example.test/model/m/converse-stream",
+            model_id="us.amazon.nova-2-lite-v1:0",
+        ),
+    ):
+        public, provider = route_generation_parameter_requests((profile,), request)
+        assert "messages.content.is_error->content" in public.ignored_parameters
+        payload = dialect_stream_payload(profile, provider)
+        rendered = str(payload)
+        assert "[tool error] exit 1" in rendered, profile.dialect
+
+
+def test_a_failed_tool_result_stays_a_native_flag_on_an_anthropic_route() -> None:
+    """The one wire with a native error flag keeps it verbatim, undisclosed."""
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-opus-5",
+    )
+    public, provider = route_generation_parameter_requests((profile,), _tool_error_request())
+
+    assert "messages.content.is_error->content" not in public.ignored_parameters
+    payload = dialect_stream_payload(profile, provider)
+    rendered = str(payload)
+    assert "'is_error': True" in rendered
+    assert "[tool error]" not in rendered
+
+
+def test_the_tool_error_fold_never_accumulates_across_replays() -> None:
+    """The fold derives from the canonical flag, never from prior folded text.
+
+    A caller replays its ORIGINAL content each turn (it never sees the
+    provider payload), so a two-build round of the same request must emit
+    exactly one prefix, and caller text that happens to start with the
+    marker is not treated as a prior fold.
+    """
+    profile = _openai_reasoning_profile()
+    request = _tool_error_request()
+    _public_one, provider = route_generation_parameter_requests((profile,), request)
+    first = dialect_stream_payload(profile, provider)
+    second = dialect_stream_payload(profile, provider)
+    assert first == second
+    rendered = str(first)
+    assert rendered.count("[tool error]") == 1
+
+    # Caller-authored text carrying the literal marker is content, not a fold.
+    marked = _tool_error_request(content="[tool error] exit 1")
+    _public_two, provider = route_generation_parameter_requests((profile,), marked)
+    rendered = str(dialect_stream_payload(profile, provider))
+    assert rendered.count("[tool error] [tool error] exit 1") == 1
+
+
+def test_a_messages_probe_below_the_openai_floor_rides_the_floor() -> None:
+    """Claude Code's max_tokens:1 probe serves instead of a provider 400."""
+    profile = _openai_reasoning_profile()
+    public, provider = route_generation_parameter_requests(
+        (profile,), _messages_request(maximum_output_tokens=1)
+    )
+
+    assert provider.maximum_output_tokens == 16
+    assert "max_tokens->16" in public.ignored_parameters
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["max_output_tokens"] == 16
+
+
+def test_the_openai_floor_leaves_anthropic_routes_and_other_surfaces_alone() -> None:
+    """The clamp is a Messages-surface translation, not a global rewrite."""
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-opus-5",
+    )
+    _public, provider = route_generation_parameter_requests(
+        (anthropic,), _messages_request(maximum_output_tokens=1)
+    )
+    assert provider.maximum_output_tokens == 1
+
+    chat_surface = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=1,
+        stream=True,
+    )
+    public, provider = route_generation_parameter_requests(
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://api.example.test/v1/chat/completions",
+                model_id="plain-chat",
+            ),
+        ),
+        chat_surface,
+    )
+    assert provider.maximum_output_tokens == 1
+    assert "max_tokens->16" not in public.ignored_parameters
+
+    # A rung whose declared output ceiling sits below the provider floor
+    # cannot ride it: the gateway never dispatches above a rung's declared
+    # capability just to satisfy the floor, and a homogeneous native
+    # Responses route then rejects the sub-minimum value by name at
+    # admission instead of dispatching a request the provider will 400
+    # opaquely post-commit.
+    capped = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://api.openai.com/v1/responses",
+        model_id="tiny-cap",
+        maximum_output_tokens=8,
+    )
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((capped,), _messages_request(maximum_output_tokens=1))
+    assert "at least 16" in str(rejected.value)
 
 
 def _exposed_reasoning_request(
@@ -3847,3 +4067,136 @@ def test_route_rejects_max_output_tokens_below_the_responses_minimum() -> None:
     anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://a.test")
     public, _provider = route_generation_parameter_requests((responses, anthropic), request)
     assert public.ignored_parameters == ()
+
+
+def test_an_all_responses_route_keeps_tool_result_images() -> None:
+    """The native Responses wire carries tool-result images itself (the SDK
+    function_call_output part list), so a homogeneous Responses route keeps
+    the screenshot verbatim like an all-Anthropic route does."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (GatewayWireProfile(dialect="openai_responses", url="https://r.test"),)
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.messages[-1].images
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
+
+
+def test_a_responses_and_chat_route_still_degrades_tool_result_images() -> None:
+    """A chat fallback rung has no tool-image carrier, so the mixed route
+    keeps the disclosed placeholder degrade."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (
+        GatewayWireProfile(dialect="openai_responses", url="https://r.test"),
+        GatewayWireProfile(dialect="openai_compatible", url="https://c.test"),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.messages[-1].content_parts == ()
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public_request.ignored_parameters
+
+
+def _attributed_history_request() -> GatewayRequest:
+    """One replayed turn whose call, and result, carry Responses attribution."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-1",
+                        name="spawn_agent",
+                        arguments={},
+                        provider_namespace="collaboration",
+                        provider_caller={"type": "program", "caller_id": "call_prog"},
+                    ),
+                ),
+            ),
+            GatewayMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="done",
+                provider_tool_name="spawn_agent",
+                provider_tool_namespace="collaboration",
+            ),
+        ),
+    )
+
+
+def test_tool_call_attribution_drops_with_disclosure_off_the_responses_wire() -> None:
+    """A chat rung rebuilds the call without its namespace/caller attribution;
+    the call still executes with its exact name and arguments, so the route
+    discloses the per-field drop instead of rejecting a history the caller
+    cannot rewrite."""
+    profiles = (GatewayWireProfile(dialect="openai_compatible", url="https://c.test"),)
+
+    public_request, _provider = route_generation_parameter_requests(
+        profiles, _attributed_history_request()
+    )
+
+    assert (
+        "messages.tool_calls.namespace->dropped(unsupported_by_provider)"
+        in public_request.ignored_parameters
+    )
+    assert (
+        "messages.tool_calls.caller->dropped(unsupported_by_provider)"
+        in public_request.ignored_parameters
+    )
+    assert (
+        "messages.tool_results.attribution->dropped(unsupported_by_provider)"
+        in public_request.ignored_parameters
+    )
+
+
+def test_tool_call_attribution_is_undisclosed_on_a_homogeneous_responses_route() -> None:
+    """The native wire re-emits the attribution verbatim: nothing is dropped."""
+    profiles = (GatewayWireProfile(dialect="openai_responses", url="https://r.test"),)
+
+    public_request, _provider = route_generation_parameter_requests(
+        profiles, _attributed_history_request()
+    )
+
+    assert not any("attribution" in path for path in public_request.ignored_parameters)
+    assert not any("tool_calls.namespace" in path for path in public_request.ignored_parameters)
+    assert not any("tool_calls.caller" in path for path in public_request.ignored_parameters)
+
+
+def test_a_messages_surface_effort_rejection_matches_the_client_recovery_latch() -> None:
+    """The 400 names output_config.effort and phrases the miss recoverably.
+
+    Claude Code sends output_config.effort on every request and auto-recovers
+    (drops the field and retries) only when the message contains "effort
+    parameter" and "not support" or the param names output_config.effort; any
+    other phrasing wedges every turn on an effort-constrained route (#795).
+    """
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://c.test",
+            model_id="hermes-4-405b",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning_effort",
+            supported_reasoning_efforts=("medium",),
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        reasoning_effort="high",
+    )
+
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.param == "output_config.effort"
+    assert "effort parameter" in str(raised.value)
+    assert "not supported" in str(raised.value)

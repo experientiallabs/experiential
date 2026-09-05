@@ -40,7 +40,16 @@ def model_request(request: GatewayRequest) -> ModelRequest:
         messages.append(
             ModelMessage(
                 role=role,
-                content=message.content,
+                # The model contract has no tool-result error flag, so a set
+                # flag folds into the text here (the Gemini and Bedrock wires
+                # build from this projection); the Anthropic and OpenAI
+                # gateway payloads read the canonical message directly and
+                # apply the same fold or the native field per wire.
+                content=(
+                    message.folded_tool_error_content()
+                    if message.role == "tool"
+                    else message.content
+                ),
                 tool_call_id=message.tool_call_id,
                 assistant_action=action,
                 content_parts=message.content_parts,

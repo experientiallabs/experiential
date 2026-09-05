@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
+    TOOL_ERROR_TEXT_PREFIX,
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
@@ -32,10 +33,31 @@ from exp.runtime.models.providers.videos import openai_chat_video_part, reject_v
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
     """Translate one non-instruction gateway message to Responses input items."""
     if message.role == "tool":
+        output_value: str | list[JsonObject]
+        if message.content_parts:
+            # The SDK list form round-trips: text and image parts re-emit as
+            # typed output parts (the image encoder is the same one user
+            # messages use). A failed invocation folds its error prefix in as
+            # a leading text part, derived from the canonical flag each time
+            # so replays never accumulate prefixes.
+            output_value = []
+            for part in message.content_parts:
+                if part.kind == "text":
+                    output_value.append({"type": "input_text", "text": part.text})
+                elif part.kind == "image":
+                    output_value.append(responses_image_part(part))
+                else:
+                    # The canonical contract restricts tool messages to text
+                    # and image parts; anything else here is a gateway bug.
+                    raise ProviderResponseError("tool results carry only text and image parts")
+            if message.tool_is_error:
+                output_value.insert(0, {"type": "input_text", "text": TOOL_ERROR_TEXT_PREFIX})
+        else:
+            output_value = message.folded_tool_error_content()
         output_item: JsonObject = {
             "type": "function_call_output",
             "call_id": message.tool_call_id or "",
-            "output": message.content or "",
+            "output": output_value,
         }
         # Tool attribution round-trips verbatim: present stays present and
         # absent stays absent, so pre-namespace histories are unchanged.
@@ -43,6 +65,8 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             output_item["name"] = message.provider_tool_name
         if message.provider_tool_namespace is not None:
             output_item["namespace"] = message.provider_tool_namespace
+        if message.provider_tool_caller is not None:
+            output_item["caller"] = message.provider_tool_caller
         return [output_item]
     if message.role == "user":
         if message.content_parts:
@@ -135,6 +159,10 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
         # retained value re-emits verbatim; absent stays absent.
         if call.provider_namespace is not None:
             item["namespace"] = call.provider_namespace
+        # SDK 3.0 programmatic tool-calling attribution round-trips verbatim
+        # like the namespace; absent stays absent.
+        if call.provider_caller is not None:
+            item["caller"] = call.provider_caller
         if call.provider_item_id is not None:
             item["id"] = call.provider_item_id
         if call.provider_status is not None:
@@ -359,7 +387,7 @@ def openai_chat_message(
     if message.role == "tool":
         return {
             "role": "tool",
-            "content": message.content or "",
+            "content": message.folded_tool_error_content(),
             "tool_call_id": message.tool_call_id or "",
         }
     payload: JsonObject = {

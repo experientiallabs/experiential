@@ -668,3 +668,57 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     assert tool_message.content == TOOL_RESULT_IMAGE_PLACEHOLDER
     assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public.ignored_parameters
     assert accounting.recorded == 1
+
+
+def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> None:
+    """The full admit loop serves a thinking config on an all-OpenAI route.
+
+    Route shaping rejects the config by name, the coercion translates it to
+    the route's effort ladder, and the re-narrowed route serves with the
+    translation disclosed and counted.
+    """
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_thinking_config={"type": "enabled", "budget_tokens": 8192},
+        stream=True,
+        include_usage=True,
+    )
+    accounting = _AdmissionCoercionCounter()
+    client = cast(NativeWireClient, object())
+    reasoning = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("gpt", provider="openai", gateway=reasoning),),
+        GatewayApiSurface.MESSAGES,
+    )
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_responses",
+                url="https://api.openai.test/v1/responses",
+                model_id="gpt-5.6-sol",
+                supports_reasoning=True,
+                reasoning_wire_format="openai_responses",
+                supported_reasoning_efforts=("none", "low", "medium", "high"),
+            ),
+            client,
+        ),
+    )
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("gpt",)
+    assert "thinking->reasoning_effort:medium" in public.ignored_parameters
+    assert provider.provider_thinking_config is None
+    assert provider.reasoning_effort == "medium"
+    assert accounting.recorded == 1

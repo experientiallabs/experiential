@@ -712,6 +712,7 @@ mod tests {
             },
             Event::ToolCallStarted {
                 namespace: None,
+                caller: None,
                 index: 0,
                 call_id: "call-one".to_string(),
                 name: "lookup".to_string(),
@@ -724,6 +725,7 @@ mod tests {
                 index: 0,
                 call: crate::events::CompletedToolCall {
                     namespace: None,
+                    caller: None,
                     call_id: "call-one".to_string(),
                     name: "lookup".to_string(),
                     raw_arguments: "{}".to_string(),
@@ -803,12 +805,14 @@ mod tests {
             },
             Event::ToolCallStarted {
                 namespace: None,
+                caller: None,
                 index: 1,
                 call_id: "call-one".to_string(),
                 name: "first".to_string(),
             },
             Event::ToolCallStarted {
                 namespace: None,
+                caller: None,
                 index: 0,
                 call_id: "call-zero".to_string(),
                 name: "second".to_string(),
@@ -817,6 +821,7 @@ mod tests {
                 index: 0,
                 call: crate::events::CompletedToolCall {
                     namespace: None,
+                    caller: None,
                     call_id: "call-zero".to_string(),
                     name: "second".to_string(),
                     raw_arguments: "{\"order\":0}".to_string(),
@@ -829,6 +834,7 @@ mod tests {
                 index: 1,
                 call: crate::events::CompletedToolCall {
                     namespace: None,
+                    caller: None,
                     call_id: "call-one".to_string(),
                     name: "first".to_string(),
                     raw_arguments: "{\"order\":1}".to_string(),

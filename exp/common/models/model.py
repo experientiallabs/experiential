@@ -238,6 +238,18 @@ class ToolCall(ContractModel):
     from serialization like the other replay fields, and joins gateway replay
     identity explicitly.
     """
+    provider_caller: JsonObject | None = Field(default=None, exclude=True)
+    """Opaque SDK 3.0 ``caller`` attribution on a Responses tool-call item.
+
+    Programmatic tool calling attributes a ``function_call`` or
+    ``custom_tool_call`` to the program that invoked it (for example
+    ``{"type": "program", "id": ...}``). The object's internal shape is an
+    evolving provider surface, so it is validated only as an object and
+    round-trips verbatim like ``provider_namespace``: set when a Responses
+    caller replays an item carrying ``caller`` or when the provider emits
+    one. Excluded from serialization like the other replay fields, and joins
+    gateway replay identity explicitly.
+    """
 
     @model_validator(mode="after")
     def _require_matching_raw_arguments(self) -> ToolCall:
