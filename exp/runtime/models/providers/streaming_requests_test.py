@@ -15,6 +15,7 @@ from exp.common.models.content import (
 )
 from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
+    ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
@@ -3687,3 +3688,94 @@ def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> No
     with pytest.raises(ProviderParameterError) as reordered:
         compatible_generation_parameter_profile_indexes((fallback, anthropic), request)
     assert reordered.value.param == "thinking"
+
+
+def _exposed_reasoning_request(
+    surface: GatewayApiSurface = GatewayApiSurface.CHAT_COMPLETIONS,
+) -> GatewayRequest:
+    """A Terminus-shaped loop: plaintext reasoning on a prior non-tool assistant turn."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(
+            GatewayMessage(role="user", content="run ls"),
+            GatewayMessage(
+                role="assistant",
+                content='{"command": "ls"}',
+                provider_reasoning=(
+                    ExposedReasoningContentBlock(content="The user wants a directory listing."),
+                ),
+            ),
+            GatewayMessage(role="user", content="a.txt b.txt"),
+        ),
+        stream=True,
+    )
+
+
+def _exposed_profile(
+    *, exposed: bool, url: str = "https://tokenhub-intl.tencentcloudmaas.com/v1"
+) -> GatewayWireProfile:
+    return GatewayWireProfile(
+        dialect="openai_compatible",
+        url=url,
+        model_id="hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_output_exposed=exposed,
+    )
+
+
+def test_plaintext_reasoning_replays_only_on_an_exposing_rung() -> None:
+    """The exposing rung forwards the caller's plaintext verbatim; others omit it."""
+    request = _exposed_reasoning_request()
+    forwarded = openai_compatible_stream_payload(
+        "hy4-preview", request, reasoning_output_exposed=True
+    )
+    messages = forwarded["messages"]
+    assert isinstance(messages, list)
+    assert messages[1]["reasoning_content"] == "The user wants a directory listing."
+    omitted = openai_compatible_stream_payload("hy4-preview", request)
+    omitted_messages = omitted["messages"]
+    assert isinstance(omitted_messages, list)
+    assert "reasoning_content" not in omitted_messages[1]
+    # Other wires drop the block instead of raising; narrowing disclosed it.
+    anthropic = anthropic_messages_stream_payload("claude-haiku-4-5", request)
+    anthropic_messages = anthropic["messages"]
+    assert isinstance(anthropic_messages, list)
+    assert anthropic_messages[1]["content"] == [{"type": "text", "text": '{"command": "ls"}'}]
+
+
+def test_plaintext_reasoning_route_gate_rejects_discloses_or_forwards() -> None:
+    """No exposing rung -> named 400; mixed -> disclosed drop; all exposing -> silent."""
+    request = _exposed_reasoning_request()
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((_exposed_profile(exposed=False),), request)
+    assert rejected.value.param == "messages.reasoning_content"
+
+    public, _provider = route_generation_parameter_requests(
+        (
+            _exposed_profile(exposed=True),
+            _exposed_profile(exposed=False, url="https://openrouter.test/v1"),
+        ),
+        request,
+    )
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_provider)" in public.ignored_parameters
+    )
+
+    public, _provider = route_generation_parameter_requests(
+        (_exposed_profile(exposed=True),), request
+    )
+    assert public.ignored_parameters == ()
+
+
+def test_plaintext_reasoning_prefers_the_exposing_rung_on_a_mixed_waterfall() -> None:
+    """A rung that carries the reasoning is exact; a rung that would drop it is a fallback."""
+    request = _exposed_reasoning_request()
+    profiles = (
+        _exposed_profile(exposed=False, url="https://openrouter.test/v1"),
+        _exposed_profile(exposed=True),
+    )
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+    # Without plaintext history both rungs are exact and the order is preserved.
+    plain = request.model_copy(update={"messages": (GatewayMessage(role="user", content="hi"),)})
+    assert compatible_generation_parameter_profile_indexes(profiles, plain) == (0, 1)

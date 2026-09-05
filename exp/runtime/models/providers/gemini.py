@@ -59,8 +59,13 @@ def gemini_generate_response(
         The typed assistant action, served model identity, and observed economics.
 
     Raises:
+        ProviderRefusalError: Google blocked the prompt itself (``promptFeedback.blockReason``)
+            or stopped the candidate on a safety, copyright, or sensitive-information reason.
         ProviderResponseError: The response omits a usable candidate or has malformed content.
     """
+    prompt_block = _gemini_prompt_block_signal(payload)
+    if prompt_block is not None:
+        raise ProviderRefusalError(provider="gemini", signal=prompt_block)
     candidates = require_array(payload.get("candidates"), "Gemini candidates")
     if not candidates:
         raise ProviderResponseError("Gemini response has no candidates")
@@ -257,6 +262,45 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
     )
 
 
+# Finish and block reasons Google reports for content its safety systems
+# refused; the prompt-level block adds the image-specific reason.
+_GEMINI_SAFETY_REASONS: frozenset[str] = frozenset({"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"})
+_GEMINI_PROMPT_SAFETY_REASONS: frozenset[str] = _GEMINI_SAFETY_REASONS | {"IMAGE_SAFETY"}
+
+
+def _gemini_prompt_block_signal(payload: JsonObject) -> ProviderRefusalSignal | None:
+    """Map a prompt-level block to a content-free refusal category.
+
+    A blocked prompt arrives as ``promptFeedback.blockReason`` with no
+    candidates at all, so it must be read before the candidate contract is
+    enforced. ``BLOCK_REASON_UNSPECIFIED`` is the enum default and, like
+    ratings-only feedback, means the prompt was not blocked.
+
+    Args:
+        payload: Decoded Gemini response object.
+
+    Returns:
+        The refusal signal for a blocked prompt, or ``None`` when generation ran.
+
+    Raises:
+        ProviderResponseError: ``promptFeedback`` is not an object, or its
+            ``blockReason`` is not text.
+    """
+    raw = payload.get("promptFeedback")
+    if raw is None:
+        return None
+    feedback = require_object(raw, "Gemini promptFeedback")
+    raw_reason = feedback.get("blockReason")
+    if raw_reason is None:
+        return None
+    reason = require_string(raw_reason, "Gemini promptFeedback.blockReason")
+    if reason == "BLOCK_REASON_UNSPECIFIED":
+        return None
+    if reason in _GEMINI_PROMPT_SAFETY_REASONS:
+        return ProviderRefusalSignal.SAFETY
+    return ProviderRefusalSignal.PROVIDER_REFUSAL
+
+
 def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:
     """Map a Gemini finish reason to a content-free refusal category.
 
@@ -266,7 +310,7 @@ def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:
     Returns:
         A normalized refusal signal, or ``None`` for ordinary terminal reasons.
     """
-    if value in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"}:
+    if isinstance(value, str) and value in _GEMINI_SAFETY_REASONS:
         return ProviderRefusalSignal.SAFETY
     if value == "RECITATION":
         return ProviderRefusalSignal.COPYRIGHT

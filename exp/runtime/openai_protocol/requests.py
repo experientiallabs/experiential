@@ -20,6 +20,7 @@ from exp.runtime.gateway.compatibility import (
 )
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
+    ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
@@ -647,21 +648,46 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
             for call_index, call in enumerate(message.history_tool_calls)
         )
-        provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
+        provider_reasoning: tuple[
+            SealedReasoningContentBlock | ExposedReasoningContentBlock, ...
+        ] = ()
         if message.reasoning_content is not None:
-            # The scheme is fixed by the carrier's own opaque prefix; raw client
-            # text (no known prefix) matches none and is rejected here. Each
-            # provider's carrier only parses under its own scheme.
+            param = f"{prefix}.{message_index}.reasoning_content"
+            # The scheme is fixed by the carrier's own opaque prefix. A known
+            # prefix MUST parse as that provider's carrier. Text under no known
+            # prefix is the plaintext an exposure-gated rung itself returned on
+            # a non-tool turn (Tencent/DeepSeek): it decodes as caller-owned
+            # history and route admission decides which rungs may carry it.
             scheme = scheme_for_carrier(message.reasoning_content)
-            try:
-                if scheme is None:
-                    raise ValueError("reasoning_content is not a gateway-issued carrier")
-                provider_reasoning = (
-                    parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
-                )
-            except ValueError as exc:
-                param = f"{prefix}.{message_index}.reasoning_content"
-                raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
+            if scheme is None:
+                if calls:
+                    # A tool turn's reasoning is only ever issued as the sealed
+                    # carrier that binds it to its calls and issuing rung;
+                    # plaintext here was never ours and would bypass that bond.
+                    raise invalid_field(
+                        param,
+                        f"'{param}' must be a gateway-issued carrier on an assistant "
+                        "tool-call turn.",
+                    )
+                try:
+                    provider_reasoning = (
+                        ExposedReasoningContentBlock(content=message.reasoning_content),
+                    )
+                except ValidationError as exc:
+                    raise invalid_field(
+                        param,
+                        f"'{param}' must be non-empty plaintext reasoning within the size bound "
+                        "or a gateway-issued carrier.",
+                    ) from exc
+            else:
+                try:
+                    provider_reasoning = (
+                        parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
+                    )
+                except ValueError as exc:
+                    raise invalid_field(
+                        param, f"'{param}' must be a gateway-issued carrier."
+                    ) from exc
         content, content_parts = message_content(
             message.content, f"{prefix}.{message_index}.content"
         )

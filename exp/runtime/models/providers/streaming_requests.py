@@ -264,6 +264,7 @@ def dialect_stream_payload(
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
             hunyuan_reasoning_route_sha256=profile.hunyuan_reasoning_route_sha256,
+            reasoning_output_exposed=profile.reasoning_output_exposed,
             forwards_service_tier=profile.billing_customer_managed,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
@@ -726,6 +727,32 @@ def route_generation_parameter_requests(
 
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.
+    # Plaintext reasoning an exposure-gated rung itself returned (Tencent/
+    # DeepSeek) replays only to rungs that expose their reasoning: the
+    # provider's wire accepts it verbatim there, and nowhere else was it ever
+    # issued. A route with no exposing rung rejects by name; a mixed waterfall
+    # keeps it on the exposing rungs and discloses the drop on the others.
+    exposed_reasoning_present = any(
+        block.kind == "exposed_reasoning_content"
+        for message in request.messages
+        for block in message.provider_reasoning
+    )
+    if exposed_reasoning_present:
+        if not any(profile.reasoning_output_exposed for profile in profiles):
+            raise ProviderParameterError(
+                message=(
+                    "The parameter 'messages.reasoning_content' carries plaintext reasoning, "
+                    "which only a model that exposes its reasoning can replay. Remove the "
+                    "field or choose a reasoning-exposed model alias."
+                ),
+                param="messages.reasoning_content",
+                code="unsupported_parameter",
+            )
+        if not all(profile.reasoning_output_exposed for profile in profiles):
+            ignore(
+                "messages.reasoning_content",
+                "messages.reasoning_content->dropped(unsupported_by_provider)",
+            )
     anthropic_reasoning_present = request.provider_thinking_config is not None or any(
         block.kind in {"thinking", "redacted_thinking"}
         for message in request.messages
