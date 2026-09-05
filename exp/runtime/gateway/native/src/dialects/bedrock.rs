@@ -23,7 +23,14 @@ fn bedrock_exception_detail(frame: &crate::sse::SseEvent) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         });
-    super::provider_error_detail(None, message.as_deref())
+    let detail = super::provider_error_detail(None, message.as_deref());
+    if let Some(detail) = &detail {
+        // The same structured operator line the other dialects emit, so a
+        // Bedrock-declared failure is equally visible in the immediate
+        // diagnostic stream.
+        super::log_provider_declared_failure("bedrock_converse_stream", detail);
+    }
+    detail
 }
 
 impl Normalizer {

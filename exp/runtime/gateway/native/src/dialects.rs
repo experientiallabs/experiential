@@ -170,6 +170,16 @@ fn provider_error_detail(code: Option<&str>, message: Option<&str>) -> Option<St
     )
 }
 
+/// Emit the structured operator line naming one provider-declared failure.
+fn log_provider_declared_failure(dialect: &str, detail: &str) {
+    let line = serde_json::json!({
+        "event": "provider_declared_failure",
+        "dialect": dialect,
+        "detail": detail,
+    });
+    eprintln!("exp-gateway-native: {line}");
+}
+
 /// Build the provider-declared stream failure carrying its bounded detail,
 /// and emit the structured operator line naming it.
 fn provider_stream_failed_with_detail(
@@ -179,12 +189,7 @@ fn provider_stream_failed_with_detail(
 ) -> Failure {
     let detail = provider_error_detail(code, message);
     if let Some(detail) = &detail {
-        let line = serde_json::json!({
-            "event": "provider_declared_failure",
-            "dialect": dialect,
-            "detail": detail,
-        });
-        eprintln!("exp-gateway-native: {line}");
+        log_provider_declared_failure(dialect, detail);
     }
     provider_stream_failed().with_provider_detail(detail)
 }
