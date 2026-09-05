@@ -37,6 +37,11 @@ from exp.runtime.models.providers.fireworks import (
     require_responses_continuation_channel,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
+    anthropic_reasoning_disengaged,
+    mid_conversation_system_present,
+    serves_reasoning_summary,
+)
+from exp.runtime.models.providers.generation_parameter_validation import (
     effective_profile_reasoning_effort as _effective_profile_reasoning_effort,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -100,53 +105,6 @@ _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
 _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
     {"gemini_generate_content", "bedrock_converse_stream"}
 )
-_REASONING_SUMMARY_DIALECTS = frozenset({"openai_responses", "anthropic_messages"})
-
-
-def _serves_reasoning_summary(profile: GatewayWireProfile) -> bool:
-    """Return whether one rung's reasoning reaches Responses summary parts.
-
-    Native Responses deployments carry summary parts on the wire, and
-    Anthropic thinking text is projected onto the same parts by the
-    Responses encoder. Every other dialect either has no reasoning text or
-    surfaces a reasoning item the summary channel cannot carry.
-
-    Args:
-        profile: One certified deployment wire profile from the route.
-
-    Returns:
-        Whether this deployment can serve a requested reasoning summary.
-    """
-    return profile.supports_reasoning and profile.dialect in _REASONING_SUMMARY_DIALECTS
-
-
-def _anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
-    """Whether an Anthropic dispatch will send no extended-thinking budget.
-
-    On the native Messages wire the model reasons only when the caller asks:
-    a ``thinking`` config of type ``enabled``/``adaptive`` or a reasoning
-    effort turns it on, and their absence leaves thinking OFF. This is the
-    inverse of the OpenAI effort-native models, whose default IS reasoning, so
-    it governs the srn sampling hatch ONLY for the anthropic_adaptive wire
-    (a budgeted-enabled route such as haiku-4-5): with thinking off, Anthropic
-    accepts an ordinary temperature, so srn must not drop it.
-    """
-    config = request.provider_thinking_config
-    thinking_on = config is not None and config.get("type") in {"enabled", "adaptive"}
-    effort_on = request.reasoning_effort is not None and request.reasoning_effort != "none"
-    return not thinking_on and not effort_on
-
-
-def _mid_conversation_system_present(request: GatewayRequest) -> bool:
-    """Whether a system turn appears after the conversation has begun."""
-    conversation_started = False
-    for message in request.messages:
-        if message.role in {"system", "developer"} and message.provider_native_item is None:
-            if conversation_started:
-                return True
-        else:
-            conversation_started = True
-    return False
 
 
 def route_generation_parameter_requests(
@@ -282,7 +240,7 @@ def route_generation_parameter_requests(
             # budget at all, so ordinary thinking-off sampling is honored.
             or (
                 profile.reasoning_wire_format == "anthropic_adaptive"
-                and _anthropic_reasoning_disengaged(request)
+                and anthropic_reasoning_disengaged(request)
             )
         )
 
@@ -432,7 +390,7 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
     if request.reasoning_summary is not None and not all(
-        _serves_reasoning_summary(profile) for profile in profiles
+        serves_reasoning_summary(profile) for profile in profiles
     ):
         path = next(
             iter(request.reasoning_summary_parameters),
@@ -884,7 +842,7 @@ def route_generation_parameter_requests(
 
     # A system turn after conversation began has positional semantics that
     # instruction-hoisting wires cannot preserve; those rungs narrow out.
-    if _mid_conversation_system_present(request) and any(
+    if mid_conversation_system_present(request) and any(
         profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
         for profile in profiles
     ):
