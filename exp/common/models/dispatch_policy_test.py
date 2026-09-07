@@ -35,6 +35,10 @@ def test_rate_and_cache_fields_validate_their_prerequisites() -> None:
         )
     with pytest.raises(ValueError, match="concurrency_bound"):
         GatewayRungDispatchPolicy(fresh_session_spill_fraction=0.85)
+    # Warm standing IS a live sticky binding, so the early threshold without a
+    # binding lifetime would class every session fresh forever.
+    with pytest.raises(ValueError, match="sticky_spill_seconds"):
+        GatewayRungDispatchPolicy(concurrency_bound=8, fresh_session_spill_fraction=0.85)
     for fraction in (0.0, 1.0):
         with pytest.raises(ValueError):
             GatewayRungDispatchPolicy(concurrency_bound=8, fresh_session_spill_fraction=fraction)

@@ -125,7 +125,10 @@ class GatewayRungDispatchPolicy(ContractModel):
     in-flight dispatches reach ``concurrency_bound * fraction``
     (``fresh_session_spill``), reserving the top slice of the bound for warm
     sessions, which shed only at the hard bound. ``None`` disables the early
-    threshold. Requires ``concurrency_bound``.
+    threshold. Requires ``concurrency_bound`` AND ``sticky_spill_seconds``:
+    warm standing IS a live sticky binding, so without a binding lifetime
+    every session would stay fresh forever and the reserved top slice would be
+    reachable only through force admission.
     """
     sticky_spill_seconds: int | None = Field(default=None, ge=1)
     """How long one conversation stays bound to the rung that served it.
@@ -152,6 +155,13 @@ class GatewayRungDispatchPolicy(ContractModel):
             raise ValueError("fair_share requires a concurrency_bound to share")
         if self.cache_priority_alpha is not None and not self.fair_share:
             raise ValueError("cache_priority_alpha requires fair_share to weight")
-        if self.fresh_session_spill_fraction is not None and self.concurrency_bound is None:
-            raise ValueError("fresh_session_spill_fraction requires a concurrency_bound")
+        if self.fresh_session_spill_fraction is not None:
+            if self.concurrency_bound is None:
+                raise ValueError("fresh_session_spill_fraction requires a concurrency_bound")
+            if self.sticky_spill_seconds is None:
+                raise ValueError(
+                    "fresh_session_spill_fraction requires sticky_spill_seconds: warm "
+                    "standing is a live sticky binding, so without one every session "
+                    "stays fresh and the reserved slice is unreachable"
+                )
         return self

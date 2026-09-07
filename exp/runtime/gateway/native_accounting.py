@@ -932,6 +932,10 @@ class NativeAttemptAccounting:
             self._accounting_healthy = False
             return False
         self._record_health(entry, attempt_id, opened=False, failure=failure)
+        # A retained settlement that finally lands through the sweep carries
+        # the same observed usage as the direct path, so the cache-priority
+        # EWMA must not depend on WHICH recovery path succeeded.
+        self._record_cache_fraction(entry, attempt_id, terminal.usage)
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)

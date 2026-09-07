@@ -125,6 +125,7 @@ class _RecordingLedger:
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
+        self.fail_finishes = 0
         self._counter = 0
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
@@ -185,6 +186,9 @@ class _RecordingLedger:
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart."""
         del terminal_event, first_token_at
+        if self.fail_finishes > 0:
+            self.fail_finishes -= 1
+            raise RuntimeError("scripted terminal-write failure")
         self.finished.append(
             {
                 "attempt_id": attempt_id,
@@ -1229,7 +1233,7 @@ class TestRateLimitSettlement:
                     "attempt_id": str(started["attempt_id"]),
                     "outcome": "completed",
                     "usage": {
-                        "input_tokens": 200,
+                        "input_tokens": 1_000,
                         "cached_input_tokens": 800,
                         "output_tokens": 5,
                     },
@@ -1240,7 +1244,61 @@ class TestRateLimitSettlement:
                 }
             )
         )
-        assert recorded == [(("deployment-a", "b" * 64), "organization-one", 800, 200)]
+        assert recorded == [(("deployment-a", "b" * 64), "organization-one", 800, 1_000)]
+
+    def test_swept_retained_settlement_still_records_the_cache_fraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A settlement recovered by the sweep feeds the EWMA like a direct one."""
+        recorded: list[tuple[tuple[str, str], str, int, int]] = []
+        registry, ledger, _entry = _registry()
+
+        def _record(
+            key: tuple[str, str],
+            organization_id: str,
+            *,
+            cached_tokens: int,
+            input_tokens: int,
+        ) -> None:
+            """Record one EWMA sample instead of folding it."""
+            recorded.append((key, organization_id, cached_tokens, input_tokens))
+
+        monkeypatch.setattr(registry.loads, "record_settle", _record)
+        started = _start(registry, ordinal=0)
+        ledger.fail_finishes = 1
+        settlement = json.dumps(
+            {
+                "request_id": "request-one",
+                "attempt_id": str(started["attempt_id"]),
+                "outcome": "completed",
+                "usage": {
+                    "input_tokens": 1_000,
+                    "cached_input_tokens": 800,
+                    "output_tokens": 5,
+                },
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+                "rate_limit_headers": {"x-ratelimit-remaining-requests": "9999"},
+            }
+        )
+        with pytest.raises(NativeBridgeError):
+            registry.settle(settlement)
+        assert recorded == []
+        registry.sweep_expired()
+        assert recorded == [(("deployment-a", "b" * 64), "organization-one", 800, 1_000)]
+        # The harvested rate-limit values ride the swept write too.
+        assert ledger.rate_limit_settlements == [
+            {
+                "attempt_id": str(started["attempt_id"]),
+                "retry_after_seconds": None,
+                "ratelimit_limit_requests": None,
+                "ratelimit_remaining_requests": 9_999,
+                "ratelimit_limit_tokens": None,
+                "ratelimit_remaining_tokens": None,
+            }
+        ]
 
 
 class TestStickySpillBindings:

@@ -427,12 +427,14 @@ class RungLoadRegistry:
             key: Physical rung identity.
             organization_id: The settling organization.
             cached_tokens: Provider-reported cached input tokens.
-            input_tokens: Provider-reported (uncached) input tokens.
+            input_tokens: Provider-reported TOTAL input tokens, which already
+                include the cached ones (the same semantics settlement billing
+                subtracts against), so the fraction is cached over total,
+                clamped in case a provider ever reports cached past total.
         """
-        denominator = cached_tokens + input_tokens
-        if denominator <= 0:
+        if input_tokens <= 0:
             return
-        sample = cached_tokens / denominator
+        sample = min(cached_tokens, input_tokens) / input_tokens
         now = self._clock()
         with self._lock:
             # A long stream can settle after its organization's request-recency

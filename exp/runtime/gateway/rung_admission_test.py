@@ -354,7 +354,7 @@ class TestCachePriority:
         now = [0.0]
         registry = _registry(now)
         assert isinstance(_reserve(registry, "org-a", bound=8, fair_share=True), str)
-        registry.record_settle(_KEY, "org-a", cached_tokens=800, input_tokens=200)
+        registry.record_settle(_KEY, "org-a", cached_tokens=800, input_tokens=1_000)
         # Zero-token settles record nothing; the seeded estimate stands.
         registry.record_settle(_KEY, "org-a", cached_tokens=0, input_tokens=0)
         now[0] = 600.0
@@ -397,7 +397,7 @@ class TestCachePriority:
                 assert isinstance(ticket, str)
                 if organization == "org-cold":
                     cold_tickets.append(ticket)
-        registry.record_settle(_KEY, "org-cache", cached_tokens=1_000, input_tokens=0)
+        registry.record_settle(_KEY, "org-cache", cached_tokens=1_000, input_tokens=1_000)
         now[0] = 1.0
         registry.release_ticket(cold_tickets[0])
         # The cold organization cannot reclaim its own freed slot...
@@ -421,7 +421,7 @@ class TestCachePriority:
                 assert isinstance(ticket, str)
                 if organization == "org-cold":
                     cold_tickets.append(ticket)
-        registry.record_settle(_KEY, "org-cache", cached_tokens=1_000, input_tokens=0)
+        registry.record_settle(_KEY, "org-cache", cached_tokens=1_000, input_tokens=1_000)
         now[0] = 1.0
         registry.release_ticket(cold_tickets[0])
         # Base weights: org-cache is above its 4-slot share and the freed slot
