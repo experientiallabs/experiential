@@ -33,17 +33,41 @@ def worst_case_attempt_tokens(
     their byte-bounded input and zero output; a completion reserves its
     byte-bounded input (plus replayed-carrier bytes) and its clamped max output.
     """
+    return worst_case_input_tokens(request), worst_case_output_tokens(request, deployment)
+
+
+def worst_case_input_tokens(request: ServingRequest) -> int:
+    """Byte-bounded worst-case input tokens for one request.
+
+    Deployment-independent, and the only expensive half of the estimate (it
+    serializes the whole request), so a ladder walk computes it once and pairs
+    it with each candidate's cheap output clamp.
+    """
+    input_tokens = len(canonical_json_bytes(request))
     match request:
         case EmbeddingsRequest() | ImagesRequest():
-            return len(canonical_json_bytes(request)), 0
+            return input_tokens
         case GatewayRequest():
-            input_tokens = len(canonical_json_bytes(request))
             # Excluded provider carriers (replayed reasoning, native items,
             # verbatim configs) are provider-read input the plain serialization
             # misses; their envelope bytes keep the bound an upper bound.
             replay_envelope = provider_replay_authority(request)
             if replay_envelope is not None:
                 input_tokens += len(canonical_json_bytes(replay_envelope))
+            return input_tokens
+        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+            assert_never(request)
+
+
+def worst_case_output_tokens(
+    request: ServingRequest,
+    deployment: ExactModelDeployment,
+) -> int:
+    """Worst-case output tokens one deployment could emit for this request."""
+    match request:
+        case EmbeddingsRequest() | ImagesRequest():
+            return 0
+        case GatewayRequest():
             output_tokens = request.maximum_output_tokens
             deployment_ceiling = (
                 deployment.capabilities.maximum_output_tokens
@@ -70,6 +94,6 @@ def worst_case_attempt_tokens(
                     if context_window is not None
                     else DEFAULT_RESERVATION_OUTPUT_TOKENS
                 )
-            return input_tokens, output_tokens
+            return output_tokens
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)

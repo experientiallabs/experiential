@@ -20,7 +20,7 @@ from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.attempt_tokens import worst_case_attempt_tokens
+from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
@@ -427,6 +427,9 @@ class NativeAttemptAccounting:
         # manufacture a failure unbounded admission would not have had.
         policy_sheds: list[tuple[int, str]] = []
         forced_overflow = False
+        # The input half of the worst-case reservation serializes the whole
+        # request, so it is computed once per ladder walk, never per candidate.
+        reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             if candidate is None:
                 if policy_sheds and last_failure is None and not forced_overflow:
@@ -447,9 +450,7 @@ class NativeAttemptAccounting:
             # rate limits, soft) count these dispatched reservations, and the
             # rung's own authored token window counts the same conservative
             # bound, so a concurrent burst binds instead of leaking past caps.
-            reserved_input_tokens, reserved_output_tokens = worst_case_attempt_tokens(
-                entry.request, deployment
-            )
+            reserved_output_tokens = worst_case_output_tokens(entry.request, deployment)
             ticket = self._reserve_rung_slot(
                 entry,
                 deployment,
