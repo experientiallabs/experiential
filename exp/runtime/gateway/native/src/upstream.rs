@@ -226,7 +226,8 @@ pub async fn open_stream(
                 )
                 .with_retry(false, false)
                 .with_rejected_parameter(parameter)
-                .with_provider_detail(detail));
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
             }
             return Err(failure);
         }
