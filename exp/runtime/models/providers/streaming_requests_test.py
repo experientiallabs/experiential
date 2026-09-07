@@ -2662,7 +2662,9 @@ def test_assistant_prefill_narrows_out_rungs_whose_model_rejects_it() -> None:
         model_id="anthropic.claude-fable-5-1-20260901-v1:0",
     )
     relayed = GatewayWireProfile(
-        dialect="openrouter", url="https://openrouter.test", model_id="anthropic/claude-opus-5"
+        dialect="openai_compatible",
+        url="https://openrouter.test",
+        model_id="anthropic/claude-opus-5",
     )
     accepting = GatewayWireProfile(
         dialect="anthropic_messages", url="https://anthropic.test", model_id="claude-sonnet-4-5"
