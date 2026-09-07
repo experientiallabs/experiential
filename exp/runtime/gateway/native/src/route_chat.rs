@@ -28,9 +28,9 @@ use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
-    bearer_key, cached_response, capture_frame, complete_visible_refusal, error_response,
-    escalation_error, finish_stream_terminal, json_response, latin1_header, read_body,
-    send_bounded, settle_stream_end, sse_body_response,
+    bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
+    error_response, escalation_error, finish_stream_terminal, json_response, latin1_header,
+    read_body, send_bounded, settle_stream_end, sse_body_response,
 };
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -121,6 +121,7 @@ pub(crate) async fn chat(
         "body": body_text,
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
+        "client_ip": client_ip(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,

@@ -354,12 +354,11 @@ class _ReadyControlStore:
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Authorize only an alias revision this process can serve, reloading once on drift.
 
-        A revision retired by a concurrent activation stays authorized while its retained
-        catalogs can still serve it, so a request whose SQLite authority was minted an instant
-        before the swap is pinned to its revision instead of being rejected at the swap boundary.
+        An authority minted just before an activation swap is pinned to its revision, not rejected.
         """
         authorization = self.store.authorize_request(
             raw_key=raw_key,
@@ -368,6 +367,7 @@ class _ReadyControlStore:
             deadline_monotonic=deadline_monotonic,
             app_referer=app_referer,
             app_title=app_title,
+            client_ip=client_ip,
         )
         served = _serve_or_fallback(self.reloader.state, authorization)
         if served is not None:

@@ -139,6 +139,29 @@ def test_authorization_freezes_revision_scoped_refusal_policy(
     assert snapshot.refusal_failover is refusal_failover
 
 
+def test_authorization_freezes_the_trusted_client_ip(tmp_path: Path) -> None:
+    """The caller IP the native engine resolved from the trusted proxy hop rides
+    onto the frozen snapshot for per-key IP enforcement; absent it, it is None."""
+    store, clock, raw_key = _configured_store(tmp_path)
+
+    with_ip = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request(),
+        deadline_monotonic=clock.monotonic() + 30,
+        client_ip="203.0.113.7",
+    )
+    assert with_ip.client_ip == "203.0.113.7"
+
+    without_ip = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request(),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    assert without_ip.client_ip is None
+
+
 def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(
     tmp_path: Path,
 ) -> None:

@@ -29,8 +29,8 @@ use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
-    bearer_key, complete_visible_refusal, escalation_error, json_response, latin1_header_list,
-    read_body, send_bounded, settle_stream_end, sse_body_response,
+    bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
+    latin1_header_list, read_body, send_bounded, settle_stream_end, sse_body_response,
 };
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -128,6 +128,7 @@ pub(crate) async fn messages(
         "body": body_text,
         "surface": "messages",
         "anthropic_beta": anthropic_beta,
+        "client_ip": client_ip(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,

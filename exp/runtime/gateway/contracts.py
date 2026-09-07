@@ -901,6 +901,12 @@ class AuthorizationSnapshot(ContractModel):
     attribution_label: str | None = Field(default=None, max_length=1024)
     """End-user attribution from the OpenAI ``safety_identifier`` (or deprecated
     ``user``) request field: content-free and never a credential."""
+    client_ip: str | None = Field(default=None, max_length=45)
+    """Caller IP from the TRUSTED proxy hop (``X-Real-IP``, else the RIGHTMOST
+    ``X-Forwarded-For`` entry; never the leftmost, which is client-forgeable),
+    for per-key IP allow/deny enforcement by the hosted authority. Content-free
+    and never a credential; ``None`` when no trusted hop yields an address (an
+    allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
     """Relative weight of this organization for fair-share rung admission.
 
