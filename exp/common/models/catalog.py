@@ -149,12 +149,8 @@ class ConnectionConfig(ContractModel):
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
-    # A native provider (anthropic/openai/gemini/openrouter) uses its built-in
-    # official endpoint by default. Set this to route it through a customer-run
-    # trusted endpoint via ``base_url`` in the SAME wire dialect (e.g. a reseller
-    # that speaks the Anthropic Messages API), preserving the native auth and
-    # response shape. Opt-in and default-off: the caller asserts the origin is
-    # trusted; the fixed-origin guard below stays in force for every other case.
+    # Opt-in: route a native provider (anthropic/openai/gemini/openrouter) through a
+    # customer-run trusted endpoint via ``base_url`` in its own dialect. Default-off.
     trusted_custom_origin: bool = False
 
     @field_validator("api_key_env", "aws_access_key_id_env")
@@ -192,18 +188,13 @@ class ConnectionConfig(ContractModel):
             )
         if self.trusted_custom_origin:
             if self.provider not in _FIXED_ORIGIN_PROVIDERS:
-                raise ValueError(
-                    "trusted_custom_origin applies only to a native provider "
-                    f"({', '.join(sorted(_FIXED_ORIGIN_PROVIDERS))}); "
-                    f"{self.provider!r} already accepts a base_url"
-                )
+                raise ValueError("trusted_custom_origin applies only to a native provider")
             if self.base_url is None:
                 raise ValueError("trusted_custom_origin requires an explicit base_url")
         elif self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
-                "set trusted_custom_origin=True to route it through a trusted custom base_url, "
-                "or use provider='openai-compatible' for an OpenAI-wire custom endpoint"
+                "set trusted_custom_origin=True or use provider='openai-compatible'"
             )
         if self.provider == "azure":
             if self.base_url is None:
@@ -319,10 +310,7 @@ class ConnectionConfig(ContractModel):
             identity["azure_api_surface"] = "model_inference"
         if self.region is not None:
             identity["region"] = self.region
-        if self.trusted_custom_origin:
-            # A trusted custom origin routes a native dialect to a customer host;
-            # it is part of the endpoint identity (only added when set, so an
-            # official-origin connection keeps its pre-existing digest).
+        if self.trusted_custom_origin:  # endpoint identity; added only when set
             identity["trusted_custom_origin"] = True
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (

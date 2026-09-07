@@ -637,6 +637,7 @@ def existing_setup_connections(existing: ModelCatalog | None) -> tuple[ProviderC
             region=connection.region,
             aws_access_key_id_env=connection.aws_access_key_id_env,
             bedrock_auth_mode=connection.bedrock_auth_mode,
+            trusted_custom_origin=connection.trusted_custom_origin,
         )
         for name, connection in sorted(existing.connections.items())
         if connection.provider in SETUP_PROVIDERS
