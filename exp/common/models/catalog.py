@@ -319,6 +319,11 @@ class ConnectionConfig(ContractModel):
             identity["azure_api_surface"] = "model_inference"
         if self.region is not None:
             identity["region"] = self.region
+        if self.trusted_custom_origin:
+            # A trusted custom origin routes a native dialect to a customer host;
+            # it is part of the endpoint identity (only added when set, so an
+            # official-origin connection keeps its pre-existing digest).
+            identity["trusted_custom_origin"] = True
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -353,6 +358,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
             serialized.pop("bedrock_auth_mode", None)
+        if not self.trusted_custom_origin:
+            serialized.pop("trusted_custom_origin", None)
         return serialized
 
 

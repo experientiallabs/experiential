@@ -148,6 +148,7 @@ class ProviderConnectionRevision(ContractModel):
     secret_reference: OpaqueSecretReference | None = None
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    trusted_custom_origin: bool = False
     connection_sha256: Sha256
     active: bool = True
     created_at: AwareDatetime
@@ -576,6 +577,7 @@ class UpsertProviderConnectionCommand(ContractModel):
     secret_reference: OpaqueSecretReference | None = None
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    trusted_custom_origin: bool = False
     replace: bool = False
 
 

@@ -437,6 +437,7 @@ class SQLiteGatewayPlatform:
                         'Literal["access_key_pair", "api_key"]', str(row["bedrock_auth_mode"])
                     )
                 ),
+                trusted_custom_origin=bool(row["trusted_custom_origin"]),
                 connection_sha256=str(row["connection_sha256"]),
                 active=bool(row["active"]) and row["active_revision_id"] == row["revision_id"],
                 created_at=_datetime(row["created_at"]),

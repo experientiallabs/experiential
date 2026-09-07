@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 class GatewaySchemaError(RuntimeError):
@@ -685,6 +685,18 @@ _MIGRATION_17 = (
     "ALTER TABLE gateway_attempts ADD COLUMN counterfactual_cost_micro_usd INTEGER",
 )
 
+# v18: a native provider (anthropic/openai/gemini/openrouter) may carry a
+# custom base_url when trusted_custom_origin is set, so the flag rides the
+# revision alongside base_url or a reconstructed connection defaults it to 0
+# and the fixed-origin validator rejects the reload.
+_MIGRATION_18 = (
+    """
+    ALTER TABLE provider_connection_revisions
+    ADD COLUMN trusted_custom_origin INTEGER NOT NULL DEFAULT 0
+    CHECK (trusted_custom_origin IN (0, 1))
+    """,
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -703,6 +715,7 @@ _MIGRATIONS = {
     15: _MIGRATION_15,
     16: _MIGRATION_16,
     17: _MIGRATION_17,
+    18: _MIGRATION_18,
 }
 
 
