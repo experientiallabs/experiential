@@ -902,6 +902,10 @@ mod compatible;
 mod tests;
 
 #[cfg(test)]
+#[path = "openai/relay_finish_tests.rs"]
+mod relay_finish_tests;
+
+#[cfg(test)]
 #[path = "openai/identity_tests.rs"]
 mod identity_tests;
 

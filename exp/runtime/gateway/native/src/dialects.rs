@@ -10,6 +10,8 @@
 mod anthropic;
 mod bedrock;
 mod deferred_tools;
+mod relay_finish;
+pub(in crate::dialects) use relay_finish::finish_open_tools_relay;
 mod gemini;
 mod openai;
 

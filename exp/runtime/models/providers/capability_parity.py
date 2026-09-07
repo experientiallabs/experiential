@@ -148,9 +148,10 @@ def deployment_capability_parity(
         supports_streaming=capabilities.supports_streaming,
         supports_developer_messages=capabilities.supports_developer_messages,
         supports_strict_tools=capabilities.supports_strict_tools,
-        supports_forced_tool_choice=not (
-            dialect == "anthropic_messages" and anthropic_rejects_forced_tool_choice(model_id)
-        ),
+        # The model's own rule on every wire: a relay (OpenRouter, Azure)
+        # forwards Anthropic's 400 unchanged, so scoping this to the native
+        # dialect only let relayed rungs dispatch a request known to fail.
+        supports_forced_tool_choice=not anthropic_rejects_forced_tool_choice(model_id),
         supports_parallel_tool_calls=capabilities.supports_parallel_tool_calls,
         supports_structured_text=capabilities.supports_structured_text,
         supports_stop_sequences=capabilities.supports_stop_sequences,

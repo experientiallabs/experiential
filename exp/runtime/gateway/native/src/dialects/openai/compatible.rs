@@ -5,7 +5,7 @@
 use serde_json::Value;
 
 use super::super::{
-    finish_open_tools, finish_open_tools_truncated, malformed, parse_object, Normalizer,
+    finish_open_tools_relay, finish_open_tools_truncated, malformed, parse_object, Normalizer,
 };
 use crate::errors::Failure;
 use crate::events::{openai_compatible_usage, require_string, require_u64, Event, ToolAccumulator};
@@ -23,12 +23,15 @@ impl Normalizer {
             // with the truncated call dropped, exactly what the caller must
             // act on (raise max_tokens), never as a 502. Live shape: Tencent
             // TokenHub glm-5.3 at max_tokens=32 streamed `{"` + `city` then
-            // finished with length (staging, 2026-09-03). Any other finish
-            // keeps the strict contract: unparsable arguments are malformed.
-            let mut events = if finish == Some("length") {
-                finish_open_tools_truncated(&mut self.tools)?
+            // finished with length (staging, 2026-09-03). Under any other
+            // finish a relay may still close a call mid-fragment
+            // (finish_open_tools_relay): that cut call is dropped and the turn
+            // settles Incomplete too; a syntax error inside the arguments
+            // keeps the strict contract and stays malformed.
+            let (mut events, cut_mid_fragment) = if finish == Some("length") {
+                (finish_open_tools_truncated(&mut self.tools)?, false)
             } else {
-                finish_open_tools(&mut self.tools)?
+                finish_open_tools_relay(&mut self.tools)?
             };
             if let Some(usage) = self.usage.take() {
                 events.push(Event::Usage(usage));
@@ -43,7 +46,7 @@ impl Normalizer {
                     _ => crate::errors::RefusalReason::Unspecified,
                 };
                 events.push(Event::Failed(Failure::refusal(reason)));
-            } else if finish == Some("length") {
+            } else if finish == Some("length") || cut_mid_fragment {
                 events.push(Event::Incomplete);
             } else {
                 events.push(Event::Completed);

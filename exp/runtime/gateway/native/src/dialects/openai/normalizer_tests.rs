@@ -598,30 +598,6 @@ fn a_complete_tool_call_still_completes_when_the_budget_ends_the_stream() {
 }
 
 #[test]
-fn unparsable_tool_arguments_stay_malformed_on_a_normal_finish() {
-    // The strict contract holds whenever the provider claims it finished the
-    // call: a `tool_calls`/`stop` terminal with a dangling fragment is still a
-    // malformed stream, never silently dropped.
-    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
-    normalizer
-        .feed(&compatible_chunk(
-            serde_json::json!({"tool_calls": [{
-                "index": 0, "id": "call_1", "type": "function",
-                "function": {"name": "get_weather", "arguments": "{\"city"},
-            }]}),
-            Some("tool_calls"),
-        ))
-        .expect("tool chunk must normalize");
-    let failure = normalizer
-        .feed(&SseEvent {
-            event: None,
-            data: "[DONE]".to_string(),
-        })
-        .expect_err("a dangling fragment on a normal finish is malformed");
-    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
-}
-
-#[test]
 fn namespaced_function_call_round_trips_namespace_through_the_stream() {
     // Codex agent tools (e.g. spawn_agent) arrive as namespaced function
     // calls; the provider rejects a replay of the item without its

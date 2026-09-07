@@ -2692,9 +2692,11 @@ def test_assistant_prefill_narrows_out_rungs_whose_model_rejects_it() -> None:
 
 
 def test_mid_conversation_system_stays_positional_on_capable_wires() -> None:
-    """A system turn after conversation start keeps its position on the
-    Anthropic and OpenAI wires and narrows out instruction-hoisting rungs
-    (Claude Code appends one by default; accepted live 2026-08-30)."""
+    """A system turn after conversation start keeps its position: as user text
+    on the Anthropic wire (a `system` role inside `messages` is refused there
+    unless it directly precedes an assistant turn or ends the array, and
+    haiku-4-5 refuses it outright; live 2026-09-07), verbatim on the OpenAI
+    wires, and it narrows out instruction-hoisting rungs."""
     request = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,
         messages=(
@@ -2707,9 +2709,15 @@ def test_mid_conversation_system_stays_positional_on_capable_wires() -> None:
     )
     payload = anthropic_messages_stream_payload("claude-fable-5", request)
     assert payload["system"] == "lead instructions"
+    # The mid-conversation instruction merges into the adjacent user turn.
     assert payload["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-        {"role": "system", "content": [{"type": "text", "text": "answer in uppercase"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "text", "text": "answer in uppercase"},
+            ],
+        },
     ]
 
     responses = openai_responses_stream_payload(
