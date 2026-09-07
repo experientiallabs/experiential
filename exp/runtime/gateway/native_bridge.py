@@ -46,7 +46,6 @@ from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
-    gateway_updating_failure,
     record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_accounting import (
@@ -110,6 +109,7 @@ from exp.runtime.gateway.native_responses import (
 )
 from exp.runtime.gateway.native_rungs import build_rung_dispatch
 from exp.runtime.gateway.native_settlement import (
+    gateway_updating_failure,
     optional_text,
 )
 from exp.runtime.gateway.reasoning_carrier import (
@@ -513,13 +513,15 @@ class NativeControlPlane(
         try:
             if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
-            route, resolved_wires, public_request, provider_request = admitted_route_requests(
-                route,
-                resolved_wires,
-                request,
-                accounting=self._accounting,
-                authorization=authorization,
-                continuation=continuation_context,
+            route, resolved_wires, public_request, provider_request, placement = (
+                admitted_route_requests(
+                    route,
+                    resolved_wires,
+                    request,
+                    accounting=self._accounting,
+                    authorization=authorization,
+                    continuation=continuation_context,
+                )
             )
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
@@ -640,6 +642,8 @@ class NativeControlPlane(
                     profile.forwards_tier(provider_request.service_tier)
                     for profile, _client in resolved_wires
                 ),
+                affinity_fingerprint=placement.fingerprint,
+                sticky_preferred=placement.sticky_preferred,
             )
         )
         response: JsonObject = {

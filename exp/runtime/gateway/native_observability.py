@@ -142,6 +142,7 @@ class NativeObservabilityMixin:
         retained_replayed, abandoned_cancelled, inflight = self._accounting.counters()
         lead_rungs_skipped, dead_rungs_skipped = self._accounting.admission_rung_skips()
         rung_sheds, rung_overflows = self._accounting.rung_admission_counters()
+        rate_limit_sheds, fresh_session_spills = self._accounting.rung_rate_counters()
         control_plane: JsonObject = {
             "sweep_retained_settlements_replayed": retained_replayed,
             "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
@@ -150,6 +151,13 @@ class NativeObservabilityMixin:
             "admission_parameter_coercions": self._accounting.admission_parameter_coercions(),
             "rung_admission_sheds": rung_sheds,
             "rung_saturated_overflows": rung_overflows,
+            "rung_rate_limit_sheds": rate_limit_sheds,
+            "rung_fresh_session_spills": fresh_session_spills,
+            "sticky_spill_bindings": self._accounting.sticky.size(),
+            # Live learned request ceilings keyed by rung (JSON snapshot only;
+            # the Prometheus rendering stays worker-global counters so no
+            # per-rung label cardinality is exported).
+            "rung_learned_ceilings": self._accounting.loads.learned_ceilings(),
             "inflight_attempts": inflight,
             "reconciled_expired_requests": self._components.reconciled_expired_requests,
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,

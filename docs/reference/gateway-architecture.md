@@ -219,19 +219,68 @@ A rung may author a `GatewayRungDispatchPolicy` on its gateway metadata (all fie
 default). Its `concurrency_bound` is a per-worker in-flight cap enforced by pure in-process
 counters at the same pre-dispatch point: a rung at its bound is bypassed sideways to the next
 claimable rung (spill in seconds) instead of queueing at the deployment until the request
-deadline. With `fair_share: true` (which requires the bound), a contended rung additionally
+deadline. `requests_per_minute` and `tokens_per_minute` (each usable without the bound) cap the
+rung's sliding 60-second dispatch window the same way, shedding a reservation the window cannot
+absorb sideways as `rate_limit` BEFORE the provider answers 429; token accounting counts each
+dispatch's conservative worst-case reserved input plus output tokens at reservation, with a
+burst allowance admitting a single over-cap reservation into an EMPTY window (a prompt whose
+worst case exceeds the whole per-worker cap must stay admissible, then blocks the window until
+it slides out). The working
+request ceiling is additionally calibrated passively per worker: a provider throttle settlement
+clamps a learned ceiling to ninety percent of the rate observed in the window at that moment,
+every unthrottled recovery minute creeps it back up by five percent (at least one request, capped
+at the authored rate when one exists; each creep step is the probe that rediscovers headroom, so
+no synthetic traffic is ever sent), and a ceiling unthrottled for six hours is forgotten. The
+learned ceiling is a float and may sit below one request per minute: per-worker ceilings
+multiply across the fleet, and some provider accounts allow less than one request per worker
+per minute. With
+`fair_share: true` (which requires the bound), a contended rung additionally
 limits each organization to its weighted max-min share of the bound; weights arrive per request
 on `AuthorizationSnapshot.fair_share_weight` (default 1) from the hosted store, capacity below
 the bound is always borrowable (a lone organization uses the whole rung), freed slots are
 reserved for recently active under-share organizations, and running dispatches are never
-preempted. A ladder whose every remaining rung was bypassed only by these policies force-admits
-past the bound rather than manufacturing a failure unbounded admission would not have had.
+preempted. With `cache_priority_alpha` authored on a fair-share rung, each organization's
+effective weight becomes `weight * (1 + alpha * congestion * cached_fraction)`, where congestion
+is the rung's in-flight total over its bound and the cached fraction is the worker's time-decayed
+EWMA (half-life roughly ten minutes) of the organization's settled cached-token share on that
+rung, so at the contended margin traffic that reuses warm provider cache is admitted ahead of
+equal-weight cold traffic. A ladder whose every remaining rung was bypassed only by these
+policies force-admits past the bound rather than manufacturing a failure unbounded admission
+would not have had.
 Every policy-routed dispatch is disclosed on its attempt row: `dispatch_reason` (`affinity`,
-`fair_share_shed`, `queue_bound`, `rung_dead`, `saturated_overflow`), the bypassed
+`affinity_sticky`, `fair_share_shed`, `queue_bound`, `rate_limit`, `fresh_session_spill`,
+`rung_dead`, `saturated_overflow`), the bypassed
 `preferred_deployment_id` with its frozen base token rates, and at settle a
 `counterfactual_cost_micro_usd` pricing the same observed usage at those preferred rates, so
-cost optimality is measurable from the ledger alone. Pools and rungs that author none of this
-keep byte-identical behavior and null disclosure columns.
+cost optimality is measurable from the ledger alone. Settlement also persists the provider's own
+rate-limit response headers per attempt when the data plane harvests them (`retry-after` plus the
+OpenAI `x-ratelimit-*` and Anthropic `anthropic-ratelimit-*` families, normalized to integers),
+and a throttled settlement carrying a parseable `Retry-After` (seconds or HTTP-date) sizes that
+deployment's throttle window from it, clamped to [5s, 6h], instead of the fixed default, so a
+daily-quota reset actually suppresses the rung for the wait the provider asked for. Pools and
+rungs that author none of this keep byte-identical behavior and null disclosure columns.
+
+Under `maximize_cache_affinity`, two further per-rung fields keep provider prompt caches warm
+across spills. `sticky_spill_seconds` gives each dispatch a worker-local
+fingerprint-to-deployment binding with that lifetime (refreshed per hit, but capped at four
+lifetimes of total age from creation so continuous hits cannot pin a long-running session to a
+pricier spill rung forever): the binding is honored
+ahead of rendezvous order on later requests, so a spilled conversation keeps serving off the rung
+holding its warm cache instead of bouncing back the moment the preferred rung stops shedding, and
+a binding whose rung is throttled or circuit-open is cleared rather than followed. The binding is
+deliberately worker-local (the serving edge's keep-alives pin a client to one worker; the
+cross-worker miss costs one cold dispatch). The binding keys on the affinity fingerprint (the
+session identity rendezvous already uses), never on a derived provider cache key: on
+OpenAI-compatible shim lanes (including Experiential Cloud's vLLM boxes) no `prompt_cache_key` is
+forwarded and the box's prefix cache is content-addressed, so gateway-side session-to-rung
+consistency is the entire cache-preservation mechanism there. `fresh_session_spill_fraction`
+reserves the top slice
+of a bounded rung for warm sessions: a request whose fingerprint holds no live binding on the
+rung sheds sideways once in-flight dispatches reach `bound * fraction` (`fresh_session_spill`),
+while warm sessions ride to the hard bound (it requires `sticky_spill_seconds`, because warm
+standing IS a live binding). A hosted composition may also exclude individual attempts from the
+cache-priority EWMA through the accounting's `cache_sample_gate` (promotion-funded replay must
+not buy fair-share weight with prefixes the promotion already made costless).
 
 A deployment's price schedule may declare a long-context tier: a whole-request premium applied
 once provider-reported input tokens reach its threshold, matching both published tier schedules

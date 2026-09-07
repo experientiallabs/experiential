@@ -12,6 +12,7 @@ use crate::param_attribution::{
     rejected_caller_reference_not_found, rejected_code, rejected_detail, rejected_model_not_found,
     rejected_parameter,
 };
+use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
@@ -170,7 +171,14 @@ pub async fn open_stream(
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        let failure = transport_failure(Some(status));
+        // Rate-limit facts are read off the headers before anything consumes
+        // the response: a 429's `retry-after` and remaining-quota counts ride
+        // the failure into settlement (never to the caller), where the
+        // control plane sizes throttle windows and persists them per attempt.
+        let rate_limit = harvest_rate_limit_headers(response.headers());
+        let retry_after = retry_after_seconds(response.headers());
+        let failure =
+            transport_failure(Some(status)).with_rate_limit_facts(rate_limit.clone(), retry_after);
         // Only the generic client-error class may carry attribution: the body
         // is read bounded, and the relayable facts are a validated parameter
         // path plus the provider's own bounded explanation of what the caller
@@ -218,7 +226,8 @@ pub async fn open_stream(
                 )
                 .with_retry(false, false)
                 .with_rejected_parameter(parameter)
-                .with_provider_detail(detail));
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
             }
             return Err(failure);
         }
@@ -232,7 +241,8 @@ pub async fn open_stream(
                     "provider does not route this model for the gateway's account; ask \
                      the gateway operator to change or disable the lane",
                 )
-                .with_retry(false, true));
+                .with_retry(false, true)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
             }
             return Err(failure);
         }
@@ -243,7 +253,9 @@ pub async fn open_stream(
             .as_deref()
             .is_some_and(|body| rejected_model_not_found(dialect, body))
         {
-            return Err(transport_failure(Some(404)));
+            return Err(
+                transport_failure(Some(404)).with_rate_limit_facts(rate_limit.clone(), retry_after)
+            );
         }
         let parameter = body
             .as_deref()
@@ -274,7 +286,9 @@ pub async fn open_stream(
         // sentence saying "blocked by" could be about a firewall or a limit.
         if crate::stream_errors::is_refusal_code(code.as_deref()) {
             let reason = crate::stream_errors::refusal_reason(code.as_deref(), None);
-            return Err(Failure::refusal(reason).with_provider_detail(detail));
+            return Err(Failure::refusal(reason)
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
         }
         // A sentence naming a limitation of THIS lane's serving stack (a chat
         // template that rejects a mid-conversation system turn the OpenAI

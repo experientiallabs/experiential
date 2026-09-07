@@ -459,6 +459,11 @@ class SQLiteAttemptLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -468,6 +473,12 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from the response's
+                ``Retry-After`` header, when one was harvested.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -477,6 +488,11 @@ class SQLiteAttemptLedger:
                 failure=failure,
                 finalize_request=finalize_request,
                 first_token_at=first_token_at,
+                retry_after_seconds=retry_after_seconds,
+                ratelimit_limit_requests=ratelimit_limit_requests,
+                ratelimit_remaining_requests=ratelimit_remaining_requests,
+                ratelimit_limit_tokens=ratelimit_limit_tokens,
+                ratelimit_remaining_tokens=ratelimit_remaining_tokens,
             )
 
     def apply_finish_attempt(
@@ -488,6 +504,11 @@ class SQLiteAttemptLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -498,6 +519,12 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from the response's
+                ``Retry-After`` header, when one was harvested.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
         """
         state, normalized_failure, failure_message, usage = _terminal_values(
             terminal_event, failure
@@ -570,7 +597,10 @@ class SQLiteAttemptLedger:
                 input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
                 reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
                 counterfactual_cost_micro_usd = ?,
-                budget_settled_micro_usd = ?
+                budget_settled_micro_usd = ?,
+                retry_after_seconds = ?, ratelimit_limit_requests = ?,
+                ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
+                ratelimit_remaining_tokens = ?
             WHERE attempt_id = ? AND state = 'dispatched'
             """,
             (
@@ -587,6 +617,11 @@ class SQLiteAttemptLedger:
                 cost,
                 counterfactual_cost,
                 budget_settlement,
+                retry_after_seconds,
+                ratelimit_limit_requests,
+                ratelimit_remaining_requests,
+                ratelimit_limit_tokens,
+                ratelimit_remaining_tokens,
                 attempt_id,
             ),
         )

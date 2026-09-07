@@ -14,15 +14,13 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import threading
 import time
 from collections.abc import Callable
-from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.attempt_tokens import worst_case_attempt_tokens
+from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
@@ -35,6 +33,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayUsage,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_components import SyncWriteLedger
@@ -43,19 +42,26 @@ from exp.runtime.gateway.native_execution import (
     InflightRequest,
     claim_route_from,
     deployment_health_key,
+    deployment_priced_for_service_tier,
+    dispatch_disclosure,
     next_route_candidate,
+    rung_load_key,
 )
 from exp.runtime.gateway.native_settlement import (
+    all_routes_throttled_failure,
+    all_routes_unavailable_failure,
+    budget_quota_failure,
     budget_quota_protocol_error,
+    failure_from_boundary_payload,
     first_token_at_from_settlement,
     ledger_failure,
-    refusal_reason_from_payload,
+    settlement_rate_limit,
     terminal_from_settlement,
 )
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.rate_limit_headers import RateLimitObservation
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
+from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import (
-    THROTTLED_RETRY_AFTER_SECONDS,
     OpenAIProtocolError,
     public_failure_error,
 )
@@ -111,121 +117,6 @@ def internal_protocol_error() -> OpenAIProtocolError:
     )
 
 
-def budget_quota_failure() -> GatewayFailure:
-    """Return the sanitized quota failure after no route can reserve its cost."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.QUOTA_EXCEEDED,
-        safe_message="monthly gateway allocation is exhausted",
-    )
-
-
-def all_routes_unavailable_failure() -> GatewayFailure:
-    """Return the sanitized terminal failure for an exhausted certified pool."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
-        safe_message="all exact-model deployments are unavailable",
-    )
-
-
-def all_routes_throttled_failure(remaining_seconds: float) -> GatewayFailure:
-    """Return the throttle-window failure for a route the provider backed off.
-
-    Every deployment sitting inside a provider throttle window is caller-facing
-    rate limiting (the provider answered 429 and asked for backoff), not
-    platform deadness: classing it provider_internal misfiled 429 storms as
-    outages and paged operators for caller-driven load (2026-09-04 ledger,
-    deepseek-v4-flash-vision-exp). One computed wait (the remaining window,
-    floored at the default throttle backoff) rides both the message and
-    ``retry_after_seconds`` so the Retry-After header a client honors never
-    disagrees with the sentence it reads.
-
-    Args:
-        remaining_seconds: Longest remaining throttle window across the route.
-
-    Returns:
-        Sanitized throttled failure naming the retry window.
-    """
-    seconds = max(THROTTLED_RETRY_AFTER_SECONDS, math.ceil(remaining_seconds))
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.THROTTLED,
-        safe_message=(
-            "all exact-model deployments are inside a provider throttle window; "
-            f"retry in {seconds}s"
-        ),
-        retry_after_seconds=seconds,
-    )
-
-
-def gateway_updating_failure() -> GatewayFailure:
-    """Return the sanitized retryable failure for a transient roll condition.
-
-    A pod that cannot build the authorized catalog revision during a rolling
-    deploy (a snapshot authored by another engine version it cannot reconcile)
-    surfaces this instead of a closed INTERNAL: the condition clears on its own
-    once the roll settles, so the honest answer is a retryable 503, never a bug
-    signal that pages or opens a deployment circuit.
-    """
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.UNAVAILABLE,
-        safe_message="the gateway is updating; retry the request",
-    )
-
-
-def _failure_from_payload(payload: object) -> GatewayFailure | None:
-    """Parse one optional classified failure from a boundary payload."""
-    if not isinstance(payload, dict):
-        return None
-    data = cast("JsonObject", payload)
-    rejected_parameter = data.get("rejected_parameter")
-    provider_detail = data.get("provider_detail")
-    return GatewayFailure(
-        failure_class=GatewayFailureClass(str(data["failure_class"])),
-        safe_message=str(data["safe_message"]),
-        retryable_same_deployment=bool(data.get("retryable_same_deployment", False)),
-        failover_eligible=bool(data.get("failover_eligible", False)),
-        rejected_parameter=(
-            rejected_parameter
-            if isinstance(rejected_parameter, str) and rejected_parameter
-            else None
-        ),
-        provider_detail=(
-            provider_detail if isinstance(provider_detail, str) and provider_detail else None
-        ),
-        customer_owned=data.get("customer_owned") is True,
-        refusal_reason=refusal_reason_from_payload(data.get("refusal_reason")),
-    )
-
-
-def _deployment_priced_for_service_tier(
-    deployment: ExactModelDeployment,
-    service_tier: str | None,
-    *,
-    forwards_tier: bool,
-) -> ExactModelDeployment:
-    """Reprice one deployment for a requested flex/priority processing tier.
-
-    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
-    the tier to its provider and carries a pass-through card for it, the card's
-    rates replace the base schedule on a copy used only for THIS reservation, so
-    the ceiling, the stored per-token rates, and settlement all bill the tier
-    transparently. ``forwards_tier`` is the admission-time forwarding decision
-    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
-    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
-    wire would strip the tier (non-tier dialect, tier disabled) — such a depth
-    runs the provider's base schedule, so it must bill the base schedule too. No
-    tier, no forwarding, or no card returns the deployment unchanged. The copy
-    stays Python-side and never crosses the native boundary.
-    """
-    if not forwards_tier:
-        return deployment
-    effective = deployment.gateway.prices.for_service_tier(service_tier)
-    if effective is deployment.gateway.prices:
-        return deployment
-    return deployment.model_copy(
-        update={"gateway": deployment.gateway.model_copy(update={"prices": effective})}
-    )
-
-
 class NativeAttemptAccounting:
     """Registry of admitted requests and their durable attempt settlements.
 
@@ -241,6 +132,7 @@ class NativeAttemptAccounting:
         write_ledger: SyncWriteLedger,
         *,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
+        cache_sample_gate: Callable[[str], bool] | None = None,
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -248,16 +140,30 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation.
+            cache_sample_gate: Optional hosted predicate deciding whether one
+                settled attempt (by attempt id) may feed the cache-priority
+                EWMA. The hosted store knows which attempts are promo-funded;
+                admitting those samples would let free-tier replay traffic
+                (whose cached prefixes are costless under a promotion) buy
+                fair-share weight with the very replay the promotion already
+                subsidizes. ``None`` admits every sample; a raising gate
+                skips the sample (fails closed).
         """
         self._write_ledger = write_ledger
         self._budget_error_factory = budget_error_factory
+        self._cache_sample_gate = cache_sample_gate
         # The native waterfall's deployment-health circuits, revision-scoped
         # to the traffic this plane serves.
         self._health = DeploymentHealthRegistry()
-        # Per-worker in-flight counters for rungs that author a dispatch
-        # policy (concurrency bound, weighted fair share); pure in-memory
-        # arithmetic, physical-lane scoped so counters survive catalog rolls.
+        # Per-worker in-flight counters and rate windows for rungs that author
+        # a dispatch policy (concurrency bound, rate caps, weighted fair
+        # share); pure in-memory arithmetic, physical-lane scoped so counters
+        # survive catalog rolls.
         self._loads = RungLoadRegistry()
+        # Worker-local conversation-to-rung bindings under
+        # maximize_cache_affinity, so a spilled conversation keeps serving off
+        # the rung holding its warm cache instead of bouncing back.
+        self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -269,11 +175,14 @@ class NativeAttemptAccounting:
         self._admission_dead_rungs_skipped = 0
         self._admission_parameter_coercions = 0
         self._admission_lead_rungs_skipped = 0
-        # Dispatch-policy outcomes: rungs bypassed at their bound or their
-        # organization's fair share, and dispatches forced past a bound
-        # because no other rung could serve.
+        # Dispatch-policy outcomes: rungs bypassed at their bound, rate
+        # window, fresh-session threshold, or their organization's fair
+        # share, and dispatches forced past a bound because no other rung
+        # could serve. The per-reason counters split the aggregate.
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
+        self._rung_rate_limit_sheds = 0
+        self._rung_fresh_session_spills = 0
         # The sweep also runs on a timer so retained settlements and abandoned
         # attempts are recovered even when no further requests arrive.
         self._sweeper = threading.Thread(
@@ -298,11 +207,17 @@ class NativeAttemptAccounting:
         """Return the per-worker rung in-flight registry for bounded admission."""
         return self._loads
 
+    @property
+    def sticky(self) -> StickySpillRegistry:
+        """Return the worker-local sticky conversation-to-rung bindings."""
+        return self._sticky
+
     def _reserve_rung_slot(
         self,
         entry: InflightRequest,
         deployment: ExactModelDeployment,
         *,
+        reserved_tokens: int,
         force: bool,
     ) -> str | RungShed | None:
         """Reserve one policy-bounded slot on a rung, or report the shed.
@@ -310,32 +225,78 @@ class NativeAttemptAccounting:
         Args:
             entry: The owning in-flight request (organization and weight).
             deployment: The claimed rung about to dispatch.
-            force: Admit past the bound because no other rung can serve.
+            reserved_tokens: Worst-case tokens this dispatch reserves, counted
+                against the rung's token window when one is authored.
+            force: Admit past every policy limit because no other rung can
+                serve.
 
         Returns:
             An opaque reservation ticket, the shed disclosure, or ``None``
-            when the rung authors no dispatch policy (the untouched default).
+            when the rung authors no admission policy (the untouched default).
         """
         policy = deployment.gateway.dispatch
-        if policy is None or policy.concurrency_bound is None:
+        if policy is None or (
+            policy.concurrency_bound is None
+            and policy.requests_per_minute is None
+            and policy.tokens_per_minute is None
+        ):
             return None
+        # Warm standing: the request's affinity fingerprint holds a live
+        # sticky binding on THIS rung, so its provider cache lives here and
+        # the fresh-session early threshold does not apply to it. The early
+        # threshold only exists on affinity pools AND for requests that carry
+        # a fingerprint (chat/Responses admission): a surface with no session
+        # concept (embeddings, images) must never be classed fresh wholesale.
+        fresh_fraction = (
+            policy.fresh_session_spill_fraction
+            if entry.route.snapshot.failover_mode == "maximize_cache_affinity"
+            and entry.affinity_fingerprint is not None
+            else None
+        )
+        warm_session = True
+        if fresh_fraction is not None and entry.affinity_fingerprint is not None:
+            warm_session = (
+                self._sticky.bound_deployment(entry.affinity_fingerprint)
+                == deployment.deployment_id
+            )
         result = self._loads.reserve(
             (deployment.deployment_id, deployment.connection_sha256),
             organization_id=entry.authorization.organization_id,
             weight=entry.authorization.fair_share_weight,
             bound=policy.concurrency_bound,
             fair_share=policy.fair_share,
+            requests_per_minute=policy.requests_per_minute,
+            tokens_per_minute=policy.tokens_per_minute,
+            cache_priority_alpha=policy.cache_priority_alpha,
+            reserved_tokens=reserved_tokens if policy.tokens_per_minute is not None else 0,
+            warm_session=warm_session,
+            fresh_spill_fraction=fresh_fraction,
             force=force,
         )
         if isinstance(result, RungShed):
             with self._lock:
                 self._rung_admission_sheds += 1
+                if result.reason == "rate_limit":
+                    self._rung_rate_limit_sheds += 1
+                elif result.reason == "fresh_session_spill":
+                    self._rung_fresh_session_spills += 1
+            if result.reason == "rate_limit":
+                _logger.debug(
+                    "gateway rate-limit shed on deployment %r (learned ceiling %s/min)",
+                    deployment.deployment_id,
+                    result.learned_requests_per_minute,
+                )
         return result
 
     def rung_admission_counters(self) -> tuple[int, int]:
         """Return ``(sheds, saturated_overflows)`` for the metrics snapshot."""
         with self._lock:
             return (self._rung_admission_sheds, self._rung_saturated_overflows)
+
+    def rung_rate_counters(self) -> tuple[int, int]:
+        """Return ``(rate_limit_sheds, fresh_session_spills)`` for metrics."""
+        with self._lock:
+            return (self._rung_rate_limit_sheds, self._rung_fresh_session_spills)
 
     def mark_unhealthy(self) -> None:
         """Latch an unhealthy state after a lost terminal accounting write."""
@@ -441,7 +402,7 @@ class NativeAttemptAccounting:
             with self._lock:
                 self._inflight.pop(request_id, None)
             raise NativeBridgeError(public_failure_error(failure))
-        failure = _failure_from_payload(data.get("failure"))
+        failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
         if failure is not None and isinstance(current_depth, int):
             candidate = next_route_candidate(
@@ -466,6 +427,9 @@ class NativeAttemptAccounting:
         # manufacture a failure unbounded admission would not have had.
         policy_sheds: list[tuple[int, str]] = []
         forced_overflow = False
+        # The input half of the worst-case reservation serializes the whole
+        # request, so it is computed once per ladder walk, never per candidate.
+        reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             if candidate is None:
                 if policy_sheds and last_failure is None and not forced_overflow:
@@ -473,7 +437,7 @@ class NativeAttemptAccounting:
                     candidate = policy_sheds[0][0]
                 else:
                     break
-            deployment = _deployment_priced_for_service_tier(
+            deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
                 forwards_tier=(
@@ -481,24 +445,29 @@ class NativeAttemptAccounting:
                     and entry.tier_forwarded_by_depth[candidate]
                 ),
             )
-            ticket = self._reserve_rung_slot(entry, deployment, force=forced_overflow)
+            # Reserve the worst-case in-flight tokens alongside the worst-case
+            # cost. The platform's token windows (promo free-tier, strict; org
+            # rate limits, soft) count these dispatched reservations, and the
+            # rung's own authored token window counts the same conservative
+            # bound, so a concurrent burst binds instead of leaking past caps.
+            reserved_output_tokens = worst_case_output_tokens(entry.request, deployment)
+            ticket = self._reserve_rung_slot(
+                entry,
+                deployment,
+                reserved_tokens=reserved_input_tokens + reserved_output_tokens,
+                force=forced_overflow,
+            )
             if isinstance(ticket, RungShed):
                 policy_sheds.append((candidate, ticket.reason))
                 self._health.release_probe(keys[candidate])
                 candidate = claim_route_from(self._health, keys, candidate + 1)
                 continue
-            dispatch_reason, preferred_deployment = _dispatch_disclosure(
+            dispatch_reason, preferred_deployment = dispatch_disclosure(
                 route,
                 candidate,
                 policy_sheds=policy_sheds,
                 forced_overflow=forced_overflow,
-            )
-            # Reserve the worst-case in-flight tokens alongside the worst-case
-            # cost. The platform's token windows (promo free-tier, strict; org
-            # rate limits, soft) count these dispatched reservations, so a
-            # concurrent burst binds instead of leaking past the cap.
-            reserved_input_tokens, reserved_output_tokens = worst_case_attempt_tokens(
-                entry.request, deployment
+                sticky_preferred=entry.sticky_preferred,
             )
             try:
                 attempt_id = self._write_ledger.start_attempt(
@@ -564,6 +533,7 @@ class NativeAttemptAccounting:
             if forced_overflow:
                 with self._lock:
                     self._rung_saturated_overflows += 1
+            self._bind_sticky_dispatch(entry, deployment)
             with self._lock:
                 entry.attempt_counts[candidate] += 1
                 entry.total_attempts += 1
@@ -610,6 +580,38 @@ class NativeAttemptAccounting:
             separators=(",", ":"),
         )
 
+    def _bind_sticky_dispatch(
+        self,
+        entry: InflightRequest,
+        deployment: ExactModelDeployment,
+    ) -> None:
+        """Record or refresh the conversation's binding to its serving rung.
+
+        Every dispatch on a ``maximize_cache_affinity`` pool records where the
+        conversation's provider cache is being built, with the serving rung's
+        authored ``sticky_spill_seconds`` as the lifetime: a spilled
+        conversation thereby stays on its spill target instead of bouncing
+        back to the higher-ranked rung the moment it stops shedding, and a
+        conversation on its preferred rung simply refreshes a no-op binding.
+        A rung authoring no lifetime records nothing.
+
+        Args:
+            entry: The owning in-flight request.
+            deployment: The rung about to receive the dispatch.
+        """
+        if entry.affinity_fingerprint is None:
+            return
+        if entry.route.snapshot.failover_mode != "maximize_cache_affinity":
+            return
+        policy = deployment.gateway.dispatch
+        if policy is None or policy.sticky_spill_seconds is None:
+            return
+        self._sticky.bind(
+            entry.affinity_fingerprint,
+            deployment.deployment_id,
+            ttl_seconds=float(policy.sticky_spill_seconds),
+        )
+
     def settle(self, argument: str) -> str:
         """Durably settle one previously reserved attempt exactly once.
 
@@ -644,6 +646,7 @@ class NativeAttemptAccounting:
         opened = bool(data.get("opened", False))
         terminal, failure = terminal_from_settlement(data)
         first_token_at = first_token_at_from_settlement(data)
+        rate_limit = settlement_rate_limit(data)
         try:
             self._write_ledger.finish_attempt(
                 attempt_id=attempt_id,
@@ -651,6 +654,11 @@ class NativeAttemptAccounting:
                 failure=failure,
                 finalize_request=finalize,
                 first_token_at=first_token_at,
+                retry_after_seconds=rate_limit.retry_after_seconds,
+                ratelimit_limit_requests=rate_limit.limit_requests,
+                ratelimit_remaining_requests=rate_limit.remaining_requests,
+                ratelimit_limit_tokens=rate_limit.limit_tokens,
+                ratelimit_remaining_tokens=rate_limit.remaining_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -660,6 +668,7 @@ class NativeAttemptAccounting:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
         self._record_health(entry, attempt_id, opened=opened, failure=failure)
+        self._record_cache_fraction(entry, attempt_id, terminal.usage)
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)
@@ -693,7 +702,7 @@ class NativeAttemptAccounting:
             entry = self._inflight.get(request_id)
         if entry is None:
             return "{}"
-        failure = _failure_from_payload(data.get("failure")) or GatewayFailure(
+        failure = failure_from_boundary_payload(data.get("failure")) or GatewayFailure(
             failure_class=GatewayFailureClass.CANCELLED,
             safe_message="gateway request was cancelled",
         )
@@ -762,13 +771,78 @@ class NativeAttemptAccounting:
         depth = entry.attempt_depths.get(attempt_id)
         if depth is None:
             return
-        key = deployment_health_key(entry.authorization, entry.route.deployments[depth])
+        deployment = entry.route.deployments[depth]
+        key = deployment_health_key(entry.authorization, deployment)
         if opened:
             self._health.dispatch_opened(key)
         if failure is not None:
+            policy = deployment.gateway.dispatch
+            if failure.failure_class == GatewayFailureClass.THROTTLED and (
+                policy is not None
+                and (
+                    policy.concurrency_bound is not None
+                    or policy.requests_per_minute is not None
+                    or policy.tokens_per_minute is not None
+                )
+            ):
+                # Passive-adaptive calibration: the provider just proved the
+                # observed dispatch rate is too high for this physical lane,
+                # so the rung's learned ceiling clamps to it. Recovery creep
+                # rediscovers headroom without synthetic probes. Gated on an
+                # admission-participating policy: only such rungs reserve
+                # through the registry, so only they carry a real observed
+                # window (and only they would ever enforce the ceiling).
+                self._loads.record_throttle(rung_load_key(deployment))
             self._health.failed(key, failure)
         else:
             self._health.succeeded(key)
+
+    def _record_cache_fraction(
+        self,
+        entry: InflightRequest,
+        attempt_id: str,
+        usage: GatewayUsage | None,
+    ) -> None:
+        """Fold one settled attempt's cached-token fraction into the registry.
+
+        Feeds the congestion-dependent cache-priority term: the registry keeps
+        a per-(organization, rung) EWMA of the settled cached fraction, so
+        fairness can favor the organization whose traffic actually reuses warm
+        provider cache. Attempts without observed token usage record nothing,
+        and one attempt folds at most once: a settlement can reach the ledger
+        through both the direct path and the retained-settlement sweep (each
+        idempotent there), and a duplicate fold would skew the estimate.
+
+        Args:
+            entry: The owning in-flight request.
+            attempt_id: The settled attempt.
+            usage: The terminal event's usage, if any.
+        """
+        if usage is None or usage.input_tokens is None:
+            return
+        depth = entry.attempt_depths.get(attempt_id)
+        if depth is None:
+            return
+        if self._cache_sample_gate is not None:
+            # Promo-funded (or otherwise excluded) attempts must not buy
+            # fair-share weight; an erroring gate skips the sample rather
+            # than admit one the host meant to exclude.
+            try:
+                if not self._cache_sample_gate(attempt_id):
+                    return
+            except Exception:  # noqa: BLE001 - the sample is telemetry, never worth failing settle.
+                return
+        with self._lock:
+            if attempt_id in entry.cache_recorded_attempts:
+                return
+            entry.cache_recorded_attempts.add(attempt_id)
+        cached = usage.cached_input_tokens
+        self._loads.record_settle(
+            rung_load_key(entry.route.deployments[depth]),
+            entry.authorization.organization_id,
+            cached_tokens=0 if cached is None else cached,
+            input_tokens=usage.input_tokens,
+        )
 
     def _sweep_loop(self) -> None:
         """Run the settlement sweep on a timer for the process lifetime."""
@@ -813,6 +887,7 @@ class NativeAttemptAccounting:
                 terminal=terminal,
                 failure=failure,
                 finalize=bool(settlement.get("finalize", True)),
+                rate_limit=settlement_rate_limit(settlement),
             ):
                 with self._lock:
                     entry.pending_settlement = None
@@ -860,80 +935,40 @@ class NativeAttemptAccounting:
         terminal: GatewayEvent,
         failure: GatewayFailure | None,
         finalize: bool,
+        rate_limit: RateLimitObservation | None = None,
     ) -> bool:
         """Land one swept settlement; keep the entry for retry on failure.
 
         Returns:
             Whether the swept terminal write reached the ledger.
         """
+        observation = RateLimitObservation() if rate_limit is None else rate_limit
         try:
             self._write_ledger.finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
+                retry_after_seconds=observation.retry_after_seconds,
+                ratelimit_limit_requests=observation.limit_requests,
+                ratelimit_remaining_requests=observation.remaining_requests,
+                ratelimit_limit_tokens=observation.limit_tokens,
+                ratelimit_remaining_tokens=observation.remaining_tokens,
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False
             return False
         self._record_health(entry, attempt_id, opened=False, failure=failure)
+        # A retained settlement that finally lands through the sweep carries
+        # the same observed usage as the direct path, so the cache-priority
+        # EWMA must not depend on WHICH recovery path succeeded.
+        self._record_cache_fraction(entry, attempt_id, terminal.usage)
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)
             elif entry.active_attempt_id == attempt_id:
                 entry.active_attempt_id = None
         return True
-
-
-def _dispatch_disclosure(
-    route: GatewayRoute,
-    candidate: int,
-    *,
-    policy_sheds: list[tuple[int, str]],
-    forced_overflow: bool,
-) -> tuple[str | None, ExactModelDeployment | None]:
-    """Name why the chosen rung serves and the bypassed preferred rung, if any.
-
-    Emission is gated so an alias the platform never opted in keeps byte-null
-    disclosure columns. On a ``maximize_cache_affinity`` pool every attempt
-    discloses against the rendezvous-preferred depth-0 rung: ``affinity`` on
-    the happy path, the shed reason when depth 0 was policy-shed in this
-    reservation, ``rung_dead`` when it was bypassed by health or an earlier
-    failure, ``saturated_overflow`` when the ladder force-admitted past a
-    bound. On any other pool a disclosure appears only when a dispatch policy
-    actually shed a rung in this reservation, and the preferred rung is the
-    shed rung itself (the counterfactual the shed is measured against).
-
-    Args:
-        route: Frozen ordered route for this request.
-        candidate: The route depth about to dispatch.
-        policy_sheds: ``(depth, reason)`` for every policy shed this
-            reservation, in ladder order.
-        forced_overflow: Whether this dispatch was forced past a bound.
-
-    Returns:
-        ``(dispatch_reason, preferred_deployment)``; the deployment is
-        ``None`` whenever the chosen rung IS the disclosure's preferred rung.
-    """
-    if route.snapshot.failover_mode == "maximize_cache_affinity":
-        target_depth = 0
-        if forced_overflow:
-            reason = "saturated_overflow"
-        elif candidate == 0:
-            reason = "affinity"
-        else:
-            lead_shed = next((shed for depth, shed in policy_sheds if depth == 0), None)
-            reason = lead_shed or "rung_dead"
-    elif forced_overflow:
-        target_depth = policy_sheds[0][0]
-        reason = "saturated_overflow"
-    elif policy_sheds:
-        target_depth, reason = policy_sheds[0]
-    else:
-        return None, None
-    if target_depth == candidate:
-        return reason, None
-    return reason, route.deployments[target_depth]
 
 
 def record_dead_admission_rungs(

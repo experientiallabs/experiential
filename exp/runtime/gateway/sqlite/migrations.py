@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 class GatewaySchemaError(RuntimeError):
@@ -697,6 +697,20 @@ _MIGRATION_18 = (
     """,
 )
 
+# v19: per-attempt provider rate-limit observability. The data plane harvests
+# the allowlisted rate-limit response headers (retry-after, x-ratelimit-*,
+# anthropic-ratelimit-*) on successes and failures alike; these columns
+# persist the normalized integers so throttle calibration can be audited
+# against what the provider actually said, per attempt. Header names and
+# numbers only: no content, no credentials.
+_MIGRATION_19 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN retry_after_seconds INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_limit_requests INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_requests INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_limit_tokens INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_tokens INTEGER",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -716,6 +730,7 @@ _MIGRATIONS = {
     16: _MIGRATION_16,
     17: _MIGRATION_17,
     18: _MIGRATION_18,
+    19: _MIGRATION_19,
 }
 
 

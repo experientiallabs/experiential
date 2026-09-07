@@ -66,6 +66,7 @@ fn settle_argument(
     finalize: bool,
     opened: bool,
     first_token_at: Option<SystemTime>,
+    rate_limit_headers: Option<&serde_json::Map<String, Value>>,
 ) -> String {
     compact_json(&json!({
         "request_id": request_id,
@@ -93,10 +94,18 @@ fn settle_argument(
             // files it as the caller's invalid request (see
             // native_accounting.ledger_failure).
             "customer_owned": failure.customer_owned,
+            // The provider's own stated wait (a throttled open's integer
+            // Retry-After), so the control plane sizes the deployment's
+            // throttle window from it instead of the fixed default.
+            "retry_after_seconds": failure.retry_after_seconds,
         })),
         "finalize": finalize,
         "opened": opened,
         "first_token_at": first_token_at.map(system_time_to_rfc3339),
+        // Allowlisted rate-limit headers of the attempt's provider response
+        // (successes and failures alike, absent when none were present); the
+        // control plane normalizes and persists them per attempt.
+        "rate_limit_headers": rate_limit_headers,
     }))
 }
 
@@ -162,6 +171,11 @@ pub struct AttemptGuard {
     /// reported in the finalizing settlement so the control plane can derive
     /// time-to-first-token. `None` until an attempt observes a first token.
     first_token_at: Option<SystemTime>,
+    /// Allowlisted rate-limit headers of the active attempt's OPENED provider
+    /// response, recorded once per attempt at open and settled alongside the
+    /// outcome. An attempt that failed at open instead carries them on its
+    /// `Failure`, which settlement hoists into the same payload field.
+    rate_limit_headers: Option<serde_json::Map<String, Value>>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -207,6 +221,7 @@ impl AttemptGuard {
             decided_settlement: None,
             started,
             first_token_at: None,
+            rate_limit_headers: None,
         }
     }
 
@@ -216,8 +231,10 @@ impl AttemptGuard {
         self.opened = false;
         self.decided_settlement = None;
         // Each physical attempt observes its own first token; a prior failed
-        // attempt's timing never carries into its successor.
+        // attempt's timing never carries into its successor. The same holds
+        // for its provider response's rate-limit headers.
         self.first_token_at = None;
+        self.rate_limit_headers = None;
     }
 
     /// Record the wall-clock time the active attempt streamed its first output
@@ -232,6 +249,12 @@ impl AttemptGuard {
     /// Record that the active attempt's provider dispatch opened.
     pub fn mark_opened(&mut self) {
         self.opened = true;
+    }
+
+    /// Record the allowlisted rate-limit headers of the active attempt's
+    /// opened provider response, for settlement.
+    pub fn record_rate_limit_headers(&mut self, headers: Option<serde_json::Map<String, Value>>) {
+        self.rate_limit_headers = headers;
     }
 
     /// Record this request's terminal outcome and duration exactly once, at
@@ -265,6 +288,12 @@ impl AttemptGuard {
             // path owns request-only terminalization.
             return true;
         };
+        // An opened attempt's headers live on the guard; an attempt that
+        // failed at open carries them on its failure instead.
+        let rate_limit_headers = self
+            .rate_limit_headers
+            .as_ref()
+            .or_else(|| failure.and_then(|failure| failure.rate_limit_headers.as_deref()));
         let argument = settle_argument(
             &self.request_id,
             &attempt_id,
@@ -275,6 +304,7 @@ impl AttemptGuard {
             finalize,
             self.opened,
             self.first_token_at,
+            rate_limit_headers,
         );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
@@ -382,6 +412,7 @@ impl Drop for AttemptGuard {
                             true,
                             self.opened,
                             self.first_token_at,
+                            self.rate_limit_headers.as_ref(),
                         ),
                     )
                 }
@@ -448,6 +479,7 @@ mod tests {
             true,
             true,
             Some(observed),
+            None,
         );
         let parsed: Value = serde_json::from_str(&with_token).expect("valid json");
         assert_eq!(
@@ -456,7 +488,18 @@ mod tests {
         );
         // A non-streaming attempt observes no first token: the field is null,
         // matching the control plane's backward-compatible parse.
-        let without = settle_argument("req", "att", "completed", None, &[], None, true, true, None);
+        let without = settle_argument(
+            "req",
+            "att",
+            "completed",
+            None,
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+        );
         let parsed: Value = serde_json::from_str(&without).expect("valid json");
         assert_eq!(parsed["first_token_at"], Value::Null);
     }
@@ -476,6 +519,7 @@ mod tests {
             Some(&failure),
             true,
             true,
+            None,
             None,
         );
         let parsed: Value = serde_json::from_str(&argument).expect("valid json");
@@ -499,6 +543,7 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let parsed: Value = serde_json::from_str(&owned_argument).expect("valid json");
         assert_eq!(
@@ -519,8 +564,90 @@ mod tests {
             true,
             true,
             None,
+            None,
         );
         let parsed: Value = serde_json::from_str(&bare_argument).expect("valid json");
         assert_eq!(parsed["failure"]["provider_detail"], Value::Null);
+    }
+
+    #[test]
+    fn settle_argument_carries_rate_limit_facts_when_harvested() {
+        // A throttled open: the failure carries the harvested headers and the
+        // integer Retry-After, both settled for the control plane.
+        let mut headers = serde_json::Map::new();
+        headers.insert("retry-after".to_string(), Value::String("3600".to_string()));
+        headers.insert(
+            "x-ratelimit-remaining-requests".to_string(),
+            Value::String("0".to_string()),
+        );
+        let throttled = crate::upstream::transport_failure(Some(429))
+            .with_rate_limit_facts(Some(headers.clone()), Some(3_600));
+        let argument = settle_argument(
+            "req",
+            "att",
+            "failed",
+            None,
+            &[],
+            Some(&throttled),
+            true,
+            false,
+            None,
+            throttled.rate_limit_headers.as_deref(),
+        );
+        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+        assert_eq!(parsed["failure"]["retry_after_seconds"], 3_600);
+        assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
+        assert_eq!(
+            parsed["rate_limit_headers"]["x-ratelimit-remaining-requests"],
+            "0"
+        );
+        // A successful attempt settles the opened response's headers; absent
+        // headers settle an explicit null the control plane treats as absent.
+        let success = settle_argument(
+            "req",
+            "att",
+            "completed",
+            None,
+            &[],
+            None,
+            true,
+            true,
+            None,
+            Some(&headers),
+        );
+        let parsed: Value = serde_json::from_str(&success).expect("valid json");
+        assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
+        let bare = settle_argument(
+            "req",
+            "att",
+            "completed",
+            None,
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+        );
+        let parsed: Value = serde_json::from_str(&bare).expect("valid json");
+        assert_eq!(parsed["rate_limit_headers"], Value::Null);
+    }
+
+    #[test]
+    fn retry_after_fills_only_throttled_failures_and_never_overwrites() {
+        let throttled =
+            crate::upstream::transport_failure(Some(429)).with_rate_limit_facts(None, Some(30));
+        assert_eq!(throttled.retry_after_seconds, Some(30));
+        let already = Failure::new(FailureClass::Throttled, "throttled")
+            .with_rate_limit_facts(None, Some(30));
+        let kept = Failure {
+            retry_after_seconds: Some(7),
+            ..already
+        }
+        .with_rate_limit_facts(None, Some(30));
+        assert_eq!(kept.retry_after_seconds, Some(7));
+        let internal =
+            crate::upstream::transport_failure(Some(500)).with_rate_limit_facts(None, Some(30));
+        assert_eq!(internal.retry_after_seconds, None);
     }
 }

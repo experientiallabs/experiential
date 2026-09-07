@@ -43,6 +43,12 @@ def _control_plane() -> JsonObject:
         "admission_parameter_coercions": 0,
         "rung_admission_sheds": 0,
         "rung_saturated_overflows": 0,
+        "rung_rate_limit_sheds": 3,
+        "rung_fresh_session_spills": 1,
+        "sticky_spill_bindings": 4,
+        # JSON-snapshot-only: per-rung learned ceilings never render as text,
+        # so the exposition carries no per-rung label cardinality.
+        "rung_learned_ceilings": {"dep-house:abcd1234": 96},
         "inflight_attempts": 2,
         "reconciled_expired_requests": 0,
         "reconciled_unknown_attempts": 0,
@@ -115,6 +121,12 @@ exp_gateway_rung_admission_sheds_total 0
 # HELP exp_gateway_rung_saturated_overflows_total Dispatches forced past a saturated rung bound.
 # TYPE exp_gateway_rung_saturated_overflows_total counter
 exp_gateway_rung_saturated_overflows_total 0
+# HELP exp_gateway_rung_rate_limit_sheds_total Dispatches shed by a rung's rate window.
+# TYPE exp_gateway_rung_rate_limit_sheds_total counter
+exp_gateway_rung_rate_limit_sheds_total 3
+# HELP exp_gateway_rung_fresh_session_spills_total Fresh-session dispatches shed early to spill.
+# TYPE exp_gateway_rung_fresh_session_spills_total counter
+exp_gateway_rung_fresh_session_spills_total 1
 # HELP exp_gateway_reconciled_expired_requests_total Crashed requests reconciled at startup.
 # TYPE exp_gateway_reconciled_expired_requests_total counter
 exp_gateway_reconciled_expired_requests_total 0
@@ -124,6 +136,9 @@ exp_gateway_reconciled_unknown_attempts_total 0
 # HELP exp_gateway_inflight_attempts In-flight attempt reservations on the control plane.
 # TYPE exp_gateway_inflight_attempts gauge
 exp_gateway_inflight_attempts 2
+# HELP exp_gateway_sticky_spill_bindings Worker-local sticky conversation-to-rung bindings retained.
+# TYPE exp_gateway_sticky_spill_bindings gauge
+exp_gateway_sticky_spill_bindings 4
 # HELP exp_gateway_accounting_healthy Control-plane accounting health (1 healthy, 0 failed).
 # TYPE exp_gateway_accounting_healthy gauge
 exp_gateway_accounting_healthy 1

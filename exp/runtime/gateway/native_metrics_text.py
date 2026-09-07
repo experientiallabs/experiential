@@ -68,6 +68,14 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Dispatches forced past a saturated rung bound.",
     ),
     (
+        "rung_rate_limit_sheds",
+        "Dispatches shed by a rung's rate window.",
+    ),
+    (
+        "rung_fresh_session_spills",
+        "Fresh-session dispatches shed early to spill.",
+    ),
+    (
         "reconciled_expired_requests",
         "Crashed requests reconciled at startup.",
     ),
@@ -219,6 +227,12 @@ def render_metrics_text(snapshot: JsonObject) -> str:
         "gauge",
         "In-flight attempt reservations on the control plane.",
         [f"{_PREFIX}inflight_attempts {_value(control_plane['inflight_attempts'])}"],
+    )
+    lines += _family(
+        f"{_PREFIX}sticky_spill_bindings",
+        "gauge",
+        "Worker-local sticky conversation-to-rung bindings retained.",
+        [f"{_PREFIX}sticky_spill_bindings {_value(control_plane['sticky_spill_bindings'])}"],
     )
     lines += _family(
         f"{_PREFIX}accounting_healthy",

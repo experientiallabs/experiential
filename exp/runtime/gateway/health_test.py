@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 
@@ -115,6 +117,72 @@ def test_forced_claim_still_respects_the_throttle_window() -> None:
     assert not registry.claim_forced(_KEY)
     now[0] += 31
     assert registry.claim_forced(_KEY)
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected_window"),
+    [(2, 5.0), (7_200, 7_200.0), (999_999, 21_600.0)],
+)
+def test_retry_after_sizes_the_throttle_window_clamped(
+    retry_after: int, expected_window: float
+) -> None:
+    """A provider-stated wait sizes the window inside the [5s, 6h] clamp.
+
+    A short or degenerate wait floors at five seconds, an in-range wait (an
+    hourly quota reset) suppresses for exactly what the provider asked, and an
+    absurd wait ceilings at six hours; a throttle carrying no wait keeps the
+    fixed default window.
+    """
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(
+        _KEY,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="scripted throttle",
+            retry_after_seconds=retry_after,
+        ),
+    )
+    now[0] = 100.0 + expected_window - 0.5
+    assert not registry.claim(_KEY)
+    now[0] = 100.0 + expected_window + 0.5
+    assert registry.claim(_KEY)
+
+
+def test_throttle_without_retry_after_keeps_the_default_window() -> None:
+    """An absent wait falls back to the registry's fixed throttle window."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    now[0] = 129.0
+    assert not registry.claim(_KEY)
+    now[0] = 131.0
+    assert registry.claim(_KEY)
+
+
+def test_suppressed_is_a_read_only_probe() -> None:
+    """``suppressed`` reports throttle and circuit windows without claiming.
+
+    Unlike ``claim`` it must not consume the half-open probe: a sticky-affinity
+    lookup that peeked would otherwise steal the one probe real dispatch needs.
+    """
+    now = [100.0]
+    registry = DeploymentHealthRegistry(
+        failure_threshold=1, open_seconds=30.0, throttle_seconds=30.0, clock=lambda: now[0]
+    )
+    assert not registry.suppressed(_KEY)
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.suppressed(_KEY)
+    now[0] = 131.0
+    assert not registry.suppressed(_KEY)
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    assert registry.suppressed(_KEY)
+    for _ in range(3):
+        assert registry.suppressed(_KEY)
+    now[0] = 162.0
+    assert not registry.suppressed(_KEY)
+    # The half-open probe is still available to the first real claim.
+    assert registry.claim(_KEY)
 
 
 def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:

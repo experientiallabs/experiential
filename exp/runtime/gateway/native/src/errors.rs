@@ -271,6 +271,13 @@ pub struct Failure {
     /// declined the content without parsing `provider_detail`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<RefusalReason>,
+    /// Allowlisted rate-limit headers harvested from the provider response
+    /// that produced this failure (a non-2xx open carries the interesting
+    /// ones: a 429's `retry-after` and remaining-quota counts). Settlement
+    /// hoists them into the payload's `rate_limit_headers` map; they never
+    /// reach the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_headers: Option<Box<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl Failure {
@@ -285,6 +292,7 @@ impl Failure {
             retry_after_seconds: None,
             customer_owned: false,
             refusal_reason: None,
+            rate_limit_headers: None,
         }
     }
 
@@ -319,6 +327,21 @@ impl Failure {
     pub fn with_retry(mut self, retryable_same_deployment: bool, failover_eligible: bool) -> Self {
         self.retryable_same_deployment = retryable_same_deployment;
         self.failover_eligible = failover_eligible;
+        self
+    }
+
+    /// Attach the allowlisted rate-limit headers of the producing response,
+    /// and, on a throttled failure, the provider's own integer `Retry-After`
+    /// so the control plane sizes the throttle window from it.
+    pub fn with_rate_limit_facts(
+        mut self,
+        headers: Option<serde_json::Map<String, serde_json::Value>>,
+        retry_after_seconds: Option<u32>,
+    ) -> Self {
+        self.rate_limit_headers = headers.map(Box::new);
+        if self.failure_class == FailureClass::Throttled && self.retry_after_seconds.is_none() {
+            self.retry_after_seconds = retry_after_seconds;
+        }
         self
     }
 
