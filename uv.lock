@@ -642,7 +642,7 @@ source = { directory = "exp/runtime/gateway/native" }
 
 [[package]]
 name = "experiential"
-version = "0.7.54"
+version = "0.7.55"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },

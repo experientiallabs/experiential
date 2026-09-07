@@ -2963,6 +2963,44 @@ def _settle_one_completed_chat(control: NativeControlPlane, raw_key: str) -> Non
     assert settled == "{}"
 
 
+def test_cache_sample_gate_reaches_accounting_through_the_control_plane(tmp_path: Path) -> None:
+    """A hosted gate forwarded at construction vets settled cache samples.
+
+    The hosted composition builds only ``NativeControlPlane``, never the
+    accounting registry directly, so the gate must ride the control plane's
+    constructor; a dropped kwarg would silently let promo-funded replay feed
+    the cache-priority EWMA.
+    """
+    gated: list[str] = []
+
+    def _gate(attempt_id: str) -> bool:
+        """Record the consulted attempt and veto its sample."""
+        gated.append(attempt_id)
+        return False
+
+    _manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, cache_sample_gate=_gate)
+    admission = _admit_started(control, raw_key, _chat_body())
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    assert settled == "{}"
+    assert gated == [admission["attempt_id"]]
+
+
 def test_usage_callbacks_scope_reports_to_the_presented_key(tmp_path: Path) -> None:
     """A key sees only its own identity; anonymous callers see the whole organization."""
     control, raw_key = _control_plane(tmp_path)
