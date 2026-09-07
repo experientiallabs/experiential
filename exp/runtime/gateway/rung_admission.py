@@ -62,11 +62,16 @@ RATE_WINDOW_SECONDS = 60.0
 # Passive-adaptive calibration constants. A throttle clamps the learned
 # request ceiling to the observed rate times the clamp factor; every recovery
 # interval without a throttle creeps it up by the creep fraction (at least one
-# request); a ceiling unthrottled for the expiry horizon is forgotten.
+# request); a ceiling unthrottled for the expiry horizon is forgotten. The
+# ceiling stays a FLOAT and may sit below one request per minute: per-worker
+# enforcement multiplies across the fleet, so a provider whose account ceiling
+# is below one request per worker per minute (zai's ~6/min against 8 workers)
+# is only expressible sub-1; the floor exists to keep the value positive.
 LEARNED_CLAMP_FACTOR = 0.9
 LEARNED_CREEP_FRACTION = 0.05
 LEARNED_RECOVERY_INTERVAL_SECONDS = 60.0
 LEARNED_EXPIRY_SECONDS = 6.0 * 3_600.0
+LEARNED_MINIMUM_RPM = 0.1
 
 # Cached-fraction EWMA: half-life of roughly ten minutes of activity, with the
 # per-sample decay floored at one second of elapsed time so a burst of settles
@@ -110,11 +115,12 @@ class RungShed:
     """One refused reservation and the disclosure reason for the bypass."""
 
     reason: RungShedReason
-    learned_requests_per_minute: int | None = None
+    learned_requests_per_minute: float | None = None
     """The learned working request ceiling behind a ``rate_limit`` shed.
 
     Carried so the shed can be logged and counted with the ceiling that caused
-    it; the durable disclosure column stays the bare reason code.
+    it; the durable disclosure column stays the bare reason code. A float
+    because the ceiling can sit below one request per minute per worker.
     """
 
 
@@ -311,13 +317,19 @@ class RungLoadRegistry:
                 return RungShed("fresh_session_spill")
         working_rpm = self._working_rpm(rung, requests_per_minute, now)
         if working_rpm is not None and rung.window_requests + 1 > working_rpm:
-            learned = None if rung.learned_rpm is None else int(rung.learned_rpm)
-            return RungShed("rate_limit", learned_requests_per_minute=learned)
-        if tokens_per_minute is not None and rung.window_tokens + reserved_tokens > (
-            tokens_per_minute
+            return RungShed("rate_limit", learned_requests_per_minute=rung.learned_rpm)
+        # Burst allowance: a single request whose worst-case reservation alone
+        # exceeds the token cap must still be admissible into an EMPTY window
+        # (deepseek p99 input is 230k tokens against 125k/worker pilot caps),
+        # or the cap becomes a permanent shed loop for big prompts rather than
+        # rate limiting. It then occupies the window and blocks further
+        # dispatches until it slides out.
+        if (
+            tokens_per_minute is not None
+            and rung.window_tokens > 0
+            and rung.window_tokens + reserved_tokens > tokens_per_minute
         ):
-            learned = None if rung.learned_rpm is None else int(rung.learned_rpm)
-            return RungShed("rate_limit", learned_requests_per_minute=learned)
+            return RungShed("rate_limit", learned_requests_per_minute=rung.learned_rpm)
         if not fair_share or bound is None:
             return None
         congestion = rung.total / bound
@@ -396,10 +408,13 @@ class RungLoadRegistry:
         """Clamp one rung's learned request ceiling after a provider throttle.
 
         The ceiling becomes the dispatch rate actually observed in the sliding
-        window at this moment times the clamp factor (floored at one request
-        per minute): the provider just proved the observed rate is too high,
-        so the worker assumes it throttles there again and lets recovery creep
-        re-discover the real headroom.
+        window at this moment times the clamp factor: the provider just proved
+        the observed rate is too high, so the worker assumes it throttles
+        there again and lets recovery creep re-discover the real headroom. The
+        value is a float and may sit below one request per minute (floored
+        only at a small positive minimum), because per-worker ceilings
+        multiply across the fleet and some provider accounts allow less than
+        one request per worker per minute.
 
         Args:
             key: Physical rung identity.
@@ -408,8 +423,7 @@ class RungLoadRegistry:
         with self._lock:
             rung = self._rungs.setdefault(key, _RungLoad())
             self._prune_window(rung, now)
-            observed = max(1, rung.window_requests)
-            rung.learned_rpm = max(1.0, observed * LEARNED_CLAMP_FACTOR)
+            rung.learned_rpm = max(LEARNED_MINIMUM_RPM, rung.window_requests * LEARNED_CLAMP_FACTOR)
             rung.learned_throttled_at = now
             rung.learned_crept_at = now
 
@@ -452,16 +466,17 @@ class RungLoadRegistry:
                 )
             organization.cached_sampled_at = now
 
-    def learned_ceilings(self) -> dict[str, int]:
+    def learned_ceilings(self) -> dict[str, float]:
         """Return live learned request ceilings keyed by rung, for metrics.
 
         Keys are ``deployment_id:connection-prefix`` (catalog identifiers,
         content-free); only rungs currently holding a learned ceiling appear,
         so the map stays as small as the set of recently throttled rungs.
+        Values are floats because a ceiling can sit below one per minute.
         """
         with self._lock:
             return {
-                f"{deployment_id}:{connection[:8]}": int(rung.learned_rpm)
+                f"{deployment_id}:{connection[:8]}": rung.learned_rpm
                 for (deployment_id, connection), rung in self._rungs.items()
                 if rung.learned_rpm is not None
             }

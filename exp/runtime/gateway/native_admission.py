@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.affinity import (
@@ -28,7 +27,6 @@ from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, G
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import (
-    deployment_health_key,
     reorder_route_deployments,
     request_carries_cache_markers,
     select_route_deployments,
@@ -37,6 +35,7 @@ from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import require_prompt_fits_context_window
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
 from exp.runtime.models.providers import (
     emulated_gateway_capabilities,
     preflight_gateway_request,
@@ -65,22 +64,6 @@ from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespa
 _logger = logging.getLogger(__name__)
 
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
-
-
-@dataclass(frozen=True)
-class AffinityPlacement:
-    """The affinity facts one admission resolved for dispatch accounting.
-
-    ``fingerprint`` is present only on ``maximize_cache_affinity`` routes (the
-    tenant-isolated conversation identity that keyed placement), so dispatch
-    reservation can read and refresh the worker-local sticky binding and apply
-    the fresh-session spill threshold. ``sticky_preferred`` marks a route
-    whose depth 0 was chosen by a live sticky binding rather than rendezvous
-    order, for the ``affinity_sticky`` disclosure.
-    """
-
-    fingerprint: bytes | None = None
-    sticky_preferred: bool = False
 
 
 def _with_cache_affinity(
@@ -424,11 +407,12 @@ def _affinity_ordered_rungs(
         for deployment in route.deployments
     )
     order = rendezvous_order(fingerprint, weighted_rungs)
-    order, sticky_index = _sticky_first_order(
+    order, sticky_index = sticky_first_order(
         order,
         route,
         fingerprint=fingerprint,
-        accounting=accounting,
+        sticky=accounting.sticky,
+        health=accounting.health,
         authorization=authorization,
     )
     if request_carries_cache_markers(provider_request):
@@ -451,57 +435,6 @@ def _affinity_ordered_rungs(
         tuple(resolved_wires[index] for index in order),
         placement,
     )
-
-
-def _sticky_first_order(
-    order: tuple[int, ...],
-    route: GatewayRoute,
-    *,
-    fingerprint: bytes,
-    accounting: NativeAttemptAccounting,
-    authorization: AuthorizationSnapshot,
-) -> tuple[tuple[int, ...], int | None]:
-    """Move a live sticky binding's rung to the front of the rendezvous order.
-
-    A binding whose rung left the route is ignored (the binding expires on its
-    own); a binding whose rung is suppressed right now is cleared and ignored,
-    so a throttled or dead spill target releases the conversation back to
-    rendezvous placement. A binding already at the rendezvous front changes
-    nothing and is not reported as sticky.
-
-    Args:
-        order: Rendezvous permutation of the route's deployment indexes.
-        route: Frozen route the permutation indexes into.
-        fingerprint: The request's affinity fingerprint.
-        accounting: Shared accounting owning the sticky and health registries.
-        authorization: Frozen authority, for the health key.
-
-    Returns:
-        The (possibly reordered) permutation and the sticky rung's route
-        index when a live binding moved or confirmed the front (``None``
-        when rendezvous order stands on its own).
-    """
-    bound = accounting.sticky.bound_deployment(fingerprint)
-    if bound is None:
-        return order, None
-    sticky_index = next(
-        (
-            index
-            for index, deployment in enumerate(route.deployments)
-            if deployment.deployment_id == bound
-        ),
-        None,
-    )
-    if sticky_index is None:
-        return order, None
-    if accounting.health.suppressed(
-        deployment_health_key(authorization, route.deployments[sticky_index])
-    ):
-        accounting.sticky.clear(fingerprint)
-        return order, None
-    if order[0] == sticky_index:
-        return order, None
-    return (sticky_index, *(index for index in order if index != sticky_index)), sticky_index
 
 
 def _candidate_serves(

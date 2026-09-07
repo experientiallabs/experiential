@@ -222,12 +222,18 @@ claimable rung (spill in seconds) instead of queueing at the deployment until th
 deadline. `requests_per_minute` and `tokens_per_minute` (each usable without the bound) cap the
 rung's sliding 60-second dispatch window the same way, shedding a reservation the window cannot
 absorb sideways as `rate_limit` BEFORE the provider answers 429; token accounting counts each
-dispatch's conservative worst-case reserved input plus output tokens at reservation. The working
+dispatch's conservative worst-case reserved input plus output tokens at reservation, with a
+burst allowance admitting a single over-cap reservation into an EMPTY window (a prompt whose
+worst case exceeds the whole per-worker cap must stay admissible, then blocks the window until
+it slides out). The working
 request ceiling is additionally calibrated passively per worker: a provider throttle settlement
 clamps a learned ceiling to ninety percent of the rate observed in the window at that moment,
 every unthrottled recovery minute creeps it back up by five percent (at least one request, capped
 at the authored rate when one exists; each creep step is the probe that rediscovers headroom, so
-no synthetic traffic is ever sent), and a ceiling unthrottled for six hours is forgotten. With
+no synthetic traffic is ever sent), and a ceiling unthrottled for six hours is forgotten. The
+learned ceiling is a float and may sit below one request per minute: per-worker ceilings
+multiply across the fleet, and some provider accounts allow less than one request per worker
+per minute. With
 `fair_share: true` (which requires the bound), a contended rung additionally
 limits each organization to its weighted max-min share of the bound; weights arrive per request
 on `AuthorizationSnapshot.fair_share_weight` (default 1) from the hosted store, capacity below
@@ -256,15 +262,25 @@ rungs that author none of this keep byte-identical behavior and null disclosure 
 
 Under `maximize_cache_affinity`, two further per-rung fields keep provider prompt caches warm
 across spills. `sticky_spill_seconds` gives each dispatch a worker-local
-fingerprint-to-deployment binding with that lifetime (refreshed per hit): the binding is honored
+fingerprint-to-deployment binding with that lifetime (refreshed per hit, but capped at four
+lifetimes of total age from creation so continuous hits cannot pin a long-running session to a
+pricier spill rung forever): the binding is honored
 ahead of rendezvous order on later requests, so a spilled conversation keeps serving off the rung
 holding its warm cache instead of bouncing back the moment the preferred rung stops shedding, and
 a binding whose rung is throttled or circuit-open is cleared rather than followed. The binding is
 deliberately worker-local (the serving edge's keep-alives pin a client to one worker; the
-cross-worker miss costs one cold dispatch). `fresh_session_spill_fraction` reserves the top slice
+cross-worker miss costs one cold dispatch). The binding keys on the affinity fingerprint (the
+session identity rendezvous already uses), never on a derived provider cache key: on
+OpenAI-compatible shim lanes (including Experiential Cloud's vLLM boxes) no `prompt_cache_key` is
+forwarded and the box's prefix cache is content-addressed, so gateway-side session-to-rung
+consistency is the entire cache-preservation mechanism there. `fresh_session_spill_fraction`
+reserves the top slice
 of a bounded rung for warm sessions: a request whose fingerprint holds no live binding on the
 rung sheds sideways once in-flight dispatches reach `bound * fraction` (`fresh_session_spill`),
-while warm sessions ride to the hard bound.
+while warm sessions ride to the hard bound (it requires `sticky_spill_seconds`, because warm
+standing IS a live binding). A hosted composition may also exclude individual attempts from the
+cache-priority EWMA through the accounting's `cache_sample_gate` (promotion-funded replay must
+not buy fair-share weight with prefixes the promotion already made costless).
 
 A deployment's price schedule may declare a long-context tier: a whole-request premium applied
 once provider-reported input tokens reach its threshold, matching both published tier schedules

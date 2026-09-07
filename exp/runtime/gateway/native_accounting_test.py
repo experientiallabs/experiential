@@ -1065,14 +1065,22 @@ class TestRateLimitSheds:
         assert registry.rung_rate_counters() == (1, 0)
 
     def test_token_rate_counts_the_worst_case_reservation(self) -> None:
-        """A token cap below one request's worst case spills every dispatch."""
+        """An over-cap request bursts into an empty window; the next one spills.
+
+        The burst allowance keeps a token cap below one request's worst case
+        from becoming a permanent shed loop: the first dispatch lands on the
+        rung and occupies the window, and the follow-up spills as a normal
+        ``rate_limit`` shed until the window slides.
+        """
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger)
         deployments = _rated_pair(tokens_per_minute=1)
         _admit(registry, deployments, request_id="request-1")
-        spilled = _start(registry, ordinal=0, request_id="request-1")
+        _admit(registry, deployments, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        spilled = _start(registry, ordinal=0, request_id="request-2")
         assert spilled["route_depth"] == 1
-        assert ledger.started[0]["dispatch_reason"] == "rate_limit"
+        assert ledger.started[1]["dispatch_reason"] == "rate_limit"
 
     def test_whole_ladder_rate_limited_still_force_admits(self) -> None:
         """A single rate-capped rung never manufactures a failure."""
@@ -1093,6 +1101,48 @@ class TestRateLimitSheds:
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
         assert registry.rung_admission_counters() == (1, 1)
 
+    def test_whole_ladder_fresh_spill_limited_still_force_admits(self) -> None:
+        """A narrow ladder blocked only by the fresh threshold never mints a 429.
+
+        Production showed one org taking hard 429s while its only eligible
+        rung sat healthy; both new shed reasons (rate_limit above,
+        fresh_session_spill here) must participate in the saturated-overflow
+        force-admit so policy sheds can never manufacture a caller failure.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(
+                    concurrency_bound=2,
+                    fresh_session_spill_fraction=0.5,
+                    sticky_spill_seconds=600,
+                ),
+            ),
+        )
+        _admit(
+            registry,
+            only,
+            request_id="request-1",
+            failover_mode="maximize_cache_affinity",
+            affinity_fingerprint=b"conversation-1",
+        )
+        _admit(
+            registry,
+            only,
+            request_id="request-2",
+            failover_mode="maximize_cache_affinity",
+            affinity_fingerprint=b"conversation-2",
+        )
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        overflow = _start(registry, ordinal=0, request_id="request-2")
+        assert overflow["route_depth"] == 0
+        assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
+        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_rate_counters() == (0, 1)
+
     def test_throttled_settle_teaches_the_rungs_learned_ceiling(self) -> None:
         """A provider 429 clamps the physical lane's learned request ceiling."""
         ledger = _RecordingLedger()
@@ -1112,8 +1162,9 @@ class TestRateLimitSheds:
             },
             request_id="request-1",
         )
-        # One dispatch observed in the window: learned = max(1, 1 * 0.9) = 1.
-        assert registry.loads.learned_ceilings() == {"deployment-a:bbbbbbbb": 1}
+        # One dispatch observed in the window: learned = 1 * 0.9 (a float; the
+        # ceiling may sit below one per minute so fleet totals can undershoot).
+        assert registry.loads.learned_ceilings() == {"deployment-a:bbbbbbbb": 0.9}
 
     def test_bound_only_rungs_calibrate_and_unpolicied_rungs_do_not(self) -> None:
         """A bound-only rung learns from its real window; unpolicied lanes never do."""
@@ -1137,7 +1188,7 @@ class TestRateLimitSheds:
             failure=throttle,
             request_id="request-1",
         )
-        assert registry.loads.learned_ceilings() == {"deployment-a:bbbbbbbb": 1}
+        assert registry.loads.learned_ceilings() == {"deployment-a:bbbbbbbb": 0.9}
         # Unpolicied: a throttle teaches nothing (nothing would enforce it and
         # the window never observed the lane's rate).
         bare_ledger = _RecordingLedger()
@@ -1247,6 +1298,67 @@ class TestRateLimitSettlement:
         # fold the same attempt's sample into the EWMA a second time.
         registry.settle(settlement)
         assert recorded == [(("deployment-a", "b" * 64), "organization-one", 800, 1_000)]
+
+    def test_cache_sample_gate_excludes_promo_funded_attempts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hosted gate can veto samples so promo replay cannot buy weight.
+
+        A gate answering False (the host marked the attempt promo-funded) and
+        a raising gate both skip the fold; only an admitted attempt records.
+        """
+        for verdict, folds in (("deny", 0), ("raise", 0), ("admit", 1)):
+            recorded: list[str] = []
+            ledger = _RecordingLedger()
+
+            def _gate(attempt_id: str, verdict: str = verdict) -> bool:
+                """Answer the scripted verdict for every attempt."""
+                del attempt_id
+                if verdict == "raise":
+                    raise RuntimeError("scripted gate failure")
+                return verdict == "admit"
+
+            registry = NativeAttemptAccounting(ledger, cache_sample_gate=_gate)
+            deployments = (
+                _deployment("deployment-a", connection_sha256="b" * 64),
+                _deployment("deployment-b", connection_sha256="c" * 64),
+            )
+            entry = _admit(registry, deployments, request_id="request-1")
+            del entry
+
+            def _record(
+                key: tuple[str, str],
+                organization_id: str,
+                *,
+                cached_tokens: int,
+                input_tokens: int,
+                folds: list[str] = recorded,
+            ) -> None:
+                """Record the fold instead of applying it."""
+                del key, organization_id, cached_tokens, input_tokens
+                folds.append("fold")
+
+            monkeypatch.setattr(registry.loads, "record_settle", _record)
+            started = _start(registry, ordinal=0, request_id="request-1")
+            registry.settle(
+                json.dumps(
+                    {
+                        "request_id": "request-1",
+                        "attempt_id": str(started["attempt_id"]),
+                        "outcome": "completed",
+                        "usage": {
+                            "input_tokens": 1_000,
+                            "cached_input_tokens": 800,
+                            "output_tokens": 5,
+                        },
+                        "tool_names": [],
+                        "failure": None,
+                        "finalize": True,
+                        "opened": True,
+                    }
+                )
+            )
+            assert len(recorded) == folds, verdict
 
     def test_swept_retained_settlement_still_records_the_cache_fraction(
         self, monkeypatch: pytest.MonkeyPatch

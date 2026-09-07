@@ -38,6 +38,31 @@ def test_rebinding_refreshes_the_lifetime_and_can_move_the_rung() -> None:
     assert registry.bound_deployment(b"conversation") == "dep-house"
 
 
+def test_continuous_hits_cannot_extend_a_binding_past_the_age_cap() -> None:
+    """A binding lapses at four lifetimes from creation despite steady refreshes.
+
+    Refresh-on-hit alone would let one transient congestion pin a long agent
+    session to its spill rung forever; the age cap releases it back to
+    rendezvous, and a still-congested rung simply re-spills and re-binds.
+    """
+    now = [0.0]
+    registry = _registry(now)
+    registry.bind(b"conversation", "dep-spill", ttl_seconds=600.0)
+    # Refresh every 500s, well inside the idle lifetime, past the 2400s cap.
+    for tick in range(1, 6):
+        now[0] = tick * 500.0
+        if registry.bound_deployment(b"conversation") is not None:
+            registry.bind(b"conversation", "dep-spill", ttl_seconds=600.0)
+    now[0] = 2_400.0
+    assert registry.bound_deployment(b"conversation") is None
+    # Rebinding to a DIFFERENT rung starts a fresh age (a new cache home).
+    registry.bind(b"conversation", "dep-spill", ttl_seconds=600.0)
+    now[0] = 2_500.0
+    registry.bind(b"conversation", "dep-house", ttl_seconds=600.0)
+    now[0] = 3_000.0
+    assert registry.bound_deployment(b"conversation") == "dep-house"
+
+
 def test_capacity_evicts_the_least_recently_bound_conversation() -> None:
     """The LRU cap drops the coldest binding first and never grows past it."""
     now = [0.0]

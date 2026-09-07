@@ -21,11 +21,92 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
+
+from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.native_execution import deployment_health_key
+from exp.runtime.gateway.routing import GatewayRoute
 
 # Bound on remembered conversations per worker. At two cache lines of payload
 # per entry this is a few megabytes; the least recently used binding is
 # evicted first, which is also the coldest provider cache.
 _MAXIMUM_BINDINGS = 65_536
+
+# Hard cap on one binding's total age, as a multiple of its authored lifetime.
+# Refresh-on-hit alone would let one transient congestion pin a long-running
+# agent session to its (possibly pricier) spill rung forever; past the cap the
+# binding lapses even under continuous hits, the conversation returns to its
+# rendezvous rung once, and a still-congested rung simply re-spills and
+# re-binds it.
+STICKY_MAXIMUM_AGE_LIFETIMES = 4.0
+
+
+@dataclass(frozen=True)
+class AffinityPlacement:
+    """The affinity facts one admission resolved for dispatch accounting.
+
+    ``fingerprint`` is present only on ``maximize_cache_affinity`` routes (the
+    tenant-isolated conversation identity that keyed placement), so dispatch
+    reservation can read and refresh the worker-local sticky binding and apply
+    the fresh-session spill threshold. ``sticky_preferred`` marks a route
+    whose depth 0 was chosen by a live sticky binding rather than rendezvous
+    order, for the ``affinity_sticky`` disclosure.
+    """
+
+    fingerprint: bytes | None = None
+    sticky_preferred: bool = False
+
+
+def sticky_first_order(
+    order: tuple[int, ...],
+    route: GatewayRoute,
+    *,
+    fingerprint: bytes,
+    sticky: StickySpillRegistry,
+    health: DeploymentHealthRegistry,
+    authorization: AuthorizationSnapshot,
+) -> tuple[tuple[int, ...], int | None]:
+    """Move a live sticky binding's rung to the front of the rendezvous order.
+
+    A binding whose rung left the route is ignored (the binding expires on its
+    own); a binding whose rung is suppressed right now is cleared and ignored,
+    so a throttled or dead spill target releases the conversation back to
+    rendezvous placement. A binding already at the rendezvous front changes
+    nothing and is not reported as sticky.
+
+    Args:
+        order: Rendezvous permutation of the route's deployment indexes.
+        route: Frozen route the permutation indexes into.
+        fingerprint: The request's affinity fingerprint.
+        sticky: Worker-local conversation-to-rung bindings.
+        health: Deployment circuit and throttle registry.
+        authorization: Frozen authority, for the health key.
+
+    Returns:
+        The (possibly reordered) permutation and the sticky rung's route
+        index when a live binding moved or confirmed the front (``None``
+        when rendezvous order stands on its own).
+    """
+    bound = sticky.bound_deployment(fingerprint)
+    if bound is None:
+        return order, None
+    sticky_index = next(
+        (
+            index
+            for index, deployment in enumerate(route.deployments)
+            if deployment.deployment_id == bound
+        ),
+        None,
+    )
+    if sticky_index is None:
+        return order, None
+    if health.suppressed(deployment_health_key(authorization, route.deployments[sticky_index])):
+        sticky.clear(fingerprint)
+        return order, None
+    if order[0] == sticky_index:
+        return order, None
+    return (sticky_index, *(index for index in order if index != sticky_index)), sticky_index
 
 
 class StickySpillRegistry:
@@ -50,11 +131,18 @@ class StickySpillRegistry:
             raise ValueError("sticky binding capacity must be positive")
         self._maximum = maximum_bindings
         self._clock = clock
-        self._bindings: OrderedDict[bytes, tuple[str, float]] = OrderedDict()
+        # fingerprint -> (deployment_id, expires_at, age_deadline). The age
+        # deadline is fixed when the binding is (re)created for a deployment
+        # and survives refreshes, so continuous hits cannot extend one binding
+        # forever.
+        self._bindings: OrderedDict[bytes, tuple[str, float, float]] = OrderedDict()
         self._lock = threading.Lock()
 
     def bind(self, fingerprint: bytes, deployment_id: str, *, ttl_seconds: float) -> None:
         """Record or refresh one fingerprint's serving rung.
+
+        A refresh extends the idle lifetime but never the age deadline; a
+        binding to a DIFFERENT rung starts a fresh age (a new cache home).
 
         Args:
             fingerprint: Tenant-isolated affinity fingerprint.
@@ -63,9 +151,18 @@ class StickySpillRegistry:
         """
         if ttl_seconds <= 0:
             return
-        expires_at = self._clock() + ttl_seconds
+        now = self._clock()
+        expires_at = now + ttl_seconds
+        age_deadline = now + STICKY_MAXIMUM_AGE_LIFETIMES * ttl_seconds
         with self._lock:
-            self._bindings[fingerprint] = (deployment_id, expires_at)
+            entry = self._bindings.get(fingerprint)
+            if entry is not None and entry[0] == deployment_id:
+                age_deadline = entry[2]
+            self._bindings[fingerprint] = (
+                deployment_id,
+                min(expires_at, age_deadline),
+                age_deadline,
+            )
             self._bindings.move_to_end(fingerprint)
             while len(self._bindings) > self._maximum:
                 self._bindings.popitem(last=False)
@@ -84,7 +181,7 @@ class StickySpillRegistry:
             entry = self._bindings.get(fingerprint)
             if entry is None:
                 return None
-            deployment_id, expires_at = entry
+            deployment_id, expires_at, _age_deadline = entry
             if expires_at <= now:
                 del self._bindings[fingerprint]
                 return None

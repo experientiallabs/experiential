@@ -132,6 +132,7 @@ class NativeAttemptAccounting:
         write_ledger: SyncWriteLedger,
         *,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
+        cache_sample_gate: Callable[[str], bool] | None = None,
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -139,9 +140,18 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation.
+            cache_sample_gate: Optional hosted predicate deciding whether one
+                settled attempt (by attempt id) may feed the cache-priority
+                EWMA. The hosted store knows which attempts are promo-funded;
+                admitting those samples would let free-tier replay traffic
+                (whose cached prefixes are costless under a promotion) buy
+                fair-share weight with the very replay the promotion already
+                subsidizes. ``None`` admits every sample; a raising gate
+                skips the sample (fails closed).
         """
         self._write_ledger = write_ledger
         self._budget_error_factory = budget_error_factory
+        self._cache_sample_gate = cache_sample_gate
         # The native waterfall's deployment-health circuits, revision-scoped
         # to the traffic this plane serves.
         self._health = DeploymentHealthRegistry()
@@ -812,6 +822,15 @@ class NativeAttemptAccounting:
         depth = entry.attempt_depths.get(attempt_id)
         if depth is None:
             return
+        if self._cache_sample_gate is not None:
+            # Promo-funded (or otherwise excluded) attempts must not buy
+            # fair-share weight; an erroring gate skips the sample rather
+            # than admit one the host meant to exclude.
+            try:
+                if not self._cache_sample_gate(attempt_id):
+                    return
+            except Exception:  # noqa: BLE001 - the sample is telemetry, never worth failing settle.
+                return
         with self._lock:
             if attempt_id in entry.cache_recorded_attempts:
                 return

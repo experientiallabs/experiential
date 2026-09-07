@@ -269,6 +269,31 @@ class TestRateWindows:
             str,
         )
 
+    def test_single_over_cap_reservation_bursts_into_an_empty_window(self) -> None:
+        """A request bigger than the whole token cap is not permanently shed.
+
+        Worst-case reservations can exceed a per-worker cap outright (230k-token
+        prompts against a 125k cap); the burst allowance admits exactly one
+        into an EMPTY window, which then blocks further dispatches until the
+        window slides past it.
+        """
+        now = [0.0]
+        registry = _registry(now)
+        assert isinstance(
+            _reserve(registry, "org-a", bound=None, tokens_per_minute=1_000, reserved_tokens=2_000),
+            str,
+        )
+        # Even a tiny follow-up is shed while the burst occupies the window.
+        assert _reserve(
+            registry, "org-a", bound=None, tokens_per_minute=1_000, reserved_tokens=10
+        ) == RungShed("rate_limit")
+        # Once the window slides past the burst, admission resumes.
+        now[0] = 61.0
+        assert isinstance(
+            _reserve(registry, "org-a", bound=None, tokens_per_minute=1_000, reserved_tokens=10),
+            str,
+        )
+
     def test_force_admits_past_the_rate_window(self) -> None:
         """A ladder exhausted only by rate sheds still dispatches somewhere."""
         now = [0.0]
@@ -338,8 +363,8 @@ class TestPassiveAdaptiveCalibration:
         registry.record_throttle(_KEY)  # learned 9.0 from 10 observed
         assert registry.learned_ceilings() == {"dep-house:connecti": 9}
         now[0] = 61.0
-        registry.record_throttle(_KEY)  # window empty: observed floors at 1
-        assert registry.learned_ceilings() == {"dep-house:connecti": 1}
+        registry.record_throttle(_KEY)  # window empty: floors at the positive minimum
+        assert registry.learned_ceilings() == {"dep-house:connecti": 0.1}
         # Six hours without a throttle expire the learned ceiling entirely.
         now[0] = 61.0 + 6 * 3_600.0
         assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=50), str)
