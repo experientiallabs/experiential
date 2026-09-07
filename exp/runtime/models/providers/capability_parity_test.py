@@ -235,9 +235,10 @@ def test_parity_row_projects_audio_declarations_onto_the_wire() -> None:
 
 
 def test_parity_row_reports_forced_tool_choice_as_engine_ground_truth() -> None:
-    """Fable 5.1 and Mythos 5.1 on the Anthropic wire cannot force a tool; the
-    same listing through an OpenAI-compatible aggregator, and every other
-    model, report support (the fact is dialect-scoped, verified live 2026-09-05)."""
+    """Fable 5.1 and Mythos 5.1 cannot force a tool on ANY wire: the same
+    listing through an OpenAI-compatible aggregator forwards Anthropic's 400
+    unchanged (ledger 2026-09-07, 154 attempts through OpenRouter), so the
+    aggregated rung reports the same fact; every other model reports support."""
     declared = GatewayDeploymentCapabilities(supports_streaming=True, supports_strict_tools=True)
     fable = deployment_capability_parity(
         provider="anthropic",
@@ -263,4 +264,4 @@ def test_parity_row_reports_forced_tool_choice_as_engine_ground_truth() -> None:
         capabilities=declared,
         reasoning_wire_format="reasoning",
     )
-    assert aggregated.supports_forced_tool_choice is True
+    assert aggregated.supports_forced_tool_choice is False

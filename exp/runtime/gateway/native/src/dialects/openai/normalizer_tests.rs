@@ -598,10 +598,15 @@ fn a_complete_tool_call_still_completes_when_the_budget_ends_the_stream() {
 }
 
 #[test]
-fn unparsable_tool_arguments_stay_malformed_on_a_normal_finish() {
-    // The strict contract holds whenever the provider claims it finished the
-    // call: a `tool_calls`/`stop` terminal with a dangling fragment is still a
-    // malformed stream, never silently dropped.
+fn a_dangling_fragment_on_a_normal_relay_finish_is_truncation_not_malformed() {
+    // Until 2026-09-07 a `tool_calls`/`stop` terminal with a dangling fragment
+    // was a malformed stream. Relays (OpenRouter, Tencent, the house vLLM
+    // lanes) then showed 57 such attempts in 12h, fragments from 1 KB to
+    // 87 KB, every one ending mid-token: a model never emits a well-formed
+    // answer that stops mid-string, so the shape is the provider's cut
+    // misreported, and the turn now settles Incomplete with the cut call
+    // dropped. A syntax error INSIDE the arguments keeps the strict contract
+    // (see the test below).
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
     normalizer
         .feed(&compatible_chunk(
@@ -612,13 +617,16 @@ fn unparsable_tool_arguments_stay_malformed_on_a_normal_finish() {
             Some("tool_calls"),
         ))
         .expect("tool chunk must normalize");
-    let failure = normalizer
+    let events = normalizer
         .feed(&SseEvent {
             event: None,
             data: "[DONE]".to_string(),
         })
-        .expect_err("a dangling fragment on a normal finish is malformed");
-    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        .expect("a dangling fragment on a normal relay finish is truncation");
+    assert!(
+        matches!(events.as_slice(), [Event::Incomplete]),
+        "{events:?}"
+    );
 }
 
 #[test]
@@ -906,4 +914,71 @@ fn responses_error_frames_keep_numeric_codes() {
         [Event::Failed(failure)] if failure.failure_class == FailureClass::Throttled
             && failure.provider_detail.as_deref() == Some("429: Slow down.")
     ));
+}
+
+#[test]
+fn a_relay_stop_finish_with_arguments_cut_mid_fragment_settles_incomplete() {
+    // OpenRouter / Tencent relays close deepseek tool calls with
+    // finish_reason `tool_calls` while the arguments end mid-string (ledger
+    // 2026-09-07). The cut call is dropped and the turn is Incomplete, never a
+    // malformed 502 that churns the ladder.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": "{\"path\": \"a.txt\", \"content\": \"partial te"},
+            }]}),
+            None,
+        ))
+        .expect("tool delta normalizes");
+    normalizer
+        .feed(&compatible_chunk(serde_json::json!({}), Some("tool_calls")))
+        .expect("finish chunk normalizes");
+    let events = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        })
+        .expect("a mid-fragment cut is truncation, not corruption");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Incomplete)),
+        "the turn settles Incomplete: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallCompleted { .. })),
+        "the cut call is never served: {events:?}"
+    );
+}
+
+#[test]
+fn a_relay_stop_finish_with_a_syntax_error_inside_arguments_stays_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": "{\"path\": }"},
+            }]}),
+            None,
+        ))
+        .expect("tool delta normalizes");
+    normalizer
+        .feed(&compatible_chunk(serde_json::json!({}), Some("tool_calls")))
+        .expect("finish chunk normalizes");
+    let failure = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        })
+        .expect_err("a syntax error inside a served answer stays fail-closed");
+    assert!(failure.safe_message.contains("not valid JSON"));
 }

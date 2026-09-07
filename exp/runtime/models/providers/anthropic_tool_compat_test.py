@@ -25,6 +25,9 @@ def test_forced_tool_choice_rejection_is_an_exact_release_fact() -> None:
         "claude-fable-5.1",
         "claude-mythos-5-1",
         "claude-fable-5-1-20260901",
+        # Relay and Bedrock spellings carry the same model, so the same rule.
+        "anthropic/claude-fable-5.1",
+        "anthropic.claude-fable-5-1-20260901-v1:0",
     ):
         assert anthropic_rejects_forced_tool_choice(model), model
     for model in (

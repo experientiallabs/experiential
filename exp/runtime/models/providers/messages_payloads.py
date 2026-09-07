@@ -74,21 +74,28 @@ def anthropic_messages_stream_payload(
         if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ProviderResponseError("instruction messages require text")
-            # Leading instructions ride the top-level system field; a system
-            # turn after conversation began is a first-class mid-conversation
-            # message on this wire (the provider enforces its own placement
-            # rules), so its position is preserved verbatim.
+            # Leading instructions ride the top-level system field. A system
+            # turn after conversation began rides as USER text at its position:
+            # Anthropic accepts a `system` role inside `messages` only directly
+            # before an assistant turn or as the final message, and haiku-4-5
+            # not at all (live 2026-09-07: "role 'system' must precede an
+            # 'assistant' message or end the array" / "role 'system' is not
+            # supported on this model"), while every current model accepts the
+            # same text as a user block, which is also how Anthropic's own
+            # clients carry mid-conversation instructions. The builder below
+            # merges it into an adjacent user turn.
             if messages:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            list(message.provider_text_blocks)
-                            if message.provider_text_blocks
-                            else [{"type": "text", "text": message.content}]
-                        ),
-                    }
+                instruction_blocks: list[JsonObject] = (
+                    list(message.provider_text_blocks)
+                    if message.provider_text_blocks
+                    else [{"type": "text", "text": message.content}]
                 )
+                previous = messages[-1]
+                previous_content = previous.get("content")
+                if previous.get("role") == "user" and isinstance(previous_content, list):
+                    previous_content.extend(instruction_blocks)
+                else:
+                    messages.append({"role": "user", "content": instruction_blocks})
             else:
                 system_parts.append((message.content, message.provider_text_blocks))
             continue

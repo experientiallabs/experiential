@@ -48,9 +48,19 @@ def anthropic_rejects_forced_tool_choice(model_id: str) -> bool:
         ``True`` when the model answers ``tool_choice.type`` of ``any`` or
         ``tool`` with a 400 regardless of the rest of the request.
     """
+    # Matched as a whole id segment in ANY spelling: the native id, a dated
+    # snapshot, OpenRouter's `anthropic/claude-fable-5-1`, or a Bedrock/Vertex
+    # form. Relays forward Anthropic's rejection unchanged (live 2026-09-07:
+    # "Azure: tool_choice: type \"tool\" and \"any\" are not supported for this
+    # model" through OpenRouter, 154 attempts / 5 orgs in 12h), so the fact is
+    # the model's, not the wire's. A later point release never inherits.
     normalized = model_id.lower().replace(".", "-").replace("_", "-")
     return any(
-        normalized == release or normalized.startswith(f"{release}-")
+        re.search(
+            rf"(?:^|[^a-z0-9]){re.escape(release)}(?![a-z0-9])(?!-\d{{1,7}}(?![0-9]))",
+            normalized,
+        )
+        is not None
         for release in _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES
     )
 
