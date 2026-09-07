@@ -187,6 +187,7 @@ class NativeControlPlane(
         readiness_probe: Callable[[], bool] | None = None,
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
+        cache_sample_gate: Callable[[str], bool] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
     ) -> None:
@@ -205,6 +206,11 @@ class NativeControlPlane(
             readiness_probe: Optional hosted lifecycle readiness callback.
             usage_reporter: Optional hosted usage report callback.
             budget_error_factory: Optional hosted mapping for a rejected reservation.
+            cache_sample_gate: Optional hosted predicate deciding whether one
+                settled attempt (by its ledger attempt id) may feed the
+                cache-priority EWMA; the host excludes promo-funded attempts
+                so subsidized replay cannot buy fair-share weight. ``None``
+                admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
         """
@@ -235,6 +241,7 @@ class NativeControlPlane(
         self._accounting = NativeAttemptAccounting(
             self._write_ledger,
             budget_error_factory=budget_error_factory,
+            cache_sample_gate=cache_sample_gate,
         )
 
     @property
