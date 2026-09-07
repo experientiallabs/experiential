@@ -153,8 +153,28 @@ const REFUSAL_PHRASES: &[&str] = &[
 ];
 /// Cyber vocabulary that names the reason only inside a policy verdict: a
 /// caller's prompt about "exploiting a cache" or a sentence mentioning
-/// "malware" in passing is not a cyber-policy refusal on its own.
-const CYBER_WORDS: &[&str] = &["cyber", "malware", "exploit"];
+/// "malware" in passing is not a cyber-policy refusal on its own. These are
+/// prefix-safe ("cybersecurity", "cyberattack" all name the domain).
+const CYBER_PREFIX_WORDS: &[&str] = &["cyber", "malware", "ransomware", "phishing", "hacking"];
+
+/// Whether the sentence names a software exploit as a whole word ("exploit",
+/// "exploits"). "exploit" is NOT prefix-safe: "sexual exploitation" is a
+/// content-policy verdict, and "exploited"/"exploitative" are ordinary prose,
+/// so any continuation other than a plural `s` disqualifies the match.
+fn names_software_exploit(haystack: &str) -> bool {
+    haystack.match_indices("exploit").any(|(start, matched)| {
+        let mut rest = haystack[start + matched.len()..].chars();
+        match rest.next() {
+            None => true,
+            Some('s') => !rest.next().is_some_and(|c| c.is_ascii_alphabetic()),
+            Some(c) => !c.is_ascii_alphabetic(),
+        }
+    })
+}
+
+fn names_cyber_domain(haystack: &str) -> bool {
+    contains_any(haystack, CYBER_PREFIX_WORDS) || names_software_exploit(haystack)
+}
 const POLICY_CONTEXT_WORDS: &[&str] = &[
     "policy",
     "policies",
@@ -282,7 +302,7 @@ pub fn refusal_reason(code: Option<&str>, message: Option<&str>) -> RefusalReaso
     if contains_any(&haystack, CBRN_PHRASES) {
         return RefusalReason::Cbrn;
     }
-    if contains_any(&haystack, CYBER_WORDS) && contains_any(&haystack, POLICY_CONTEXT_WORDS) {
+    if names_cyber_domain(&haystack) && contains_any(&haystack, POLICY_CONTEXT_WORDS) {
         return RefusalReason::CyberPolicy;
     }
     if contains_any(&haystack, RECITATION_PHRASES) {
@@ -635,6 +655,42 @@ mod tests {
             ),
             RefusalReason::ContentPolicy,
             "the provider's own content-policy code outranks cyber words in the sentence"
+        );
+        // "exploit" is a whole word, never a prefix: "sexual exploitation" is
+        // a content-policy verdict (Greptile on #843), and "exploited" or
+        // "exploitative" is ordinary prose; only "exploit"/"exploits" names
+        // the software sense.
+        assert_eq!(
+            refusal_reason(
+                None,
+                Some("Content involving sexual exploitation was blocked by our safety policy.")
+            ),
+            RefusalReason::ContentPolicy
+        );
+        assert_eq!(
+            refusal_reason(
+                None,
+                Some("The request exploited a loophole and was flagged as unsafe.")
+            ),
+            RefusalReason::ContentPolicy
+        );
+        assert_eq!(
+            refusal_reason(
+                None,
+                Some("Writing exploits for known CVEs is not allowed.")
+            ),
+            RefusalReason::CyberPolicy
+        );
+        assert_eq!(
+            refusal_reason(
+                None,
+                Some("Blocked: exploit development violates our policy.")
+            ),
+            RefusalReason::CyberPolicy
+        );
+        assert_eq!(
+            refusal_reason(None, Some("Ransomware and phishing content is prohibited.")),
+            RefusalReason::CyberPolicy
         );
         // "bio" alone is a code token, never a substring match: a biography
         // or biology sentence does not become a weapons verdict.
