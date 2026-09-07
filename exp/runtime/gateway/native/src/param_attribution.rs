@@ -325,14 +325,19 @@ pub fn generic_error_code(token: &str) -> bool {
 
 /// One provider sentence reduced to bounded, single-line, printable text.
 ///
-/// Control characters end the candidate rather than being escaped: their
-/// presence means the field carries a payload, not a sentence. Interior runs
-/// of spaces and tabs collapse so the relayed text stays one readable line,
-/// and [`carries_provider_identifier`] then rejects any sentence naming
-/// provider-side infrastructure, except words the request itself carried.
+/// Control characters mean the field carries a payload, not a sentence, and
+/// the candidate drops. Interior runs of spaces and tabs collapse so the
+/// relayed text stays one readable line. Every word
+/// [`carries_provider_identifier`] flags (an account, deployment, key, or
+/// network handle the provider echoed) is MASKED as `[redacted]`, keeping
+/// the sentence around it: dropping the whole line left 459 callers a day
+/// (2026-09-07) with "verify the request fields" and nothing to act on,
+/// while the handle itself is the only part that must not cross. Words the
+/// request itself carried stay. An over-long sentence is cut to the bound
+/// with an ellipsis rather than dropped.
 fn sanitized_detail(message: &str, request_words: &[&str]) -> Option<String> {
     let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAXIMUM_DETAIL_LENGTH {
+    if trimmed.is_empty() {
         return None;
     }
     if trimmed
@@ -342,14 +347,69 @@ fn sanitized_detail(message: &str, request_words: &[&str]) -> Option<String> {
         return None;
     }
     let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty()
-        || collapsed
-            .split(' ')
-            .any(|word| carries_provider_identifier(word, request_words))
-    {
+    if collapsed.is_empty() {
         return None;
     }
-    Some(collapsed)
+    Some(bounded_masked_line(&collapsed, request_words))
+}
+
+/// The placeholder a provider-side handle becomes in a relayed sentence.
+pub(crate) const REDACTED: &str = "[redacted]";
+
+/// Mask every identifier-bearing word of one collapsed line and bound its
+/// length. Trailing punctuation on a masked word survives so the sentence
+/// still reads (`org_a1b2c3:` -> `[redacted]:`).
+pub(crate) fn bounded_masked_line(collapsed: &str, request_words: &[&str]) -> String {
+    let masked = collapsed
+        .split(' ')
+        .map(|word| {
+            if carries_provider_identifier(word, request_words) {
+                let tail_start = word
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| c.is_alphanumeric())
+                    .map_or(word.len(), |(index, c)| index + c.len_utf8());
+                format!("{REDACTED}{}", &word[tail_start..])
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if masked.chars().count() <= MAXIMUM_DETAIL_LENGTH {
+        return masked;
+    }
+    let mut cut: String = masked.chars().take(MAXIMUM_DETAIL_LENGTH - 1).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+/// Whether a 404 body is the provider refusing a CALLER reference (an
+/// `item_reference`, `conversation`, or similar handle the provider does not
+/// hold) rather than a missing model. OpenAI answers those as HTTP 404 with
+/// `type: invalid_request_error` and no `model_not_found` code (live
+/// 2026-09-07: "Item with id 'rs_...' not found. Items are not persisted when
+/// `store` is set to false." and "Conversation with id 'conv_...' not
+/// found."). The catalog is fine and every other rung would answer the same,
+/// so the request is the caller's 400, never a lane 404 that fails over: one
+/// client replaying foreign item ids drove 361 attempts across the astra
+/// ladder in three and a half hours.
+pub fn rejected_caller_reference_not_found(dialect: Dialect, body: &str) -> bool {
+    if !matches!(
+        dialect,
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible
+    ) {
+        return false;
+    }
+    let value: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let Some(error) = value.get("error") else {
+        return false;
+    };
+    error.get("type").and_then(Value::as_str) == Some("invalid_request_error")
+        && !rejected_model_not_found(dialect, body)
 }
 
 /// Whether one word of a provider sentence names provider-side infrastructure.
@@ -791,14 +851,14 @@ mod tests {
             rejected_detail(Dialect::OpenAiCompatible, multiline, &[]),
             None
         );
+        // An over-long sentence is bounded with an ellipsis, not dropped.
         let oversized = format!(
             r#"{{"error": {{"message": "{}"}}}}"#,
             "x".repeat(MAXIMUM_DETAIL_LENGTH + 1)
         );
-        assert_eq!(
-            rejected_detail(Dialect::OpenAiCompatible, &oversized, &[]),
-            None
-        );
+        let bounded = rejected_detail(Dialect::OpenAiCompatible, &oversized, &[]).expect("bounded");
+        assert_eq!(bounded.chars().count(), MAXIMUM_DETAIL_LENGTH);
+        assert!(bounded.ends_with('\u{2026}'));
         assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "{}", &[]), None);
         assert_eq!(
             rejected_detail(Dialect::OpenAiCompatible, "<html>", &[]),
@@ -809,26 +869,57 @@ mod tests {
     }
 
     #[test]
-    fn provider_explanation_is_dropped_when_it_names_provider_infrastructure() {
+    fn provider_infrastructure_is_masked_and_the_sentence_relayed() {
         // One readable sentence each, differing only in the operator-facing
-        // value the provider chose to echo back.
-        for message in [
-            "The deployment gpt4o-prod-7f2a91be44 is not configured for this account.",
-            "Model access denied for account 5f4dcc3b5aa765d61d8327deb882cf99.",
-            "Request 3f8a1c2e-9b44-4d17-9a1e-77c0d2b8e451 failed validation.",
-            "Route your request to https://eastus2.api.internal.example.com instead.",
-            "Contact platform-oncall@example.com about this quota.",
-            "The endpoint 10.42.117.8 rejected the model.",
-            "Deployment prod-7 is retired.",
-            "Quota exhausted for acct-123.",
-            "Use region eastus2 instead.",
-            "Model arn:aws:bedrock:us-east-1:481516234299:model/private is unavailable.",
+        // value the provider chose to echo back: the value is masked, the
+        // sentence around it (what the caller can act on) survives.
+        for (message, masked) in [
+            (
+                "The deployment gpt4o-prod-7f2a91be44 is not configured for this account.",
+                "The deployment [redacted] is not configured for this account.",
+            ),
+            (
+                "Model access denied for account 5f4dcc3b5aa765d61d8327deb882cf99.",
+                "Model access denied for account [redacted].",
+            ),
+            (
+                "Request 3f8a1c2e-9b44-4d17-9a1e-77c0d2b8e451 failed validation.",
+                "Request [redacted] failed validation.",
+            ),
+            (
+                "Route your request to https://eastus2.api.internal.example.com instead.",
+                "Route your request to [redacted] instead.",
+            ),
+            (
+                "Contact platform-oncall@example.com about this quota.",
+                "Contact [redacted] about this quota.",
+            ),
+            (
+                "The endpoint 10.42.117.8 rejected the model.",
+                "The endpoint [redacted] rejected the model.",
+            ),
+            (
+                "Deployment prod-7 is retired.",
+                "Deployment [redacted] is retired.",
+            ),
+            (
+                "Quota exhausted for acct-123.",
+                "Quota exhausted for [redacted].",
+            ),
+            (
+                "Use region eastus2 instead.",
+                "Use region [redacted] instead.",
+            ),
+            (
+                "Model arn:aws:bedrock:us-east-1:481516234299:model/private is unavailable.",
+                "Model [redacted] is unavailable.",
+            ),
         ] {
             let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
             assert_eq!(
-                rejected_detail(Dialect::OpenAiCompatible, &body, &[]),
-                None,
-                "relayed an identifier-bearing sentence: {message}"
+                rejected_detail(Dialect::OpenAiCompatible, &body, &[]).as_deref(),
+                Some(masked),
+                "identifier not masked: {message}"
             );
         }
         // Ordinary caller-actionable prose stays relayable, including the
@@ -917,9 +1008,12 @@ mod request_word_tests {
         let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
             "message": "claude-fable-5-1 requires Claude Code version 2.1.251 or later. Please upgrade Claude Code to continue."}}"#;
         assert_eq!(
-            rejected_detail(Dialect::AnthropicMessages, body, &[]),
-            None,
-            "without the request's own words the label-shaped model id still redacts"
+            rejected_detail(Dialect::AnthropicMessages, body, &[]).as_deref(),
+            Some(
+                "[redacted] requires Claude Code version 2.1.251 or later. \
+                 Please upgrade Claude Code to continue."
+            ),
+            "without the request's own words the label-shaped model id is masked"
         );
         assert_eq!(
             rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]).as_deref(),
@@ -935,9 +1029,9 @@ mod request_word_tests {
         let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
             "message": "claude-fable-5-1 is retired on deployment prod-7f2a; contact your operator."}}"#;
         assert_eq!(
-            rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]),
-            None,
-            "an infrastructure label beside the known word still redacts the sentence"
+            rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]).as_deref(),
+            Some("claude-fable-5-1 is retired on deployment [redacted]; contact your operator."),
+            "an infrastructure label beside the known word is masked, the known word kept"
         );
     }
 
@@ -952,8 +1046,42 @@ mod request_word_tests {
                 Dialect::AnthropicMessages,
                 body,
                 &["arn:aws:bedrock:us-east-1:123:model/x"],
-            ),
-            None
+            )
+            .as_deref(),
+            Some("Model [redacted] is unavailable.")
         );
+    }
+
+    #[test]
+    fn a_404_refusing_a_caller_reference_is_the_callers_error_not_a_missing_model() {
+        let item = r#"{"error":{"message":"Item with id 'rs_0' not found. Items are not persisted when `store` is set to false.","type":"invalid_request_error","param":"input","code":null}}"#;
+        assert!(rejected_caller_reference_not_found(
+            Dialect::OpenAiResponses,
+            item
+        ));
+        assert!(rejected_caller_reference_not_found(
+            Dialect::OpenAiCompatible,
+            item
+        ));
+        let conversation = r#"{"error":{"message":"Conversation with id 'conv_0' not found.","type":"invalid_request_error","param":null,"code":null}}"#;
+        assert!(rejected_caller_reference_not_found(
+            Dialect::OpenAiResponses,
+            conversation
+        ));
+        let model = r#"{"error":{"message":"The model `x` does not exist.","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#;
+        assert!(!rejected_caller_reference_not_found(
+            Dialect::OpenAiResponses,
+            model
+        ));
+        let anthropic =
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model: x"}}"#;
+        assert!(!rejected_caller_reference_not_found(
+            Dialect::AnthropicMessages,
+            anthropic
+        ));
+        assert!(!rejected_caller_reference_not_found(
+            Dialect::OpenAiResponses,
+            "<html>"
+        ));
     }
 }

@@ -26,17 +26,35 @@ from exp.runtime.models.providers.wire_messages import (
 )
 
 _INPUT_MESSAGE_ROLES = frozenset({"user", "system", "developer"})
+# Item ids another gateway's Responses emulation mints; no OpenAI wire issues
+# them, and OpenAI refuses a replayed item carrying one ("Expected an ID that
+# begins with 'rs'" / 'msg'; 164 requests across six orgs in the 48h to
+# 2026-09-07). Only this observed shape is treated as foreign.
+_FOREIGN_ITEM_ID_PREFIX = "item_"
 
 
-def _without_input_message_status(item: JsonObject) -> JsonObject:
-    """Drop ``status`` from a replayed input message; every other item is verbatim."""
+def _replayable_native_item(item: JsonObject) -> JsonObject | None:
+    """Shape one replayed Responses item for the OpenAI wire; ``None`` drops it.
+
+    Two client habits are repaired, everything else re-emits verbatim: an
+    input MESSAGE loses the output-only ``status`` OpenAI rejects on it, and
+    an item carrying a foreign ``id`` loses the id (a reasoning item with a
+    foreign id is dropped whole: without its encrypted content the provider
+    has nothing to resume from, and the id alone is refused).
+    """
+    shaped = item
+    item_id = shaped.get("id")
+    if isinstance(item_id, str) and item_id.startswith(_FOREIGN_ITEM_ID_PREFIX):
+        if shaped.get("type") == "reasoning" and "encrypted_content" not in shaped:
+            return None
+        shaped = {key: value for key, value in shaped.items() if key != "id"}
     if (
-        "status" in item
-        and item.get("type") in (None, "message")
-        and item.get("role") in _INPUT_MESSAGE_ROLES
+        "status" in shaped
+        and shaped.get("type") in (None, "message")
+        and shaped.get("role") in _INPUT_MESSAGE_ROLES
     ):
-        return {key: value for key, value in item.items() if key != "status"}
-    return item
+        shaped = {key: value for key, value in shaped.items() if key != "status"}
+    return shaped
 
 
 def openai_responses_stream_payload(
@@ -84,7 +102,9 @@ def openai_responses_stream_payload(
             # the input-message schema has no such field and OpenAI answers
             # 400 "Unknown parameter: 'input[N].status'". Hosted tool items
             # keep theirs (their schema defines it).
-            items.append(_without_input_message_status(message.provider_native_item))
+            replayable = _replayable_native_item(message.provider_native_item)
+            if replayable is not None:
+                items.append(replayable)
         elif message.role in {"system", "developer"}:
             if message.content is None:
                 raise ProviderResponseError("instruction messages require text")
