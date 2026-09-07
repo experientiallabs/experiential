@@ -797,7 +797,10 @@ class NativeAttemptAccounting:
         Feeds the congestion-dependent cache-priority term: the registry keeps
         a per-(organization, rung) EWMA of the settled cached fraction, so
         fairness can favor the organization whose traffic actually reuses warm
-        provider cache. Attempts without observed token usage record nothing.
+        provider cache. Attempts without observed token usage record nothing,
+        and one attempt folds at most once: a settlement can reach the ledger
+        through both the direct path and the retained-settlement sweep (each
+        idempotent there), and a duplicate fold would skew the estimate.
 
         Args:
             entry: The owning in-flight request.
@@ -809,6 +812,10 @@ class NativeAttemptAccounting:
         depth = entry.attempt_depths.get(attempt_id)
         if depth is None:
             return
+        with self._lock:
+            if attempt_id in entry.cache_recorded_attempts:
+                return
+            entry.cache_recorded_attempts.add(attempt_id)
         cached = usage.cached_input_tokens
         self._loads.record_settle(
             rung_load_key(entry.route.deployments[depth]),

@@ -1226,24 +1226,26 @@ class TestRateLimitSettlement:
 
         monkeypatch.setattr(registry.loads, "record_settle", _record)
         started = _start(registry, ordinal=0)
-        registry.settle(
-            json.dumps(
-                {
-                    "request_id": "request-one",
-                    "attempt_id": str(started["attempt_id"]),
-                    "outcome": "completed",
-                    "usage": {
-                        "input_tokens": 1_000,
-                        "cached_input_tokens": 800,
-                        "output_tokens": 5,
-                    },
-                    "tool_names": [],
-                    "failure": None,
-                    "finalize": True,
-                    "opened": True,
-                }
-            )
+        settlement = json.dumps(
+            {
+                "request_id": "request-one",
+                "attempt_id": str(started["attempt_id"]),
+                "outcome": "completed",
+                "usage": {
+                    "input_tokens": 1_000,
+                    "cached_input_tokens": 800,
+                    "output_tokens": 5,
+                },
+                "tool_names": [],
+                "failure": None,
+                "finalize": False,
+                "opened": True,
+            }
         )
+        registry.settle(settlement)
+        # A redelivered settlement (the ledger write is idempotent) must not
+        # fold the same attempt's sample into the EWMA a second time.
+        registry.settle(settlement)
         assert recorded == [(("deployment-a", "b" * 64), "organization-one", 800, 1_000)]
 
     def test_swept_retained_settlement_still_records_the_cache_fraction(

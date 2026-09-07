@@ -132,6 +132,11 @@ class InflightRequest:
     # so dispatch reservation can read and refresh the worker-local sticky
     # binding and apply the fresh-session spill threshold.
     affinity_fingerprint: bytes | None = None
+    # Attempts whose settled usage already fed the cache-priority EWMA: a
+    # settlement can land through the direct path AND the retained-settlement
+    # sweep (both idempotent at the ledger), so the fold is guarded to exactly
+    # once per attempt.
+    cache_recorded_attempts: set[str] = field(default_factory=set)
     # Whether the route's depth 0 was chosen by a live sticky binding rather
     # than rendezvous order, for the ``affinity_sticky`` disclosure.
     sticky_preferred: bool = False
