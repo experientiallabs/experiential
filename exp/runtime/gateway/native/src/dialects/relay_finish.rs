@@ -18,7 +18,11 @@ use crate::events::{Event, ToolAccumulator};
 /// mid-string, so this shape is the provider cutting the stream whatever its
 /// finish reason says.
 fn arguments_end_mid_fragment(raw: &str) -> bool {
-    matches!(serde_json::from_str::<Value>(raw), Err(error) if error.is_eof())
+    // Only an OBJECT prefix can be a cut tool call: a fragment that opens as an
+    // array or scalar could never have become the required arguments object,
+    // so its early end is corruption and keeps the strict contract.
+    raw.trim_start().starts_with('{')
+        && matches!(serde_json::from_str::<Value>(raw), Err(error) if error.is_eof())
 }
 
 /// Finish open tools on an OpenAI-compatible RELAY stream that declared a

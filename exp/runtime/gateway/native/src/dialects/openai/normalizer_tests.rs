@@ -982,3 +982,31 @@ fn a_relay_stop_finish_with_a_syntax_error_inside_arguments_stays_malformed() {
         .expect_err("a syntax error inside a served answer stays fail-closed");
     assert!(failure.safe_message.contains("not valid JSON"));
 }
+
+#[test]
+fn a_cut_non_object_prefix_stays_malformed_on_a_relay_finish() {
+    // An unfinished ARRAY could never have become the arguments object, so its
+    // early end is corruption, not a cut call.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": "[1,2"},
+            }]}),
+            None,
+        ))
+        .expect("tool delta normalizes");
+    normalizer
+        .feed(&compatible_chunk(serde_json::json!({}), Some("tool_calls")))
+        .expect("finish chunk normalizes");
+    let failure = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        })
+        .expect_err("a non-object prefix is corruption");
+    assert!(failure.safe_message.contains("not valid JSON"));
+}
