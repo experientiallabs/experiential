@@ -8,8 +8,9 @@ use serde_json::Value;
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
 use crate::param_attribution::{
-    generic_error_code, rejected_by_lane_limitation, rejected_by_routing_gate, rejected_code,
-    rejected_detail, rejected_model_not_found, rejected_parameter,
+    generic_error_code, rejected_by_lane_limitation, rejected_by_routing_gate,
+    rejected_caller_reference_not_found, rejected_code, rejected_detail, rejected_model_not_found,
+    rejected_parameter,
 };
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
@@ -174,8 +175,9 @@ pub async fn open_stream(
         // is read bounded, and the relayable facts are a validated parameter
         // path plus the provider's own bounded explanation of what the caller
         // got wrong; every other class stays content-free. A 403 is read too,
-        // only to tell an aggregator routing gate from a credential verdict.
-        if failure.failure_class != FailureClass::InvalidRequest && status != 403 {
+        // only to tell an aggregator routing gate from a credential verdict,
+        // and a 404 to tell a caller's dangling reference from a missing model.
+        if failure.failure_class != FailureClass::InvalidRequest && status != 403 && status != 404 {
             return Err(failure);
         }
         // The attribution read never outlives the rung's own header-phase
@@ -188,6 +190,38 @@ pub async fn open_stream(
             Ok(Some(body)) => Some(body),
             _ => None,
         };
+        if status == 404 {
+            // OpenAI answers 404 for an `item_reference`, `conversation`, or
+            // similar handle the caller sent but the provider does not hold
+            // (store=false items are never persisted). The catalog is fine and
+            // every rung would answer the same, so it is the caller's 400 with
+            // the provider's sentence, never a lane 404 that walks the ladder.
+            if body
+                .as_deref()
+                .is_some_and(|body| rejected_caller_reference_not_found(dialect, body))
+            {
+                let request_words: Vec<&str> = payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .into_iter()
+                    .collect();
+                let detail = body
+                    .as_deref()
+                    .and_then(|body| rejected_detail(dialect, body, &request_words));
+                let parameter = body
+                    .as_deref()
+                    .and_then(|body| rejected_parameter(dialect, body));
+                return Err(Failure::new(
+                    FailureClass::InvalidRequest,
+                    "the request references a provider-side item, response, or conversation \
+                     the provider does not hold; resend that content inline",
+                )
+                .with_retry(false, false)
+                .with_rejected_parameter(parameter)
+                .with_provider_detail(detail));
+            }
+            return Err(failure);
+        }
         if status == 403 {
             if body
                 .as_deref()
@@ -403,8 +437,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_provider_sentence_still_relays_the_provider_code() {
-        // The sentence names an account handle, so the identifier screen drops
-        // it; the caller still learns WHICH rejection it was.
+        // The sentence names an account handle: the handle is masked and the
+        // sentence around it still reaches the caller.
         let failure = open_against_body(
             "400 Bad Request",
             "{\"error\":{\"code\":\"invalid_value\",\"type\":\"invalid_request_error\",\
@@ -413,11 +447,57 @@ mod tests {
         )
         .await;
         assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
-        assert_eq!(failure.provider_detail.as_deref(), Some("invalid_value"));
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("Invalid value for organization [redacted]: not allowed")
+        );
         assert_eq!(
             failure.public_error().message,
-            "provider rejected the request: invalid_value"
+            "provider rejected the request: Invalid value for organization [redacted]: not allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_404_for_a_callers_dangling_item_reference_is_the_callers_400() {
+        let failure = open_against_body(
+            "404 Not Found",
+            "{\"error\":{\"message\":\"Item with id 'rs_0000' not found. Items are not \
+             persisted when `store` is set to false.\",\"type\":\"invalid_request_error\",\
+             \"param\":\"input\",\"code\":null}}",
+            "gpt-6-astra",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+        assert!(
+            !failure.failover_eligible,
+            "every rung would answer the same"
+        );
+        assert_eq!(failure.public_error().status_code, 400);
+        assert!(failure
+            .provider_detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("Item with id 'rs_0000' not found")));
+    }
+
+    #[tokio::test]
+    async fn a_404_naming_a_missing_model_keeps_the_lane_policy() {
+        let failure = open_against_body(
+            "404 Not Found",
+            "{\"error\":{\"message\":\"The model `x` does not exist or you do not have \
+             access to it.\",\"type\":\"invalid_request_error\",\"param\":\"model\",\
+             \"code\":\"model_not_found\"}}",
+            "x",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderNotFound);
+        assert!(failure.failover_eligible);
+    }
+
+    #[tokio::test]
+    async fn a_bodiless_404_keeps_the_lane_policy() {
+        let failure = open_against_body("404 Not Found", "", "m").await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderNotFound);
+        assert!(failure.failover_eligible);
     }
 
     #[tokio::test]

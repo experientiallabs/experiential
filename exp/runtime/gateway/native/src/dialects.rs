@@ -160,11 +160,9 @@ fn provider_error_detail(
             .take_while(|character| !character.is_control())
             .collect();
         let collapsed = cut.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!collapsed.is_empty()
-            && !collapsed.split(' ').any(|word| {
-                crate::param_attribution::carries_provider_identifier(word, request_words)
-            }))
-        .then_some(collapsed)
+        // Provider-side handles are masked, never dropped with the sentence.
+        (!collapsed.is_empty())
+            .then(|| crate::param_attribution::bounded_masked_line(&collapsed, request_words))
     });
     let detail = match (code, line) {
         (None, None) => return None,
@@ -823,25 +821,34 @@ mod stream_error_detail_tests {
     }
 
     #[test]
-    fn secret_shaped_words_drop_the_whole_detail_line() {
+    fn secret_shaped_words_are_masked_out_of_the_detail_line() {
         // The identifier screen treats any letter+digit label as a handle,
-        // which covers key and token shapes: a sentence carrying one drops
-        // entirely (never partially redacted), for every dialect that feeds
-        // the shared detail path, Bedrock exception messages included.
-        for message in [
-            "Invalid key sk-abc123def provided.",
-            "The access key AKIA9X7EXAMPLE is not authorized for this model.",
-            "Bearer eyJhbGciOi9 was rejected.",
+        // which covers key and token shapes: the word is masked and the
+        // sentence around it survives, for every dialect that feeds the
+        // shared detail path, Bedrock exception messages included.
+        for (message, masked) in [
+            (
+                "Invalid key sk-abc123def provided.",
+                "Invalid key [redacted] provided.",
+            ),
+            (
+                "The access key AKIA9X7EXAMPLE is not authorized for this model.",
+                "The access key [redacted] is not authorized for this model.",
+            ),
+            (
+                "Bearer eyJhbGciOi9 was rejected.",
+                "Bearer [redacted] was rejected.",
+            ),
         ] {
             assert_eq!(
-                provider_error_detail(None, Some(message), &[]),
-                None,
-                "a credential-shaped word must drop the sentence: {message}"
+                provider_error_detail(None, Some(message), &[]).as_deref(),
+                Some(masked),
+                "a credential-shaped word must be masked: {message}"
             );
             assert_eq!(
                 provider_error_detail(Some("validation_error"), Some(message), &[]).as_deref(),
-                Some("validation_error"),
-                "the safe code token alone survives: {message}"
+                Some(format!("validation_error: {masked}").as_str()),
+                "the code rides with the masked sentence: {message}"
             );
         }
     }
@@ -915,11 +922,11 @@ mod stream_error_detail_tests {
             })))
             .expect("error frame normalizes");
         // The model id trips the identifier screen (letters+digits label), so
-        // the sentence drops while the code token survives: the mechanism
-        // stays named without relaying a label-shaped word to the ledger.
+        // it is masked while the code and the sentence around it survive: the
+        // mechanism stays named without relaying a label-shaped word.
         assert_eq!(
             failed_detail(&events).as_deref(),
-            Some("rate_limit_exceeded")
+            Some("rate_limit_exceeded: Rate limit reached for [redacted].")
         );
     }
 
