@@ -1694,6 +1694,38 @@ def test_empty_tool_call_arguments_decode_as_the_canonical_empty_object() -> Non
     assert responses.request.messages[0].tool_calls[0].raw_arguments == "{}"
 
 
+def test_an_empty_additional_tools_item_forwards_natively() -> None:
+    """Codex's Apps integration ships ``additional_tools`` with ``tools: []``
+    when the connected app exposes no tools (live capture 2026-09-07, after
+    an app reconnect); the provider accepts it, so the gateway must forward
+    the item byte-for-byte instead of refusing the turn with a 400."""
+    additional_tools = {
+        "type": "additional_tools",
+        "id": "at_empty",
+        "role": "developer",
+        "tools": [],
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6",
+            "input": [
+                additional_tools,
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Run ls."}],
+                },
+            ],
+        }
+    )
+    natives = [
+        message.provider_native_item
+        for message in decoded.request.messages
+        if message.provider_native_item is not None
+    ]
+    assert natives == [additional_tools]
+
+
 def test_the_captured_codex_request_shape_decodes_losslessly() -> None:
     """Regression fixture: the field shapes real Codex (0.151.0) sends by
     default, trimmed from a live capture (2026-08-29). Native items carry
