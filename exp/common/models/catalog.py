@@ -149,6 +149,13 @@ class ConnectionConfig(ContractModel):
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    # A native provider (anthropic/openai/gemini/openrouter) uses its built-in
+    # official endpoint by default. Set this to route it through a customer-run
+    # trusted endpoint via ``base_url`` in the SAME wire dialect (e.g. a reseller
+    # that speaks the Anthropic Messages API), preserving the native auth and
+    # response shape. Opt-in and default-off: the caller asserts the origin is
+    # trusted; the fixed-origin guard below stays in force for every other case.
+    trusted_custom_origin: bool = False
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -183,10 +190,20 @@ class ConnectionConfig(ContractModel):
                 "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
                 "provider='bedrock'"
             )
-        if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
+        if self.trusted_custom_origin:
+            if self.provider not in _FIXED_ORIGIN_PROVIDERS:
+                raise ValueError(
+                    "trusted_custom_origin applies only to a native provider "
+                    f"({', '.join(sorted(_FIXED_ORIGIN_PROVIDERS))}); "
+                    f"{self.provider!r} already accepts a base_url"
+                )
+            if self.base_url is None:
+                raise ValueError("trusted_custom_origin requires an explicit base_url")
+        elif self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
-                "use provider='openai-compatible' for a trusted custom endpoint"
+                "set trusted_custom_origin=True to route it through a trusted custom base_url, "
+                "or use provider='openai-compatible' for an OpenAI-wire custom endpoint"
             )
         if self.provider == "azure":
             if self.base_url is None:
