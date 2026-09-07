@@ -2661,10 +2661,15 @@ def test_assistant_prefill_narrows_out_rungs_whose_model_rejects_it() -> None:
         url="https://bedrock.test",
         model_id="anthropic.claude-fable-5-1-20260901-v1:0",
     )
+    relayed = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://openrouter.test",
+        model_id="anthropic/claude-opus-5",
+    )
     accepting = GatewayWireProfile(
         dialect="anthropic_messages", url="https://anthropic.test", model_id="claude-sonnet-4-5"
     )
-    for profile in (rejecting, bedrock):
+    for profile in (rejecting, bedrock, relayed):
         with pytest.raises(ProviderParameterError) as prefill:
             route_generation_parameter_requests((profile,), request)
         assert prefill.value.param == "messages"
