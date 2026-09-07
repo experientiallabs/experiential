@@ -118,7 +118,12 @@ def require_assistant_prefill_supported(
     Anthropic's 4.6+ and 5-generation releases answer assistant prefill with a
     400 after the request was dispatched and billed for admission. The rungs
     that carry such a model narrow out here with the same fact stated for the
-    caller; a route with no other rung surfaces it as the request's 400.
+    caller; a route with no other rung surfaces it as the request's 400. The
+    check keys on the MODEL, not the wire: relays (OpenRouter's
+    ``anthropic/claude-opus-5``, Azure Foundry's Claude deployments) forward
+    the same rejection (live 2026-09-07: "Azure: This model does not support
+    assistant message prefill" through OpenRouter), and the release matcher
+    only ever matches a Claude release id.
 
     Raises:
         ProviderParameterError: The final message is an assistant turn and a
@@ -129,10 +134,7 @@ def require_assistant_prefill_supported(
     if request.messages[-1].provider_native_item is not None:
         return
     for profile in profiles:
-        if profile.dialect not in {
-            "anthropic_messages",
-            "bedrock_converse_stream",
-        } or not anthropic_rejects_assistant_prefill(profile.model_id):
+        if not anthropic_rejects_assistant_prefill(profile.model_id):
             continue
         raise ProviderParameterError(
             message=(
