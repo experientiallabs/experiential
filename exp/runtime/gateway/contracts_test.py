@@ -120,6 +120,33 @@ def test_targets_and_compatibility_manifest_are_closed_and_deterministic() -> No
         )
 
 
+def test_authorization_snapshot_carries_the_trusted_client_ip() -> None:
+    """The optional trusted-hop client IP round-trips and defaults to None."""
+    without_ip = AuthorizationSnapshot(
+        request_id="request-1",
+        organization_id="organization-1",
+        identity_id="identity-1",
+        virtual_key_id="key-1",
+        alias="coding",
+        alias_revision_id="alias-revision-1",
+        target=ProjectTarget(
+            project_ref="support-agent",
+            activation_ref="activation-1",
+            catalog_sha256="a" * 64,
+        ),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="b" * 64,
+        deadline_monotonic=10.0,
+    )
+    assert without_ip.client_ip is None
+
+    with_ip = without_ip.model_copy(update={"client_ip": "198.51.100.9"})
+    assert with_ip.client_ip == "198.51.100.9"
+    restored = AuthorizationSnapshot.model_validate_json(with_ip.model_dump_json())
+    assert restored.client_ip == "198.51.100.9"
+
+
 def test_project_authorization_precedes_route_bound_execution() -> None:
     """Authorization can freeze a target before learned selection supplies route identity."""
     authorization = AuthorizationSnapshot(

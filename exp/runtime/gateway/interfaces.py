@@ -40,11 +40,15 @@ class GatewayControlStore(Protocol):
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Authenticate, authorize, and freeze authority before route selection.
 
         ``app_referer`` and ``app_title`` carry the caller's OpenRouter-style app identity
         (the ``HTTP-Referer`` and ``X-Title`` request headers) for content-free attribution.
+        ``client_ip`` is the caller IP from the TRUSTED proxy hop (``X-Real-IP``, else the
+        rightmost ``X-Forwarded-For`` entry), frozen onto the snapshot for the hosted
+        authority's per-key IP allow/deny enforcement; ``None`` when unavailable.
         """
         ...
 

@@ -98,6 +98,28 @@ pub(crate) fn bearer_key(headers: &HeaderMap) -> Result<String, PublicError> {
     Ok(trimmed.to_string())
 }
 
+/// Resolve the caller IP from the TRUSTED proxy hop for per-key IP enforcement:
+/// `X-Real-IP` when present, else the RIGHTMOST `X-Forwarded-For` entry. The
+/// leftmost XFF token is client-forgeable per request, so it is never trusted;
+/// the rightmost entry is the one our own ingress appended. Content-free (an
+/// address), decoded latin-1 like every other header. `None` when no trusted hop
+/// yields a non-empty address — the hosted authority then treats the IP as
+/// unknown (an allowlist fails closed, a denylist open).
+pub(crate) fn client_ip(headers: &HeaderMap) -> Option<String> {
+    if let Some(real) = latin1_header(headers, "x-real-ip") {
+        let trimmed = real.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let forwarded = latin1_header_list(headers, "x-forwarded-for")?;
+    forwarded
+        .rsplit(',')
+        .map(str::trim)
+        .find(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
 /// Read one request body under the shared explicit cap.
 pub(crate) async fn read_body(body: Body) -> Result<Bytes, PublicError> {
     axum::body::to_bytes(body, MAXIMUM_REQUEST_BODY_BYTES)
@@ -356,5 +378,45 @@ mod tests {
             latin1_header_list(&headers, "anthropic-beta").as_deref(),
             Some("context-1m-2025-08-07")
         );
+    }
+
+    #[test]
+    fn client_ip_prefers_x_real_ip() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-real-ip", "203.0.113.7".parse().unwrap());
+        headers.append("x-forwarded-for", "10.0.0.1, 198.51.100.9".parse().unwrap());
+        assert_eq!(client_ip(&headers).as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn client_ip_takes_the_rightmost_forwarded_entry() {
+        // The leftmost token is client-forgeable; the rightmost is our ingress's.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            "1.2.3.4, 10.0.0.1, 198.51.100.9".parse().unwrap(),
+        );
+        assert_eq!(client_ip(&headers).as_deref(), Some("198.51.100.9"));
+    }
+
+    #[test]
+    fn client_ip_takes_the_rightmost_across_repeated_lines() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        assert_eq!(client_ip(&headers).as_deref(), Some("198.51.100.9"));
+    }
+
+    #[test]
+    fn client_ip_is_none_without_a_trusted_hop() {
+        assert_eq!(client_ip(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn client_ip_skips_a_blank_real_ip_and_trailing_forwarded_commas() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-real-ip", "   ".parse().unwrap());
+        headers.append("x-forwarded-for", "203.0.113.7, ".parse().unwrap());
+        assert_eq!(client_ip(&headers).as_deref(), Some("203.0.113.7"));
     }
 }

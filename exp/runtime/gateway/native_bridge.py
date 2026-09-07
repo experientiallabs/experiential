@@ -315,7 +315,9 @@ class NativeControlPlane(
         try:
             # ``app_referer``/``app_title`` are forwarded when the native engine includes the
             # caller HTTP-Referer/X-Title in its admit payload; absent them app attribution
-            # stays null on the default path until the Rust engine populates them.
+            # stays null on the default path until the Rust engine populates them. ``client_ip``
+            # rides the same seam: the Rust engine resolves the trusted proxy hop and includes
+            # it so the hosted store can freeze it onto the snapshot for per-key IP enforcement.
             authorization = self._components.store.authorize_request(
                 raw_key=data["raw_key"],
                 alias=decoded.alias,
@@ -323,6 +325,7 @@ class NativeControlPlane(
                 deadline_monotonic=deadline,
                 app_referer=optional_text(data.get("app_referer")),
                 app_title=optional_text(data.get("app_title")),
+                client_ip=optional_text(data.get("client_ip")),
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
