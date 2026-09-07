@@ -106,12 +106,19 @@ class _FastHouseTarget(BaseHTTPRequestHandler):
     """A fast house rung for the rate-window scenario: sheds are never queueing."""
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract.
-        """Stream one instant success identifying the house rung."""
+        """Stream one instant success identifying the house rung.
+
+        The response carries provider rate-limit headers so the scenario also
+        proves the data plane harvests the allowlisted set into settlement and
+        the ledger persists the normalized integers per attempt.
+        """
         length = int(self.headers.get("content-length", "0"))
         self.rfile.read(length)
         try:
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
+            self.send_header("x-ratelimit-limit-requests", "60")
+            self.send_header("x-ratelimit-remaining-requests", "41")
             self.end_headers()
             self.wfile.write(_content_chunk("from-house"))
             self.wfile.write(_terminal_frames())
@@ -376,10 +383,18 @@ def test_rate_limited_rung_spills_the_burst_before_any_provider_429(
         (failures,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE failure_class IS NOT NULL"
         ).fetchone()
+        harvested = connection.execute(
+            "SELECT deployment_id, ratelimit_limit_requests, ratelimit_remaining_requests"
+            " FROM gateway_attempts WHERE ratelimit_remaining_requests IS NOT NULL"
+        ).fetchall()
     assert failures == 0
     assert len(sheds) == _BURST_REQUESTS - 1
     assert {reason for reason, _preferred in sheds} == {"rate_limit"}
     assert {preferred for _reason, preferred in sheds} == {"alpha"}
+    # The one dispatch that reached the house rung settled the provider's own
+    # rate-limit headers end to end: harvested by the data plane, normalized
+    # by accounting, persisted as integer columns on exactly that attempt.
+    assert harvested == [("alpha", 60, 41)]
 
 
 def test_unbounded_rung_queues_the_burst_into_deadline_deaths(

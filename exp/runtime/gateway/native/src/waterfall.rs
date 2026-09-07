@@ -31,6 +31,7 @@ use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
+use crate::rate_limit_headers::harvest_rate_limit_headers;
 use crate::relay::{
     collection_public_error, ended_without_terminal, remaining, track_event, UpstreamRelay,
 };
@@ -575,6 +576,10 @@ async fn run_attempt(
         }
     };
     guard.mark_opened();
+    // The opened response's allowlisted rate-limit headers settle with this
+    // attempt whatever its terminal outcome; a failed OPEN instead carries
+    // them on its failure (attached in `open_stream`).
+    guard.record_rate_limit_headers(harvest_rate_limit_headers(response.headers()));
     let mut relay = match wire
         .fireworks_reasoning_route_sha256
         .clone()
