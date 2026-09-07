@@ -1112,6 +1112,47 @@ def test_cross_tenant_grant_is_rejected_by_composite_foreign_keys(tmp_path: Path
         )
 
 
+def test_trusted_custom_origin_survives_sqlite_persistence(tmp_path: Path) -> None:
+    """A native custom-origin connection reloads with the flag and base_url intact.
+
+    Without persisting ``trusted_custom_origin`` the reconstruction would default
+    it to False and the fixed-origin validator would reject the reload (the
+    Greptile P1 on #853).
+    """
+    db = tmp_path / "gateway.db"
+    store = SQLiteGatewayStore(db)
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="reseller",
+        revision_id="provider-revision-one",
+        config=ConnectionConfig(
+            provider="anthropic",
+            base_url="https://reseller.example.test/v1",
+            api_key_env="RESELLER_API_KEY",
+            trusted_custom_origin=True,
+        ),
+    )
+    store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="official",
+        revision_id="provider-revision-two",
+        config=ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY"),
+    )
+
+    # A FRESH store reads the persisted rows and reconstructs each ConnectionConfig
+    # back through the fixed-origin validator.
+    reopened = SQLiteGatewayStore(db)
+    by_id = {
+        authority.connection_id: authority.config
+        for authority in reopened.provider_connections(organization_id="org-one")
+    }
+    assert by_id["reseller"].trusted_custom_origin is True
+    assert by_id["reseller"].base_url == "https://reseller.example.test/v1"
+    assert by_id["official"].trusted_custom_origin is False
+    assert by_id["official"].base_url is None
+
+
 def test_provider_revisions_are_sqlite_authority_and_alias_bindings_remain_frozen(
     tmp_path: Path,
 ) -> None:

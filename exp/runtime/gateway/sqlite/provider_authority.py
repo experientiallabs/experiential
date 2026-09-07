@@ -128,8 +128,9 @@ def upsert_provider_connection(
         INSERT INTO provider_connection_revisions (
             revision_id, organization_id, connection_id, revision_number,
             provider, base_url, api_key_env, api_version, azure_api_surface, region,
-            aws_access_key_id_env, bedrock_auth_mode, connection_sha256, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            aws_access_key_id_env, bedrock_auth_mode, trusted_custom_origin,
+            connection_sha256, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             revision_id,
@@ -144,6 +145,7 @@ def upsert_provider_connection(
             config.region,
             config.aws_access_key_id_env,
             config.bedrock_auth_mode,
+            1 if config.trusted_custom_origin else 0,
             digest,
             now,
         ),
@@ -198,7 +200,7 @@ def bound_provider_connections(
         SELECT c.connection_id, r.revision_id, r.revision_number,
                r.provider, r.base_url, r.api_key_env, r.api_version,
                r.azure_api_surface, r.region,
-               r.aws_access_key_id_env, r.bedrock_auth_mode,
+               r.aws_access_key_id_env, r.bedrock_auth_mode, r.trusted_custom_origin,
                r.connection_sha256, c.active
         FROM alias_revision_provider_connections AS b
         JOIN provider_connections AS c
@@ -340,6 +342,7 @@ def _authority(row: sqlite3.Row) -> ProviderConnectionAuthority:
             if row["bedrock_auth_mode"] is None
             else cast('Literal["access_key_pair", "api_key"]', str(row["bedrock_auth_mode"]))
         ),
+        trusted_custom_origin=bool(row["trusted_custom_origin"]),
     )
     digest = str(row["connection_sha256"])
     if config.identity_sha256() != digest:
@@ -358,7 +361,7 @@ _SELECT_AUTHORITY = """
 SELECT c.connection_id, r.revision_id, r.revision_number,
        r.provider, r.base_url, r.api_key_env, r.api_version,
        r.azure_api_surface, r.region,
-       r.aws_access_key_id_env, r.bedrock_auth_mode,
+       r.aws_access_key_id_env, r.bedrock_auth_mode, r.trusted_custom_origin,
        r.connection_sha256, c.active
 FROM provider_connections AS c
 JOIN provider_connection_revisions AS r

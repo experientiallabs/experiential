@@ -511,6 +511,43 @@ def test_native_provider_rejects_a_custom_endpoint_that_could_receive_its_key(
         )
 
 
+def test_trusted_custom_origin_allows_a_native_dialect_custom_endpoint() -> None:
+    """An explicit trusted origin routes a native provider through a custom base_url.
+
+    A reseller that speaks the Anthropic Messages API serves claude-* in the
+    native dialect when the caller opts in; the fixed-origin guard stays on for
+    every case that does not set the flag.
+    """
+    connection = ConnectionConfig(
+        provider="anthropic",
+        base_url="https://reseller.example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
+        trusted_custom_origin=True,
+    )
+    assert connection.base_url == "https://reseller.example.test/v1"
+    assert connection.trusted_custom_origin is True
+
+
+def test_trusted_custom_origin_requires_a_base_url_and_a_native_provider() -> None:
+    """The opt-in is meaningless without a custom origin, and only for native providers."""
+    with pytest.raises(ValueError, match="requires an explicit base_url"):
+        ConnectionConfig(provider="anthropic", trusted_custom_origin=True)
+    with pytest.raises(ValueError, match="only to a native provider"):
+        ConnectionConfig(
+            provider="openai-compatible",
+            base_url="https://reseller.example.test/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+    with pytest.raises(ValueError, match="requires an https base_url"):
+        ConnectionConfig(
+            provider="anthropic",
+            base_url="http://reseller.example.test/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+
+
 def test_azure_surface_inference_follows_the_resource_host() -> None:
     """Foundry hosts serve model inference, Azure OpenAI hosts serve deployments."""
     assert infer_azure_api_surface("https://resource.openai.azure.com") == "openai_deployments"

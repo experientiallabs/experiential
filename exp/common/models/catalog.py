@@ -149,6 +149,8 @@ class ConnectionConfig(ContractModel):
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
+    trusted_custom_origin: bool = False
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -183,10 +185,17 @@ class ConnectionConfig(ContractModel):
                 "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
                 "provider='bedrock'"
             )
-        if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
+        if self.trusted_custom_origin:
+            if self.provider not in _FIXED_ORIGIN_PROVIDERS:
+                raise ValueError("trusted_custom_origin applies only to a native provider")
+            if self.base_url is None:
+                raise ValueError("trusted_custom_origin requires an explicit base_url")
+            if urlsplit(self.base_url).scheme != "https":
+                raise ValueError("trusted_custom_origin requires an https base_url")
+        elif self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
-                "use provider='openai-compatible' for a trusted custom endpoint"
+                "set trusted_custom_origin=True or use provider='openai-compatible'"
             )
         if self.provider == "azure":
             if self.base_url is None:
@@ -302,6 +311,8 @@ class ConnectionConfig(ContractModel):
             identity["azure_api_surface"] = "model_inference"
         if self.region is not None:
             identity["region"] = self.region
+        if self.trusted_custom_origin:  # endpoint identity; added only when set
+            identity["trusted_custom_origin"] = True
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -336,6 +347,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
             serialized.pop("bedrock_auth_mode", None)
+        if not self.trusted_custom_origin:
+            serialized.pop("trusted_custom_origin", None)
         return serialized
 
 

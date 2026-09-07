@@ -29,6 +29,7 @@ def sqlite_connection_config(command: UpsertProviderConnectionCommand) -> Connec
         region=command.region,
         aws_access_key_id_env=_environment_name(command.access_key_id_reference),
         bedrock_auth_mode=command.bedrock_auth_mode,
+        trusted_custom_origin=command.trusted_custom_origin,
     )
 
 
