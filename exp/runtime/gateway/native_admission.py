@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.affinity import (
@@ -27,6 +28,7 @@ from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, G
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import (
+    deployment_health_key,
     reorder_route_deployments,
     request_carries_cache_markers,
     select_route_deployments,
@@ -65,6 +67,22 @@ _logger = logging.getLogger(__name__)
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
 
 
+@dataclass(frozen=True)
+class AffinityPlacement:
+    """The affinity facts one admission resolved for dispatch accounting.
+
+    ``fingerprint`` is present only on ``maximize_cache_affinity`` routes (the
+    tenant-isolated conversation identity that keyed placement), so dispatch
+    reservation can read and refresh the worker-local sticky binding and apply
+    the fresh-session spill threshold. ``sticky_preferred`` marks a route
+    whose depth 0 was chosen by a live sticky binding rather than rendezvous
+    order, for the ``affinity_sticky`` disclosure.
+    """
+
+    fingerprint: bytes | None = None
+    sticky_preferred: bool = False
+
+
 def _with_cache_affinity(
     provider_request: GatewayRequest, authorization: AuthorizationSnapshot
 ) -> GatewayRequest:
@@ -96,7 +114,7 @@ def admitted_route_requests(
     accounting: NativeAttemptAccounting,
     authorization: AuthorizationSnapshot,
     continuation: ContinuationContext | None = None,
-) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest]:
+) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest, AffinityPlacement]:
     """Narrow one certified route to rungs that serve the admitted request.
 
     Args:
@@ -110,8 +128,9 @@ def admitted_route_requests(
             conversation's cache-affinity placement.
 
     Returns:
-        The narrowed route and wires plus the public request (carrying any
-        coercion disclosures) and the streaming-forced provider request.
+        The narrowed route and wires, the public request (carrying any
+        coercion disclosures), the streaming-forced provider request, and the
+        resolved affinity placement.
 
     Raises:
         ProviderParameterError: No rung preserves a generation control and no
@@ -274,14 +293,15 @@ def admitted_route_requests(
         )
     provider_request = _with_cache_affinity(provider_request, authorization)
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
-    route, resolved_wires = _affinity_ordered_rungs(
+    route, resolved_wires, placement = _affinity_ordered_rungs(
         route,
         resolved_wires,
         provider_request,
+        accounting=accounting,
         authorization=authorization,
         continuation=continuation,
     )
-    return route, resolved_wires, public_request, provider_request
+    return route, resolved_wires, public_request, provider_request, placement
 
 
 def route_rejection(
@@ -357,25 +377,28 @@ def _affinity_ordered_rungs(
     resolved_wires: _ResolvedWires,
     provider_request: GatewayRequest,
     *,
+    accounting: NativeAttemptAccounting,
     authorization: AuthorizationSnapshot,
     continuation: ContinuationContext | None,
-) -> tuple[GatewayRoute, _ResolvedWires]:
-    """Dispatch rungs in weighted rendezvous order on affinity pools.
+) -> tuple[GatewayRoute, _ResolvedWires, AffinityPlacement]:
+    """Dispatch rungs in sticky-then-rendezvous order on affinity pools.
 
     Under ``maximize_cache_affinity`` the certified order is replaced by the
     request fingerprint's rendezvous permutation over the surviving rungs, so
     every worker sends one conversation to the same rung and, when that rung
     sheds or dies, to the same deterministic alternate. Weights come from each
     deployment's authored ``GatewayRungDispatchPolicy.affinity_weight``
-    (default 1.0). The cache-marker guarantee composes: a cache-marked request
-    on a route mixing marker-honoring and marker-dropping wires still
-    dispatches the marker-honoring group first, rendezvous-ordered within each
-    group. The other two failover modes are untouched.
+    (default 1.0). A live worker-local sticky binding is honored AHEAD of
+    rendezvous order (its rung holds the conversation's warm cache after a
+    spill), except when its rung is suppressed (throttled or circuit-open)
+    right now, in which case the binding is cleared so stickiness can never
+    pin a conversation to a dead lane. The cache-marker guarantee composes: a
+    cache-marked request on a route mixing marker-honoring and marker-dropping
+    wires still dispatches the marker-honoring group first, ordered within
+    each group. The other two failover modes are untouched.
     """
     if route.snapshot.failover_mode != "maximize_cache_affinity":
-        return route, resolved_wires
-    if len(resolved_wires) < 2:
-        return route, resolved_wires
+        return route, resolved_wires, AffinityPlacement()
     material = affinity_seed_material(
         provider_request,
         continuation_episode_key=None if continuation is None else continuation.episode_key,
@@ -386,6 +409,8 @@ def _affinity_ordered_rungs(
         identity_id=authorization.identity_id,
         material=material,
     )
+    if len(resolved_wires) < 2:
+        return route, resolved_wires, AffinityPlacement(fingerprint=fingerprint)
     weighted_rungs = tuple(
         (
             deployment.deployment_id,
@@ -399,6 +424,13 @@ def _affinity_ordered_rungs(
         for deployment in route.deployments
     )
     order = rendezvous_order(fingerprint, weighted_rungs)
+    order, sticky_index = _sticky_first_order(
+        order,
+        route,
+        fingerprint=fingerprint,
+        accounting=accounting,
+        authorization=authorization,
+    )
     if request_carries_cache_markers(provider_request):
         marker_capable = frozenset(
             index
@@ -410,10 +442,66 @@ def _affinity_ordered_rungs(
                 *(index for index in order if index in marker_capable),
                 *(index for index in order if index not in marker_capable),
             )
+    placement = AffinityPlacement(
+        fingerprint=fingerprint,
+        sticky_preferred=sticky_index is not None and order[0] == sticky_index,
+    )
     return (
         reorder_route_deployments(route, order),
         tuple(resolved_wires[index] for index in order),
+        placement,
     )
+
+
+def _sticky_first_order(
+    order: tuple[int, ...],
+    route: GatewayRoute,
+    *,
+    fingerprint: bytes,
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+) -> tuple[tuple[int, ...], int | None]:
+    """Move a live sticky binding's rung to the front of the rendezvous order.
+
+    A binding whose rung left the route is ignored (the binding expires on its
+    own); a binding whose rung is suppressed right now is cleared and ignored,
+    so a throttled or dead spill target releases the conversation back to
+    rendezvous placement. A binding already at the rendezvous front changes
+    nothing and is not reported as sticky.
+
+    Args:
+        order: Rendezvous permutation of the route's deployment indexes.
+        route: Frozen route the permutation indexes into.
+        fingerprint: The request's affinity fingerprint.
+        accounting: Shared accounting owning the sticky and health registries.
+        authorization: Frozen authority, for the health key.
+
+    Returns:
+        The (possibly reordered) permutation and the sticky rung's route
+        index when a live binding moved or confirmed the front (``None``
+        when rendezvous order stands on its own).
+    """
+    bound = accounting.sticky.bound_deployment(fingerprint)
+    if bound is None:
+        return order, None
+    sticky_index = next(
+        (
+            index
+            for index, deployment in enumerate(route.deployments)
+            if deployment.deployment_id == bound
+        ),
+        None,
+    )
+    if sticky_index is None:
+        return order, None
+    if accounting.health.suppressed(
+        deployment_health_key(authorization, route.deployments[sticky_index])
+    ):
+        accounting.sticky.clear(fingerprint)
+        return order, None
+    if order[0] == sticky_index:
+        return order, None
+    return (sticky_index, *(index for index in order if index != sticky_index)), sticky_index
 
 
 def _candidate_serves(

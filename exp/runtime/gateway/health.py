@@ -27,6 +27,14 @@ _OPERATIONAL_FAILURES = {
     GatewayFailureClass.PROVIDER_INTERNAL,
 }
 
+# Clamp on a provider-stated Retry-After when it sizes a throttle window. The
+# floor keeps a degenerate "0"/"1" from thrashing the rung; the ceiling keeps
+# one absurd header from suppressing a lane for days while still letting a
+# daily-quota reset (hours) mark the rung dead-for-hours so the waterfall
+# skips it for the whole window.
+RETRY_AFTER_WINDOW_MINIMUM_SECONDS = 5.0
+RETRY_AFTER_WINDOW_MAXIMUM_SECONDS = 6.0 * 3_600.0
+
 
 @dataclass
 class _DeploymentHealth:
@@ -188,7 +196,7 @@ class DeploymentHealthRegistry:
             if failure.failure_class == GatewayFailureClass.THROTTLED:
                 state.throttle_until = max(
                     state.throttle_until,
-                    now + self._throttle_seconds,
+                    now + self._throttle_window_seconds(failure),
                 )
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
@@ -202,6 +210,48 @@ class DeploymentHealthRegistry:
                 state.consecutive_failures += 1
                 if state.consecutive_failures >= self._failure_threshold:
                     state.open_until = now + self._open_seconds
+
+    def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
+        """Size one throttle window from the provider's own stated wait.
+
+        A throttled failure carrying a parsed ``Retry-After`` sizes the window
+        from it, clamped to the bounded range, so a long provider backoff (an
+        exhausted daily quota) actually suppresses the rung for the wait the
+        provider asked for instead of re-attempting every fixed default. An
+        absent or unparseable wait keeps the fixed default window.
+
+        Args:
+            failure: Sanitized throttled failure.
+
+        Returns:
+            The window length in seconds.
+        """
+        if failure.retry_after_seconds is None:
+            return self._throttle_seconds
+        return min(
+            max(float(failure.retry_after_seconds), RETRY_AFTER_WINDOW_MINIMUM_SECONDS),
+            RETRY_AFTER_WINDOW_MAXIMUM_SECONDS,
+        )
+
+    def suppressed(self, key: DeploymentHealthKey) -> bool:
+        """Whether one deployment currently sits inside any suppression window.
+
+        A read-only probe (unlike :meth:`claim` it never reserves a half-open
+        slot), used by sticky-affinity admission to bypass and clear a binding
+        whose rung is throttled or circuit-open right now.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the deployment is throttle- or circuit-suppressed.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return False
+            return state.throttle_until > now or state.open_until > now
 
     def throttled_remaining_seconds(self, keys: tuple[DeploymentHealthKey, ...]) -> float | None:
         """Return the longest remaining throttle window when EVERY key is inside one.

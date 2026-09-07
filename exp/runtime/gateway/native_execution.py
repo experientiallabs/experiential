@@ -40,6 +40,7 @@ from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -126,6 +127,14 @@ class InflightRequest:
     # forward and bill stay consistent even if a card sits on a lane that would
     # strip it. Empty on surfaces without a service tier (images, embeddings).
     tier_forwarded_by_depth: tuple[bool, ...] = ()
+    # The request's tenant-isolated affinity fingerprint on a
+    # ``maximize_cache_affinity`` pool (None elsewhere), captured at admission
+    # so dispatch reservation can read and refresh the worker-local sticky
+    # binding and apply the fresh-session spill threshold.
+    affinity_fingerprint: bytes | None = None
+    # Whether the route's depth 0 was chosen by a live sticky binding rather
+    # than rendezvous order, for the ``affinity_sticky`` disclosure.
+    sticky_preferred: bool = False
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -143,6 +152,96 @@ def deployment_health_key(
         deployment.deployment_id,
         deployment.connection_sha256,
     )
+
+
+def rung_load_key(deployment: ExactModelDeployment) -> RungLoadKey:
+    """Return one deployment's physical-lane load key (never revision-scoped)."""
+    return (deployment.deployment_id, deployment.connection_sha256)
+
+
+def deployment_priced_for_service_tier(
+    deployment: ExactModelDeployment,
+    service_tier: str | None,
+    *,
+    forwards_tier: bool,
+) -> ExactModelDeployment:
+    """Reprice one deployment for a requested flex/priority processing tier.
+
+    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
+    the tier to its provider and carries a pass-through card for it, the card's
+    rates replace the base schedule on a copy used only for THIS reservation, so
+    the ceiling, the stored per-token rates, and settlement all bill the tier
+    transparently. ``forwards_tier`` is the admission-time forwarding decision
+    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
+    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
+    wire would strip the tier (non-tier dialect, tier disabled): such a depth
+    runs the provider's base schedule, so it must bill the base schedule too. No
+    tier, no forwarding, or no card returns the deployment unchanged. The copy
+    stays Python-side and never crosses the native boundary.
+    """
+    if not forwards_tier:
+        return deployment
+    effective = deployment.gateway.prices.for_service_tier(service_tier)
+    if effective is deployment.gateway.prices:
+        return deployment
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"prices": effective})}
+    )
+
+
+def dispatch_disclosure(
+    route: GatewayRoute,
+    candidate: int,
+    *,
+    policy_sheds: list[tuple[int, str]],
+    forced_overflow: bool,
+    sticky_preferred: bool = False,
+) -> tuple[str | None, ExactModelDeployment | None]:
+    """Name why the chosen rung serves and the bypassed preferred rung, if any.
+
+    Emission is gated so an alias the platform never opted in keeps byte-null
+    disclosure columns. On a ``maximize_cache_affinity`` pool every attempt
+    discloses against the preferred depth-0 rung: ``affinity`` on the happy
+    path (``affinity_sticky`` when a live sticky binding, not rendezvous,
+    chose depth 0), the shed reason when depth 0 was policy-shed in this
+    reservation, ``rung_dead`` when it was bypassed by health or an earlier
+    failure, ``saturated_overflow`` when the ladder force-admitted past a
+    bound. On any other pool a disclosure appears only when a dispatch policy
+    actually shed a rung in this reservation, and the preferred rung is the
+    shed rung itself (the counterfactual the shed is measured against).
+
+    Args:
+        route: Frozen ordered route for this request.
+        candidate: The route depth about to dispatch.
+        policy_sheds: ``(depth, reason)`` for every policy shed this
+            reservation, in ladder order.
+        forced_overflow: Whether this dispatch was forced past a bound.
+        sticky_preferred: Whether the route's depth 0 was chosen by a sticky
+            spill binding rather than rendezvous order.
+
+    Returns:
+        ``(dispatch_reason, preferred_deployment)``; the deployment is
+        ``None`` whenever the chosen rung IS the disclosure's preferred rung.
+    """
+    if route.snapshot.failover_mode == "maximize_cache_affinity":
+        target_depth = 0
+        if forced_overflow:
+            reason = "saturated_overflow"
+        elif candidate == 0:
+            reason = "affinity_sticky" if sticky_preferred else "affinity"
+        else:
+            lead_shed = next((shed for depth, shed in policy_sheds if depth == 0), None)
+            reason = lead_shed or "rung_dead"
+    elif forced_overflow:
+        target_depth = policy_sheds[0][0]
+        reason = "saturated_overflow"
+    elif policy_sheds:
+        target_depth, reason = policy_sheds[0]
+    else:
+        return None, None
+    if target_depth == candidate:
+        return reason, None
+    return reason, route.deployments[target_depth]
 
 
 def claim_route_from(

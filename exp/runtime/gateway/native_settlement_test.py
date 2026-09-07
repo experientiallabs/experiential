@@ -12,6 +12,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     first_token_at_from_settlement,
+    settlement_rate_limit,
     terminal_from_settlement,
 )
 
@@ -188,3 +189,83 @@ def test_customer_owned_failures_settle_as_the_callers_invalid_request() -> None
     )
     assert house is not None
     assert house.failure_class == GatewayFailureClass.PROVIDER_AUTHENTICATION
+
+
+def test_throttled_settlement_takes_retry_after_from_harvested_headers() -> None:
+    """A throttled failure without its own wait borrows the header's wait."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "throttled",
+                "safe_message": "provider throttled the request",
+            },
+            "rate_limit_headers": {"retry-after": "3600"},
+        }
+    )
+    assert failure is not None
+    assert failure.retry_after_seconds == 3_600
+
+
+def test_failure_payloads_own_retry_after_wins_over_the_headers() -> None:
+    """A wait the failure payload names is kept verbatim."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "throttled",
+                "safe_message": "provider throttled the request",
+                "retry_after_seconds": 42,
+            },
+            "rate_limit_headers": {"retry-after": "3600"},
+        }
+    )
+    assert failure is not None
+    assert failure.retry_after_seconds == 42
+
+
+def test_non_throttled_failures_never_borrow_a_retry_after() -> None:
+    """Only the throttled class reads the harvested wait; garbage stays None."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "provider_internal",
+                "safe_message": "provider service failed",
+            },
+            "rate_limit_headers": {"retry-after": "3600"},
+        }
+    )
+    assert failure is not None
+    assert failure.retry_after_seconds is None
+    _terminal, garbled = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "throttled",
+                "safe_message": "provider throttled the request",
+                "retry_after_seconds": "soon",
+            },
+            "rate_limit_headers": {"retry-after": "eventually"},
+        }
+    )
+    assert garbled is not None
+    assert garbled.retry_after_seconds is None
+
+
+def test_settlement_rate_limit_reads_the_optional_header_map() -> None:
+    """The typed observation parses when present and stays empty when absent."""
+    observation = settlement_rate_limit(
+        {
+            "outcome": "completed",
+            "rate_limit_headers": {
+                "anthropic-ratelimit-requests-limit": "10000",
+                "anthropic-ratelimit-requests-remaining": "9500",
+                "retry-after": "7",
+            },
+        }
+    )
+    assert observation.limit_requests == 10_000
+    assert observation.remaining_requests == 9_500
+    assert observation.retry_after_seconds == 7
+    assert settlement_rate_limit({"outcome": "completed"}).is_empty

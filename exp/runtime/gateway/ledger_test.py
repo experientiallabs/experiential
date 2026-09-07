@@ -1302,6 +1302,56 @@ def test_dispatch_disclosure_persists_and_prices_the_counterfactual(tmp_path: Pa
     assert row["estimated_cost_micro_usd"] == 195
 
 
+def test_finish_attempt_persists_harvested_rate_limit_observations(tmp_path: Path) -> None:
+    """The provider's rate-limit headers land as nullable integer columns."""
+    clock = FakeLedgerClock()
+    ledger, snapshot, chosen, _preferred = _spill_fixture(tmp_path, clock)
+    attempt_id = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=chosen,
+        attempt_ordinal=0,
+        route_depth=1,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=10, output_tokens=5),
+        ),
+        failure=None,
+        finalize_request=False,
+        retry_after_seconds=30,
+        ratelimit_limit_requests=10_000,
+        ratelimit_remaining_requests=9_999,
+        ratelimit_limit_tokens=180_000_000,
+        ratelimit_remaining_tokens=179_000_000,
+    )
+    row = _attempt_row(tmp_path, attempt_id)
+    assert row["retry_after_seconds"] == 30
+    assert row["ratelimit_limit_requests"] == 10_000
+    assert row["ratelimit_remaining_requests"] == 9_999
+    assert row["ratelimit_limit_tokens"] == 180_000_000
+    assert row["ratelimit_remaining_tokens"] == 179_000_000
+
+    # A settlement without observations keeps every column NULL.
+    second = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=chosen,
+        attempt_ordinal=1,
+        route_depth=1,
+    )
+    ledger.finish_attempt(
+        attempt_id=second,
+        terminal_event=GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+        failure=None,
+    )
+    bare = _attempt_row(tmp_path, second)
+    assert bare["retry_after_seconds"] is None
+    assert bare["ratelimit_limit_requests"] is None
+    assert bare["ratelimit_remaining_tokens"] is None
+
+
 def test_counterfactual_stays_null_when_a_preferred_rate_is_unknown(tmp_path: Path) -> None:
     """An unpriced preferred rung never guesses a counterfactual cost."""
     clock = FakeLedgerClock()

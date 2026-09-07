@@ -102,6 +102,27 @@ class _FastSpillTarget(BaseHTTPRequestHandler):
         del format, args
 
 
+class _FastHouseTarget(BaseHTTPRequestHandler):
+    """A fast house rung for the rate-window scenario: sheds are never queueing."""
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract.
+        """Stream one instant success identifying the house rung."""
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        try:
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(_content_chunk("from-house"))
+            self.wfile.write(_terminal_frames())
+        except OSError:
+            return
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Suppress request logs so test output cannot retain payload context."""
+        del format, args
+
+
 class _DetachedServer(ThreadingHTTPServer):
     """Loopback provider whose stuck handlers never block test teardown."""
 
@@ -122,8 +143,8 @@ class _SoakEngine:
         return f"http://{_HOST}:{self.port}"
 
 
-def _author_lead_rung_bound(root: Path) -> tuple[Path, str]:
-    """Author ``concurrency_bound=1`` on the pool's lead rung and re-snapshot.
+def _author_lead_rung_policy(root: Path, policy: GatewayRungDispatchPolicy) -> tuple[Path, str]:
+    """Author one dispatch policy on the pool's lead rung and re-snapshot.
 
     Mirrors the hosted platform's authoring path: the dispatch policy is
     catalog data on the deployment's gateway metadata, so opting in is a
@@ -139,11 +160,7 @@ def _author_lead_rung_bound(root: Path) -> tuple[Path, str]:
     lead = catalog.models["alpha"]
     assert lead.gateway is not None
     bounded = lead.model_copy(
-        update={
-            "gateway": lead.gateway.model_copy(
-                update={"dispatch": GatewayRungDispatchPolicy(concurrency_bound=1)}
-            )
-        }
+        update={"gateway": lead.gateway.model_copy(update={"dispatch": policy})}
     )
     write_model_catalog(
         catalog_path,
@@ -156,10 +173,11 @@ def _author_lead_rung_bound(root: Path) -> tuple[Path, str]:
 def _serve_engine(
     root: Path,
     *,
-    bounded: bool,
+    policy: GatewayRungDispatchPolicy | None,
+    house_handler: type[BaseHTTPRequestHandler] = _CapacityOneBox,
 ) -> Iterator[tuple[_SoakEngine, subprocess.Popen[str], list[_DetachedServer]]]:
-    """Seed one pool root, optionally author the bound, and boot the engine."""
-    house = _DetachedServer((_HOST, 0), _CapacityOneBox)
+    """Seed one pool root, optionally author a lead policy, and boot the engine."""
+    house = _DetachedServer((_HOST, 0), house_handler)
     spill = _DetachedServer((_HOST, 0), _FastSpillTarget)
     for server in (house, spill):
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -170,8 +188,8 @@ def _serve_engine(
             f"http://{_HOST}:{spill.server_address[1]}/v1",
         ),
     )
-    if bounded:
-        snapshot, digest = _author_lead_rung_bound(root)
+    if policy is not None:
+        snapshot, digest = _author_lead_rung_policy(root, policy)
         manager.activate_direct_alias(
             alias_id="coding",
             alias_name="coding",
@@ -250,7 +268,9 @@ def _serve_engine(
 @pytest.fixture(name="spill_engine")
 def _spill_engine(tmp_path: Path) -> Iterator[_SoakEngine]:
     """Serve the pool with ``concurrency_bound=1`` authored on the lead rung."""
-    generator = _serve_engine(tmp_path / "bounded-root", bounded=True)
+    generator = _serve_engine(
+        tmp_path / "bounded-root", policy=GatewayRungDispatchPolicy(concurrency_bound=1)
+    )
     engine, _process, _servers = next(generator)
     yield engine
     for _tail in generator:
@@ -260,7 +280,25 @@ def _spill_engine(tmp_path: Path) -> Iterator[_SoakEngine]:
 @pytest.fixture(name="baseline_engine")
 def _baseline_engine(tmp_path: Path) -> Iterator[_SoakEngine]:
     """Serve the identical pool with no dispatch policy authored (today)."""
-    generator = _serve_engine(tmp_path / "baseline-root", bounded=False)
+    generator = _serve_engine(tmp_path / "baseline-root", policy=None)
+    engine, _process, _servers = next(generator)
+    yield engine
+    for _tail in generator:
+        pass
+
+
+@pytest.fixture(name="rate_limited_engine")
+def _rate_limited_engine(tmp_path: Path) -> Iterator[_SoakEngine]:
+    """Serve the pool with ``requests_per_minute=1`` on a FAST lead rung.
+
+    The house rung answers instantly here: every shed in this scenario is
+    purely the sliding rate window firing pre-emptively, never queueing.
+    """
+    generator = _serve_engine(
+        tmp_path / "rated-root",
+        policy=GatewayRungDispatchPolicy(requests_per_minute=1),
+        house_handler=_FastHouseTarget,
+    )
     engine, _process, _servers = next(generator)
     yield engine
     for _tail in generator:
@@ -311,6 +349,36 @@ def test_bounded_rung_spills_the_burst_with_zero_deadline_deaths(
     assert timeouts == 0
     assert len(sheds) >= _BURST_REQUESTS - 2
     assert {reason for reason, _preferred in sheds} == {"queue_bound"}
+    assert {preferred for _reason, preferred in sheds} == {"alpha"}
+
+
+def test_rate_limited_rung_spills_the_burst_before_any_provider_429(
+    rate_limited_engine: _SoakEngine,
+) -> None:
+    """The rate window sheds pre-emptively: one dispatch stays home, the rest spill.
+
+    The lead rung authors ``requests_per_minute=1`` and answers instantly, so
+    a shed here can only be the sliding window firing before the provider
+    would have 429'd. Every burst request completes, exactly one serves off
+    the house rung inside the window, and every spilled attempt disclosed
+    ``rate_limit`` against the bypassed preferred rung.
+    """
+    responses = _burst(rate_limited_engine)
+    assert [response.status_code for response in responses] == [200] * _BURST_REQUESTS
+    contents = [response.json()["choices"][0]["message"]["content"] for response in responses]
+    assert contents.count("from-house") == 1
+    assert contents.count("from-spill") == _BURST_REQUESTS - 1
+    with sqlite3.connect(rate_limited_engine.database_path) as connection:
+        sheds = connection.execute(
+            "SELECT dispatch_reason, preferred_deployment_id FROM gateway_attempts"
+            " WHERE dispatch_reason IS NOT NULL"
+        ).fetchall()
+        (failures,) = connection.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE failure_class IS NOT NULL"
+        ).fetchone()
+    assert failures == 0
+    assert len(sheds) == _BURST_REQUESTS - 1
+    assert {reason for reason, _preferred in sheds} == {"rate_limit"}
     assert {preferred for _reason, preferred in sheds} == {"alpha"}
 
 

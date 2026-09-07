@@ -1,4 +1,4 @@
-"""Fairness, bound, work-conservation, and release tests for rung admission."""
+"""Fairness, bound, rate-window, calibration, and release tests for rung admission."""
 
 from __future__ import annotations
 
@@ -19,8 +19,14 @@ def _reserve(
     organization_id: str,
     *,
     weight: int = 1,
-    bound: int = 4,
+    bound: int | None = 4,
     fair_share: bool = False,
+    requests_per_minute: int | None = None,
+    tokens_per_minute: int | None = None,
+    cache_priority_alpha: float | None = None,
+    reserved_tokens: int = 0,
+    warm_session: bool = True,
+    fresh_spill_fraction: float | None = None,
     force: bool = False,
 ) -> str | RungShed:
     """Reserve one slot on the shared test rung."""
@@ -30,6 +36,12 @@ def _reserve(
         weight=weight,
         bound=bound,
         fair_share=fair_share,
+        requests_per_minute=requests_per_minute,
+        tokens_per_minute=tokens_per_minute,
+        cache_priority_alpha=cache_priority_alpha,
+        reserved_tokens=reserved_tokens,
+        warm_session=warm_session,
+        fresh_spill_fraction=fresh_spill_fraction,
         force=force,
     )
 
@@ -219,6 +231,250 @@ class TestFairShare:
         )
         assert registry.inflight(_KEY, "org-a") == 8
         assert all(isinstance(ticket, str) for ticket in tickets)
+
+
+class TestRateWindows:
+    """Sliding-window request and token caps shed sideways before the 429."""
+
+    def test_request_rate_sheds_at_the_cap_and_slides_forward(self) -> None:
+        """The 61st-second slot frees exactly the requests that left the window."""
+        now = [0.0]
+        registry = _registry(now)
+        for index in range(3):
+            now[0] = float(index)
+            assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=3), str)
+        now[0] = 3.0
+        shed = _reserve(registry, "org-a", bound=None, requests_per_minute=3)
+        assert shed == RungShed("rate_limit")
+        # At t=60.5 the t=0 dispatch has left the 60s window; one slot frees.
+        now[0] = 60.5
+        assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=3), str)
+        assert _reserve(registry, "org-a", bound=None, requests_per_minute=3) == RungShed(
+            "rate_limit"
+        )
+
+    def test_token_rate_counts_worst_case_reservations(self) -> None:
+        """The token window sheds the reservation that would overflow the cap."""
+        now = [0.0]
+        registry = _registry(now)
+        assert isinstance(
+            _reserve(registry, "org-a", bound=None, tokens_per_minute=1_000, reserved_tokens=600),
+            str,
+        )
+        shed = _reserve(registry, "org-a", bound=None, tokens_per_minute=1_000, reserved_tokens=600)
+        assert shed == RungShed("rate_limit")
+        # A smaller reservation still fits under the cap.
+        assert isinstance(
+            _reserve(registry, "org-a", bound=None, tokens_per_minute=1_000, reserved_tokens=400),
+            str,
+        )
+
+    def test_force_admits_past_the_rate_window(self) -> None:
+        """A ladder exhausted only by rate sheds still dispatches somewhere."""
+        now = [0.0]
+        registry = _registry(now)
+        assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=1), str)
+        assert _reserve(registry, "org-a", bound=None, requests_per_minute=1) == RungShed(
+            "rate_limit"
+        )
+        assert isinstance(
+            _reserve(registry, "org-a", bound=None, requests_per_minute=1, force=True), str
+        )
+
+
+class TestPassiveAdaptiveCalibration:
+    """AIMD: throttles clamp the working ceiling, recovery creeps it back."""
+
+    def test_throttle_clamps_to_ninety_percent_of_the_observed_rate(self) -> None:
+        """A 429 with 20 dispatches in the window learns a ceiling of 18."""
+        now = [0.0]
+        registry = _registry(now)
+        for index in range(20):
+            now[0] = index * 0.1
+            assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=100), str)
+        registry.record_throttle(_KEY)
+        assert registry.learned_ceilings() == {"dep-house:connecti": 18}
+        # The working ceiling is now the learned 18, not the authored 100:
+        # window holds 20 >= 18, so the next reservation sheds.
+        now[0] = 2.1
+        shed = _reserve(registry, "org-a", bound=None, requests_per_minute=100)
+        assert shed == RungShed("rate_limit", learned_requests_per_minute=18)
+
+    def test_recovery_creep_raises_the_ceiling_and_caps_at_authored(self) -> None:
+        """Each unthrottled minute adds max(1, ceil(5%)), never past authored."""
+        now = [0.0]
+        registry = _registry(now)
+        for index in range(20):
+            now[0] = index * 0.1
+            assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=20), str)
+        registry.record_throttle(_KEY)  # learned 18.0 at t=1.9
+        # Two full recovery intervals later: 18 -> 19 -> 20, capped at the
+        # authored 20 (ceil(0.05*18)=1, then ceil(0.05*19)=1).
+        now[0] = 1.9 + 120.0
+        assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=20), str)
+        assert registry.learned_ceilings() == {"dep-house:connecti": 20}
+
+    def test_learned_ceiling_creeps_unbounded_without_an_authored_rate(self) -> None:
+        """With no authored rpm each creep step keeps probing for headroom."""
+        now = [0.0]
+        registry = _registry(now)
+        for index in range(20):
+            now[0] = index * 0.1
+            assert isinstance(_reserve(registry, "org-a", bound=None, tokens_per_minute=10**9), str)
+        registry.record_throttle(_KEY)  # learned 18.0
+        now[0] = 1.9 + 180.0
+        # Three creep steps: 18 -> 19 -> 20 -> 21; window is empty by now so
+        # the reservation admits under the learned-only working ceiling.
+        assert isinstance(_reserve(registry, "org-a", bound=None, tokens_per_minute=10**9), str)
+        assert registry.learned_ceilings() == {"dep-house:connecti": 21}
+
+    def test_fresh_throttle_reclamps_and_quiet_expiry_forgets(self) -> None:
+        """A new 429 re-clamps mid-recovery; six quiet hours forget the lesson."""
+        now = [0.0]
+        registry = _registry(now)
+        for index in range(10):
+            now[0] = index * 0.1
+            assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=50), str)
+        registry.record_throttle(_KEY)  # learned 9.0 from 10 observed
+        assert registry.learned_ceilings() == {"dep-house:connecti": 9}
+        now[0] = 61.0
+        registry.record_throttle(_KEY)  # window empty: observed floors at 1
+        assert registry.learned_ceilings() == {"dep-house:connecti": 1}
+        # Six hours without a throttle expire the learned ceiling entirely.
+        now[0] = 61.0 + 6 * 3_600.0
+        assert isinstance(_reserve(registry, "org-a", bound=None, requests_per_minute=50), str)
+        assert registry.learned_ceilings() == {}
+
+
+class TestCachePriority:
+    """The congestion-scaled EWMA term admits warm-cache traffic at the margin."""
+
+    def test_settled_cache_fractions_fold_into_a_time_decayed_ewma(self) -> None:
+        """The first sample seeds the estimate; later samples decay toward it."""
+        now = [0.0]
+        registry = _registry(now)
+        assert isinstance(_reserve(registry, "org-a", bound=8, fair_share=True), str)
+        registry.record_settle(_KEY, "org-a", cached_tokens=800, input_tokens=200)
+        # Zero-token settles record nothing; the seeded estimate stands.
+        registry.record_settle(_KEY, "org-a", cached_tokens=0, input_tokens=0)
+        now[0] = 600.0
+        # One half-life later a fully-cold sample halves the estimate:
+        # 0.8 * 0.5 + 0.0 * 0.5 = 0.4.
+        registry.record_settle(_KEY, "org-a", cached_tokens=0, input_tokens=1_000)
+        now[0] = 600.5
+        # Pin the folded value through the share arithmetic below rather than
+        # reading private state: with alpha=0 the estimate is inert.
+        assert isinstance(_reserve(registry, "org-a", bound=8, fair_share=True), str)
+
+    def test_congestion_boost_flips_a_freed_slot_to_the_cached_org(self) -> None:
+        """Exact margin arithmetic for alpha=2 on a contended bound of 8.
+
+        Both organizations weigh 1 and hold 4 slots each; org-cache's EWMA is
+        1.0 (fully cached), org-cold has no signal (fraction 0). org-cold then
+        frees one slot (total 7, congestion 7/8). Effective weights:
+        org-cache 1 * (1 + 2 * 7/8 * 1.0) = 2.75, org-cold 1, total 3.75.
+          - org-cold reclaiming its own slot: share 8 * 1/3.75 ~= 2.133,
+            held+1 = 4 > share, and org-cache's deficit
+            (8 * 2.75/3.75 - 4 ~= 1.867, aggregate floor 1) reserves the free
+            slot, so the COLD organization is SHED.
+          - org-cache: share ~= 5.867 >= held+1 = 5, so the CACHED
+            organization ADMITS into the slot the cold one freed.
+        The alpha-off twin below proves base fairness decides the SAME release
+        the opposite way, so this pins the term itself, not the scenario.
+        """
+        now = [0.0]
+        registry = _registry(now)
+        cold_tickets: list[str] = []
+        for organization in ("org-cache", "org-cold"):
+            for _ in range(4):
+                ticket = _reserve(
+                    registry,
+                    organization,
+                    bound=8,
+                    fair_share=True,
+                    cache_priority_alpha=2.0,
+                )
+                assert isinstance(ticket, str)
+                if organization == "org-cold":
+                    cold_tickets.append(ticket)
+        registry.record_settle(_KEY, "org-cache", cached_tokens=1_000, input_tokens=0)
+        now[0] = 1.0
+        registry.release_ticket(cold_tickets[0])
+        # The cold organization cannot reclaim its own freed slot...
+        assert _reserve(
+            registry, "org-cold", bound=8, fair_share=True, cache_priority_alpha=2.0
+        ) == RungShed("fair_share_shed")
+        # ...because the boosted cache-heavy organization is owed it.
+        assert isinstance(
+            _reserve(registry, "org-cache", bound=8, fair_share=True, cache_priority_alpha=2.0),
+            str,
+        )
+
+    def test_alpha_off_decides_the_same_release_the_opposite_way(self) -> None:
+        """Without alpha the cold org reclaims its slot and the cache org is shed."""
+        now = [0.0]
+        registry = _registry(now)
+        cold_tickets: list[str] = []
+        for organization in ("org-cache", "org-cold"):
+            for _ in range(4):
+                ticket = _reserve(registry, organization, bound=8, fair_share=True)
+                assert isinstance(ticket, str)
+                if organization == "org-cold":
+                    cold_tickets.append(ticket)
+        registry.record_settle(_KEY, "org-cache", cached_tokens=1_000, input_tokens=0)
+        now[0] = 1.0
+        registry.release_ticket(cold_tickets[0])
+        # Base weights: org-cache is above its 4-slot share and the freed slot
+        # is reserved for org-cold's deficit, cache history notwithstanding.
+        assert _reserve(registry, "org-cache", bound=8, fair_share=True) == RungShed(
+            "fair_share_shed"
+        )
+        assert isinstance(_reserve(registry, "org-cold", bound=8, fair_share=True), str)
+
+
+class TestFreshSessionSpill:
+    """Fresh sessions shed at the early threshold; warm sessions ride to the bound."""
+
+    def test_fresh_sheds_early_and_warm_sheds_only_at_the_bound(self) -> None:
+        """With bound 8 and fraction 0.75, fresh sheds at 6 while warm fills 8."""
+        now = [0.0]
+        registry = _registry(now)
+        for _ in range(6):
+            assert isinstance(
+                _reserve(
+                    registry,
+                    "org-a",
+                    bound=8,
+                    warm_session=False,
+                    fresh_spill_fraction=0.75,
+                ),
+                str,
+            )
+        assert _reserve(
+            registry, "org-a", bound=8, warm_session=False, fresh_spill_fraction=0.75
+        ) == RungShed("fresh_session_spill")
+        # Warm sessions keep the reserved top slice up to the hard bound.
+        for _ in range(2):
+            assert isinstance(
+                _reserve(
+                    registry,
+                    "org-a",
+                    bound=8,
+                    warm_session=True,
+                    fresh_spill_fraction=0.75,
+                ),
+                str,
+            )
+        assert _reserve(
+            registry, "org-a", bound=8, warm_session=True, fresh_spill_fraction=0.75
+        ) == RungShed("queue_bound")
+
+    def test_no_fraction_means_no_early_threshold(self) -> None:
+        """Fresh sessions behave exactly like warm ones when nothing is authored."""
+        registry = _registry([0.0])
+        for _ in range(4):
+            assert isinstance(_reserve(registry, "org-a", warm_session=False), str)
+        assert _reserve(registry, "org-a", warm_session=False) == RungShed("queue_bound")
 
 
 class TestRegistryContracts:

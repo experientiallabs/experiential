@@ -1,4 +1,4 @@
-"""Authored per-rung dispatch policy: admission bounds and affinity weight.
+"""Authored per-rung dispatch policy: bounds, rate windows, and affinity.
 
 One nested, fully defaulted model hung off ``GatewayDeploymentMetadata``. It
 is additive-defaulted on purpose: an unauthored rung contributes zero identity
@@ -47,12 +47,14 @@ fleet-wide pin bump, then the catalog opt-in.
 
 
 class GatewayRungDispatchPolicy(ContractModel):
-    """Authored per-rung dispatch controls: admission bounds and affinity weight.
+    """Authored per-rung dispatch controls: admission bounds, rates, and affinity.
 
     Every field defaults to inert so an unauthored rung behaves exactly as
-    today: unbounded admission, no fairness accounting, rendezvous weight 1.
-    The bound and fairness apply on any pool; the affinity weight is read only
-    under a pool's ``maximize_cache_affinity`` policy.
+    today: unbounded admission, no rate windows, no fairness accounting,
+    rendezvous weight 1, no session stickiness. The bound, rate caps, and
+    fairness apply on any pool; the affinity weight, fresh-session threshold,
+    and sticky binding are read only under a pool's
+    ``maximize_cache_affinity`` policy.
     """
 
     concurrency_bound: int | None = Field(default=None, ge=1)
@@ -81,10 +83,75 @@ class GatewayRungDispatchPolicy(ContractModel):
     a heavy house rung and a moderate cheap-cached-input rung makes the house
     box the warm home and the cheap rung the stable spill target.
     """
+    requests_per_minute: int | None = Field(default=None, ge=1)
+    """Sliding-window dispatch rate cap for this rung, per gateway worker process.
+
+    A reservation past the 60-second window's cap sheds sideways to the next
+    rung (``rate_limit``) BEFORE the provider answers 429, so the pre-emptive
+    spill preserves the request instead of burning a provider attempt. Like
+    ``concurrency_bound`` the value is authored per worker process (fleet rate
+    divided by serving replicas). Usable without a ``concurrency_bound``. The
+    worker additionally learns a lower working ceiling from observed provider
+    throttles and re-discovers headroom by letting a little more through over
+    time, so the authored value is a cap, never a promise the provider honors
+    it.
+    """
+    tokens_per_minute: int | None = Field(default=None, ge=1)
+    """Sliding-window token rate cap for this rung, per gateway worker process.
+
+    Counted from each dispatch's worst-case reserved input plus output tokens
+    at reservation time (the same conservative bound the platform's token
+    windows count), so a concurrent burst binds instead of leaking past the
+    cap. Over-window reservations shed sideways as ``rate_limit`` exactly like
+    ``requests_per_minute``. Usable without a ``concurrency_bound``.
+    """
+    cache_priority_alpha: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    """Congestion-dependent boost for cache-heavy organizations under fairness.
+
+    When set on a ``fair_share`` rung, each organization's effective admission
+    weight becomes ``weight * (1 + alpha * congestion * cached_fraction)``
+    where ``congestion`` is the rung's in-flight total over its bound and
+    ``cached_fraction`` is the worker's EWMA of that organization's settled
+    cached-token fraction on this rung. At the contended margin the
+    organization whose traffic reuses warm provider cache is admitted ahead of
+    an equal-weight organization running cold, exactly when cache is most
+    valuable. ``None`` disables the term. Requires ``fair_share``.
+    """
+    fresh_session_spill_fraction: float | None = Field(default=None, gt=0, lt=1)
+    """Fraction of the bound where sessions with no warm standing shed early.
+
+    Under a pool's ``maximize_cache_affinity`` policy, a request whose affinity
+    fingerprint holds no live sticky binding on this rung sheds sideways once
+    in-flight dispatches reach ``concurrency_bound * fraction``
+    (``fresh_session_spill``), reserving the top slice of the bound for warm
+    sessions, which shed only at the hard bound. ``None`` disables the early
+    threshold. Requires ``concurrency_bound``.
+    """
+    sticky_spill_seconds: int | None = Field(default=None, ge=1)
+    """How long one conversation stays bound to the rung that served it.
+
+    Under ``maximize_cache_affinity`` each dispatch records a worker-local
+    fingerprint-to-deployment binding with this time-to-live, refreshed on
+    every hit; the binding is honored ahead of rendezvous order on subsequent
+    requests, so a spilled conversation does not bounce back to the
+    higher-ranked rung the moment it stops shedding (its warm cache now lives
+    on the spill target). Author roughly the provider's prompt-cache lifetime.
+    ``None`` records no binding for dispatches landing on this rung.
+    """
 
     @model_validator(mode="after")
-    def _require_bound_for_fair_share(self) -> GatewayRungDispatchPolicy:
-        """Reject fairness without a capacity: shares need a bound to divide."""
+    def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:
+        """Reject values whose prerequisite lever is not authored.
+
+        Fairness and the fresh-session threshold divide a capacity, so both
+        need the bound; the cache-priority term scales fairness weights, so it
+        needs fairness. Failing closed here keeps an inert combination from
+        being authored and silently doing nothing.
+        """
         if self.fair_share and self.concurrency_bound is None:
             raise ValueError("fair_share requires a concurrency_bound to share")
+        if self.cache_priority_alpha is not None and not self.fair_share:
+            raise ValueError("cache_priority_alpha requires fair_share to weight")
+        if self.fresh_session_spill_fraction is not None and self.concurrency_bound is None:
+            raise ValueError("fresh_session_spill_fraction requires a concurrency_bound")
         return self
