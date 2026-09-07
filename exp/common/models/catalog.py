@@ -149,8 +149,7 @@ class ConnectionConfig(ContractModel):
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
-    # Opt-in: route a native provider (anthropic/openai/gemini/openrouter) through a
-    # customer-run trusted endpoint via ``base_url`` in its own dialect. Default-off.
+    # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
     trusted_custom_origin: bool = False
 
     @field_validator("api_key_env", "aws_access_key_id_env")
@@ -191,6 +190,8 @@ class ConnectionConfig(ContractModel):
                 raise ValueError("trusted_custom_origin applies only to a native provider")
             if self.base_url is None:
                 raise ValueError("trusted_custom_origin requires an explicit base_url")
+            if urlsplit(self.base_url).scheme != "https":
+                raise ValueError("trusted_custom_origin requires an https base_url")
         elif self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "

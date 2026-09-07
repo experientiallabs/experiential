@@ -539,6 +539,13 @@ def test_trusted_custom_origin_requires_a_base_url_and_a_native_provider() -> No
             api_key_env="FIXTURE_API_KEY",
             trusted_custom_origin=True,
         )
+    with pytest.raises(ValueError, match="requires an https base_url"):
+        ConnectionConfig(
+            provider="anthropic",
+            base_url="http://reseller.example.test/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
 
 
 def test_azure_surface_inference_follows_the_resource_host() -> None:
