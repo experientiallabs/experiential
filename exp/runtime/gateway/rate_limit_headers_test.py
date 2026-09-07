@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from exp.runtime.gateway.rate_limit_headers import (
+    MAXIMUM_RETRY_AFTER_SECONDS,
     RateLimitObservation,
     parse_retry_after_seconds,
     rate_limit_observation,
@@ -33,6 +34,22 @@ class TestParseRetryAfter:
         """Unparseable values never raise and never invent a wait."""
         for value in ("", "soon", "-5", "Mon, 99 Foo 2026", "12.5"):
             assert parse_retry_after_seconds(value, now=_NOW) is None
+
+    def test_absurd_waits_clamp_to_the_ceiling(self) -> None:
+        """A wait past the week ceiling clamps for both RFC forms.
+
+        Python parses arbitrary-precision integers, and an unbounded value
+        would overflow the ledger's signed 64-bit column and wedge the
+        settlement in a retry loop, so one hostile BYOK server header must
+        never cross the boundary unbounded.
+        """
+        assert parse_retry_after_seconds("9" * 40, now=_NOW) == MAXIMUM_RETRY_AFTER_SECONDS
+        assert (
+            parse_retry_after_seconds("Fri, 01 Jan 2100 00:00:00 GMT", now=_NOW)
+            == MAXIMUM_RETRY_AFTER_SECONDS
+        )
+        # A day-scale quota reset stays exact: the ceiling only cuts absurdity.
+        assert parse_retry_after_seconds("86400", now=_NOW) == 86_400
 
 
 class TestHeaderMap:
@@ -85,6 +102,18 @@ class TestHeaderMap:
         assert observation.limit_requests is None
         assert observation.remaining_requests is None
         assert observation.is_empty
+
+    def test_counts_past_the_sanity_ceiling_read_as_absent(self) -> None:
+        """An arbitrary-precision count never reaches the 64-bit ledger columns."""
+        observation = rate_limit_observation(
+            {
+                "x-ratelimit-limit-tokens": "9" * 40,
+                "x-ratelimit-remaining-tokens": "15000000000",
+            }
+        )
+        assert observation.limit_tokens is None
+        # A large-but-real published quota (OpenAI scale-tier TPM) stays exact.
+        assert observation.remaining_tokens == 15_000_000_000
 
 
 class TestPayloadTolerance:

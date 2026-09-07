@@ -50,6 +50,16 @@ class RateLimitObservation(ContractModel):
 
 _EMPTY_OBSERVATION = RateLimitObservation()
 
+# Bounds on what a provider header may claim. The raw strings cross the
+# boundary unbounded (Python integers are arbitrary precision), and a value
+# past SQLite's signed 64-bit column would fail every settlement write for the
+# attempt — a wedge one hostile BYOK server header must never be able to
+# cause. A wait is clamped to a week (a longer ask is still "come back much
+# later" for the ledger; the health window clamps far tighter anyway); a
+# limit/remaining count past the sanity ceiling is garbage and reads as absent.
+MAXIMUM_RETRY_AFTER_SECONDS = 7 * 24 * 3_600
+_MAXIMUM_OBSERVED_COUNT = 10**15
+
 # The small provider header map: one canonical field per provider spelling.
 # OpenAI-compatible wires send x-ratelimit-*; Anthropic sends
 # anthropic-ratelimit-*. Nothing else is special-cased per provider.
@@ -71,7 +81,9 @@ def parse_retry_after_seconds(value: str, *, now: datetime | None = None) -> int
     Both RFC 9110 forms are accepted: a nonnegative integer second count and
     an HTTP-date, whose wait is measured from ``now``. A parseable wait is
     floored at one second so a zero or already-passed date still expresses
-    "back off briefly" rather than vanishing; anything unparseable yields
+    "back off briefly" rather than vanishing, and capped at
+    ``MAXIMUM_RETRY_AFTER_SECONDS`` so one absurd header can neither distort
+    the ledger nor overflow an integer column; anything unparseable yields
     ``None`` so garbage degrades to the caller's default window.
 
     Args:
@@ -90,7 +102,9 @@ def parse_retry_after_seconds(value: str, *, now: datetime | None = None) -> int
     except ValueError:
         pass
     else:
-        return max(1, seconds) if seconds >= 0 else None
+        if seconds < 0:
+            return None
+        return min(max(1, seconds), MAXIMUM_RETRY_AFTER_SECONDS)
     try:
         when = parsedate_to_datetime(text)
     except (TypeError, ValueError):
@@ -98,7 +112,7 @@ def parse_retry_after_seconds(value: str, *, now: datetime | None = None) -> int
     if when.tzinfo is None:
         when = when.replace(tzinfo=UTC)
     reference = now if now is not None else datetime.now(UTC)
-    return max(1, math.ceil((when - reference).total_seconds()))
+    return min(max(1, math.ceil((when - reference).total_seconds())), MAXIMUM_RETRY_AFTER_SECONDS)
 
 
 def rate_limit_observation(headers: Mapping[str, str]) -> RateLimitObservation:
@@ -152,9 +166,14 @@ def rate_limit_observation_from_payload(payload: object) -> RateLimitObservation
 
 
 def _parse_count(value: str) -> int | None:
-    """Parse one nonnegative integer header value, tolerating garbage."""
+    """Parse one nonnegative integer header value, tolerating garbage.
+
+    A count past the sanity ceiling is treated as garbage rather than clamped:
+    no provider states a real quota there, and an unbounded integer would
+    overflow the ledger's 64-bit columns and fail the settlement write.
+    """
     try:
         count = int(value.strip())
     except ValueError:
         return None
-    return count if count >= 0 else None
+    return count if 0 <= count <= _MAXIMUM_OBSERVED_COUNT else None
