@@ -77,14 +77,23 @@ LEARNED_MINIMUM_RPM = 0.1
 # per-sample decay floored at one second of elapsed time so a burst of settles
 # still moves the estimate. An organization's estimate is retained for the
 # retention horizon after its last sample so a conversational cadence (minutes
-# between turns) keeps its cache standing.
+# between turns) keeps its cache standing. Estimates live in their own
+# per-rung map, NOT on the fairness recency entries: retention is 360x the
+# activity window, and folding them into ``organizations`` would grow the
+# per-reservation prune and active-share scans from "orgs seen in the last
+# ten seconds" to "orgs settled in the last hour" under the registry lock.
 EWMA_HALF_LIFE_SECONDS = 600.0
 EWMA_MINIMUM_STEP_SECONDS = 1.0
 EWMA_RETENTION_SECONDS = 3_600.0
+# Stale cache estimates are swept at most this often (amortized off both the
+# reserve and settle paths), keeping each sweep O(retained estimates) once a
+# minute per rung instead of per decision.
+EWMA_PRUNE_INTERVAL_SECONDS = 60.0
 
 
 def _effective_weight(
     load: _OrganizationLoad,
+    cached_fraction: float,
     *,
     alpha: float | None,
     congestion: float,
@@ -99,6 +108,7 @@ def _effective_weight(
 
     Args:
         load: The organization's per-rung state, under the registry lock.
+        cached_fraction: The organization's live cache estimate (0 when none).
         alpha: The rung's authored ``cache_priority_alpha``, if any.
         congestion: The rung's in-flight total over its bound.
 
@@ -107,7 +117,13 @@ def _effective_weight(
     """
     if alpha is None or alpha <= 0.0:
         return float(load.weight)
-    return load.weight * (1.0 + alpha * congestion * load.cached_fraction)
+    return load.weight * (1.0 + alpha * congestion * cached_fraction)
+
+
+def _cached_fraction(rung: _RungLoad, organization_id: str) -> float:
+    """Return one organization's live cache estimate on this rung, else zero."""
+    signal = rung.cache_fractions.get(organization_id)
+    return 0.0 if signal is None else signal.fraction
 
 
 @dataclass(frozen=True)
@@ -126,16 +142,19 @@ class RungShed:
 
 @dataclass
 class _OrganizationLoad:
-    """Per-organization in-flight count, recency, and cache EWMA on one rung."""
+    """Per-organization in-flight count and recency on one rung."""
 
     inflight: int = 0
     last_seen: float = 0.0
     weight: int = 1
-    # Time-decayed EWMA of the organization's settled cached-token fraction on
-    # this rung, and the monotonic time of its last sample (None = no signal;
-    # new organizations weigh at their base weight).
-    cached_fraction: float = 0.0
-    cached_sampled_at: float | None = None
+
+
+@dataclass
+class _CacheSignal:
+    """One organization's cache EWMA on one rung and its last sample time."""
+
+    fraction: float
+    sampled_at: float
 
 
 @dataclass
@@ -144,6 +163,12 @@ class _RungLoad:
 
     total: int = 0
     organizations: dict[str, _OrganizationLoad] = field(default_factory=dict)
+    # Time-decayed EWMA of each organization's settled cached-token fraction
+    # on this rung (absent = no signal; such organizations weigh at their base
+    # weight). Kept apart from ``organizations`` so its hour-scale retention
+    # never lengthens the per-reservation prune and share scans.
+    cache_fractions: dict[str, _CacheSignal] = field(default_factory=dict)
+    cache_pruned_at: float = 0.0
     # Sliding 60s dispatch window: (reserved_at, reserved_tokens) per admitted
     # reservation, with running totals so every decision is O(1) amortized.
     window: deque[tuple[float, int]] = field(default_factory=deque)
@@ -334,31 +359,30 @@ class RungLoadRegistry:
             return None
         congestion = rung.total / bound
         recency_floor = organization.last_seen - self._window
-        active = [
-            candidate
-            for candidate in rung.organizations.values()
+        # Each ACTIVE organization's effective weight is resolved once; the
+        # requesting organization is always active (its last_seen was just
+        # stamped), so the ``next`` below cannot exhaust.
+        weighted = [
+            (
+                candidate,
+                _effective_weight(
+                    candidate,
+                    _cached_fraction(rung, candidate_id),
+                    alpha=cache_priority_alpha,
+                    congestion=congestion,
+                ),
+            )
+            for candidate_id, candidate in rung.organizations.items()
             if candidate.inflight > 0 or candidate.last_seen >= recency_floor
         ]
-        total_weight = sum(
-            _effective_weight(candidate, alpha=cache_priority_alpha, congestion=congestion)
-            for candidate in active
-        )
-        share = (
-            bound
-            * _effective_weight(organization, alpha=cache_priority_alpha, congestion=congestion)
-            / total_weight
-        )
+        total_weight = sum(weight for _candidate, weight in weighted)
+        own_weight = next(weight for candidate, weight in weighted if candidate is organization)
+        share = bound * own_weight / total_weight
         if organization.inflight + 1 <= share:
             return None
         reserved_deficit = sum(
-            max(
-                0.0,
-                bound
-                * _effective_weight(candidate, alpha=cache_priority_alpha, congestion=congestion)
-                / total_weight
-                - candidate.inflight,
-            )
-            for candidate in active
+            max(0.0, bound * weight / total_weight - candidate.inflight)
+            for candidate, weight in weighted
             if candidate is not organization
         )
         if rung.total + 1 + int(reserved_deficit) > bound:
@@ -444,27 +468,28 @@ class RungLoadRegistry:
             input_tokens: Provider-reported TOTAL input tokens, which already
                 include the cached ones (the same semantics settlement billing
                 subtracts against), so the fraction is cached over total,
-                clamped in case a provider ever reports cached past total.
+                clamped in case a provider ever reports cached outside
+                [0, total].
         """
         if input_tokens <= 0:
             return
-        sample = min(cached_tokens, input_tokens) / input_tokens
+        sample = min(max(cached_tokens, 0), input_tokens) / input_tokens
         now = self._clock()
         with self._lock:
             # A long stream can settle after its organization's request-recency
-            # entry was pruned; the sample still counts, so the entry is
-            # recreated (inactive for fairness until its next reservation).
+            # entry was pruned; the estimate lives apart from that entry, so
+            # the sample still counts without re-marking the organization
+            # active for fairness.
             rung = self._rungs.setdefault(key, _RungLoad())
-            organization = rung.organizations.setdefault(organization_id, _OrganizationLoad())
-            if organization.cached_sampled_at is None:
-                organization.cached_fraction = sample
-            else:
-                elapsed = max(EWMA_MINIMUM_STEP_SECONDS, now - organization.cached_sampled_at)
-                retained = 0.5 ** (elapsed / EWMA_HALF_LIFE_SECONDS)
-                organization.cached_fraction = organization.cached_fraction * retained + sample * (
-                    1.0 - retained
-                )
-            organization.cached_sampled_at = now
+            self._prune_cache_fractions(rung, now)
+            signal = rung.cache_fractions.get(organization_id)
+            if signal is None:
+                rung.cache_fractions[organization_id] = _CacheSignal(sample, now)
+                return
+            elapsed = max(EWMA_MINIMUM_STEP_SECONDS, now - signal.sampled_at)
+            retained = 0.5 ** (elapsed / EWMA_HALF_LIFE_SECONDS)
+            signal.fraction = signal.fraction * retained + sample * (1.0 - retained)
+            signal.sampled_at = now
 
     def learned_ceilings(self) -> dict[str, float]:
         """Return live learned request ceilings keyed by rung, for metrics.
@@ -546,32 +571,50 @@ class RungLoadRegistry:
     def _prune(self, key: RungLoadKey, rung: _RungLoad, now: float) -> None:
         """Drop idle organizations past the activity window, bounding memory.
 
-        An organization holding a live cached-fraction estimate is retained
-        past the activity window (its cache standing outlives one request's
-        recency), until the EWMA retention horizon passes with no new sample.
-        A rung entry itself survives while it holds any organization, window
-        entry, or learned ceiling, because the learned ceiling must outlive
-        the traffic that taught it.
+        Cache estimates are pruned on their own (longer) horizon and their own
+        amortized cadence, so this per-reservation scan stays bounded by the
+        organizations active within the ten-second window. A rung entry itself
+        survives while it holds any organization, cache estimate, window
+        entry, or learned ceiling, because the learned ceiling and estimates
+        must outlive the traffic that taught them.
         """
         stale = [
             organization_id
             for organization_id, load in rung.organizations.items()
-            if load.inflight == 0
-            and load.last_seen < now - self._window
-            and (
-                load.cached_sampled_at is None
-                or load.cached_sampled_at < now - EWMA_RETENTION_SECONDS
-            )
+            if load.inflight == 0 and load.last_seen < now - self._window
         ]
         for organization_id in stale:
             del rung.organizations[organization_id]
+        self._prune_cache_fractions(rung, now)
         if (
             rung.total == 0
             and not rung.organizations
+            and not rung.cache_fractions
             and not rung.window
             and rung.learned_rpm is None
         ):
             self._rungs.pop(key, None)
+
+    @staticmethod
+    def _prune_cache_fractions(rung: _RungLoad, now: float) -> None:
+        """Sweep expired cache estimates at most once per prune interval.
+
+        Retention is hour-scale while reservations are per-request, so the
+        sweep is amortized: between intervals the map is only read (O(1) per
+        lookup), keeping the hot path independent of how many organizations
+        settled on the rung in the last hour.
+        """
+        if now - rung.cache_pruned_at < EWMA_PRUNE_INTERVAL_SECONDS:
+            return
+        rung.cache_pruned_at = now
+        horizon = now - EWMA_RETENTION_SECONDS
+        stale = [
+            organization_id
+            for organization_id, signal in rung.cache_fractions.items()
+            if signal.sampled_at < horizon
+        ]
+        for organization_id in stale:
+            del rung.cache_fractions[organization_id]
 
     def _prune_window(self, rung: _RungLoad, now: float) -> None:
         """Slide one rung's dispatch window forward, keeping totals exact."""

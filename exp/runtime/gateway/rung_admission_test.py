@@ -435,6 +435,43 @@ class TestCachePriority:
             str,
         )
 
+    def test_settle_only_organizations_never_join_the_fairness_scans(self) -> None:
+        """Hour-scale cache retention must not lengthen the reservation path.
+
+        The prune and active-share scans run per reservation under the
+        registry lock and are bounded by the ten-second activity window; the
+        cache estimates are retained for an hour. Folding the estimates into
+        the fairness entries would grow those scans 360-fold on a rung many
+        organizations settle on (the house fair-share lanes), so a settle-only
+        organization must hold a cache estimate WITHOUT a fairness entry.
+        """
+        now = [0.0]
+        registry = _registry(now)
+        for index in range(50):
+            registry.record_settle(_KEY, f"org-{index}", cached_tokens=1_000, input_tokens=1_000)
+        rung = registry._rungs[_KEY]  # Private read: pins the structural bound itself.
+        assert rung.organizations == {}
+        assert len(rung.cache_fractions) == 50
+        # The estimate still boosts the organization once it does reserve, and
+        # a settle-only organization contributes no weight to anyone's share.
+        assert isinstance(
+            _reserve(registry, "org-0", bound=8, fair_share=True, cache_priority_alpha=2.0),
+            str,
+        )
+        # Past the retention horizon the estimates sweep out and the rung
+        # entry (nothing else held) is dropped.
+        now[0] = 3_601.0
+        registry.record_settle(_KEY, "org-fresh", cached_tokens=0, input_tokens=10)
+        assert set(registry._rungs[_KEY].cache_fractions) == {"org-fresh"}
+
+    def test_negative_cached_tokens_clamp_to_a_cold_sample(self) -> None:
+        """A provider reporting cached below zero folds as zero, never negative."""
+        now = [0.0]
+        registry = _registry(now)
+        registry.record_settle(_KEY, "org-a", cached_tokens=-500, input_tokens=1_000)
+        rung = registry._rungs[_KEY]  # Private read: the clamp is otherwise unobservable.
+        assert rung.cache_fractions["org-a"].fraction == 0.0
+
     def test_alpha_off_decides_the_same_release_the_opposite_way(self) -> None:
         """Without alpha the cold org reclaims its slot and the cache org is shed."""
         now = [0.0]
