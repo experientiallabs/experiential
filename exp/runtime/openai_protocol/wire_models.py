@@ -788,13 +788,17 @@ class _AdditionalToolsItem(_WireModel):
     has no cross-wire representation, so validation is deliberately shallow
     and the raw item forwards byte-for-byte on native Responses rungs only
     (captured live from Codex 0.151.0 and accepted by the provider with a
-    plain API key, 2026-08-29).
+    plain API key, 2026-08-29). ``tools`` may be EMPTY: Codex's Apps
+    integration ships the item with ``tools: []`` when the connected app
+    exposes no tools (observed 2026-09-07 after an app reconnect), and the
+    provider accepts that shape; requiring one entry turned every such turn
+    into a 400 that no other wire produces.
     """
 
     type: Literal["additional_tools"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     role: str | None = Field(default=None, max_length=64)
-    tools: tuple[JsonValue, ...] = Field(min_length=1)
+    tools: tuple[JsonValue, ...]
 
 
 class _CustomToolCall(_WireModel):
