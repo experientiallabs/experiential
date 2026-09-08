@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -369,6 +371,20 @@ def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
     assert models[1].supports_embeddings is True
     assert transport.requests[0].headers["x-goog-api-key"] == "secret-key"
     assert transport.requests[1].url.endswith("&pageToken=page-2")
+
+
+def test_gemini_listing_preserves_an_opaque_page_token() -> None:
+    """Gemini pagination must encode reserved characters without changing the cursor."""
+    page_token = "page+2&cursor=%23fragment#tail"
+    transport = _transport(
+        _ok({"models": [], "nextPageToken": page_token}),
+        _ok({"models": []}),
+    )
+
+    _lister(transport).list_models(ProviderEndpoint(provider="gemini", api_key="secret-key"))
+
+    query = parse_qs(urlsplit(transport.requests[1].url).query)
+    assert query["pageToken"] == [page_token]
 
 
 def test_listing_rejects_an_invalid_credential_without_retrying() -> None:
