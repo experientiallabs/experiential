@@ -1044,6 +1044,7 @@ def _configured_gateway(
     *,
     base_url: str = "http://127.0.0.1:9/v1",
     capabilities: ModelCapabilities | None = None,
+    gateway_capabilities: GatewayDeploymentCapabilities | None = None,
     provider: str = "openai-compatible",
 ) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
@@ -1068,7 +1069,8 @@ def _configured_gateway(
         exact_model_id="model-revision-exact",
         revision=None,
         capabilities=capabilities or ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(
+        gateway_capabilities=gateway_capabilities
+        or GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_streaming_tool_arguments=True,
         ),
