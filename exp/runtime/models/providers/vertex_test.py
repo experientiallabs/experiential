@@ -490,6 +490,9 @@ def test_vertex_wire_follows_the_model_id_spelling() -> None:
         "deepseek-ai/deepseek-v3.2-maas",
         "xai/grok-4.20-reasoning",
         "google/gemma-4-26b-a4b-it-maas",
+        # Google's own managed endpoint under the listing's resource path: the
+        # ``-maas`` suffix is what separates it from the Gemini models sharing it.
+        "publishers/google/models/gemma-4-26b-a4b-it-maas",
         "publishers/qwen/models/qwen3-coder-480b-a35b-instruct-maas",
     ):
         assert vertex_wire_for_model(maas_id) == "openai_compatible"
@@ -505,6 +508,40 @@ def test_vertex_openapi_model_id_collapses_the_resource_path_spelling() -> None:
         vertex_openapi_model_id("publishers/qwen/models/qwen3-coder-480b-a35b-instruct-maas")
         == "qwen/qwen3-coder-480b-a35b-instruct-maas"
     )
+    assert (
+        vertex_openapi_model_id("publishers/google/models/gemma-4-26b-a4b-it-maas")
+        == "google/gemma-4-26b-a4b-it-maas"
+    )
+
+
+def test_vertex_openapi_embeddings_name_the_collapsed_maas_id() -> None:
+    """The embeddings route carries the same ``<publisher>/<model>`` id as completions."""
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "data": [{"index": 0, "embedding": [0.6, 0.8]}],
+                    "usage": {"prompt_tokens": 3},
+                },
+            )
+        ]
+    )
+    client = VertexOpenAIClient(
+        model=_snapshot("vertex", "publishers/e5/models/multilingual-e5-large-instruct-maas"),
+        api_key='{"placeholder": true}',
+        base_url=_GLOBAL_BASE_URL,
+        transport=transport,
+        token_provider=lambda: "fixture-bearer-token",
+    )
+
+    embeddings = client.embed(["hello"])
+
+    assert len(embeddings) == 1
+    url, headers, payload = transport.requests[0]
+    assert url == f"{_GLOBAL_BASE_URL}/endpoints/openapi/embeddings"
+    assert headers["authorization"] == "Bearer fixture-bearer-token"
+    assert payload["model"] == "e5/multilingual-e5-large-instruct-maas"
 
 
 def test_vertex_openapi_client_posts_chat_completions_with_a_bearer_token() -> None:

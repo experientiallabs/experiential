@@ -219,7 +219,10 @@ Chat Completions request and stream handling as `openai-compatible`), still unde
 bearer. Most MaaS models are addressed through the `global` location
 (`https://aiplatform.googleapis.com/v1/projects/PROJECT/locations/global`); a listing-style
 `publishers/<publisher>/models/<model>` spelling is collapsed onto the `<publisher>/<model>`
-form the route accepts.
+form the route accepts. Google's own managed endpoints share the Gemini resource path in
+the listing (`publishers/google/models/gemma-4-26b-a4b-it-maas`) and are told apart by
+Vertex's `-maas` endpoint suffix, so both that spelling and `google/gemma-4-26b-a4b-it-maas`
+take the MaaS route.
 
 Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
 does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or

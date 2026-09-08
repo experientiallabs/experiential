@@ -55,10 +55,13 @@ VertexWire = Literal["gemini_generate_content", "openai_compatible"]
 """The two wire dialects one Vertex connection serves, chosen per model id."""
 
 _MODEL_PATH_PREFIX = "publishers/google/models/"
-# Catalog spellings that name a Google-published model and therefore ride the Gemini wire:
-# a bare id (``gemini-2.5-pro``) or a Google resource path. Any OTHER ``<publisher>/<model>``
-# spelling is a Model Garden MaaS id for the OpenAI-compatible route.
-_GOOGLE_RESOURCE_PREFIXES = (_MODEL_PATH_PREFIX, "models/")
+# A bare id (``gemini-2.5-pro``) or a Google resource path names a Google-published model
+# on the Gemini wire; any OTHER ``<publisher>/<model>`` spelling is a Model Garden MaaS id
+# for the OpenAI-compatible route (see ``vertex_wire_for_model``).
+# Google's OWN Model Garden managed endpoints (``gemma-4-26b-a4b-it-maas``) carry this
+# suffix in Vertex's listing; it is what separates them from the Gemini models that share
+# the ``publishers/google/models/`` resource path.
+_MAAS_SUFFIX = "-maas"
 _PUBLISHER_RESOURCE_PATH = re.compile(r"^publishers/([^/]+)/models/(.+)$")
 _VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
 
@@ -71,8 +74,10 @@ def vertex_wire_for_model(model_id: str) -> VertexWire:
     publisher-qualified id (``deepseek-ai/deepseek-v3.2-maas``, ``xai/grok-4.20-reasoning``,
     ``publishers/qwen/models/qwen3-coder-480b-a35b-instruct-maas``) names a Model Garden
     MaaS model, which Vertex serves only over its OpenAI-compatible route. Google's own
-    MaaS-served open models (``google/gemma-4-26b-a4b-it-maas``) follow the same rule: the
-    ``<publisher>/<model>`` spelling IS the OpenAI-route address.
+    MaaS-served open models follow the same rule under either spelling: the listing's
+    ``publishers/google/models/gemma-4-26b-a4b-it-maas`` is recognized by Vertex's
+    ``-maas`` endpoint suffix, and ``google/gemma-4-26b-a4b-it-maas`` IS the OpenAI-route
+    address.
 
     Args:
         model_id: Catalog model identifier as spelled on the deployment record.
@@ -80,7 +85,9 @@ def vertex_wire_for_model(model_id: str) -> VertexWire:
     Returns:
         The dialect the resolved client speaks for this model.
     """
-    if model_id.startswith(_GOOGLE_RESOURCE_PREFIXES) or "/" not in model_id:
+    if model_id.startswith(_MODEL_PATH_PREFIX):
+        return "openai_compatible" if model_id.endswith(_MAAS_SUFFIX) else "gemini_generate_content"
+    if model_id.startswith("models/") or "/" not in model_id:
         return "gemini_generate_content"
     return "openai_compatible"
 
@@ -475,11 +482,25 @@ class VertexOpenAIClient(OpenAICompatibleClient):
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
-        """Return the compatible client's profile addressed with the MaaS wire id."""
+        """Return the compatible client's profile addressed with the MaaS wire id.
+
+        Profile resolution runs on the native bridge's blocking callback thread,
+        exactly like :meth:`VertexClient.gateway_wire_profile`, so the roughly-hourly
+        OAuth refresh never blocks Rust's async dispatcher; the resulting bearer token
+        is frozen only for this admitted request.
+        """
         return replace(super().gateway_wire_profile(), model_id=self._wire_model_id)
 
+    def _embedding_model_id(self) -> str:
+        """Name the MaaS id on the embeddings wire too, never the resource-path spelling."""
+        return self._wire_model_id
+
     def _headers(self) -> dict[str, str]:
-        """Build headers carrying the provider's current bearer token (never the credential)."""
+        """Build headers carrying the provider's current bearer token (never the credential).
+
+        The async completion entry point warms the provider off the event loop first, so
+        this call returns the cached token without blocking in the ordinary case.
+        """
         return _vertex_bearer_headers(self._token_provider)
 
     def _request_path(self, path: str) -> str:
