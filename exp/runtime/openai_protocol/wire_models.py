@@ -19,6 +19,7 @@ from exp.common.models.content import (
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
     MAXIMUM_VIDEO_BASE64_BYTES,
+    ImageMediaType,
 )
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
@@ -72,10 +73,16 @@ _MAXIMUM_IMAGE_URL_CHARACTERS = MAXIMUM_IMAGE_BASE64_BYTES + 128
 
 
 class _ChatImageUrl(_WireModel):
-    """Chat Completions image reference: a remote URL or a base64 data URL."""
+    """Chat Completions image reference: a remote URL or a base64 data URL.
+
+    Copilot includes ``media_type`` as a MIME hint for uploaded images. It
+    is validated and discarded: the URL or its embedded data-URL media type
+    defines the image, so the hint never rewrites content or replay identity.
+    """
 
     url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
     detail: _ImageDetail | None = None
+    media_type: ImageMediaType | None = None
 
 
 class _ChatImagePart(_WireModel):

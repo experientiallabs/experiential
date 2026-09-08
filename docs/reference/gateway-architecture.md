@@ -333,6 +333,12 @@ Responses have separate allowlist decoders and field-specific OpenAI error respo
 convert to one canonical gateway request without conflating their wire contracts. The package also
 owns headers, response assembly, SSE framing, tool-call reconstruction, and official SDK
 compatibility.
+Chat image references accept Copilot's optional `image_url.media_type` MIME hint
+(`image/png`, `image/jpeg`, `image/gif`, or `image/webp`). The hint is validated and
+discarded before provider dispatch and canonical replay identity; the `url` and
+`detail` remain authoritative. A data URL keeps its embedded MIME type, and a
+remote URL is forwarded for the provider to fetch. Unknown image fields and
+malformed URLs or base64 remain rejected.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.
