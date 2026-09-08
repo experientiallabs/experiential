@@ -495,11 +495,44 @@ class VertexOpenAIClient(OpenAICompatibleClient):
         """Name the MaaS id on the embeddings wire too, never the resource-path spelling."""
         return self._wire_model_id
 
+    async def _post_async(
+        self,
+        path: str,
+        payload: JsonObject,
+        *,
+        deadline: RequestDeadline | None = None,
+        idempotency_key: str | None = None,
+    ) -> JsonObject:
+        """Warm the bearer token off the event loop before the shared JSON post.
+
+        The embeddings routes reach ``_headers`` through this path, so the same bounded
+        off-loop mint the completion flow performs happens here too: a blocking token
+        refresh never runs inline on the event loop, and a stalled token endpoint fails
+        the request at its deadline instead of outliving it.
+
+        Args:
+            path: Provider route below the configured base URL.
+            payload: Complete JSON request object.
+            deadline: Optional request-wide deadline.
+            idempotency_key: Optional stable identity for same-endpoint retries.
+
+        Returns:
+            The first successful decoded provider body.
+        """
+        request_deadline = deadline or RequestDeadline.after(self._timeout_seconds)
+        await _warm_vertex_bearer_token(
+            self._token_provider, request_deadline, self._timeout_seconds
+        )
+        return await super()._post_async(
+            path, payload, deadline=request_deadline, idempotency_key=idempotency_key
+        )
+
     def _headers(self) -> dict[str, str]:
         """Build headers carrying the provider's current bearer token (never the credential).
 
-        The async completion entry point warms the provider off the event loop first, so
-        this call returns the cached token without blocking in the ordinary case.
+        Every async entry point (completions and the embeddings post) warms the provider
+        off the event loop first, so this call returns the cached token without blocking
+        in the ordinary case.
         """
         return _vertex_bearer_headers(self._token_provider)
 

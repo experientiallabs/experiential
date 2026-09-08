@@ -714,3 +714,35 @@ def test_catalog_resolution_builds_the_openapi_client_for_model_garden_ids() -> 
     assert response.finish_reason == ModelFinishReason.COMPLETED
     assert response.output.content == "Working."
     assert seen_credentials == ['{"type": "service_account"}', '{"type": "service_account"}']
+
+
+def test_vertex_openapi_embeddings_bound_the_token_mint_by_the_request_deadline() -> None:
+    """The embeddings post warms the token off the loop and fails at the request deadline."""
+
+    def stalled_provider() -> str:
+        """Simulate a token endpoint that answers far too late."""
+        time.sleep(0.5)
+        return "too-late-token"
+
+    client = VertexOpenAIClient(
+        model=_snapshot("vertex", "e5/multilingual-e5-large-instruct-maas"),
+        api_key='{"placeholder": true}',
+        base_url=_GLOBAL_BASE_URL,
+        transport=ScriptedJsonTransport(),
+        token_provider=stalled_provider,
+    )
+
+    async def scenario() -> float:
+        """Time how quickly the deadline error reaches the caller inside the loop."""
+        started = time.monotonic()
+        with pytest.raises(ProviderDeadlineExceeded, match="token refresh"):
+            await client._post_async(
+                "embeddings",
+                {"model": "e5/multilingual-e5-large-instruct-maas", "input": ["hello"]},
+                deadline=RequestDeadline.after(0.05),
+            )
+        return time.monotonic() - started
+
+    # asyncio.run may wait for the orphaned worker thread at loop shutdown; the bound
+    # under test is how quickly the caller inside the loop sees the deadline error.
+    assert asyncio.run(scenario()) < 0.4
