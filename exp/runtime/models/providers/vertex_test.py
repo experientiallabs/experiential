@@ -31,8 +31,11 @@ from exp.runtime.models.providers.vertex import (
     ServiceAccountTokenProvider,
     VertexClient,
     VertexCredentialError,
+    VertexOpenAIClient,
     VertexTokenProvider,
     _vertex_model_id,
+    vertex_openapi_model_id,
+    vertex_wire_for_model,
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.openai_protocol.model_adapter import model_request
@@ -443,3 +446,234 @@ def test_vertex_error_status_surfaces_after_bounded_retries() -> None:
 
     with pytest.raises(Exception, match="403"):
         client.complete(_request())
+
+
+_GLOBAL_BASE_URL = "https://aiplatform.googleapis.com/v1/projects/fixture-project/locations/global"
+
+
+def _chat_completion_response() -> JsonObject:
+    """Return one minimal Chat Completions payload as Vertex's MaaS route shapes it.
+
+    ``prompt_tokens_details`` is ``null`` and ``usage`` carries Google's
+    ``extra_properties`` on the live wire (2026-09-08), so the fixture keeps both.
+    """
+    return {
+        "id": "04aa73bb-2800-4f51-985b-a6ef5b3b2ca9",
+        "object": "chat.completion",
+        "model": "deepseek-ai/deepseek-v3.2-maas",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "Working.", "tool_calls": None},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 6,
+            "total_tokens": 18,
+            "prompt_tokens_details": None,
+            "extra_properties": {"google": {"traffic_type": "ON_DEMAND"}},
+        },
+    }
+
+
+def test_vertex_wire_follows_the_model_id_spelling() -> None:
+    """Google ids ride the Gemini wire; any other publisher-qualified id is a MaaS route."""
+    for google_id in (
+        "gemini-2.5-pro",
+        "models/gemini-2.5-pro",
+        "publishers/google/models/gemini-2.5-flash",
+    ):
+        assert vertex_wire_for_model(google_id) == "gemini_generate_content"
+    for maas_id in (
+        "deepseek-ai/deepseek-v3.2-maas",
+        "xai/grok-4.20-reasoning",
+        "google/gemma-4-26b-a4b-it-maas",
+        "publishers/qwen/models/qwen3-coder-480b-a35b-instruct-maas",
+    ):
+        assert vertex_wire_for_model(maas_id) == "openai_compatible"
+
+
+def test_vertex_openapi_model_id_collapses_the_resource_path_spelling() -> None:
+    """The route accepts only ``<publisher>/<model>``; the listing's path form is collapsed."""
+    assert (
+        vertex_openapi_model_id("deepseek-ai/deepseek-v3.2-maas")
+        == "deepseek-ai/deepseek-v3.2-maas"
+    )
+    assert (
+        vertex_openapi_model_id("publishers/qwen/models/qwen3-coder-480b-a35b-instruct-maas")
+        == "qwen/qwen3-coder-480b-a35b-instruct-maas"
+    )
+
+
+def test_vertex_openapi_client_posts_chat_completions_with_a_bearer_token() -> None:
+    """A MaaS completion posts to the openapi route with OAuth auth and the publisher id."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_chat_completion_response())]
+    )
+    client = VertexOpenAIClient(
+        model=_snapshot("vertex", "deepseek-ai/deepseek-v3.2-maas"),
+        api_key='{"placeholder": true}',
+        base_url=_GLOBAL_BASE_URL,
+        transport=transport,
+        token_provider=lambda: "fixture-bearer-token",
+    )
+
+    response = client.complete(_request())
+
+    assert isinstance(client, ModelClient)
+    assert isinstance(client, EmbeddingClient)
+    assert response.output.content == "Working."
+    assert response.model.model_id == "deepseek-ai/deepseek-v3.2-maas"
+    assert response.economics.usage is not None
+    assert response.economics.usage.input_tokens == 12
+    assert response.economics.usage.cached_input_tokens is None
+    url, headers, payload = transport.requests[0]
+    assert url == f"{_GLOBAL_BASE_URL}/endpoints/openapi/chat/completions"
+    assert headers["authorization"] == "Bearer fixture-bearer-token"
+    assert "x-goog-api-key" not in headers
+    assert payload["model"] == "deepseek-ai/deepseek-v3.2-maas"
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assert messages[0] == {"role": "system", "content": "You are precise."}
+    assert payload["stream"] is False
+
+
+def test_vertex_openapi_profile_is_the_compatible_dialect_on_the_vertex_host() -> None:
+    """The native profile speaks openai_compatible at the openapi route with the MaaS id."""
+    provider = _StatefulTokenProvider("token-first")
+    client = VertexOpenAIClient(
+        model=_snapshot("vertex", "publishers/xai/models/grok-4.20-reasoning"),
+        api_key='{"placeholder": true}',
+        base_url=_GLOBAL_BASE_URL,
+        transport=ScriptedJsonTransport(),
+        token_provider=provider,
+        supports_top_k=False,
+        supports_reasoning=True,
+    )
+
+    profile = client.gateway_wire_profile()
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Preserve these controls."),),
+        maximum_output_tokens=128,
+        temperature=0.4,
+        top_k=32,
+        reasoning_effort="high",
+    )
+    native_payload = dialect_stream_payload(profile, request)
+    payload = client._build_request(model_request(request))
+
+    assert profile.dialect == "openai_compatible"
+    assert profile.url == f"{_GLOBAL_BASE_URL}/endpoints/openapi/chat/completions"
+    assert profile.embeddings_url == f"{_GLOBAL_BASE_URL}/endpoints/openapi/embeddings"
+    assert profile.headers == {
+        "authorization": "Bearer token-first",
+        "content-type": "application/json",
+    }
+    assert profile.model_id == "xai/grok-4.20-reasoning"
+    assert profile.reasoning_wire_format == "reasoning_effort"
+    assert profile.token_limit_key == "max_tokens"
+    assert native_payload["model"] == "xai/grok-4.20-reasoning"
+    assert native_payload["stream"] is True
+    assert native_payload["stream_options"] == {"include_usage": True}
+    assert native_payload["temperature"] == 0.4
+    assert "top_k" not in native_payload
+    assert native_payload["reasoning_effort"] == "high"
+    assert native_payload["max_tokens"] == 128
+    assert payload["model"] == "xai/grok-4.20-reasoning"
+    assert payload["reasoning_effort"] == "high"
+    # The token is re-read per profile so a renewed bearer reaches the wire.
+    provider.token = "token-second"
+    assert client.gateway_wire_profile().headers["authorization"] == "Bearer token-second"
+
+
+def test_vertex_openapi_client_refuses_non_google_hosts() -> None:
+    """The MaaS client fails closed before a bearer token could leave for a foreign host."""
+    with pytest.raises(ValueError, match="aiplatform.googleapis.com"):
+        VertexOpenAIClient(
+            model=_snapshot("vertex", "deepseek-ai/deepseek-v3.2-maas"),
+            api_key='{"placeholder": true}',
+            base_url="https://attacker.example.com/v1/projects/p/locations/global",
+            transport=ScriptedJsonTransport(),
+            token_provider=lambda: "fixture-bearer-token",
+        )
+
+
+def test_vertex_openapi_token_refresh_is_bounded_by_the_request_deadline() -> None:
+    """The MaaS client shares the Gemini-wire client's bounded off-loop token warm."""
+    provider = _StatefulTokenProvider("unused-token")
+    client = VertexOpenAIClient(
+        model=_snapshot("vertex", "deepseek-ai/deepseek-v3.2-maas"),
+        api_key='{"placeholder": true}',
+        base_url=_GLOBAL_BASE_URL,
+        transport=ScriptedJsonTransport(),
+        token_provider=provider,
+    )
+    spent = RequestDeadline.after(10.0, now_monotonic=0.0)
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        asyncio.run(client.complete_async(_request(), deadline=spent))
+
+    assert provider.calls == 0
+
+
+def test_catalog_resolution_builds_the_openapi_client_for_model_garden_ids() -> None:
+    """One Vertex connection resolves Gemini ids and MaaS ids to their own clients."""
+    seen_credentials: list[str] = []
+
+    def factory(*, credentials_json: str) -> VertexTokenProvider:
+        """Record the routed credential and hand back a deterministic token provider."""
+        seen_credentials.append(credentials_json)
+        return lambda: "factory-token"
+
+    catalog = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={
+                "vertex": ConnectionConfig(
+                    provider="vertex",
+                    base_url=_GLOBAL_BASE_URL,
+                    api_key_env="VERTEX_SERVICE_ACCOUNT_JSON",
+                )
+            },
+            models={
+                "deepseek": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="vertex",
+                    model="deepseek-ai/deepseek-v3.2-maas",
+                    capabilities=ModelCapabilities(
+                        supports_tools=True,
+                        supports_completions=True,
+                        supports_embeddings=False,
+                    ),
+                ),
+                "gemini-pro": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="vertex",
+                    model="gemini-2.5-pro",
+                    capabilities=ModelCapabilities(
+                        supports_tools=True,
+                        supports_completions=True,
+                        supports_embeddings=False,
+                    ),
+                ),
+            },
+        ),
+        environment={"VERTEX_SERVICE_ACCOUNT_JSON": '{"type": "service_account"}'},
+        transport_factory=lambda: ScriptedJsonTransport(
+            [JsonHttpResponse(status_code=200, body=_chat_completion_response())]
+        ),
+        vertex_token_provider_factory=factory,
+    )
+
+    maas = catalog.resolve("deepseek")
+    gemini = catalog.resolve("gemini-pro")
+    response = maas.client.complete(_request())
+
+    assert isinstance(maas.client, VertexOpenAIClient)
+    assert maas.embedding_client is None
+    assert type(gemini.client) is VertexClient
+    assert response.finish_reason == ModelFinishReason.COMPLETED
+    assert response.output.content == "Working."
+    assert seen_credentials == ['{"type": "service_account"}', '{"type": "service_account"}']

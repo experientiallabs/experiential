@@ -209,10 +209,24 @@ JSON itself never travels on the wire, and the endpoint host is pinned to HTTPS
 Requests use the same `generateContent` wire protocol as the Gemini provider on
 `publishers/google/models/` routes.
 
+The model id spelling picks the wire. A bare id (`gemini-2.5-pro`) or a Google resource path
+(`publishers/google/models/gemini-2.5-pro`) is a Google-published model on the Gemini wire. A
+`<publisher>/<model>` id (`deepseek-ai/deepseek-v3.2-maas`, `xai/grok-4.20-reasoning`,
+`qwen/qwen3-coder-480b-a35b-instruct-maas`) is a Model Garden model served as a managed API
+(MaaS), which Vertex serves only over its OpenAI-compatible route
+`{base_url}/endpoints/openapi/chat/completions` (dialect `openai_compatible`, the same
+Chat Completions request and stream handling as `openai-compatible`), still under the OAuth
+bearer. Most MaaS models are addressed through the `global` location
+(`https://aiplatform.googleapis.com/v1/projects/PROJECT/locations/global`); a listing-style
+`publishers/<publisher>/models/<model>` spelling is collapsed onto the `<publisher>/<model>`
+form the route accepts.
+
 Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
 does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or
 prices, so every Vertex alias declares explicit capabilities. Embeddings are not supported on
-Vertex connections; use a `gemini` connection for Gemini embeddings.
+the Gemini-wire Vertex aliases; use a `gemini` connection for Gemini embeddings. MaaS aliases
+expose the compatible embeddings route (`endpoints/openapi/embeddings`) when their
+capabilities declare `supports_embeddings`.
 
 ```toml
 [connections.vertex]
