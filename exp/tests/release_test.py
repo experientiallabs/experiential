@@ -3176,13 +3176,20 @@ def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
 
 
 def test_documentation_index_commands_and_release_scope_are_current() -> None:
-    """Every indexed doc exists and release docs name current commands and explicit exclusions."""
+    """Every public doc is indexed and release docs name current commands and exclusions."""
     repository = Path(__file__).resolve().parent.parent.parent
     docs = repository / "docs"
     index = (docs / "README.md").read_text(encoding="utf-8")
     indexed_paths = re.findall(r"\| `([^`]+\.md)` \|", index)
     assert indexed_paths
+    assert len(indexed_paths) == len(set(indexed_paths))
     assert not [path for path in indexed_paths if not (docs / path).is_file()]
+    public_paths = {
+        path.relative_to(docs).as_posix()
+        for path in docs.rglob("*.md")
+        if path != docs / "README.md"
+    }
+    assert set(indexed_paths) == public_paths
 
     usage = (docs / "usage.md").read_text(encoding="utf-8")
     assert "exp optimize router" in usage
