@@ -359,6 +359,15 @@ def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -
 class OpenAIEmbeddingMixin(ProviderHttpClient):
     """Adds the shared OpenAI-wire embeddings endpoint to one HTTP provider client."""
 
+    def _embedding_model_id(self) -> str:
+        """Return the model id placed on the embeddings wire.
+
+        The configured identity by default; a client whose provider spells the wire id
+        differently from the catalog record (Vertex MaaS collapses a resource path onto
+        ``<publisher>/<model>``) overrides this so both routes name the same model.
+        """
+        return self._model.model_id
+
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
         """Embed ordered text through the configured model without making empty requests.
 
@@ -370,7 +379,9 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
         """
         if not texts:
             return ()
-        response = self._post("embeddings", openai_embedding_request(self._model.model_id, texts))
+        response = self._post(
+            "embeddings", openai_embedding_request(self._embedding_model_id(), texts)
+        )
         return openai_embedding_response(response, expected_count=len(texts))
 
     def embed_raw(
@@ -406,7 +417,7 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
         response = self._post(
             "embeddings",
             openai_embedding_request(
-                self._model.model_id,
+                self._embedding_model_id(),
                 texts,
                 dimensions=dimensions,
                 encoding_format=encoding_format,
