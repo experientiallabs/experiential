@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from exp.common.auth import ProviderAuthStore
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import (
     EmbeddingClient,
@@ -17,7 +18,7 @@ from exp.common.models import (
     ReasoningEffort,
     known_model_metadata,
 )
-from exp.runtime.models.credentials import read_connection_api_key
+from exp.runtime.models.credentials import connection_credential_binding, read_connection_api_key
 from exp.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.async_transport import (
@@ -34,6 +35,12 @@ from exp.runtime.models.providers.bedrock import (
     BedrockClient,
     BedrockRuntimeFactory,
     BoundedBedrockClient,
+)
+from exp.runtime.models.providers.chatgpt_subscription import (
+    ChatGptSubscriptionClient,
+    ChatGptTokenSource,
+    TokenEndpoint,
+    post_token_request,
 )
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from exp.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
@@ -132,12 +139,18 @@ class RuntimeModelCatalog:
         tinker_sampler_factory: TinkerSamplerFactory | None = None,
         bedrock_runtime_factory: BedrockRuntimeFactory | None = None,
         vertex_token_provider_factory: VertexTokenProviderFactory | None = None,
+        auth_store: ProviderAuthStore | None = None,
+        chatgpt_token_endpoint: TokenEndpoint = post_token_request,
     ) -> None:
         """Create a local resolver without importing SDK registries or contacting providers.
 
         Args:
             catalog: Parsed `.exp/models.toml` aliases and connections.
             environment: Credential mapping, injectable for deterministic tests.
+            auth_store: Credential store holding subscription sign-ins. Omit it to use the
+                platform user-data file.
+            chatgpt_token_endpoint: ChatGPT OAuth token POST used to refresh plan sign-ins,
+                injectable for deterministic tests.
             transport_factory: Explicit transport construction for HTTP-backed providers.
             tinker_sampler_factory: Optional deterministic test override for completed-handle
                 sampling. Omit it to use the runtime-owned Tinker SDK construction seam.
@@ -151,6 +164,8 @@ class RuntimeModelCatalog:
         self._tinker_sampler_factory = tinker_sampler_factory
         self._bedrock_runtime_factory = bedrock_runtime_factory
         self._vertex_token_provider_factory = vertex_token_provider_factory
+        self._auth_store = auth_store
+        self._chatgpt_token_endpoint = chatgpt_token_endpoint
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Resolve static identity and exact capability evidence without provider access.
@@ -228,6 +243,8 @@ class RuntimeModelCatalog:
                 current_connection["aws_access_key_id_env"] = connection.aws_access_key_id_env
             if connection.bedrock_auth_mode is not None:
                 current_connection["bedrock_auth_mode"] = connection.bedrock_auth_mode
+            if connection.subscription is not None:
+                current_connection["subscription"] = connection.subscription
             current_connection_sha256 = sha256_json(current_connection)
             if provenance.connection_config_sha256 != current_connection_sha256:
                 raise ModelConnectionError(
@@ -235,6 +252,30 @@ class RuntimeModelCatalog:
                     "verified SFT provenance"
                 )
         provider = connection.provider
+        if connection.subscription == "chatgpt":
+            subscription_client = ChatGptSubscriptionClient(
+                model=snapshot,
+                tokens=ChatGptTokenSource(
+                    store=self._auth_store if self._auth_store is not None else ProviderAuthStore(),
+                    connection_id=record.connection,
+                    binding=connection_credential_binding(connection),
+                    token_endpoint=self._chatgpt_token_endpoint,
+                ),
+                transport=self._transport_factory(),
+                supports_temperature=capabilities.supports_temperature,
+                supports_top_p=_supports_top_p(capabilities),
+                supports_reasoning=capabilities.supports_reasoning,
+                reasoning_effort=capabilities.reasoning_effort,
+                sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+            )
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                subscription_client,
+                None,
+                served_model_id=record.served_model_id,
+            )
         if provider == "bedrock":
             bearer_token = None
             access_key_id = (

@@ -70,6 +70,7 @@ def openai_responses_stream_payload(
     sampling_requires_reasoning_none: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
+    omits_output_token_limit: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
 
@@ -79,6 +80,8 @@ def openai_responses_stream_payload(
         supports_temperature: Whether this exact model accepts explicit temperature.
         supports_reasoning: Whether this exact model accepts the reasoning parameter.
         reasoning_effort: Optional catalog-pinned reasoning effort.
+        omits_output_token_limit: Whether the wire rejects ``max_output_tokens`` (the
+            ChatGPT plan backend), so the caller's ceiling is dropped structurally.
 
     Returns:
         Native Responses request with storage disabled and streaming enabled.
@@ -153,7 +156,7 @@ def openai_responses_stream_payload(
         text_payload["format"] = format_payload
     if text_payload:
         payload["text"] = text_payload
-    if request.maximum_output_tokens is not None:
+    if request.maximum_output_tokens is not None and not omits_output_token_limit:
         payload["max_output_tokens"] = request.maximum_output_tokens
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     require_sampling_reasoning_compatibility(

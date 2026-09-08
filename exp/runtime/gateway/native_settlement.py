@@ -9,6 +9,7 @@ typed :class:`GatewayFailure`.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
 
@@ -204,7 +205,12 @@ def terminal_from_settlement(
             # the provider's own Retry-After when the data plane harvested the
             # rate-limit headers; sizing the throttle window from it is what
             # lets a daily-quota reset actually suppress the rung for hours.
-            observed = settlement_rate_limit(data).retry_after_seconds
+            observation = settlement_rate_limit(data)
+            observed = observation.retry_after_seconds
+            if observed is None:
+                # A plan backend's 429 states the wait as its exhausted usage
+                # window's reset rather than a Retry-After.
+                observed = observation.exhausted_reset_after_seconds
             if observed is not None:
                 failure = failure.model_copy(update={"retry_after_seconds": observed})
         # A rejected credential or exhausted account on the customer's own
@@ -291,6 +297,35 @@ def settlement_rate_limit(data: JsonObject) -> RateLimitObservation:
         The typed observation for the ledger and throttle calibration.
     """
     return rate_limit_observation_from_payload(data.get("rate_limit_headers"))
+
+
+@dataclass(frozen=True)
+class PlanWindowColumns:
+    """One observation's plan usage windows flattened to the attempt ledger's columns."""
+
+    primary_used_percent: int | None = None
+    primary_reset_after_seconds: int | None = None
+    secondary_used_percent: int | None = None
+    secondary_reset_after_seconds: int | None = None
+
+
+def plan_window_columns(observation: RateLimitObservation) -> PlanWindowColumns:
+    """Flatten one observation's plan usage windows into the attempt ledger's columns.
+
+    Args:
+        observation: The settlement's harvested rate-limit observation.
+
+    Returns:
+        The four ``plan_*`` column values, ``None`` where the response carried no window.
+    """
+    primary = observation.subscription_window("primary")
+    secondary = observation.subscription_window("secondary")
+    return PlanWindowColumns(
+        primary_used_percent=None if primary is None else primary.used_percent,
+        primary_reset_after_seconds=None if primary is None else primary.reset_after_seconds,
+        secondary_used_percent=None if secondary is None else secondary.used_percent,
+        secondary_reset_after_seconds=None if secondary is None else secondary.reset_after_seconds,
+    )
 
 
 def deployment_operation_key(route: GatewayRoute, deployment: ExactModelDeployment) -> str:

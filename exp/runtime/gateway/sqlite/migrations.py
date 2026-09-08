@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 21
 
 
 class GatewaySchemaError(RuntimeError):
@@ -711,6 +711,28 @@ _MIGRATION_19 = (
     "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_tokens INTEGER",
 )
 
+# v20: per-attempt plan usage windows. A ChatGPT plan rung answers every request
+# with its rolling windows (percent used and seconds to reset for the short and
+# the long window); persisting them per attempt is what lets the pool view show
+# how full each plan is and audit why the waterfall moved past it. Numbers only.
+_MIGRATION_20 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN plan_primary_used_percent INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN plan_primary_reset_after_seconds INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN plan_secondary_used_percent INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN plan_secondary_reset_after_seconds INTEGER",
+)
+
+# v21: plan sign-in connections. A connection revision may dispatch on a consumer
+# subscription instead of an API key; the kind is part of the connection's
+# identity digest, so it must round-trip through the authority table or every
+# plan revision would fail the digest check on reload.
+_MIGRATION_21 = (
+    """
+    ALTER TABLE provider_connection_revisions
+    ADD COLUMN subscription TEXT CHECK (subscription IN ('chatgpt'))
+    """,
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -731,6 +753,8 @@ _MIGRATIONS = {
     17: _MIGRATION_17,
     18: _MIGRATION_18,
     19: _MIGRATION_19,
+    20: _MIGRATION_20,
+    21: _MIGRATION_21,
 }
 
 

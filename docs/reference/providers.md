@@ -54,6 +54,7 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Provider | Catalog `provider` | Credential | Endpoint identity |
 |---|---|---|---|
 | OpenAI | `openai` | `api_key_env` (suggested `OPENAI_API_KEY`) | Official OpenAI origin |
+| ChatGPT plan (Codex) | `openai` with `subscription = "chatgpt"` | Browser sign-in stored under the connection ID; no `api_key_env` | `https://chatgpt.com/backend-api/codex` |
 | OpenRouter | `openrouter` | `api_key_env` (suggested `OPENROUTER_API_KEY`) | Official OpenRouter origin |
 | Anthropic | `anthropic` | `api_key_env` (suggested `ANTHROPIC_API_KEY`) | Official Anthropic origin |
 | Gemini | `gemini` | `api_key_env` (suggested `GEMINI_API_KEY`) | Official Gemini origin |
@@ -66,6 +67,45 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
+
+## ChatGPT plan connections
+
+A `subscription = "chatgpt"` connection dispatches on a ChatGPT plan (Plus, Pro, Team, or
+Enterprise seat) instead of an OpenAI API key. It is the sign-in Codex itself uses: the same
+public OAuth client, the same loopback callback (`http://localhost:1455/auth/callback`), and the
+same Codex Responses backend. The connection carries no credential name and accepts no endpoint
+override; the tokens live in the user-only credential file as a `type = "oauth"` record under the
+connection ID, beside API-key records.
+
+```console
+exp config gateway provider add plan-a --provider openai --subscription chatgpt --root ROOT
+exp config gateway provider add plan-b --provider openai --subscription chatgpt \
+  --codex-auth-file ~/.codex/auth.json --non-interactive --root ROOT
+```
+
+The first form opens the browser and waits for the callback (the port must be free: a running
+`codex login` holds it). The second imports an existing Codex sign-in without touching Codex's
+file; from then on the two refresh independently. Re-running `add` with `--replace` signs in
+again; `update` never re-authenticates. `provider list` shows `subscription = "chatgpt"` for the
+connection. The gateway mints a fresh bearer for every physical dispatch from the stored tokens,
+refreshing five minutes ahead of expiry and persisting the rotated refresh token, so a
+long-running worker never dispatches on a stale token. Every other CLI path, including
+`exp config providers`, build, and optimize, is API-key only: the plan backend serves streaming
+requests only, so a plan connection is gateway-only and its non-streaming completion path fails
+closed.
+
+The backend is stricter than the public Responses API and the connection's wire profile encodes
+that: requests always stream with provider storage disabled, and the caller's
+`max_output_tokens` is dropped structurally because the backend rejects the field. Every response
+carries the plan's rolling usage windows as `x-codex-primary-*` (the short window) and
+`x-codex-secondary-*` (the weekly window) headers; the gateway records them per attempt and, when
+a window reaches 100 percent, throttles that connection until the stated reset so a certified
+pool of several plans rotates to the next one before the first 429.
+
+Using a consumer plan through a gateway is subject to OpenAI's terms for that plan. The engine
+sends the client's own identity (`originator: experiential`) and never impersonates another
+client. Anthropic restricts Claude plan tokens to Claude Code, so no `subscription` kind exists
+for it.
 
 ## OpenAI-compatible listing metadata
 

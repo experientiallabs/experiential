@@ -65,6 +65,10 @@ class SyncWriteLedger(Protocol):
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        plan_primary_used_percent: int | None = None,
+        plan_primary_reset_after_seconds: int | None = None,
+        plan_secondary_used_percent: int | None = None,
+        plan_secondary_reset_after_seconds: int | None = None,
     ) -> None:
         """Durably settle one attempt exactly once.
 

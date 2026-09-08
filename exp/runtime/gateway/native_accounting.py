@@ -38,7 +38,6 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
-    DeadRung,
     InflightRequest,
     claim_route_from,
     deployment_health_key,
@@ -55,6 +54,7 @@ from exp.runtime.gateway.native_settlement import (
     failure_from_boundary_payload,
     first_token_at_from_settlement,
     ledger_failure,
+    plan_window_columns,
     settlement_rate_limit,
     terminal_from_settlement,
 )
@@ -647,6 +647,7 @@ class NativeAttemptAccounting:
         terminal, failure = terminal_from_settlement(data)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
+        plan = plan_window_columns(rate_limit)
         try:
             self._write_ledger.finish_attempt(
                 attempt_id=attempt_id,
@@ -659,6 +660,10 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=rate_limit.remaining_requests,
                 ratelimit_limit_tokens=rate_limit.limit_tokens,
                 ratelimit_remaining_tokens=rate_limit.remaining_tokens,
+                plan_primary_used_percent=plan.primary_used_percent,
+                plan_primary_reset_after_seconds=plan.primary_reset_after_seconds,
+                plan_secondary_used_percent=plan.secondary_used_percent,
+                plan_secondary_reset_after_seconds=plan.secondary_reset_after_seconds,
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -667,7 +672,9 @@ class NativeAttemptAccounting:
             with self._lock:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
-        self._record_health(entry, attempt_id, opened=opened, failure=failure)
+        self._record_health(
+            entry, attempt_id, opened=opened, failure=failure, rate_limit=rate_limit
+        )
         self._record_cache_fraction(entry, attempt_id, terminal.usage)
         with self._lock:
             if finalize:
@@ -751,18 +758,22 @@ class NativeAttemptAccounting:
         *,
         opened: bool,
         failure: GatewayFailure | None,
+        rate_limit: RateLimitObservation | None = None,
     ) -> None:
         """Apply one settled attempt's outcome to the deployment circuits.
 
         Mirrors the executor's recording order: a successful dispatch opening
         restores admission first, then the terminal outcome either closes the
-        circuit or counts against it.
+        circuit or counts against it. A plan rung whose response reports an
+        exhausted usage window is throttled until that window resets, success
+        or not, so the pool rotates to the next plan before the first 429.
 
         Args:
             entry: The owning in-flight request.
             attempt_id: The settled attempt.
             opened: Whether the provider dispatch opened successfully.
             failure: The terminal failure, or ``None`` for a success.
+            rate_limit: The response's harvested rate-limit observation.
         """
         # The rung's bounded-admission slot frees with the health recording:
         # both releases are idempotent, so settle, abandon, and the sweep can
@@ -796,6 +807,9 @@ class NativeAttemptAccounting:
             self._health.failed(key, failure)
         else:
             self._health.succeeded(key)
+        exhausted_reset = None if rate_limit is None else rate_limit.exhausted_reset_after_seconds
+        if exhausted_reset is not None:
+            self._health.exhausted(key, exhausted_reset)
 
     def _record_cache_fraction(
         self,
@@ -943,6 +957,7 @@ class NativeAttemptAccounting:
             Whether the swept terminal write reached the ledger.
         """
         observation = RateLimitObservation() if rate_limit is None else rate_limit
+        plan = plan_window_columns(observation)
         try:
             self._write_ledger.finish_attempt(
                 attempt_id=attempt_id,
@@ -954,11 +969,17 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=observation.remaining_requests,
                 ratelimit_limit_tokens=observation.limit_tokens,
                 ratelimit_remaining_tokens=observation.remaining_tokens,
+                plan_primary_used_percent=plan.primary_used_percent,
+                plan_primary_reset_after_seconds=plan.primary_reset_after_seconds,
+                plan_secondary_used_percent=plan.secondary_used_percent,
+                plan_secondary_reset_after_seconds=plan.secondary_reset_after_seconds,
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False
             return False
-        self._record_health(entry, attempt_id, opened=False, failure=failure)
+        self._record_health(
+            entry, attempt_id, opened=False, failure=failure, rate_limit=observation
+        )
         # A retained settlement that finally lands through the sweep carries
         # the same observed usage as the direct path, so the cache-priority
         # EWMA must not depend on WHICH recovery path succeeded.
@@ -969,31 +990,3 @@ class NativeAttemptAccounting:
             elif entry.active_attempt_id == attempt_id:
                 entry.active_attempt_id = None
         return True
-
-
-def record_dead_admission_rungs(
-    accounting: NativeAttemptAccounting,
-    authorization: AuthorizationSnapshot,
-    dead: tuple[DeadRung, ...],
-    *,
-    fallback_available: bool,
-) -> None:
-    """Record admission-dead rungs and surface a lead masked by fallback."""
-    if not dead:
-        return
-    for rung in dead:
-        accounting.health.failed(
-            deployment_health_key(authorization, rung.deployment),
-            rung.failure,
-        )
-    lead = next((rung for rung in dead if rung.index == 0), None)
-    lead_masked = lead is not None and fallback_available
-    accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
-    if lead is not None and fallback_available:
-        _logger.warning(
-            "gateway admission skipped the lead rung for alias %r: served off a "
-            "fallback because deployment %r (provider %r) was dead at admission",
-            authorization.alias,
-            lead.deployment.deployment_id,
-            lead.deployment.provider,
-        )

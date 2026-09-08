@@ -183,6 +183,10 @@ class _RecordingLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        plan_primary_used_percent: int | None = None,
+        plan_primary_reset_after_seconds: int | None = None,
+        plan_secondary_used_percent: int | None = None,
+        plan_secondary_reset_after_seconds: int | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart."""
         del terminal_event, first_token_at
@@ -204,6 +208,10 @@ class _RecordingLedger:
                 ratelimit_remaining_requests,
                 ratelimit_limit_tokens,
                 ratelimit_remaining_tokens,
+                plan_primary_used_percent,
+                plan_primary_reset_after_seconds,
+                plan_secondary_used_percent,
+                plan_secondary_reset_after_seconds,
             )
         ):
             self.rate_limit_settlements.append(
@@ -214,6 +222,10 @@ class _RecordingLedger:
                     "ratelimit_remaining_requests": ratelimit_remaining_requests,
                     "ratelimit_limit_tokens": ratelimit_limit_tokens,
                     "ratelimit_remaining_tokens": ratelimit_remaining_tokens,
+                    "plan_primary_used_percent": plan_primary_used_percent,
+                    "plan_primary_reset_after_seconds": plan_primary_reset_after_seconds,
+                    "plan_secondary_used_percent": plan_secondary_used_percent,
+                    "plan_secondary_reset_after_seconds": plan_secondary_reset_after_seconds,
                 }
             )
 
@@ -1245,8 +1257,82 @@ class TestRateLimitSettlement:
                 "ratelimit_remaining_requests": 9_999,
                 "ratelimit_limit_tokens": 180_000_000,
                 "ratelimit_remaining_tokens": 179_000_000,
+                "plan_primary_used_percent": None,
+                "plan_primary_reset_after_seconds": None,
+                "plan_secondary_used_percent": None,
+                "plan_secondary_reset_after_seconds": None,
             }
         ]
+
+    def test_exhausted_plan_window_throttles_the_rung_until_its_reset(self) -> None:
+        """A plan whose short window hit 100 percent is suppressed for the stated reset, even
+        on a success, and its window numbers land in the plan ledger columns."""
+        registry, ledger, entry = _registry()
+        started = _start(registry, ordinal=0)
+        key = deployment_health_key(entry.authorization, entry.route.deployments[0])
+        assert not registry.health.suppressed(key)
+        registry.settle(
+            json.dumps(
+                {
+                    "request_id": "request-one",
+                    "attempt_id": str(started["attempt_id"]),
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "tool_names": [],
+                    "failure": None,
+                    "finalize": True,
+                    "opened": True,
+                    "rate_limit_headers": {
+                        "x-codex-primary-used-percent": "100",
+                        "x-codex-primary-reset-after-seconds": "11511",
+                        "x-codex-primary-window-minutes": "300",
+                        "x-codex-secondary-used-percent": "4",
+                        "x-codex-secondary-reset-after-seconds": "598311",
+                        "x-codex-secondary-window-minutes": "10080",
+                    },
+                }
+            )
+        )
+        assert registry.health.suppressed(key)
+        assert ledger.rate_limit_settlements == [
+            {
+                "attempt_id": str(started["attempt_id"]),
+                "retry_after_seconds": None,
+                "ratelimit_limit_requests": None,
+                "ratelimit_remaining_requests": None,
+                "ratelimit_limit_tokens": None,
+                "ratelimit_remaining_tokens": None,
+                "plan_primary_used_percent": 100,
+                "plan_primary_reset_after_seconds": 11_511,
+                "plan_secondary_used_percent": 4,
+                "plan_secondary_reset_after_seconds": 598_311,
+            }
+        ]
+
+    def test_a_plan_window_below_its_ceiling_leaves_the_rung_admitted(self) -> None:
+        """Window numbers are recorded without suppressing a plan that still has room."""
+        registry, _ledger, entry = _registry()
+        started = _start(registry, ordinal=0)
+        key = deployment_health_key(entry.authorization, entry.route.deployments[0])
+        registry.settle(
+            json.dumps(
+                {
+                    "request_id": "request-one",
+                    "attempt_id": str(started["attempt_id"]),
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "tool_names": [],
+                    "failure": None,
+                    "finalize": True,
+                    "opened": True,
+                    "rate_limit_headers": {
+                        "x-codex-primary-used-percent": "22",
+                        "x-codex-primary-reset-after-seconds": "11511",
+                    },
+                }
+            )
+        )
+        assert not registry.health.suppressed(key)
 
     def test_settle_without_headers_records_no_rate_limit_values(self) -> None:
         """An engine that sends no header map keeps every kwarg None."""
@@ -1411,6 +1497,10 @@ class TestRateLimitSettlement:
                 "ratelimit_remaining_requests": 9_999,
                 "ratelimit_limit_tokens": None,
                 "ratelimit_remaining_tokens": None,
+                "plan_primary_used_percent": None,
+                "plan_primary_reset_after_seconds": None,
+                "plan_secondary_used_percent": None,
+                "plan_secondary_reset_after_seconds": None,
             }
         ]
 
