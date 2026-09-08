@@ -74,6 +74,8 @@ def test_copilot_image_mime_hint_serves_without_leaking_to_the_provider(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+        provider="azure",
+        api_version="2024-10-21",
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True, supports_image_input=True, supports_image_url_input=True
         ),
