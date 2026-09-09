@@ -573,8 +573,7 @@ def _pump_process_output(process: subprocess.Popen[str], lines: list[str]) -> No
     """
     if process.stdout is None:
         return
-    for line in process.stdout:
-        lines.append(line)
+    lines.extend(process.stdout)
 
 
 def wait_for_http_ok(

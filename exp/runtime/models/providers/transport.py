@@ -26,6 +26,7 @@ class ProviderTransportError(RuntimeError):
     """A non-success HTTP or transport result that contains no secret-bearing payload."""
 
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        """Bind the sanitized message and the optional HTTP status that produced it."""
         super().__init__(message)
         self.status_code = status_code
 
@@ -170,6 +171,7 @@ class HttpxJsonTransport(JsonHttpTransport):
     """Production JSON transport backed by a caller-owned-or-default httpx client."""
 
     def __init__(self, client: httpx.Client | None = None) -> None:
+        """Use a caller-owned client or construct a default one."""
         self._client = client or httpx.Client()
 
     def get(

@@ -106,7 +106,7 @@ class JudgePromptTemplate(ContractModel):
             raise ValueError(
                 "judge variable mapping must name every required canonical input exactly once"
             )
-        if len(set(cast(str, value) for value in self.variable_mapping.values())) != len(required):
+        if len({cast(str, value) for value in self.variable_mapping.values()}) != len(required):
             raise ValueError("judge variable mapping values must be unique")
         projection = self.score_projection
         if self.response_shape == "scalar":

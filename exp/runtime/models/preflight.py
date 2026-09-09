@@ -21,6 +21,7 @@ class CapabilityRequirement:
     minimum_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
+        """Reject non-positive minimum token bounds."""
         if (
             self.minimum_context_window_tokens is not None
             and self.minimum_context_window_tokens < 1

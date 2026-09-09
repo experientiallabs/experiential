@@ -121,6 +121,7 @@ class RouterRuntime:
         decision_ttl_seconds: float = 24 * 60 * 60,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Bind the frozen policy, evidence bank, catalog, pricing identity, and decision buffer."""
         if decision_capacity < 1 or decision_ttl_seconds <= 0:
             raise ValueError("router decision bounds must be positive")
         self.policy = policy
