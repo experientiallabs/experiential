@@ -28,11 +28,9 @@ from exp.runtime.gateway.attempt_tokens import (
     INPUT_TOKEN_HEADROOM_PERCENT,
     MESSAGE_FRAMING_TOKENS,
     OPAQUE_BYTES_PER_TOKEN,
-    RESERVATION_ENCODING,
     TOOLS_PRESENT_TOKENS,
     VIDEO_BYTES_PER_TOKEN,
     VIDEO_TOKENS,
-    reservation_encoder,
     worst_case_input_tokens,
 )
 from exp.runtime.gateway.contracts import (
@@ -46,6 +44,7 @@ from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
+from exp.runtime.gateway.reservation_tokenizer import RESERVATION_ENCODING, reservation_encoder
 
 GATEWAY_DIR = Path(__file__).resolve().parent
 

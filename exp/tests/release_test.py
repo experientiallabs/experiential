@@ -40,6 +40,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "posthog",
         "pydantic",
         "rich",
+        "tiktoken",
         "tomli-w",
         "typer",
     }
@@ -1377,7 +1378,11 @@ def _installed_release_driver() -> None:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 output = process.stdout.read() if process.stdout is not None else ""
-                raise AssertionError(f"exp gateway exited before startup:\n{output}")
+                errors = process.stderr.read() if process.stderr is not None else ""
+                raise AssertionError(
+                    f"exp gateway exited before startup (exit {process.returncode}):\n"
+                    f"{output}\n--- stderr ---\n{errors}"
+                )
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                     return

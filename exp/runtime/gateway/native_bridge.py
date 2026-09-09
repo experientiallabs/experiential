@@ -30,7 +30,6 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
-from exp.runtime.gateway.attempt_tokens import reservation_encoder
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -116,6 +115,7 @@ from exp.runtime.gateway.native_settlement import (
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
+from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import (
@@ -244,8 +244,9 @@ class NativeControlPlane(
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
         )
-        # Every reservation tokenizes its prompt; load the BPE table now so a
-        # fresh process pays that once at bind time, never on its first request.
+        # Every reservation tokenizes its prompt; build the packaged BPE now so
+        # a fresh process pays that once at bind time, never on its first
+        # request, and a corrupt table fails startup with its own message.
         reservation_encoder()
 
     @property

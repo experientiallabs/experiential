@@ -16,10 +16,8 @@ from __future__ import annotations
 
 import json
 import re
-from functools import cache
 from typing import assert_never
 
-import tiktoken
 from pydantic import JsonValue
 
 from exp.common.models.content import (
@@ -34,20 +32,11 @@ from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.replay_identity import provider_replay_authority
+from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 
 # Output tokens reserved when neither the caller nor the deployment bounds output
 # (an output bound is not a price, so its absence must not unprice a route).
 DEFAULT_RESERVATION_OUTPUT_TOKENS = 32_768
-
-RESERVATION_ENCODING = "o200k_base"
-"""BPE used to count prompt text for every route.
-
-It is the tokenizer of the OpenAI models the gateway serves most, and the
-other served families (Anthropic, DeepSeek, Gemini) tokenize the same text
-within the headroom below on production traffic, so one encoding keeps the
-estimate deployment-independent: a ladder walk counts once and prices each
-candidate from the same number.
-"""
 
 INPUT_TOKEN_HEADROOM_PERCENT = 15
 """Multiplicative margin on the counted prompt.
@@ -116,18 +105,6 @@ OPAQUE_MINIMUM_CHARACTERS = 256
 counted as text (a long identifier costs a few extra tokens, never fewer)."""
 
 _OPAQUE_BASE64 = re.compile(r"[A-Za-z0-9+/_=-]{256,}")
-
-
-@cache
-def reservation_encoder() -> tiktoken.Encoding:
-    """Return the process-wide cached reservation tokenizer.
-
-    Loading the BPE table takes on the order of a second and may fetch the
-    published vocabulary into tiktoken's on-disk cache on a fresh host, so a
-    serving process warms it once at bind time instead of on its first
-    request.
-    """
-    return tiktoken.get_encoding(RESERVATION_ENCODING)
 
 
 def worst_case_attempt_tokens(
