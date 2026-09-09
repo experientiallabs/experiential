@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
+from exp.runtime.gateway.attempt_tokens import reservation_encoder
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -243,6 +244,9 @@ class NativeControlPlane(
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
         )
+        # Every reservation tokenizes its prompt; load the BPE table now so a
+        # fresh process pays that once at bind time, never on its first request.
+        reservation_encoder()
 
     @property
     def request_timeout_seconds(self) -> float:

@@ -26,6 +26,9 @@ dependencies = [
     # Vertex mints OAuth tokens from service-account JSON through Google's official credential
     # library. Imports stay lazy inside the Vertex adapter, mirroring the Bedrock boundary.
     "google-auth>=2.35,<3",
+    # Realistic input-token estimates for per-attempt reservations (free-tier windows and the
+    # paid worst-case ceiling) count the prompt with the o200k BPE instead of a byte bound.
+    "tiktoken>=0.9,<1",
 ]
 
 [project.optional-dependencies]

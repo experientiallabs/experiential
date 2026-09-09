@@ -24,8 +24,10 @@ from exp.common.models.gateway_catalog import (
 from exp.runtime.gateway.attempt_tokens import (
     DEFAULT_RESERVATION_OUTPUT_TOKENS,
     worst_case_attempt_tokens,
+    worst_case_input_tokens,
 )
 from exp.runtime.gateway.budgets import (
+    LONG_CONTEXT_TIER_MARGIN_PERCENT,
     BudgetReservationRejected,
     BudgetScope,
     BudgetScopeKind,
@@ -188,11 +190,18 @@ def _accepted(
 
 
 def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_closed() -> None:
-    """Reservation pricing uses canonical bytes, output ceiling, and no float money."""
+    """Reservation pricing uses the input estimate, output ceiling, and no float money."""
     request = _request("four bytes")
     known = maximum_attempt_cost_micro_usd(request, _deployment())
 
-    assert known is not None and isinstance(known, int) and known > 32
+    assert known is not None and isinstance(known, int) and known > 16
+    # A caller that already holds the input estimate prices identically.
+    assert (
+        maximum_attempt_cost_micro_usd(
+            request, _deployment(), input_tokens=worst_case_input_tokens(request)
+        )
+        == known
+    )
     assert maximum_attempt_cost_micro_usd(request, _deployment(priced=False)) is None
     unrepresentable = _deployment().model_copy(
         update={
@@ -278,8 +287,8 @@ def test_huge_caller_output_ceiling_clamps_to_deployment_instead_of_failing_clos
     worst case past ``MAXIMUM_MICRO_USD`` and returns ``None``, which fails a
     perfectly fundable request closed and mis-terminalizes it as a quota refusal.
     The deployment can never emit more than its own ceiling, so the output term
-    clamps to it: the huge request stays a small bounded int, differing from the
-    at-ceiling request only by the extra JSON bytes of the larger literal.
+    clamps to it: the huge request stays a small bounded int and prices exactly
+    like the at-ceiling request (the literal is not prompt text).
     """
     deployment = _deployment()  # ModelCapabilities(maximum_output_tokens=16)
     bounded = maximum_attempt_cost_micro_usd(_request("four bytes"), deployment)
@@ -290,9 +299,9 @@ def test_huge_caller_output_ceiling_clamps_to_deployment_instead_of_failing_clos
 
     assert bounded is not None
     assert huge is not None and isinstance(huge, int)
-    # Output is clamped to the ceiling; only the input-byte count of the larger
-    # literal differs, so the two stay within a handful of micro-USD of each other.
-    assert abs(huge - bounded) < 100
+    # Output is clamped to the ceiling and the literal is not prompt text, so
+    # the two price identically.
+    assert huge == bounded
 
 
 def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path) -> None:
@@ -372,7 +381,7 @@ def test_configured_optional_prices_are_reserved_even_when_reporting_hints_are_f
         route_depth=0,
         maximum_cost_micro_usd=maximum,
     )
-    input_ceiling = len(canonical_json_bytes(request))
+    input_ceiling = worst_case_input_tokens(request)
     ledger.finish_attempt(
         attempt_id=attempt,
         terminal_event=GatewayEvent(
@@ -952,12 +961,13 @@ def test_deployment_budget_scope_fails_closed_on_unreadable_snapshot(tmp_path: P
 
 
 def test_reservation_prices_the_long_context_tier_conservatively() -> None:
-    """The byte bound decides tier exposure fail-safe.
+    """The input estimate decides tier exposure with a documented margin.
 
-    Canonical bytes never undercount tokens, so a request whose bytes stay
-    below the threshold reserves at base rates, while a byte bound at or
-    past the threshold must survive the whole-request premium schedule; a
-    tier missing a required rate unprices the route entirely.
+    The estimate is realistic with headroom, not a bound, so the tier is
+    treated as reachable from ``LONG_CONTEXT_TIER_MARGIN_PERCENT`` below its
+    threshold: inside that band the whole-request premium schedule prices the
+    reservation, below it base rates reserve, and a reachable tier missing a
+    required rate unprices the route entirely.
     """
     from exp.common.models.catalog import GatewayLongContextTier
 
@@ -977,25 +987,37 @@ def test_reservation_prices_the_long_context_tier_conservatively() -> None:
             }
         )
 
+    request = _request("x " * 400)
+    input_tokens = worst_case_input_tokens(request)
+    assert input_tokens >= 64
     tier = GatewayLongContextTier(
         input_threshold_tokens=64,
         input_micro_usd_per_million_tokens=3_000_000,
         output_micro_usd_per_million_tokens=5_000_000,
     )
-    request = _request("x" * 400)
-    input_bytes = len(canonical_json_bytes(request))
-    assert input_bytes >= 64
 
     flat = maximum_attempt_cost_micro_usd(request, tiered(None))
     premium = maximum_attempt_cost_micro_usd(request, tiered(tier))
     assert flat is not None and premium is not None
     # 16 output tokens from the deployment ceiling; the premium worst case
     # prices both directions at the tier's higher rates.
-    assert flat == (input_bytes * 1_000_000 + 16 * 2_000_000 + 999_999) // 1_000_000
-    assert premium == (input_bytes * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
+    assert flat == (input_tokens * 1_000_000 + 16 * 2_000_000 + 999_999) // 1_000_000
+    assert premium == (input_tokens * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
 
-    # Below the threshold the tier cannot trigger, so base rates reserve.
-    unreachable = tier.model_copy(update={"input_threshold_tokens": input_bytes + 1})
+    # Just past the estimate the tier is still reachable: the margin band
+    # reserves at premium rates rather than trusting the estimate exactly.
+    within_margin = tier.model_copy(update={"input_threshold_tokens": input_tokens + 1})
+    assert maximum_attempt_cost_micro_usd(request, tiered(within_margin)) == premium
+    band_edge = (input_tokens * 100) // (100 - LONG_CONTEXT_TIER_MARGIN_PERCENT)
+    assert (
+        maximum_attempt_cost_micro_usd(
+            request, tiered(tier.model_copy(update={"input_threshold_tokens": band_edge}))
+        )
+        == premium
+    )
+
+    # Past the margin the tier cannot trigger, so base rates reserve.
+    unreachable = tier.model_copy(update={"input_threshold_tokens": band_edge + 1})
     assert maximum_attempt_cost_micro_usd(request, tiered(unreachable)) == flat
 
     # A reachable tier with an unknown required rate fails closed.
@@ -1010,7 +1032,7 @@ def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -
     """Serialization-excluded carriers cannot dodge the premium reservation.
 
     Replayed encrypted reasoning is provider-read input excluded from the
-    request's plain serialization; without its envelope bytes a
+    request's plain serialization; without it in the estimate a
     carrier-heavy request could reserve at base rates and settle at the
     premium schedule, overdrawing a hard budget.
     """
@@ -1036,41 +1058,48 @@ def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -
             )
         }
     )
-    carried = GatewayRequest(
+    visible = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
-        messages=(
-            GatewayMessage(
-                role="assistant",
-                content="tiny",
-                provider_reasoning=(
-                    EncryptedReasoningBlock(
-                        id="rs_carrier",
-                        encrypted_content="A" * 4_096,
-                        output_index=0,
-                    ),
-                ),
-            ),
-        ),
+        messages=(GatewayMessage(role="assistant", content="tiny"),),
         maximum_output_tokens=16,
     )
-    from exp.runtime.gateway.replay_identity import provider_replay_authority
-
-    visible_bytes = len(canonical_json_bytes(carried))
-    assert visible_bytes < 2_048
-    envelope = provider_replay_authority(carried)
-    assert envelope is not None
-    bound = visible_bytes + len(canonical_json_bytes(envelope))
+    carried = visible.model_copy(
+        update={
+            "messages": (
+                visible.messages[0].model_copy(
+                    update={
+                        "provider_reasoning": (
+                            EncryptedReasoningBlock(
+                                id="rs_carrier",
+                                # Sixteen kilobytes of opaque carrier: far past the
+                                # threshold by decoded length, invisible to the
+                                # plain serialization.
+                                encrypted_content="A" * 16_384,
+                                output_index=0,
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    assert worst_case_input_tokens(visible) < 2_048
+    bound = worst_case_input_tokens(carried)
     assert bound >= 2_048
-    # The premium worst case governs because the carrier bytes cross the
+    assert (
+        maximum_attempt_cost_micro_usd(visible, tiered)
+        == (worst_case_input_tokens(visible) * 1_000_000 + 16 * 2_000_000 + 999_999) // 1_000_000
+    )
+    # The premium worst case governs because the carrier crosses the
     # threshold even though the visible serialization stays below it.
     expected = (bound * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
     assert maximum_attempt_cost_micro_usd(carried, tiered) == expected
 
 
 def test_worst_case_attempt_tokens_matches_over_the_serving_request_union() -> None:
-    """The promo token reservation is match-aware: completions reserve worst-case
+    """The promo token reservation is match-aware: completions reserve estimated
     input and clamped output; embeddings and image requests reserve their
-    byte-bounded input and zero completion output."""
+    estimated input and zero completion output."""
     deployment = _deployment()
 
     completion_in, completion_out = worst_case_attempt_tokens(_request("four bytes"), deployment)
@@ -1080,10 +1109,16 @@ def test_worst_case_attempt_tokens_matches_over_the_serving_request_union() -> N
 
     embeddings = EmbeddingsRequest(inputs=("hello", "world"))
     emb_in, emb_out = worst_case_attempt_tokens(embeddings, deployment)
-    assert emb_in == len(canonical_json_bytes(embeddings)) and emb_in > 0
+    assert emb_in == worst_case_input_tokens(embeddings) and emb_in > 0
     assert emb_out == 0
+    # The embeddings money ceiling prices the same estimate at the input rate.
+    input_rate = deployment.gateway.prices.input_micro_usd_per_million_tokens
+    assert input_rate is not None
+    assert maximum_attempt_cost_micro_usd(embeddings, deployment) == (
+        (emb_in * input_rate + 999_999) // 1_000_000
+    )
 
     images = ImagesRequest(prompt="a cat")
     img_in, img_out = worst_case_attempt_tokens(images, deployment)
-    assert img_in == len(canonical_json_bytes(images)) and img_in > 0
+    assert img_in == worst_case_input_tokens(images) and img_in > 0
     assert img_out == 0

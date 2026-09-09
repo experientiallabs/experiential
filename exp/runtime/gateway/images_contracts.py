@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, canonical_json_bytes
+from exp.common.core.artifacts import ContractModel
 from exp.runtime.gateway.contracts import GatewayApiSurface
 
 ImageSize = Literal[
@@ -58,6 +58,7 @@ class ImagesRequest(ContractModel):
 def images_ceiling_micro_usd(
     request: ImagesRequest,
     *,
+    input_tokens: int,
     input_rate: int | None,
     output_rate: int | None,
     maximum: int,
@@ -65,14 +66,14 @@ def images_ceiling_micro_usd(
     """Return the conservative reservation ceiling for one token-priced image call.
 
     GPT image models bill prompt tokens at the input rate and generated image
-    tokens at the output rate; the prompt's canonical byte length upper-bounds
-    the input tokens and ``n`` times the largest per-image token count bounds the
+    tokens at the output rate; ``input_tokens`` is the prompt's estimated input
+    reservation and ``n`` times the largest per-image token count bounds the
     output. A lane without both rates is unpriced for images (``None``): the
     per-image priced models (dall-e) wait for the typed billed-units ledger.
     """
     if input_rate is None or output_rate is None:
         return None
-    input_ceiling = len(canonical_json_bytes(request)) * input_rate
+    input_ceiling = input_tokens * input_rate
     output_ceiling = request.n * MAXIMUM_IMAGE_OUTPUT_TOKENS * output_rate
     ceiling = (input_ceiling + output_ceiling + 999_999) // 1_000_000
     return ceiling if ceiling <= maximum else None
