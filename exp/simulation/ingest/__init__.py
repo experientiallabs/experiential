@@ -6,6 +6,7 @@ from exp.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_d
 from exp.simulation.ingest.langfuse import LANGFUSE_SOURCE
 from exp.simulation.ingest.langsmith import LANGSMITH_SOURCE
 from exp.simulation.ingest.mastra import MASTRA_SOURCE
+from exp.simulation.ingest.mlflow import MLFLOW_SOURCE
 from exp.simulation.ingest.otel_genai import (
     load_otel_genai_file,
     normalize_otel_genai_payloads,
@@ -42,6 +43,7 @@ __all__ = [
     "LANGFUSE_SOURCE",
     "LANGSMITH_SOURCE",
     "MASTRA_SOURCE",
+    "MLFLOW_SOURCE",
     "OtlpTraceFormatError",
     "PHOENIX_SOURCE",
     "PersistedTraceDataset",
