@@ -397,6 +397,26 @@ def test_root_combinators_flatten_into_the_object_anthropic_accepts() -> None:
             ]
         }
     }
+    # A root oneOf and a root anyOf on the SAME name are independent
+    # constraints, so each keeps its own anyOf member instead of pooling.
+    independent: JsonObject = {
+        "oneOf": [
+            {"properties": {"n": {"minimum": 0}}},
+            {"properties": {"n": {"maximum": -10}}},
+        ],
+        "anyOf": [
+            {"properties": {"n": {"multipleOf": 2}}},
+            {"properties": {"n": {"multipleOf": 3}}},
+        ],
+    }
+    assert anthropic_input_schema(independent)["properties"] == {
+        "n": {
+            "allOf": [
+                {"anyOf": [{"minimum": 0}, {"maximum": -10}]},
+                {"anyOf": [{"multipleOf": 2}, {"multipleOf": 3}]},
+            ]
+        }
+    }
     # allOf requires everything any variant requires.
     conjunction: JsonObject = {
         "allOf": [

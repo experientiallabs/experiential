@@ -395,8 +395,11 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
         return {**schema, "type": "object"}
     # Per property: definitions that must ALL hold (root properties, allOf
     # variants) and definitions of which ANY may hold (oneOf/anyOf variants).
+    # Alternatives are kept PER combinator: a root oneOf and a root anyOf on the
+    # same name are independent constraints (pick one of these AND at least one
+    # of those), so each becomes its own anyOf member rather than one pool.
     conjunctive: dict[str, list[JsonValue]] = {}
-    disjunctive: dict[str, list[JsonValue]] = {}
+    disjunctive: dict[str, dict[str, list[JsonValue]]] = {}
     order: list[str] = []
 
     def record(bucket: dict[str, list[JsonValue]], name: str, subschema: JsonValue) -> None:
@@ -420,9 +423,11 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
         for variant in variants:
             properties = variant.get("properties")
             if isinstance(properties, dict):
-                bucket = conjunctive if keyword == "allOf" else disjunctive
                 for name, subschema in properties.items():
-                    record(bucket, name, subschema)
+                    if keyword == "allOf":
+                        record(conjunctive, name, subschema)
+                    else:
+                        record(disjunctive.setdefault(keyword, {}), name, subschema)
             required = variant.get("required")
             requirement_sets.append(
                 {name for name in required if isinstance(name, str)}
@@ -445,11 +450,12 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
     properties_out: dict[str, JsonValue] = {}
     for name in order:
         must = list(conjunctive.get(name, []))
-        may = disjunctive.get(name, [])
-        if may:
-            # Alternatives fold into one anyOf; it joins the conjunctive
-            # definitions (which all still apply) under allOf.
-            must.append(may[0] if len(may) == 1 else {"anyOf": may})
+        for keyword in ("oneOf", "anyOf"):
+            may = disjunctive.get(keyword, {}).get(name, [])
+            if may:
+                # This combinator's alternatives fold into one anyOf member
+                # that joins the conjunctive definitions under allOf.
+                must.append(may[0] if len(may) == 1 else {"anyOf": may})
         properties_out[name] = must[0] if len(must) == 1 else {"allOf": must}
     flattened["properties"] = properties_out
     ordered_required = [name for name in order if name in required_names]
