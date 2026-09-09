@@ -346,10 +346,24 @@ def load_knn_bank(
 
 
 def _novelty_floor(embeddings: np.ndarray) -> float:
-    """Return the fifth percentile of each fit row's nearest distinct neighbor."""
+    """Return the fifth percentile of each distinct fit vector's nearest distinct neighbor.
+
+    Args:
+        embeddings: Unit-normalized embedding array of shape (N, D).
+
+    Returns:
+        The empirical cosine threshold for novelty gating.
+    """
     if embeddings.shape[0] < 2:
         return 1.0
-    similarities = embeddings @ embeddings.T
+    distinct_vectors: list[np.ndarray] = []
+    for vector in embeddings:
+        if not any(float(np.dot(vector, distinct)) >= 1.0 - 1e-5 for distinct in distinct_vectors):
+            distinct_vectors.append(vector)
+    if len(distinct_vectors) < 2:
+        return 1.0
+    distinct_matrix = np.asarray(distinct_vectors, dtype=np.float32)
+    similarities = distinct_matrix @ distinct_matrix.T
     np.fill_diagonal(similarities, -np.inf)
     nearest = np.max(similarities, axis=1).astype(np.float64)
     return float(np.quantile(nearest, 0.05))
