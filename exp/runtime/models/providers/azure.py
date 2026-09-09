@@ -7,7 +7,7 @@ from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from exp.common.models import ChatMaxTokensField, ModelSnapshot
-from exp.common.models.catalog import (
+from exp.common.models.connection import (
     AzureApiSurface,
     infer_azure_api_surface,
     strip_model_inference_root,

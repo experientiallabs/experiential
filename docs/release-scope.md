@@ -59,6 +59,7 @@ credentials. `Not run` means exactly that; it is not inferred from fixture cover
 | Provider surface | Deterministic evidence in this release | Credential-gated live evidence |
 |---|---|---|
 | OpenAI | Native Responses fixtures for text, tool arguments, usage, cancellation, and refusal; all eight official SDK quadrants run against the installed local gateway | Not run; requires an OpenAI credential |
+| ChatGPT plan (Codex backend) | Shares the native Responses fixtures; deterministic coverage of the sign-in store, code exchange and refresh grants, per-dispatch bearer minting, and usage-window throttling | Not run in CI; requires a signed-in ChatGPT plan |
 | Anthropic | Native Messages fixtures for text, tool arguments, usage, cancellation, and refusal through both public gateway surfaces | Not run; requires an Anthropic credential |
 | Generic OpenAI-compatible | Real loopback upstream through the installed gateway; text, tool arguments, usage, cancellation, and refusal contracts | Not run; requires a compatible hosted endpoint and credential |
 | Azure OpenAI | Compatible-adapter fixtures for text, tool arguments, usage, cancellation, and refusal | Not run; requires Azure endpoint and credential |

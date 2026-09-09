@@ -1,7 +1,6 @@
 """Canonical model identities and data contracts."""
 
 from exp.common.models.catalog import (
-    ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayEquivalenceCertification,
@@ -17,6 +16,7 @@ from exp.common.models.catalog import (
     write_model_catalog,
 )
 from exp.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
+from exp.common.models.connection import ConnectionConfig
 from exp.common.models.connection_authoring import (
     ProviderConnectionAuthoringError,
     configure_provider_connections,

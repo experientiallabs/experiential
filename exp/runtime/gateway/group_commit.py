@@ -225,6 +225,10 @@ class GroupCommitAttemptLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        plan_primary_used_percent: int | None = None,
+        plan_primary_reset_after_seconds: int | None = None,
+        plan_secondary_used_percent: int | None = None,
+        plan_secondary_reset_after_seconds: int | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -239,6 +243,10 @@ class GroupCommitAttemptLedger:
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            plan_primary_used_percent: Plan short-window usage, when the rung is a plan.
+            plan_primary_reset_after_seconds: Seconds until the short window resets.
+            plan_secondary_used_percent: Plan long-window usage, when the rung is a plan.
+            plan_secondary_reset_after_seconds: Seconds until the long window resets.
         """
         await self._submit(
             lambda connection: self.core.apply_finish_attempt(
@@ -253,6 +261,10 @@ class GroupCommitAttemptLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                plan_primary_used_percent=plan_primary_used_percent,
+                plan_primary_reset_after_seconds=plan_primary_reset_after_seconds,
+                plan_secondary_used_percent=plan_secondary_used_percent,
+                plan_secondary_reset_after_seconds=plan_secondary_reset_after_seconds,
             )
         )
 
@@ -568,6 +580,10 @@ class SyncGroupCommitLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        plan_primary_used_percent: int | None = None,
+        plan_primary_reset_after_seconds: int | None = None,
+        plan_secondary_used_percent: int | None = None,
+        plan_secondary_reset_after_seconds: int | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -582,6 +598,10 @@ class SyncGroupCommitLedger:
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            plan_primary_used_percent: Plan short-window usage, when the rung is a plan.
+            plan_primary_reset_after_seconds: Seconds until the short window resets.
+            plan_secondary_used_percent: Plan long-window usage, when the rung is a plan.
+            plan_secondary_reset_after_seconds: Seconds until the long window resets.
         """
         self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_attempt(
@@ -596,6 +616,10 @@ class SyncGroupCommitLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                plan_primary_used_percent=plan_primary_used_percent,
+                plan_primary_reset_after_seconds=plan_primary_reset_after_seconds,
+                plan_secondary_used_percent=plan_secondary_used_percent,
+                plan_secondary_reset_after_seconds=plan_secondary_reset_after_seconds,
             )
         )
 

@@ -46,7 +46,6 @@ from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
-    record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
@@ -54,6 +53,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_admission import (
     admitted_route_requests,
     fold_parallel_tool_call_disclosures,
+    record_dead_admission_rungs,
     resolve_admission_route,
 )
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin

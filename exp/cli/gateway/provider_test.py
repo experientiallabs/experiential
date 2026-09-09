@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
+import pytest
 from click import unstyle
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.common.auth import ProviderAuthStore
+from exp.common.models import ConnectionConfig
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.models.credentials import connection_credential_binding
 
 _runner = CliRunner()
 
@@ -476,3 +481,212 @@ def test_provider_update_can_clear_bedrock_auth_and_region_to_ambient(tmp_path: 
     assert authority.config.aws_access_key_id_env is None
     assert authority.config.bedrock_auth_mode is None
     assert authority.config.region is None
+
+
+def _codex_auth_file(tmp_path: Path) -> Path:
+    """Write a Codex-shaped ``auth.json`` carrying unsigned fixture tokens.
+
+    Args:
+        tmp_path: Test directory.
+
+    Returns:
+        Path of the fixture file.
+    """
+    claims = {
+        "exp": 4_000_000_000,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-fixture",
+            "chatgpt_plan_type": "team",
+        },
+    }
+    segment = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+    token = f"header.{segment}.signature"
+    path = tmp_path / "codex-auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": token,
+                    "refresh_token": "refresh-fixture",
+                    "id_token": token,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_provider_add_imports_a_codex_sign_in_for_a_chatgpt_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan connection stores the imported sign-in under the connection and lists its kind."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    auth_file = _codex_auth_file(tmp_path)
+
+    result = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--subscription",
+            "chatgpt",
+            "--codex-auth-file",
+            str(auth_file),
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    receipt = json.loads(result.output)
+    assert receipt["data"] == {
+        "subscription": "chatgpt",
+        "sign_in": "codex-auth-file",
+        "plan_type": "team",
+    }
+    connection = GatewayManagement(root).provider_connections()[0]
+    assert connection.config == ConnectionConfig(provider="openai", subscription="chatgpt")
+    stored = ProviderAuthStore().get_oauth(
+        "plan-a", binding=connection_credential_binding(connection.config)
+    )
+    assert stored is not None
+    assert stored.account_id == "acct-fixture"
+    assert "refresh-fixture" not in result.output
+
+    listed = _runner.invoke(
+        app, ["config", "gateway", "provider", "list", "--json", "--root", str(root)]
+    )
+    assert json.loads(listed.output)["items"][0]["subscription"] == "chatgpt"
+
+
+def test_provider_add_for_a_plan_needs_a_browser_or_an_import_file(tmp_path: Path) -> None:
+    """Without a browser, the command names the import alternative instead of hanging."""
+    root = _initialized_root(tmp_path)
+
+    result = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--subscription",
+            "chatgpt",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--codex-auth-file" in _plain_output(result.output)
+    assert GatewayManagement(root).provider_connections() == ()
+
+
+def test_provider_add_rejects_a_plan_with_a_credential_env(tmp_path: Path) -> None:
+    """A plan connection and an API-key locator cannot be combined."""
+    root = _initialized_root(tmp_path)
+
+    result = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--subscription",
+            "chatgpt",
+            "--credential-env",
+            "OPENAI_API_KEY",
+            "--codex-auth-file",
+            str(tmp_path / "missing.json"),
+            "--non-interactive",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "omit api_key_env" in _plain_output(result.output)
+
+
+def test_provider_update_keeps_the_plan_sign_in_and_refuses_a_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Updating a plan connection never re-signs in; adding a key to it is refused."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--subscription",
+            "chatgpt",
+            "--codex-auth-file",
+            str(_codex_auth_file(tmp_path)),
+            "--non-interactive",
+            "--root",
+            str(root),
+        ],
+    )
+    assert added.exit_code == 0, added.output
+
+    unchanged = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+    assert unchanged.exit_code == 0, unchanged.output
+    assert GatewayManagement(root).provider_connections()[0].config.subscription == "chatgpt"
+
+    keyed = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--credential-env",
+            "OPENAI_API_KEY",
+            "--root",
+            str(root),
+        ],
+    )
+    assert keyed.exit_code != 0
+    assert "omit api_key_env" in _plain_output(keyed.output)

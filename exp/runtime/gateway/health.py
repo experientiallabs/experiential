@@ -211,6 +211,28 @@ class DeploymentHealthRegistry:
                 if state.consecutive_failures >= self._failure_threshold:
                     state.open_until = now + self._open_seconds
 
+    def exhausted(self, key: DeploymentHealthKey, reset_after_seconds: float) -> None:
+        """Suppress one deployment until its provider-stated usage window resets.
+
+        A plan rung reports its rolling usage windows on every response, so a
+        window that reaches 100 percent is known BEFORE the next request would
+        429: the rung is throttled for the reset the provider stated (clamped like
+        a ``Retry-After`` window), and the waterfall moves on to the next plan in
+        the pool. A success on the same response leaves the circuit closed.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+            reset_after_seconds: Provider-stated seconds until the window reopens.
+        """
+        now = self._clock()
+        window = min(
+            max(float(reset_after_seconds), RETRY_AFTER_WINDOW_MINIMUM_SECONDS),
+            RETRY_AFTER_WINDOW_MAXIMUM_SECONDS,
+        )
+        with self._lock:
+            state = self._states.setdefault(key, _DeploymentHealth())
+            state.throttle_until = max(state.throttle_until, now + window)
+
     def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
         """Size one throttle window from the provider's own stated wait.
 

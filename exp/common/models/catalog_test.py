@@ -25,10 +25,8 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
-from exp.common.models.catalog import (
-    SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION,
-    infer_azure_api_surface,
-)
+from exp.common.models.catalog import SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
+from exp.common.models.connection import infer_azure_api_surface
 
 
 def _catalog() -> ModelCatalog:

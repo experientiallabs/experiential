@@ -206,3 +206,37 @@ def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:
     # One key outside its window makes the route dispatchable again.
     now[0] += 21.0
     assert registry.throttled_remaining_seconds((first, second)) is None
+
+
+def test_exhausted_plan_window_suppresses_the_rung_for_the_stated_reset() -> None:
+    """A reported 100 percent window throttles the deployment until the provider's reset."""
+    now = [1_000.0]
+    registry = DeploymentHealthRegistry(clock=lambda: now[0])
+    key = ("catalog", "plan-a", "connection")
+
+    registry.exhausted(key, 3_600)
+
+    assert registry.suppressed(key)
+    assert not registry.claim(key)
+    assert not registry.claim_forced(key)
+    now[0] += 3_601
+    assert not registry.suppressed(key)
+    assert registry.claim(key)
+
+
+def test_exhaustion_windows_are_clamped_and_never_shortened() -> None:
+    """A week-long reset is clamped to the ceiling; a shorter later report keeps the longer wait."""
+    now = [0.0]
+    registry = DeploymentHealthRegistry(clock=lambda: now[0])
+    key = ("catalog", "plan-a", "connection")
+
+    registry.exhausted(key, 7 * 24 * 3_600)
+    now[0] = 6 * 3_600 - 1
+    assert registry.suppressed(key)
+    now[0] = 6 * 3_600 + 1
+    assert not registry.suppressed(key)
+
+    registry.exhausted(key, 1_000)
+    registry.exhausted(key, 1)
+    now[0] += 900
+    assert registry.suppressed(key)

@@ -130,3 +130,69 @@ class TestPayloadTolerance:
         """A well-shaped payload map parses exactly like raw headers."""
         observation = rate_limit_observation_from_payload({"retry-after": "45"})
         assert observation.retry_after_seconds == 45
+
+
+class TestPlanWindows:
+    """The ChatGPT plan backend's ``x-codex-*`` usage windows become typed observations."""
+
+    def test_both_windows_parse_primary_first(self) -> None:
+        """Percent, reset, and length ride each window; the observation is not empty."""
+        observation = rate_limit_observation(
+            {
+                "X-Codex-Primary-Used-Percent": "22",
+                "x-codex-primary-reset-after-seconds": "11511",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-secondary-used-percent": "4",
+                "x-codex-secondary-reset-after-seconds": "598311",
+                "x-codex-secondary-window-minutes": "10080",
+            }
+        )
+
+        assert [window.window for window in observation.subscription_windows] == [
+            "primary",
+            "secondary",
+        ]
+        primary = observation.subscription_window("primary")
+        assert primary is not None
+        assert (primary.used_percent, primary.reset_after_seconds, primary.window_minutes) == (
+            22,
+            11_511,
+            300,
+        )
+        assert not observation.is_empty
+        assert observation.exhausted_reset_after_seconds is None
+
+    def test_exhaustion_takes_the_longest_reset_among_spent_windows(self) -> None:
+        """A spent long window outlasts a spent short one, so its reset is the wait."""
+        observation = rate_limit_observation(
+            {
+                "x-codex-primary-used-percent": "100",
+                "x-codex-primary-reset-after-seconds": "600",
+                "x-codex-secondary-used-percent": "100",
+                "x-codex-secondary-reset-after-seconds": "80000",
+            }
+        )
+
+        assert observation.exhausted_reset_after_seconds == 80_000
+
+    def test_a_window_without_a_percent_is_absent_and_garbage_fields_stay_none(self) -> None:
+        """Only a parseable used-percent reports a window; other garbled fields degrade."""
+        observation = rate_limit_observation(
+            {
+                "x-codex-primary-used-percent": "137",
+                "x-codex-primary-reset-after-seconds": "soon",
+                "x-codex-secondary-reset-after-seconds": "600",
+            }
+        )
+
+        primary = observation.subscription_window("primary")
+        assert primary is not None
+        assert primary.used_percent == 100
+        assert primary.exhausted
+        assert primary.reset_after_seconds is None
+        assert observation.subscription_window("secondary") is None
+        assert observation.exhausted_reset_after_seconds is None
+
+    def test_payload_without_plan_headers_has_no_windows(self) -> None:
+        """API-key rungs keep an empty window tuple."""
+        assert rate_limit_observation_from_payload({"retry-after": "5"}).subscription_windows == ()

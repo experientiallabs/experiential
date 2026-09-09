@@ -13,8 +13,11 @@
 use reqwest::header::HeaderMap;
 use serde_json::{Map, Value};
 
-/// The closed set of forwarded rate-limit headers, lowercased.
-const ALLOWLISTED_HEADERS: [&str; 9] = [
+/// The closed set of forwarded rate-limit headers, lowercased. The `x-codex-*`
+/// entries are the ChatGPT plan backend's rolling usage windows (percent used,
+/// seconds to reset, window length); numbers only, never the opaque
+/// `x-codex-turn-state` or any account label.
+const ALLOWLISTED_HEADERS: [&str; 15] = [
     "retry-after",
     "x-ratelimit-limit-requests",
     "x-ratelimit-remaining-requests",
@@ -24,6 +27,12 @@ const ALLOWLISTED_HEADERS: [&str; 9] = [
     "anthropic-ratelimit-requests-remaining",
     "anthropic-ratelimit-tokens-limit",
     "anthropic-ratelimit-tokens-remaining",
+    "x-codex-primary-used-percent",
+    "x-codex-primary-reset-after-seconds",
+    "x-codex-primary-window-minutes",
+    "x-codex-secondary-used-percent",
+    "x-codex-secondary-reset-after-seconds",
+    "x-codex-secondary-window-minutes",
 ];
 
 /// Collect the allowlisted rate-limit headers from one provider response.
@@ -88,6 +97,22 @@ mod tests {
         assert_eq!(harvested["retry-after"], "30");
         assert_eq!(harvested["x-ratelimit-remaining-requests"], "9999");
         assert_eq!(harvested["anthropic-ratelimit-tokens-limit"], "12000000");
+    }
+
+    #[test]
+    fn harvest_keeps_plan_window_numbers_but_never_the_turn_state() {
+        let harvested = harvest_rate_limit_headers(&headers(&[
+            ("x-codex-primary-used-percent", "22"),
+            ("x-codex-primary-reset-after-seconds", "11511"),
+            ("x-codex-secondary-window-minutes", "10080"),
+            ("x-codex-turn-state", "gAAAAABqn4w3"),
+            ("x-codex-plan-type", "team"),
+        ]))
+        .unwrap();
+        assert_eq!(harvested.len(), 3);
+        assert_eq!(harvested["x-codex-primary-used-percent"], "22");
+        assert!(!harvested.contains_key("x-codex-turn-state"));
+        assert!(!harvested.contains_key("x-codex-plan-type"));
     }
 
     #[test]

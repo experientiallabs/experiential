@@ -263,8 +263,15 @@ rate-limit response headers per attempt when the data plane harvests them (`retr
 OpenAI `x-ratelimit-*` and Anthropic `anthropic-ratelimit-*` families, normalized to integers),
 and a throttled settlement carrying a parseable `Retry-After` (seconds or HTTP-date) sizes that
 deployment's throttle window from it, clamped to [5s, 6h], instead of the fixed default, so a
-daily-quota reset actually suppresses the rung for the wait the provider asked for. Pools and
-rungs that author none of this keep byte-identical behavior and null disclosure columns.
+daily-quota reset actually suppresses the rung for the wait the provider asked for. A ChatGPT
+plan rung (`subscription = "chatgpt"`) adds its rolling usage windows: the `x-codex-primary-*`
+and `x-codex-secondary-*` percent-used and reset headers land in the attempt's `plan_*` columns,
+and a window at 100 percent throttles that rung until the stated reset, success or not, so a
+certified pool of several plans rotates before the first 429 while sticky affinity keeps each
+conversation on one plan while it has room. A plan rung's bearer is minted per physical dispatch
+through the body-signing seam (`sign_dispatch`), the same hook Bedrock uses for SigV4, so queue
+time never ages a token and every redial signs afresh. Pools and rungs that author none of this
+keep byte-identical behavior and null disclosure columns.
 
 Under `maximize_cache_affinity`, two further per-rung fields keep provider prompt caches warm
 across spills. `sticky_spill_seconds` gives each dispatch a worker-local

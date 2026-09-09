@@ -2,7 +2,8 @@
 
 The native data plane forwards the small allowlisted subset of provider
 response headers that describe rate limiting (``retry-after`` plus the OpenAI
-``x-ratelimit-*`` and Anthropic ``anthropic-ratelimit-*`` families) on the
+``x-ratelimit-*`` and Anthropic ``anthropic-ratelimit-*`` families, and the
+ChatGPT plan backend's ``x-codex-*`` usage windows) on the
 settlement payload, for successes and failures alike. This module owns the
 one place those raw header strings become typed integers: the observation
 rides the attempt ledger for calibration analytics, and a throttled
@@ -18,8 +19,32 @@ import math
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from typing import Literal
 
 from exp.common.core.artifacts import ContractModel
+
+SubscriptionWindowName = Literal["primary", "secondary"]
+"""A plan's rolling usage windows: the short one (hours) and the long one (a week)."""
+
+EXHAUSTED_USED_PERCENT = 100
+"""The used-percent reading at which a plan window admits no more requests."""
+
+
+class SubscriptionWindowObservation(ContractModel):
+    """One plan usage window as the ChatGPT backend reports it on every response."""
+
+    window: SubscriptionWindowName
+    used_percent: int
+    """Share of the window's allowance already spent, 0 to 100."""
+    reset_after_seconds: int | None = None
+    """Seconds until the window rolls over, when the provider states it."""
+    window_minutes: int | None = None
+    """The window's length, when the provider states it."""
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the window admits no more requests until it resets."""
+        return self.used_percent >= EXHAUSTED_USED_PERCENT
 
 
 class RateLimitObservation(ContractModel):
@@ -35,6 +60,8 @@ class RateLimitObservation(ContractModel):
     """The account's token-rate ceiling as the provider states it."""
     remaining_tokens: int | None = None
     """Tokens left in the provider's current window."""
+    subscription_windows: tuple[SubscriptionWindowObservation, ...] = ()
+    """Plan usage windows, in primary-then-secondary order, when the rung is a plan."""
 
     @property
     def is_empty(self) -> bool:
@@ -45,7 +72,29 @@ class RateLimitObservation(ContractModel):
             and self.remaining_requests is None
             and self.limit_tokens is None
             and self.remaining_tokens is None
+            and not self.subscription_windows
         )
+
+    def subscription_window(
+        self, window: SubscriptionWindowName
+    ) -> SubscriptionWindowObservation | None:
+        """Return one named plan window, or ``None`` when the response carried none."""
+        return next((item for item in self.subscription_windows if item.window == window), None)
+
+    @property
+    def exhausted_reset_after_seconds(self) -> int | None:
+        """The longest stated reset among exhausted plan windows, or ``None`` when none is.
+
+        A plan whose short window is spent stays unusable until that window rolls over,
+        and a spent long window outlasts a spent short one, so the longest reset is the
+        wait that actually reopens the rung.
+        """
+        waits = [
+            item.reset_after_seconds
+            for item in self.subscription_windows
+            if item.exhausted and item.reset_after_seconds is not None
+        ]
+        return max(waits) if waits else None
 
 
 _EMPTY_OBSERVATION = RateLimitObservation()
@@ -143,7 +192,40 @@ def rate_limit_observation(headers: Mapping[str, str]) -> RateLimitObservation:
         remaining_requests=values.get("remaining_requests"),
         limit_tokens=values.get("limit_tokens"),
         remaining_tokens=values.get("remaining_tokens"),
+        subscription_windows=_subscription_windows(lowered),
     )
+
+
+def _subscription_windows(lowered: Mapping[str, str]) -> tuple[SubscriptionWindowObservation, ...]:
+    """Read the ChatGPT plan backend's ``x-codex-*`` usage windows.
+
+    A window is reported only when its used-percent header parses; the reset and
+    length stay ``None`` when theirs do not, so one garbled header never hides the
+    window's exhaustion.
+
+    Args:
+        lowered: Lowercased header names mapped to raw values.
+
+    Returns:
+        The windows present, primary first.
+    """
+    windows: list[SubscriptionWindowObservation] = []
+    for name in ("primary", "secondary"):
+        used_raw = lowered.get(f"x-codex-{name}-used-percent")
+        used = None if used_raw is None else _parse_count(used_raw)
+        if used is None:
+            continue
+        reset_raw = lowered.get(f"x-codex-{name}-reset-after-seconds")
+        length_raw = lowered.get(f"x-codex-{name}-window-minutes")
+        windows.append(
+            SubscriptionWindowObservation(
+                window=name,
+                used_percent=min(used, EXHAUSTED_USED_PERCENT),
+                reset_after_seconds=None if reset_raw is None else _parse_count(reset_raw),
+                window_minutes=None if length_raw is None else _parse_count(length_raw),
+            )
+        )
+    return tuple(windows)
 
 
 def rate_limit_observation_from_payload(payload: object) -> RateLimitObservation:

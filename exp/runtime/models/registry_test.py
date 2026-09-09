@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import json
+from pathlib import Path
 from typing import Literal
 
 import pytest
 
+from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, StoredOAuthTokens
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
     AssistantAction,
@@ -24,6 +28,7 @@ from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
 from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.azure import AzureClient
+from exp.runtime.models.providers.chatgpt_subscription import ChatGptSubscriptionClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSample,
@@ -524,3 +529,60 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
 
     with pytest.raises(ModelConnectionError, match="uv sync --extra sft"):
         catalog.resolve("fixture-model")
+
+
+def test_subscription_connection_resolves_to_a_plan_client_that_signs_each_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A chatgpt plan connection needs no environment key; its client mints bearers itself."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    plan = ConnectionConfig(provider="openai", subscription="chatgpt")
+    access = _plan_jwt(exp_seconds=4_000_000_000, account="acct-plan")
+    store.put_oauth(
+        "plan",
+        StoredOAuthTokens(
+            access_token=access,
+            refresh_token="refresh",
+            expires_at_ms=4_000_000_000_000,
+            account_id="acct-plan",
+        ),
+        binding=StoredCredentialBinding(provider="openai", endpoint_sha256=plan.identity_sha256()),
+    )
+    catalog = ModelCatalog(
+        connections={"plan": plan},
+        models={
+            "codex": ModelRecord(
+                connection="plan",
+                model="gpt-5.6-sol",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=_DEFAULT_CAPABILITIES,
+            )
+        },
+        roles=ModelRoles(candidates=("codex",), incumbent="codex"),
+    )
+
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={},
+        transport_factory=lambda: ScriptedJsonTransport([]),
+        auth_store=store,
+        chatgpt_token_endpoint=lambda payload: {},
+    ).resolve("codex")
+
+    assert isinstance(resolved.client, ChatGptSubscriptionClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.url == "https://chatgpt.com/backend-api/codex/responses"
+    assert profile.headers["chatgpt-account-id"] == "acct-plan"
+    assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
+        "Authorization": f"Bearer {access}"
+    }
+    assert resolved.embedding_client is None
+
+
+def _plan_jwt(*, exp_seconds: int, account: str) -> str:
+    """Return an unsigned JWT carrying a ChatGPT account claim and ``exp``."""
+    payload = json.dumps(
+        {"exp": exp_seconds, "https://api.openai.com/auth": {"chatgpt_account_id": account}}
+    ).encode()
+    segment = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    return f"header.{segment}.signature"
