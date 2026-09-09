@@ -972,6 +972,90 @@ def test_responses_decoder_captures_end_user_attribution() -> None:
     assert request.attribution_label == "sid-9"
 
 
+def test_chat_decoder_folds_the_ai_sdk_prompt_cache_key_alias() -> None:
+    """A camelCase-only ``promptCacheKey`` (Vercel AI SDK) decodes as ``prompt_cache_key``."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "promptCacheKey": "opencode-session-1",
+        }
+    )
+    request = decoded.request
+    assert request.prompt_cache_key == "opencode-session-1"
+    assert request.attribution_label is None
+    assert request.ignored_parameters == ()
+
+
+def test_chat_decoder_prefers_snake_case_over_the_alias_and_discloses_the_drop() -> None:
+    """Both spellings present: the documented wire field wins and the alias is disclosed."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "snake",
+            "promptCacheKey": "camel",
+        }
+    )
+    request = decoded.request
+    assert request.prompt_cache_key == "snake"
+    assert request.ignored_parameters == ("promptCacheKey->ignored(explicit_prompt_cache_key)",)
+
+
+def test_chat_decoder_validates_the_alias_value_as_prompt_cache_key() -> None:
+    """The alias is renamed, not trusted: its value meets the canonical field's contract."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "promptCacheKey": ["not", "a", "string"],
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.param == "prompt_cache_key"
+
+
+@pytest.mark.parametrize("field", ["safetyIdentifier", "maxTokens", "serviceTier"])
+def test_chat_decoder_still_rejects_other_camel_case_fields(field: str) -> None:
+    """Only ``promptCacheKey`` is aliased; every other camelCase field stays a named 400."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                field: "value",
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.code == "unsupported_parameter"
+    assert captured.value.detail.param == field
+
+
+def test_responses_decoder_folds_the_ai_sdk_prompt_cache_key_alias() -> None:
+    """The Responses surface folds ``promptCacheKey`` the same way as Chat."""
+    decoded = decode_responses(
+        {"model": "coding", "input": "hi", "promptCacheKey": "opencode-session-2"}
+    )
+    assert decoded.request.prompt_cache_key == "opencode-session-2"
+    assert decoded.request.ignored_parameters == ()
+    both = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "prompt_cache_key": "snake",
+            "promptCacheKey": "camel",
+        }
+    )
+    assert both.request.prompt_cache_key == "snake"
+    assert both.request.ignored_parameters == (
+        "promptCacheKey->ignored(explicit_prompt_cache_key)",
+    )
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "coding", "input": "hi", "safetyIdentifier": "x"})
+    assert captured.value.detail.param == "safetyIdentifier"
+
+
 def test_responses_decoder_accepts_the_codex_request_shape() -> None:
     """store:false, include, ultra effort, and replayed reasoning all decode."""
     decoded = decode_responses(

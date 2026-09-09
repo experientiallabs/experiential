@@ -47,6 +47,7 @@ from exp.runtime.openai_protocol.manifest import (
     disposition_map,
 )
 from exp.runtime.openai_protocol.media_parts import message_content
+from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
@@ -158,7 +159,9 @@ def decode_chat(
     OpenCode may attach an Anthropic-style ``cache_control`` annotation on
     Chat messages and on text content parts. Supported ephemeral forms are
     validated and removed before official OpenAI validation and before
-    canonical conversion. Other unknown nested fields stay rejected.
+    canonical conversion. Other unknown nested fields stay rejected. The
+    Vercel AI SDK's camelCase ``promptCacheKey`` is folded onto
+    ``prompt_cache_key`` first, so it decodes as the documented wire field.
 
     Args:
         payload: Parsed JSON request body.
@@ -171,6 +174,7 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
+    payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
     payload = drop_opencode_cache_control(payload)
     _validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
@@ -206,7 +210,11 @@ def decode_chat(
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
-            ignored_parameters=(*json_object_disclosure, *thinking.disclosures),
+            ignored_parameters=(
+                *alias_disclosures,
+                *json_object_disclosure,
+                *thinking.disclosures,
+            ),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -293,6 +301,7 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
+    payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
     _validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
@@ -376,6 +385,7 @@ def decode_responses(
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
+            ignored_parameters=alias_disclosures,
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None

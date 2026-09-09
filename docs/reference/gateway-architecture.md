@@ -339,6 +339,11 @@ discarded before provider dispatch and canonical replay identity; the `url` and
 `detail` remain authoritative. A data URL keeps its embedded MIME type, and a
 remote URL is forwarded for the provider to fetch. Unknown image fields and
 malformed URLs or base64 remain rejected.
+Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
+opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
+before manifest validation and decodes exactly as the documented field. When both spellings
+arrive, `prompt_cache_key` wins and the dropped alias is disclosed through `ignored_parameters`.
+It is the only camelCase spelling admitted; every other unknown top-level field stays a named 400.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.
