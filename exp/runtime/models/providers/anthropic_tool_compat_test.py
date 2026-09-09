@@ -7,6 +7,8 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_input_schema,
+    anthropic_input_schema_reshaping,
     anthropic_rejects_forced_tool_choice,
     anthropic_strict_schema_unsupported,
 )
@@ -316,3 +318,131 @@ def test_supported_features_pass_untouched() -> None:
         },
     )
     assert anthropic_strict_schema_unsupported(acyclic) is None
+
+
+def test_root_combinators_flatten_into_the_object_anthropic_accepts() -> None:
+    """A tool declared as a union of parameter shapes (valid for OpenAI) becomes
+    one object on the Anthropic wire: properties are the union, first
+    declaration wins on a clash, required keeps what EVERY variant requires,
+    the combinator key is gone, and the reshaping is named for disclosure
+    (live 2026-09-08: Anthropic 400s "does not support oneOf, allOf, or anyOf at
+    the top level" and accepts the merged object)."""
+    union: JsonObject = {
+        "description": "Read or write.",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "mode": {"const": "read"}},
+                "required": ["path", "mode"],
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "clash: first wins"},
+                    "content": {"type": "string"},
+                    "mode": {"const": "write"},
+                },
+                "required": ["path", "content", "mode"],
+            },
+        ],
+    }
+    assert anthropic_input_schema_reshaping(union) == "top_level_combinator_flattened"
+    assert anthropic_input_schema(union) == {
+        "description": "Read or write.",
+        "type": "object",
+        "properties": {
+            # Distinct definitions of one name survive as a nested anyOf, so the
+            # write discriminator is not lost to the read variant.
+            "path": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "string", "description": "clash: first wins"},
+                ]
+            },
+            "mode": {"anyOf": [{"const": "read"}, {"const": "write"}]},
+            "content": {"type": "string"},
+        },
+        "required": ["path", "mode"],
+    }
+    # Mixed root combinators are judged per combinator: allOf requires every
+    # name any of ITS variants requires, oneOf only what all of ITS variants do.
+    mixed: JsonObject = {
+        "allOf": [{"properties": {"a": {"type": "string"}}, "required": ["a"]}],
+        "oneOf": [
+            {"properties": {"b": {"type": "integer"}}, "required": ["b"]},
+            {"properties": {"c": {"type": "integer"}}, "required": ["c"]},
+        ],
+    }
+    assert anthropic_input_schema(mixed) == {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "integer"}, "c": {"type": "integer"}},
+        "required": ["a"],
+    }
+    # A root property and an allOf variant constrain the same name TOGETHER
+    # (allOf), while oneOf alternatives for it join as one anyOf member.
+    layered: JsonObject = {
+        "properties": {"path": {"type": "string"}},
+        "allOf": [{"properties": {"path": {"minLength": 1}}}],
+        "oneOf": [
+            {"properties": {"path": {"pattern": "^/"}}},
+            {"properties": {"path": {"pattern": "^~"}}},
+        ],
+    }
+    assert anthropic_input_schema(layered)["properties"] == {
+        "path": {
+            "allOf": [
+                {"type": "string"},
+                {"minLength": 1},
+                {"anyOf": [{"pattern": "^/"}, {"pattern": "^~"}]},
+            ]
+        }
+    }
+    # A root oneOf and a root anyOf on the SAME name are independent
+    # constraints, so each keeps its own anyOf member instead of pooling.
+    independent: JsonObject = {
+        "oneOf": [
+            {"properties": {"n": {"minimum": 0}}},
+            {"properties": {"n": {"maximum": -10}}},
+        ],
+        "anyOf": [
+            {"properties": {"n": {"multipleOf": 2}}},
+            {"properties": {"n": {"multipleOf": 3}}},
+        ],
+    }
+    assert anthropic_input_schema(independent)["properties"] == {
+        "n": {
+            "allOf": [
+                {"anyOf": [{"minimum": 0}, {"maximum": -10}]},
+                {"anyOf": [{"multipleOf": 2}, {"multipleOf": 3}]},
+            ]
+        }
+    }
+    # allOf requires everything any variant requires.
+    conjunction: JsonObject = {
+        "allOf": [
+            {"properties": {"a": {"type": "string"}}, "required": ["a"]},
+            {"properties": {"b": {"type": "integer"}}, "required": ["b"]},
+        ]
+    }
+    assert anthropic_input_schema(conjunction) == {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+    }
+
+
+def test_a_root_without_type_gains_object_and_everything_else_is_verbatim() -> None:
+    typeless: JsonObject = {"properties": {"q": {"type": "string"}}}
+    assert anthropic_input_schema_reshaping(typeless) == "type_object_added"
+    assert anthropic_input_schema(typeless) == {
+        "properties": {"q": {"type": "string"}},
+        "type": "object",
+    }
+    assert anthropic_input_schema({}) == {"type": "object"}
+    # A well-formed schema, nested combinators included, is the same object.
+    nested: JsonObject = {
+        "type": "object",
+        "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
+    }
+    assert anthropic_input_schema_reshaping(nested) is None
+    assert anthropic_input_schema(nested) is nested

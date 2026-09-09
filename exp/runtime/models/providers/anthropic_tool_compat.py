@@ -337,3 +337,130 @@ def _references(node: Mapping[str, JsonValue]) -> Iterator[str]:
             for member in value:
                 if isinstance(member, dict):
                     yield from _references(member)
+
+
+_TOP_LEVEL_COMBINATORS = ("oneOf", "anyOf", "allOf")
+"""Combinators Anthropic refuses at the ROOT of ``input_schema`` (live 2026-09-08:
+"input_schema does not support oneOf, allOf, or anyOf at the top level"); the
+same keywords nest freely under ``properties``."""
+
+
+def anthropic_input_schema_reshaping(schema: Mapping[str, JsonValue]) -> str | None:
+    """Name the reshaping [`anthropic_input_schema`] would apply, or ``None``.
+
+    Returns:
+        ``"top_level_combinator_flattened"`` when the root carries oneOf /
+        anyOf / allOf, ``"type_object_added"`` when the root lacks ``type``,
+        else ``None`` (the schema is emitted verbatim).
+    """
+    if any(isinstance(schema.get(keyword), list) for keyword in _TOP_LEVEL_COMBINATORS):
+        return "top_level_combinator_flattened"
+    if "type" not in schema:
+        return "type_object_added"
+    return None
+
+
+def anthropic_input_schema(schema: JsonObject) -> JsonObject:
+    """Return one tool schema in the shape Anthropic's ``input_schema`` accepts.
+
+    Anthropic requires the root to be ``type: object`` and refuses oneOf /
+    anyOf / allOf there, while OpenAI's ``parameters`` takes both (a coding
+    agent that declares a tool as a union of parameter shapes works on every
+    OpenAI wire and 400s on every Anthropic rung: 7 days to 2026-09-08 saw
+    that rejection across a dozen orgs, after dispatch). The reshaping is the
+    provider-accepted equivalent, verified live:
+
+    * a root combinator is flattened into one object. ``properties`` is the
+      union of the variants' properties; a name two variants define
+      DIFFERENTLY (a ``mode`` discriminator with ``const: read`` in one and
+      ``const: write`` in the other) keeps every distinct definition: the
+      oneOf/anyOf variants' definitions become a nested ``anyOf`` (any may
+      hold), the root's and allOf variants' definitions stay conjunctive
+      (``allOf``), and both nest under ``properties``, where Anthropic
+      accepts them, so no alternative or constraint is lost. ``required``
+      keeps the names every oneOf/anyOf variant requires plus every name any
+      allOf variant requires, each combinator judged on its own variants. The
+      combinator keys are dropped.
+      What is lost is the variants' mutual exclusion, disclosed at admission
+      (``tools[i].parameters->reshaped(top_level_combinator_flattened)``);
+    * a root without ``type`` gains ``"type": "object"``.
+
+    A schema that needs neither is returned as the same object, so the
+    verbatim path stays byte-identical.
+    """
+    reshaping = anthropic_input_schema_reshaping(schema)
+    if reshaping is None:
+        return schema
+    if reshaping == "type_object_added":
+        return {**schema, "type": "object"}
+    # Per property: definitions that must ALL hold (root properties, allOf
+    # variants) and definitions of which ANY may hold (oneOf/anyOf variants).
+    # Alternatives are kept PER combinator: a root oneOf and a root anyOf on the
+    # same name are independent constraints (pick one of these AND at least one
+    # of those), so each becomes its own anyOf member rather than one pool.
+    conjunctive: dict[str, list[JsonValue]] = {}
+    disjunctive: dict[str, dict[str, list[JsonValue]]] = {}
+    order: list[str] = []
+
+    def record(bucket: dict[str, list[JsonValue]], name: str, subschema: JsonValue) -> None:
+        if name not in order:
+            order.append(name)
+        definitions = bucket.setdefault(name, [])
+        if subschema not in definitions:
+            definitions.append(subschema)
+
+    root_properties = schema.get("properties")
+    if isinstance(root_properties, dict):
+        for name, subschema in root_properties.items():
+            record(conjunctive, name, subschema)
+    required_names: set[str] = set()
+    for keyword in _TOP_LEVEL_COMBINATORS:
+        listed = schema.get(keyword)
+        if not isinstance(listed, list):
+            continue
+        variants = [variant for variant in listed if isinstance(variant, dict)]
+        requirement_sets: list[set[str]] = []
+        for variant in variants:
+            properties = variant.get("properties")
+            if isinstance(properties, dict):
+                for name, subschema in properties.items():
+                    if keyword == "allOf":
+                        record(conjunctive, name, subschema)
+                    else:
+                        record(disjunctive.setdefault(keyword, {}), name, subschema)
+            required = variant.get("required")
+            requirement_sets.append(
+                {name for name in required if isinstance(name, str)}
+                if isinstance(required, list)
+                else set()
+            )
+        if not requirement_sets:
+            continue
+        if keyword == "allOf":
+            required_names |= set().union(*requirement_sets)
+        else:
+            required_names |= set.intersection(*requirement_sets)
+    root_required = schema.get("required")
+    if isinstance(root_required, list):
+        required_names |= {name for name in root_required if isinstance(name, str)}
+    flattened: dict[str, JsonValue] = {
+        key: value for key, value in schema.items() if key not in _TOP_LEVEL_COMBINATORS
+    }
+    flattened["type"] = "object"
+    properties_out: dict[str, JsonValue] = {}
+    for name in order:
+        must = list(conjunctive.get(name, []))
+        for keyword in ("oneOf", "anyOf"):
+            may = disjunctive.get(keyword, {}).get(name, [])
+            if may:
+                # This combinator's alternatives fold into one anyOf member
+                # that joins the conjunctive definitions under allOf.
+                must.append(may[0] if len(may) == 1 else {"anyOf": may})
+        properties_out[name] = must[0] if len(must) == 1 else {"allOf": must}
+    flattened["properties"] = properties_out
+    ordered_required = [name for name in order if name in required_names]
+    if ordered_required:
+        flattened["required"] = ordered_required
+    else:
+        flattened.pop("required", None)
+    return flattened

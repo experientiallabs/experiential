@@ -15,6 +15,7 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.models.providers.anthropic_tool_compat import anthropic_input_schema
 from exp.runtime.models.providers.audios import reject_audio_part
 from exp.runtime.models.providers.documents import bedrock_document_block
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -337,7 +338,9 @@ def _tool_config(
         tool_spec: JsonObject = {
             "name": tool.name,
             "description": tool.description,
-            "inputSchema": {"json": tool.input_schema},
+            # Converse relays Anthropic's input_schema rules (root object,
+            # no root combinator), so the same reshaping applies here.
+            "inputSchema": {"json": anthropic_input_schema(tool.input_schema)},
         }
         if tool.name in strict_tool_names:
             tool_spec["strict"] = True

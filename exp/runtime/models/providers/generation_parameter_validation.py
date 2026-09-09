@@ -6,7 +6,10 @@ import re
 from collections.abc import Callable, Sequence
 
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.models.providers.anthropic_tool_compat import anthropic_rejects_assistant_prefill
+from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_input_schema_reshaping,
+    anthropic_rejects_assistant_prefill,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.reasoning_compat import supported_reasoning_efforts
@@ -182,6 +185,30 @@ def require_tool_names_supported(
                 param=f"tools[{index}].name",
                 code="invalid_parameter",
             )
+
+
+_ANTHROPIC_SCHEMA_DIALECTS = frozenset({"anthropic_messages", "bedrock_converse_stream"})
+
+
+def disclose_anthropic_tool_schemas(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest, ignored: list[str]
+) -> None:
+    """Record every tool schema an Anthropic-family rung will reshape at dispatch.
+
+    ``anthropic_input_schema`` flattens a root oneOf/anyOf/allOf into one
+    object and adds a missing root ``type``; the caller reads the change in
+    ``ignored_parameters`` as ``tools[i].parameters->reshaped(<kind>)``.
+    """
+    if not request.tools or not any(
+        profile.dialect in _ANTHROPIC_SCHEMA_DIALECTS for profile in profiles
+    ):
+        return
+    for index, tool in enumerate(request.tools):
+        kind = anthropic_input_schema_reshaping(tool.parameters)
+        if kind is not None:
+            note = f"tools[{index}].parameters->reshaped({kind})"
+            if note not in ignored:
+                ignored.append(note)
 
 
 def mid_conversation_system_present(request: GatewayRequest) -> bool:

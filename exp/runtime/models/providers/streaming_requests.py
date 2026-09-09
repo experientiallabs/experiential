@@ -38,6 +38,7 @@ from exp.runtime.models.providers.fireworks import (
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
+    disclose_anthropic_tool_schemas,
     mid_conversation_system_present,
     require_assistant_prefill_supported,
     require_tool_names_supported,
@@ -265,9 +266,8 @@ def route_generation_parameter_requests(
             sampling_supported(profile, top_p=top_p) for profile in profiles
         )
 
-    # Sampling a rung cannot carry is DROPPED with disclosure, not refused; the
-    # 400 stays only for a value outside a supporting route's declared range
-    # (2026-09-06: 1,483 rejections / 289 orgs on one alias OpenAI itself refuses).
+    # Sampling a rung cannot carry is DROPPED with disclosure; the 400 stays only
+    # for an out-of-range value on a supporting route (2026-09-06: 1,483/289 orgs).
     if request.temperature is not None:
         if srn_only_block():
             ignore("temperature", "temperature->dropped(set_reasoning_effort_none)")
@@ -866,6 +866,7 @@ def route_generation_parameter_requests(
 
     require_assistant_prefill_supported(profiles, request)
     require_tool_names_supported(profiles, request)
+    disclose_anthropic_tool_schemas(profiles, request, ignored)
     # A mid-conversation system turn narrows out instruction-hoisting wires.
     if mid_conversation_system_present(request) and any(
         profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
@@ -953,8 +954,7 @@ def route_generation_parameter_requests(
     elif request.parallel_tool_calls is not None and all(
         profile.dialect in _NO_PARALLEL_TOOL_CONTROL_DIALECTS for profile in profiles
     ):
-        # No rung carries a parallel-tool control: `true` drops (provider default),
-        # `false` is serialized by the data plane; mixed routes shape per rung.
+        # No rung has a parallel-tool control: true drops, false is serialized per rung.
         if request.parallel_tool_calls:
             ignore("parallel_tool_calls", "parallel_tool_calls->dropped(provider_default)")
         else:
