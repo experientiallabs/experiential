@@ -13,6 +13,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_input_schema,
     anthropic_rejects_forced_tool_choice,
     anthropic_strict_schema_unsupported,
 )
@@ -176,9 +177,13 @@ def anthropic_messages_stream_payload(
     if request.tools:
         tools: list[JsonObject] = []
         for tool in request.tools:
+            # Root combinators and a missing root type are reshaped into the
+            # object Anthropic accepts (disclosed at admission); everything
+            # else is the caller's schema verbatim.
+            input_schema = anthropic_input_schema(tool.parameters)
             translated: JsonObject = {
                 "name": tool.name,
-                "input_schema": tool.parameters,
+                "input_schema": input_schema,
             }
             # Anthropic rejects an explicit null description ("Input should
             # be a valid string"), so an absent description stays absent.
@@ -190,7 +195,7 @@ def anthropic_messages_stream_payload(
                 # 2026-09-05: ``maxItems`` on every current model). Declining
                 # here keeps the schema intact and lets admission drop only
                 # ``strict`` when no rung can honor it.
-                if anthropic_strict_schema_unsupported(tool.parameters) is not None:
+                if anthropic_strict_schema_unsupported(input_schema) is not None:
                     raise ProviderCapabilityError(capability="strict_tools")
                 translated["strict"] = True
             # Anthropic-native tool annotations forward verbatim on this

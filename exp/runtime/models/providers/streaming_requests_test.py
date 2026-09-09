@@ -2396,6 +2396,49 @@ def test_reasoning_context_passes_through_verbatim_and_narrows_per_rung() -> Non
     assert raised.value.code == "unsupported_parameter"
 
 
+def test_union_tool_schemas_are_reshaped_on_anthropic_rungs_and_disclosed() -> None:
+    """A root oneOf tool schema is flattened on the Anthropic wire (Anthropic
+    refuses root combinators; a dozen orgs hit that 400 after dispatch in the
+    week to 2026-09-08), left verbatim on the OpenAI wires, and the reshaping
+    is disclosed only when the route has an Anthropic-family rung."""
+    union: JsonObject = {
+        "oneOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            {"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]},
+        ]
+    }
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(
+            GatewayToolDefinition(name="rw", parameters=union),
+            GatewayToolDefinition(name="plain", parameters={"type": "object"}),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    tools = cast(list[JsonObject], payload["tools"])
+    assert tools[0]["input_schema"] == {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+    }
+    assert tools[1]["input_schema"] == {"type": "object"}
+    responses = openai_responses_stream_payload("gpt-6-astra", request, supports_temperature=False)
+    responses_tools = cast(list[JsonObject], responses["tools"])
+    assert responses_tools[0]["parameters"] == union
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    public, _provider = route_generation_parameter_requests((anthropic,), request)
+    assert "tools[0].parameters->reshaped(top_level_combinator_flattened)" in (
+        public.ignored_parameters
+    )
+    assert not any("tools[1]" in note for note in public.ignored_parameters)
+    compatible = GatewayWireProfile(dialect="openai_compatible", url="https://fw.test")
+    public, _provider = route_generation_parameter_requests((compatible,), request)
+    assert not any("reshaped" in note for note in public.ignored_parameters)
+
+
 def test_anthropic_tools_omit_an_absent_description() -> None:
     """Anthropic 400s an explicit null description, so the key stays absent.
 

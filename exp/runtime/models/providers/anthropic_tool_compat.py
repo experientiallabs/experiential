@@ -337,3 +337,93 @@ def _references(node: Mapping[str, JsonValue]) -> Iterator[str]:
             for member in value:
                 if isinstance(member, dict):
                     yield from _references(member)
+
+
+_TOP_LEVEL_COMBINATORS = ("oneOf", "anyOf", "allOf")
+"""Combinators Anthropic refuses at the ROOT of ``input_schema`` (live 2026-09-08:
+"input_schema does not support oneOf, allOf, or anyOf at the top level"); the
+same keywords nest freely under ``properties``."""
+
+
+def anthropic_input_schema_reshaping(schema: Mapping[str, JsonValue]) -> str | None:
+    """Name the reshaping [`anthropic_input_schema`] would apply, or ``None``.
+
+    Returns:
+        ``"top_level_combinator_flattened"`` when the root carries oneOf /
+        anyOf / allOf, ``"type_object_added"`` when the root lacks ``type``,
+        else ``None`` (the schema is emitted verbatim).
+    """
+    if any(isinstance(schema.get(keyword), list) for keyword in _TOP_LEVEL_COMBINATORS):
+        return "top_level_combinator_flattened"
+    if "type" not in schema:
+        return "type_object_added"
+    return None
+
+
+def anthropic_input_schema(schema: JsonObject) -> JsonObject:
+    """Return one tool schema in the shape Anthropic's ``input_schema`` accepts.
+
+    Anthropic requires the root to be ``type: object`` and refuses oneOf /
+    anyOf / allOf there, while OpenAI's ``parameters`` takes both (a coding
+    agent that declares a tool as a union of parameter shapes works on every
+    OpenAI wire and 400s on every Anthropic rung: 7 days to 2026-09-08 saw
+    that rejection across a dozen orgs, after dispatch). The reshaping is the
+    provider-accepted equivalent, verified live:
+
+    * a root combinator is flattened into one object: ``properties`` is the
+      union of the variants' properties (first declaration wins on a name
+      clash), ``required`` keeps the names EVERY variant requires (allOf:
+      every name ANY variant requires), and the combinator key is dropped.
+      The mutual exclusion is lost, which is disclosed at admission
+      (``tools[i].parameters->reshaped(top_level_combinator_flattened)``);
+      the model still sees every property and its description;
+    * a root without ``type`` gains ``"type": "object"``.
+
+    A schema that needs neither is returned as the same object, so the
+    verbatim path stays byte-identical.
+    """
+    reshaping = anthropic_input_schema_reshaping(schema)
+    if reshaping is None:
+        return schema
+    if reshaping == "type_object_added":
+        return {**schema, "type": "object"}
+    combinators = [k for k in _TOP_LEVEL_COMBINATORS if isinstance(schema.get(k), list)]
+    variants: list[Mapping[str, JsonValue]] = []
+    for keyword in combinators:
+        listed = schema.get(keyword)
+        if isinstance(listed, list):
+            variants.extend(variant for variant in listed if isinstance(variant, dict))
+    merged_properties: dict[str, JsonValue] = {}
+    root_properties = schema.get("properties")
+    if isinstance(root_properties, dict):
+        merged_properties.update(root_properties)
+    required_sets: list[set[str]] = []
+    for variant in variants:
+        properties = variant.get("properties")
+        if isinstance(properties, dict):
+            for name, subschema in properties.items():
+                merged_properties.setdefault(name, subschema)
+        required = variant.get("required")
+        required_sets.append(
+            {name for name in required if isinstance(name, str)}
+            if isinstance(required, list)
+            else set()
+        )
+    if "allOf" in combinators:
+        required_names = set().union(*required_sets) if required_sets else set()
+    else:
+        required_names = set.intersection(*required_sets) if required_sets else set()
+    root_required = schema.get("required")
+    if isinstance(root_required, list):
+        required_names |= {name for name in root_required if isinstance(name, str)}
+    flattened: dict[str, JsonValue] = {
+        key: value for key, value in schema.items() if key not in _TOP_LEVEL_COMBINATORS
+    }
+    flattened["type"] = "object"
+    flattened["properties"] = merged_properties
+    ordered_required = [name for name in merged_properties if name in required_names]
+    if ordered_required:
+        flattened["required"] = ordered_required
+    else:
+        flattened.pop("required", None)
+    return flattened
