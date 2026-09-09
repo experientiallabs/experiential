@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 
-from exp.common.core.artifacts import ContractModel, canonical_json_bytes
+from exp.common.core.artifacts import ContractModel
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 
@@ -74,19 +74,19 @@ exhaustively.
 
 
 def embeddings_input_ceiling_micro_usd(
-    request: EmbeddingsRequest,
     *,
+    input_tokens: int,
     input_rate: int | None,
     maximum: int,
 ) -> int | None:
     """Return the conservative input-only reservation ceiling for one embeddings call.
 
-    The canonical UTF-8 byte length upper-bounds the input tokens (there is no
+    ``input_tokens`` is the request's estimated input reservation (there is no
     output leg and no excluded provider carrier), so only the input rate
     applies. A missing rate unprices the route (``None``), and a ceiling above
     ``maximum`` is likewise unpriceable, matching the completion path.
     """
     if input_rate is None:
         return None
-    ceiling = (len(canonical_json_bytes(request)) * input_rate + 999_999) // 1_000_000
+    ceiling = (input_tokens * input_rate + 999_999) // 1_000_000
     return ceiling if ceiling <= maximum else None

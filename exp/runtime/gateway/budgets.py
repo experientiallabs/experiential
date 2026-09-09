@@ -19,7 +19,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     read_pinned_normalized_snapshot,
 )
-from exp.runtime.gateway.attempt_tokens import worst_case_attempt_tokens
+from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.embeddings_contracts import (
@@ -34,11 +34,20 @@ from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 MAXIMUM_MICRO_USD = 9_223_372_036_854_775_807
 
-# Reservation-only output bound used when neither the caller nor the frozen
-# deployment declares an output ceiling. This is a pricing estimate for the
-# per-attempt reservation, not a wire capability: it never rejects or clamps a
-# caller's requested output. Settlement always charges actual tokens, so a
-# longer real response simply over-spends its reservation.
+LONG_CONTEXT_TIER_MARGIN_PERCENT = 20
+"""How far below a long-context threshold the input estimate may sit and still
+reserve at the premium schedule.
+
+The input reservation is a realistic estimate with headroom, not an upper
+bound, so an estimate just under the threshold can settle just over it and
+be repriced for the WHOLE request (the tier doubles Gemini's rates above
+200k). The reservation therefore treats the tier as reachable inside this
+band below the threshold: a request estimated at 160k+ tokens against a 200k
+tier reserves at premium rates and settles at whatever schedule the provider
+actually applied. The cost of the rule is a one-attempt over-reservation of
+roughly the tier multiple inside the band; without it a hard monthly budget
+could be overdrawn by the same multiple on a threshold-straddling request.
+"""
 
 
 class BudgetScopeKind(StrEnum):
@@ -539,24 +548,35 @@ def budget_period_start(period: str) -> str:
 def maximum_attempt_cost_micro_usd(
     request: ServingRequest,
     deployment: ExactModelDeployment,
+    *,
+    input_tokens: int | None = None,
 ) -> int | None:
-    """Return a conservative micro-USD ceiling for one physical call (per surface)."""
+    """Return a conservative micro-USD ceiling for one physical call (per surface).
+
+    ``input_tokens`` is the request's :func:`worst_case_input_tokens` when the
+    caller already computed it (a ladder walk prices every candidate from one
+    tokenizer pass); it is computed here otherwise. Both the platform's token
+    reservation and this money ceiling price the same estimate.
+    """
+    if input_tokens is None:
+        input_tokens = worst_case_input_tokens(request)
     match request:
         case EmbeddingsRequest():
             return embeddings_input_ceiling_micro_usd(
-                request,
+                input_tokens=input_tokens,
                 input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
                 maximum=MAXIMUM_MICRO_USD,
             )
         case ImagesRequest():
             return images_ceiling_micro_usd(
                 request,
+                input_tokens=input_tokens,
                 input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
                 output_rate=deployment.gateway.prices.output_micro_usd_per_million_tokens,
                 maximum=MAXIMUM_MICRO_USD,
             )
         case GatewayRequest():
-            return _completion_attempt_cost_micro_usd(request, deployment)
+            return _completion_attempt_cost_micro_usd(request, deployment, input_tokens)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)
 
@@ -564,23 +584,27 @@ def maximum_attempt_cost_micro_usd(
 def _completion_attempt_cost_micro_usd(
     request: GatewayRequest,
     deployment: ExactModelDeployment,
+    input_tokens: int,
 ) -> int | None:
     """Return a conservative micro-USD ceiling for one chat/responses call.
 
-    Canonical UTF-8 bytes upper-bound input tokens; the output ceiling is the
+    The input estimate carries its own headroom; the output ceiling is the
     caller's, else the frozen deployment limit, else a reservation-only default
     bounded by the context window. Cached and reasoning tokens are subsets of the
     totals, so the worst case charges the higher rate for the whole leg.
     """
-    input_tokens, output_tokens = worst_case_attempt_tokens(request, deployment)
+    output_tokens = worst_case_output_tokens(request, deployment)
     prices = deployment.gateway.prices
     capabilities = deployment.gateway.capabilities
-    # The byte bound never undercounts tokens, so a request whose canonical
-    # bytes stay below the long-context threshold can never be repriced by
-    # the tier; above it, the worst case must also survive the whole-request
-    # premium schedule.
+    # The tier reprices the whole request once actual input reaches its
+    # threshold, and the estimate can land under a threshold the provider's
+    # count then crosses, so the tier is treated as reachable from
+    # LONG_CONTEXT_TIER_MARGIN_PERCENT below it; a reachable tier must survive
+    # the whole-request premium schedule.
     tier = prices.long_context
-    if tier is not None and input_tokens < tier.input_threshold_tokens:
+    if tier is not None and input_tokens * 100 < tier.input_threshold_tokens * (
+        100 - LONG_CONTEXT_TIER_MARGIN_PERCENT
+    ):
         tier = None
     schedules = [prices] if tier is None else [prices, tier]
     for schedule in schedules:

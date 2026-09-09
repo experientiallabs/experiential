@@ -657,6 +657,7 @@ dependencies = [
     { name = "posthog" },
     { name = "pydantic" },
     { name = "rich" },
+    { name = "tiktoken" },
     { name = "tomli-w" },
     { name = "typer" },
 ]
@@ -698,6 +699,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8" },
     { name = "rich", specifier = ">=14.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "tiktoken", specifier = ">=0.9,<1" },
     { name = "tinker", marker = "extra == 'sft'", specifier = ">=0.23,<0.24" },
     { name = "tinker-cookbook", marker = "extra == 'sft'", specifier = ">=0.4.3,<0.5" },
     { name = "tomli-w", specifier = ">=1.0" },

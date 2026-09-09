@@ -34,19 +34,23 @@ def test_images_request_rejects_out_of_contract_controls(overrides: dict[str, ob
         ImagesRequest.model_validate(values)
 
 
-def test_reservation_ceiling_prices_prompt_bytes_and_maximum_image_tokens() -> None:
-    """The ceiling bounds prompt bytes at the input rate and n images at the output rate."""
+def test_reservation_ceiling_prices_prompt_tokens_and_maximum_image_tokens() -> None:
+    """The ceiling prices the prompt estimate at the input rate and n images at the output rate."""
     request = ImagesRequest(prompt="a cat", n=2)
     ceiling = images_ceiling_micro_usd(
-        request, input_rate=5_000_000, output_rate=40_000_000, maximum=10**12
+        request, input_tokens=10, input_rate=5_000_000, output_rate=40_000_000, maximum=10**12
     )
     assert ceiling is not None
     output_only = (2 * MAXIMUM_IMAGE_OUTPUT_TOKENS * 40_000_000) // 1_000_000
-    assert ceiling >= output_only
-    assert ceiling < output_only + 5_000_000
+    assert ceiling == output_only + 50
     # A lane without an output rate (per-image priced) is unpriced for images.
     assert (
-        images_ceiling_micro_usd(request, input_rate=5_000_000, output_rate=None, maximum=10**12)
+        images_ceiling_micro_usd(
+            request, input_tokens=10, input_rate=5_000_000, output_rate=None, maximum=10**12
+        )
         is None
     )
-    assert images_ceiling_micro_usd(request, input_rate=1, output_rate=1, maximum=0) is None
+    assert (
+        images_ceiling_micro_usd(request, input_tokens=10, input_rate=1, output_rate=1, maximum=0)
+        is None
+    )

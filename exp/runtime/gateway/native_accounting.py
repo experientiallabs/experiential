@@ -427,8 +427,8 @@ class NativeAttemptAccounting:
         # manufacture a failure unbounded admission would not have had.
         policy_sheds: list[tuple[int, str]] = []
         forced_overflow = False
-        # The input half of the worst-case reservation serializes the whole
-        # request, so it is computed once per ladder walk, never per candidate.
+        # The input half of the reservation tokenizes the whole prompt, so it
+        # is computed once per ladder walk and shared with every candidate.
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             if candidate is None:
@@ -476,7 +476,7 @@ class NativeAttemptAccounting:
                     attempt_ordinal=entry.total_attempts,
                     route_depth=candidate,
                     maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(
-                        entry.request, deployment
+                        entry.request, deployment, input_tokens=reserved_input_tokens
                     ),
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
