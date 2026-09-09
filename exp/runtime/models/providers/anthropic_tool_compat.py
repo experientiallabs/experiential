@@ -373,9 +373,11 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
     * a root combinator is flattened into one object. ``properties`` is the
       union of the variants' properties; a name two variants define
       DIFFERENTLY (a ``mode`` discriminator with ``const: read`` in one and
-      ``const: write`` in the other) keeps every distinct definition as a
-      nested ``anyOf``, which Anthropic accepts under ``properties``, so no
-      alternative is lost. ``required`` keeps the names every oneOf/anyOf
+      ``const: write`` in the other) keeps every distinct definition: the
+      oneOf/anyOf variants' definitions become a nested ``anyOf`` (any may
+      hold), the root's and allOf variants' definitions stay conjunctive
+      (``allOf``), and both nest under ``properties``, where Anthropic
+      accepts them, so no alternative or constraint is lost. ``required`` keeps the names every oneOf/anyOf
       variant requires plus every name any allOf variant requires, each
       combinator judged on its own variants. The combinator keys are dropped.
       What is lost is the variants' mutual exclusion, disclosed at admission
@@ -390,11 +392,23 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
         return schema
     if reshaping == "type_object_added":
         return {**schema, "type": "object"}
-    merged: dict[str, list[JsonValue]] = {}
+    # Per property: definitions that must ALL hold (root properties, allOf
+    # variants) and definitions of which ANY may hold (oneOf/anyOf variants).
+    conjunctive: dict[str, list[JsonValue]] = {}
+    disjunctive: dict[str, list[JsonValue]] = {}
+    order: list[str] = []
+
+    def record(bucket: dict[str, list[JsonValue]], name: str, subschema: JsonValue) -> None:
+        if name not in order:
+            order.append(name)
+        definitions = bucket.setdefault(name, [])
+        if subschema not in definitions:
+            definitions.append(subschema)
+
     root_properties = schema.get("properties")
     if isinstance(root_properties, dict):
         for name, subschema in root_properties.items():
-            merged[name] = [subschema]
+            record(conjunctive, name, subschema)
     required_names: set[str] = set()
     for keyword in _TOP_LEVEL_COMBINATORS:
         listed = schema.get(keyword)
@@ -405,10 +419,9 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
         for variant in variants:
             properties = variant.get("properties")
             if isinstance(properties, dict):
+                bucket = conjunctive if keyword == "allOf" else disjunctive
                 for name, subschema in properties.items():
-                    definitions = merged.setdefault(name, [])
-                    if subschema not in definitions:
-                        definitions.append(subschema)
+                    record(bucket, name, subschema)
             required = variant.get("required")
             requirement_sets.append(
                 {name for name in required if isinstance(name, str)}
@@ -428,11 +441,17 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
         key: value for key, value in schema.items() if key not in _TOP_LEVEL_COMBINATORS
     }
     flattened["type"] = "object"
-    flattened["properties"] = {
-        name: (definitions[0] if len(definitions) == 1 else {"anyOf": definitions})
-        for name, definitions in merged.items()
-    }
-    ordered_required = [name for name in merged if name in required_names]
+    properties_out: dict[str, JsonValue] = {}
+    for name in order:
+        must = list(conjunctive.get(name, []))
+        may = disjunctive.get(name, [])
+        if may:
+            # Alternatives fold into one anyOf; it joins the conjunctive
+            # definitions (which all still apply) under allOf.
+            must.append(may[0] if len(may) == 1 else {"anyOf": may})
+        properties_out[name] = must[0] if len(must) == 1 else {"allOf": must}
+    flattened["properties"] = properties_out
+    ordered_required = [name for name in order if name in required_names]
     if ordered_required:
         flattened["required"] = ordered_required
     else:

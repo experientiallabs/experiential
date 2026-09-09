@@ -378,6 +378,25 @@ def test_root_combinators_flatten_into_the_object_anthropic_accepts() -> None:
         "properties": {"a": {"type": "string"}, "b": {"type": "integer"}, "c": {"type": "integer"}},
         "required": ["a"],
     }
+    # A root property and an allOf variant constrain the same name TOGETHER
+    # (allOf), while oneOf alternatives for it join as one anyOf member.
+    layered: JsonObject = {
+        "properties": {"path": {"type": "string"}},
+        "allOf": [{"properties": {"path": {"minLength": 1}}}],
+        "oneOf": [
+            {"properties": {"path": {"pattern": "^/"}}},
+            {"properties": {"path": {"pattern": "^~"}}},
+        ],
+    }
+    assert anthropic_input_schema(layered)["properties"] == {
+        "path": {
+            "allOf": [
+                {"type": "string"},
+                {"minLength": 1},
+                {"anyOf": [{"pattern": "^/"}, {"pattern": "^~"}]},
+            ]
+        }
+    }
     # allOf requires everything any variant requires.
     conjunction: JsonObject = {
         "allOf": [
