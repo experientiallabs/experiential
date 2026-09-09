@@ -377,9 +377,10 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
       oneOf/anyOf variants' definitions become a nested ``anyOf`` (any may
       hold), the root's and allOf variants' definitions stay conjunctive
       (``allOf``), and both nest under ``properties``, where Anthropic
-      accepts them, so no alternative or constraint is lost. ``required`` keeps the names every oneOf/anyOf
-      variant requires plus every name any allOf variant requires, each
-      combinator judged on its own variants. The combinator keys are dropped.
+      accepts them, so no alternative or constraint is lost. ``required``
+      keeps the names every oneOf/anyOf variant requires plus every name any
+      allOf variant requires, each combinator judged on its own variants. The
+      combinator keys are dropped.
       What is lost is the variants' mutual exclusion, disclosed at admission
       (``tools[i].parameters->reshaped(top_level_combinator_flattened)``);
     * a root without ``type`` gains ``"type": "object"``.
