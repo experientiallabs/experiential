@@ -126,10 +126,19 @@ def _quiet_http_logs() -> None:
 def main() -> None:
     """Load local environment settings, quiet HTTP logs, and dispatch the CLI.
 
-    The explicit entrypoint keeps environment loading out of import time, so library imports
-    cannot mutate an operator's process environment.
+    The explicit entrypoint keeps environment loading out of import time while retaining its
+    pre-parse timing for CLI option environment variables. Invalid environment files are rendered
+    through Typer's standard usage-error type before command parsing begins.
+
+    Raises:
+        SystemExit: The local environment file cannot be read safely.
     """
-    load_env_file()
+    try:
+        load_env_file()
+    except ValueError as exc:
+        error = typer.BadParameter(str(exc), param_hint=".env")
+        error.show()
+        raise SystemExit(error.exit_code) from None
     _quiet_http_logs()
     app()
 
