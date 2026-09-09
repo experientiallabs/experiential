@@ -370,13 +370,16 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
     that rejection across a dozen orgs, after dispatch). The reshaping is the
     provider-accepted equivalent, verified live:
 
-    * a root combinator is flattened into one object: ``properties`` is the
-      union of the variants' properties (first declaration wins on a name
-      clash), ``required`` keeps the names EVERY variant requires (allOf:
-      every name ANY variant requires), and the combinator key is dropped.
-      The mutual exclusion is lost, which is disclosed at admission
+    * a root combinator is flattened into one object. ``properties`` is the
+      union of the variants' properties; a name two variants define
+      DIFFERENTLY (a ``mode`` discriminator with ``const: read`` in one and
+      ``const: write`` in the other) keeps every distinct definition as a
+      nested ``anyOf``, which Anthropic accepts under ``properties``, so no
+      alternative is lost. ``required`` keeps the names every oneOf/anyOf
+      variant requires plus every name any allOf variant requires, each
+      combinator judged on its own variants. The combinator keys are dropped.
+      What is lost is the variants' mutual exclusion, disclosed at admission
       (``tools[i].parameters->reshaped(top_level_combinator_flattened)``);
-      the model still sees every property and its description;
     * a root without ``type`` gains ``"type": "object"``.
 
     A schema that needs neither is returned as the same object, so the
@@ -387,32 +390,37 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
         return schema
     if reshaping == "type_object_added":
         return {**schema, "type": "object"}
-    combinators = [k for k in _TOP_LEVEL_COMBINATORS if isinstance(schema.get(k), list)]
-    variants: list[Mapping[str, JsonValue]] = []
-    for keyword in combinators:
-        listed = schema.get(keyword)
-        if isinstance(listed, list):
-            variants.extend(variant for variant in listed if isinstance(variant, dict))
-    merged_properties: dict[str, JsonValue] = {}
+    merged: dict[str, list[JsonValue]] = {}
     root_properties = schema.get("properties")
     if isinstance(root_properties, dict):
-        merged_properties.update(root_properties)
-    required_sets: list[set[str]] = []
-    for variant in variants:
-        properties = variant.get("properties")
-        if isinstance(properties, dict):
-            for name, subschema in properties.items():
-                merged_properties.setdefault(name, subschema)
-        required = variant.get("required")
-        required_sets.append(
-            {name for name in required if isinstance(name, str)}
-            if isinstance(required, list)
-            else set()
-        )
-    if "allOf" in combinators:
-        required_names = set().union(*required_sets) if required_sets else set()
-    else:
-        required_names = set.intersection(*required_sets) if required_sets else set()
+        for name, subschema in root_properties.items():
+            merged[name] = [subschema]
+    required_names: set[str] = set()
+    for keyword in _TOP_LEVEL_COMBINATORS:
+        listed = schema.get(keyword)
+        if not isinstance(listed, list):
+            continue
+        variants = [variant for variant in listed if isinstance(variant, dict)]
+        requirement_sets: list[set[str]] = []
+        for variant in variants:
+            properties = variant.get("properties")
+            if isinstance(properties, dict):
+                for name, subschema in properties.items():
+                    definitions = merged.setdefault(name, [])
+                    if subschema not in definitions:
+                        definitions.append(subschema)
+            required = variant.get("required")
+            requirement_sets.append(
+                {name for name in required if isinstance(name, str)}
+                if isinstance(required, list)
+                else set()
+            )
+        if not requirement_sets:
+            continue
+        if keyword == "allOf":
+            required_names |= set().union(*requirement_sets)
+        else:
+            required_names |= set.intersection(*requirement_sets)
     root_required = schema.get("required")
     if isinstance(root_required, list):
         required_names |= {name for name in root_required if isinstance(name, str)}
@@ -420,8 +428,11 @@ def anthropic_input_schema(schema: JsonObject) -> JsonObject:
         key: value for key, value in schema.items() if key not in _TOP_LEVEL_COMBINATORS
     }
     flattened["type"] = "object"
-    flattened["properties"] = merged_properties
-    ordered_required = [name for name in merged_properties if name in required_names]
+    flattened["properties"] = {
+        name: (definitions[0] if len(definitions) == 1 else {"anyOf": definitions})
+        for name, definitions in merged.items()
+    }
+    ordered_required = [name for name in merged if name in required_names]
     if ordered_required:
         flattened["required"] = ordered_required
     else:

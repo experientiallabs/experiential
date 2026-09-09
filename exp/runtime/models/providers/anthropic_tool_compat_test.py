@@ -351,11 +351,32 @@ def test_root_combinators_flatten_into_the_object_anthropic_accepts() -> None:
         "description": "Read or write.",
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "mode": {"const": "read"},
+            # Distinct definitions of one name survive as a nested anyOf, so the
+            # write discriminator is not lost to the read variant.
+            "path": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "string", "description": "clash: first wins"},
+                ]
+            },
+            "mode": {"anyOf": [{"const": "read"}, {"const": "write"}]},
             "content": {"type": "string"},
         },
         "required": ["path", "mode"],
+    }
+    # Mixed root combinators are judged per combinator: allOf requires every
+    # name any of ITS variants requires, oneOf only what all of ITS variants do.
+    mixed: JsonObject = {
+        "allOf": [{"properties": {"a": {"type": "string"}}, "required": ["a"]}],
+        "oneOf": [
+            {"properties": {"b": {"type": "integer"}}, "required": ["b"]},
+            {"properties": {"c": {"type": "integer"}}, "required": ["c"]},
+        ],
+    }
+    assert anthropic_input_schema(mixed) == {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "integer"}, "c": {"type": "integer"}},
+        "required": ["a"],
     }
     # allOf requires everything any variant requires.
     conjunction: JsonObject = {
