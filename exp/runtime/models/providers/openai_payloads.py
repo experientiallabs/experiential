@@ -214,6 +214,7 @@ def openai_compatible_stream_payload(
     fireworks_reasoning_route_sha256: str | None = None,
     hunyuan_reasoning_route_sha256: str | None = None,
     reasoning_output_exposed: bool = False,
+    deepseek_reasoning_history: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
 ) -> JsonObject:
@@ -231,6 +232,10 @@ def openai_compatible_stream_payload(
         reasoning_effort: Optional catalog-pinned reasoning effort.
         reasoning_output_exposed: Whether this rung replays the caller's plaintext
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
+        deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
+            which replays caller plaintext regardless of exposure and requires
+            ``reasoning_content`` on every assistant tool-call turn (an absent one
+            is backfilled empty); see ``openai_chat_message``.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -250,6 +255,7 @@ def openai_compatible_stream_payload(
                 message,
                 reasoning_route_sha256=reasoning_route_sha256,
                 reasoning_output_exposed=reasoning_output_exposed,
+                deepseek_reasoning_history=deepseek_reasoning_history,
             )
             for message in messages
         ],

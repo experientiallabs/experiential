@@ -34,6 +34,7 @@ from exp.runtime.models.providers.base import (
     ProviderHttpClient,
     ReasoningWireFormat,
 )
+from exp.runtime.models.providers.deepseek import is_deepseek_base_url
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -514,6 +515,12 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_output_exposed=(
                 self._reasoning_output_exposed and self._hunyuan_reasoning_route_sha256 is not None
             ),
+            # DeepSeek's own API enforces reasoning_content on assistant
+            # tool-call history in thinking mode (400 otherwise), so its rung
+            # replays caller plaintext and backfills the field WITHOUT the
+            # exposure stamp: a house lane that fails every agent loop by
+            # default is wrong, and the stamp only governs output exposure.
+            deepseek_reasoning_history=is_deepseek_base_url(self._base_url),
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
             # 2026-09-05). Other compatible servers may reject unknown fields,

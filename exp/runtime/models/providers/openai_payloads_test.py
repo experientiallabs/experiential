@@ -3,8 +3,17 @@ are exercised in streaming_requests_test.py."""
 
 from __future__ import annotations
 
+from typing import cast
+
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.common.models.model import ToolCall
+from exp.runtime.gateway.contracts import (
+    ExposedReasoningContentBlock,
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
 from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
@@ -139,3 +148,125 @@ def test_replayed_items_with_foreign_ids_are_repaired_for_the_openai_wire() -> N
     assert {key: value for key, value in foreign_call.items() if key != "id"} in items
     assert own_reasoning in items
     assert all("item_" not in str(item.get("id", "")) for item in items if isinstance(item, dict))
+
+
+def _agent_loop(*, reasoning: tuple[str | None, ...]) -> GatewayRequest:
+    """One tools request whose history holds two assistant tool-call turns and a final text turn.
+
+    ``reasoning`` gives the ``reasoning_content`` each assistant turn replays
+    (``None`` = the field was absent, the shape an OpenAI-compatible SDK or a
+    history started on another provider produces).
+    """
+    turns: tuple[tuple[str | None, tuple[str, JsonObject] | None], ...] = (
+        ("", ("call-1", {"path": "a.txt"})),
+        (None, ("call-2", {"path": "b.txt"})),
+        ("Done reading.", None),
+    )
+    messages: list[GatewayMessage] = [GatewayMessage(role="user", content="read a and b")]
+    for (content, call), replayed in zip(turns, reasoning, strict=True):
+        blocks = (ExposedReasoningContentBlock(content=replayed),) if replayed is not None else ()
+        if call is None:
+            messages.append(
+                GatewayMessage(role="assistant", content=content, provider_reasoning=blocks)
+            )
+            continue
+        call_id, arguments = call
+        messages.append(
+            GatewayMessage(
+                role="assistant",
+                content=content or None,
+                tool_calls=(ToolCall(call_id=call_id, name="read_file", arguments=arguments),),
+                provider_reasoning=blocks,
+            )
+        )
+        messages.append(GatewayMessage(role="tool", content="ok", tool_call_id=call_id))
+    messages.append(GatewayMessage(role="user", content="now summarize"))
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=tuple(messages),
+        tools=(
+            GatewayToolDefinition(
+                name="read_file",
+                description="Read one file.",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def _assistant_turns(payload: JsonObject) -> list[JsonObject]:
+    messages = cast("list[JsonObject]", payload["messages"])
+    return [message for message in messages if message["role"] == "assistant"]
+
+
+def test_deepseek_origin_backfills_empty_reasoning_on_tool_call_turns_only() -> None:
+    """A tool-call turn with no reasoning gets ``reasoning_content: ""``; text turns do not.
+
+    DeepSeek's thinking mode 400s a tools request unless every assistant
+    tool-call turn carries the field (``The `reasoning_content` in the thinking
+    mode must be passed back to the API.``) and accepts an empty string exactly
+    like real reasoning (verified live 2026-09-10). The final text turn is left
+    alone: the provider does not require the field there and the wire stays
+    minimal.
+    """
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash", _agent_loop(reasoning=(None, None, None)), deepseek_reasoning_history=True
+    )
+    first_call, second_call, final_text = _assistant_turns(payload)
+    assert first_call["tool_calls"] and first_call["reasoning_content"] == ""
+    assert second_call["tool_calls"] and second_call["reasoning_content"] == ""
+    assert "tool_calls" not in final_text
+    assert "reasoning_content" not in final_text
+
+
+def test_deepseek_origin_forwards_caller_reasoning_verbatim_without_the_exposure_stamp() -> None:
+    """Caller plaintext replays byte-for-byte on plain AND tool-call turns, empty included.
+
+    No ``reasoning_output_exposed`` stamp is involved: the platform's DeepSeek
+    lane is not stamped, and replay is what the provider REQUIRES, not what the
+    catalog chose to expose.
+    """
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash",
+        _agent_loop(reasoning=("", "I should read b next.", "Both files are read.")),
+        deepseek_reasoning_history=True,
+    )
+    first_call, second_call, final_text = _assistant_turns(payload)
+    assert first_call["reasoning_content"] == ""
+    assert second_call["reasoning_content"] == "I should read b next."
+    assert final_text["reasoning_content"] == "Both files are read."
+
+
+def test_deepseek_origin_leaves_a_history_with_no_tool_calls_untouched() -> None:
+    """A plain conversation on the DeepSeek origin gets no injected field at all."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(role="assistant", content="hello"),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash", request, deepseek_reasoning_history=True
+    )
+    (assistant,) = _assistant_turns(payload)
+    assert assistant == {"role": "assistant", "content": "hello"}
+
+
+def test_other_compatible_origins_keep_the_exposure_gated_behaviour() -> None:
+    """Off the DeepSeek origin nothing changes: no backfill, plaintext still exposure-gated."""
+    request = _agent_loop(reasoning=("", "I should read b next.", None))
+    stripped = openai_compatible_stream_payload("deepseek-v4-flash", request)
+    assert all("reasoning_content" not in turn for turn in _assistant_turns(stripped))
+    exposed = openai_compatible_stream_payload(
+        "hy4-preview", request, reasoning_output_exposed=True
+    )
+    first_call, second_call, final_text = _assistant_turns(exposed)
+    assert first_call["reasoning_content"] == ""
+    assert second_call["reasoning_content"] == "I should read b next."
+    assert "reasoning_content" not in final_text

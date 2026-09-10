@@ -520,6 +520,22 @@ including routes with no exposing rung. Gateway-issued carriers are recognized b
 scheme prefix and retain strict parsing, authentication, and route binding; malformed carriers
 never become plaintext history.
 
+DeepSeek's own origin (`https://api.deepseek.com`, `is_deepseek_base_url`) is a reasoning-HISTORY
+route by origin, independent of the exposure stamp (`GatewayWireProfile.deepseek_reasoning_history`).
+Its thinking mode, on by default, rejects a request that carries `tools` unless every assistant
+message with `tool_calls` in the history carries `reasoning_content` (HTTP 400 ``The
+`reasoning_content` in the thinking mode must be passed back to the API.``), while accepting an
+empty string exactly like real reasoning (verified live 2026-09-10). On that rung the Chat builder
+forwards caller plaintext `reasoning_content` verbatim on plain and tool-call turns alike, and a
+tool-call turn that arrives without the field (a history started on another provider, or an
+OpenAI-compatible SDK that strips the extension) is backfilled with `reasoning_content: ""`;
+non-tool turns are never backfilled and no other origin is touched. The rung counts as a carrying
+rung for narrowing and disclosure (`replays_plaintext_reasoning`), so no drop is disclosed there.
+`reasoning_output_exposed` keeps its one meaning on DeepSeek: whether the caller SEES the reasoning
+deltas on output. Unstamped, the caller never receives reasoning to replay and the empty backfill
+is what keeps agent loops alive; stamped, the caller replays the real text and the backfill only
+covers turns minted elsewhere.
+
 Route admission preserves caller capabilities in three verbatim-preference layers before any
 coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
 controls narrow the waterfall to the rungs that preserve every exact value

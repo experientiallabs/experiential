@@ -194,6 +194,7 @@ def dialect_stream_payload(
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
             hunyuan_reasoning_route_sha256=profile.hunyuan_reasoning_route_sha256,
             reasoning_output_exposed=profile.reasoning_output_exposed,
+            deepseek_reasoning_history=profile.deepseek_reasoning_history,
             forwards_service_tier=profile.forwards_tier(provider_request.service_tier),
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
         )

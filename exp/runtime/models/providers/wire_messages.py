@@ -495,6 +495,7 @@ def openai_chat_message(
     *,
     reasoning_route_sha256: str | None = None,
     reasoning_output_exposed: bool = False,
+    deepseek_reasoning_history: bool = False,
 ) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON.
 
@@ -517,6 +518,13 @@ def openai_chat_message(
     ``reasoning_output_exposed`` marks a rung whose plaintext reasoning the
     caller may replay verbatim (an ``exposed_reasoning_content`` block); any
     other rung omits that block, which route narrowing already disclosed.
+    ``deepseek_reasoning_history`` marks DeepSeek's own origin, whose thinking
+    mode 400s a tools request unless every assistant tool-call turn in the
+    history carries ``reasoning_content`` (presence checked, content not;
+    verified live 2026-09-10): caller plaintext forwards verbatim there without
+    the exposure stamp, and a tool-call turn with no reasoning block is
+    backfilled with an empty string. Non-tool turns are never backfilled (the
+    provider does not require it) and no other origin is touched.
     """
     if message.role == "tool":
         tool_payload: JsonObject = {
@@ -563,7 +571,7 @@ def openai_chat_message(
             raise ProviderResponseError("Chat reasoning history requires exactly one carrier")
         block = message.provider_reasoning[0]
         if block.kind == "exposed_reasoning_content":
-            if reasoning_output_exposed:
+            if reasoning_output_exposed or deepseek_reasoning_history:
                 payload["reasoning_content"] = block.content
             return payload
         if (
@@ -573,6 +581,13 @@ def openai_chat_message(
         ):
             raise ProviderResponseError("reasoning carrier belongs to a different Chat route")
         payload["reasoning_content"] = block.content
+    elif deepseek_reasoning_history and message.role == "assistant" and message.tool_calls:
+        # DeepSeek's thinking mode rejects the whole request when a tool-call
+        # turn arrives without the field, and accepts an empty one exactly like
+        # real reasoning. Histories that started on another provider, or that
+        # an OpenAI-compatible SDK re-serialized without the extension field,
+        # arrive this way on every turn of an agent loop.
+        payload["reasoning_content"] = ""
     return payload
 
 

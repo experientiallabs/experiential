@@ -232,6 +232,17 @@ class GatewayWireProfile:
     category (Tencent/DeepSeek/Anthropic) so the caller sees the model's thinking
     it is already billed for; the round-trip token stays the sealed carrier."""
 
+    deepseek_reasoning_history: bool = False
+    """Whether this rung is DeepSeek's own API, whose thinking mode enforces
+    ``reasoning_content`` on every assistant tool-call turn in the history.
+
+    Origin-derived (``is_deepseek_base_url``), never a catalog stamp: the Chat
+    wire builder replays caller plaintext ``reasoning_content`` verbatim on
+    this rung and backfills an empty string on a tool-call turn that lacks it
+    (DeepSeek validates presence, not content; verified live 2026-09-10).
+    Independent of ``reasoning_output_exposed``, which still decides alone
+    whether the caller SEES the reasoning deltas on output."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 
@@ -252,6 +263,17 @@ class GatewayWireProfile:
     images_url: str | None = None
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
     sharing ``headers``; ``None`` when the connection speaks no images wire."""
+
+    @property
+    def replays_plaintext_reasoning(self) -> bool:
+        """Whether this rung forwards caller plaintext ``reasoning_content`` verbatim.
+
+        True on an exposure-stamped rung (the caller replays what that rung
+        itself returned) and on DeepSeek's origin, which REQUIRES the field on
+        tool-call history regardless of whether its output is exposed. Route
+        narrowing and the disclosure gate read this, never the two flags apart.
+        """
+        return self.reasoning_output_exposed or self.deepseek_reasoning_history
 
     def __post_init__(self) -> None:
         """Reject malformed operator wire contracts before admission."""

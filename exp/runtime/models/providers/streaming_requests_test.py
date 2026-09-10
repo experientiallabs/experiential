@@ -4316,6 +4316,78 @@ def test_plaintext_reasoning_route_gate_discloses_or_forwards() -> None:
     assert public.ignored_parameters == ()
 
 
+def _deepseek_profile() -> GatewayWireProfile:
+    """The platform's DeepSeek house lane: DeepSeek's origin, no exposure stamp."""
+    return GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.deepseek.com/v1/chat/completions",
+        model_id="deepseek-flash",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        deepseek_reasoning_history=True,
+    )
+
+
+def test_deepseek_rung_carries_plaintext_reasoning_without_disclosure_or_stamp() -> None:
+    """An unstamped DeepSeek rung is a carrying rung: no drop disclosure, verbatim replay.
+
+    Before this, the DeepSeek house lane disclosed
+    ``messages.reasoning_content->dropped`` and stripped the field, and DeepSeek
+    then 400'd the whole request in thinking mode.
+    """
+    request = _exposed_reasoning_request()
+    public, provider = route_generation_parameter_requests((_deepseek_profile(),), request)
+    assert public.ignored_parameters == ()
+    payload = dialect_stream_payload(_deepseek_profile(), provider)
+    payload_messages = cast("list[JsonObject]", payload["messages"])
+    assert payload_messages[1]["reasoning_content"] == "The user wants a directory listing."
+    # On a mixed waterfall the DeepSeek rung is exact and a stripping rung is a fallback.
+    assert compatible_generation_parameter_profile_indexes(
+        (_exposed_profile(exposed=False, url="https://openrouter.test/v1"), _deepseek_profile()),
+        request,
+    ) == (1,)
+
+
+def test_deepseek_rung_backfills_tool_call_history_through_dialect_dispatch() -> None:
+    """The resolved profile alone (no builder kwargs) yields the accepted wire shape.
+
+    A 296-message coding-agent history whose tool calls were minted elsewhere
+    arrives with bare ``tool_calls`` turns; every one of them leaves with
+    ``reasoning_content: ""`` on the DeepSeek rung and untouched on any other.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="read it"),
+            GatewayMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(
+                    ToolCall(call_id="call_other_provider", name="read_file", arguments={}),
+                ),
+            ),
+            GatewayMessage(role="tool", content="contents", tool_call_id="call_other_provider"),
+        ),
+        tools=(
+            GatewayToolDefinition(
+                name="read_file", description="Read.", parameters={"type": "object"}
+            ),
+        ),
+        stream=True,
+    )
+    deepseek = cast(
+        "list[JsonObject]", dialect_stream_payload(_deepseek_profile(), request)["messages"]
+    )
+    assert deepseek[1]["tool_calls"] and deepseek[1]["reasoning_content"] == ""
+    generic = cast(
+        "list[JsonObject]",
+        dialect_stream_payload(
+            _exposed_profile(exposed=False, url="https://openrouter.test/v1"), request
+        )["messages"],
+    )
+    assert generic[1]["tool_calls"] and "reasoning_content" not in generic[1]
+
+
 def test_plaintext_reasoning_prefers_the_exposing_rung_on_a_mixed_waterfall() -> None:
     """A rung that carries the reasoning is exact; a rung that would drop it is a fallback."""
     request = _exposed_reasoning_request()
