@@ -43,6 +43,18 @@ Output guardrail byte limits count the complete serialized completion, including
 tool IDs, tool names, arguments, and JSON framing.
 Provider-specific wire restrictions still apply when routing to a different API dialect.
 
+Streamed function-call arguments must assemble to one JSON object. On OpenAI-compatible
+Chat streams the gateway stops relaying argument deltas at the byte that closes that object:
+whatever the provider streams after it is withheld and judged at completion. A tail that is
+only whitespace, an exact repetition of the whole object, or (after a zero-argument `{}`)
+empty literals such as `""` is dropped and the call completes — Azure Foundry's DeepSeek shim
+streams `{}` then `""` for every zero-argument call — so the deltas a client receives always
+concatenate to the completed call's bytes. Any other tail, and any syntax error inside the
+object, keeps the strict contract: the attempt fails as `malformed_response` (a provider
+fault, eligible to fail over to a later deployment), the ledger names the parse position and
+byte count, and the operator log names the tool; argument bytes are never logged or repaired
+by guessing.
+
 ## The data plane
 
 The gateway has exactly one data plane: a native Rust HTTP server compiled as

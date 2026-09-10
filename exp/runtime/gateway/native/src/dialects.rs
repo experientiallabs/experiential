@@ -290,14 +290,15 @@ fn complete_streamed_tool(
         // invites dictionary guessing): the operator line carries only the
         // tool name, the size, and the parse reason, which together
         // correlate identical unparsable shapes across requests.
+        let bytes = tool.raw_arguments.len() + tool.withheld_tail.len();
         let line = serde_json::json!({
             "event": "malformed_tool_arguments",
             "name": tool.name,
-            "bytes": tool.raw_arguments.len(),
+            "bytes": bytes,
             "reason": message,
         });
         eprintln!("exp-gateway-native: {line}");
-        malformed(&format!("{message} ({} bytes)", tool.raw_arguments.len()))
+        malformed(&format!("{message} ({bytes} bytes)"))
     })?;
     events.push(if tool.server {
         Event::ServerToolUseCompleted { index, call }

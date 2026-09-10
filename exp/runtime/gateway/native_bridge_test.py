@@ -5299,3 +5299,57 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
             (str(started["attempt_id"]),),
         ).fetchone()
     assert row == ("affinity", None)
+
+
+def test_foundry_deepseek_zero_argument_call_with_a_stray_empty_string_delta_completes() -> None:
+    """The captured Azure Foundry DeepSeek zero-argument tool stream completes as ``{}``.
+
+    Live wire of 2026-09-10 (ids redacted): after ``arguments: ""`` and ``{}`` the
+    shim streams one more argument delta whose text is two quote characters. Verbatim
+    assembly is ``{}""`` and failed 222 production attempts in one day as
+    ``malformed_response`` ("trailing characters at line 1 column 3 (4 bytes)"). The
+    stray delta is content-free, so it is withheld from the caller and the call
+    completes; the deltas a client sees concatenate to exactly the completed bytes.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    head = (
+        '{"id":"chatcmpl-redacted","object":"chat.completion.chunk","created":1789000000,'
+        '"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":'
+    )
+    tail = ',"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}'
+    tool = '{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":%s}}'
+    deltas = [
+        '{"reasoning_content":null,"role":"assistant","content":""}',
+        '{"role":null,"content":"\\n\\n","reasoning_content":null,"tool_calls":null}',
+        '{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":"call_redacted",'
+        '"index":0,"type":"function","function":{"name":"view_agent_graph","arguments":""}}]}',
+        '{"role":null,"content":null,"reasoning_content":null,"tool_calls":['
+        + tool % '"{}"'
+        + "]}",
+        '{"role":null,"content":null,"reasoning_content":null,"tool_calls":['
+        + tool % '"\\"\\""'
+        + "]}",
+    ]
+    frames = [f"data: {head}{delta}{tail}\n\n" for delta in deltas]
+    frames.append(
+        'data: {"id":"chatcmpl-redacted","object":"chat.completion.chunk","created":1789000000,'
+        '"model":"DeepSeek-V4-Flash","choices":[{"index":0,"delta":{"reasoning_content":null},'
+        '"logprobs":null,"finish_reason":"tool_calls","matched_stop":1}]}\n\n'
+    )
+    frames.append("data: [DONE]\n\n")
+    # The fixture boundary carries raw stream bytes as latin-1 code points.
+    normalized = json.loads(
+        native.normalize_stream_fixture(
+            "openai_compatible",
+            json.dumps([frame.encode().decode("latin-1") for frame in frames]),
+        )
+    )
+    assert normalized["failure"] is None
+    events = normalized["events"]
+    shown = "".join(event["text"] for event in events if event["kind"] == "tool_arguments_delta")
+    assert shown == "{}"
+    completed = [event for event in events if event["kind"] == "tool_call_completed"]
+    assert [(event["name"], event["raw_arguments"]) for event in completed] == [
+        ("view_agent_graph", "{}")
+    ]
+    assert events[-1]["kind"] == "completed"
