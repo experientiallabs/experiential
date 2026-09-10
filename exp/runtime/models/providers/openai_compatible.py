@@ -515,8 +515,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_output_exposed=(
                 self._reasoning_output_exposed and self._hunyuan_reasoning_route_sha256 is not None
             ),
-            # DeepSeek's own API enforces reasoning_content on assistant
-            # tool-call history in thinking mode (400 otherwise), so its rung
+            # DeepSeek's own API enforces reasoning_content on every assistant
+            # message of the current turn in thinking mode (400 otherwise), so its rung
             # replays caller plaintext and backfills the field WITHOUT the
             # exposure stamp: a house lane that fails every agent loop by
             # default is wrong, and the stamp only governs output exposure.

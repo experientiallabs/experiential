@@ -238,8 +238,11 @@ class GatewayWireProfile:
 
     Origin-derived (``is_deepseek_base_url``), never a catalog stamp: the Chat
     wire builder replays caller plaintext ``reasoning_content`` verbatim on
-    this rung and backfills an empty string on a tool-call turn that lacks it
-    (DeepSeek validates presence, not content; verified live 2026-09-10).
+    this rung and backfills an empty string on every assistant message that
+    lacks it — the provider requires the field on each assistant message of
+    the current turn, text-only ones included, and accepts an empty one
+    anywhere (DeepSeek validates presence, not content; verified live
+    2026-09-10).
     Independent of ``reasoning_output_exposed``, which still decides alone
     whether the caller SEES the reasoning deltas on output."""
 

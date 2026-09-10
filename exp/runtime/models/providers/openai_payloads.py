@@ -234,8 +234,9 @@ def openai_compatible_stream_payload(
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
         deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
             which replays caller plaintext regardless of exposure and requires
-            ``reasoning_content`` on every assistant tool-call turn (an absent one
-            is backfilled empty); see ``openai_chat_message``.
+            ``reasoning_content`` on every assistant message of the current turn
+            (an absent one is backfilled empty on every assistant message); see
+            ``openai_chat_message``.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
