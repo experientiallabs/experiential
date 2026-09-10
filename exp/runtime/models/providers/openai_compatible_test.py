@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
@@ -557,3 +558,57 @@ def test_deepseek_reasoning_history_is_off_for_every_other_compatible_origin() -
         ).gateway_wire_profile()
         assert profile.deepseek_reasoning_history is False
         assert profile.replays_plaintext_reasoning is False
+
+
+def test_buffered_request_backfills_reasoning_content_on_deepseek_assistant_turns() -> None:
+    """The non-streaming builder applies the DeepSeek rule too, tool-call and text turns alike.
+
+    ``RouterRuntime.complete`` serializes through ``openai_compatible_request``,
+    not the streaming ``openai_chat_message``; a text-then-tool-call history on
+    this path would otherwise still draw DeepSeek's thinking-mode 400. The
+    typed request carries no reasoning to forward, so the rule here is the
+    backfill alone; system, user, and tool messages are untouched.
+    """
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="read a.txt"),
+            ModelMessage(role="assistant", content="Let me read it."),
+            ModelMessage(
+                role="assistant",
+                assistant_action=AssistantAction(
+                    tool_calls=(ToolCall(call_id="call_foreign_1", name="read_file", arguments={}),)
+                ),
+            ),
+            ModelMessage(role="tool", content="hello", tool_call_id="call_foreign_1"),
+        ),
+        tools=(ToolSchema(name="read_file", description="Read.", input_schema={"type": "object"}),),
+    )
+    payload = openai_compatible_request("deepseek-flash", request, deepseek_reasoning_history=True)
+    system, user, text_turn, tool_call_turn, tool = cast("list[JsonObject]", payload["messages"])
+    assert text_turn == {"role": "assistant", "content": "Let me read it.", "reasoning_content": ""}
+    assert tool_call_turn["tool_calls"] and tool_call_turn["reasoning_content"] == ""
+    assert all("reasoning_content" not in message for message in (system, user, tool))
+    # Off the DeepSeek origin the buffered wire is byte-identical to before.
+    generic = cast(
+        "list[JsonObject]", openai_compatible_request("deepseek-flash", request)["messages"]
+    )
+    assert all("reasoning_content" not in message for message in generic)
+
+
+def test_deepseek_client_builds_buffered_requests_with_the_backfill_from_its_origin() -> None:
+    """The client derives the buffered-path backfill from its base URL, like the wire profile."""
+    deepseek = OpenAICompatibleClient(
+        model=_snapshot(model_id="deepseek-flash"),
+        base_url="https://api.deepseek.com/v1",
+        api_key="fake-key",
+    )
+    messages = cast("list[JsonObject]", deepseek._build_request(_request())["messages"])
+    assert messages[2]["tool_calls"] and messages[2]["reasoning_content"] == ""
+    generic = OpenAICompatibleClient(
+        model=_snapshot(model_id="deepseek-flash"),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+    )
+    generic_messages = cast("list[JsonObject]", generic._build_request(_request())["messages"])
+    assert "reasoning_content" not in generic_messages[2]
