@@ -787,6 +787,23 @@ def test_native_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> 
         )
 
 
+def test_text_verbosity_is_carried_on_responses_and_chat_but_not_messages() -> None:
+    """The one verbosity carrier serves both OpenAI spellings and no other surface."""
+    for surface in (GatewayApiSurface.RESPONSES, GatewayApiSurface.CHAT_COMPLETIONS):
+        request = GatewayRequest(
+            surface=surface,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            text_verbosity="high",
+        )
+        assert request.text_verbosity == "high"
+    with pytest.raises(ValidationError, match="valid only for Responses and Chat"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            text_verbosity="high",
+        )
+
+
 def test_required_tool_choice_counts_native_tool_declarations() -> None:
     """A toolset made only of verbatim native declarations satisfies required."""
     request = GatewayRequest(

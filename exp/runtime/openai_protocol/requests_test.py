@@ -882,6 +882,39 @@ def test_chat_decoder_rejects_store_true_retention_request() -> None:
     assert captured.value.detail.param == "store"
 
 
+def test_chat_decoder_accepts_verbosity_as_the_chat_spelling_of_text_verbosity() -> None:
+    """opencode sends ``verbosity`` on every Chat request (2026-09-10 400s).
+
+    It decodes onto the same canonical carrier as Responses ``text.verbosity``
+    with no disclosure at decode; the route step decides forward-or-drop.
+    """
+    for value in ("low", "medium", "high"):
+        decoded = decode_chat(
+            {
+                "model": "gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "hello"}],
+                "verbosity": value,
+            }
+        )
+        assert decoded.request.text_verbosity == value
+        assert decoded.request.ignored_parameters == ()
+
+
+def test_chat_decoder_rejects_an_unknown_verbosity_value() -> None:
+    """Accepting the field never means accepting any value: a typo is a client bug."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "hello"}],
+                "verbosity": "verbose",
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "verbosity"
+
+
 def test_chat_decoder_preserves_logprobs_for_route_validation() -> None:
     """The route gate distinguishes a semantic true request from a false no-op."""
     for value in (True, False):

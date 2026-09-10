@@ -533,6 +533,12 @@ class _ChatRequest(_WireModel):
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""
+    verbosity: Literal["low", "medium", "high"] | None = None
+    """Output-length hint (GPT-5 family), the Chat spelling of Responses ``text.verbosity``.
+
+    Forwarded on native Responses rungs and dropped with disclosure elsewhere;
+    the value itself stays validated so a typo is still a named 400.
+    """
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
