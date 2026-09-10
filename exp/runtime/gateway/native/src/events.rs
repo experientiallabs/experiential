@@ -678,6 +678,130 @@ pub fn require_json_object_text(raw: &str) -> Result<(), String> {
     }
 }
 
+/// Incremental scan of one JSON-argument accumulation that knows the byte at
+/// which the top-level value closed.
+///
+/// A tool call's arguments are one JSON object, so nothing a provider streams
+/// after the byte that closes it can be argument content: it is either an
+/// extra delta the shim never should have sent or noise. The scan is a
+/// constant-time-per-byte bracket/string tracker (never a re-parse of the
+/// whole accumulation), exact for any well-formed prefix; a malformed prefix
+/// simply never closes and keeps the strict parse at completion.
+#[derive(Debug, Clone, Default)]
+pub struct JsonValueScan {
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+    /// Whether the top-level value has closed (depth returned to zero after
+    /// a container opened).
+    pub closed: bool,
+}
+
+impl JsonValueScan {
+    /// Feed one fragment; returns the byte offset within it at which the
+    /// top-level value closed (exclusive, i.e. the first byte of the tail),
+    /// or `None` when the fragment left the value open. Only ASCII
+    /// structural bytes advance the scan, so the offset is always a char
+    /// boundary.
+    pub fn feed(&mut self, fragment: &str) -> Option<usize> {
+        if self.closed {
+            return Some(0);
+        }
+        for (offset, byte) in fragment.bytes().enumerate() {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' if self.depth > 0 => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        self.closed = true;
+                        return Some(offset + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+/// Why a tail streamed after a complete argument object was dropped rather
+/// than failing the call. Each shape reproduces exactly one parse, so no
+/// argument content is ever invented or chosen between alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedundantTail {
+    /// Only whitespace (a pretty-printed buffer's trailing newline).
+    Whitespace,
+    /// One or more exact repetitions of the complete value (`{}{}`, a
+    /// duplicated whole-object delta).
+    DuplicateValue,
+    /// Empty JSON literals after a zero-argument call (`{}""`: Azure
+    /// Foundry's DeepSeek shim, live 2026-09-10, 222 attempts in one day).
+    EmptyLiterals,
+}
+
+impl RedundantTail {
+    fn as_str(self) -> &'static str {
+        match self {
+            RedundantTail::Whitespace => "whitespace",
+            RedundantTail::DuplicateValue => "duplicate_value",
+            RedundantTail::EmptyLiterals => "empty_literals",
+        }
+    }
+}
+
+/// Classify the bytes a provider streamed AFTER its argument object closed.
+///
+/// Accepts only tails whose removal is unambiguous: whitespace; exact
+/// repetitions of the whole value; and, after a zero-argument `{}` only,
+/// empty literals (`""`, `{}`, `[]`) that carry no argument content. A tail
+/// that is merely a suffix of the value (`{"a":1}}`) is NOT accepted: the same
+/// bytes arise from a dropped inner delta (`{"a":1,"b":{` lost from
+/// `{"a":1,"b":{"c":2}}`), so the parse would be a guess.
+pub fn redundant_tail(value: &str, tail: &str) -> Option<RedundantTail> {
+    let value = value.trim();
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Some(RedundantTail::Whitespace);
+    }
+    let mut rest = tail;
+    let mut duplicates = true;
+    while !rest.is_empty() {
+        match rest.strip_prefix(value) {
+            Some(after) if !value.is_empty() => rest = after.trim_start(),
+            _ => {
+                duplicates = false;
+                break;
+            }
+        }
+    }
+    if duplicates {
+        return Some(RedundantTail::DuplicateValue);
+    }
+    if value != "{}" {
+        return None;
+    }
+    let mut rest = tail;
+    while !rest.is_empty() {
+        rest = rest
+            .strip_prefix("\"\"")
+            .or_else(|| rest.strip_prefix("{}"))
+            .or_else(|| rest.strip_prefix("[]"))?
+            .trim_start();
+    }
+    Some(RedundantTail::EmptyLiterals)
+}
+
 /// Accumulated per-stream state for one incrementally emitted function call.
 #[derive(Debug, Clone)]
 pub struct ToolAccumulator {
@@ -696,6 +820,13 @@ pub struct ToolAccumulator {
     /// (`server_tool_use`), whose lifecycle events stay on the dedicated
     /// server-tool variants and never count toward the tool-use stop reason.
     pub server: bool,
+    /// Scan of `raw_arguments` for dialects that accumulate through
+    /// [`ToolAccumulator::push_arguments`]; dialects that append directly
+    /// leave it untouched and never withhold anything.
+    scan: JsonValueScan,
+    /// Bytes streamed after the argument object closed, never emitted to the
+    /// caller; reconciled by [`ToolAccumulator::complete`].
+    pub withheld_tail: String,
 }
 
 /// Opaque tool IDs share the Python model bound, including signature carriers.
@@ -714,11 +845,62 @@ impl ToolAccumulator {
             completed: false,
             custom: false,
             server: false,
+            scan: JsonValueScan::default(),
+            withheld_tail: String::new(),
+        }
+    }
+
+    /// Append one streamed argument fragment, returning the part the caller
+    /// may see: everything up to and including the byte that closes the
+    /// argument object. Whatever follows that byte is withheld (never
+    /// emitted) and judged at completion, so the deltas a client receives
+    /// always concatenate to the completed call's bytes. Custom (freeform)
+    /// input is opaque text and passes through whole.
+    pub fn push_arguments(&mut self, fragment: &str) -> Option<String> {
+        if self.custom {
+            self.raw_arguments.push_str(fragment);
+            return Some(fragment.to_string());
+        }
+        match self.scan.feed(fragment) {
+            None => {
+                self.raw_arguments.push_str(fragment);
+                Some(fragment.to_string())
+            }
+            Some(closed_at) => {
+                let (value, tail) = fragment.split_at(closed_at);
+                self.raw_arguments.push_str(value);
+                self.withheld_tail.push_str(tail);
+                (!value.is_empty()).then(|| value.to_string())
+            }
         }
     }
 
     pub fn complete(&self) -> Result<CompletedToolCall, String> {
         if !self.custom {
+            if !self.withheld_tail.is_empty() {
+                // A provider streamed bytes after its argument object closed.
+                // Only a content-free tail is dropped (its shape reaches the
+                // operator log; never its bytes); anything else is validated
+                // as the concatenation the provider actually sent, so the
+                // failure names the same parse position it always did.
+                match redundant_tail(&self.raw_arguments, &self.withheld_tail) {
+                    Some(RedundantTail::Whitespace) => {}
+                    Some(shape) => {
+                        let line = serde_json::json!({
+                            "event": "tool_arguments_tail_dropped",
+                            "name": self.name,
+                            "shape": shape.as_str(),
+                            "tail_bytes": self.withheld_tail.len(),
+                        });
+                        eprintln!("exp-gateway-native: {line}");
+                    }
+                    None => {
+                        let mut streamed = self.raw_arguments.clone();
+                        streamed.push_str(&self.withheld_tail);
+                        require_json_object_text(&streamed)?;
+                    }
+                }
+            }
             // Custom (freeform) tool input is opaque text by contract; only
             // function arguments must parse as one JSON object.
             require_json_object_text(&self.raw_arguments)?;

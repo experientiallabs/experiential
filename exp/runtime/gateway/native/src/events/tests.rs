@@ -384,3 +384,163 @@ fn tool_id_bound_counts_characters_and_preserves_opaque_signatures() {
         assert!(tool.complete().is_err());
     }
 }
+
+/// Push fragments through the hold-back path and return what a client would
+/// have been shown.
+fn push_all(tool: &mut ToolAccumulator, fragments: &[&str]) -> Vec<String> {
+    fragments
+        .iter()
+        .filter_map(|fragment| tool.push_arguments(fragment))
+        .collect()
+}
+
+#[test]
+fn zero_argument_tail_of_empty_literals_is_dropped_after_the_object_closes() {
+    // Azure Foundry's DeepSeek-V4-Flash shim (captured live 2026-09-10):
+    // a zero-argument call streams `""` (arguments start), `{}`, then a
+    // stray `""` delta. Verbatim concatenation is `{}""`, the exact
+    // "trailing characters at line 1 column 3 (4 bytes)" seen on 222
+    // production attempts in one day. The stray delta carries no argument
+    // content, so it is withheld from the caller and the call completes.
+    let mut tool = ToolAccumulator::new("call_1".into(), "view_agent_graph".into());
+    let shown = push_all(&mut tool, &["", "{}", "\"\""]);
+    // The empty opening delta is shown as before (unchanged wire behaviour);
+    // only the bytes after the closing brace are withheld.
+    assert_eq!(shown, vec![String::new(), "{}".to_string()]);
+    assert_eq!(tool.withheld_tail, "\"\"");
+    let call = tool.complete().expect("a content-free tail completes");
+    assert_eq!(call.raw_arguments, "{}");
+    // The same verdict for every empty literal, in any mix, with whitespace;
+    // a bare `{}` after `{}` is first of all a duplicated whole value.
+    for tail in ["[]", "\"\"{}", " \"\" \n[] {}"] {
+        assert_eq!(
+            redundant_tail("{}", tail),
+            Some(RedundantTail::EmptyLiterals)
+        );
+    }
+    assert_eq!(
+        redundant_tail("{}", "{}"),
+        Some(RedundantTail::DuplicateValue)
+    );
+}
+
+#[test]
+fn duplicated_whole_object_deltas_collapse_to_one_value() {
+    // A delta re-sent whole (`{}{}`, or a non-empty object twice) adds no
+    // information: the first copy is the call, the repetition is dropped.
+    let mut tool = ToolAccumulator::new("call_1".into(), "lookup".into());
+    assert_eq!(push_all(&mut tool, &["{}", "{}"]), vec!["{}".to_string()]);
+    assert_eq!(tool.complete().expect("duplicate").raw_arguments, "{}");
+
+    let mut tool = ToolAccumulator::new("call_2".into(), "lookup".into());
+    // The repetition straddles a fragment boundary with the closing byte.
+    let shown = push_all(&mut tool, &["{\"a\":", "1}{\"a\"", ":1}"]);
+    assert_eq!(shown.concat(), "{\"a\":1}");
+    assert_eq!(tool.withheld_tail, "{\"a\":1}");
+    assert_eq!(
+        tool.complete().expect("duplicate").raw_arguments,
+        "{\"a\":1}"
+    );
+    assert_eq!(
+        redundant_tail("{\"a\":1}", " {\"a\":1}\n{\"a\":1}"),
+        Some(RedundantTail::DuplicateValue)
+    );
+}
+
+#[test]
+fn pretty_printed_arguments_with_a_trailing_newline_complete() {
+    let mut tool = ToolAccumulator::new("call_1".into(), "lookup".into());
+    let shown = push_all(
+        &mut tool,
+        &["{\n  \"a\": [1, 2],\n", "  \"b\": {}\n}", "\n"],
+    );
+    assert_eq!(shown.concat(), "{\n  \"a\": [1, 2],\n  \"b\": {}\n}");
+    assert_eq!(tool.withheld_tail, "\n");
+    assert_eq!(
+        redundant_tail("{}", " \n\t"),
+        Some(RedundantTail::Whitespace)
+    );
+    tool.complete()
+        .expect("whitespace after the object is not content");
+}
+
+#[test]
+fn a_tail_carrying_content_or_a_bare_suffix_stays_malformed() {
+    // Anything whose removal would pick one parse over another fails closed
+    // with the parse position of the bytes the provider actually sent.
+    for (fragments, position) in [
+        (vec!["{\"a\":1}", "{\"b\":2}"], "line 1 column 8"),
+        // A bare `}` is also what a dropped inner delta leaves behind.
+        (vec!["{\"a\":1}", "}"], "line 1 column 8"),
+        (vec!["{}", "\"x\""], "line 1 column 3"),
+        (vec!["{}", "null"], "line 1 column 3"),
+        (vec!["{\"a\":1}", "\"\""], "line 1 column 8"),
+    ] {
+        let mut tool = ToolAccumulator::new("call_1".into(), "lookup".into());
+        push_all(&mut tool, &fragments);
+        let error = tool
+            .complete()
+            .expect_err("content after the object is malformed");
+        assert!(
+            error
+                .starts_with("streamed tool arguments are not valid JSON: trailing characters at ")
+                && error.contains(position),
+            "{fragments:?} -> {error}"
+        );
+    }
+    assert_eq!(redundant_tail("{\"a\":1}", "}"), None);
+    assert_eq!(redundant_tail("{\"a\":1}", "\"\""), None);
+    assert_eq!(redundant_tail("{}", "{\"a\":1}"), None);
+}
+
+#[test]
+fn the_scan_ignores_structural_bytes_inside_strings_and_never_closes_a_scalar() {
+    let mut tool = ToolAccumulator::new("call_1".into(), "terminal".into());
+    let shown = push_all(
+        &mut tool,
+        &[
+            "{\"command\":\"echo }\\\"{ ]\"",
+            ", \"n\": [1, {\"x\": \"}\"}]}",
+            "{}",
+        ],
+    );
+    assert_eq!(
+        shown.concat(),
+        "{\"command\":\"echo }\\\"{ ]\", \"n\": [1, {\"x\": \"}\"}]}"
+    );
+    assert_eq!(tool.withheld_tail, "{}");
+    // `{}` after a non-empty object is content-bearing ambiguity, not noise.
+    assert!(tool.complete().is_err());
+
+    // A top-level scalar never closes, so every byte is shown and the strict
+    // object contract rejects it at completion exactly as before.
+    let mut tool = ToolAccumulator::new("call_2".into(), "lookup".into());
+    assert_eq!(
+        push_all(&mut tool, &["\"just", " text\""]).concat(),
+        "\"just text\""
+    );
+    assert!(tool.withheld_tail.is_empty());
+    assert_eq!(
+        tool.complete().expect_err("a string is not an object"),
+        "streamed tool arguments must decode to an object"
+    );
+
+    // An open object stays open: no tail, and the usual EOF parse error.
+    let mut tool = ToolAccumulator::new("call_3".into(), "lookup".into());
+    push_all(&mut tool, &["{\"a\": [1, 2"]);
+    assert!(tool.withheld_tail.is_empty());
+    assert!(tool.complete().is_err());
+}
+
+#[test]
+fn custom_tool_input_passes_through_the_hold_back_untouched() {
+    let mut tool = ToolAccumulator::new("call_1".into(), "shell".into());
+    tool.custom = true;
+    let shown = push_all(&mut tool, &["{}", "\"\"", " ls -la"]);
+    assert_eq!(shown.concat(), "{}\"\" ls -la");
+    assert!(tool.withheld_tail.is_empty());
+    assert_eq!(
+        tool.complete().expect("freeform").raw_arguments,
+        "{}\"\" ls -la"
+    );
+}

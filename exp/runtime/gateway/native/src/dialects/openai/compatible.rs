@@ -202,11 +202,15 @@ impl Normalizer {
                             };
                             self.reserve_tool_bytes(raw_fragment.len())?;
                             let tool = self.tools.get_mut(&index).expect("tool just ensured");
-                            tool.raw_arguments.push_str(&raw_fragment);
-                            events.push(Event::ToolArgumentsDelta {
-                                index,
-                                delta: raw_fragment,
-                            });
+                            // Bytes after the argument object closes are
+                            // withheld, never relayed: Azure Foundry's
+                            // DeepSeek shim streams `{}` then `""` for a
+                            // zero-argument call (live 2026-09-10), and a
+                            // client that concatenates deltas must end up
+                            // with exactly the completed call's bytes.
+                            if let Some(delta) = tool.push_arguments(&raw_fragment) {
+                                events.push(Event::ToolArgumentsDelta { index, delta });
+                            }
                         }
                     }
                 }
