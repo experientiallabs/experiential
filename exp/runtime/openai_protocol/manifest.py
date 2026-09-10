@@ -97,6 +97,13 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # OpenAI's output-length hint (GPT-5 family). Admitted on the Chat
+        # surface exactly like ``text.verbosity`` on Responses: forwarded on
+        # native Responses rungs (where the wire carries it), dropped with
+        # disclosure on every other rung, never a rejection. opencode sends it
+        # on every Chat request, so the 400 made the gateway unusable for it
+        # (2026-09-10). The value is still validated (low|medium|high).
+        _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
@@ -113,7 +120,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "verbosity",
                 "web_search_options",
             )
         ),

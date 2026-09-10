@@ -58,6 +58,9 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["truncation"] == CompatibilityDisposition.SUPPORTED
     assert responses["prompt_cache_options"] == CompatibilityDisposition.SUPPORTED
     assert chat["logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    # Chat verbosity is admitted (forwarded on native Responses rungs, dropped
+    # with disclosure elsewhere); opencode sends it on every request.
+    assert chat["verbosity"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED

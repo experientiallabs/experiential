@@ -2909,6 +2909,34 @@ def test_client_metadata_and_verbosity_forward_native_and_disclose_elsewhere() -
     assert provider.text_verbosity is None
 
 
+def test_chat_verbosity_forwards_native_responses_and_discloses_elsewhere() -> None:
+    """Chat ``verbosity`` (opencode sends it unconditionally) rides a native
+    Responses rung as ``text.verbosity``; on any other rung it is dropped with a
+    disclosure under the caller's Chat spelling, never a 400."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        text_verbosity="low",
+        stream=True,
+        include_usage=True,
+    )
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    compatible = GatewayWireProfile(dialect="openai_compatible", url="https://deepseek.test")
+
+    public, provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    assert provider.text_verbosity == "low"
+    payload = openai_responses_stream_payload("gpt-5.6-luna", provider, supports_temperature=False)
+    assert payload["text"] == {"verbosity": "low"}
+
+    public, provider = route_generation_parameter_requests((compatible,), request)
+    assert public.ignored_parameters == ("verbosity",)
+    assert provider.text_verbosity is None
+    payload = openai_compatible_stream_payload("deepseek-flash", provider)
+    assert "verbosity" not in payload
+    assert "text" not in payload
+
+
 def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere() -> None:
     """The conditional Claude Code carriers ride Anthropic rungs verbatim
     with their required beta tokens merged into one header; a route with

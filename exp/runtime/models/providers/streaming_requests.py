@@ -547,9 +547,10 @@ def route_generation_parameter_requests(
         if not (effort_only and request.reasoning_effort is not None):
             ignore("provider_output_config", "output_config")
 
-    # Client telemetry and the verbosity hint are native Responses surface;
+    # Client telemetry and the verbosity hint are native Responses wire;
     # elsewhere they are dropped with disclosure (Codex sends both by
-    # default), never a rejection.
+    # default, opencode sends Chat ``verbosity`` on every request), never a
+    # rejection. The disclosure names the caller's own spelling of the field.
     if request.client_metadata is not None and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
@@ -557,7 +558,12 @@ def route_generation_parameter_requests(
     if request.text_verbosity is not None and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
-        ignore("text_verbosity", "text.verbosity")
+        ignore(
+            "text_verbosity",
+            "verbosity"
+            if request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+            else "text.verbosity",
+        )
 
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a

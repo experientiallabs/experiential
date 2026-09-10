@@ -242,6 +242,7 @@ def decode_chat(
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
             service_tier=request.service_tier,
+            text_verbosity=request.verbosity,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )

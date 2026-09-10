@@ -187,7 +187,8 @@ A caller `anthropic-beta` header forwards through an exact token allowlist (nota
 `context-1m-2025-08-07`, which activates the provider's 1M context window; without it the
 provider serves 200K); non-allowlisted tokens drop with a per-token
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
-and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
+and drop with disclosure elsewhere (Chat `verbosity` is the same hint under its Chat spelling: forwarded on native
+Responses rungs, disclosed-dropped on every other rung, never rejected — opencode sends it unconditionally); Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
 declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
 `tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
