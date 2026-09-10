@@ -1972,6 +1972,143 @@ def test_the_captured_codex_reasoning_echo_with_null_content_decodes() -> None:
     assert carrier[0].encrypted_content == "gAAAAABfixture"
 
 
+def _named(param: str, message: str) -> tuple[str, str]:
+    """Build the (param, message) pair one rejection is expected to carry."""
+    return param, message
+
+
+def test_numeric_bound_rejections_state_the_bound_not_only_the_field() -> None:
+    """An out-of-range control names its limit instead of a bare field path.
+
+    Customer-facing surfaces read these messages directly, and a bare
+    ``Invalid value for 'temperature'.`` forces the caller to bisect the
+    ceiling out of the rejection (the same problem the over-long description
+    bound was fixed for).
+    """
+    for decoder, payload, expected in (
+        (
+            decode_chat,
+            {"model": "coding", "messages": [{"role": "user", "content": "hi"}], "temperature": 5},
+            _named("temperature", "Invalid value for 'temperature': expected at most 2."),
+        ),
+        (
+            decode_chat,
+            {"model": "coding", "messages": [{"role": "user", "content": "hi"}], "top_p": 3},
+            _named("top_p", "Invalid value for 'top_p': expected at most 1."),
+        ),
+        (
+            decode_chat,
+            {"model": "coding", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 0},
+            _named("max_tokens", "Invalid value for 'max_tokens': expected greater than 0."),
+        ),
+        (
+            decode_chat,
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "presence_penalty": -9,
+            },
+            _named(
+                "presence_penalty",
+                "Invalid value for 'presence_penalty': expected at least -2.",
+            ),
+        ),
+        (
+            decode_responses,
+            {"model": "coding", "input": "hi", "max_output_tokens": 0},
+            _named(
+                "max_output_tokens",
+                "Invalid value for 'max_output_tokens': expected greater than 0.",
+            ),
+        ),
+        (
+            decode_responses,
+            {"model": "coding", "input": "hi", "top_k": -1},
+            _named("top_k", "Invalid value for 'top_k': expected at least 0."),
+        ),
+    ):
+        with pytest.raises(OpenAIProtocolError) as raised:
+            decoder(payload)
+        assert (raised.value.detail.param, raised.value.detail.message) == expected
+
+
+def test_boolean_and_short_list_rejections_name_the_expected_shape() -> None:
+    """A wrong boolean and an empty message list state what was expected."""
+    with pytest.raises(OpenAIProtocolError) as boolean:
+        decode_responses({"model": "coding", "input": "hi", "store": "x"})
+    assert boolean.value.detail.param == "store"
+    assert boolean.value.detail.message == (
+        "Invalid value for 'store': expected a boolean, but got a string instead."
+    )
+
+    with pytest.raises(OpenAIProtocolError) as empty:
+        decode_chat({"model": "coding", "messages": []})
+    assert empty.value.detail.param == "messages"
+    assert empty.value.detail.message == (
+        "Invalid value for 'messages': expected at least 1 entry, but got 0."
+    )
+
+
+def test_unknown_item_type_names_the_type_selector_not_a_sibling_field() -> None:
+    """An unknown item ``type`` names the tag field and the accepted tags.
+
+    Pydantic reports the union miss at the item's own location and then adds a
+    speculative complaint from the arm it tried first (``input.0.role``), naming
+    a field the caller never sent. The tag diagnosis is the caller's real
+    mistake, so it wins and its path names the ``type`` selector itself.
+    """
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses({"model": "coding", "input": [{"type": "bogus"}]})
+    assert raised.value.detail.param == "input.0.type"
+    assert raised.value.detail.message.startswith(
+        "Invalid value for 'input.0.type': expected one of 'function_call', 'function_call_output'"
+    )
+
+
+def test_unknown_content_part_type_names_the_part_selector() -> None:
+    """A bad content-part ``type`` names that part's selector and its options."""
+    with pytest.raises(OpenAIProtocolError) as chat:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": [{"type": "image", "image_url": "u"}]}],
+            }
+        )
+    assert chat.value.detail.param == "messages.0.content.0.type"
+    assert chat.value.detail.message == (
+        "Invalid value for 'messages.0.content.0.type': expected one of 'text', "
+        "'input_text', 'output_text', 'image_url', 'input_image', 'video_url', "
+        "'input_audio', 'file', 'input_file'."
+    )
+
+    with pytest.raises(OpenAIProtocolError) as missing:
+        decode_chat(
+            {"model": "coding", "messages": [{"role": "user", "content": [{"image_url": "u"}]}]}
+        )
+    assert missing.value.detail.param == "messages.0.content.0.type"
+    assert missing.value.detail.message == (
+        "Invalid value for 'messages.0.content.0.type': a type selector is required here."
+    )
+
+
+def test_undeclared_nested_keys_use_the_unknown_parameter_phrasing() -> None:
+    """A stray key inside a tool entry reads like the top-level rejection."""
+    with pytest.raises(OpenAIProtocolError) as chat:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"type": "function", "function": {"name": "t", "parameters": {}, "bogus": 1}}
+                ],
+            }
+        )
+    assert chat.value.detail.param == "tools.0.function.bogus"
+    assert chat.value.detail.message == (
+        "Unknown parameter 'tools.0.function.bogus'. Remove the field and resend the request."
+    )
+
+
 def test_decode_errors_name_the_expected_shape_against_the_arriving_type() -> None:
     """Union rejections say what shape the field expected and what arrived,
     at type level only, matching the provider's own error style."""
