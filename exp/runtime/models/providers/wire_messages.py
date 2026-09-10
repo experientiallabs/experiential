@@ -519,12 +519,15 @@ def openai_chat_message(
     caller may replay verbatim (an ``exposed_reasoning_content`` block); any
     other rung omits that block, which route narrowing already disclosed.
     ``deepseek_reasoning_history`` marks DeepSeek's own origin, whose thinking
-    mode 400s a tools request unless every assistant tool-call turn in the
-    history carries ``reasoning_content`` (presence checked, content not;
-    verified live 2026-09-10): caller plaintext forwards verbatim there without
-    the exposure stamp, and a tool-call turn with no reasoning block is
-    backfilled with an empty string. Non-tool turns are never backfilled (the
-    provider does not require it) and no other origin is touched.
+    mode 400s a tools request unless every assistant message of the CURRENT
+    turn (after the last user message, text-only messages that precede a
+    tool call included) carries ``reasoning_content`` (presence checked,
+    content not; verified live 2026-09-10): caller plaintext forwards verbatim
+    there without the exposure stamp, and EVERY assistant message with no
+    reasoning block (an absent field or an explicit null) is backfilled with
+    an empty string. An empty string is harmless on the turns the provider
+    exempts (earlier turns, tool-less requests), so the builder does not track
+    turn boundaries; no other origin is touched.
     """
     if message.role == "tool":
         tool_payload: JsonObject = {
@@ -581,12 +584,15 @@ def openai_chat_message(
         ):
             raise ProviderResponseError("reasoning carrier belongs to a different Chat route")
         payload["reasoning_content"] = block.content
-    elif deepseek_reasoning_history and message.role == "assistant" and message.tool_calls:
-        # DeepSeek's thinking mode rejects the whole request when a tool-call
-        # turn arrives without the field, and accepts an empty one exactly like
-        # real reasoning. Histories that started on another provider, or that
-        # an OpenAI-compatible SDK re-serialized without the extension field,
-        # arrive this way on every turn of an agent loop.
+    elif deepseek_reasoning_history and message.role == "assistant":
+        # DeepSeek's thinking mode rejects the whole request when any assistant
+        # message of the current turn arrives without the field — a text-only
+        # message before the tool call included (0.7.61 backfilled tool-call
+        # turns alone and the "text turn, then tool-call turn" agent shape
+        # still 400'd in production) — and accepts an empty one exactly like
+        # real reasoning, on exempt turns too. Histories that started on
+        # another provider, or that an OpenAI-compatible SDK re-serialized
+        # without the extension field, arrive this way on every turn.
         payload["reasoning_content"] = ""
     return payload
 

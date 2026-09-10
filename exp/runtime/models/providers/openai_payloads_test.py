@@ -18,6 +18,7 @@ from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
+from exp.runtime.openai_protocol.requests import decode_chat
 
 
 def _developer_conversation() -> GatewayRequest:
@@ -201,15 +202,15 @@ def _assistant_turns(payload: JsonObject) -> list[JsonObject]:
     return [message for message in messages if message["role"] == "assistant"]
 
 
-def test_deepseek_origin_backfills_empty_reasoning_on_tool_call_turns_only() -> None:
-    """A tool-call turn with no reasoning gets ``reasoning_content: ""``; text turns do not.
+def test_deepseek_origin_backfills_empty_reasoning_on_every_assistant_turn() -> None:
+    """Every assistant message with no reasoning gets ``reasoning_content: ""``, text turns too.
 
     DeepSeek's thinking mode 400s a tools request unless every assistant
-    tool-call turn carries the field (``The `reasoning_content` in the thinking
-    mode must be passed back to the API.``) and accepts an empty string exactly
-    like real reasoning (verified live 2026-09-10). The final text turn is left
-    alone: the provider does not require the field there and the wire stays
-    minimal.
+    message of the current turn carries the field (``The `reasoning_content`
+    in the thinking mode must be passed back to the API.``) and accepts an
+    empty string exactly like real reasoning, on exempt turns included
+    (verified live 2026-09-10). The builder does not track turn boundaries:
+    the empty string is harmless where the provider does not require it.
     """
     payload = openai_compatible_stream_payload(
         "deepseek-flash", _agent_loop(reasoning=(None, None, None)), deepseek_reasoning_history=True
@@ -218,7 +219,62 @@ def test_deepseek_origin_backfills_empty_reasoning_on_tool_call_turns_only() -> 
     assert first_call["tool_calls"] and first_call["reasoning_content"] == ""
     assert second_call["tool_calls"] and second_call["reasoning_content"] == ""
     assert "tool_calls" not in final_text
-    assert "reasoning_content" not in final_text
+    assert final_text["reasoning_content"] == ""
+
+
+def test_deepseek_origin_backfills_a_text_message_before_a_tool_call_and_an_explicit_null() -> None:
+    """The residual production shape: a text-only assistant message, then a tool-call one.
+
+    0.7.61 backfilled tool-call turns alone; DeepSeek still 400'd
+    ``text-asst(no rc) + toolcall-asst(rc "") + tool`` (org cc2023new's agent
+    emits a text message and then a tool-call message in one turn). An
+    explicit ``reasoning_content: null`` on the wire decodes to no block and
+    is backfilled exactly like an absent field.
+    """
+    decoded = decode_chat(
+        {
+            "model": "deepseek-flash",
+            "messages": [
+                {"role": "user", "content": "read a.txt"},
+                {"role": "assistant", "content": "Let me read it.", "reasoning_content": None},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_foreign_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_foreign_1", "content": "hello"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read one file.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        }
+    )
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash", decoded.request, deepseek_reasoning_history=True
+    )
+    text_message, tool_call_message = _assistant_turns(payload)
+    assert text_message["content"] == "Let me read it."
+    assert text_message["reasoning_content"] == ""
+    assert tool_call_message["tool_calls"] and tool_call_message["reasoning_content"] == ""
+    # Off the DeepSeek origin the same request is untouched.
+    generic = openai_compatible_stream_payload("deepseek-v4-flash", decoded.request)
+    assert all("reasoning_content" not in turn for turn in _assistant_turns(generic))
 
 
 def test_deepseek_origin_forwards_caller_reasoning_verbatim_without_the_exposure_stamp() -> None:
@@ -239,8 +295,13 @@ def test_deepseek_origin_forwards_caller_reasoning_verbatim_without_the_exposure
     assert final_text["reasoning_content"] == "Both files are read."
 
 
-def test_deepseek_origin_leaves_a_history_with_no_tool_calls_untouched() -> None:
-    """A plain conversation on the DeepSeek origin gets no injected field at all."""
+def test_deepseek_origin_backfills_a_tool_less_conversation_harmlessly() -> None:
+    """A plain conversation on the DeepSeek origin is backfilled too.
+
+    DeepSeek accepts ``reasoning_content: ""`` on a request with no tools
+    (verified live), so one rule covers every shape and the builder never has
+    to know whether a later turn will add tools.
+    """
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(
@@ -255,7 +316,7 @@ def test_deepseek_origin_leaves_a_history_with_no_tool_calls_untouched() -> None
         "deepseek-flash", request, deepseek_reasoning_history=True
     )
     (assistant,) = _assistant_turns(payload)
-    assert assistant == {"role": "assistant", "content": "hello"}
+    assert assistant == {"role": "assistant", "content": "hello", "reasoning_content": ""}
 
 
 def test_other_compatible_origins_keep_the_exposure_gated_behaviour() -> None:
