@@ -524,3 +524,36 @@ def test_tokenhub_intl_rung_resolves_a_carrier_route_and_exposes_when_declared()
     ).gateway_wire_profile()
     assert profile.hunyuan_reasoning_route_sha256 is not None
     assert profile.reasoning_output_exposed is True
+
+
+def test_deepseek_origin_replays_reasoning_history_without_the_exposure_stamp() -> None:
+    """DeepSeek's own API is a reasoning-HISTORY route by origin, not by catalog stamp.
+
+    Its thinking mode requires ``reasoning_content`` on every assistant tool-call
+    turn (400 otherwise), so the flag is derived from the base URL alone. Output
+    exposure stays the catalog's decision: an unstamped rung still hides the
+    deltas, and the rung is not a sealed-carrier route either.
+    """
+    for base_url in ("https://api.deepseek.com/v1", "https://api.deepseek.com"):
+        profile = OpenAICompatibleClient(
+            model=_snapshot(model_id="deepseek-flash"),
+            base_url=base_url,
+            api_key="fake-key",
+        ).gateway_wire_profile()
+        assert profile.deepseek_reasoning_history is True
+        assert profile.replays_plaintext_reasoning is True
+        assert profile.reasoning_output_exposed is False
+        assert profile.hunyuan_reasoning_route_sha256 is None
+        assert profile.fireworks_reasoning_route_sha256 is None
+
+
+def test_deepseek_reasoning_history_is_off_for_every_other_compatible_origin() -> None:
+    """Hunyuan and generic shims never backfill: an unknown field is a 400 on strict servers."""
+    for base_url in (_HUNYUAN_BASE_URL, "https://openrouter.ai/api/v1", "https://example.test/v1"):
+        profile = OpenAICompatibleClient(
+            model=_snapshot(model_id="deepseek-v4-flash"),
+            base_url=base_url,
+            api_key="fake-key",
+        ).gateway_wire_profile()
+        assert profile.deepseek_reasoning_history is False
+        assert profile.replays_plaintext_reasoning is False

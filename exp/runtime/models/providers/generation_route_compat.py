@@ -83,11 +83,11 @@ def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequ
     """Return whether a rung forwards the request's plaintext reasoning history.
 
     Replayed plaintext ``reasoning_content`` reaches the provider only on an
-    exposure-gated rung; any other rung serves the turn by dropping it (a
-    disclosed drop), so it is only a fallback behind a rung that carries it —
-    the same preference rule sampling controls follow.
+    exposure-gated rung or DeepSeek's own origin; any other rung serves the
+    turn by dropping it (a disclosed drop), so it is only a fallback behind a
+    rung that carries it — the same preference rule sampling controls follow.
     """
-    if profile.reasoning_output_exposed:
+    if profile.replays_plaintext_reasoning:
         return True
     return not any(
         block.kind == "exposed_reasoning_content"

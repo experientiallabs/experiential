@@ -666,17 +666,18 @@ def route_generation_parameter_requests(
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.
     # Plaintext reasoning an exposure-gated rung itself returned (Tencent/
-    # DeepSeek) replays only to rungs that expose their reasoning: the
-    # provider's wire accepts it verbatim there, and nowhere else was it ever
-    # issued. A route with no exposing rung rejects by name; a mixed waterfall
-    # keeps it on the exposing rungs and discloses the drop on the others.
+    # DeepSeek) replays only to rungs that replay plaintext: an exposing rung
+    # (the provider's wire accepts back what it issued) or DeepSeek's own
+    # origin, which requires the field on tool-call history whether or not
+    # its output is exposed. A mixed waterfall keeps it on those rungs and
+    # discloses the drop on the others.
     exposed_reasoning_present = any(
         block.kind == "exposed_reasoning_content"
         for message in request.messages
         for block in message.provider_reasoning
     )
     if exposed_reasoning_present and not all(
-        profile.reasoning_output_exposed for profile in profiles
+        profile.replays_plaintext_reasoning for profile in profiles
     ):
         # Plaintext reasoning is baked into the caller's transcript (an
         # earlier turn on a reasoning-exposed rung, or a client-side AI-SDK
