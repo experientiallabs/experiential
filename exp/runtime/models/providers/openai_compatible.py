@@ -462,8 +462,17 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
         reasoning_output_exposed: bool = False,
+        reasoning_content_native: bool = False,
     ) -> None:
-        """Create one compatible client with explicit model wire capabilities."""
+        """Create one compatible client with explicit model wire capabilities.
+
+        ``reasoning_content_native`` declares that this origin returns the
+        model's chain-of-thought in the standard ``reasoning_content`` field and
+        accepts it back on assistant turns, so the rung is a preserved-thinking
+        carrier route whatever its hostname (a self-hosted vLLM origin with a
+        reasoning parser). Tencent's own origins carry that contract by
+        recognition and need no declaration.
+        """
         super().__init__(
             model=model,
             api_key=api_key,
@@ -486,12 +495,18 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._fireworks_reasoning_route_sha256 = (
             reasoning_content_route_sha256(model) if is_fireworks_base_url(self._base_url) else None
         )
-        # Tencent Hunyuan returns the model's plaintext reasoning natively and
-        # accepts it back; the gateway exposes it for display and round-trips it
-        # through a domain-separated opaque carrier, so this rung is both a
-        # carrier route and an exposed-plaintext route.
+        # A native ``reasoning_content`` origin returns the model's plaintext
+        # reasoning and accepts it back; the gateway exposes it for display and
+        # round-trips it through a domain-separated opaque carrier, so this rung
+        # is both a carrier route and an exposed-plaintext route. Tencent's own
+        # origins are recognized by host; any other origin declares the contract
+        # per rung. Fireworks keeps its own carrier and wire flag, so the
+        # declaration never doubles a Fireworks rung's route.
+        self._reasoning_content_native = (
+            is_hunyuan_base_url(self._base_url) or reasoning_content_native
+        ) and self._fireworks_reasoning_route_sha256 is None
         self._hunyuan_reasoning_route_sha256 = (
-            reasoning_content_route_sha256(model) if is_hunyuan_base_url(self._base_url) else None
+            reasoning_content_route_sha256(model) if self._reasoning_content_native else None
         )
         # DeepSeek's own API enforces reasoning_content on every assistant
         # message of the current turn in thinking mode (400 otherwise); both the
@@ -535,9 +550,11 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             deepseek_reasoning_history=self._deepseek_reasoning_history,
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
-            # 2026-09-05). Other compatible servers may reject unknown fields,
+            # 2026-09-05), and a declared native-reasoning origin (vLLM) allows
+            # and ignores unknown request fields, so the hint rides every
+            # carrier rung. Other compatible servers may reject unknown fields,
             # so the hint stays off them, BYOK or not.
-            forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
+            forwards_prompt_cache_key=self._reasoning_content_native,
         )
 
     def _completion_path(self) -> str:

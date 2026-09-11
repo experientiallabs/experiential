@@ -612,3 +612,77 @@ def test_deepseek_client_builds_buffered_requests_with_the_backfill_from_its_ori
     )
     generic_messages = cast("list[JsonObject]", generic._build_request(_request())["messages"])
     assert "reasoning_content" not in generic_messages[2]
+
+
+_NATIVE_REASONING_ORIGIN = "https://hy4-preview--serve.modal.run/v1"
+
+
+def test_reasoning_content_native_rung_resolves_a_carrier_route_on_any_origin() -> None:
+    """The catalog flag, not the hostname, makes a rung a preserved-thinking route.
+
+    A self-hosted vLLM origin serving hy4-preview with ``--reasoning-parser``
+    returns the standard ``reasoning_content`` field and accepts it back, so a
+    rung declaring ``reasoning_content_native`` resolves the Hunyuan carrier
+    route, exposes plaintext when the exposure capability is declared, and
+    pins its prefix cache with ``prompt_cache_key`` (vLLM allows and ignores
+    unknown request fields).
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.fireworks_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is True
+    assert profile.forwards_prompt_cache_key is True
+
+
+def test_reasoning_content_native_rung_without_exposure_keeps_its_carrier_but_stays_stripped() -> (
+    None
+):
+    """Exposure still fails closed per rung on a flagged origin."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is False
+
+
+def test_an_unflagged_arbitrary_origin_stays_stripped_and_unpinned() -> None:
+    """Without the flag an unknown origin gets no carrier, no exposure, no cache hint."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is False
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_the_flag_matches_the_tencent_hosts_route_identity_for_one_model() -> None:
+    """A flagged origin and the Tencent host derive the same model-keyed route identity.
+
+    The carrier's route binding is the model's identity, so the same model
+    self-hosted resolves the same route digest the Tencent lane does; the
+    carrier domain stays the Hunyuan scheme either way.
+    """
+    flagged = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    tencent = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert flagged.hunyuan_reasoning_route_sha256 == tencent.hunyuan_reasoning_route_sha256

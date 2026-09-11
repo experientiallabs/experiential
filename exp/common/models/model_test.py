@@ -118,6 +118,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "reasoning_effort": None,
         "sampling_requires_reasoning_none": False,
         "reasoning_output_exposed": False,
+        "reasoning_content_native": False,
         "chat_max_tokens_field": None,
         "minimum_temperature": None,
         "maximum_temperature": None,
@@ -434,3 +435,12 @@ def test_generation_parameter_contract_rejects_inverted_ranges() -> None:
         ModelCapabilities(minimum_top_k=10, maximum_top_k=5)
     with pytest.raises(ValidationError, match="conditional sampling requires reasoning support"):
         ModelCapabilities(sampling_requires_reasoning_none=True)
+
+
+def test_reasoning_content_native_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The native reasoning_content declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().reasoning_content_native is False
+    assert (
+        ModelCapabilities(reasoning_content_native=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )

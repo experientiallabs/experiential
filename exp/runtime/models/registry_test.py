@@ -24,6 +24,7 @@ from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
 from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.azure import AzureClient
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSample,
@@ -524,3 +525,26 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
 
     with pytest.raises(ModelConnectionError, match="uv sync --extra sft"):
         catalog.resolve("fixture-model")
+
+
+def test_resolution_threads_reasoning_content_native_to_compatible_rungs() -> None:
+    """A flagged openai-compatible rung on any origin resolves a preserved-thinking route."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://hy4-preview--serve.modal.run/v1",
+            capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_output_exposed=True,
+                reasoning_content_native=True,
+            ),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is True
+    assert profile.forwards_prompt_cache_key is True
