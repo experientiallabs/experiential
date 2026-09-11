@@ -615,9 +615,11 @@ async fn stream_messages(
                 other => other.clone(),
             };
             if event.is_terminal() {
-                if matches!(event, Event::Completed) {
-                    // Mirrors the Chat stream: a completed tool turn with
-                    // hidden reasoning is sealed before its terminal frames.
+                if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {
+                    // Mirrors the Chat stream: a tool turn with hidden
+                    // reasoning is sealed before its terminal frames on both
+                    // terminals the encoder requires a carrier for (a stop
+                    // sequence ends the turn as legitimately as a plain stop).
                     let candidate = match encoder.reasoning_carrier_candidate() {
                         Ok(candidate) => candidate,
                         Err(_) => {
