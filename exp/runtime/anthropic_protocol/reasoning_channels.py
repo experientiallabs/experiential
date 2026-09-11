@@ -109,7 +109,7 @@ def output_config_effort(config: JsonObject | None) -> ReasoningEffort | None:
 def resolve_reasoning_channels(
     reasoning: ReasoningConfig | None,
     *,
-    max_tokens: int,
+    max_tokens: int | None,
     thinking: JsonObject | None,
     output_config: JsonObject | None,
 ) -> ReasoningChannels:
@@ -138,7 +138,9 @@ def resolve_reasoning_channels(
 
     Args:
         reasoning: The validated OpenRouter object, or ``None`` when absent.
-        max_tokens: The caller's reply ceiling, which a budget must stay below.
+        max_tokens: The caller's reply ceiling, which a budget must stay below;
+            ``None`` for a ``count_tokens`` body, which has no reply to leave
+            room for.
         thinking: The caller's raw ``thinking`` object, byte-for-byte.
         output_config: The caller's raw ``output_config`` object, byte-for-byte.
 
@@ -163,7 +165,7 @@ def resolve_reasoning_channels(
         effort = None
         resolved_thinking: JsonObject | None = _THINKING_DISABLED
     elif reasoning.max_tokens is not None:
-        if reasoning.max_tokens >= max_tokens:
+        if max_tokens is not None and reasoning.max_tokens >= max_tokens:
             raise invalid_field(
                 "reasoning.max_tokens",
                 "reasoning.max_tokens must be below max_tokens so the reply has room "

@@ -51,6 +51,12 @@ pub(crate) struct Admission {
     /// the flag (default false) and never invoke that callback.
     #[serde(default)]
     pub output_guardrail: bool,
+    /// The control plane's pre-dispatch count of the prompt (the reservation
+    /// estimator without its headroom). Messages admissions carry it so the
+    /// caller's `message_start` shows a real input figure when the upstream
+    /// reports nothing before its final chunk; display-only, never settled.
+    #[serde(default)]
+    pub input_token_estimate: Option<u64>,
 }
 
 impl Admission {

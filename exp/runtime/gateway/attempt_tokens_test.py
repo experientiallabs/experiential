@@ -31,6 +31,7 @@ from exp.runtime.gateway.attempt_tokens import (
     TOOLS_PRESENT_TOKENS,
     VIDEO_BYTES_PER_TOKEN,
     VIDEO_TOKENS,
+    counted_input_tokens,
     worst_case_input_tokens,
 )
 from exp.runtime.gateway.contracts import (
@@ -650,3 +651,20 @@ def test_encoder_is_loaded_once_and_the_estimate_stays_cheap() -> None:
         worst_case_input_tokens(request)
     per_call = (time.perf_counter() - started) / 5
     assert per_call < 0.25
+
+
+def test_counted_input_tokens_is_the_estimate_before_headroom() -> None:
+    """The start-frame / count_tokens figure is the counted prompt, not the reservation.
+
+    The reservation adds ``INPUT_TOKEN_HEADROOM_PERCENT`` on top so caps are
+    not leaked past; a figure shown to the caller as their input count must be
+    the counted prompt itself, so the two differ by exactly the headroom.
+    """
+    request = _chat((GatewayMessage(role="user", content="Hello, world!"),))
+    counted = counted_input_tokens(request)
+    assert counted == 4 + MESSAGE_FRAMING_TOKENS
+    assert (
+        worst_case_input_tokens(request)
+        == (counted * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
+    )
+    assert counted < worst_case_input_tokens(request)

@@ -5664,3 +5664,46 @@ def test_anthropic_signed_thinking_drops_with_disclosure_on_a_foreign_route(
     messages = _payload_messages(admitted)
     assert messages[1]["content"] == "prior answer"
     assert "reasoning_content" not in messages[1]
+
+
+def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> None:
+    """``count_tokens`` answers Anthropic's shape from the counted prompt and writes no row.
+
+    The count is the gateway's own tokenizer estimate (there is no Anthropic
+    tokenizer authority for a foreign rung), disclosed through the shared
+    ignored-parameters body field, and it never accepts a request or reserves
+    an attempt: the usage report stays empty.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    # Anthropic's count body carries no max_tokens (Claude Code sends
+    # model + messages + system + tools).
+    body = json.dumps(
+        {"model": "coding", "messages": [{"role": "user", "content": "Hello, world!"}]}
+    )
+    counted = json.loads(control.count_tokens(json.dumps({"raw_key": raw_key, "body": body})))
+    assert isinstance(counted["input_tokens"], int)
+    assert counted["input_tokens"] > 0
+    assert counted["x-experiential-ignored-parameters"] == [
+        "input_tokens->estimated(gateway_tokenizer)"
+    ]
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 0
+
+    with pytest.raises(NativeBridgeError) as ungranted:
+        control.count_tokens(
+            json.dumps(
+                {
+                    "raw_key": raw_key,
+                    "body": json.dumps(
+                        {"model": "not-granted", "messages": [{"role": "user", "content": "x"}]}
+                    ),
+                }
+            )
+        )
+    assert json.loads(ungranted.value.public_error_json)["status_code"] == 404
+
+    with pytest.raises(NativeBridgeError) as malformed:
+        control.count_tokens(
+            json.dumps({"raw_key": raw_key, "body": json.dumps({"model": "coding"})})
+        )
+    assert json.loads(malformed.value.public_error_json)["status_code"] == 400

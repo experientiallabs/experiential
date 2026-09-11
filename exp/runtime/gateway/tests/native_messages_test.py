@@ -959,6 +959,16 @@ def test_streaming_message_emits_the_full_anthropic_lifecycle(
         "output_tokens": 4,
         "cache_read_input_tokens": 2,
     }
+    # An OpenAI-wire upstream reports nothing before its final chunk, so the
+    # start frame carries the gateway's pre-dispatch prompt estimate (what a
+    # client that reads input from message_start, e.g. Claude Code, shows)
+    # with Anthropic's ``output_tokens: 1`` placeholder; the authoritative
+    # meters stay on message_delta above and are what the ledger bills.
+    message_start = next(payload for payload in payloads if payload["type"] == "message_start")
+    start_usage = message_start["message"]["usage"]
+    assert start_usage["output_tokens"] == 1
+    assert isinstance(start_usage["input_tokens"], int) and start_usage["input_tokens"] > 0
+    assert "cache_read_input_tokens" not in start_usage
 
 
 def test_tool_calls_translate_to_tool_use_blocks(engine: _ServingEngine) -> None:
@@ -1009,14 +1019,68 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     assert unknown_field.json()["error"]["type"] == "invalid_request_error"
     assert "unknown_field" in unknown_field.json()["error"]["message"]
 
-    count_tokens = httpx.post(
+    malformed_count = httpx.post(
         f"{engine.base}/v1/messages/count_tokens",
         headers={"x-api-key": engine.raw_key},
         json={},
         timeout=10.0,
     )
-    assert count_tokens.status_code == 404
-    assert count_tokens.json()["error"]["type"] == "not_found_error"
+    assert malformed_count.status_code == 400
+    assert malformed_count.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_count_tokens_answers_anthropic_shape_from_the_gateway_estimate(
+    engine: _ServingEngine,
+) -> None:
+    """``POST /v1/messages/count_tokens`` counts the prompt without a ledger row.
+
+    Anthropic's shape (``{"input_tokens": N}``) with the gateway's own
+    tokenizer estimate for a foreign rung, disclosed through the shared body
+    field; an ungranted alias answers the same no-oracle 404 as the model
+    listing; an unknown key answers 401 in the Anthropic envelope.
+    """
+
+    def counted_requests() -> int:
+        report = httpx.get(
+            f"{engine.base}/usage.json", headers={"x-api-key": engine.raw_key}, timeout=10.0
+        ).json()
+        return int(report["totals"]["requests"])
+
+    before = counted_requests()
+    # Anthropic's count body carries no max_tokens.
+    count_body = {k: v for k, v in _messages_body("fast-token").items() if k != "max_tokens"}
+    counted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json=count_body,
+        timeout=10.0,
+    )
+    assert counted.status_code == 200, counted.text
+    body = counted.json()
+    assert isinstance(body["input_tokens"], int) and body["input_tokens"] > 0
+    assert body["x-experiential-ignored-parameters"] == [
+        "input_tokens->estimated(gateway_tokenizer)"
+    ]
+    # A count is a read: no request is accepted, reserved, or charged.
+    assert counted_requests() == before
+
+    ungranted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json={**count_body, "model": "not-granted"},
+        timeout=10.0,
+    )
+    assert ungranted.status_code == 404
+    assert ungranted.json()["error"]["type"] == "not_found_error"
+
+    bad_key = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": "exp_vk_invalid"},
+        json=_messages_body("fast-token"),
+        timeout=10.0,
+    )
+    assert bad_key.status_code == 401
+    assert bad_key.json()["error"]["type"] == "authentication_error"
 
 
 def test_native_serves_an_effort_on_a_reasoning_less_route_by_dropping_it(

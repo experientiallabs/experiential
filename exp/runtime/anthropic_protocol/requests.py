@@ -29,7 +29,6 @@ import json
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
@@ -58,6 +57,7 @@ from exp.runtime.anthropic_protocol.reasoning_channels import (
     ReasoningConfig,
     resolve_reasoning_channels,
 )
+from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
 from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -69,21 +69,9 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
-
-_REJECTED_BLOCK_HINTS = {
-    kind: (
-        f"{kind} blocks are not supported: the Anthropic Messages wire defines no "
-        f"{kind} content, so send {kind} on the Chat Completions surface"
-    )
-    for kind in ("video", "audio")
-}
-_REJECTED_TOOL_RESULT_BLOCK_HINTS = {
-    "document": "document blocks are not supported inside tool_result content",
-    **_REJECTED_BLOCK_HINTS,
-}
 
 
 class _TextBlock(AnthropicWireModel):
@@ -317,6 +305,18 @@ class _MessagesRequest(AnthropicWireModel):
     region set is an evolving provider surface."""
 
 
+class _CountTokensRequest(_MessagesRequest):
+    """The ``count_tokens`` body: a Messages body with no generation budget.
+
+    Anthropic's count endpoint takes the prompt-side fields (``model``,
+    ``messages``, ``system``, ``tools``, ``tool_choice``, ``thinking``) and
+    no ``max_tokens``; a body that carries one is still counted, since the
+    budget changes nothing about the prompt.
+    """
+
+    max_tokens: int | None = Field(default=None, gt=0)
+
+
 def decode_messages(
     payload: JsonObject,
     *,
@@ -340,8 +340,43 @@ def decode_messages(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
             The HTTP layer renders it in the Anthropic error envelope.
     """
+    return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+
+
+def decode_messages_count_tokens(
+    payload: JsonObject,
+    *,
+    anthropic_beta: str | None = None,
+) -> DecodedGatewayRequest:
+    """Decode one Anthropic ``count_tokens`` body for prompt counting.
+
+    Identical to :func:`decode_messages` except that ``max_tokens`` is
+    optional: Anthropic's count request carries only prompt-side fields, so
+    the canonical request has no output budget (``maximum_output_tokens`` is
+    ``None``) and is never dispatched, only counted.
+
+    Args:
+        payload: Parsed JSON request body.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+
+    Returns:
+        Public alias and the canonical request to count.
+
+    Raises:
+        OpenAIProtocolError: The body is invalid, unknown, or unsupported.
+    """
+    return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+
+
+def _decode(
+    payload: JsonObject,
+    wire: type[_MessagesRequest],
+    *,
+    anthropic_beta: str | None,
+) -> DecodedGatewayRequest:
+    """Validate ``payload`` against ``wire`` and build the canonical request."""
     _validate_manifest(payload)
-    request = _validate_wire(payload)
+    request = validate_wire(payload, wire)
     _require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
@@ -398,7 +433,9 @@ def decode_messages(
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
-            maximum_output_tokens_parameter="max_tokens",
+            maximum_output_tokens_parameter="max_tokens"
+            if request.max_tokens is not None
+            else None,
             stop=_stop_sequences(request.stop_sequences),
             temperature=request.temperature,
             top_p=request.top_p,
@@ -425,7 +462,7 @@ def decode_messages(
             provider_output_config=channels.output_config,
         )
     except ValidationError as exc:
-        raise _validation_error(exc.errors(include_url=False)[0]) from exc
+        raise validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
 
 
@@ -532,101 +569,6 @@ def _validate_manifest(payload: JsonObject) -> None:
         disposition = decisions.get(field)
         if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
             raise unsupported_field(field)
-
-
-def _validate_wire(payload: JsonObject) -> _MessagesRequest:
-    """Validate the strict wire model with a field-specific public error."""
-    try:
-        return _MessagesRequest.model_validate(payload)
-    except ValidationError as exc:
-        hint = _rejected_block_hint(payload)
-        if hint is not None:
-            param, message = hint
-            raise invalid_field(param, message) from exc
-        # A union miss reports one error PER ARM, and the first arm is the
-        # scalar one: naming it ("content.str: Input should be a valid
-        # string") misdirects a caller whose list merely held an unsupported
-        # block. The deepest location is the arm that actually matched the
-        # payload's shape, so its error names the offending element.
-        errors = exc.errors(include_url=False)
-        first = max(errors, key=lambda error: len(error["loc"]))
-        raise _validation_error(first) from exc
-
-
-def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
-    """Convert one Pydantic error location into a stable dotted field error.
-
-    The public message keeps the expected-vs-got shape: it names the field
-    and states what the decoder expected there (Pydantic's own expectation
-    text, which never echoes the caller's value), so a rejected request says
-    what to fix instead of only where it failed.
-    """
-    location = first["loc"]
-    cleaned: list[str] = []
-    for part in location:
-        text = str(part)
-        # Union arm labels in pydantic locations are noise for callers: wire
-        # model class names (private or public), scalar type names, and
-        # constrained-type spellings. Real wire fields are snake_case.
-        if isinstance(part, str) and (
-            part.startswith("_")
-            or "[" in text
-            or text[:1].isupper()
-            or text in ("str", "int", "float", "bool", "none", "list", "dict")
-        ):
-            continue
-        cleaned.append(text)
-    param = ".".join(cleaned) or "body"
-    if first["type"] == "extra_forbidden":
-        return invalid_field(
-            param,
-            f"Unknown parameter '{param}'. Remove the field and resend the request.",
-        )
-    if param == "body" and first["type"] == "value_error":
-        # A whole-request rule (such as the attachment count ceiling) has no
-        # field of its own, so its own wording is the only useful message.
-        return invalid_field(param, first["msg"].removeprefix("Value error, ") + ".")
-    return invalid_field(param, f"Invalid value for '{param}': {first['msg']}.")
-
-
-def _rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
-    """Return the field path and message for a known-but-unsupported block.
-
-    The path names the exact offending block (and, for a ``tool_result``, the
-    offending sub-block), so the caller is never sent to the union's string
-    arm for a list-shaped problem.
-    """
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return None
-    for message_index, message in enumerate(messages):
-        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
-            continue
-        for block_index, block in enumerate(cast(list[object], message["content"])):
-            if not isinstance(block, dict):
-                continue
-            block_object = cast(JsonObject, block)
-            param = f"messages.{message_index}.content.{block_index}"
-            hint = _REJECTED_BLOCK_HINTS.get(str(block_object.get("type")))
-            if hint is not None:
-                return param, hint
-            if block_object.get("type") == "tool_result" and isinstance(
-                block_object.get("content"), list
-            ):
-                for inner_index, inner in enumerate(cast(list[object], block_object["content"])):
-                    if not isinstance(inner, dict):
-                        continue
-                    inner_type = str(cast(JsonObject, inner).get("type"))
-                    inner_param = f"{param}.content.{inner_index}"
-                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(inner_type)
-                    if hint is not None:
-                        return inner_param, hint
-                    if inner_type not in ("text", "image"):
-                        return inner_param, (
-                            f"unsupported block type '{inner_type}' inside tool_result "
-                            "content; only text and image sub-blocks are supported."
-                        )
-    return None
 
 
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
