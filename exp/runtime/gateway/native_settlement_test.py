@@ -48,6 +48,37 @@ def test_usage_from_payload_handles_tokens_and_tool_names() -> None:
     assert complete.input_tokens == 10
     assert complete.output_tokens == 3
     assert complete.cached_input_tokens == 2
+    # A payload from a data plane that predates the write leg carries no
+    # key; the leg stays unknown instead of being approximated.
+    assert complete.cache_creation_input_tokens is None
+
+
+def test_usage_from_payload_carries_the_cache_write_leg() -> None:
+    """The settle payload's cache-write subset reaches GatewayUsage (gpt-5.6-luna shape)."""
+    luna_write_turn = _usage_from_payload(
+        {
+            "input_tokens": 9080,
+            "output_tokens": 32,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 9077,
+            "reasoning_tokens": 23,
+        },
+        [],
+    )
+    assert luna_write_turn is not None
+    assert luna_write_turn.cache_creation_input_tokens == 9077
+    read_turn = _usage_from_payload(
+        {
+            "input_tokens": 9080,
+            "output_tokens": 29,
+            "cached_input_tokens": 9077,
+            "cache_creation_input_tokens": None,
+            "reasoning_tokens": 20,
+        },
+        [],
+    )
+    assert read_turn is not None
+    assert read_turn.cache_creation_input_tokens is None
 
 
 def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:

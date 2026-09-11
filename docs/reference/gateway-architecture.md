@@ -330,8 +330,16 @@ month. Management and remaining-allocation reports are CLI surfaces only. There 
 dashboard.
 
 Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
-of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and settlement prices the
-subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
+of `output_tokens`, and `cached_input_tokens` (cache reads) and `cache_creation_input_tokens`
+(billed cache writes) are disjoint subsets of `input_tokens`, which is every prompt token billed at
+some rate (Anthropic and Bedrock report their cache legs beside a fresh-input count and are folded;
+OpenAI and Gemini totals already include them). Settlement prices each subset at its own rate and
+the remainder at the base rate. The write leg is carried only where the wire reports a positive
+count: Anthropic `cache_creation_input_tokens`, Bedrock `cacheWriteInputTokens`, and OpenAI's
+`cache_write_tokens` detail (`prompt_tokens_details` on Chat Completions, `input_tokens_details` on
+Responses; billed at 1.25x the input rate on GPT-5.6 and later, reported as zero on earlier models,
+absent on compatible relays). Gemini publishes none. `None` is priced as zero writes and never
+approximated from the fresh input. Wires that report reasoning outside
 their output total are folded by the native usage mappers before the counts leave the data plane:
 Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
 `output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own

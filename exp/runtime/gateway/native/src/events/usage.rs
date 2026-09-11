@@ -67,6 +67,14 @@ fn optional_usage_detail(
     }
 }
 
+/// Keep a cache-write leg only when it is positive: `Usage.cache_creation_input_tokens`
+/// is `None` for "no positive write count reported", whether the wire omits
+/// the field (relays that strip details, Gemini) or reports zero (a cache
+/// hit, or an OpenAI model that does not bill writes and reports `0`).
+fn positive_cache_write(count: Option<u64>) -> Option<u64> {
+    count.filter(|count| *count > 0)
+}
+
 /// Sum persistable legs into one ledger count. Individually persistable legs
 /// whose total is not are a provider contract violation, never a clamped or
 /// wrapped total.
@@ -114,6 +122,10 @@ fn fold_openai_shaped_reasoning(
 /// omitted object is unknown usage, while a malformed one fails the stream.
 /// `output_tokens_details.reasoning_tokens` folds into `output_tokens` when
 /// the provider's `total_tokens` shows it was reported additively.
+/// `input_tokens_details.cache_write_tokens` (the prompt-cache write leg
+/// OpenAI bills at a premium on GPT-5.6 and later; reported as `0` on models
+/// that do not bill writes) rides as `cache_creation_input_tokens` when
+/// positive. Both details are subsets of `input_tokens`.
 pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -147,7 +159,12 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
             "cached_tokens",
             "OpenAI cached_tokens",
         )?,
-        cache_creation_input_tokens: None,
+        cache_creation_input_tokens: positive_cache_write(optional_usage_detail(
+            object,
+            "input_tokens_details",
+            "cache_write_tokens",
+            "OpenAI cache_write_tokens",
+        )?),
         reasoning_tokens,
     }))
 }
@@ -156,6 +173,10 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
 /// instead of silently dropping token accounting.
 /// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
 /// when the provider's `total_tokens` shows it was reported additively.
+/// `prompt_tokens_details.cache_write_tokens` (OpenAI's billed cache-write
+/// leg, a subset of `prompt_tokens` like `cached_tokens`) rides as
+/// `cache_creation_input_tokens` when positive; compatible relays that omit
+/// the detail leave it unknown.
 pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     let object = value
         .as_object()
@@ -185,14 +206,21 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
             "cached_tokens",
             "cached_tokens",
         )?,
-        cache_creation_input_tokens: None,
+        cache_creation_input_tokens: positive_cache_write(optional_usage_detail(
+            object,
+            "prompt_tokens_details",
+            "cache_write_tokens",
+            "cache_write_tokens",
+        )?),
         reasoning_tokens,
     })
 }
 
 /// Parse Gemini `usageMetadata`: cached tokens are an input subset, absent
 /// counts are zero (`require_integer` parity), and `thoughtsTokenCount` stays
-/// unknown when omitted.
+/// unknown when omitted. Gemini publishes no cache-write count (implicit
+/// caching writes are free and explicit caches bill by storage time), so the
+/// write leg stays unknown rather than invented.
 ///
 /// Google defines thinking tokens as ADDITIVE to `candidatesTokenCount`
 /// (`totalTokenCount` = prompt + candidates + thoughts, and response pricing
@@ -238,11 +266,12 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
 }
 
 /// Parse Bedrock `metadata.usage`: cache read and write legs fold into total
-/// input, cached input reports the read leg, and absent counts are zero
-/// (`require_integer` parity). Legs and the folded total beyond the
-/// persistable ledger range are provider contract violations and fail the
-/// stream rather than reaching settlement as a value the ledger could never
-/// write. Converse bills a reasoning model's thinking inside `outputTokens`
+/// input, cached input reports the read leg, a positive write leg rides as
+/// `cache_creation_input_tokens` (Converse bills it at the provider's
+/// cache-write rate), and absent counts are zero (`require_integer` parity).
+/// Legs and the folded total beyond the persistable ledger range are provider
+/// contract violations and fail the stream rather than reaching settlement as
+/// a value the ledger could never write. Converse bills a reasoning model's thinking inside `outputTokens`
 /// and publishes no separate count, so `reasoning_tokens` stays unknown.
 pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
     let usage = value
@@ -268,7 +297,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "Bedrock outputTokens",
         )?),
         cached_input_tokens: Some(cache_read),
-        cache_creation_input_tokens: None,
+        cache_creation_input_tokens: positive_cache_write(Some(cache_write)),
         reasoning_tokens: None,
     })
 }

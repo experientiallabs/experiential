@@ -68,7 +68,8 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
     """Extract one served line's usage across the three provider wire shapes.
 
     Chat Completions bodies report ``prompt_tokens``/``completion_tokens`` with
-    ``prompt_tokens_details.cached_tokens`` and
+    ``prompt_tokens_details.cached_tokens`` (and, on GPT-5.6 and later, the
+    billed ``prompt_tokens_details.cache_write_tokens`` leg) and
     ``completion_tokens_details.reasoning_tokens``; Responses bodies report
     ``input_tokens``/``output_tokens`` with the ``input_tokens_details`` and
     ``output_tokens_details`` equivalents; Anthropic messages report
@@ -107,6 +108,11 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
     cached = _detail_count(
         usage, ("prompt_tokens_details", "input_tokens_details"), "cached_tokens"
     )
+    # OpenAI names its billed write leg inside the same details object as the
+    # read leg (GPT-5.6+; the synchronous normalizer reads the same key).
+    cache_write = _detail_count(
+        usage, ("prompt_tokens_details", "input_tokens_details"), "cache_write_tokens"
+    )
     reasoning = _detail_count(
         usage, ("completion_tokens_details", "output_tokens_details"), "reasoning_tokens"
     )
@@ -144,7 +150,7 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
         output_tokens=output_tokens,
         cached_input_tokens=cached,
         # Present only when nonzero, matching the synchronous normalizer.
-        cache_creation_input_tokens=cache_creation if cache_creation else None,
+        cache_creation_input_tokens=(cache_creation or cache_write) or None,
         reasoning_tokens=reasoning,
     )
 

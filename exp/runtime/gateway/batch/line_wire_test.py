@@ -494,3 +494,48 @@ def test_malformed_blocks_are_a_typed_rendering_failure() -> None:
             anthropic_result_body(
                 _line("/v1/chat/completions", _CHAT_BODY), unnamed, request_id="r", created_at=0.0
             )
+
+
+def test_openai_shaped_usage_carries_the_billed_cache_write_leg() -> None:
+    """OpenAI's `cache_write_tokens` detail (GPT-5.6+, billed at 1.25x input) rides as the
+    creation leg on both wire shapes, like the synchronous normalizer; a zero or absent detail
+    stays unknown rather than being approximated from the fresh input."""
+    chat = line_usage(
+        {
+            "usage": {
+                "prompt_tokens": 9080,
+                "completion_tokens": 5,
+                "total_tokens": 9085,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 9077},
+                "completion_tokens_details": {"reasoning_tokens": 5},
+            }
+        }
+    )
+    assert (chat.input_tokens, chat.cached_input_tokens, chat.cache_creation_input_tokens) == (
+        9080,
+        0,
+        9077,
+    )
+    responses = line_usage(
+        {
+            "usage": {
+                "input_tokens": 9080,
+                "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 9077},
+                "output_tokens": 29,
+                "output_tokens_details": {"reasoning_tokens": 20},
+                "total_tokens": 9109,
+            }
+        }
+    )
+    assert responses.cached_input_tokens == 9077
+    assert responses.cache_creation_input_tokens is None
+    with pytest.raises(ProviderResponseError, match="cache_write_tokens"):
+        line_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "prompt_tokens_details": {"cache_write_tokens": -1},
+                }
+            }
+        )

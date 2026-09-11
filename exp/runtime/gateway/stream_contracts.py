@@ -17,9 +17,16 @@ from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
 class GatewayUsage(ContractModel):
     """Normalized token counts and invoked tool names from one provider attempt.
 
-    Cached-input and reasoning counts are subsets of the total input and output counts when
-    present. They identify differently priced portions of those totals and must not be added a
-    second time by callers.
+    ``input_tokens`` is EVERY prompt token the provider bills at some rate: the native mappers fold
+    the wires that report cache legs beside a fresh-input count (Anthropic ``input_tokens`` +
+    ``cache_read_input_tokens`` + ``cache_creation_input_tokens``, Bedrock ``inputTokens`` +
+    ``cacheReadInputTokens`` + ``cacheWriteInputTokens``) and pass through the wires whose total
+    already includes them (OpenAI ``prompt_tokens`` / ``input_tokens``, Gemini
+    ``promptTokenCount``). ``cached_input_tokens`` (read leg) and ``cache_creation_input_tokens``
+    (write leg) are therefore disjoint subsets of ``input_tokens`` on every wire, and
+    ``reasoning_tokens`` a subset of ``output_tokens``. They identify differently priced portions
+    of those totals (fresh input = ``input - cached - creation``) and must not be added a second
+    time by callers.
 
     A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
     case both token totals remain unknown instead of being represented as zero.
@@ -29,9 +36,14 @@ class GatewayUsage(ContractModel):
     output_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    """Cache-write tokens inside the input total (Anthropic-only today),
-    present only when the provider reported a nonzero count; billing keeps
-    using the folded input total."""
+    """Billed cache-write tokens inside the input total, present only when the
+    provider reported a POSITIVE count: Anthropic ``cache_creation_input_tokens``
+    (5-minute + 1-hour legs), Bedrock ``cacheWriteInputTokens``, OpenAI
+    ``prompt_tokens_details.cache_write_tokens`` (Chat) /
+    ``input_tokens_details.cache_write_tokens`` (Responses; billed at 1.25x
+    input on GPT-5.6 and later). ``None`` means no positive count was reported
+    (a wire without one, or zero) and is priced as zero writes, never
+    approximated from the fresh input."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""

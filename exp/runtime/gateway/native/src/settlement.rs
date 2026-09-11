@@ -76,6 +76,10 @@ fn settle_argument(
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_input_tokens": usage.cached_input_tokens,
+            // The billed cache-write subset of input_tokens (see
+            // `events::Usage`); null when the wire reported no positive
+            // count, which the control plane prices as zero writes.
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
         })),
         "tool_names": tool_names,
@@ -464,6 +468,54 @@ mod tests {
             system_time_to_rfc3339(leap),
             "2020-02-29T00:00:00.000+00:00"
         );
+    }
+
+    #[test]
+    fn settle_argument_carries_the_cache_write_leg_beside_the_other_counts() {
+        // The control plane prices the write subset at the cache-write rate,
+        // so the settle payload names it; an unknown leg rides as null (the
+        // control plane's backward-compatible parse reads null as zero writes).
+        let with_write = Usage {
+            input_tokens: Some(9080),
+            output_tokens: Some(32),
+            cached_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(9077),
+            reasoning_tokens: Some(23),
+        };
+        let argument = settle_argument(
+            "req",
+            "att",
+            "completed",
+            Some(&with_write),
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+        );
+        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+        assert_eq!(parsed["usage"]["input_tokens"], json!(9080));
+        assert_eq!(parsed["usage"]["cached_input_tokens"], json!(0));
+        assert_eq!(parsed["usage"]["cache_creation_input_tokens"], json!(9077));
+        let without_write = Usage {
+            cache_creation_input_tokens: None,
+            ..with_write
+        };
+        let argument = settle_argument(
+            "req",
+            "att",
+            "completed",
+            Some(&without_write),
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+        );
+        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+        assert_eq!(parsed["usage"]["cache_creation_input_tokens"], Value::Null);
     }
 
     #[test]

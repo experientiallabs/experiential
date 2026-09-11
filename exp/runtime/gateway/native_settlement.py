@@ -257,6 +257,10 @@ def _usage_from_payload(
         input_tokens=_optional_count(payload.get("input_tokens")),
         output_tokens=_optional_count(payload.get("output_tokens")),
         cached_input_tokens=_optional_count(payload.get("cached_input_tokens")),
+        # The billed cache-write subset of input_tokens; absent or null (a
+        # wire without the count, or a pre-0.3.52 data plane) stays unknown
+        # and is priced as zero writes, never approximated.
+        cache_creation_input_tokens=_optional_count(payload.get("cache_creation_input_tokens")),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         tool_names=names,
     )

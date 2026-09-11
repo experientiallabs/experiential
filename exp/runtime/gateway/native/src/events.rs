@@ -35,15 +35,32 @@ use serde_json::Value;
 use crate::errors::Failure;
 
 /// Normalized token usage mirroring `GatewayUsage` semantics.
+///
+/// `input_tokens` is EVERY prompt token the provider bills at some rate:
+/// wires that report their cache legs beside a fresh-input count (Anthropic
+/// Messages `input_tokens` + `cache_read_input_tokens` +
+/// `cache_creation_input_tokens`, Bedrock Converse `inputTokens` +
+/// `cacheReadInputTokens` + `cacheWriteInputTokens`) are folded here, and
+/// wires whose total already includes them (OpenAI `prompt_tokens` /
+/// `input_tokens`, Gemini `promptTokenCount`) pass through. Both
+/// `cached_input_tokens` (read leg) and `cache_creation_input_tokens` (write
+/// leg) are therefore disjoint SUBSETS of `input_tokens` on every wire, and a
+/// consumer prices `input - cached - creation` as fresh input, the read leg at
+/// the cached rate and the write leg at the cache-write rate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     /// Cache-write tokens inside the input total, present only when the
-    /// provider reported a nonzero count (Anthropic-only today). The ledger
-    /// keeps billing the folded input total; this leg exists so callers see
-    /// their prompt being cached (Claude Code displays it).
+    /// provider reported a POSITIVE count: Anthropic `cache_creation_input_tokens`
+    /// (the sum of its 5-minute and 1-hour `cache_creation` legs), Bedrock
+    /// `cacheWriteInputTokens`, OpenAI `prompt_tokens_details.cache_write_tokens`
+    /// (Chat) / `input_tokens_details.cache_write_tokens` (Responses). `None`
+    /// covers both "the wire has no such count" (Gemini, relays that strip the
+    /// detail) and "reported zero", so settlement prices `None` as zero writes
+    /// and never approximates one. Rides the settle callback (`cache_creation_input_tokens`)
+    /// and the client usage blocks (Claude Code displays it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
