@@ -18,6 +18,7 @@ from exp.runtime.gateway.sqlite.migrations import (
 from exp.runtime.gateway.sqlite.nano_usd_migration import (
     MONEY_COLUMNS,
     NANO_USD_PER_MICRO_USD,
+    RATE_COLUMNS,
     nano_usd_column_name,
 )
 
@@ -33,6 +34,7 @@ def _replay_history(connection: sqlite3.Connection, *, upto: int) -> None:
 def test_every_v19_money_column_is_named_and_renamed_by_rule() -> None:
     """The column inventory is the migration's contract with the readers."""
     assert NANO_USD_PER_MICRO_USD == 1_000
+    assert len(RATE_COLUMNS) == 12 and all(column.endswith("_rate") for column in RATE_COLUMNS)
     for _table, columns in MONEY_COLUMNS:
         for column in columns:
             assert column.endswith("_micro_usd")
@@ -78,11 +80,17 @@ def _seed_v19_money_rows(path: Path, *, estimated_cost: int) -> None:
                 route_depth, deployment_id, provider, exact_model_id, pool_id,
                 catalog_sha256, state, started_at, budget_period_start,
                 estimated_cost_micro_usd, budget_reserved_micro_usd,
-                budget_settled_micro_usd, counterfactual_cost_micro_usd
+                budget_settled_micro_usd, counterfactual_cost_micro_usd,
+                input_rate, cached_input_rate, output_rate, reasoning_rate,
+                long_context_input_rate, long_context_output_rate,
+                preferred_input_rate, preferred_output_rate
             ) VALUES (
                 'att-1', 'req-1', 'org', 0, 0, 'deploy', 'provider', 'exact',
                 'pool', '{digest}', 'completed', 't', '2026-08-01T00:00:00+00:00',
-                {estimated_cost}, 9, 7, 5
+                {estimated_cost}, 9, 7, 5,
+                1000000, 100000, 2000000, NULL,
+                2500000, 15000000,
+                500000, 1000000
             );
             INSERT INTO gateway_attempts (
                 attempt_id, request_id, organization_id, attempt_ordinal,
@@ -168,6 +176,33 @@ def test_v20_migration_renames_every_money_column_to_nano_usd_and_scales_rows(
                 "FROM gateway_attempt_budget_charges WHERE attempt_id = 'att-1'"
             ).fetchone()
         ) == (None, 7_000)
+        # The frozen per-million rates (unit-free names, micro values at v19)
+        # are scaled with the amounts, NULL staying NULL.
+        assert tuple(
+            migrated.execute(
+                """
+                SELECT input_rate, cached_input_rate, output_rate, reasoning_rate,
+                       long_context_input_rate, long_context_cached_input_rate,
+                       long_context_output_rate, long_context_reasoning_rate,
+                       preferred_input_rate, preferred_cached_input_rate,
+                       preferred_output_rate, preferred_reasoning_rate
+                FROM gateway_attempts WHERE attempt_id = 'att-1'
+                """
+            ).fetchone()
+        ) == (
+            1_000_000_000,
+            100_000_000,
+            2_000_000_000,
+            None,
+            2_500_000_000,
+            None,
+            15_000_000_000,
+            None,
+            500_000_000,
+            None,
+            1_000_000_000,
+            None,
+        )
         # Every stored amount is still a typed integer (STRICT refuses a REAL).
         assert tuple(
             migrated.execute(
