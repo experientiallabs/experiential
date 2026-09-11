@@ -459,7 +459,6 @@ class BoundedInspect:
         """
         if max_inflight < 1:
             raise ValueError("max_inflight must be a positive integer")
-        self._max_inflight = max_inflight
         self._pool = _IsolationPool(max_inflight)
         self._lock = threading.Lock()
         self._abandoned: dict[str, set[Future[object]]] = {}

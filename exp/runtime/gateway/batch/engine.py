@@ -9,11 +9,9 @@ survives process restarts because all state lives behind the host's stores.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import secrets
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from exp.common.core.artifacts import JsonObject
@@ -492,21 +490,6 @@ class BatchEngine:
                 _LOGGER.exception("batch %s poll failed; will retry", job.batch_id)
         return advanced
 
-    async def run_poller(self, *, stop: asyncio.Event | None = None) -> None:
-        """Poll open jobs forever, until the optional stop event is set.
-
-        Run exactly one poller per job store; see the class contract.
-        """
-        while stop is None or not stop.is_set():
-            await self.poll_once()
-            if stop is None:
-                await asyncio.sleep(self._poll_interval)
-            else:
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=self._poll_interval)
-                except TimeoutError:
-                    continue
-
     async def _advance(self, job: BatchJob) -> None:
         """Move one open job forward: submit, poll, settle, or expire."""
         if job.status in TERMINAL_STATUSES:
@@ -760,6 +743,3 @@ class BatchEngine:
                 }
             )
         )
-
-
-PollerFactory = Callable[[BatchEngine], asyncio.Task[None]]

@@ -283,10 +283,6 @@ class NativeAttemptAccounting:
             else:
                 self._throttles_failed_over += 1
 
-    def mark_unhealthy(self) -> None:
-        """Latch an unhealthy state after a lost terminal accounting write."""
-        self._accounting_healthy = False
-
     def counters(self) -> tuple[int, int, int]:
         """Return sweep recoveries and registry size for the metrics snapshot."""
         with self._lock:

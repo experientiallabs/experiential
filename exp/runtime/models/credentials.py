@@ -14,8 +14,6 @@ from exp.common.auth import (
     ProviderAuthStore,
     ProviderAuthStoreError,
     StoredCredentialBinding,
-    StoredCredentialEndpointMismatch,
-    StoredCredentialStatus,
 )
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import ConnectionConfig
@@ -94,59 +92,6 @@ def lookup_connection_credential(
     if stored:
         return CredentialResolution(stored, "stored")
     return None
-
-
-def describe_connection_credential(
-    connection: ConnectionConfig,
-    *,
-    connection_id: str,
-    environment: Mapping[str, str] | None = None,
-    store: ProviderAuthStore | None = None,
-) -> StoredCredentialStatus:
-    """Return public credential metadata for one connection without the secret.
-
-    Args:
-        connection: Secret-free connection metadata.
-        connection_id: Exact catalog or gateway connection name.
-        environment: Optional mapping used instead of the process environment.
-        store: Optional credential store. When omitted, the platform user-data file is used.
-
-    Returns:
-        Connection identity, provider, source, and environment-variable name.
-    """
-    if connection.provider == "bedrock" and connection.api_key_env is None:
-        return StoredCredentialStatus(
-            connection_id=connection_id,
-            provider=connection.provider,
-            source="aws_chain",
-        )
-    try:
-        resolved = lookup_connection_credential(
-            connection,
-            connection_id=connection_id,
-            environment=environment,
-            store=store,
-        )
-    except StoredCredentialEndpointMismatch:
-        return StoredCredentialStatus(
-            connection_id=connection_id,
-            provider=connection.provider,
-            source="mismatch",
-            environment_variable=connection.api_key_env,
-        )
-    source: Literal["environment", "stored", "missing"]
-    if resolved is None:
-        source = "missing"
-    elif resolved.source == "environment":
-        source = "environment"
-    else:
-        source = "stored"
-    return StoredCredentialStatus(
-        connection_id=connection_id,
-        provider=connection.provider,
-        source=source,
-        environment_variable=connection.api_key_env,
-    )
 
 
 class MissingModelCredentialError(ModelCredentialError):
