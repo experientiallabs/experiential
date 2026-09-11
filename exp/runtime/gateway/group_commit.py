@@ -171,7 +171,7 @@ class GroupCommitAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
         reserved_input_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
@@ -186,7 +186,7 @@ class GroupCommitAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
             dispatch_reason: Optional policy-dispatch disclosure code.
@@ -202,7 +202,7 @@ class GroupCommitAttemptLedger:
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
                 reserved_input_tokens=reserved_input_tokens,
                 reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,
@@ -514,7 +514,7 @@ class SyncGroupCommitLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
         reserved_input_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
@@ -529,7 +529,7 @@ class SyncGroupCommitLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
             dispatch_reason: Optional policy-dispatch disclosure code.
@@ -545,7 +545,7 @@ class SyncGroupCommitLedger:
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
                 reserved_input_tokens=reserved_input_tokens,
                 reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,

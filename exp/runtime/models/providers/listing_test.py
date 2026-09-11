@@ -103,7 +103,7 @@ def test_openai_listing_discards_optional_entry_metadata() -> None:
                         "supports_completions": True,
                         "supports_tools": True,
                         "maximum_output_tokens": 16_000,
-                        "pricing": {"input_micro_usd_per_million_tokens": 1_250_000},
+                        "pricing": {"input_nano_usd_per_million_tokens": 1_250_000_000},
                     }
                 ]
             }
@@ -124,7 +124,7 @@ def test_openai_listing_discards_optional_entry_metadata() -> None:
 
 
 def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> None:
-    """The hosted gateway contract supplies capabilities, limits, and micro-USD prices."""
+    """The hosted gateway contract supplies capabilities, limits, and nano-USD prices."""
     transport = _transport(
         _ok(
             {
@@ -156,9 +156,9 @@ def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> Non
                         "maximum_top_k": 100,
                         "maximum_output_tokens": 16_000,
                         "pricing": {
-                            "input_micro_usd_per_million_tokens": 1_250_000,
-                            "output_micro_usd_per_million_tokens": 10_000_000,
-                            "cached_input_micro_usd_per_million_tokens": 125_000,
+                            "input_nano_usd_per_million_tokens": 1_250_000_000,
+                            "output_nano_usd_per_million_tokens": 10_000_000_000,
+                            "cached_input_nano_usd_per_million_tokens": 125_000_000,
                         },
                     }
                 ]
@@ -211,8 +211,8 @@ def test_openai_compatible_listing_preserves_unknowns_for_absent_or_invalid_fiel
                         "supports_structured_output": "true",
                         "maximum_output_tokens": 16_000.0,
                         "pricing": {
-                            "input_micro_usd_per_million_tokens": "1250000",
-                            "output_micro_usd_per_million_tokens": -1,
+                            "input_nano_usd_per_million_tokens": "1250000",
+                            "output_nano_usd_per_million_tokens": -1,
                         },
                     }
                 ]

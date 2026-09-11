@@ -35,7 +35,7 @@ exp config gateway provider add fireworks \
 
 Then bind one exact model as a direct alias. The capability flags are the template for a
 current Fireworks chat model: most support tools and structured output, and none require
-developer messages. Confirm the flags and the micro-USD prices per million tokens against
+developer messages. Confirm the flags and the nano-USD prices per million tokens against
 the Fireworks model page before authoring, because the gateway treats both as frozen
 authority for routing and accounting.
 

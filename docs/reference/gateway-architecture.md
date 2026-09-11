@@ -230,7 +230,7 @@ message as `(param: ...)` on the Anthropic surface; anything unextractable keeps
 content-free message.
 
 Before each physical dispatch, the same immediate SQLite transaction reserves the request's
-conservative maximum integer micro-USD cost and inserts its attempt row. Applicable hard limits can
+conservative maximum integer nano-USD cost and inserts its attempt row. Applicable hard limits can
 cover the local team, one identity, one alias pool, and each provider deployment within that pool.
 An exhausted deployment allocation removes only that route from the current certified waterfall.
 If no route can fit the shared team, identity, or total pool allocation, the neutral protocol
@@ -279,7 +279,7 @@ Every policy-routed dispatch is disclosed on its attempt row: `dispatch_reason` 
 `affinity_sticky`, `fair_share_shed`, `queue_bound`, `rate_limit`, `fresh_session_spill`,
 `rung_dead`, `saturated_overflow`), the bypassed
 `preferred_deployment_id` with its frozen base token rates, and at settle a
-`counterfactual_cost_micro_usd` pricing the same observed usage at those preferred rates, so
+`counterfactual_cost_nano_usd` pricing the same observed usage at those preferred rates, so
 cost optimality is measurable from the ledger alone. Settlement also persists the provider's own
 rate-limit response headers per attempt when the data plane harvests them (`retry-after` plus the
 OpenAI `x-ratelimit-*` and Anthropic `anthropic-ratelimit-*` families, normalized to integers),
@@ -321,7 +321,7 @@ plus seconds per million approximate input tokens, both serving defaults with pe
 overrides), so a 1M-token prefill is not misread as a dead lane while small requests keep the
 fail-fast bound.
 
-Settlement replaces the reservation with observed integer micro-USD usage. A dispatched failure,
+Settlement replaces the reservation with observed integer nano-USD usage. A dispatched failure,
 cancellation, or crash without trustworthy usage retains its conservative reservation because it
 may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt,
 while keyed replay creates no new reservation. A period is the immutable UTC bucket beginning at
@@ -708,7 +708,7 @@ idempotency, request, or provider values.
 only the OpenAI `object` and `data` fields, and every entry contains only `id`, `object`,
 `created`, and `owned_by`. Capability, pricing, revision, and catalog-digest metadata never
 ride this compatibility endpoint. Platform's separate `/api/models` catalog owns rich route
-metadata, including configured micro-USD-per-million-token prices.
+metadata, including configured nano-USD-per-million-token prices.
 `GET /v1/models/{model_id}` describes one granted alias with
 the same exact OpenAI Model object and
 returns the identical `model_not_found` 404 for every other model ID, so the route never confirms

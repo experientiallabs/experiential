@@ -46,7 +46,7 @@ def _deployment(
         deployment_id: Catalog deployment identifier.
         source_alias: Source alias recorded on the deployment.
         exact_model_id: Exact logical model identity shared with its pool.
-        input_price: Configured input micro-USD per million tokens.
+        input_price: Configured input nano-USD per million tokens.
 
     Returns:
         A secret-free deployment with declared tools, output limit, and prices.
@@ -67,8 +67,8 @@ def _deployment(
         ),
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                output_micro_usd_per_million_tokens=900_000,
+                input_nano_usd_per_million_tokens=input_price,
+                output_nano_usd_per_million_tokens=900_000,
             )
         ),
     )
@@ -140,9 +140,9 @@ def test_published_metadata_uses_the_revision_direct_pool_not_the_public_name() 
     assert metadata.supports_completions is True
     assert metadata.supports_tools is True
     assert metadata.maximum_output_tokens == 8_192
-    assert metadata.input_micro_usd_per_million_tokens == 900_000
+    assert metadata.input_nano_usd_per_million_tokens == 900_000
     assert metadata.context_window_tokens is None
-    assert metadata.cached_input_micro_usd_per_million_tokens is None
+    assert metadata.cached_input_nano_usd_per_million_tokens is None
 
 
 def test_published_metadata_ignores_a_deployment_that_only_shares_the_public_name() -> None:
@@ -181,7 +181,7 @@ def test_published_metadata_ignores_a_deployment_that_only_shares_the_public_nam
     )
 
     assert metadata is not None
-    assert metadata.input_micro_usd_per_million_tokens == 900_000
+    assert metadata.input_nano_usd_per_million_tokens == 900_000
 
 
 def test_published_metadata_stays_closed_for_multi_deployment_pools() -> None:

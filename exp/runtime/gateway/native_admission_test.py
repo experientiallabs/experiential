@@ -893,11 +893,11 @@ def test_tier_priced_host_lane_admits_the_named_tier() -> None:
                 gateway=GatewayDeploymentMetadata(
                     capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        output_micro_usd_per_million_tokens=4_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=4_000_000,
                         flex=GatewayServiceTierPrices(
-                            input_micro_usd_per_million_tokens=500_000,
-                            output_micro_usd_per_million_tokens=2_000_000,
+                            input_nano_usd_per_million_tokens=500_000,
+                            output_nano_usd_per_million_tokens=2_000_000,
                         ),
                     ),
                 ),
@@ -954,11 +954,11 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
                 gateway=GatewayDeploymentMetadata(
                     capabilities=streaming,
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        output_micro_usd_per_million_tokens=4_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=4_000_000,
                         flex=GatewayServiceTierPrices(
-                            input_micro_usd_per_million_tokens=500_000,
-                            output_micro_usd_per_million_tokens=2_000_000,
+                            input_nano_usd_per_million_tokens=500_000,
+                            output_nano_usd_per_million_tokens=2_000_000,
                         ),
                     ),
                 ),

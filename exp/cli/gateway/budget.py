@@ -18,7 +18,7 @@ from exp.runtime.gateway.budgets import (
 from exp.runtime.gateway.management import GatewayManagement
 
 budget_app = typer.Typer(
-    help="Manage hard integer micro-USD allocations by immutable UTC month.",
+    help="Manage hard integer nano-USD allocations by immutable UTC month.",
     no_args_is_help=True,
 )
 _JSON_OPTION = typer.Option(False, "--json")
@@ -30,7 +30,7 @@ _SCOPE_OPTION = typer.Option(None, "--scope")
 def budget_set(
     period: str | None = typer.Option(None, "--period"),
     scope_kind: BudgetScopeKind | None = _SCOPE_OPTION,
-    limit_micro_usd: int | None = typer.Option(None, "--limit-micro-usd", min=0),
+    limit_nano_usd: int | None = typer.Option(None, "--limit-nano-usd", min=0),
     identity_id: str | None = typer.Option(None, "--identity"),
     alias_id: str | None = typer.Option(None, "--alias"),
     pool_id: str | None = typer.Option(None, "--pool"),
@@ -58,11 +58,11 @@ def budget_set(
         if non_interactive:
             raise typer.BadParameter("--scope is required with --non-interactive")
         selected_scope = BudgetScopeKind(typer.prompt("Scope (team, identity, pool, deployment)"))
-    selected_limit = limit_micro_usd
+    selected_limit = limit_nano_usd
     if selected_limit is None:
         if non_interactive:
-            raise typer.BadParameter("--limit-micro-usd is required with --non-interactive")
-        selected_limit = typer.prompt("Limit in integer micro-USD", type=int)
+            raise typer.BadParameter("--limit-nano-usd is required with --non-interactive")
+        selected_limit = typer.prompt("Limit in integer nano-USD", type=int)
     scope = _scope(
         kind=selected_scope,
         identity_id=identity_id,
@@ -78,7 +78,7 @@ def budget_set(
             organization_id=manager.organization_id,
             period=selected_period,
             scope=scope,
-            limit_micro_usd=selected_limit,
+            limit_nano_usd=selected_limit,
             replace=replace,
             strict_unknown_cost=strict_unknown_cost,
         )
@@ -91,7 +91,7 @@ def budget_set(
             data=limit.model_dump(mode="json"),
         ),
         json_output=json_output,
-        human=f"{selected_period} {scope.key()} limit_micro_usd={selected_limit} changed={changed}",
+        human=f"{selected_period} {scope.key()} limit_nano_usd={selected_limit} changed={changed}",
     )
 
 
@@ -99,7 +99,7 @@ def budget_set(
 def budget_reconcile(
     period: str | None = typer.Option(None, "--period"),
     scope_kind: BudgetScopeKind | None = _SCOPE_OPTION,
-    assigned_cost_micro_usd: int | None = typer.Option(None, "--assigned-cost-micro-usd", min=0),
+    assigned_cost_nano_usd: int | None = typer.Option(None, "--assigned-cost-nano-usd", min=0),
     identity_id: str | None = typer.Option(None, "--identity"),
     alias_id: str | None = typer.Option(None, "--alias"),
     pool_id: str | None = typer.Option(None, "--pool"),
@@ -120,11 +120,11 @@ def budget_reconcile(
         if non_interactive:
             raise typer.BadParameter("--scope is required with --non-interactive")
         selected_scope = BudgetScopeKind(typer.prompt("Scope (team, identity, pool, deployment)"))
-    selected_cost = assigned_cost_micro_usd
+    selected_cost = assigned_cost_nano_usd
     if selected_cost is None:
         if non_interactive:
-            raise typer.BadParameter("--assigned-cost-micro-usd is required with --non-interactive")
-        selected_cost = typer.prompt("Assigned cost per attempt in integer micro-USD", type=int)
+            raise typer.BadParameter("--assigned-cost-nano-usd is required with --non-interactive")
+        selected_cost = typer.prompt("Assigned cost per attempt in integer nano-USD", type=int)
     scope = _scope(
         kind=selected_scope,
         identity_id=identity_id,
@@ -140,7 +140,7 @@ def budget_reconcile(
             organization_id=manager.organization_id,
             period=selected_period,
             scope=scope,
-            assigned_cost_micro_usd=selected_cost,
+            assigned_cost_nano_usd=selected_cost,
         )
     emit_receipt(
         GatewayReceipt(
@@ -150,15 +150,15 @@ def budget_reconcile(
             changed=reconciled > 0,
             data={
                 "reconciled_attempts": reconciled,
-                "assigned_cost_micro_usd": selected_cost,
+                "assigned_cost_nano_usd": selected_cost,
                 "remaining": remaining.model_dump(mode="json"),
             },
         ),
         json_output=json_output,
         human=(
             f"{selected_period} {scope.key()} reconciled_attempts={reconciled} "
-            f"assigned_cost_micro_usd={selected_cost} "
-            f"remaining_micro_usd={remaining.remaining_micro_usd}"
+            f"assigned_cost_nano_usd={selected_cost} "
+            f"remaining_nano_usd={remaining.remaining_nano_usd}"
         ),
     )
 
@@ -187,7 +187,7 @@ def budget_remaining(
     root: Path = ROOT_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
-    """Report reserved, settled, and remaining micro-USD for one UTC month."""
+    """Report reserved, settled, and remaining nano-USD for one UTC month."""
     selected_period = period or current_budget_period(datetime.now(UTC))
     manager = GatewayManagement(root)
     with usage_error(ValueError):

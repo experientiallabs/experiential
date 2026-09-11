@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -22,9 +23,11 @@ from exp.common.models.catalog import (
     SFTModelProvenance,
 )
 from exp.common.models.gateway_catalog import (
+    FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     SANE_MAX_SNAPSHOT_SCHEMA_VERSION,
     SNAPSHOT_SCHEMA_VERSION,
     CatalogSnapshotDigestError,
+    CatalogSnapshotUnitError,
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
@@ -121,6 +124,35 @@ def test_read_pinned_snapshot_same_version_requires_the_exact_digest() -> None:
         read_pinned_normalized_snapshot(catalog.model_dump_json().encode(), "b" * 64)
 
 
+def test_read_pinned_snapshot_upgrades_schema_3_and_refuses_older_money_units() -> None:
+    """Schema 3 (the previous build's micro-USD snapshot) is UPGRADED at read
+    time by version (see ``nano_usd_upgrade_test`` for the price twin pins);
+    schema 1 and 2 are refused by name; a schema-4 document smuggling a micro
+    key is refused. The refusal is its own error, never a digest mismatch."""
+    assert SNAPSHOT_SCHEMA_VERSION == 4
+    assert FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION == 4
+    micro: dict[str, Any] = json.loads(_minimal_normalized().model_dump_json())
+    # The previous build wrote every price key under its micro name (nulls too).
+    micro["deployments"][0]["gateway"]["prices"] = {
+        key.replace("_nano_usd_", "_micro_usd_"): value
+        for key, value in micro["deployments"][0]["gateway"]["prices"].items()
+    }
+    micro["schema_version"] = 3
+    served = read_pinned_normalized_snapshot(json.dumps(micro).encode(), "b" * 64)
+    assert served.schema_version == 3
+    assert served.deployments[0].gateway.prices == GatewayTokenPrices()
+    for micro_version in (1, 2):
+        micro["schema_version"] = micro_version
+        with pytest.raises(CatalogSnapshotUnitError, match="predates"):
+            read_pinned_normalized_snapshot(json.dumps(micro).encode(), "b" * 64)
+    nano: dict[str, Any] = json.loads(_minimal_normalized().model_dump_json())
+    nano["deployments"][0]["gateway"]["prices"]["input_micro_usd_per_million_tokens"] = 1
+    with pytest.raises(CatalogSnapshotUnitError, match="micro-USD price key"):
+        read_pinned_normalized_snapshot(json.dumps(nano).encode(), "b" * 64)
+    assert issubclass(CatalogSnapshotUnitError, ValueError)
+    assert not issubclass(CatalogSnapshotUnitError, CatalogSnapshotDigestError)
+
+
 def test_read_pinned_snapshot_serves_a_cross_version_snapshot_without_the_digest_check() -> None:
     """Roll-safety guard: a snapshot from a NEWER build (higher schema_version,
     an unknown pool field, a digest this build cannot recompute) is SERVED under
@@ -169,11 +201,11 @@ def _identity_fixture_catalog() -> ModelCatalog:
                         supports_streaming=True, supports_image_input=True
                     ),
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=150,
-                        output_micro_usd_per_million_tokens=600,
+                        input_nano_usd_per_million_tokens=150,
+                        output_nano_usd_per_million_tokens=600,
                         long_context=GatewayLongContextTier(
                             input_threshold_tokens=200_000,
-                            input_micro_usd_per_million_tokens=300,
+                            input_nano_usd_per_million_tokens=300,
                         ),
                     ),
                 ),
@@ -215,11 +247,14 @@ def test_identity_digest_is_pinned_until_a_deliberate_schema_version_bump() -> N
     - You deliberately changed identity output (default change, rename,
       removal, normalization change): bump ``SNAPSHOT_SCHEMA_VERSION`` and
       repin BOTH values below in the same change.
+
+    Version 4 (the micro-USD to nano-USD money-unit move) renamed every price
+    key, so the digest was repinned with it.
     """
     normalized = normalize_gateway_catalog(_identity_fixture_catalog())
     assert (SNAPSHOT_SCHEMA_VERSION, normalized.identity_sha256()) == (
-        3,
-        "f9e74a42f5b47ec0a0739836ef15bbfa36df4eaa7c34efee10c421d46962529f",
+        4,
+        "df22e497cb162814a54a4321963859fd1bc8499e8fdd68c1e35c7df6a1520f0e",
     )
 
 
@@ -273,7 +308,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 3,
+        "schema_version": 4,
         "normalized": ["deployments", "pools", "schema_version"],
         "deployment": [
             "billing_source",

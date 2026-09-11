@@ -3,7 +3,7 @@
 """Realistic worst-case token estimation for one physical gateway attempt.
 
 The planning ``(input, output)`` token bound a single dispatch can consume, per
-API surface. It is what :func:`exp.runtime.gateway.budgets.maximum_attempt_cost_micro_usd`
+API surface. It is what :func:`exp.runtime.gateway.budgets.maximum_attempt_cost_nano_usd`
 prices, and what the platform's free-tier and token-rate-limit windows reserve
 in flight (released to the settled truth on finish). The input half counts the
 prompt the provider actually reads with a real BPE tokenizer and adds explicit
@@ -323,7 +323,7 @@ def worst_case_output_tokens(
                 else None
             )
             # Clamp caller output to the deployment ceiling: an unbounded value
-            # would inflate the estimate past MAXIMUM_MICRO_USD and mis-refuse a
+            # would inflate the estimate past MAXIMUM_NANO_USD and mis-refuse a
             # fundable request. Settlement charges actual tokens, not this bound.
             if output_tokens is None:
                 output_tokens = deployment_ceiling

@@ -25,7 +25,7 @@ from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
-    maximum_attempt_cost_micro_usd,
+    maximum_attempt_cost_nano_usd,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -468,7 +468,7 @@ class NativeAttemptAccounting:
                     deployment=deployment,
                     attempt_ordinal=entry.total_attempts,
                     route_depth=candidate,
-                    maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(
+                    maximum_cost_nano_usd=maximum_attempt_cost_nano_usd(
                         entry.request, deployment, input_tokens=reserved_input_tokens
                     ),
                     reserved_input_tokens=reserved_input_tokens,

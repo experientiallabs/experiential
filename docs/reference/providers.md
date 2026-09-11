@@ -94,11 +94,12 @@ required price or limit remains unknown.
 | `supports_structured_output` | boolean | The alias accepts structured output |
 | `maximum_output_tokens` | positive integer | Declared output ceiling |
 | `context_window_tokens` | positive integer | Declared context window, only when the host publishes one |
-| `pricing.input_micro_usd_per_million_tokens` | integer `>= 0` | Configured input price in micro-USD per million tokens |
-| `pricing.output_micro_usd_per_million_tokens` | integer `>= 0` | Configured output price in micro-USD per million tokens |
-| `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
+| `pricing.input_nano_usd_per_million_tokens` | integer `>= 0` | Configured input price in nano-USD per million tokens |
+| `pricing.output_nano_usd_per_million_tokens` | integer `>= 0` | Configured output price in nano-USD per million tokens |
+| `pricing.cached_input_nano_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in nano-USD per million tokens |
 
-Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`.
+Nano-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000_000`
+(one nano-USD is a billionth of a dollar; `1_250_000_000` is $1.25 per million tokens).
 When a trusted third-party compatible host publishes these fields, completion, tool,
 structured-output, and input/output price declarations can assign world-model and judge roles
 without a questionnaire. Router-candidate setup still requires a published or

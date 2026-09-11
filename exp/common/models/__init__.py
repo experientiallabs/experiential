@@ -33,9 +33,11 @@ from exp.common.models.discovery import (
 )
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import (
+    FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     GATEWAY_EXCLUDED_PROVIDERS,
     SNAPSHOT_SCHEMA_VERSION,
     CatalogSnapshotDigestError,
+    CatalogSnapshotUnitError,
     DeploymentId,
     ExactModelDeployment,
     ExactModelId,
@@ -45,6 +47,8 @@ from exp.common.models.gateway_catalog import (
     is_foreign_snapshot,
     load_forward_compatible,
     normalize_gateway_catalog,
+    read_model_catalog_document,
+    read_normalized_snapshot_document,
     read_pinned_normalized_snapshot,
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
@@ -186,12 +190,16 @@ __all__ = [
     "derive_model_alias",
     "known_model_metadata",
     "CatalogSnapshotDigestError",
+    "CatalogSnapshotUnitError",
     "load_forward_compatible",
     "load_model_catalog",
     "load_pricing_snapshot",
     "is_foreign_snapshot",
+    "read_model_catalog_document",
+    "read_normalized_snapshot_document",
     "normalize_gateway_catalog",
     "read_pinned_normalized_snapshot",
+    "FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION",
     "SNAPSHOT_SCHEMA_VERSION",
     "persist_pricing_snapshot",
     "reconcile_completion_economics",

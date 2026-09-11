@@ -409,7 +409,7 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
                     "--period",
                     budget_period,
                     *budget_arguments,
-                    "--limit-micro-usd",
+                    "--limit-nano-usd",
                     "1000000",
                     "--root",
                     str(tmp_path),
@@ -455,7 +455,7 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
         primary_budget = next(
             row for row in budget_rows if row["budget"]["scope"].get("deployment_id") == "primary"
         )
-        assert primary_budget["charged_micro_usd"] > 0
+        assert primary_budget["charged_nano_usd"] > 0
         exhausted_primary = runner.invoke(
             app,
             [
@@ -473,8 +473,8 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
                 "coding",
                 "--deployment",
                 "primary",
-                "--limit-micro-usd",
-                str(primary_budget["charged_micro_usd"]),
+                "--limit-nano-usd",
+                str(primary_budget["charged_nano_usd"]),
                 "--replace",
                 "--root",
                 str(tmp_path),
@@ -553,8 +553,8 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
                 "identity",
                 "--identity",
                 "default",
-                "--limit-micro-usd",
-                str(identity_budget["charged_micro_usd"]),
+                "--limit-nano-usd",
+                str(identity_budget["charged_nano_usd"]),
                 "--replace",
                 "--root",
                 str(tmp_path),
@@ -634,8 +634,8 @@ def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement,
         capabilities=ModelCapabilities(),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=1_000_000,
-            output_micro_usd_per_million_tokens=2_000_000,
+            input_nano_usd_per_million_tokens=1_000_000,
+            output_nano_usd_per_million_tokens=2_000_000,
         ),
         pricing_source="loopback-test",
         replace=False,

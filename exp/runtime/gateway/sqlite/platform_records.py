@@ -141,7 +141,7 @@ def reservation_record(
         attempt_ordinal=int(row["attempt_ordinal"]),
         route_depth=int(row["route_depth"]),
         period=str(row["budget_period_start"])[:7],
-        reserved_micro_usd=optional_int(row["budget_reserved_micro_usd"]),
+        reserved_nano_usd=optional_int(row["budget_reserved_nano_usd"]),
         started_at=required_datetime(row["started_at"]),
     )
 
@@ -175,34 +175,34 @@ def require_reservation_replay(
             if request.deployment.gateway.pricing_effective_at is None
             else utc_text(request.deployment.gateway.pricing_effective_at)
         ),
-        prices.input_micro_usd_per_million_tokens,
-        prices.cached_input_micro_usd_per_million_tokens,
-        prices.output_micro_usd_per_million_tokens,
-        prices.reasoning_micro_usd_per_million_tokens,
+        prices.input_nano_usd_per_million_tokens,
+        prices.cached_input_nano_usd_per_million_tokens,
+        prices.output_nano_usd_per_million_tokens,
+        prices.reasoning_nano_usd_per_million_tokens,
         (None if prices.long_context is None else prices.long_context.input_threshold_tokens),
         (
             None
             if prices.long_context is None
-            else prices.long_context.input_micro_usd_per_million_tokens
+            else prices.long_context.input_nano_usd_per_million_tokens
         ),
         (
             None
             if prices.long_context is None
-            else prices.long_context.cached_input_micro_usd_per_million_tokens
+            else prices.long_context.cached_input_nano_usd_per_million_tokens
         ),
         (
             None
             if prices.long_context is None
-            else prices.long_context.output_micro_usd_per_million_tokens
+            else prices.long_context.output_nano_usd_per_million_tokens
         ),
         (
             None
             if prices.long_context is None
-            else prices.long_context.reasoning_micro_usd_per_million_tokens
+            else prices.long_context.reasoning_nano_usd_per_million_tokens
         ),
         request.attempt_ordinal,
         request.route_depth,
-        request.maximum_cost_micro_usd,
+        request.maximum_cost_nano_usd,
     )
     actual = (
         record.request_id,
@@ -231,7 +231,7 @@ def require_reservation_replay(
         record.long_context_reasoning_rate,
         record.attempt_ordinal,
         record.route_depth,
-        record.reserved_micro_usd,
+        record.reserved_nano_usd,
     )
     if actual != expected:
         raise ValueError("attempt reservation replay differs from durable accounting input")

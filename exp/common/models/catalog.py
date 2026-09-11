@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -38,6 +38,7 @@ from exp.common.models.model import (
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.common.models.nano_usd_upgrade import upgrade_model_catalog_document
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -538,6 +539,22 @@ class GatewayDeploymentCapabilities(ContractModel):
         return self
 
 
+MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS = 1_000_000_000_000
+"""Upper bound on any authored rate: $1,000 per million tokens in nano-USD.
+
+Every published price today is far below it (the highest authored rate is
+$600 per million, 6e11 nano-USD), and at this ceiling on every dimension a
+1M-context request with the full output ceiling still sums to well under the
+signed 64-bit ledger column before the per-million division, so no authored
+catalog can produce an attempt cost the ledger cannot hold.
+"""
+
+NanoUsdRatePerMillionTokens = Annotated[
+    int | None, Field(ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS)
+]
+"""One optional integer nano-USD-per-million-tokens rate; ``None`` is unknown, never zero."""
+
+
 class GatewayLongContextTier(ContractModel):
     """Premium rates a provider applies to whole long-context requests.
 
@@ -553,10 +570,10 @@ class GatewayLongContextTier(ContractModel):
     """
 
     input_threshold_tokens: int = Field(gt=0)
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
 
 
 class GatewayServiceTierPrices(ContractModel):
@@ -568,23 +585,25 @@ class GatewayServiceTierPrices(ContractModel):
     on the base schedule (never the base rate). v1 bills the REQUESTED tier.
     """
 
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
 
 
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
-    Values are micro-USD per million provider-reported tokens. ``None`` means the rate is unknown;
-    it must never be interpreted as zero. Existing optimizer float pricing remains unchanged.
+    Values are integer nano-USD per million provider-reported tokens (one nano-USD is a
+    billionth of a dollar: $1.25 per million is ``1_250_000_000``), bounded above by
+    ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS``. ``None`` means the rate is unknown; it must
+    never be interpreted as zero. Existing optimizer float pricing remains unchanged.
     """
 
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     long_context: GatewayLongContextTier | None = None
     """Whole-request premium schedule for long-context input, when one exists.
 
@@ -616,10 +635,10 @@ class GatewayTokenPrices(ContractModel):
         if card is None:
             return self
         return GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=card.input_micro_usd_per_million_tokens,
-            cached_input_micro_usd_per_million_tokens=card.cached_input_micro_usd_per_million_tokens,
-            output_micro_usd_per_million_tokens=card.output_micro_usd_per_million_tokens,
-            reasoning_micro_usd_per_million_tokens=card.reasoning_micro_usd_per_million_tokens,
+            input_nano_usd_per_million_tokens=card.input_nano_usd_per_million_tokens,
+            cached_input_nano_usd_per_million_tokens=card.cached_input_nano_usd_per_million_tokens,
+            output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
+            reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             long_context=None,
         )
 
@@ -753,6 +772,9 @@ class ModelRoles(ContractModel):
         return self
 
 
+MODEL_CATALOG_SCHEMA_VERSION = 3
+"""Authored catalog revision this build writes (3 = integer nano-USD prices)."""
+
 SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION = 10_000
 """Upper bound on an authored catalog version this parser accepts as real.
 
@@ -765,8 +787,13 @@ and fails closed rather than being read as a future contract.
 class ModelCatalog(ContractModel):
     """The local model aliases, connection metadata, and project role assignments."""
 
-    schema_version: int = Field(default=2, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION)
+    schema_version: int = Field(
+        default=MODEL_CATALOG_SCHEMA_VERSION, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
+    )
     """Authored catalog contract revision. Deliberately NOT a ``Literal``.
+
+    Schema 3 prices in integer nano-USD; schema 2 (micro-USD) documents are
+    upgraded at every read boundary by ``upgrade_model_catalog_document``.
 
     Every cross-version hydration parses the authored document first, and a
     changed ``Literal`` value on a known field raises ``literal_error``, which
@@ -899,7 +926,9 @@ def load_model_catalog(path: Path) -> ModelCatalog:
     except tomllib.TOMLDecodeError as exc:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
-        return ModelCatalog.model_validate(_migrate_legacy_model_catalog(raw_catalog))
+        return ModelCatalog.model_validate(
+            upgrade_model_catalog_document(_migrate_legacy_model_catalog(raw_catalog))
+        )
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
 

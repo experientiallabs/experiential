@@ -97,19 +97,20 @@ they do not partition logical request counts. Legacy schema-v1/v2 attempts migra
 `customer_managed`.
 
 Monthly serving limits are separate from the one-shot `exp config budget` command ceiling. They use
-integer micro-USD and explicit immutable UTC periods. The local team, an identity, a total alias
+integer nano-USD (a billionth of a dollar; `20000000000000` is $20,000) and explicit immutable UTC
+periods. The local team, an identity, a total alias
 pool, and each provider deployment can have overlapping hard limits:
 
 ```console
 exp config gateway budget set --period 2026-08 --scope identity \
-  --identity TEAM_MEMBER --limit-micro-usd 20000000000 \
+  --identity TEAM_MEMBER --limit-nano-usd 20000000000000 \
   --root ROOT --non-interactive --json
 exp config gateway budget set --period 2026-08 --scope deployment \
   --alias PUBLIC_ALIAS --pool EXACT_POOL --deployment AZURE_DEPLOYMENT \
-  --limit-micro-usd 10000000000 --root ROOT --non-interactive --json
+  --limit-nano-usd 10000000000000 --root ROOT --non-interactive --json
 exp config gateway budget set --period 2026-08 --scope deployment \
   --alias PUBLIC_ALIAS --pool EXACT_POOL --deployment BEDROCK_DEPLOYMENT \
-  --limit-micro-usd 10000000000 --root ROOT --non-interactive --json
+  --limit-nano-usd 10000000000000 --root ROOT --non-interactive --json
 exp config gateway budget remaining --period 2026-08 --root ROOT --json
 ```
 
@@ -121,7 +122,7 @@ admitted and recorded as unknown cost; `budget remaining` reports the unknown-co
 their observed token volume. `--strict-unknown-cost` on `budget set` opts one limit into failing
 closed instead: unpriced attempts are rejected, recorded unknown-cost attempts block the limit even
 after `--replace` raises it, and `exp config gateway budget reconcile --period 2026-08 --scope
-team --assigned-cost-micro-usd COST --root ROOT --non-interactive` settles each unknown-cost
+team --assigned-cost-nano-usd COST --root ROOT --non-interactive` settles each unknown-cost
 attempt at an explicit assigned cost and restores service with exact per-attempt attribution.
 There is no budget reset job and no budgets dashboard.
 

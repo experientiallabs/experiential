@@ -6,16 +6,27 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 19
+from exp.runtime.gateway.sqlite.nano_usd_migration import (
+    NanoUsdMigrationError,
+    migrate_money_to_nano_usd,
+)
+
+SCHEMA_VERSION = 20
 
 
 class GatewaySchemaError(RuntimeError):
     """The gateway database schema cannot be opened safely."""
+
+
+MigrationStep = str | Callable[[sqlite3.Connection], None]
+"""One forward-migration step: a plain SQL statement, or a callable for a step
+that must read before it writes (the v20 money-unit move guards every amount
+before scaling it)."""
 
 
 _MIGRATION_1 = (
@@ -674,7 +685,8 @@ _MIGRATION_16 = ("ALTER TABLE gateway_attempts ADD COLUMN failure_message TEXT",
 # queue_bound, rung_dead, saturated_overflow) and the preferred_* columns
 # freeze the bypassed rung's identity and base token rates at reservation, so
 # settle can price the SAME observed usage counterfactually
-# (counterfactual_cost_micro_usd) without any content or re-derivation.
+# (counterfactual_cost_micro_usd, renamed counterfactual_cost_nano_usd at v20)
+# without any content or re-derivation.
 _MIGRATION_17 = (
     "ALTER TABLE gateway_attempts ADD COLUMN dispatch_reason TEXT",
     "ALTER TABLE gateway_attempts ADD COLUMN preferred_deployment_id TEXT",
@@ -711,7 +723,7 @@ _MIGRATION_19 = (
     "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_tokens INTEGER",
 )
 
-_MIGRATIONS = {
+_MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
@@ -731,6 +743,7 @@ _MIGRATIONS = {
     17: _MIGRATION_17,
     18: _MIGRATION_18,
     19: _MIGRATION_19,
+    20: (migrate_money_to_nano_usd,),
 }
 
 
@@ -860,8 +873,14 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
             if 0 < version < SCHEMA_VERSION:
                 backup = _backup_database(path, version)
             for next_version in range(version + 1, SCHEMA_VERSION + 1):
-                for statement in _MIGRATIONS[next_version]:
-                    connection.execute(statement)
+                for step in _MIGRATIONS[next_version]:
+                    if isinstance(step, str):
+                        connection.execute(step)
+                    else:
+                        try:
+                            step(connection)
+                        except NanoUsdMigrationError as exc:
+                            raise GatewaySchemaError(str(exc)) from exc
                 connection.execute(f"PRAGMA user_version = {next_version}")
             _require_schema_objects(connection)
             connection.execute("COMMIT")

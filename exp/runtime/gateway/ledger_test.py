@@ -75,10 +75,10 @@ def _deployment(
     """Create one exact singleton deployment with optional known rates."""
     prices = (
         GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=2_000_000,
-            cached_input_micro_usd_per_million_tokens=1_000_000,
-            output_micro_usd_per_million_tokens=4_000_000,
-            reasoning_micro_usd_per_million_tokens=5_000_000,
+            input_nano_usd_per_million_tokens=2_000_000,
+            cached_input_nano_usd_per_million_tokens=1_000_000,
+            output_nano_usd_per_million_tokens=4_000_000,
+            reasoning_nano_usd_per_million_tokens=5_000_000,
         )
         if priced
         else GatewayTokenPrices()
@@ -200,7 +200,7 @@ def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None
     assert len(usage) == 1
     assert usage[0].requests == 1
     assert usage[0].attempts == 1
-    assert usage[0].known_estimated_cost_micro_usd == 3_950
+    assert usage[0].known_estimated_cost_nano_usd == 3_950
     assert usage[0].unknown_cost_attempts == 0
     assert 124 <= usage[0].total_latency_ms <= 126
     assert usage[0].average_latency_ms is not None
@@ -325,7 +325,7 @@ def test_usage_billing_source_buckets_conserve_physical_attempt_totals(tmp_path:
     assert host.attempts == 1
     assert host.input_tokens == 3
     assert host.output_tokens == 2
-    assert host.known_estimated_cost_micro_usd == 14
+    assert host.known_estimated_cost_nano_usd == 14
     assert host.unknown_cost_attempts == 0
     assert [(item.state, item.attempts) for item in host.terminal_counts] == [("completed", 1)]
 
@@ -385,7 +385,7 @@ def test_usage_snapshot_conserves_source_totals_during_concurrent_wal_settlement
             "cached_input_tokens",
             "output_tokens",
             "reasoning_tokens",
-            "known_estimated_cost_micro_usd",
+            "known_estimated_cost_nano_usd",
             "unknown_cost_attempts",
         ):
             assert getattr(identity, field_name) == sum(
@@ -443,7 +443,7 @@ def test_unknown_prices_remain_unknown_instead_of_zero(tmp_path: Path) -> None:
     )
 
     usage = ledger.usage(organization_id="org-one")[0]
-    assert usage.known_estimated_cost_micro_usd == 0
+    assert usage.known_estimated_cost_nano_usd == 0
     assert usage.unknown_cost_attempts == 1
 
 
@@ -480,7 +480,7 @@ def test_cancelled_post_commit_attempt_keeps_observed_billable_usage(tmp_path: P
     )
 
     usage = ledger.usage(organization_id="org-one")[0]
-    assert usage.known_estimated_cost_micro_usd == 280
+    assert usage.known_estimated_cost_nano_usd == 280
     assert usage.terminal_counts[0].attempts == 1
     assert usage.terminal_counts[0].state == "cancelled"
 
@@ -1095,16 +1095,16 @@ def _tiered_deployment() -> ExactModelDeployment:
         update={
             "gateway": GatewayDeploymentMetadata(
                 prices=GatewayTokenPrices(
-                    input_micro_usd_per_million_tokens=1_250_000,
-                    cached_input_micro_usd_per_million_tokens=125_000,
-                    output_micro_usd_per_million_tokens=10_000_000,
-                    reasoning_micro_usd_per_million_tokens=10_000_000,
+                    input_nano_usd_per_million_tokens=1_250_000,
+                    cached_input_nano_usd_per_million_tokens=125_000,
+                    output_nano_usd_per_million_tokens=10_000_000,
+                    reasoning_nano_usd_per_million_tokens=10_000_000,
                     long_context=GatewayLongContextTier(
                         input_threshold_tokens=200_000,
-                        input_micro_usd_per_million_tokens=2_500_000,
-                        cached_input_micro_usd_per_million_tokens=250_000,
-                        output_micro_usd_per_million_tokens=15_000_000,
-                        reasoning_micro_usd_per_million_tokens=15_000_000,
+                        input_nano_usd_per_million_tokens=2_500_000,
+                        cached_input_nano_usd_per_million_tokens=250_000,
+                        output_nano_usd_per_million_tokens=15_000_000,
+                        reasoning_nano_usd_per_million_tokens=15_000_000,
                     ),
                 ),
                 pricing_source="operator-authored",
@@ -1126,7 +1126,7 @@ def test_long_context_settlement_reprices_the_whole_request_at_the_threshold(
     every token at the tier rates.
     """
     cases = (
-        # (input_tokens, expected settled micro-USD with 1,000 output tokens)
+        # (input_tokens, expected settled nano-USD with 1,000 output tokens)
         (199_999, (199_999 * 1_250_000 + 1_000 * 10_000_000 + 500_000) // 1_000_000),
         (200_000, (200_000 * 2_500_000 + 1_000 * 15_000_000 + 500_000) // 1_000_000),
         (200_001, (200_001 * 2_500_000 + 1_000 * 15_000_000 + 500_000) // 1_000_000),
@@ -1157,7 +1157,7 @@ def test_long_context_settlement_reprices_the_whole_request_at_the_threshold(
             failure=None,
         )
         usage = ledger.usage(organization_id="org-one")
-        assert usage[0].known_estimated_cost_micro_usd == expected, input_tokens
+        assert usage[0].known_estimated_cost_nano_usd == expected, input_tokens
 
 
 def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
@@ -1171,11 +1171,11 @@ def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
         update={
             "gateway": GatewayDeploymentMetadata(
                 prices=GatewayTokenPrices(
-                    input_micro_usd_per_million_tokens=1_250_000,
-                    output_micro_usd_per_million_tokens=10_000_000,
+                    input_nano_usd_per_million_tokens=1_250_000,
+                    output_nano_usd_per_million_tokens=10_000_000,
                     long_context=GatewayLongContextTier(
                         input_threshold_tokens=200_000,
-                        input_micro_usd_per_million_tokens=2_500_000,
+                        input_nano_usd_per_million_tokens=2_500_000,
                     ),
                 ),
                 pricing_source="operator-authored",
@@ -1205,7 +1205,7 @@ def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
         failure=None,
     )
     usage = ledger.usage(organization_id="org-one")
-    assert usage[0].known_estimated_cost_micro_usd == 0
+    assert usage[0].known_estimated_cost_nano_usd == 0
     assert usage[0].unknown_cost_attempts == 1
 
 
@@ -1231,10 +1231,10 @@ def _spill_fixture(
             "connection_sha256": "e" * 64,
             "gateway": GatewayDeploymentMetadata(
                 prices=GatewayTokenPrices(
-                    input_micro_usd_per_million_tokens=100_000,
-                    cached_input_micro_usd_per_million_tokens=50_000,
-                    output_micro_usd_per_million_tokens=200_000,
-                    reasoning_micro_usd_per_million_tokens=200_000,
+                    input_nano_usd_per_million_tokens=100_000,
+                    cached_input_nano_usd_per_million_tokens=50_000,
+                    output_nano_usd_per_million_tokens=200_000,
+                    reasoning_nano_usd_per_million_tokens=200_000,
                 ),
                 pricing_source="operator-authored",
             ),
@@ -1298,8 +1298,8 @@ def test_dispatch_disclosure_persists_and_prices_the_counterfactual(tmp_path: Pa
     assert row["preferred_reasoning_rate"] == 5_000_000
     # The SAME settled usage priced at the preferred base rates: 900 fresh
     # input + 100 cached + 450 fresh output + 50 reasoning tokens.
-    assert row["counterfactual_cost_micro_usd"] == 3_950
-    assert row["estimated_cost_micro_usd"] == 195
+    assert row["counterfactual_cost_nano_usd"] == 3_950
+    assert row["estimated_cost_nano_usd"] == 195
 
 
 def test_finish_attempt_persists_harvested_rate_limit_observations(tmp_path: Path) -> None:
@@ -1375,7 +1375,7 @@ def test_counterfactual_stays_null_when_a_preferred_rate_is_unknown(tmp_path: Pa
     )
     row = _attempt_row(tmp_path, attempt_id)
     assert row["dispatch_reason"] == "fair_share_shed"
-    assert row["counterfactual_cost_micro_usd"] is None
+    assert row["counterfactual_cost_nano_usd"] is None
 
 
 def test_undisclosed_attempts_keep_null_disclosure_columns(tmp_path: Path) -> None:
@@ -1401,7 +1401,7 @@ def test_undisclosed_attempts_keep_null_disclosure_columns(tmp_path: Path) -> No
     assert row["dispatch_reason"] is None
     assert row["preferred_deployment_id"] is None
     assert row["preferred_input_rate"] is None
-    assert row["counterfactual_cost_micro_usd"] is None
+    assert row["counterfactual_cost_nano_usd"] is None
 
 
 def test_preferred_rung_disclosure_requires_divergence(tmp_path: Path) -> None:

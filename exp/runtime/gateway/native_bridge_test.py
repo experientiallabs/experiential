@@ -2406,7 +2406,7 @@ def test_admit_escalates_host_ineligible_route_and_finalizes_the_request(tmp_pat
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
     assert report["totals"]["attempts"] == 0
-    assert report["totals"]["known_estimated_cost_micro_usd"] == 0
+    assert report["totals"]["known_estimated_cost_nano_usd"] == 0
 
 
 def test_claim_scope_supports_the_responses_surface(tmp_path: Path) -> None:

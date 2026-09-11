@@ -17,7 +17,7 @@ from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
-    ModelCatalog,
+    read_model_catalog_document,
 )
 from exp.common.models.known_models import known_model_metadata
 from exp.optimize.router.activation import load_project_router
@@ -42,6 +42,11 @@ _EXACT_MODEL_OPTION = typer.Option(None, "--exact-model")
 _PROJECT_OPTION = typer.Option(None, "--project")
 _POLICY_OPTION = typer.Option(None, "--policy")
 _REVISION_OPTION = typer.Option(None, "--revision")
+_PRICE_HELP = "Integer nano-USD per million tokens ($1.25 per million is 1250000000)."
+_INPUT_PRICE_OPTION = typer.Option(None, "--input-price", min=0, help=_PRICE_HELP)
+_CACHED_INPUT_PRICE_OPTION = typer.Option(None, "--cached-input-price", min=0, help=_PRICE_HELP)
+_OUTPUT_PRICE_OPTION = typer.Option(None, "--output-price", min=0, help=_PRICE_HELP)
+_REASONING_PRICE_OPTION = typer.Option(None, "--reasoning-price", min=0, help=_PRICE_HELP)
 _PRICING_SOURCE_OPTION = typer.Option(None, "--pricing-source")
 _MAXIMUM_OUTPUT_OPTION = typer.Option(None, "--maximum-output-tokens", min=1)
 _REFUSAL_FAILOVER_OPTION = typer.Option(False, "--refusal-failover")
@@ -322,10 +327,10 @@ def alias_create(
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
-    input_price: int | None = typer.Option(None, "--input-price", min=0),
-    cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
-    output_price: int | None = typer.Option(None, "--output-price", min=0),
-    reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
+    input_price: int | None = _INPUT_PRICE_OPTION,
+    cached_input_price: int | None = _CACHED_INPUT_PRICE_OPTION,
+    output_price: int | None = _OUTPUT_PRICE_OPTION,
+    reasoning_price: int | None = _REASONING_PRICE_OPTION,
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
     billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
@@ -360,10 +365,10 @@ def alias_create(
             supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                cached_input_micro_usd_per_million_tokens=cached_input_price,
-                output_micro_usd_per_million_tokens=output_price,
-                reasoning_micro_usd_per_million_tokens=reasoning_price,
+                input_nano_usd_per_million_tokens=input_price,
+                cached_input_nano_usd_per_million_tokens=cached_input_price,
+                output_nano_usd_per_million_tokens=output_price,
+                reasoning_nano_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
             billing_source=billing_source,
@@ -417,10 +422,10 @@ def alias_update(
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
-    input_price: int | None = typer.Option(None, "--input-price", min=0),
-    cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
-    output_price: int | None = typer.Option(None, "--output-price", min=0),
-    reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
+    input_price: int | None = _INPUT_PRICE_OPTION,
+    cached_input_price: int | None = _CACHED_INPUT_PRICE_OPTION,
+    output_price: int | None = _OUTPUT_PRICE_OPTION,
+    reasoning_price: int | None = _REASONING_PRICE_OPTION,
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
     billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
@@ -455,10 +460,10 @@ def alias_update(
             supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                cached_input_micro_usd_per_million_tokens=cached_input_price,
-                output_micro_usd_per_million_tokens=output_price,
-                reasoning_micro_usd_per_million_tokens=reasoning_price,
+                input_nano_usd_per_million_tokens=input_price,
+                cached_input_nano_usd_per_million_tokens=cached_input_price,
+                output_nano_usd_per_million_tokens=output_price,
+                reasoning_nano_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
             billing_source=billing_source,
@@ -631,7 +636,9 @@ def _activate(
             replace=replace,
             serving_connections=serving_connections,
         )
-        authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
+        authored, _dropped = read_model_catalog_document(
+            authored_snapshot_path(snapshot).read_bytes()
+        )
         catalog_sha256 = normalized.identity_sha256()
         return (
             manager.activate_direct_alias(

@@ -12,6 +12,12 @@ from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, 
 from exp.common.models.dispatch_policy import FailoverMode
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.common.models.model import ModelAlias, ModelCapabilities
+from exp.common.models.nano_usd_upgrade import (
+    CatalogSnapshotUnitError,
+    decode_document,
+    upgrade_model_catalog_document,
+    upgrade_normalized_snapshot_document,
+)
 
 ExactModelId = ArtifactId
 DeploymentId = ArtifactId
@@ -20,8 +26,12 @@ ExactModelPoolId = ArtifactId
 GATEWAY_EXCLUDED_PROVIDERS = frozenset({"tinker"})
 """Runtime-resolvable providers whose records never become gateway deployments."""
 
-SNAPSHOT_SCHEMA_VERSION = 3
+SNAPSHOT_SCHEMA_VERSION = 4
 """Normalized-catalog schema version this engine build reads and writes.
+
+Version 4 moved every catalog price from integer micro-USD to integer nano-USD
+(``*_nano_usd_per_million_tokens``); see ``FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION``
+for why documents below it are refused rather than served tolerantly.
 
 Every change that alters the IDENTITY serialization of the normalized catalog
 MUST bump this in the same PR (the pinned-digest change-detector test enforces
@@ -36,6 +46,21 @@ digest) instead of a digest rejection, so no request ever hard-fails mid-roll.
 When the versions match, the byte-exact digest checks stay strict, preserving
 corruption detection.
 """
+
+FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION = 4
+"""First schema version whose catalog prices are integer nano-USD.
+
+Every earlier version keyed prices as ``*_micro_usd_per_million_tokens``. The
+tolerant cross-version reader would drop those keys as unknown and serve the
+deployments UNPRICED, so every snapshot read goes through
+:func:`read_normalized_snapshot_document`: the one known micro-USD schema (3,
+the previous build's) is upgraded explicitly at read time (each price key
+renamed to its nano twin, x1000 exactly), and anything else that is not
+nano-USD is refused by name with ``CatalogSnapshotUnitError``. There is no
+generic coercion path.
+"""
+
+__all__ = ["CatalogSnapshotUnitError"]
 
 SANE_MAX_SNAPSHOT_SCHEMA_VERSION = 10_000
 """Upper bound on a schema version this reader will trust as a real cross-build skew.
@@ -304,11 +329,13 @@ def read_pinned_normalized_snapshot(data: bytes, catalog_sha256: str) -> Normali
         The parsed normalized catalog, keyed downstream by ``catalog_sha256``.
 
     Raises:
+        CatalogSnapshotUnitError: The snapshot's money unit cannot be read (see
+            ``read_normalized_snapshot_document``).
         CatalogSnapshotDigestError: A same-version snapshot's digest does not
             match its pinned authority.
         ValueError: The document is unreadable or malformed.
     """
-    catalog, _dropped = load_forward_compatible(NormalizedGatewayCatalog, data)
+    catalog, _dropped = read_normalized_snapshot_document(data)
     # A real cross-build skew cannot be byte-verified here and is served under
     # its pinned digest (see is_foreign_snapshot for the accepted trade-off and
     # the shared-trust-domain rationale); every same-version or wild-version
@@ -318,6 +345,45 @@ def read_pinned_normalized_snapshot(data: bytes, catalog_sha256: str) -> Normali
             "catalog snapshot digest does not match its pinned authority"
         )
     return catalog
+
+
+def read_normalized_snapshot_document(
+    data: bytes | str,
+) -> tuple[NormalizedGatewayCatalog, tuple[tuple[str | int, ...], ...]]:
+    """Parse a stored normalized snapshot, upgrading the one known micro-USD schema.
+
+    A schema-3 document (the previous build's, priced in micro-USD) is upgraded
+    at read time by ``upgrade_normalized_snapshot_document`` — every known price
+    key renamed to its nano twin and multiplied by exactly 1000 — BEFORE the
+    forward-compatible parse, which would otherwise drop those keys as unknown
+    and serve the deployments unpriced. Anything else that is not nano-USD is
+    refused by name.
+
+    Raises:
+        CatalogSnapshotUnitError: The snapshot predates schema 3, mixes money
+            units, or carries a micro key under a nano schema.
+        ValidationError, ValueError: As ``load_forward_compatible``.
+    """
+    raw = upgrade_normalized_snapshot_document(decode_document(data, what="catalog snapshot"))
+    return load_forward_compatible(NormalizedGatewayCatalog, json.dumps(raw))
+
+
+def read_model_catalog_document(
+    data: bytes | str,
+) -> tuple[ModelCatalog, tuple[tuple[str | int, ...], ...]]:
+    """Parse a stored authored catalog, upgrading the one known micro-USD schema.
+
+    The published authored document a platform pod hydrates at boot is the
+    previous build's schema-2 (micro-USD) catalog during a roll; it is upgraded
+    by ``upgrade_model_catalog_document`` before the forward-compatible parse.
+
+    Raises:
+        CatalogSnapshotUnitError: The catalog predates schema 2, mixes money
+            units, or carries a micro key under a nano schema.
+        ValidationError, ValueError: As ``load_forward_compatible``.
+    """
+    raw = upgrade_model_catalog_document(decode_document(data, what="authored catalog"))
+    return load_forward_compatible(ModelCatalog, json.dumps(raw))
 
 
 def load_forward_compatible[ForwardModelT: BaseModel](

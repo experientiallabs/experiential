@@ -295,7 +295,7 @@ class SQLiteGatewayPlatform:
                 pool_id=command.scope.pool_id,
                 deployment_id=command.scope.deployment_id,
             ),
-            limit_micro_usd=command.limit_micro_usd,
+            limit_nano_usd=command.limit_nano_usd,
             replace=command.replace,
         )
         return NaturalMutationOutcome(
@@ -530,10 +530,10 @@ class SQLiteGatewayPlatform:
                     pool_id=item.budget.scope.pool_id,
                     deployment_id=item.budget.scope.deployment_id,
                 ),
-                limit_micro_usd=item.budget.limit_micro_usd,
-                reserved_micro_usd=item.reserved_micro_usd,
-                settled_micro_usd=item.settled_micro_usd,
-                remaining_micro_usd=item.remaining_micro_usd,
+                limit_nano_usd=item.budget.limit_nano_usd,
+                reserved_nano_usd=item.reserved_nano_usd,
+                settled_nano_usd=item.settled_nano_usd,
+                remaining_nano_usd=item.remaining_nano_usd,
                 unknown_cost_attempts=item.unknown_cost_attempts,
                 exhausted=item.exhausted,
                 created_at=item.budget.created_at,
@@ -559,7 +559,7 @@ class SQLiteGatewayPlatform:
                 deployment=request.deployment,
                 attempt_ordinal=request.attempt_ordinal,
                 route_depth=request.route_depth,
-                maximum_cost_micro_usd=request.maximum_cost_micro_usd,
+                maximum_cost_nano_usd=request.maximum_cost_nano_usd,
             )
         except sqlite3.IntegrityError:
             concurrent = self._attempt_for_reservation(request)
@@ -620,8 +620,8 @@ class SQLiteGatewayPlatform:
             ),
             usage=usage,
             usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
-            estimated_cost_micro_usd=_optional_int(row["estimated_cost_micro_usd"]),
-            settled_micro_usd=_optional_int(row["budget_settled_micro_usd"]),
+            estimated_cost_nano_usd=_optional_int(row["estimated_cost_nano_usd"]),
+            settled_nano_usd=_optional_int(row["budget_settled_nano_usd"]),
             first_token_at=_optional_datetime(row["first_token_at"]),
         )
         _require_settlement_replay(settlement, request=request)
@@ -650,7 +650,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     total_latency_ms=item.total_latency_ms,
                     average_latency_ms=item.average_latency_ms,
@@ -672,7 +672,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     terminal_counts=tuple(
                         UsageTerminalCount(

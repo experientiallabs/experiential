@@ -18,11 +18,13 @@ from exp.common.config import ARTIFACT_DIR
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
     SNAPSHOT_SCHEMA_VERSION,
+    CatalogSnapshotUnitError,
     ModelCatalog,
     NormalizedGatewayCatalog,
     is_foreign_snapshot,
-    load_forward_compatible,
     normalize_gateway_catalog,
+    read_model_catalog_document,
+    read_normalized_snapshot_document,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -790,26 +792,20 @@ def _load_snapshot(
         raise GatewayLifecycleError("catalog snapshot reference escapes gateway state")
     authored = snapshot.with_suffix(".models.json")
     try:
-        # Read forward-compatibly: a snapshot authored by a NEWER engine build
-        # during a rolling deploy may carry fields this build does not know, and
-        # rejecting it would hard-fail every request until the roll finished.
-        # Unknown fields are dropped; every other validation stays strict.
-        normalized, normalized_dropped = load_forward_compatible(
-            NormalizedGatewayCatalog, snapshot.read_bytes()
-        )
-        authored_catalog, authored_dropped = load_forward_compatible(
-            ModelCatalog, authored.read_bytes()
-        )
+        # Forward-compatible read (a NEWER build's unknown fields are dropped, all
+        # else strict); the previous build's micro-USD documents are UPGRADED by
+        # version, any other money unit is refused BY NAME.
+        normalized, normalized_dropped = read_normalized_snapshot_document(snapshot.read_bytes())
+        authored_catalog, authored_dropped = read_model_catalog_document(authored.read_bytes())
+    except CatalogSnapshotUnitError as exc:
+        raise GatewayLifecycleError(f"alias {alias.alias_name!r}: {exc}") from exc
     except (OSError, ValueError) as exc:
         raise GatewayLifecycleError(
             f"alias {alias.alias_name!r} has an unreadable catalog snapshot"
         ) from exc
     catalog_sha256 = _required(alias.catalog_sha256, "catalog digest", alias)
-    # A cross-version skew (this build's schema differs from the snapshot's) is
-    # served through this build's own tolerant view, keyed by the pinned digest,
-    # instead of the byte-exact digest checks below: the local normalizer is not
-    # expected to reproduce another build's bytes. When the versions agree the
-    # checks stay strict, so same-version corruption is still caught.
+    # A cross-version skew is served through this build's tolerant view keyed by
+    # the pinned digest; same-version reads keep the strict digest check below.
     foreign = is_foreign_snapshot(normalized)
     if normalized_dropped or authored_dropped or foreign:
         _logger.warning(
