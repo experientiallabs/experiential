@@ -29,8 +29,10 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import (
+    OPENROUTER_BASE_URL,
     OpenAICompatibleClient,
     OpenAICompatibleResponseError,
+    OpenRouterClient,
     openai_compatible_request,
     openai_compatible_response,
     openai_embedding_request,
@@ -686,3 +688,27 @@ def test_the_flag_matches_the_tencent_hosts_route_identity_for_one_model() -> No
         api_key="fake-key",
     ).gateway_wire_profile()
     assert flagged.hunyuan_reasoning_route_sha256 == tencent.hunyuan_reasoning_route_sha256
+
+
+def test_openrouter_routes_by_prompt_cache_key_as_its_sticky_session_key() -> None:
+    """OpenRouter documents ``prompt_cache_key`` as its sticky-routing fallback key.
+
+    OpenRouter load-balances one model across upstream providers and pins a
+    conversation to the provider that served it only after a cache hit is
+    observed, keyed by ``session_id`` else the OpenAI-style ``prompt_cache_key``
+    (openrouter.ai/docs/features/prompt-caching, read 2026-09-11). Without the
+    hint, two identical prefixes can land on different providers or nodes, so
+    the cache miss a caller sees is real and the metering of it is correct.
+    Forwarding the tenant-namespaced key makes placement deterministic per
+    conversation, and OpenRouter forwards provider-specific fields upstream,
+    so Tencent's per-node pin rides along on the hy4 lane.
+    """
+    profile = OpenRouterClient(
+        model=_snapshot(provider="openrouter", model_id="tencent/hy4-preview"),
+        base_url=OPENROUTER_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert profile.forwards_prompt_cache_key is True
+    # The OpenRouter origin is neither a Hunyuan nor a Fireworks carrier route.
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.fireworks_reasoning_route_sha256 is None

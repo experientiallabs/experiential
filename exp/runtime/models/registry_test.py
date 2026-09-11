@@ -548,3 +548,15 @@ def test_resolution_threads_reasoning_content_native_to_compatible_rungs() -> No
     assert profile.hunyuan_reasoning_route_sha256 is not None
     assert profile.reasoning_output_exposed is True
     assert profile.forwards_prompt_cache_key is False
+
+
+def test_openrouter_resolution_forwards_the_prompt_cache_key_hint() -> None:
+    """The catalog's openrouter provider resolves to a rung that routes by the hint."""
+    catalog = RuntimeModelCatalog(
+        _catalog(provider="openrouter"),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().forwards_prompt_cache_key is True

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import ClassVar, Literal, cast
 
 from pydantic import JsonValue
@@ -596,6 +597,21 @@ class OpenRouterClient(OpenAICompatibleClient):
         "X-Title": OPENROUTER_TITLE,
     }
     reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning"
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the compatible profile with OpenRouter's sticky-routing hint on.
+
+        OpenRouter load-balances one model across upstream providers and pins a
+        conversation to the provider that served it only once a cache hit has
+        been observed, keyed by ``session_id`` else the OpenAI-style
+        ``prompt_cache_key`` (its documented fallback sticky key). Without the
+        hint two identical prefixes can land on different providers or nodes,
+        so the miss a caller sees is real and its metering is correct.
+        Forwarding the tenant-namespaced key makes placement deterministic per
+        conversation, and OpenRouter forwards provider-specific fields
+        upstream, so a per-node pin such as Tencent's rides along.
+        """
+        return replace(super().gateway_wire_profile(), forwards_prompt_cache_key=True)
 
 
 def _openai_message(

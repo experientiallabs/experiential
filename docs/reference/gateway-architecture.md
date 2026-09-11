@@ -422,8 +422,11 @@ an identical prompt hits but the same stem with a new tail (every turn of an age
 routed by the whole prompt and usually misses (Tencent TokenHub, measured 2026-09-05: 2 of 8
 shared-stem turns hit with no hint, 10 of 10 with one). The gateway therefore dispatches a
 `prompt_cache_key` on rungs whose wire profile says the provider routes by it (OpenAI, Tencent
-TokenHub; other OpenAI-compatible servers may reject unknown fields, so they never receive it,
-BYOK or not): never the caller's raw value, which shares a house account across tenants, but a
+TokenHub, and OpenRouter, whose documented sticky routing falls back to that field as the session
+key and forwards it upstream, so a provider's own node pin rides along; other OpenAI-compatible
+servers may reject unknown fields, so they never receive it, BYOK or not, and a vLLM origin
+ignores the field because its prefix cache is per engine process and content-addressed): never
+the caller's raw value, which shares a house account across tenants, but a
 digest namespaced by organization and identity (`exp/runtime/gateway/prompt_cache_affinity.py`).
 A caller `prompt_cache_key` is the material when present; otherwise the conversation stem (the
 leading system/developer messages, which every turn of a session and every request sharing that
