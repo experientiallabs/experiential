@@ -219,16 +219,9 @@ def route_generation_parameter_requests(
         provider_updates["maximum_output_tokens"] = min(
             (_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT, *route_limits)
         )
-    # The rejection names the field the CALLER sent: Claude Code carries its
-    # effort as Messages output_config.effort and auto-recovers (drops the
-    # field and retries) only when the 400 names that channel, so naming the
-    # translated internal field wedges every turn instead (issue #795).
-    if request.surface == GatewayApiSurface.RESPONSES:
-        effort_path = "reasoning.effort"
-    elif request.surface == GatewayApiSurface.MESSAGES:
-        effort_path = "output_config.effort"
-    else:
-        effort_path = "reasoning_effort"
+    # The rejection names the field the CALLER sent (the request knows which
+    # of its surface's effort fields carried the value; see the property).
+    effort_path = request.caller_effort_parameter
 
     def profile_reasoning_effort(profile: GatewayWireProfile) -> str | None:
         """Return the caller effort or this wire's required provider default."""

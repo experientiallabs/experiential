@@ -179,7 +179,12 @@ possible billable dispatch is visible to the gateway ledger.
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
-engine-derived ones), mid-conversation `system` turns keep their position on wires that express
+engine-derived ones); OpenRouter's `reasoning` object (`effort`, or a `max_tokens` budget, plus
+`enabled` / `exclude`) is accepted as a second effort channel, mapped onto the same canonical
+effort (a budget becomes a budgeted `thinking` config on Anthropic rungs and the nearest tier
+elsewhere), and when it is present it wins: a `thinking` config beside it and a disagreeing
+`output_config.effort` drop with disclosure, `exclude` is disclosed rather than honored, and an
+effort the route cannot serve is rejected as `reasoning.effort`; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
 config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
 Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.

@@ -4602,6 +4602,38 @@ def test_a_messages_surface_effort_rejection_matches_the_client_recovery_latch()
     assert "not supported" in str(raised.value)
 
 
+def test_a_messages_effort_from_the_openrouter_channel_is_rejected_by_its_own_name() -> None:
+    """A depth sent as OpenRouter's ``reasoning.effort`` is refused under that path.
+
+    The Messages decoder records which caller field carried the effort; the
+    rejection names it so an agent built against OpenRouter's Messages endpoint
+    finds the field it sent, while the Anthropic ``output_config.effort`` default
+    (and Claude Code's recovery latch) is untouched.
+    """
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://c.test",
+            model_id="hermes-4-405b",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning_effort",
+            supported_reasoning_efforts=("medium",),
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        reasoning_effort="high",
+        reasoning_effort_parameter="reasoning.effort",
+    )
+
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.param == "reasoning.effort"
+    assert "effort parameter" in str(raised.value)
+
+
 def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() -> None:
     """The Anthropic wire rejects empty text content blocks post-dispatch
     ("text content blocks must be non-empty"; 2026-09-05, six orgs on

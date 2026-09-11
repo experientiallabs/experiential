@@ -40,6 +40,12 @@ MESSAGES_MANIFEST = CompatibilityManifest(
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "extended_thinking"),
+        # OpenRouter's Anthropic-compatible Messages endpoint accepts its
+        # ``reasoning`` object (effort / max_tokens / enabled / exclude) on
+        # this surface, and agents built against it send the field verbatim.
+        # Not an official SDK field: an installed extension, decoded closed and
+        # mapped onto the canonical effort channel (see requests.py).
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field(
             "context_management",
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,

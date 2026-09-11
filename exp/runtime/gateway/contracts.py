@@ -513,6 +513,15 @@ class GatewayRequest(ContractModel):
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
+    reasoning_effort_parameter: (
+        Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
+    ) = Field(default=None, exclude=True)
+    """Exact caller field normalized into ``reasoning_effort``, when a surface
+    offers more than one (the Messages surface takes Anthropic's
+    ``output_config.effort`` and the OpenRouter ``reasoning.effort`` extension);
+    an effort the route cannot serve is rejected by that name so the caller's
+    own recovery finds the field it sent. ``None`` means the surface default
+    (see :attr:`caller_effort_parameter`)."""
     # Level-less enable-thinking; the route seam resolves the concrete effort.
     thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
@@ -772,6 +781,28 @@ class GatewayRequest(ContractModel):
         if len(set(value)) != len(value):
             raise ValueError("stop sequences must not repeat")
         return value
+
+    @property
+    def caller_effort_parameter(
+        self,
+    ) -> Literal["reasoning_effort", "reasoning.effort", "output_config.effort"]:
+        """The public field an unservable effort is rejected under.
+
+        The recorded caller field when the decoder knows it; otherwise the
+        surface's one effort field. The name matters: Claude Code carries its
+        effort as Messages ``output_config.effort`` and auto-recovers (drops
+        the field and retries) only when the 400 names that channel, so naming
+        a translated internal field wedges every turn instead.
+        """
+        if self.reasoning_effort_parameter is not None:
+            return self.reasoning_effort_parameter
+        match self.surface:
+            case GatewayApiSurface.RESPONSES:
+                return "reasoning.effort"
+            case GatewayApiSurface.MESSAGES:
+                return "output_config.effort"
+            case _:
+                return "reasoning_effort"
 
     @model_validator(mode="after")
     def _require_coherent_tools(self) -> GatewayRequest:
