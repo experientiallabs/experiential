@@ -100,6 +100,21 @@ CHAT_MANIFEST = CompatibilityManifest(
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
+        # Explicit prompt-cache boundaries: Chat callers can name cache
+        # breakpoints and retention. No rung honors those selectors yet, so
+        # both stay refused rather than silently dropped. The
+        # ``prompt_cache_boundaries`` capability records that decision for
+        # catalog metadata; implicit prefix caching is a different fact.
+        _field(
+            "prompt_cache_options",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
+        _field(
+            "prompt_cache_retention",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -110,8 +125,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "modalities",
                 "moderation",
                 "prediction",
-                "prompt_cache_options",
-                "prompt_cache_retention",
                 "seed",
                 "verbosity",
                 "web_search_options",
@@ -164,6 +177,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # (context is never truncated; served routes cache implicitly).
         _field("truncation", CompatibilityDisposition.SUPPORTED),
         _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # The Responses tool-call cap is refused until a route can honor it.
+        # ``tool_call_limit`` is the catalog vocabulary for that decision.
+        _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.
@@ -176,7 +192,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "background",
                 "context_management",
                 "conversation",
-                "max_tool_calls",
                 "moderation",
                 "prompt",
                 "prompt_cache_retention",

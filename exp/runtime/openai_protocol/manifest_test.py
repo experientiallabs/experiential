@@ -70,6 +70,24 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
+    assert chat["prompt_cache_options"] == CompatibilityDisposition.UNSUPPORTED
+    assert chat["prompt_cache_retention"] == CompatibilityDisposition.UNSUPPORTED
+    assert responses["max_tool_calls"] == CompatibilityDisposition.UNSUPPORTED
+    assert responses["prompt_cache_retention"] == CompatibilityDisposition.UNSUPPORTED
+
+
+def test_schema_drift_fields_carry_capability_vocabulary() -> None:
+    """Explicit cache boundaries and the tool-call cap name their catalog slots.
+
+    Implicit Responses ``prompt_cache_options`` stays a no-op acceptance and
+    is not labeled as boundary support.
+    """
+    chat = {field.field_path: field for field in CHAT_MANIFEST.fields}
+    responses = {field.field_path: field for field in RESPONSES_MANIFEST.fields}
+    assert chat["prompt_cache_options"].capability == "prompt_cache_boundaries"
+    assert chat["prompt_cache_retention"].capability == "prompt_cache_boundaries"
+    assert responses["max_tool_calls"].capability == "tool_call_limit"
+    assert responses["prompt_cache_options"].capability is None
 
 
 def _sdk_literal_values(annotation: object) -> frozenset[str]:

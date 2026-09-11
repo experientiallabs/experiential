@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.runtime.models.providers.capability_parity import (
     CAPABILITY_PARITY_SCHEMA_VERSION,
     deployment_capability_parity,
@@ -248,7 +248,7 @@ def test_parity_row_reports_forced_tool_choice_as_engine_ground_truth() -> None:
         reasoning_wire_format="anthropic_adaptive",
     )
     assert fable.supports_forced_tool_choice is False
-    assert fable.schema_version == CAPABILITY_PARITY_SCHEMA_VERSION == 6
+    assert fable.schema_version == CAPABILITY_PARITY_SCHEMA_VERSION == 7
     opus = deployment_capability_parity(
         provider="anthropic",
         model_id="claude-opus-5",
@@ -265,3 +265,49 @@ def test_parity_row_reports_forced_tool_choice_as_engine_ground_truth() -> None:
         reasoning_wire_format="reasoning",
     )
     assert aggregated.supports_forced_tool_choice is False
+
+
+def test_parity_row_projects_schema_drift_disclosure_fields() -> None:
+    """The six disclosure fields copy from the declaration onto the parity row."""
+    declared = GatewayDeploymentCapabilities(
+        supports_streaming=True,
+        supports_custom_tools=True,
+        supports_grammar_tools=True,
+        supports_tool_call_limit=True,
+        supports_prompt_cache_boundaries=True,
+        reports_model_status=True,
+        reports_reasoning_tokens=True,
+    )
+    row = deployment_capability_parity(
+        provider="openai",
+        model_id="gpt-fixture",
+        dialect="openai_responses",
+        capabilities=declared,
+        reasoning_wire_format="openai_responses",
+    )
+    assert row.schema_version == 7
+    assert row.dialect == "openai_responses"
+    assert row.supports_custom_tools is True
+    assert row.supports_grammar_tools is True
+    assert row.supports_tool_call_limit is True
+    assert row.supports_prompt_cache_boundaries is True
+    assert row.reports_model_status is True
+    assert row.reports_reasoning_tokens is True
+
+
+def test_parity_row_disclosure_fields_default_off() -> None:
+    """Undeclared schema-drift capabilities stay false on the exported row."""
+    row = deployment_capability_parity(
+        provider="gemini",
+        model_id="gemini-fixture",
+        dialect="gemini_generate_content",
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        reasoning_wire_format="gemini_thinking",
+    )
+    assert row.schema_version == CAPABILITY_PARITY_SCHEMA_VERSION == 7
+    assert row.supports_custom_tools is False
+    assert row.supports_grammar_tools is False
+    assert row.supports_tool_call_limit is False
+    assert row.supports_prompt_cache_boundaries is False
+    assert row.reports_model_status is False
+    assert row.reports_reasoning_tokens is False
