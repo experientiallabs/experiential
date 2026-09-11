@@ -116,8 +116,9 @@ def resolve_reasoning_channels(
 
     * ``effort`` is the canonical tier; ``max_tokens`` is a thinking budget
       (forwarded as a budgeted ``enabled`` config on Anthropic rungs, mapped to
-      the nearest tier elsewhere); ``enabled: false`` is ``none``; a bare or
-      ``enabled: true`` object is OpenRouter's default depth.
+      the nearest tier elsewhere); ``enabled: false`` is ``none`` and wins over
+      any depth sent beside it; a bare or ``enabled: true`` object is
+      OpenRouter's default depth.
     * A ``thinking`` config beside it is dropped with disclosure, and an
       ``output_config.effort`` that disagrees is dropped with disclosure (an
       agreeing one stays, so the caller's forwarded object is untouched).
@@ -143,7 +144,12 @@ def resolve_reasoning_channels(
             disclosures=(),
         )
     disclosures: list[str] = []
-    if reasoning.max_tokens is not None:
+    if reasoning.enabled is False:
+        # An explicit off switch wins over any depth beside it (effort or a
+        # budget): the caller asked for no reasoning, so none is configured.
+        effort: ReasoningEffort = "none"
+        resolved_thinking: JsonObject | None = None
+    elif reasoning.max_tokens is not None:
         if reasoning.max_tokens >= max_tokens:
             raise invalid_field(
                 "reasoning.max_tokens",
@@ -152,14 +158,11 @@ def resolve_reasoning_channels(
             )
         budget: JsonObject = {"type": "enabled", "budget_tokens": reasoning.max_tokens}
         effort = thinking_config_reasoning_effort(budget)
-        resolved_thinking: JsonObject | None = budget
+        resolved_thinking = budget
     else:
-        if reasoning.enabled is False:
-            effort = "none"
-        elif reasoning.effort is not None:
-            effort = reasoning.effort
-        else:
-            effort = _REASONING_ENABLED_DEFAULT_EFFORT
+        effort = (
+            reasoning.effort if reasoning.effort is not None else _REASONING_ENABLED_DEFAULT_EFFORT
+        )
         resolved_thinking = None
     if thinking is not None:
         disclosures.append(REASONING_SUPERSEDES_THINKING_DISCLOSURE)
