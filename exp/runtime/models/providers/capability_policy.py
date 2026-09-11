@@ -69,8 +69,16 @@ rung whose strict validator requires it."""
 EFFORT_DROP_DISCLOSURE = "reasoning_effort"
 """Disclosure recorded when a zero-reasoning route drops the caller effort."""
 
-THINKING_DROP_DISCLOSURE = "thinking"
-"""Disclosure recorded when a zero-reasoning route drops adaptive thinking."""
+THINKING_DROP_DISCLOSURE = "thinking->dropped(unsupported_by_route)"
+"""Disclosure recorded when a route that cannot honor any depth drops the
+thinking config (no reasoning rung, or no legal budget under the ceiling)."""
+
+THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE = "thinking->dropped(superseded_by_effort)"
+"""Disclosure recorded when the caller's own effort (``output_config.effort``
+or ``reasoning.effort``) states the depth and the thinking config beside it is
+therefore redundant. Named so a caller never reads it as a stripped depth:
+Harbor read a bare ``thinking`` as "effort high does not apply" (2026-09-11)."""
+
 
 THINKING_DISABLED_DISCLOSURE = "thinking.type->adaptive"
 """Disclosure recorded when an adaptive-only route overrides a disabled thinking config."""
@@ -262,7 +270,7 @@ def _coerce_thinking_to_effort(
         return admitted(
             RequestCoercion(
                 request=request.model_copy(update={"provider_thinking_config": None}),
-                disclosures=(THINKING_DROP_DISCLOSURE,),
+                disclosures=(THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE,),
             )
         )
     requested_tier = thinking_config_reasoning_effort(config)

@@ -57,6 +57,27 @@ impl Normalizer {
                     "Anthropic cache_creation_input_tokens",
                 )
                 .map_err(|message| malformed(&message))?;
+                self.output_tokens =
+                    count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
+                        .map_err(|message| malformed(&message))?;
+                // Surface the start-frame meters at once: the Messages encoder
+                // mirrors them on its own `message_start` (Claude Code reads
+                // the input legs there), and the settlement tracker holds them
+                // as the best known count until the terminal report, which
+                // supersedes them at `message_stop` (server-tool turns re-read
+                // fetched results as input, so the start count undercounts).
+                let input_tokens = bounded_ledger_sum(
+                    &[self.input_tokens, self.cache_read, self.cache_write],
+                    "Anthropic input",
+                )
+                .map_err(|message| malformed(&message))?;
+                events.push(Event::Usage(Usage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(self.output_tokens),
+                    cached_input_tokens: Some(self.cache_read),
+                    cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    reasoning_tokens: None,
+                }));
             }
             "content_block_start" => {
                 let index = require_u64(&payload, "index", "Anthropic content index")
@@ -409,7 +430,16 @@ mod tests {
             "type": "message_start",
             "message": {"usage": {"input_tokens": 2230, "output_tokens": 25}},
         }));
-        assert!(normalizer.feed(&start_message).expect("start").is_empty());
+        // The start-frame meters surface early so the Messages encoder can put
+        // them on its own `message_start` (Claude Code reads input there); the
+        // terminal report still supersedes them at `message_stop`.
+        assert!(matches!(
+            normalizer.feed(&start_message).expect("start").as_slice(),
+            [Event::Usage(usage)]
+                if usage.input_tokens == Some(2230)
+                    && usage.output_tokens == Some(25)
+                    && usage.cached_input_tokens == Some(0)
+        ));
 
         let start = frame(serde_json::json!({
             "type": "content_block_start",

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
-from typing import cast
+import logging
+from collections.abc import Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, cast
 
 from exp.common.models.known_models import canonical_model_id, known_model_metadata
 from exp.common.models.model import ReasoningEffort
@@ -11,6 +12,12 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.contracts import GatewayRequest
+    from exp.runtime.models.providers.base import GatewayWireProfile
+
+_logger = logging.getLogger(__name__)
 
 REASONING_EFFORTS = (
     "none",
@@ -441,3 +448,123 @@ def _require_exact_effort(
 def _normalized_model(model_id: str) -> str:
     """Normalize common provider separators without weakening identity checks."""
     return model_id.lower().replace(".", "-").replace("_", "-")
+
+
+def fill_bare_enabled_budget(
+    config: Mapping[str, object], maximum_output_tokens: int | None
+) -> dict[str, object] | None:
+    """Give a budget-less ``enabled`` thinking config the derived legal budget.
+
+    Claude Code sends ``{"type": "enabled"}``; the Anthropic wire requires
+    ``1024 <= budget_tokens < max_tokens``. The fill is the same derivation the
+    adaptive->enabled translation uses, so both paths agree on the depth an
+    unspecified budget means.
+
+    Args:
+        config: The caller's verbatim thinking object (type ``enabled``, no
+            budget).
+        maximum_output_tokens: The caller's reply ceiling.
+
+    Returns:
+        The config with ``budget_tokens`` filled, or ``None`` when no legal
+        budget fits under the ceiling (the caller cannot request thinking on
+        this turn at all).
+    """
+    budget = anthropic_thinking_budget_tokens(maximum_output_tokens)
+    if budget is None:
+        return None
+    return {**config, "budget_tokens": budget}
+
+
+THINKING_BUDGET_DERIVED_DISCLOSURE = "thinking.budget_tokens->derived"
+"""Disclosure recorded when a bare ``enabled`` config (no budget, Claude Code's
+shape) is forwarded to an Anthropic rung with the gateway's derived budget."""
+
+THINKING_NO_LEGAL_BUDGET_DISCLOSURE = "thinking->dropped(no_legal_budget)"
+"""Disclosure recorded when a bare ``enabled`` config cannot be forwarded
+because no budget in [1024, max_tokens) exists under the caller's ceiling."""
+
+
+def shape_anthropic_thinking_config(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    provider_updates: dict[str, object],
+    ignored: list[str],
+) -> None:
+    """Family-gate a caller thinking config for a route with Anthropic rungs.
+
+    The adaptive-thinking generation rejects caller ``enabled``/``disabled``
+    configs outright and the budgeted generation rejects ``adaptive`` by name,
+    so verbatim forwarding is decided per model family (a route is one
+    exact-model pool, so the answer is uniform across rungs). The named
+    rejections here are what let the admit loop offer the disclosed coercions
+    instead of the provider's own opaque 400 (which never fails over). A bare
+    ``enabled`` config (Claude Code's shape) gets the derived legal budget,
+    disclosed, or drops with disclosure when no legal budget fits the ceiling.
+
+    Args:
+        profiles: The route's wire profiles.
+        request: The caller's canonical request; ``provider_thinking_config``
+            must be present.
+        provider_updates: The dispatched-request overrides, written in place.
+        ignored: The route's disclosure list, appended in place.
+
+    Raises:
+        ProviderParameterError: The config names a mode this family rejects.
+    """
+    from exp.runtime.models.providers.errors import ProviderParameterError
+
+    config = request.provider_thinking_config
+    if config is None:
+        return
+
+    def disclose(path: str) -> None:
+        if path not in ignored:
+            ignored.append(path)
+
+    config_type = str(config.get("type"))
+    adaptive_only = all(anthropic_adaptive_only_thinking(profile.model_id) for profile in profiles)
+    budgeted_enabled_only = all(
+        profile.dialect == "anthropic_messages"
+        and anthropic_budgeted_enabled_only(profile.model_id)
+        for profile in profiles
+    )
+    if budgeted_enabled_only and config_type == "adaptive":
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'thinking.type' cannot be 'adaptive' on this model: "
+                "it reasons via an explicit token budget. Send thinking "
+                "{type: 'enabled', budget_tokens: N} or remove the field."
+            ),
+            param="thinking.type",
+            code="unsupported_parameter",
+        )
+    if adaptive_only and config_type == "enabled":
+        # Translate to the model's one supported mode, emitted explicitly so
+        # the promise holds even on routes with no pinned effort. The token
+        # budget has no adaptive equivalent, so it is disclosed as ignored
+        # rather than silently mapped onto an effort level.
+        provider_updates["provider_thinking_config"] = {"type": "adaptive"}
+        disclose("thinking.budget_tokens")
+        _logger.warning(
+            "translated a caller 'enabled' thinking config to adaptive for an "
+            "adaptive-only Anthropic route; thinking.budget_tokens was disclosed as ignored"
+        )
+    elif config_type == "enabled" and "budget_tokens" not in config:
+        filled = fill_bare_enabled_budget(config, request.maximum_output_tokens)
+        if filled is None:
+            provider_updates["provider_thinking_config"] = None
+            disclose(THINKING_NO_LEGAL_BUDGET_DISCLOSURE)
+        else:
+            provider_updates["provider_thinking_config"] = filled
+            disclose(THINKING_BUDGET_DERIVED_DISCLOSURE)
+    elif adaptive_only and config_type == "disabled":
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'thinking.type' cannot be 'disabled' on this model: "
+                "it always reasons adaptively. Remove the thinking field or choose "
+                "a model that supports disabling thinking."
+            ),
+            param="thinking.type",
+            code="unsupported_parameter",
+        )

@@ -259,6 +259,18 @@ impl MessagesSseEncoder {
         }
     }
 
+    /// Seed the meters `message_start` reports from what the upstream already
+    /// said (an Anthropic upstream's own start frame). `None` keeps the zero
+    /// placeholder an OpenAI-wire upstream forces, whose final meters ride
+    /// `message_delta` (the official SDK accumulators copy them from there).
+    pub fn set_initial_usage(&mut self, usage: Option<Usage>) {
+        if let Some(usage) = usage {
+            if usage.has_token_counts() {
+                self.usage = Some(usage);
+            }
+        }
+    }
+
     /// Attach the authenticated carrier before the terminal is encoded.
     ///
     /// Mirrors `ChatSseEncoder::set_reasoning_content_carrier`: a tool turn's
@@ -303,7 +315,7 @@ impl MessagesSseEncoder {
             "content": [],
             "stop_reason": Value::Null,
             "stop_sequence": Value::Null,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": messages_usage(self.usage.as_ref()),
         });
         // Same body-level disclosure as the Chat and Responses encoders: the
         // Anthropic envelope has no field for it, and the official SDK
@@ -946,3 +958,5 @@ pub(super) fn disclose_ignored_parameters(message: &mut Value, ignored_parameter
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_claude_code;

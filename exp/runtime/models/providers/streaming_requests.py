@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
+    GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
-    SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS,
+    CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
+    THINKING_HISTORY_DROP_DISCLOSURE,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
-    THINKING_HISTORY_DROP_DISCLOSURE,
+    SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE as TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
@@ -73,13 +75,13 @@ from exp.runtime.models.providers.openai_payloads import (
 )
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
-    anthropic_adaptive_only_thinking,
-    anthropic_budgeted_enabled_only,
+    shape_anthropic_thinking_config,
 )
 from exp.runtime.models.providers.server_tools import (
     anthropic_server_tool_names,
     anthropic_server_tools_message,
     anthropic_server_tools_present,
+    disclose_dropped_server_tools,
 )
 
 if TYPE_CHECKING:
@@ -501,7 +503,7 @@ def route_generation_parameter_requests(
     if request.provider_cache_control is not None and not any(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
-        ignore("provider_cache_control", "cache_control")
+        ignore("provider_cache_control", f"cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}")
     if request.inference_geo is not None and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
@@ -563,8 +565,9 @@ def route_generation_parameter_requests(
         for message in request.messages
         for call in message.tool_calls
     ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
-        if "messages.tool_calls.cache_control" not in ignored:
-            ignored.append("messages.tool_calls.cache_control")
+        tool_call_marker = f"messages.tool_calls.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
+        if tool_call_marker not in ignored:
+            ignored.append(tool_call_marker)
 
     # Block-level cache markers (system and message text runs, tool-result
     # breakpoints) follow the #699 rule: kept while ANY rung is Anthropic
@@ -576,8 +579,9 @@ def route_generation_parameter_requests(
         message.provider_text_blocks or message.cache_control is not None
         for message in request.messages
     ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
-        if "messages.content.cache_control" not in ignored:
-            ignored.append("messages.content.cache_control")
+        content_marker = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
+        if content_marker not in ignored:
+            ignored.append(content_marker)
 
     # LiteLLM stamps ``provider_specific_fields`` on every assistant message it
     # returns, and naive agent loops echo the dump back verbatim. No wire takes
@@ -592,7 +596,10 @@ def route_generation_parameter_requests(
     # rejection (Claude Code sends eager_input_streaming conditionally).
     if not all(profile.dialect == "anthropic_messages" for profile in profiles):
         tool_annotation_paths = (
-            ("tools.cache_control", any(tool.cache_control is not None for tool in request.tools)),
+            (
+                f"tools.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}",
+                any(tool.cache_control is not None for tool in request.tools),
+            ),
             (
                 "tools.eager_input_streaming",
                 any(tool.eager_input_streaming is not None for tool in request.tools),
@@ -717,69 +724,31 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
     if request.provider_thinking_config is not None and not non_anthropic_route:
-        # The adaptive-thinking generation rejects caller enabled/disabled
-        # configs outright, so verbatim forwarding is family-gated (a route
-        # is one exact-model pool, so the answer is uniform across rungs).
-        config_type = str(request.provider_thinking_config.get("type"))
-        adaptive_only = all(
-            anthropic_adaptive_only_thinking(profile.model_id) for profile in profiles
-        )
-        # A budgeted-enabled-only model (haiku-4-5) rejects an adaptive config
-        # by NAME; the named rejection here is what lets the admit loop offer
-        # the disclosed adaptive->enabled(budget) coercion instead of the
-        # provider's own opaque 400 (which never fails over).
-        budgeted_enabled_only = all(
-            profile.dialect == "anthropic_messages"
-            and anthropic_budgeted_enabled_only(profile.model_id)
-            for profile in profiles
-        )
-        if budgeted_enabled_only and config_type == "adaptive":
-            raise ProviderParameterError(
-                message=(
-                    "The parameter 'thinking.type' cannot be 'adaptive' on this model: "
-                    "it reasons via an explicit token budget. Send thinking "
-                    "{type: 'enabled', budget_tokens: N} or remove the field."
-                ),
-                param="thinking.type",
-                code="unsupported_parameter",
-            )
-        if adaptive_only and config_type == "enabled":
-            # Translate to the model's one supported mode, emitted explicitly
-            # so the promise holds even on routes with no pinned effort. The
-            # token budget has no adaptive equivalent, so it is disclosed as
-            # ignored rather than silently mapped onto an effort level.
-            provider_updates["provider_thinking_config"] = {"type": "adaptive"}
-            if "thinking.budget_tokens" not in ignored:
-                ignored.append("thinking.budget_tokens")
-            _logger.warning(
-                "translated a caller 'enabled' thinking config to adaptive for an "
-                "adaptive-only Anthropic route; thinking.budget_tokens was disclosed "
-                "as ignored"
-            )
-        elif adaptive_only and config_type == "disabled":
-            raise ProviderParameterError(
-                message=(
-                    "The parameter 'thinking.type' cannot be 'disabled' on this model: "
-                    "it always reasons adaptively. Remove the thinking field or choose "
-                    "a model that supports disabling thinking."
-                ),
-                param="thinking.type",
-                code="unsupported_parameter",
-            )
+        shape_anthropic_thinking_config(profiles, request, provider_updates, ignored)
     if anthropic_server_tools_present(request) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         server_tool_names = anthropic_server_tool_names(request)
-        # Server tools execute inside Anthropic's API; silently dropping a
-        # search capability the caller asked for would be a behavior lie, so
-        # a route that cannot serve them rejects and NAMES the tool (Claude
-        # Code's WebSearch is the common case) so the caller knows which
-        # feature needs a Claude model.
-        raise ProviderParameterError(
-            message=anthropic_server_tools_message(server_tool_names),
-            param="tools",
-            code="unsupported_parameter",
+        if any(profile.dialect == "anthropic_messages" for profile in profiles):
+            # A mixed route has a rung that could run the tool; the request
+            # still cannot be served uniformly, so it rejects and NAMES the
+            # tool (Claude Code's WebSearch is the common case).
+            raise ProviderParameterError(
+                message=anthropic_server_tools_message(server_tool_names),
+                param="tools",
+                code="unsupported_parameter",
+            )
+        # No rung on this route can run an Anthropic server tool: the
+        # dispatched request drops the carriers with disclosure and the turn
+        # serves (see ``disclose_dropped_server_tools``).
+        current_messages = provider_updates.get("messages", request.messages)
+        stripped_messages, clear_tool_choice = disclose_dropped_server_tools(
+            request, cast("Sequence[GatewayMessage]", current_messages), ignored
         )
+        provider_updates["messages"] = stripped_messages
+        provider_updates["provider_server_tools"] = ()
+        if clear_tool_choice:
+            provider_updates["tool_choice"] = None
     if any(message.provider_native_item is not None for message in request.messages) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
