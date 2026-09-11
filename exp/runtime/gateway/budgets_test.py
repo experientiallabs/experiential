@@ -11,16 +11,13 @@ import pytest
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import ModelCapabilities
-from exp.common.models.catalog import (
-    GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
-    GatewayTokenPrices,
-)
+from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.attempt_tokens import (
     DEFAULT_RESERVATION_OUTPUT_TOKENS,
     worst_case_attempt_tokens,

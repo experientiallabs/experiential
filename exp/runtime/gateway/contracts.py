@@ -928,3 +928,8 @@ class ExecutionSnapshot(ContractModel):
     # per-attempt retry/failover decision can honor it. Defaults to the
     # historical maximize_availability.
     failover_mode: FailoverMode = "maximize_availability"
+    # The pool's cache-stakes throttle control, carried alongside so the
+    # per-attempt decision can weigh the requesting organization's observed
+    # cached fraction on the throttled rung against it. ``None`` leaves the
+    # failover mode's own throttle rule in force.
+    throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)

@@ -45,6 +45,8 @@ def _control_plane() -> JsonObject:
         "rung_saturated_overflows": 0,
         "rung_rate_limit_sheds": 3,
         "rung_fresh_session_spills": 1,
+        "throttle_surfaced_cache_preserving": 2,
+        "throttle_failover_cold": 5,
         "sticky_spill_bindings": 4,
         # JSON-snapshot-only: per-rung learned ceilings never render as text,
         # so the exposition carries no per-rung label cardinality.
@@ -127,6 +129,12 @@ exp_gateway_rung_rate_limit_sheds_total 3
 # HELP exp_gateway_rung_fresh_session_spills_total Fresh-session dispatches shed early to spill.
 # TYPE exp_gateway_rung_fresh_session_spills_total counter
 exp_gateway_rung_fresh_session_spills_total 1
+# HELP exp_gateway_throttle_surfaced_cache_preserving_total Throttles surfaced to keep warm cache.
+# TYPE exp_gateway_throttle_surfaced_cache_preserving_total counter
+exp_gateway_throttle_surfaced_cache_preserving_total 2
+# HELP exp_gateway_throttle_failover_cold_total Throttles failed over cold (cache below threshold).
+# TYPE exp_gateway_throttle_failover_cold_total counter
+exp_gateway_throttle_failover_cold_total 5
 # HELP exp_gateway_reconciled_expired_requests_total Crashed requests reconciled at startup.
 # TYPE exp_gateway_reconciled_expired_requests_total counter
 exp_gateway_reconciled_expired_requests_total 0

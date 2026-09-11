@@ -10,13 +10,14 @@ from urllib.parse import urlsplit
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
-from exp.common.models.catalog import BillingSource, GatewayEquivalenceCertification
+from exp.common.models.catalog import BillingSource
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelDeployment,
     ExactModelId,
     ExactModelPoolId,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.contracts import (
     AttemptId,
     ExecutionSnapshot,

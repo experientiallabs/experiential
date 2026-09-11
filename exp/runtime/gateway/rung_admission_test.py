@@ -391,6 +391,22 @@ class TestCachePriority:
         # reading private state: with alpha=0 the estimate is inert.
         assert isinstance(_reserve(registry, "org-a", bound=8, fair_share=True), str)
 
+    def test_cached_fraction_reads_the_live_estimate_and_zero_without_a_signal(self) -> None:
+        """The public read returns the folded EWMA, scoped to one organization and rung."""
+        now = [0.0]
+        registry = _registry(now)
+        assert registry.cached_fraction(_KEY, "org-a") == 0.0
+        registry.record_settle(_KEY, "org-a", cached_tokens=800, input_tokens=1_000)
+        assert registry.cached_fraction(_KEY, "org-a") == pytest.approx(0.8)
+        # Another organization on the same rung, and the same organization on
+        # another rung, hold no signal.
+        assert registry.cached_fraction(_KEY, "org-b") == 0.0
+        assert registry.cached_fraction(("other", "connection"), "org-a") == 0.0
+        # One half-life later a fully cold sample halves the estimate.
+        now[0] = 600.0
+        registry.record_settle(_KEY, "org-a", cached_tokens=0, input_tokens=1_000)
+        assert registry.cached_fraction(_KEY, "org-a") == pytest.approx(0.4)
+
     def test_congestion_boost_flips_a_freed_slot_to_the_cached_org(self) -> None:
         """Exact margin arithmetic for alpha=2 on a contended bound of 8.
 

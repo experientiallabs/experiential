@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, Literal
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import (
@@ -54,14 +54,22 @@ if TYPE_CHECKING:
 MAXIMUM_TOTAL_ATTEMPTS = 8
 MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 
-# Under maximize_cache, a throttle (429) does NOT fail over to a cold provider:
-# the request returns the throttle and the caller retries the warm rung after the
-# provider's backoff window, keeping that rung's prompt cache. A same-request
-# redial is impossible -- the 429 sets the rung's throttle window before the next
-# candidate is chosen, so an immediate re-claim is refused -- and failing over
-# cold would abandon the cache the provider just built, so the only cache-
-# preserving move is to surface the throttle instead of advancing. The default
-# maximize_availability policy is unchanged: a throttle fails over there.
+# The failure classes whose failover is a cache-stakes decision rather than a
+# fixed rule. A throttle (429) leaves the rung's prompt cache intact but
+# unreachable for this request: a same-request redial is impossible (the 429
+# sets the rung's throttle window before the next candidate is chosen, so an
+# immediate re-claim is refused), and failing over cold abandons the cache the
+# provider just built, strips the conversation's reasoning carry-over, and
+# rebills the whole context. So the only two moves are to SURFACE the throttle
+# (the caller retries the warm rung after the provider's backoff) or to ADVANCE
+# cold, and which is better depends on how much warm cache is actually at
+# stake. A pool authoring ``throttle_cache_threshold`` decides per request by
+# ``throttle_disposition`` below: surface when the requesting organization's
+# observed cached fraction on the throttled rung meets the threshold, advance
+# otherwise (an organization with no cache evidence reads as 0 and advances,
+# so a request is never stranded to protect cache that does not exist). With
+# no threshold the mode's fixed rule stands: ``maximize_cache`` surfaces every
+# throttle, ``maximize_availability`` and ``maximize_cache_affinity`` advance.
 #
 # TIMEOUT is deliberately NOT in this set. The classifier already decides, per
 # timeout, whether the same rung may be redialed: a genuine retryable timeout
@@ -75,6 +83,53 @@ MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 # request on a lane that never answered -- there is no warm cache to preserve on a
 # lane that never answered.
 _CACHE_PRESERVING_NO_FAILOVER_CLASSES = frozenset({GatewayFailureClass.THROTTLED})
+
+ThrottleDisposition = Literal["throttle_surfaced_cache_preserving", "throttle_failover_cold"]
+"""How a threshold-authoring pool disposed of one throttle, as a disclosure code.
+
+``throttle_surfaced_cache_preserving`` ended the ladder so the caller retries
+the warm rung; ``throttle_failover_cold`` advanced past it. The failover code
+lands as the cold attempt's ``dispatch_reason`` with the throttled rung as its
+``preferred_deployment`` (the counterfactual the cold restart is measured
+against); the surfaced branch reserves no further attempt, so it is counted on
+the worker's control-plane metrics instead.
+"""
+THROTTLE_SURFACED_CACHE_PRESERVING: Final[ThrottleDisposition] = (
+    "throttle_surfaced_cache_preserving"
+)
+THROTTLE_FAILOVER_COLD: Final[ThrottleDisposition] = "throttle_failover_cold"
+
+
+def throttle_disposition(
+    failure: GatewayFailure,
+    *,
+    throttle_cache_threshold: float | None,
+    cached_fraction: float,
+) -> ThrottleDisposition | None:
+    """Decide one throttle by the cache actually at stake, when a threshold is authored.
+
+    Pure: the same inputs always name the same disposition, so the waterfall
+    decision and its disclosure can each call it without sharing state.
+
+    Args:
+        failure: The classified failure that ended the previous dispatch.
+        throttle_cache_threshold: The pool's authored cached-fraction floor,
+            or ``None`` when the pool leaves the failover mode's rule in force.
+        cached_fraction: The requesting organization's observed cached-token
+            fraction on the throttled rung (0 without evidence).
+
+    Returns:
+        The disposition, or ``None`` when the failure is not a throttle or
+        no threshold is authored (the caller applies the mode's own rule).
+    """
+    if (
+        throttle_cache_threshold is None
+        or failure.failure_class not in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
+    ):
+        return None
+    if cached_fraction >= throttle_cache_threshold:
+        return THROTTLE_SURFACED_CACHE_PRESERVING
+    return THROTTLE_FAILOVER_COLD
 
 
 class NativeDialectUnavailableError(RuntimeError):
@@ -212,13 +267,15 @@ def dispatch_disclosure(
     reservation, ``rung_dead`` when it was bypassed by health or an earlier
     failure, ``saturated_overflow`` when the ladder force-admitted past a
     bound. On any other pool a disclosure appears only when a dispatch policy
-    actually shed a rung in this reservation, and the preferred rung is the
-    shed rung itself (the counterfactual the shed is measured against).
+    actually bypassed a rung in this reservation (a shed, or a
+    ``throttle_failover_cold`` advance past a throttled warm rung under an
+    authored ``throttle_cache_threshold``), and the preferred rung is the
+    bypassed rung itself (the counterfactual the bypass is measured against).
 
     Args:
         route: Frozen ordered route for this request.
         candidate: The route depth about to dispatch.
-        policy_sheds: ``(depth, reason)`` for every policy shed this
+        policy_sheds: ``(depth, reason)`` for every policy bypass this
             reservation, in ladder order.
         forced_overflow: Whether this dispatch was forced past a bound.
         sticky_preferred: Whether the route's depth 0 was chosen by a sticky
@@ -293,6 +350,8 @@ def next_route_candidate(
     total_attempts: int,
     refusal_failover: bool,
     failover_mode: FailoverMode = "maximize_availability",
+    throttle_cache_threshold: float | None = None,
+    cached_fraction: float = 0.0,
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
 ) -> int | None:
@@ -303,18 +362,30 @@ def next_route_candidate(
     a failover-eligible failure (or an opted-in typed refusal) advances to the
     next claimable deployment.
 
-    Under ``maximize_cache`` a throttle (429) surfaces to the caller instead of
-    failing over: the warm rung's prompt cache is kept for a caller retry after
-    the provider's backoff, rather than restarting cold on another provider.
-    ``maximize_cache_affinity`` deliberately does NOT share that short-circuit:
-    its cache story is the deterministic rendezvous alternate, so a throttle
-    fails over exactly like ``maximize_availability``. Timeouts are identical
-    in every mode: a retryable 408 redials the
-    warm rung via its own ``retryable_same_deployment`` flag, while
-    a first-byte/header-phase stall is a dead lane the classifier marks
-    non-redialable and so still fails over. Operational deadness (auth, not-found,
-    provider 5xx, transport) and client errors are identical in every mode too:
-    deadness always fails over, client errors never do.
+    A throttle (429) is the one failure whose failover is a cache-stakes
+    decision. When the pool authors ``throttle_cache_threshold`` it is the
+    authoritative throttle control under every ``failover_mode``: the throttle
+    surfaces to the caller (who retries the warm rung after the provider's
+    backoff, keeping its prompt cache) exactly when ``cached_fraction``, the
+    requesting organization's observed cached-token fraction on the throttled
+    rung, is at or above the threshold, and fails over cold otherwise. A
+    threshold of ``0.0`` therefore always surfaces, and an organization with
+    no cache evidence on the rung (fraction 0) always fails over: a request is
+    never stranded to protect cache that does not exist. Without a threshold
+    the mode's fixed rule applies: ``maximize_cache`` surfaces every throttle,
+    while ``maximize_cache_affinity`` deliberately does NOT share that
+    short-circuit (its cache story is the deterministic rendezvous alternate)
+    and fails over exactly like ``maximize_availability``. In both shapes a
+    same-request redial of the throttled rung is impossible, because the 429
+    sets the rung's throttle window before the next candidate is chosen, so
+    surfacing is the only cache-preserving move.
+
+    Timeouts are identical in every mode: a retryable 408 redials the warm
+    rung via its own ``retryable_same_deployment`` flag, while a
+    first-byte/header-phase stall is a dead lane the classifier marks
+    non-redialable and so still fails over. Operational deadness (auth,
+    not-found, provider 5xx, transport) and client errors are identical in
+    every mode too: deadness always fails over, client errors never do.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
@@ -325,6 +396,11 @@ def next_route_candidate(
         total_attempts: Physical dispatches so far across the whole request.
         refusal_failover: Whether a typed precommit refusal may advance.
         failover_mode: The pool's per-model failover policy.
+        throttle_cache_threshold: The pool's authored cached-fraction floor
+            for surfacing a throttle, or ``None`` to keep the mode's rule.
+        cached_fraction: The requesting organization's observed cached-token
+            fraction on the rung at ``current_depth`` (0 without evidence);
+            read only against an authored threshold.
         maximum_total_attempts: Hard cap across retries and deployments.
         maximum_same_deployment_attempts: Initial dispatch plus safe retries
             per deployment.
@@ -340,10 +416,19 @@ def next_route_candidate(
         and health.claim(keys[current_depth])
     ):
         return current_depth
-    # maximize_cache keeps a throttled rung's cache by NOT failing over cold; the
-    # request surfaces the throttle so the caller retries after the backoff window.
+    # A throttle either surfaces (the caller retries the warm rung after the
+    # backoff window, keeping its cache) or advances cold. An authored threshold
+    # decides by the cache at stake; otherwise maximize_cache alone surfaces.
+    disposition = throttle_disposition(
+        failure,
+        throttle_cache_threshold=throttle_cache_threshold,
+        cached_fraction=cached_fraction,
+    )
+    if disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
+        return None
     if (
-        failover_mode == "maximize_cache"
+        disposition is None
+        and failover_mode == "maximize_cache"
         and failure.failure_class in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
     ):
         return None

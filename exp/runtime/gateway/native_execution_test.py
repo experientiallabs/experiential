@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.models.catalog import GatewayDeploymentMetadata
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -19,10 +19,13 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
+    THROTTLE_FAILOVER_COLD,
+    THROTTLE_SURFACED_CACHE_PRESERVING,
     claim_route_from,
     deployment_wire_entry,
     next_route_candidate,
     select_route_deployments,
+    throttle_disposition,
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -656,6 +659,202 @@ def test_wire_entry_names_customer_managed_billing_for_the_data_plane() -> None:
     house = GatewayWireProfile(dialect="openai_responses", url="https://provider.test")
     assert deployment_wire_entry(route, route.deployment, byok, {})["billing_customer_managed"]
     assert not deployment_wire_entry(route, route.deployment, house, {})["billing_customer_managed"]
+
+
+@pytest.mark.parametrize(
+    ("failover_mode", "expected"),
+    (
+        ("maximize_availability", 1),
+        ("maximize_cache", None),
+        ("maximize_cache_affinity", 1),
+    ),
+)
+def test_no_threshold_keeps_each_modes_own_throttle_rule(
+    failover_mode: FailoverMode,
+    expected: int | None,
+) -> None:
+    """Without an authored threshold every mode decides a throttle as before.
+
+    The observed cached fraction is deliberately high here: with no threshold
+    it must be ignored, so an unauthored pool sees zero behavior change.
+    """
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS,
+        failure=_failover_only(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode=failover_mode,
+        throttle_cache_threshold=None,
+        cached_fraction=0.95,
+    )
+    assert candidate == expected
+
+
+@pytest.mark.parametrize(
+    ("cached_fraction", "threshold", "expected"),
+    (
+        # Above the floor: the warm cache is worth waiting for.
+        (0.8, 0.5, None),
+        # Below it: fail over cold to the next claimable rung.
+        (0.2, 0.5, 1),
+        # Exactly at the floor surfaces (at-or-above).
+        (0.5, 0.5, None),
+        # 0.0 always surfaces, even with no cache evidence (maximize_cache).
+        (0.0, 0.0, None),
+        # A fresh organization (no evidence) fails over under any positive floor.
+        (0.0, 0.5, 1),
+        (0.0, 0.01, 1),
+        # 1.0 surfaces only a fully cached prompt.
+        (0.99, 1.0, 1),
+        (1.0, 1.0, None),
+    ),
+)
+def test_threshold_surfaces_a_throttle_only_when_the_cache_at_stake_meets_it(
+    cached_fraction: float,
+    threshold: float,
+    expected: int | None,
+) -> None:
+    """An authored threshold decides a throttle by the observed cached fraction."""
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS,
+        failure=_failover_only(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        throttle_cache_threshold=threshold,
+        cached_fraction=cached_fraction,
+    )
+    assert candidate == expected
+
+
+@pytest.mark.parametrize(
+    ("failover_mode", "cached_fraction", "expected"),
+    (
+        # Availability would fail over; the warm cache says wait.
+        ("maximize_availability", 0.9, None),
+        # maximize_cache would surface; the cold cache says advance.
+        ("maximize_cache", 0.1, 1),
+        # Affinity would fail over; the warm cache says wait.
+        ("maximize_cache_affinity", 0.9, None),
+    ),
+)
+def test_threshold_is_the_authoritative_throttle_control_under_every_mode(
+    failover_mode: FailoverMode,
+    cached_fraction: float,
+    expected: int | None,
+) -> None:
+    """When a threshold is authored the mode's fixed throttle rule no longer applies."""
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS,
+        failure=_failover_only(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode=failover_mode,
+        throttle_cache_threshold=0.5,
+        cached_fraction=cached_fraction,
+    )
+    assert candidate == expected
+
+
+def test_threshold_failover_still_needs_a_claimable_later_rung() -> None:
+    """A cold failover advances only to a rung the health registry will grant."""
+    health = DeploymentHealthRegistry()
+    health.failed(
+        _KEYS[1],
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            retry_after_seconds=30,
+        ),
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=_failover_only(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        throttle_cache_threshold=0.5,
+        cached_fraction=0.0,
+    )
+    # The only later rung sits inside its own throttle window: exhausted.
+    assert candidate is None
+
+
+def test_threshold_leaves_every_non_throttle_class_alone() -> None:
+    """The threshold reads only against a throttle; other classes keep their rules.
+
+    A high cached fraction that would surface a throttle must not strand a
+    dead rung, and a low one must not fail over a caller-owned rejection.
+    """
+    health = DeploymentHealthRegistry()
+
+    def decide(failure: GatewayFailure, cached_fraction: float) -> int | None:
+        """Run one decision under maximize_cache with an authored threshold."""
+        return next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=failure,
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_cache",
+            throttle_cache_threshold=0.5,
+            cached_fraction=cached_fraction,
+        )
+
+    dead = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        safe_message="provider authentication failed",
+        failover_eligible=True,
+    )
+    assert decide(dead, 0.9) == 1
+    stalled = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT,
+        safe_message="provider did not send the first token in time",
+        retryable_same_deployment=False,
+        failover_eligible=True,
+    )
+    assert decide(stalled, 0.9) == 1
+    invalid = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message="provider rejected the request",
+    )
+    assert decide(invalid, 0.0) is None
+    # A retryable failure still redials the warm rung ahead of any failover.
+    assert decide(_retryable(), 0.0) == 0
+
+
+def test_throttle_disposition_names_each_branch_and_only_those() -> None:
+    """The pure disposition is the single source for the decision and its disclosure."""
+    throttle = _failover_only()
+    assert (
+        throttle_disposition(throttle, throttle_cache_threshold=None, cached_fraction=1.0) is None
+    )
+    assert (
+        throttle_disposition(_retryable(), throttle_cache_threshold=0.5, cached_fraction=1.0)
+        is None
+    )
+    assert (
+        throttle_disposition(throttle, throttle_cache_threshold=0.5, cached_fraction=0.5)
+        == THROTTLE_SURFACED_CACHE_PRESERVING
+        == "throttle_surfaced_cache_preserving"
+    )
+    assert (
+        throttle_disposition(throttle, throttle_cache_threshold=0.5, cached_fraction=0.49)
+        == THROTTLE_FAILOVER_COLD
+        == "throttle_failover_cold"
+    )
 
 
 def test_wire_entry_carries_the_tool_call_serialization_flag() -> None:

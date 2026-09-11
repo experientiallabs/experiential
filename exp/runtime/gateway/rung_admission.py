@@ -491,6 +491,27 @@ class RungLoadRegistry:
             signal.fraction = signal.fraction * retained + sample * (1.0 - retained)
             signal.sampled_at = now
 
+    def cached_fraction(self, key: RungLoadKey, organization_id: str) -> float:
+        """Return one organization's live cached-fraction estimate on a rung.
+
+        The same time-decayed EWMA the cache-priority fairness term weights,
+        read for the cross-rung throttle decision: it tells the waterfall how
+        much warm provider cache the organization actually holds on the rung
+        that just throttled. Zero when the organization has no retained
+        sample there (never settled with usage on this worker, or its estimate
+        aged past retention), which is deliberately the fail-over answer.
+
+        Args:
+            key: Physical rung identity.
+            organization_id: The requesting organization.
+
+        Returns:
+            The estimate in ``[0, 1]``, or ``0.0`` without a signal.
+        """
+        with self._lock:
+            rung = self._rungs.get(key)
+            return 0.0 if rung is None else _cached_fraction(rung, organization_id)
+
     def learned_ceilings(self) -> dict[str, float]:
         """Return live learned request ceilings keyed by rung, for metrics.
 

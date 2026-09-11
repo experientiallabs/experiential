@@ -143,6 +143,7 @@ class NativeObservabilityMixin:
         lead_rungs_skipped, dead_rungs_skipped = self._accounting.admission_rung_skips()
         rung_sheds, rung_overflows = self._accounting.rung_admission_counters()
         rate_limit_sheds, fresh_session_spills = self._accounting.rung_rate_counters()
+        throttles_surfaced, throttles_failed_over = self._accounting.throttle_cache_counters()
         control_plane: JsonObject = {
             "sweep_retained_settlements_replayed": retained_replayed,
             "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
@@ -153,6 +154,11 @@ class NativeObservabilityMixin:
             "rung_saturated_overflows": rung_overflows,
             "rung_rate_limit_sheds": rate_limit_sheds,
             "rung_fresh_session_spills": fresh_session_spills,
+            # Cache-stakes throttle dispositions on pools authoring a
+            # throttle_cache_threshold; the surfaced branch reserves no
+            # further attempt row, so this counter is its worker-side trace.
+            "throttle_surfaced_cache_preserving": throttles_surfaced,
+            "throttle_failover_cold": throttles_failed_over,
             "sticky_spill_bindings": self._accounting.sticky.size(),
             # Live learned request ceilings keyed by rung (JSON snapshot only;
             # the Prometheus rendering stays worker-global counters so no
