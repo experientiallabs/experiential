@@ -14,9 +14,7 @@ from exp.common.models.catalog import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
     GatewayLongContextTier,
-    GatewayPoolRecord,
     GatewayRungDispatchPolicy,
     GatewayTokenPrices,
     ModelCatalog,
@@ -35,6 +33,7 @@ from exp.common.models.gateway_catalog import (
     normalize_gateway_catalog,
     read_pinned_normalized_snapshot,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.model import ModelCapabilities, ModelSnapshot
 
 _DIGEST = "a" * 64
@@ -257,12 +256,15 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     """Anti-regression change-detector for the roll-safety contract.
 
     A rolling deploy detects a cross-version snapshot only by ``schema_version``,
-    so every change to the normalized-catalog TOP-LEVEL shape MUST bump
-    ``SNAPSHOT_SCHEMA_VERSION`` in the same change (nested additive growth is
-    covered by the pinned identity digest test above, which defaulted fields
-    pass automatically). If this fails, bump ``SNAPSHOT_SCHEMA_VERSION`` and
-    update the pinned fingerprint below together, so the reader keeps serving
-    old and new pods through a roll instead of hard-failing.
+    so every change to the normalized-catalog TOP-LEVEL shape stops here for a
+    deliberate decision. A defaulted ADDITIVE field is identity-invisible (the
+    pinned identity digest test above passes untouched) and an older reader
+    drops it as unknown, so it updates this fingerprint WITHOUT a bump and its
+    authoring stays deployment-ordered (author only once every worker parses
+    it). Anything else (a default change, rename, removal, or normalization
+    change) MUST bump ``SNAPSHOT_SCHEMA_VERSION`` and repin the digest test in
+    the same change, so the reader keeps serving old and new pods through a
+    roll instead of hard-failing.
     """
     fingerprint = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
@@ -293,6 +295,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
             "exact_model_id",
             "failover_mode",
             "pool_id",
+            "throttle_cache_threshold",
         ],
     }
 
@@ -659,6 +662,87 @@ def test_affinity_pool_and_dispatch_policy_round_trip_and_move_identity() -> Non
     )
     baseline = normalize_gateway_catalog(catalog(opted_in=False))
     assert normalized.identity_sha256() != baseline.identity_sha256()
+
+
+def test_pool_throttle_cache_threshold_validates_normalizes_and_is_identity_inert() -> None:
+    """The cache-stakes threshold is a bounded fraction, carried intact, inert unauthored.
+
+    An unauthored (``None``) threshold contributes zero identity bytes, so the
+    field's existence leaves every published pool digest where it was (the
+    pinned-digest fixture above authors a ``maximize_cache`` pool without one
+    and stays pinned); authoring a value is a real catalog change.
+    """
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-threshold",
+        provenance="operator comparison run 2026-09-10",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 9, 10, tzinfo=UTC),
+    )
+
+    def record(threshold: float | None) -> GatewayPoolRecord:
+        """Build the same certified pool with one authored threshold."""
+        return GatewayPoolRecord(
+            exact_model_id="exact-threshold",
+            deployment_aliases=("route-a", "route-b"),
+            equivalence=certification,
+            failover_mode="maximize_cache",
+            throttle_cache_threshold=threshold,
+        )
+
+    for accepted in (None, 0.0, 0.5, 1.0):
+        assert record(accepted).throttle_cache_threshold == accepted
+    for rejected in (-0.1, 1.1, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            record(rejected)
+
+    # Unauthored: byte-identical identity serialization to a pool that never
+    # heard of the field, spelled implicitly or explicitly.
+    unauthored = record(None).model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    assert "throttle_cache_threshold" not in unauthored
+    legacy = GatewayPoolRecord(
+        exact_model_id="exact-threshold",
+        deployment_aliases=("route-a", "route-b"),
+        equivalence=certification,
+        failover_mode="maximize_cache",
+    )
+    assert legacy.model_dump(mode="json", by_alias=True, exclude_defaults=True) == unauthored
+
+    def catalog(threshold: float | None) -> ModelCatalog:
+        """Build the two-rung authored catalog around one pool record."""
+        return ModelCatalog(
+            connections={"openai": ConnectionConfig(provider="openai")},
+            models={
+                "route-a": ModelRecord(
+                    connection="openai",
+                    model="m-a",
+                    billing_source=BillingSource.HOST_MANAGED,
+                    gateway=GatewayDeploymentMetadata(exact_model_id="exact-threshold"),
+                ),
+                "route-b": ModelRecord(
+                    connection="openai",
+                    model="m-b",
+                    billing_source=BillingSource.HOST_MANAGED,
+                    gateway=GatewayDeploymentMetadata(exact_model_id="exact-threshold"),
+                ),
+            },
+            gateway_pools={"threshold-pool": record(threshold)},
+        )
+
+    baseline = normalize_gateway_catalog(catalog(None))
+    assert baseline.pools[0].throttle_cache_threshold is None
+    assert baseline.pools[0].failover_mode == "maximize_cache"
+    authored = normalize_gateway_catalog(catalog(0.5))
+    assert authored.pools[0].throttle_cache_threshold == 0.5
+    assert authored.identity_sha256() != baseline.identity_sha256()
+    # The normalized pool bounds the fraction exactly like the authored record.
+    with pytest.raises(ValidationError):
+        ExactModelPool(
+            pool_id="threshold-pool",
+            exact_model_id="exact-threshold",
+            deployment_ids=("route-a", "route-b"),
+            equivalence=certification,
+            throttle_cache_threshold=2.0,
+        )
 
 
 def test_equivalence_catalog_rejects_implicit_false_or_ambiguous_grouping() -> None:

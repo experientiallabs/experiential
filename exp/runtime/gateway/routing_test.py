@@ -7,18 +7,16 @@ from datetime import UTC, datetime
 
 import pytest
 
-from exp.common.models.catalog import (
-    GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
-    GatewayTokenPrices,
-)
+from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import (
     SNAPSHOT_SCHEMA_VERSION,
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.common.models.model import ModelCapabilities
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.routing import CatalogRouteResolver, RouteResolver
 
 _REVISION = "revision-one"
@@ -319,3 +317,53 @@ def test_index_serves_a_cross_version_catalog_under_its_pinned_digest() -> None:
     )
 
     assert metadata is not None
+
+
+def test_direct_route_carries_the_pools_throttle_cache_threshold() -> None:
+    """The authored cache-stakes threshold rides the execution snapshot like failover_mode."""
+    deployments = (
+        _deployment(deployment_id="route-a", source_alias="route-a"),
+        _deployment(deployment_id="route-b", source_alias="route-b"),
+    )
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-threshold",
+        provenance="operator comparison run 2026-09-10",
+        evidence_sha256="e" * 64,
+        certified_at=datetime(2026, 9, 10, tzinfo=UTC),
+    )
+    pool = ExactModelPool(
+        pool_id="pool-threshold",
+        exact_model_id="exact-one",
+        deployment_ids=("route-a", "route-b"),
+        equivalence=certification,
+        failover_mode="maximize_cache",
+        throttle_cache_threshold=0.5,
+    )
+    catalog, digest = _catalog(deployments, (pool,))
+    resolver = _resolver(catalog, digest)
+    authorization = AuthorizationSnapshot(
+        request_id="request-one",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        virtual_key_id="key-one",
+        alias="public-model",
+        alias_revision_id=_REVISION,
+        target=DirectTarget(pool_id="pool-threshold"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256=digest,
+        canonical_request_sha256="d" * 64,
+        deadline_monotonic=1.0,
+    )
+
+    route = resolver.resolve_direct(authorization)
+
+    assert route.snapshot.failover_mode == "maximize_cache"
+    assert route.snapshot.throttle_cache_threshold == 0.5
+    # An unauthored pool leaves the snapshot's threshold unset.
+    unauthored, unauthored_digest = _catalog(
+        deployments, (pool.model_copy(update={"throttle_cache_threshold": None}),)
+    )
+    plain = _resolver(unauthored, unauthored_digest).resolve_direct(
+        authorization.model_copy(update={"catalog_sha256": unauthored_digest})
+    )
+    assert plain.snapshot.throttle_cache_threshold is None

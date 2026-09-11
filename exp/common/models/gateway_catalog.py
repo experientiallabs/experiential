@@ -8,13 +8,9 @@ from typing import cast
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json
-from exp.common.models.catalog import (
-    BillingSource,
-    FailoverMode,
-    GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
-    ModelCatalog,
-)
+from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, ModelCatalog
+from exp.common.models.dispatch_policy import FailoverMode
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.common.models.model import ModelAlias, ModelCapabilities
 
 ExactModelId = ArtifactId
@@ -90,6 +86,10 @@ class ExactModelPool(ContractModel):
     # Per-model failover policy for this pool's waterfall. Defaults to the
     # historical maximize_availability so an unset pool behaves exactly as before.
     failover_mode: FailoverMode = "maximize_availability"
+    # The authored pool's per-request cache-stakes throttle control (see
+    # ``GatewayPoolRecord.throttle_cache_threshold``); ``None`` keeps each
+    # failover mode's own throttle rule and contributes no identity bytes.
+    throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _require_unique_deployments(self) -> ExactModelPool:
@@ -223,6 +223,7 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
                 deployment_ids=deployment_ids,
                 equivalence=authored.equivalence,
                 failover_mode=authored.failover_mode,
+                throttle_cache_threshold=authored.throttle_cache_threshold,
             )
         )
         claimed_aliases.update(authored.deployment_aliases)

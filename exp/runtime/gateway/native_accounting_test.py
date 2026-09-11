@@ -549,6 +549,7 @@ def _admit(
     organization_id: str = "organization-one",
     weight: int = 1,
     failover_mode: FailoverMode = "maximize_availability",
+    throttle_cache_threshold: float | None = None,
     affinity_fingerprint: bytes | None = None,
     sticky_preferred: bool = False,
 ) -> InflightRequest:
@@ -568,6 +569,7 @@ def _admit(
             pool_id="pool-one",
             deployment_ids=tuple(item.deployment_id for item in deployments),
             failover_mode=failover_mode,
+            throttle_cache_threshold=throttle_cache_threshold,
         ),
         deployment=deployments[0],
         fallback_deployments=deployments[1:],
@@ -1568,3 +1570,249 @@ class TestFreshSessionSpillDispatch:
             affinity_fingerprint=b"warm-conversation",
         )
         assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
+
+
+_THROTTLE: JsonObject = {
+    "failure_class": "throttled",
+    "safe_message": "provider throttled the request",
+    "failover_eligible": True,
+}
+
+
+def _settle_with_usage(
+    registry: NativeAttemptAccounting,
+    *,
+    attempt_id: str,
+    request_id: str,
+    cached_input_tokens: int,
+    input_tokens: int,
+) -> None:
+    """Settle one completed attempt with observed usage, finalizing its request."""
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "attempt_id": attempt_id,
+                "outcome": "completed",
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "output_tokens": 5,
+                },
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+
+
+class TestThrottleCacheThreshold:
+    """The per-request cache-stakes throttle decision and its disclosures."""
+
+    def test_cold_failover_discloses_the_throttled_rung_on_the_next_attempt(self) -> None:
+        """Below the threshold a throttle fails over, disclosed as throttle_failover_cold.
+
+        The organization has no cache evidence on the lead rung, so the
+        fraction reads 0 and the request advances; the cold attempt names the
+        throttled warm rung as its bypassed preferred counterfactual.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_cache_threshold=0.5,
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        failover = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert failover["route_depth"] == 1
+        assert ledger.started[0]["dispatch_reason"] is None
+        assert ledger.started[1]["dispatch_reason"] == "throttle_failover_cold"
+        assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
+        assert registry.throttle_cache_counters() == (0, 1)
+
+    def test_warm_cache_surfaces_the_throttle_instead_of_failing_over(self) -> None:
+        """At or above the threshold the ladder ends and the caller gets the throttle.
+
+        The organization's earlier settled traffic on the lead rung taught the
+        worker a cached fraction of 0.9, so under a 0.5 threshold the throttle
+        surfaces even though the pool's mode (availability) would fail over.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(registry, deployments, request_id="request-warm", throttle_cache_threshold=0.5)
+        warm = _start(registry, ordinal=0, request_id="request-warm")
+        _settle_with_usage(
+            registry,
+            attempt_id=str(warm["attempt_id"]),
+            request_id="request-warm",
+            cached_input_tokens=900,
+            input_tokens=1_000,
+        )
+        assert registry.loads.cached_fraction(("deployment-a", "b" * 64), "organization-one") == (
+            pytest.approx(0.9)
+        )
+
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_availability",
+            throttle_cache_threshold=0.5,
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        surfaced = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert surfaced["exhausted"] is True
+        exhaustion = surfaced["failure"]
+        assert isinstance(exhaustion, dict)
+        assert exhaustion["failure_class"] == "throttled"
+        # No cold attempt was reserved; the request terminalized as throttled.
+        assert [row["deployment_id"] for row in ledger.started] == ["deployment-a", "deployment-a"]
+        assert ledger.finished_requests[-1].failure_class == GatewayFailureClass.THROTTLED
+        assert registry.throttle_cache_counters() == (1, 0)
+
+    def test_another_organizations_cache_never_counts(self) -> None:
+        """The fraction is scoped to the requesting organization on the throttled rung."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        registry.loads.record_settle(
+            ("deployment-a", "b" * 64),
+            "organization-other",
+            cached_tokens=1_000,
+            input_tokens=1_000,
+        )
+        _admit(registry, deployments, request_id="request-1", throttle_cache_threshold=0.5)
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        failover = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert failover["route_depth"] == 1
+        assert ledger.started[1]["dispatch_reason"] == "throttle_failover_cold"
+
+    def test_no_threshold_keeps_legacy_decisions_and_records_nothing(self) -> None:
+        """Unauthored pools decide by mode as before: no disclosure, no counters."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        # Even a fully warm cache changes nothing without a threshold.
+        registry.loads.record_settle(
+            ("deployment-a", "b" * 64), "organization-one", cached_tokens=1_000, input_tokens=1_000
+        )
+        _admit(registry, deployments, request_id="request-1", failover_mode="maximize_availability")
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        failover = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert failover["route_depth"] == 1
+        assert all(row["dispatch_reason"] is None for row in ledger.started)
+
+        _admit(registry, deployments, request_id="request-2", failover_mode="maximize_cache")
+        first = _start(registry, ordinal=0, request_id="request-2")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-2",
+        )
+        surfaced = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-2"
+        )
+        assert surfaced["exhausted"] is True
+        assert registry.throttle_cache_counters() == (0, 0)
+
+    def test_cold_decision_that_exhausts_the_ladder_counts_no_failover(self) -> None:
+        """A below-threshold throttle with nothing claimable ends as a plain exhausted throttle.
+
+        The decision was to fail over, but no fallback attempt was reserved,
+        so neither disposition is counted and no attempt discloses a cold
+        failover: the metric reports only failovers that happened.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        entry = _admit(registry, deployments, request_id="request-1", throttle_cache_threshold=0.5)
+        # The only fallback rung sits inside its own provider throttle window.
+        registry.health.failed(
+            deployment_health_key(entry.authorization, deployments[1]),
+            GatewayFailure(
+                failure_class=GatewayFailureClass.THROTTLED,
+                safe_message="provider throttled the request",
+                retry_after_seconds=30,
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        exhausted = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert exhausted["exhausted"] is True
+        assert len(ledger.started) == 1
+        assert registry.throttle_cache_counters() == (0, 0)

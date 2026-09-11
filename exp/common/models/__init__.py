@@ -4,9 +4,7 @@ from exp.common.models.catalog import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
     GatewayLongContextTier,
-    GatewayPoolRecord,
     GatewayTokenPrices,
     ModelCatalog,
     ModelCatalogError,
@@ -49,6 +47,7 @@ from exp.common.models.gateway_catalog import (
     normalize_gateway_catalog,
     read_pinned_normalized_snapshot,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.known_models import (
     KnownModel,
     canonical_model_id,

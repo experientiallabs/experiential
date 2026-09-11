@@ -30,7 +30,8 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
-from exp.common.models.dispatch_policy import FailoverMode, GatewayRungDispatchPolicy
+from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
     ModelCapabilities,
@@ -635,45 +636,6 @@ class GatewayDeploymentMetadata(ContractModel):
     pricing_effective_at: AwareDatetime | None = None
     dispatch: GatewayRungDispatchPolicy | None = None
     """Optional dispatch policy for this rung; ``None`` is fully inert."""
-
-
-class GatewayEquivalenceCertification(ContractModel):
-    """Operator-authored evidence that deployments serve one exact model revision."""
-
-    authority: Literal["operator"] = "operator"
-    certification_id: ArtifactId
-    provenance: str = Field(min_length=1, max_length=2_048)
-    evidence_sha256: Sha256
-    certified_at: AwareDatetime
-
-    @model_validator(mode="after")
-    def _require_safe_provenance(self) -> GatewayEquivalenceCertification:
-        """Reject credential-like or control-bearing equivalence provenance."""
-        try:
-            assert_secret_free(self.model_dump(mode="json"))
-        except SecretBoundaryError as exc:
-            raise ValueError("equivalence provenance must be secret-free") from exc
-        if any(ord(character) < 32 for character in self.provenance):
-            raise ValueError("equivalence provenance must be display-safe")
-        return self
-
-
-class GatewayPoolRecord(ContractModel):
-    """Authored ordered deployments explicitly certified as one exact model."""
-
-    exact_model_id: ArtifactId
-    deployment_aliases: tuple[ArtifactId, ...] = Field(min_length=2)
-    equivalence: GatewayEquivalenceCertification
-    # Per-model failover policy for this pool's waterfall. Defaults to the
-    # historical maximize_availability so an unset authored pool is unchanged.
-    failover_mode: FailoverMode = "maximize_availability"
-
-    @model_validator(mode="after")
-    def _require_unique_deployments(self) -> GatewayPoolRecord:
-        """Reject repeated deployment aliases inside one equivalence pool."""
-        if len(set(self.deployment_aliases)) != len(self.deployment_aliases):
-            raise ValueError("gateway pool deployment aliases must not repeat")
-        return self
 
 
 class ModelRecord(ContractModel):

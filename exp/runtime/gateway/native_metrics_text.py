@@ -76,6 +76,14 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Fresh-session dispatches shed early to spill.",
     ),
     (
+        "throttle_surfaced_cache_preserving",
+        "Throttles surfaced to keep warm cache.",
+    ),
+    (
+        "throttle_failover_cold",
+        "Throttles failed over cold (cache below threshold).",
+    ),
+    (
         "reconciled_expired_requests",
         "Crashed requests reconciled at startup.",
     ),
