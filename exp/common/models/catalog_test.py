@@ -334,7 +334,7 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
                         reasoning_effort_required=True,
                     ),
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_250_000,
+                        input_nano_usd_per_million_tokens=1_250_000,
                     ),
                     pricing_source="operator",
                 ),
@@ -354,7 +354,7 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
         "high",
         "max",
     )
-    assert "input_micro_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
+    assert "input_nano_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -828,34 +828,80 @@ def test_for_service_tier_reprices_whole_request_for_flex_and_priority() -> None
     from exp.common.models.catalog import GatewayServiceTierPrices, GatewayTokenPrices
 
     prices = GatewayTokenPrices(
-        input_micro_usd_per_million_tokens=1_000_000,
-        cached_input_micro_usd_per_million_tokens=100_000,
-        output_micro_usd_per_million_tokens=4_000_000,
-        reasoning_micro_usd_per_million_tokens=4_000_000,
+        input_nano_usd_per_million_tokens=1_000_000,
+        cached_input_nano_usd_per_million_tokens=100_000,
+        output_nano_usd_per_million_tokens=4_000_000,
+        reasoning_nano_usd_per_million_tokens=4_000_000,
         flex=GatewayServiceTierPrices(
-            input_micro_usd_per_million_tokens=500_000,
-            output_micro_usd_per_million_tokens=2_000_000,
+            input_nano_usd_per_million_tokens=500_000,
+            output_nano_usd_per_million_tokens=2_000_000,
         ),
         priority=GatewayServiceTierPrices(
-            input_micro_usd_per_million_tokens=2_000_000,
-            output_micro_usd_per_million_tokens=8_000_000,
+            input_nano_usd_per_million_tokens=2_000_000,
+            output_nano_usd_per_million_tokens=8_000_000,
         ),
     )
 
     flex = prices.for_service_tier("flex")
-    assert flex.input_micro_usd_per_million_tokens == 500_000
-    assert flex.output_micro_usd_per_million_tokens == 2_000_000
+    assert flex.input_nano_usd_per_million_tokens == 500_000
+    assert flex.output_nano_usd_per_million_tokens == 2_000_000
     # A dimension absent on the card stays honestly unpriced, never the base.
-    assert flex.cached_input_micro_usd_per_million_tokens is None
+    assert flex.cached_input_nano_usd_per_million_tokens is None
     assert flex.long_context is None
 
     priority = prices.for_service_tier("priority")
-    assert priority.input_micro_usd_per_million_tokens == 2_000_000
-    assert priority.output_micro_usd_per_million_tokens == 8_000_000
+    assert priority.input_nano_usd_per_million_tokens == 2_000_000
+    assert priority.output_nano_usd_per_million_tokens == 8_000_000
 
     # default/auto/None and an unpriced tier carry no override.
     assert prices.for_service_tier("default") is prices
     assert prices.for_service_tier("auto") is prices
     assert prices.for_service_tier(None) is prices
-    no_card = GatewayTokenPrices(input_micro_usd_per_million_tokens=1)
+    no_card = GatewayTokenPrices(input_nano_usd_per_million_tokens=1)
     assert no_card.for_service_tier("flex") is no_card
+
+
+def test_price_rates_are_bounded_so_a_nano_usd_attempt_always_fits_int8() -> None:
+    """Every rate is integer nano-USD per million tokens, bounded at
+    ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS`` ($1,000 per million tokens,
+    above every published price) on the base schedule, every service-tier
+    card, and every long-context tier, so no authored catalog can produce an
+    attempt cost the int8 ledger column cannot hold."""
+    import pytest
+    from pydantic import ValidationError
+
+    from exp.common.models.catalog import (
+        MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
+        GatewayLongContextTier,
+        GatewayServiceTierPrices,
+        GatewayTokenPrices,
+    )
+
+    assert MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS == 1_000_000_000_000
+    bound = MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    at_bound = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=bound,
+        cached_input_nano_usd_per_million_tokens=bound,
+        output_nano_usd_per_million_tokens=bound,
+        reasoning_nano_usd_per_million_tokens=bound,
+        flex=GatewayServiceTierPrices(output_nano_usd_per_million_tokens=bound),
+        long_context=GatewayLongContextTier(
+            input_threshold_tokens=200_000, input_nano_usd_per_million_tokens=bound
+        ),
+    )
+    assert at_bound.input_nano_usd_per_million_tokens == bound
+    for field in (
+        "input_nano_usd_per_million_tokens",
+        "cached_input_nano_usd_per_million_tokens",
+        "output_nano_usd_per_million_tokens",
+        "reasoning_nano_usd_per_million_tokens",
+    ):
+        with pytest.raises(ValidationError):
+            GatewayTokenPrices.model_validate({field: bound + 1})
+        with pytest.raises(ValidationError):
+            GatewayServiceTierPrices.model_validate({field: bound + 1})
+        with pytest.raises(ValidationError):
+            GatewayLongContextTier.model_validate(
+                {"input_threshold_tokens": 200_000, field: bound + 1}
+            )
+    assert not any("micro" in name for name in GatewayTokenPrices.model_fields)

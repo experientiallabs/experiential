@@ -231,11 +231,11 @@ def test_profile_resolution_forwards_service_tier_on_a_tier_priced_house_lane() 
             "gateway": hosted.gateway.model_copy(
                 update={
                     "prices": GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        output_micro_usd_per_million_tokens=4_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=4_000_000,
                         flex=GatewayServiceTierPrices(
-                            input_micro_usd_per_million_tokens=500_000,
-                            output_micro_usd_per_million_tokens=2_000_000,
+                            input_nano_usd_per_million_tokens=500_000,
+                            output_nano_usd_per_million_tokens=2_000_000,
                         ),
                     )
                 }

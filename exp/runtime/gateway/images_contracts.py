@@ -8,6 +8,7 @@ from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
 from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
 
 ImageSize = Literal[
     "auto",
@@ -55,13 +56,12 @@ class ImagesRequest(ContractModel):
         return self.user
 
 
-def images_ceiling_micro_usd(
+def images_ceiling_nano_usd(
     request: ImagesRequest,
     *,
     input_tokens: int,
     input_rate: int | None,
     output_rate: int | None,
-    maximum: int,
 ) -> int | None:
     """Return the conservative reservation ceiling for one token-priced image call.
 
@@ -69,11 +69,14 @@ def images_ceiling_micro_usd(
     tokens at the output rate; ``input_tokens`` is the prompt's estimated input
     reservation and ``n`` times the largest per-image token count bounds the
     output. A lane without both rates is unpriced for images (``None``): the
-    per-image priced models (dall-e) wait for the typed billed-units ledger.
+    per-image priced models (dall-e) wait for the typed billed-units ledger. A
+    ceiling past the int8 ledger column raises ``NanoUsdOverflowError``.
     """
     if input_rate is None or output_rate is None:
         return None
     input_ceiling = input_tokens * input_rate
     output_ceiling = request.n * MAXIMUM_IMAGE_OUTPUT_TOKENS * output_rate
-    ceiling = (input_ceiling + output_ceiling + 999_999) // 1_000_000
-    return ceiling if ceiling <= maximum else None
+    return require_representable_nano_usd(
+        (input_ceiling + output_ceiling + 999_999) // 1_000_000,
+        what="images reservation ceiling",
+    )

@@ -112,7 +112,7 @@ class BatchLine(ContractModel):
     body: JsonObject
     estimated_input_tokens: int = Field(ge=0)
     maximum_output_tokens: int = Field(ge=0)
-    reserved_micro_usd: int = Field(default=0, ge=0)
+    reserved_nano_usd: int = Field(default=0, ge=0)
 
 
 class BatchLineError(ContractModel):
@@ -148,7 +148,7 @@ class BatchLineResult(ContractModel):
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
     reasoning_tokens: int | None = Field(default=None, ge=0)
-    settled_micro_usd: int = Field(default=0, ge=0)
+    settled_nano_usd: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _require_exactly_one_payload(self) -> BatchLineResult:
@@ -219,8 +219,8 @@ class BatchJob(ContractModel):
     counts: BatchCounts = Field(default_factory=BatchCounts)
     lines: tuple[BatchLine, ...] = ()
     line_errors: tuple[BatchLineError, ...] = ()
-    reserved_micro_usd: int = Field(default=0, ge=0)
-    settled_micro_usd: int = Field(default=0, ge=0)
+    reserved_nano_usd: int = Field(default=0, ge=0)
+    settled_nano_usd: int = Field(default=0, ge=0)
     failure_message: str | None = Field(default=None, max_length=2_048)
     metadata: dict[str, str] = Field(default_factory=dict)
     created_at: AwareDatetime
@@ -317,7 +317,7 @@ class BatchFile(ContractModel):
 class BatchDeployment(ContractModel):
     """One batch-callable catalog model resolved by the host catalog seam.
 
-    Prices are batch list prices in micro-USD per million tokens: the owner
+    Prices are batch list prices in nano-USD per million tokens: the owner
     policy passes the provider batch discount through to the caller, so the
     host authors these rates on the batch catalog rows directly.
     """
@@ -327,8 +327,8 @@ class BatchDeployment(ContractModel):
     provider_model: str = Field(min_length=1, max_length=2_048)
     credential_reference: str = Field(min_length=1, max_length=512)
     surfaces: tuple[BatchSurface, ...] = Field(min_length=1)
-    input_micro_usd_per_million_tokens: int = Field(ge=0)
-    output_micro_usd_per_million_tokens: int = Field(ge=0)
+    input_nano_usd_per_million_tokens: int = Field(ge=0)
+    output_nano_usd_per_million_tokens: int = Field(ge=0)
     default_maximum_output_tokens: int = Field(default=4_096, gt=0)
 
 

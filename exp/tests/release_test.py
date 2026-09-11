@@ -1335,7 +1335,7 @@ def _installed_release_driver() -> None:
                 SELECT attempt_id, request_id, attempt_ordinal, route_depth,
                        deployment_id, billing_source, state, failure_class,
                        input_tokens, cached_input_tokens, output_tokens,
-                       reasoning_tokens, estimated_cost_micro_usd
+                       reasoning_tokens, estimated_cost_nano_usd
                 FROM gateway_attempts
                 ORDER BY started_at, request_id, attempt_ordinal, attempt_id
                 """
@@ -1354,7 +1354,7 @@ def _installed_release_driver() -> None:
             Billing source and attributed cost keyed by attempt ID.
         """
         return {
-            str(row["attempt_id"]): (row["billing_source"], row["estimated_cost_micro_usd"])
+            str(row["attempt_id"]): (row["billing_source"], row["estimated_cost_nano_usd"])
             for row in rows
         }
 
@@ -1715,10 +1715,11 @@ def _installed_release_driver() -> None:
         ]
         assert [row["state"] for row in auth_attempts] == ["failed", "completed"]
         assert auth_attempts[0]["failure_class"] == "provider_authentication"
-        assert auth_attempts[0]["estimated_cost_micro_usd"] is None
+        assert auth_attempts[0]["estimated_cost_nano_usd"] is None
         assert auth_attempts[1]["input_tokens"] == 3
         assert auth_attempts[1]["output_tokens"] == 2
-        assert auth_attempts[1]["estimated_cost_micro_usd"] == 7
+        # 3 input tokens at $1/M + 2 output tokens at $2/M = $0.000007 = 7_000 nano-USD.
+        assert auth_attempts[1]["estimated_cost_nano_usd"] == 7_000
 
         with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
             assert [model.id for model in client.models.list().data] == ["coding"]
@@ -2044,7 +2045,7 @@ def _installed_release_driver() -> None:
         identity_usage = usage_payload["identities"][0]
         assert usage_payload["totals"]["requests"] >= 14
         assert usage_payload["totals"]["attempts"] > usage_payload["totals"]["requests"]
-        assert usage_payload["totals"]["known_estimated_cost_micro_usd"] > 0
+        assert usage_payload["totals"]["known_estimated_cost_nano_usd"] > 0
         terminal_counts = {
             item["state"]: item["attempts"] for item in usage_payload["totals"]["terminal_counts"]
         }
@@ -2071,11 +2072,11 @@ def _installed_release_driver() -> None:
             == (usage_payload["totals"]["reasoning_tokens"])
         )
         assert (
-            sum(cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in attempt_rows)
-            == (usage_payload["totals"]["known_estimated_cost_micro_usd"])
+            sum(cast(int | None, row["estimated_cost_nano_usd"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["known_estimated_cost_nano_usd"])
         )
         assert (
-            sum(row["estimated_cost_micro_usd"] is None for row in attempt_rows)
+            sum(row["estimated_cost_nano_usd"] is None for row in attempt_rows)
             == (usage_payload["totals"]["unknown_cost_attempts"])
         )
         source_buckets = usage_payload["by_billing_source"]
@@ -2103,11 +2104,11 @@ def _installed_release_driver() -> None:
             assert bucket["reasoning_tokens"] == sum(
                 cast(int | None, row["reasoning_tokens"]) or 0 for row in source_rows
             )
-            assert bucket["known_estimated_cost_micro_usd"] == sum(
-                cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in source_rows
+            assert bucket["known_estimated_cost_nano_usd"] == sum(
+                cast(int | None, row["estimated_cost_nano_usd"]) or 0 for row in source_rows
             )
             assert bucket["unknown_cost_attempts"] == sum(
-                row["estimated_cost_micro_usd"] is None for row in source_rows
+                row["estimated_cost_nano_usd"] is None for row in source_rows
             )
             expected_source_terminals = {
                 state: sum(row["state"] == state for row in source_rows)
@@ -2124,7 +2125,7 @@ def _installed_release_driver() -> None:
             identity_usage["cached_input_tokens"],
             identity_usage["output_tokens"],
             identity_usage["reasoning_tokens"],
-            identity_usage["known_estimated_cost_micro_usd"],
+            identity_usage["known_estimated_cost_nano_usd"],
             identity_usage["unknown_cost_attempts"],
             identity_usage["total_latency_ms"],
             ", ".join(
@@ -2141,7 +2142,7 @@ def _installed_release_driver() -> None:
                 bucket["cached_input_tokens"],
                 bucket["output_tokens"],
                 bucket["reasoning_tokens"],
-                bucket["known_estimated_cost_micro_usd"],
+                bucket["known_estimated_cost_nano_usd"],
                 bucket["unknown_cost_attempts"],
                 ", ".join(
                     f"{item['state']}: {item['attempts']}" for item in bucket["terminal_counts"]
@@ -2229,8 +2230,9 @@ def _installed_release_driver() -> None:
             capabilities=ModelCapabilities(),
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=2_000_000,
+                # $1 / $2 per million tokens, in nano-USD.
+                input_nano_usd_per_million_tokens=1_000_000_000,
+                output_nano_usd_per_million_tokens=2_000_000_000,
             ),
             pricing_source="installed project fixture",
             billing_source=billing_source,
@@ -3217,7 +3219,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
 
     architecture = (docs / "reference" / "gateway-architecture.md").read_text(encoding="utf-8")
     assert "GET /v1/models" in architecture
-    assert "micro-USD-per-million-token" in architecture
+    assert "nano-USD-per-million-token" in architecture
     assert "POST /v1/chat/completions" in architecture
     assert "POST /v1/responses" in architecture
     assert "provider_certification.py" in architecture

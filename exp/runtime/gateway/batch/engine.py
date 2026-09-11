@@ -388,9 +388,9 @@ class BatchEngine:
                     f"reservation rejected at line {line.custom_id!r}: {exc}",
                     code="insufficient_quota",
                 ) from exc
-            reserved.append(line.model_copy(update={"reserved_micro_usd": amount}))
+            reserved.append(line.model_copy(update={"reserved_nano_usd": amount}))
             total += amount
-        return job.model_copy(update={"lines": tuple(reserved), "reserved_micro_usd": total})
+        return job.model_copy(update={"lines": tuple(reserved), "reserved_nano_usd": total})
 
     def retrieve(self, *, organization_id: str, batch_id: str) -> BatchJob | None:
         """Return one owned job, or None when absent."""

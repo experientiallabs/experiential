@@ -22,9 +22,11 @@ from exp.common.models.catalog import (
     SFTModelProvenance,
 )
 from exp.common.models.gateway_catalog import (
+    FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     SANE_MAX_SNAPSHOT_SCHEMA_VERSION,
     SNAPSHOT_SCHEMA_VERSION,
     CatalogSnapshotDigestError,
+    CatalogSnapshotUnitError,
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
@@ -121,6 +123,32 @@ def test_read_pinned_snapshot_same_version_requires_the_exact_digest() -> None:
         read_pinned_normalized_snapshot(catalog.model_dump_json().encode(), "b" * 64)
 
 
+def test_read_pinned_snapshot_refuses_a_micro_usd_schema_document_by_name() -> None:
+    """Schema versions before 4 priced the catalog in micro-USD. A schema-3
+    document read by this nano-USD build would have its price keys dropped as
+    unknown and be served UNPRICED (or, worse, a value coerced across units), so
+    the reader fails closed with a named error for every pre-nano schema, even
+    though those versions are inside the tolerant cross-version range."""
+    assert SNAPSHOT_SCHEMA_VERSION == 4
+    assert FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION == 4
+    raw = json.loads(_minimal_normalized().model_dump_json())
+    for micro_version in (1, 2, 3):
+        raw["schema_version"] = micro_version
+        with pytest.raises(CatalogSnapshotUnitError, match="micro-USD"):
+            read_pinned_normalized_snapshot(json.dumps(raw).encode(), "b" * 64)
+    # A schema-3 document carrying micro-keyed prices is refused before any
+    # price is read, never coerced.
+    raw["schema_version"] = 3
+    raw["deployments"][0]["gateway"] = {
+        "prices": {"input_micro_usd_per_million_tokens": 1_000_000},
+        "pricing_source": "test",
+    }
+    with pytest.raises(CatalogSnapshotUnitError):
+        read_pinned_normalized_snapshot(json.dumps(raw).encode(), "b" * 64)
+    assert issubclass(CatalogSnapshotUnitError, ValueError)
+    assert not issubclass(CatalogSnapshotUnitError, CatalogSnapshotDigestError)
+
+
 def test_read_pinned_snapshot_serves_a_cross_version_snapshot_without_the_digest_check() -> None:
     """Roll-safety guard: a snapshot from a NEWER build (higher schema_version,
     an unknown pool field, a digest this build cannot recompute) is SERVED under
@@ -169,11 +197,11 @@ def _identity_fixture_catalog() -> ModelCatalog:
                         supports_streaming=True, supports_image_input=True
                     ),
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=150,
-                        output_micro_usd_per_million_tokens=600,
+                        input_nano_usd_per_million_tokens=150,
+                        output_nano_usd_per_million_tokens=600,
                         long_context=GatewayLongContextTier(
                             input_threshold_tokens=200_000,
-                            input_micro_usd_per_million_tokens=300,
+                            input_nano_usd_per_million_tokens=300,
                         ),
                     ),
                 ),
@@ -215,11 +243,14 @@ def test_identity_digest_is_pinned_until_a_deliberate_schema_version_bump() -> N
     - You deliberately changed identity output (default change, rename,
       removal, normalization change): bump ``SNAPSHOT_SCHEMA_VERSION`` and
       repin BOTH values below in the same change.
+
+    Version 4 (the micro-USD to nano-USD money-unit move) renamed every price
+    key, so the digest was repinned with it.
     """
     normalized = normalize_gateway_catalog(_identity_fixture_catalog())
     assert (SNAPSHOT_SCHEMA_VERSION, normalized.identity_sha256()) == (
-        3,
-        "f9e74a42f5b47ec0a0739836ef15bbfa36df4eaa7c34efee10c421d46962529f",
+        4,
+        "df22e497cb162814a54a4321963859fd1bc8499e8fdd68c1e35c7df6a1520f0e",
     )
 
 
@@ -273,7 +304,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 3,
+        "schema_version": 4,
         "normalized": ["deployments", "pools", "schema_version"],
         "deployment": [
             "billing_source",

@@ -271,14 +271,14 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         maximum_top_k=_generation_integer(entry.get("maximum_top_k")),
         context_window_tokens=_strict_positive_int(entry.get("context_window_tokens")),
         maximum_output_tokens=_strict_positive_int(entry.get("maximum_output_tokens")),
-        input_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("input_micro_usd_per_million_tokens")
+        input_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("input_nano_usd_per_million_tokens")
         ),
-        output_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("output_micro_usd_per_million_tokens")
+        output_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("output_nano_usd_per_million_tokens")
         ),
-        cached_input_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("cached_input_micro_usd_per_million_tokens")
+        cached_input_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("cached_input_nano_usd_per_million_tokens")
         ),
     )
 
@@ -468,11 +468,11 @@ def _generation_integer(value: object) -> int | None:
     return value if value >= 0 else None
 
 
-def _micro_usd_price(value: object) -> float | None:
-    """Convert one configured micro-USD-per-million-token price to USD.
+def _nano_usd_price(value: object) -> float | None:
+    """Convert one configured nano-USD-per-million-token price to USD.
 
     Args:
-        value: Integer micro-USD per million tokens published by the endpoint.
+        value: Integer nano-USD per million tokens published by the endpoint.
 
     Returns:
         USD per million tokens, or ``None`` when the value is absent or unusable.
@@ -481,7 +481,7 @@ def _micro_usd_price(value: object) -> float | None:
         return None
     if value < 0:
         return None
-    return value / 1_000_000
+    return value / 1_000_000_000
 
 
 def _million_token_price(value: object) -> float | None:

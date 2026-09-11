@@ -134,8 +134,8 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         capabilities=ModelCapabilities(supports_image_generation=True),
         gateway_capabilities=GatewayDeploymentCapabilities(),
         prices=GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=5_000_000,
-            output_micro_usd_per_million_tokens=40_000_000,
+            input_nano_usd_per_million_tokens=5_000_000,
+            output_nano_usd_per_million_tokens=40_000_000,
         ),
         pricing_source=None,
         replace=False,

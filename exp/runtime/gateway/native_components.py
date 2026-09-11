@@ -41,7 +41,7 @@ class SyncWriteLedger(Protocol):
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
         reserved_input_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
         route_reason: str | None = None,

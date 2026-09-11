@@ -12,7 +12,7 @@ from pathlib import Path
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.budgets import (
-    MAXIMUM_MICRO_USD,
+    MAXIMUM_NANO_USD,
     budget_period_start,
     current_budget_period,
     require_attempt_budget,
@@ -36,7 +36,7 @@ from exp.runtime.gateway.ledger_usage import (
     billing_source_usage_rows,
     identity_usage_rows,
 )
-from exp.runtime.gateway.ledger_valuation import estimated_cost_micro_usd, optional_int
+from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd, optional_int
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
@@ -233,7 +233,7 @@ class SQLiteAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
         reserved_input_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
@@ -248,7 +248,7 @@ class SQLiteAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
             dispatch_reason: Optional policy-dispatch disclosure code.
@@ -266,7 +266,7 @@ class SQLiteAttemptLedger:
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
                 reserved_input_tokens=reserved_input_tokens,
                 reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,
@@ -283,7 +283,7 @@ class SQLiteAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
         reserved_input_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
@@ -299,7 +299,7 @@ class SQLiteAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
             dispatch_reason: Optional policy-dispatch disclosure code.
@@ -326,8 +326,8 @@ class SQLiteAttemptLedger:
             and preferred_deployment.deployment_id == deployment.deployment_id
         ):
             raise GatewayLedgerError("a preferred rung disclosure requires a divergent rung")
-        if maximum_cost_micro_usd is not None and not (
-            0 <= maximum_cost_micro_usd <= MAXIMUM_MICRO_USD
+        if maximum_cost_nano_usd is not None and not (
+            0 <= maximum_cost_nano_usd <= MAXIMUM_NANO_USD
         ):
             raise GatewayLedgerError("maximum attempt cost must fit a nonnegative SQLite integer")
         attempt_id = f"attempt-{uuid.uuid4().hex}"
@@ -363,7 +363,7 @@ class SQLiteAttemptLedger:
                 dispatch_reason, preferred_deployment_id,
                 preferred_input_rate, preferred_cached_input_rate,
                 preferred_output_rate, preferred_reasoning_rate,
-                state, started_at, budget_period_start, budget_reserved_micro_usd
+                state, started_at, budget_period_start, budget_reserved_nano_usd
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
@@ -388,10 +388,10 @@ class SQLiteAttemptLedger:
                     if deployment.gateway.pricing_effective_at is None
                     else utc_text(deployment.gateway.pricing_effective_at)
                 ),
-                prices.input_micro_usd_per_million_tokens,
-                prices.cached_input_micro_usd_per_million_tokens,
-                prices.output_micro_usd_per_million_tokens,
-                prices.reasoning_micro_usd_per_million_tokens,
+                prices.input_nano_usd_per_million_tokens,
+                prices.cached_input_nano_usd_per_million_tokens,
+                prices.output_nano_usd_per_million_tokens,
+                prices.reasoning_nano_usd_per_million_tokens,
                 (
                     None
                     if prices.long_context is None
@@ -400,22 +400,22 @@ class SQLiteAttemptLedger:
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.input_micro_usd_per_million_tokens
+                    else prices.long_context.input_nano_usd_per_million_tokens
                 ),
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.cached_input_micro_usd_per_million_tokens
+                    else prices.long_context.cached_input_nano_usd_per_million_tokens
                 ),
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.output_micro_usd_per_million_tokens
+                    else prices.long_context.output_nano_usd_per_million_tokens
                 ),
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.reasoning_micro_usd_per_million_tokens
+                    else prices.long_context.reasoning_nano_usd_per_million_tokens
                 ),
                 route_reason,
                 fallback_reason,
@@ -423,19 +423,19 @@ class SQLiteAttemptLedger:
                 None if preferred_deployment is None else preferred_deployment.deployment_id,
                 None
                 if preferred_deployment is None
-                else preferred_deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                else preferred_deployment.gateway.prices.input_nano_usd_per_million_tokens,
                 None
                 if preferred_deployment is None
-                else preferred_deployment.gateway.prices.cached_input_micro_usd_per_million_tokens,
+                else preferred_deployment.gateway.prices.cached_input_nano_usd_per_million_tokens,
                 None
                 if preferred_deployment is None
-                else preferred_deployment.gateway.prices.output_micro_usd_per_million_tokens,
+                else preferred_deployment.gateway.prices.output_nano_usd_per_million_tokens,
                 None
                 if preferred_deployment is None
-                else preferred_deployment.gateway.prices.reasoning_micro_usd_per_million_tokens,
+                else preferred_deployment.gateway.prices.reasoning_nano_usd_per_million_tokens,
                 utc_text(now),
                 period_start,
-                maximum_cost_micro_usd,
+                maximum_cost_nano_usd,
             ),
         )
         require_attempt_budget(
@@ -447,7 +447,7 @@ class SQLiteAttemptLedger:
             deployment_id=deployment.deployment_id,
             attempt_id=attempt_id,
             period_start=period_start,
-            maximum_cost_micro_usd=maximum_cost_micro_usd,
+            maximum_cost_nano_usd=maximum_cost_nano_usd,
         )
         return attempt_id
 
@@ -535,7 +535,7 @@ class SQLiteAttemptLedger:
                    output_rate, reasoning_rate,
                    long_context_threshold_tokens, long_context_input_rate,
                    long_context_cached_input_rate, long_context_output_rate,
-                   long_context_reasoning_rate, budget_reserved_micro_usd,
+                   long_context_reasoning_rate, budget_reserved_nano_usd,
                    preferred_deployment_id, preferred_input_rate,
                    preferred_cached_input_rate, preferred_output_rate,
                    preferred_reasoning_rate
@@ -561,7 +561,7 @@ class SQLiteAttemptLedger:
             and usage.input_tokens >= threshold
         )
         prefix = "long_context_" if long_context else ""
-        cost = estimated_cost_micro_usd(
+        cost = estimated_cost_nano_usd(
             usage,
             input_rate=optional_int(row[f"{prefix}input_rate"]),
             cached_input_rate=optional_int(row[f"{prefix}cached_input_rate"]),
@@ -569,9 +569,9 @@ class SQLiteAttemptLedger:
             reasoning_rate=optional_int(row[f"{prefix}reasoning_rate"]),
         )
         budget_settlement = (
-            cost if cost is not None else optional_int(row["budget_reserved_micro_usd"])
+            cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
         )
-        if budget_settlement is not None and budget_settlement > MAXIMUM_MICRO_USD:
+        if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
             raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
         # Cost-optimality counterfactual: the SAME observed usage priced at the
         # bypassed preferred rung's frozen BASE rates (long-context tiers are
@@ -580,7 +580,7 @@ class SQLiteAttemptLedger:
         counterfactual_cost = (
             None
             if row["preferred_deployment_id"] is None
-            else estimated_cost_micro_usd(
+            else estimated_cost_nano_usd(
                 usage,
                 input_rate=optional_int(row["preferred_input_rate"]),
                 cached_input_rate=optional_int(row["preferred_cached_input_rate"]),
@@ -595,9 +595,9 @@ class SQLiteAttemptLedger:
             SET state = ?, terminal_at = ?, first_token_at = ?, failure_class = ?,
                 failure_message = ?,
                 input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
-                reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
-                counterfactual_cost_micro_usd = ?,
-                budget_settled_micro_usd = ?,
+                reasoning_tokens = ?, usage_source = ?, estimated_cost_nano_usd = ?,
+                counterfactual_cost_nano_usd = ?,
+                budget_settled_nano_usd = ?,
                 retry_after_seconds = ?, ratelimit_limit_requests = ?,
                 ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
                 ratelimit_remaining_tokens = ?
@@ -628,7 +628,7 @@ class SQLiteAttemptLedger:
         settle_attempt_budgets(
             connection,
             attempt_id=attempt_id,
-            settled_micro_usd=budget_settlement,
+            settled_nano_usd=budget_settlement,
         )
         if finalize_request and state in {"completed", "failed", "cancelled", "incomplete"}:
             connection.execute(

@@ -538,6 +538,17 @@ class GatewayDeploymentCapabilities(ContractModel):
         return self
 
 
+MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS = 1_000_000_000_000
+"""Upper bound on any authored rate: $1,000 per million tokens in nano-USD.
+
+Every published price today is far below it (the highest authored rate is
+$600 per million, 6e11 nano-USD), and at this ceiling on every dimension a
+1M-context request with the full output ceiling still sums to well under the
+signed 64-bit ledger column before the per-million division, so no authored
+catalog can produce an attempt cost the ledger cannot hold.
+"""
+
+
 class GatewayLongContextTier(ContractModel):
     """Premium rates a provider applies to whole long-context requests.
 
@@ -553,10 +564,18 @@ class GatewayLongContextTier(ContractModel):
     """
 
     input_threshold_tokens: int = Field(gt=0)
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    cached_input_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    output_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    reasoning_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
 
 
 class GatewayServiceTierPrices(ContractModel):
@@ -568,23 +587,41 @@ class GatewayServiceTierPrices(ContractModel):
     on the base schedule (never the base rate). v1 bills the REQUESTED tier.
     """
 
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    cached_input_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    output_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    reasoning_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
 
 
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
-    Values are micro-USD per million provider-reported tokens. ``None`` means the rate is unknown;
-    it must never be interpreted as zero. Existing optimizer float pricing remains unchanged.
+    Values are integer nano-USD per million provider-reported tokens (one nano-USD is a
+    billionth of a dollar: $1.25 per million is ``1_250_000_000``), bounded above by
+    ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS``. ``None`` means the rate is unknown; it must
+    never be interpreted as zero. Existing optimizer float pricing remains unchanged.
     """
 
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    cached_input_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    output_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    reasoning_nano_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
     long_context: GatewayLongContextTier | None = None
     """Whole-request premium schedule for long-context input, when one exists.
 
@@ -616,10 +653,10 @@ class GatewayTokenPrices(ContractModel):
         if card is None:
             return self
         return GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=card.input_micro_usd_per_million_tokens,
-            cached_input_micro_usd_per_million_tokens=card.cached_input_micro_usd_per_million_tokens,
-            output_micro_usd_per_million_tokens=card.output_micro_usd_per_million_tokens,
-            reasoning_micro_usd_per_million_tokens=card.reasoning_micro_usd_per_million_tokens,
+            input_nano_usd_per_million_tokens=card.input_nano_usd_per_million_tokens,
+            cached_input_nano_usd_per_million_tokens=card.cached_input_nano_usd_per_million_tokens,
+            output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
+            reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             long_context=None,
         )
 

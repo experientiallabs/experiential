@@ -75,10 +75,10 @@ def _deployment() -> ExactModelDeployment:
         capabilities_sha256="c" * 64,
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=2_000_000,
-                cached_input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=4_000_000,
-                reasoning_micro_usd_per_million_tokens=5_000_000,
+                input_nano_usd_per_million_tokens=2_000_000,
+                cached_input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=4_000_000,
+                reasoning_nano_usd_per_million_tokens=5_000_000,
             ),
             pricing_source="operator-authored",
             pricing_effective_at=datetime(2026, 8, 18, tzinfo=UTC),

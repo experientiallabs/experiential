@@ -139,7 +139,7 @@ class _RecordingLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
         reserved_input_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
@@ -148,7 +148,7 @@ class _RecordingLedger:
         preferred_deployment: ExactModelDeployment | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
-        del snapshot, maximum_cost_micro_usd, route_reason, fallback_reason
+        del snapshot, maximum_cost_nano_usd, route_reason, fallback_reason
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
@@ -859,11 +859,11 @@ def test_deployment_priced_for_service_tier_overrides_only_for_a_carried_tier() 
         capabilities_sha256="c" * 64,
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=4_000_000,
+                input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=4_000_000,
                 flex=GatewayServiceTierPrices(
-                    input_micro_usd_per_million_tokens=500_000,
-                    output_micro_usd_per_million_tokens=2_000_000,
+                    input_nano_usd_per_million_tokens=500_000,
+                    output_nano_usd_per_million_tokens=2_000_000,
                 ),
             )
         ),
@@ -871,8 +871,8 @@ def test_deployment_priced_for_service_tier_overrides_only_for_a_carried_tier() 
 
     flex = deployment_priced_for_service_tier(deployment, "flex", forwards_tier=True)
     assert flex is not deployment
-    assert flex.gateway.prices.input_micro_usd_per_million_tokens == 500_000
-    assert flex.gateway.prices.output_micro_usd_per_million_tokens == 2_000_000
+    assert flex.gateway.prices.input_nano_usd_per_million_tokens == 500_000
+    assert flex.gateway.prices.output_nano_usd_per_million_tokens == 2_000_000
     # Identity and everything else is preserved on the copy.
     assert flex.deployment_id == "d1" and flex.exact_model_id == "exact-one"
 
@@ -918,7 +918,7 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
             deployment: ExactModelDeployment,
             attempt_ordinal: int,
             route_depth: int,
-            maximum_cost_micro_usd: int | None = None,
+            maximum_cost_nano_usd: int | None = None,
             reserved_input_tokens: int | None = None,
             reserved_output_tokens: int | None = None,
             route_reason: str | None = None,
@@ -928,14 +928,14 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
         ) -> str:
             """Record the reserved input rate, then reserve as the base fake does."""
             self.reserved_input_micro.append(
-                deployment.gateway.prices.input_micro_usd_per_million_tokens
+                deployment.gateway.prices.input_nano_usd_per_million_tokens
             )
             return super().start_attempt(
                 snapshot=snapshot,
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
                 reserved_input_tokens=reserved_input_tokens,
                 reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,
@@ -949,11 +949,11 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
             "gateway": GatewayDeploymentMetadata(
                 capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
                 prices=GatewayTokenPrices(
-                    input_micro_usd_per_million_tokens=1_000_000,
-                    output_micro_usd_per_million_tokens=4_000_000,
+                    input_nano_usd_per_million_tokens=1_000_000,
+                    output_nano_usd_per_million_tokens=4_000_000,
                     flex=GatewayServiceTierPrices(
-                        input_micro_usd_per_million_tokens=500_000,
-                        output_micro_usd_per_million_tokens=2_000_000,
+                        input_nano_usd_per_million_tokens=500_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
                     ),
                 ),
             )

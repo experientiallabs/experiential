@@ -30,6 +30,19 @@ from exp.runtime.gateway.sqlite.migrations import (
 from exp.runtime.gateway.sqlite.provider_authority import active_provider_connections
 
 
+def _replay_history(connection: sqlite3.Connection, *, upto: int) -> None:
+    """Replay the historical SQL migrations ``1..upto-1`` onto one raw connection.
+
+    Every migration before v20 is a tuple of plain SQL statements; the v20 money
+    unit move is a callable step and is never replayed here (the tests that need
+    it go through ``initialize_database``).
+    """
+    for version in range(1, upto):
+        for step in migrations._MIGRATIONS[version]:
+            assert isinstance(step, str), f"migration {version} is not plain SQL"
+            connection.execute(step)
+
+
 def test_persistent_connection_reuses_one_idle_connection_per_thread(tmp_path: Path) -> None:
     """Sequential checkouts on one thread reuse the same cached connection."""
     database = tmp_path / "reuse.db"
@@ -138,8 +151,11 @@ def test_initial_database_is_private_wal_with_foreign_keys(tmp_path: Path) -> No
         assert attempt_columns["billing_source"][3] == 1
         assert "customer_managed" in str(attempt_columns["billing_source"][4])
         assert "budget_period_start" in attempt_columns
-        assert "budget_reserved_micro_usd" in attempt_columns
-        assert "budget_settled_micro_usd" in attempt_columns
+        assert "budget_reserved_nano_usd" in attempt_columns
+        assert "budget_settled_nano_usd" in attempt_columns
+        assert "estimated_cost_nano_usd" in attempt_columns
+        assert "counterfactual_cost_nano_usd" in attempt_columns
+        assert not {name for name in attempt_columns if "micro_usd" in name}
         # v16 retains the provider's sanitized rejection sentence.
         assert "failure_message" in attempt_columns
         assert (
@@ -565,12 +581,13 @@ def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path
     try:
         row = current.execute(
             """
-            SELECT budget_period_start, budget_reserved_micro_usd,
-                   budget_settled_micro_usd
+            SELECT budget_period_start, budget_reserved_nano_usd,
+                   budget_settled_nano_usd
             FROM gateway_attempts WHERE attempt_id = 'attempt-one'
             """
         ).fetchone()
-        assert row == ("2026-08-01T00:00:00+00:00", None, 17)
+        # v7 settled 17 micro-USD; v20 carries the same amount as 17_000 nano-USD.
+        assert row == ("2026-08-01T00:00:00+00:00", None, 17_000)
         assert current.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     finally:
         current.close()
@@ -775,9 +792,7 @@ def test_v10_migration_widens_api_surface_and_preserves_rows(tmp_path: Path) -> 
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 10):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=10)
         connection.execute("PRAGMA user_version = 9")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
@@ -871,9 +886,7 @@ def test_v11_migration_adds_azure_surface_without_rewriting_existing_authority(
     )
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 11):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=11)
         connection.execute("PRAGMA user_version = 10")
         connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
         connection.execute(
@@ -933,9 +946,7 @@ def test_v12_adds_bedrock_auth_locators_and_preserves_ambient_authority(
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 12):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=12)
         connection.execute("PRAGMA user_version = 11")
         connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
         connection.execute(
@@ -1006,9 +1017,7 @@ def test_v14_migration_widens_api_surface_to_embeddings_and_preserves_rows(
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 14):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=14)
         connection.execute("PRAGMA user_version = 13")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
@@ -1098,9 +1107,7 @@ def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 15):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=15)
         connection.execute("PRAGMA user_version = 14")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
@@ -1191,9 +1198,7 @@ def test_v17_migration_adds_null_dispatch_disclosures_to_existing_attempts(
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 17):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=17)
         connection.execute("PRAGMA user_version = 16")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
@@ -1247,7 +1252,7 @@ def test_v17_migration_adds_null_dispatch_disclosures_to_existing_attempts(
         "preferred_cached_input_rate",
         "preferred_output_rate",
         "preferred_reasoning_rate",
-        "counterfactual_cost_micro_usd",
+        "counterfactual_cost_nano_usd",
     )
     migrated = connect_database(path)
     try:
