@@ -38,6 +38,24 @@ def test_budget_form_becomes_a_budgeted_thinking_config_by_tier() -> None:
     )
     assert channels.thinking_config == {"type": "enabled", "budget_tokens": 4096}
     assert channels.effort == "low"
+    # An explicit off switch beside a budget (or an effort) configures nothing.
+    off = resolve_reasoning_channels(
+        ReasoningConfig(enabled=False, max_tokens=4096),
+        max_tokens=8192,
+        thinking=None,
+        output_config=None,
+    )
+    assert off.effort == "none"
+    assert off.thinking_config is None
+    assert (
+        resolve_reasoning_channels(
+            ReasoningConfig(enabled=False, effort="high"),
+            max_tokens=8192,
+            thinking=None,
+            output_config=None,
+        ).effort
+        == "none"
+    )
     with pytest.raises(OpenAIProtocolError) as oversized:
         resolve_reasoning_channels(
             ReasoningConfig(max_tokens=8192), max_tokens=8192, thinking=None, output_config=None
