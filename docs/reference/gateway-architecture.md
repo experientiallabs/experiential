@@ -525,9 +525,10 @@ Exposure-gated reasoning rungs (Tencent Hunyuan and DeepSeek, rows stamped
 history, including tool-call turns. A rung becomes a preserved-thinking carrier route either by
 host recognition (Tencent's two OpenAI-compatible origins) or by declaring the rung capability
 `reasoning_content_native`, which says the origin returns the standard `reasoning_content` field
-and accepts it back (a self-hosted vLLM origin started with a reasoning parser); the declaration
-also forwards `prompt_cache_key` to that origin. It is off by default and fails closed: an
-undeclared origin has no carrier route, and exposure still requires `reasoning_output_exposed`. The decoder preserves the text verbatim, including an
+and accepts it back (a self-hosted vLLM origin started with a reasoning parser). It is off by
+default and fails closed: an undeclared origin has no carrier route, and exposure still requires
+`reasoning_output_exposed`. The `prompt_cache_key` node pin stays keyed on Tencent's hosts, since the
+declaration says nothing about whether an origin tolerates unknown request fields. The decoder preserves the text verbatim, including an
 explicitly empty string: a provider can require the field even when the turn performed no
 reasoning. Missing or null values remain absent. Plaintext is bounded to 8,388,608 characters;
 values exceeding that limit receive a named error with the limit and a retry instruction.

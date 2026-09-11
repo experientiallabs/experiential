@@ -623,9 +623,9 @@ def test_reasoning_content_native_rung_resolves_a_carrier_route_on_any_origin() 
     A self-hosted vLLM origin serving hy4-preview with ``--reasoning-parser``
     returns the standard ``reasoning_content`` field and accepts it back, so a
     rung declaring ``reasoning_content_native`` resolves the Hunyuan carrier
-    route, exposes plaintext when the exposure capability is declared, and
-    pins its prefix cache with ``prompt_cache_key`` (vLLM allows and ignores
-    unknown request fields).
+    route and exposes plaintext when the exposure capability is declared. The
+    ``prompt_cache_key`` node pin stays Tencent-host-keyed: the declaration
+    says nothing about whether the origin tolerates unknown request fields.
     """
     profile = OpenAICompatibleClient(
         model=_snapshot(),
@@ -637,7 +637,7 @@ def test_reasoning_content_native_rung_resolves_a_carrier_route_on_any_origin() 
     assert profile.hunyuan_reasoning_route_sha256 is not None
     assert profile.fireworks_reasoning_route_sha256 is None
     assert profile.reasoning_output_exposed is True
-    assert profile.forwards_prompt_cache_key is True
+    assert profile.forwards_prompt_cache_key is False
 
 
 def test_reasoning_content_native_rung_without_exposure_keeps_its_carrier_but_stays_stripped() -> (

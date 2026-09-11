@@ -471,7 +471,9 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         accepts it back on assistant turns, so the rung is a preserved-thinking
         carrier route whatever its hostname (a self-hosted vLLM origin with a
         reasoning parser). Tencent's own origins carry that contract by
-        recognition and need no declaration.
+        recognition and need no declaration. The declaration decides the
+        carrier route and exposure only; the ``prompt_cache_key`` node pin stays
+        keyed on Tencent's hosts.
         """
         super().__init__(
             model=model,
@@ -550,11 +552,12 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             deepseek_reasoning_history=self._deepseek_reasoning_history,
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
-            # 2026-09-05), and a declared native-reasoning origin (vLLM) allows
-            # and ignores unknown request fields, so the hint rides every
-            # carrier rung. Other compatible servers may reject unknown fields,
-            # so the hint stays off them, BYOK or not.
-            forwards_prompt_cache_key=self._reasoning_content_native,
+            # 2026-09-05). The hint stays host-keyed: a rung declaring
+            # ``reasoning_content_native`` says only that its origin speaks the
+            # reasoning_content contract, and a strict compatible server that
+            # does may still reject an unknown top-level field, so the
+            # declaration never widens what is sent, BYOK or not.
+            forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
         )
 
     def _completion_path(self) -> str:

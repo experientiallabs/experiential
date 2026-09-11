@@ -547,4 +547,4 @@ def test_resolution_threads_reasoning_content_native_to_compatible_rungs() -> No
     profile = resolved.client.gateway_wire_profile()
     assert profile.hunyuan_reasoning_route_sha256 is not None
     assert profile.reasoning_output_exposed is True
-    assert profile.forwards_prompt_cache_key is True
+    assert profile.forwards_prompt_cache_key is False
