@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+import pytest
+
 from exp.common.models.catalog import (
+    BillingSource,
+    ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
+    ModelCatalog,
+    ModelRecord,
 )
-from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.common.models.gateway_catalog import (
+    ExactModelDeployment,
+    FailoverMode,
+    normalize_gateway_catalog,
+)
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
+from exp.runtime.gateway import native_rung_policy
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -21,7 +35,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_rung_policy import failed_dispatch_candidate, reserve_rung_slot
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 
@@ -182,3 +196,111 @@ def test_failed_dispatch_candidate_reads_the_organizations_cache_on_the_failed_r
     assert failed_dispatch_candidate(
         health=health, loads=loads, keys=keys, entry=plain, failure=_THROTTLE, current_depth=0
     ) == (None, None)
+
+
+def test_authored_record_threshold_is_the_one_next_route_candidate_receives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every hop carries the authored value: record, normalized pool, route, decision.
+
+    The platform authors ``GatewayPoolRecord.throttle_cache_threshold``; the
+    engine normalizes it onto ``ExactModelPool``, the resolver stamps it onto
+    the route's ``ExecutionSnapshot``, and the failed-dispatch decision hands
+    exactly that value (with the organization's live cached fraction) to the
+    frozen candidate policy. A drop at any hop would leave the platform
+    authoring a control the waterfall silently ignores.
+    """
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-threshold",
+        provenance="operator comparison run 2026-09-10",
+        evidence_sha256="e" * 64,
+        certified_at=datetime(2026, 9, 10, tzinfo=UTC),
+    )
+    authored = ModelCatalog(
+        connections={"openai": ConnectionConfig(provider="openai")},
+        models={
+            "route-a": ModelRecord(
+                connection="openai",
+                model="m-a",
+                billing_source=BillingSource.HOST_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-threshold"),
+            ),
+            "route-b": ModelRecord(
+                connection="openai",
+                model="m-b",
+                billing_source=BillingSource.HOST_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-threshold"),
+            ),
+        },
+        gateway_pools={
+            "threshold-pool": GatewayPoolRecord(
+                exact_model_id="exact-threshold",
+                deployment_aliases=("route-a", "route-b"),
+                equivalence=certification,
+                failover_mode="maximize_cache",
+                throttle_cache_threshold=0.5,
+            )
+        },
+    )
+    normalized = normalize_gateway_catalog(authored)
+    digest = normalized.identity_sha256()
+    authorization = AuthorizationSnapshot(
+        request_id="request-one",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        virtual_key_id="key-one",
+        alias="public-model",
+        alias_revision_id="revision-one",
+        target=DirectTarget(pool_id="threshold-pool"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256=digest,
+        canonical_request_sha256="d" * 64,
+        deadline_monotonic=1.0,
+    )
+    route = CatalogRouteResolver({("revision-one", digest): normalized}).resolve_direct(
+        authorization
+    )
+    assert route.snapshot.throttle_cache_threshold == 0.5
+    entry = InflightRequest(
+        authorization=authorization,
+        route=route,
+        request=GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hello"),),
+        ),
+        deadline_monotonic=1.0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+    )
+    loads = RungLoadRegistry()
+    lead = route.deployments[0]
+    loads.record_settle(
+        (lead.deployment_id, lead.connection_sha256),
+        "organization-one",
+        cached_tokens=3,
+        input_tokens=4,
+    )
+    received: dict[str, object] = {}
+
+    def _capture(**kwargs: object) -> int | None:
+        """Record the candidate policy's inputs instead of deciding."""
+        received.update(kwargs)
+        return None
+
+    monkeypatch.setattr(native_rung_policy, "next_route_candidate", _capture)
+    keys = tuple(deployment_health_key(authorization, item) for item in route.deployments)
+    candidate, disposition = failed_dispatch_candidate(
+        health=DeploymentHealthRegistry(),
+        loads=loads,
+        keys=keys,
+        entry=entry,
+        failure=_THROTTLE,
+        current_depth=0,
+    )
+    assert candidate is None
+    assert received["throttle_cache_threshold"] == 0.5
+    assert received["failover_mode"] == "maximize_cache"
+    assert received["cached_fraction"] == pytest.approx(0.75)
+    assert received["current_depth"] == 0
+    # The disclosure is computed from the same two inputs the policy received.
+    assert disposition == "throttle_surfaced_cache_preserving"
