@@ -182,7 +182,7 @@ def test_effort_drop_takes_adaptive_thinking_with_it_but_keeps_a_budget() -> Non
     assert coercion.request.reasoning_effort is None
     assert coercion.request.provider_output_config is None
     assert coercion.request.provider_thinking_config is None
-    assert coercion.disclosures == ("reasoning_effort", "thinking")
+    assert coercion.disclosures == ("reasoning_effort", "thinking->dropped(unsupported_by_route)")
 
     budgeted = adaptive.model_copy(
         update={"provider_thinking_config": {"type": "enabled", "budget_tokens": 2048}}
@@ -483,7 +483,7 @@ def test_disabled_thinking_drops_only_on_adaptive_only_anthropic_routes() -> Non
     # exactly what the route already does).
     shim_only = coerce_generation_parameters((shim,), request)
     assert shim_only is not None
-    assert "thinking" in shim_only.disclosures
+    assert "thinking->dropped(unsupported_by_route)" in shim_only.disclosures
     assert shim_only.request.provider_thinking_config is None
     # Only a disabled config is coercible; other types keep their own path.
     assert (
@@ -596,7 +596,7 @@ def test_adaptive_thinking_drops_when_no_legal_budget_fits_max_tokens() -> None:
     assert coercion.request.provider_thinking_config is None
     # The replayed thinking block survives; the coercion only drops the config.
     assert any(message.provider_reasoning for message in coercion.request.messages)
-    assert coercion.disclosures == ("thinking",)
+    assert coercion.disclosures == ("thinking->dropped(unsupported_by_route)",)
 
 
 def test_adaptive_thinking_drops_on_a_zero_reasoning_route_without_an_effort() -> None:
@@ -628,7 +628,7 @@ def test_adaptive_thinking_drops_on_a_zero_reasoning_route_without_an_effort() -
     assert coercion.request.reasoning_effort is None
     assert coercion.request.provider_thinking_config is None
     assert coercion.request.context_management == {"edits": [{"type": "clear_tool_uses_20250919"}]}
-    assert coercion.disclosures == ("thinking",)
+    assert coercion.disclosures == ("thinking->dropped(unsupported_by_route)",)
 
     only_clear_thinking = adaptive_only.model_copy(
         update={"context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
@@ -803,7 +803,10 @@ def test_an_explicit_effort_beside_a_thinking_config_wins_verbatim() -> None:
     )
 
     assert coercion is not None
-    assert coercion.disclosures == ("thinking",)
+    # Named supersession, not a bare "thinking": a caller reading the
+    # disclosure list must not conclude their depth was stripped (Harbor read
+    # "thinking" as "effort high does not apply", 2026-09-11).
+    assert coercion.disclosures == ("thinking->dropped(superseded_by_effort)",)
     assert coercion.request.provider_thinking_config is None
     assert coercion.request.reasoning_effort == "low"
 
@@ -817,7 +820,7 @@ def test_a_thinking_config_drops_with_disclosure_on_a_non_reasoning_route() -> N
     )
 
     assert coercion is not None
-    assert "thinking" in coercion.disclosures
+    assert "thinking->dropped(unsupported_by_route)" in coercion.disclosures
     assert coercion.request.provider_thinking_config is None
     assert coercion.request.reasoning_effort is None
 
@@ -832,7 +835,7 @@ def test_an_active_thinking_config_never_snaps_to_none() -> None:
     )
 
     assert coercion is not None
-    assert "thinking" in coercion.disclosures
+    assert "thinking->dropped(unsupported_by_route)" in coercion.disclosures
     assert coercion.request.reasoning_effort is None
 
 
@@ -888,7 +891,7 @@ def test_a_disabled_thinking_config_never_snaps_to_an_active_effort() -> None:
         _messages_request(provider_thinking_config={"type": "disabled"}),
     )
     assert coercion is not None
-    assert "thinking" in coercion.disclosures
+    assert "thinking->dropped(unsupported_by_route)" in coercion.disclosures
     assert coercion.request.reasoning_effort is None
 
     exact = coerce_generation_parameters(
@@ -1009,3 +1012,65 @@ def test_strict_tool_schemas_close_their_objects_for_a_closing_dialect() -> None
     closed_request = coercion.request
     assert coerce_strict_tool_schemas((anthropic,), closed_request) is None
     assert coerce_strict_tool_schemas((anthropic,), _request()) is None
+
+
+def _hy4_route() -> tuple[GatewayWireProfile, GatewayWireProfile]:
+    """The production hy4-preview route: Tencent then OpenRouter, both OpenAI wire."""
+    tencent = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        model_id="hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+        reasoning_effort="high",
+    )
+    openrouter = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://openrouter.ai/api/v1",
+        model_id="tencent/hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        supported_reasoning_efforts=("none", "low", "high"),
+    )
+    return tencent, openrouter
+
+
+def test_thinking_translates_to_an_effort_on_the_hy4_tencent_openrouter_route() -> None:
+    """Claude Code's think-mode config lands on the hy4 ladders as a translation, never a strip.
+
+    Harbor runs Claude Code think-mode-high against hy4-preview served by a
+    Tencent rung (none/low/medium/high) then an OpenRouter rung (none/low/high).
+    A 32k budget must translate to ``high`` with the ``thinking->reasoning_effort``
+    disclosure; a bare enabled config (Claude Code omits the budget) is the
+    default depth; medium narrows onto the one rung that speaks it.
+    """
+    route = _hy4_route()
+    for thinking, expected in (
+        ({"type": "enabled", "budget_tokens": 32000}, "high"),
+        ({"type": "enabled"}, "medium"),
+        ({"type": "enabled", "budget_tokens": 8192}, "medium"),
+        ({"type": "adaptive"}, "medium"),
+    ):
+        coercion = coerce_generation_parameters(
+            route, _messages_request(provider_thinking_config=thinking)
+        )
+        assert coercion is not None, thinking
+        assert coercion.disclosures == (f"thinking->reasoning_effort:{expected}",), thinking
+        assert coercion.request.reasoning_effort == expected
+        assert coercion.request.provider_thinking_config is None
+
+
+def test_output_config_effort_high_beside_thinking_keeps_high_on_the_hy4_route() -> None:
+    """``output_config.effort: high`` (Claude Code's setting) wins; the config drop names why."""
+    coercion = coerce_generation_parameters(
+        _hy4_route(),
+        _messages_request(
+            provider_thinking_config={"type": "enabled", "budget_tokens": 32000},
+            reasoning_effort="high",
+            provider_output_config={"effort": "high"},
+        ),
+    )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("thinking->dropped(superseded_by_effort)",)

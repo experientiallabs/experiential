@@ -385,7 +385,10 @@ configuration is forwarded verbatim on models that honor it, overriding the cata
 adaptive default; on the adaptive-only generation, which rejects `enabled`/`disabled`
 configs outright, an `enabled` config translates to adaptive with the dropped
 `thinking.budget_tokens` disclosed as ignored, and `disabled` is rejected by name
-because those models cannot turn thinking off), requires
+because those models cannot turn thinking off; a bare `{type: enabled}` with no budget, which
+Claude Code sends, is legal at the gateway boundary: an Anthropic rung receives the gateway's
+derived budget (`thinking.budget_tokens->derived`, or `thinking->dropped(no_legal_budget)` when
+none fits under `max_tokens`) and an effort route reads it as the default depth), requires
 `max_tokens`, validates `cache_control` (carrying it everywhere the Anthropic wire caches
 natively: `tool_use` blocks, tool definitions, the top-level automatic marker, and block-level
 markers on system and message text runs and on `tool_result` breakpoints all forward verbatim.
@@ -395,8 +398,11 @@ This is what makes Claude Code sessions cacheable at all: it marks its system bl
 conversation breakpoints on every request, and flattening them once billed whole sessions
 uncached at ~10x. Responses report both cache legs back out of the folded ledger total, so
 callers see `cache_creation_input_tokens` on the writing turn and `cache_read_input_tokens` on
-later turns. Routes with no Anthropic rung disclose the dropped markers through
-`ignored_parameters`), carries the provider-native tool annotations (`strict`,
+later turns. Routes with no Anthropic rung have no field for the markers and disclose them as
+`<path>.cache_control->not_forwarded(provider_caches_implicitly)`: the wording never says
+"ignored", because the OpenAI-family provider still caches the prefix on its own and the ledger
+bills those reads at the cached rate — Harbor saw 14,976 cached tokens billed beside an
+"ignored" marker on 2026-09-11), carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
 disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
@@ -412,8 +418,15 @@ citation-bearing text blocks, and the `pause_turn` stop reason) reaches the call
 both response paths, and a next-turn echo of those blocks (each carried verbatim as a
 whole-message block) re-serves byte-for-byte; every other Anthropic-defined tool type is
 rejected by name because the data plane does not yet carry its result blocks. Like the thinking
-carriers, server tools replay only on the Anthropic wire, so a route with any other rung rejects
-them by name instead of dropping a requested capability. The terminal `message_delta` usage
+carriers, server tools replay only on the Anthropic wire. A MIXED route (an Anthropic rung beside
+another) rejects them by name; a route with NO Anthropic rung serves the turn without them,
+dropping the declared tool (`tools.web_search->dropped(unsupported_by_provider)`), its echoed
+`server_tool_use` / `*_tool_result` history blocks
+(`messages.server_tool_blocks->dropped(unsupported_by_provider)`), the citations of a cited
+answer whose text stays (`messages.content.citations->dropped(unsupported_by_provider)`), and a
+selector that named the tool (`tool_choice->dropped(unsupported_by_provider)`), because Claude
+Code recovers on its own once WebSearch is simply absent while a 400 kills the turn (two
+production turns on 2026-09-11). The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
 
@@ -656,6 +669,20 @@ through `ignored_parameters`, logged, and counted in the `admission_parameter_co
 metric; every serving surface carries that list to the caller as a body-level
 `x-experiential-ignored-parameters` key (Chat chunk and completion, Responses envelope, and the
 Anthropic message on both `message_start` and the aggregated body), so a drop is never silent; nothing coercible keeps the first rung's own field-scoped rejection.
+The thinking vocabulary names the outcome, never a bare field: `thinking->reasoning_effort:<tier>`
+(the config was TRANSLATED onto the route's effort ladder and applies at that tier),
+`thinking->dropped(superseded_by_effort)` (the caller's own `output_config.effort` or
+`reasoning.effort` already states the depth, which is what serves), and
+`thinking->dropped(unsupported_by_route)` (no rung can reason at any depth). A caller reading a
+bare `thinking` as "my depth was stripped" is the misreading this vocabulary exists to prevent.
+
+On the Messages stream, `message_start.message.usage` carries what the upstream already reported
+before content — an Anthropic upstream's own start-frame input and cache meters, mirrored — and
+`message_delta.usage` carries the final meters (input, output, `cache_read_input_tokens`,
+`cache_creation_input_tokens`, plus the platform's cost extensions). An OpenAI-wire upstream
+reports nothing before its final chunk, so its `message_start` keeps the zero placeholder and the
+final meters ride `message_delta`; the official Anthropic SDK accumulators (Python and TypeScript)
+copy every usage field present on `message_delta`, so their final message shows the true counts.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
 provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
 caller hits that 400.

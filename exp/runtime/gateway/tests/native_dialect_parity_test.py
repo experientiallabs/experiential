@@ -619,11 +619,27 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
 )
 
 
+def _anthropic_start_usage(input_tokens: int, output_tokens: int, cached: int) -> dict[str, object]:
+    """The usage event an Anthropic ``message_start`` now surfaces before content.
+
+    The start-frame meters reach the Messages encoder's own ``message_start``
+    (Claude Code reads input there) and stand in for settlement until the
+    terminal report supersedes them at ``message_stop``.
+    """
+    return {
+        "kind": "usage",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": cached,
+        "reasoning_tokens": None,
+    }
+
+
 def test_native_anthropic_normalizer_emits_thinking_events() -> None:
     """Extended-thinking frames normalize to dedicated events, never silence."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_THINKING_CHUNKS)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_THINKING_EVENTS)
+    assert result["events"] == [_anthropic_start_usage(8, 0, 2), *ANTHROPIC_THINKING_EVENTS]
 
 
 # Captured from a live api.anthropic.com tool_use stream (2026-08-28,
@@ -682,7 +698,7 @@ def test_native_anthropic_normalizer_decodes_the_live_tool_use_wire() -> None:
     """The real captured tool_use wire decodes to the canonical event stream."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_TOOL_FRAMES)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_LIVE_TOOL_EVENTS)
+    assert result["events"] == [_anthropic_start_usage(663, 12, 0), *ANTHROPIC_LIVE_TOOL_EVENTS]
 
 
 # Captured live (2026-08-28, claude-haiku-4-5, ids neutralized): a
@@ -718,6 +734,7 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_ZERO_ARG_FRAMES)
     assert result["failure"] is None
     assert result["events"] == [
+        _anthropic_start_usage(550, 21, 0),
         {"kind": "tool_call_started", "index": 0, "call_id": "toolu_fixture", "name": "get_time"},
         {"kind": "tool_arguments_delta", "index": 0, "text": ""},
         # The completion-time seed streams before the completed call so every
@@ -855,7 +872,10 @@ def test_native_anthropic_normalizer_decodes_the_live_web_search_wire() -> None:
     """
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_WEB_SEARCH_FRAMES)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_LIVE_WEB_SEARCH_EVENTS)
+    assert result["events"] == [
+        _anthropic_start_usage(2230, 25, 0),
+        *ANTHROPIC_LIVE_WEB_SEARCH_EVENTS,
+    ]
 
 
 def test_native_responses_preserves_multi_message_status_phase_and_idless_call() -> None:

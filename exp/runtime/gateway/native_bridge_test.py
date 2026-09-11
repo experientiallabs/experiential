@@ -4986,7 +4986,10 @@ def test_adaptive_thinking_drops_with_the_effort_on_a_reasoning_less_route(
         }
     )
     admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
-    assert admission["ignored_parameters"] == ["reasoning_effort", "thinking"]
+    assert admission["ignored_parameters"] == [
+        "reasoning_effort",
+        "thinking->dropped(unsupported_by_route)",
+    ]
     upstream = admission["upstream_payload"]
     assert isinstance(upstream, dict)
     assert "thinking" not in upstream

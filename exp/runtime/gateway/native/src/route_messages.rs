@@ -559,6 +559,10 @@ async fn stream_messages(
 
         // Mirror any prefix-peeked first token before a start-frame send can cancel and drop it.
         guard.record_first_token(committed.relay.first_token_at());
+        // An Anthropic upstream reports its input and cache meters on its own
+        // start frame, tracked pre-commit; put them on the caller's
+        // `message_start` instead of the zero placeholder.
+        encoder.set_initial_usage(usage.clone());
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {

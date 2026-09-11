@@ -169,9 +169,10 @@ def test_thinking_config_is_carried_verbatim() -> None:
     assert decoded.request.provider_thinking_config == config
     assert decode_messages(_body()).request.provider_thinking_config is None
 
-    with pytest.raises(OpenAIProtocolError) as excinfo:
-        decode_messages(_body(thinking={"type": "enabled"}))
-    assert excinfo.value.detail.param == "thinking"
+    # Claude Code sends a bare enabled config (no budget); the decoder keeps it
+    # verbatim and route shaping derives or translates the depth per rung.
+    bare: JsonObject = {"type": "enabled"}
+    assert decode_messages(_body(thinking=bare)).request.provider_thinking_config == bare
     with pytest.raises(OpenAIProtocolError):
         decode_messages(_body(thinking={"type": "adaptive", "budget_tokens": 64}))
 
@@ -2043,3 +2044,37 @@ def test_anthropic_signed_thinking_still_decodes_verbatim_beside_gateway_blocks(
         "redacted_thinking",
     ]
     assert assistant.provider_anthropic_blocks is not None
+
+
+def test_claude_code_beta_header_set_decodes_with_per_token_disclosures() -> None:
+    """Claude Code's live beta header set never rejects the request.
+
+    The allowlisted tokens forward; every other token (the product umbrella,
+    the effort beta, fine-grained tool streaming) drops with its own
+    disclosure and the rest of the request decodes untouched.
+    """
+    header = (
+        "claude-code-20250219,interleaved-thinking-2025-05-14,"
+        "fine-grained-tool-streaming-2025-05-14,effort-2025-11-24,"
+        "context-management-2025-06-27"
+    )
+    decoded = decode_messages(
+        _body(
+            thinking={"type": "enabled"},
+            output_config={"effort": "high"},
+            tools=[{"name": "Bash", "input_schema": {"type": "object", "properties": {}}}],
+        ),
+        anthropic_beta=header,
+    )
+    assert decoded.request.provider_beta_tokens == (
+        "interleaved-thinking-2025-05-14",
+        "context-management-2025-06-27",
+    )
+    assert decoded.request.ignored_parameters == (
+        "anthropic-beta.claude-code-20250219",
+        "anthropic-beta.fine-grained-tool-streaming-2025-05-14",
+        "anthropic-beta.effort-2025-11-24",
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.provider_thinking_config == {"type": "enabled"}
+    assert [tool.name for tool in decoded.request.tools] == ["Bash"]

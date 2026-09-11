@@ -726,7 +726,7 @@ fn exposed_reasoning_events() -> Vec<Event> {
     ]
 }
 
-fn tool_turn_reasoning_events() -> Vec<Event> {
+pub(super) fn tool_turn_reasoning_events() -> Vec<Event> {
     vec![
         Event::ReasoningContentDelta {
             route_sha256: "route-a".to_string(),
@@ -760,7 +760,7 @@ fn tool_turn_reasoning_events() -> Vec<Event> {
     ]
 }
 
-fn frame_names(frames: &[String]) -> Vec<&str> {
+pub(super) fn frame_names(frames: &[String]) -> Vec<&str> {
     frames
         .iter()
         .map(|frame| {
@@ -944,35 +944,4 @@ fn tool_turn_reasoning_without_a_sealed_carrier_fails_closed() {
     let aggregated =
         completed_messages_body_with_reasoning("request-abc", "coding", &events, &[], None, true);
     assert!(aggregated.is_err());
-}
-
-#[test]
-fn a_stop_sequence_ending_a_reasoning_tool_turn_still_needs_and_emits_the_carrier() {
-    // Both completing terminals demand the sealed carrier, so the route must
-    // seal on `StoppedAtSequence` too (Greptile on #897): with the carrier the
-    // trailing redacted block and the terminal frames flow; without it the
-    // encoder fails closed instead of ending the stream short.
-    let mut events = tool_turn_reasoning_events();
-    events.pop();
-    events.push(Event::StoppedAtSequence("STOP".to_string()));
-    let carrier = "x-experiential-hunyuan-reasoning-v1:ZGVw:c2VhbGVk";
-    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
-    encoder.set_reasoning_content_carrier(carrier.to_string());
-    let mut frames = encoder.start().expect("starts");
-    for event in &events {
-        frames.extend(encoder.feed(event).expect("streams"));
-    }
-    let names = frame_names(&frames);
-    assert_eq!(names[names.len() - 2..], ["message_delta", "message_stop"]);
-    assert!(frames
-        .iter()
-        .any(|frame| frame.contains("\"redacted_thinking\"")));
-
-    let mut unsealed = MessagesSseEncoder::new("request-abc", "coding");
-    unsealed.start().expect("starts");
-    let error = events
-        .iter()
-        .find_map(|event| unsealed.feed(event).err())
-        .expect("terminal without a carrier fails");
-    assert!(error.message.contains("not sealed"));
 }

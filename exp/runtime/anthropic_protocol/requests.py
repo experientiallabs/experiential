@@ -267,9 +267,15 @@ class _ThinkingConfig(AnthropicWireModel):
 
     @model_validator(mode="after")
     def _require_budget_only_when_enabled(self) -> _ThinkingConfig:
-        """Bind the token budget to the one mode Anthropic defines it for."""
-        if self.type == "enabled" and self.budget_tokens is None:
-            raise ValueError("thinking.budget_tokens is required when thinking is enabled")
+        """Bind the token budget to the one mode Anthropic defines it for.
+
+        A budget is legal only on ``enabled``, but it is not REQUIRED there at
+        this boundary: Claude Code sends a bare ``{"type": "enabled"}`` and the
+        provider wire needs a budget, so route shaping derives one for an
+        Anthropic rung (disclosed) and an effort route reads the bare config as
+        its default depth. Rejecting it here made every such session die at
+        the gateway (Harbor, 2026-09-11).
+        """
         if self.type != "enabled" and self.budget_tokens is not None:
             raise ValueError("thinking.budget_tokens is valid only when thinking is enabled")
         return self

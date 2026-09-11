@@ -1234,7 +1234,9 @@ def test_mixed_route_keeps_the_prompt_cache_marker_when_any_rung_is_anthropic() 
     # No rung can cache: dropped with disclosure.
     public_only, provider_only = route_generation_parameter_requests((fallback,), request)
     assert provider_only.provider_cache_control is None
-    assert "cache_control" in public_only.ignored_parameters
+    assert (
+        "cache_control->not_forwarded(provider_caches_implicitly)" in public_only.ignored_parameters
+    )
 
 
 def test_route_shaping_omits_parallel_control_when_tool_choice_disables_tools() -> None:
@@ -2596,12 +2598,15 @@ def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() ->
         (GatewayWireProfile(dialect="openai_compatible", url="https://openai.test"),),
         request,
     )
-    assert "messages.tool_calls.cache_control" in public.ignored_parameters
+    assert (
+        "messages.tool_calls.cache_control->not_forwarded(provider_caches_implicitly)"
+        in public.ignored_parameters
+    )
     anthropic_public, _provider = route_generation_parameter_requests(
         (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"),),
         request,
     )
-    assert "messages.tool_calls.cache_control" not in anthropic_public.ignored_parameters
+    assert not any("cache_control" in path for path in anthropic_public.ignored_parameters)
 
     # The hint never perturbs digests, artifacts, or replay identity.
     bare = hinted.model_copy(update={"cache_control": None})
@@ -3043,7 +3048,7 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     # rungs.
     assert set(mixed_public.ignored_parameters) == {
         "inference_geo",
-        "tools.cache_control",
+        "tools.cache_control->not_forwarded(provider_caches_implicitly)",
         "tools.eager_input_streaming",
         "tools.defer_loading",
         "tools.allowed_callers",
@@ -3282,10 +3287,16 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     mixed_public, mixed_provider = route_generation_parameter_requests(
         (anthropic, fallback), request
     )
-    assert "messages.content.cache_control" not in mixed_public.ignored_parameters
+    assert not any("cache_control" in path for path in mixed_public.ignored_parameters)
     assert mixed_provider.messages[0].provider_text_blocks
     foreign_public, _foreign_provider = route_generation_parameter_requests((fallback,), request)
-    assert "messages.content.cache_control" in foreign_public.ignored_parameters
+    # Not "ignored": the provider still caches the prefix implicitly (Harbor saw
+    # 14,976 cached tokens billed at the cached rate beside this disclosure),
+    # so the wording says what actually happens to the marker.
+    assert (
+        "messages.content.cache_control->not_forwarded(provider_caches_implicitly)"
+        in foreign_public.ignored_parameters
+    )
 
 
 def test_litellm_provider_specific_fields_are_dropped_with_disclosure_on_every_route() -> None:
@@ -4839,3 +4850,123 @@ def test_a_tool_result_name_drops_with_disclosure_off_the_openai_wires() -> None
     )
     # Namespace/caller attribution stays a Responses-only concern.
     assert not any("attribution" in path for path in public_request.ignored_parameters)
+
+
+def _hy4_foreign_route() -> tuple[GatewayWireProfile, GatewayWireProfile]:
+    """hy4-preview's production route: two OpenAI-wire rungs, no Anthropic rung."""
+    return (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+            model_id="hy4-preview",
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.ai/api/v1",
+            model_id="tencent/hy4-preview",
+        ),
+    )
+
+
+def test_server_tools_drop_with_disclosure_on_an_all_foreign_route() -> None:
+    """Claude Code's WebSearch on a non-Anthropic route serves the turn minus the tool.
+
+    Two akhara-ai requests died on the named 400 on 2026-09-11 (hy4-preview,
+    tencent+openrouter). The agent recovers with WebFetch/Bash when the tool is
+    simply absent, so a route with NO Anthropic rung now strips the server tool
+    and its echoed history blocks from the dispatched request with per-path
+    disclosures; the public request keeps the caller's history verbatim. A
+    mixed route still rejects (its Anthropic rung could serve the tool).
+    """
+    request = _web_search_messages_request(
+        echoed_block=True, tool_choice=GatewayNamedToolChoice(name="web_search")
+    )
+    public, provider = route_generation_parameter_requests(_hy4_foreign_route(), request)
+    assert provider.provider_server_tools == ()
+    assert all(message.provider_anthropic_block is None for message in provider.messages)
+    assert [message.role for message in provider.messages] == ["user", "user"]
+    assert provider.tool_choice is None
+    assert set(public.ignored_parameters) >= {
+        "tools.web_search->dropped(unsupported_by_provider)",
+        "messages.server_tool_blocks->dropped(unsupported_by_provider)",
+        "tool_choice->dropped(unsupported_by_provider)",
+    }
+    # The caller's own history is untouched on the public copy.
+    assert public.provider_server_tools == request.provider_server_tools
+    assert any(message.provider_anthropic_block is not None for message in public.messages)
+
+    # A cited answer block (server-tool output) keeps its text and loses only
+    # the citations the foreign wire cannot carry.
+    cited = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="search"),
+            GatewayMessage(
+                role="assistant",
+                provider_anthropic_block={
+                    "type": "text",
+                    "text": "Python 3.13 is out.",
+                    "citations": [{"type": "web_search_result_location", "url": "https://x"}],
+                },
+            ),
+            GatewayMessage(role="user", content="and now?"),
+        ),
+        maximum_output_tokens=256,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+    public, provider = route_generation_parameter_requests(_hy4_foreign_route(), cited)
+    assert provider.messages[1].content == "Python 3.13 is out."
+    assert provider.messages[1].provider_anthropic_block is None
+    assert "messages.content.citations->dropped(unsupported_by_provider)" in (
+        public.ignored_parameters
+    )
+
+
+def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_route() -> None:
+    """Claude Code omits budget_tokens; the Anthropic wire requires one, so it is derived.
+
+    Anthropic rejects ``{type: enabled}`` without a budget (minimum 1024, below
+    max_tokens), so a budgeted-only Anthropic route fills the same derived
+    budget the adaptive->enabled translation uses and discloses the fill; with
+    no legal budget under the ceiling the config drops with disclosure.
+    """
+    haiku = _anthropic_profile("claude-haiku-4-5")
+    public, provider = route_generation_parameter_requests(
+        (haiku,), _messages_request(thinking={"type": "enabled"}, maximum_output_tokens=4096)
+    )
+    assert provider.provider_thinking_config == {"type": "enabled", "budget_tokens": 2048}
+    assert "thinking.budget_tokens->derived" in public.ignored_parameters
+
+    public, provider = route_generation_parameter_requests(
+        (haiku,), _messages_request(thinking={"type": "enabled"}, maximum_output_tokens=1024)
+    )
+    assert provider.provider_thinking_config is None
+    assert "thinking->dropped(no_legal_budget)" in public.ignored_parameters
+
+
+def test_claude_code_beta_tokens_disclose_without_dropping_the_request_on_a_foreign_route() -> None:
+    """Forwarded-class beta tokens are disclosed no-ops off the Anthropic wire; nothing else
+    moves."""
+    request = _messages_request(maximum_output_tokens=4096).model_copy(
+        update={
+            "provider_beta_tokens": (
+                "interleaved-thinking-2025-05-14",
+                "context-management-2025-06-27",
+            ),
+            "tools": (
+                GatewayToolDefinition(
+                    name="Bash", description="run", parameters={"type": "object", "properties": {}}
+                ),
+            ),
+        }
+    )
+    public, provider = route_generation_parameter_requests(_hy4_foreign_route(), request)
+    assert provider.provider_beta_tokens == ()
+    assert {
+        "anthropic-beta.interleaved-thinking-2025-05-14",
+        "anthropic-beta.context-management-2025-06-27",
+    } <= set(public.ignored_parameters)
+    assert [tool.name for tool in provider.tools] == ["Bash"]
+    assert provider.messages == request.messages

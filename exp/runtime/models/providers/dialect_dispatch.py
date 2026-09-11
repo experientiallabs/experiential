@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 
 TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
 THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
+
+CACHE_CONTROL_NOT_FORWARDED_SUFFIX = "->not_forwarded(provider_caches_implicitly)"
+"""Suffix for cache-marker disclosures on routes with no Anthropic rung: the
+marker has no wire field there, but the provider still caches the prefix on
+its own (and the ledger bills cache reads at the cached rate), so the wording
+never claims caching is off."""
 """Disclosed when Anthropic-signed thinking history is omitted for a foreign wire."""
 """Disclosure recorded when tool-result images degrade to placeholder text.
 
