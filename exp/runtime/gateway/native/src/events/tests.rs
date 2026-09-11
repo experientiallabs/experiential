@@ -544,3 +544,138 @@ fn custom_tool_input_passes_through_the_hold_back_untouched() {
         "{}\"\" ls -la"
     );
 }
+
+// Cache-write pins: the billed write leg rides as `cache_creation_input_tokens`
+// on every wire that reports one, as a subset of `input_tokens`, and is
+// never invented where the wire has none.
+
+#[test]
+fn openai_responses_usage_carries_the_billed_cache_write_leg_as_reported() {
+    // Verbatim gpt-5.6-luna usage (api.openai.com, 2026-09-11,
+    // prompt_cache_retention=24h): the first turn writes 9077 of the 9080
+    // prompt tokens, the second reads them back. OpenAI bills GPT-5.6+ writes
+    // at 1.25x the input rate, so dropping the leg under-meters every write.
+    let write_turn = openai_usage(Some(&json!({
+        "input_tokens": 9080,
+        "input_tokens_details": {"cache_write_tokens": 9077, "cached_tokens": 0},
+        "output_tokens": 32,
+        "output_tokens_details": {"reasoning_tokens": 23},
+        "total_tokens": 9112,
+    })))
+    .expect("valid usage")
+    .expect("usage present");
+    assert_eq!(write_turn.input_tokens, Some(9080));
+    assert_eq!(write_turn.cached_input_tokens, Some(0));
+    assert_eq!(write_turn.cache_creation_input_tokens, Some(9077));
+    let read_turn = openai_usage(Some(&json!({
+        "input_tokens": 9080,
+        "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 9077},
+        "output_tokens": 29,
+        "output_tokens_details": {"reasoning_tokens": 20},
+        "total_tokens": 9109,
+    })))
+    .expect("valid usage")
+    .expect("usage present");
+    assert_eq!(read_turn.cached_input_tokens, Some(9077));
+    // A reported zero rides as zero (gpt-5.4-nano reports `cache_write_tokens:
+    // 0` even on the turn that filled its cache, because it bills no writes);
+    // only an absent detail is unknown.
+    assert_eq!(read_turn.cache_creation_input_tokens, Some(0));
+    let without_detail = openai_usage(Some(&json!({
+        "input_tokens": 36,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": 7,
+        "total_tokens": 43,
+    })))
+    .expect("valid usage")
+    .expect("usage present");
+    assert_eq!(without_detail.cache_creation_input_tokens, None);
+    let malformed = openai_usage(Some(&json!({
+        "input_tokens": 1,
+        "input_tokens_details": {"cache_write_tokens": -1},
+        "output_tokens": 1,
+    })));
+    assert_eq!(
+        malformed.unwrap_err(),
+        "OpenAI cache_write_tokens must be a non-negative integer"
+    );
+}
+
+#[test]
+fn openai_compatible_usage_carries_the_billed_cache_write_leg_as_reported() {
+    // Verbatim gpt-5.6-luna Chat Completions usage (api.openai.com,
+    // 2026-09-11, streamed with stream_options.include_usage and identical
+    // non-streaming): `prompt_tokens_details.cache_write_tokens` is the write
+    // leg, a subset of prompt_tokens beside cached_tokens.
+    let write_turn = openai_compatible_usage(&json!({
+        "prompt_tokens": 9080,
+        "completion_tokens": 5,
+        "total_tokens": 9085,
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 9077, "audio_tokens": 0},
+        "completion_tokens_details": {
+            "reasoning_tokens": 5,
+            "audio_tokens": 0,
+            "accepted_prediction_tokens": 0,
+            "rejected_prediction_tokens": 0,
+        },
+    }))
+    .expect("valid usage");
+    assert_eq!(write_turn.input_tokens, Some(9080));
+    assert_eq!(write_turn.cached_input_tokens, Some(0));
+    assert_eq!(write_turn.cache_creation_input_tokens, Some(9077));
+    assert_eq!(write_turn.reasoning_tokens, Some(5));
+    let read_turn = openai_compatible_usage(&json!({
+        "prompt_tokens": 9080,
+        "completion_tokens": 5,
+        "total_tokens": 9085,
+        "prompt_tokens_details": {"cached_tokens": 9077, "cache_write_tokens": 0, "audio_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 5},
+    }))
+    .expect("valid usage");
+    assert_eq!(read_turn.cached_input_tokens, Some(9077));
+    assert_eq!(read_turn.cache_creation_input_tokens, Some(0));
+    // Pre-GPT-5.6 OpenAI Chat and compatible relays carry no write detail at
+    // all (verbatim gpt-5.4-nano, and the OpenRouter/Foundry shapes above):
+    // the leg stays unknown (the consumer's approximation case), never an
+    // invented zero.
+    let without_detail = openai_compatible_usage(&json!({
+        "prompt_tokens": 9072,
+        "completion_tokens": 5,
+        "total_tokens": 9077,
+        "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }))
+    .expect("valid usage");
+    assert_eq!(without_detail.cache_creation_input_tokens, None);
+}
+
+#[test]
+fn bedrock_and_gemini_usage_report_the_write_leg_only_where_the_wire_has_one() {
+    // Converse names its write leg; it folds into input AND rides as the
+    // creation subset so settlement can price it at the cache-write rate.
+    let bedrock = bedrock_usage(Some(&json!({
+        "inputTokens": 9,
+        "outputTokens": 4,
+        "cacheReadInputTokens": 2,
+        "cacheWriteInputTokens": 1,
+    })))
+    .expect("valid usage");
+    assert_eq!(bedrock.input_tokens, Some(12));
+    assert_eq!(bedrock.cached_input_tokens, Some(2));
+    assert_eq!(bedrock.cache_creation_input_tokens, Some(1));
+    // Converse omits zero-valued legs, so an absent write leg is a reported
+    // zero, not an unknown.
+    let no_write =
+        bedrock_usage(Some(&json!({"inputTokens": 9, "outputTokens": 4}))).expect("valid usage");
+    assert_eq!(no_write.cache_creation_input_tokens, Some(0));
+    // Gemini publishes no write count, so none is invented.
+    let gemini = gemini_usage(&json!({
+        "promptTokenCount": 30,
+        "cachedContentTokenCount": 20,
+        "candidatesTokenCount": 4,
+        "totalTokenCount": 34,
+    }))
+    .expect("valid usage");
+    assert_eq!(gemini.cached_input_tokens, Some(20));
+    assert_eq!(gemini.cache_creation_input_tokens, None);
+}

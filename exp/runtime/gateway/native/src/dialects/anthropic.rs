@@ -75,7 +75,7 @@ impl Normalizer {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(self.output_tokens),
                     cached_input_tokens: Some(self.cache_read),
-                    cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    cache_creation_input_tokens: Some(self.cache_write),
                     reasoning_tokens: None,
                 }));
             }
@@ -313,9 +313,10 @@ impl Normalizer {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(self.output_tokens),
                     cached_input_tokens: Some(self.cache_read),
-                    // Present only when nonzero so cache-less streams keep
-                    // their exact pre-field usage shape.
-                    cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    // The wire always reports the write leg (zero when
+                    // nothing was written), and settlement distinguishes a
+                    // reported zero from an unknown leg, so it rides as is.
+                    cache_creation_input_tokens: Some(self.cache_write),
                     // Anthropic reports thinking inside output_tokens and
                     // publishes no separate count, so the reasoning subset
                     // stays unknown instead of being invented.

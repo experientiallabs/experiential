@@ -68,7 +68,8 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
     """Extract one served line's usage across the three provider wire shapes.
 
     Chat Completions bodies report ``prompt_tokens``/``completion_tokens`` with
-    ``prompt_tokens_details.cached_tokens`` and
+    ``prompt_tokens_details.cached_tokens`` (and, on GPT-5.6 and later, the
+    billed ``prompt_tokens_details.cache_write_tokens`` leg) and
     ``completion_tokens_details.reasoning_tokens``; Responses bodies report
     ``input_tokens``/``output_tokens`` with the ``input_tokens_details`` and
     ``output_tokens_details`` equivalents; Anthropic messages report
@@ -107,6 +108,11 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
     cached = _detail_count(
         usage, ("prompt_tokens_details", "input_tokens_details"), "cached_tokens"
     )
+    # OpenAI names its billed write leg inside the same details object as the
+    # read leg (GPT-5.6+; the synchronous normalizer reads the same key).
+    cache_write = _detail_count(
+        usage, ("prompt_tokens_details", "input_tokens_details"), "cache_write_tokens"
+    )
     reasoning = _detail_count(
         usage, ("completion_tokens_details", "output_tokens_details"), "reasoning_tokens"
     )
@@ -122,12 +128,16 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
             and "output_tokens_details" not in usage
         )
     )
-    if cached is None and anthropic_shaped:
-        # The Anthropic wire always has a cache-read leg (zero when nothing
-        # was read), and the synchronous normalizer reports it as such, so
-        # the rendered chat usage carries cached_tokens: 0 rather than
-        # omitting the detail.
-        cached = cache_read or 0
+    if anthropic_shaped:
+        # The Anthropic wire always has cache-read and cache-write legs (zero
+        # when nothing was read or written), and the synchronous normalizer
+        # reports both as such, so the rendered chat usage carries
+        # cached_tokens: 0 rather than omitting the detail and the write leg
+        # is a reported zero rather than an unknown.
+        if cached is None:
+            cached = cache_read or 0
+        if cache_creation is None:
+            cache_creation = 0
     output_tokens = reported_output
     if reasoning:
         total = _count(usage.get("total_tokens"), "usage.total_tokens")
@@ -143,8 +153,9 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cached_input_tokens=cached,
-        # Present only when nonzero, matching the synchronous normalizer.
-        cache_creation_input_tokens=cache_creation if cache_creation else None,
+        # Exactly as reported (zero included), matching the synchronous
+        # normalizer; unknown only where the wire carries no write count.
+        cache_creation_input_tokens=cache_creation if cache_creation is not None else cache_write,
         reasoning_tokens=reasoning,
     )
 
