@@ -1795,3 +1795,89 @@ def test_forced_tool_choice_decodes_to_the_canonical_forced_forms() -> None:
     assert decode_messages(
         _body(tool_choice={"type": "auto"}, tools=tools)
     ).request.tool_choice == ("auto")
+
+
+def test_openrouter_reasoning_effort_rides_the_canonical_effort_channel() -> None:
+    """OpenRouter's ``reasoning: {effort}`` is a second effort channel beside thinking.
+
+    Agents built against OpenRouter's Anthropic-compatible Messages endpoint
+    send it verbatim; the gateway maps it onto ``reasoning_effort`` so every
+    rung (native Anthropic through ``output_config`` or a budget, effort
+    ladders elsewhere) sees the same canonical tier.
+    """
+    decoded = decode_messages(_body(reasoning={"effort": "low"}))
+    assert decoded.request.reasoning_effort == "low"
+    assert decoded.request.provider_thinking_config is None
+    assert decoded.request.provider_output_config is None
+    assert decoded.request.reasoning_effort_parameter == "reasoning.effort"
+    assert decoded.request.ignored_parameters == ()
+    # The Anthropic channel alone keeps the surface default for rejections.
+    native = decode_messages(_body(output_config={"effort": "low"}))
+    assert native.request.reasoning_effort_parameter is None
+    assert decode_messages(_body(reasoning={"effort": "none"})).request.reasoning_effort == "none"
+    assert decode_messages(_body(reasoning={"effort": "max"})).request.reasoning_effort == "max"
+
+
+def test_openrouter_reasoning_enabled_and_budget_forms_translate() -> None:
+    """``enabled: true`` is OpenRouter's default depth; a token budget maps by tier."""
+    enabled = decode_messages(_body(reasoning={"enabled": True}))
+    assert enabled.request.reasoning_effort == "medium"
+    disabled = decode_messages(_body(reasoning={"enabled": False}))
+    assert disabled.request.reasoning_effort == "none"
+    # A budget becomes the budgeted thinking config Anthropic rungs forward and
+    # non-Anthropic rungs translate by tier (<=4096 low, <=16384 medium, else high).
+    budget = decode_messages(_body(max_tokens=64000, reasoning={"max_tokens": 32000}))
+    assert budget.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 32000}
+    assert budget.request.reasoning_effort == "high"
+    # exclude only hides reasoning from the reply, which this gateway does not
+    # render for non-Anthropic rungs anyway; it is dropped with disclosure.
+    excluded = decode_messages(_body(reasoning={"effort": "high", "exclude": True}))
+    assert excluded.request.reasoning_effort == "high"
+    assert "reasoning.exclude" in excluded.request.ignored_parameters
+
+
+def test_openrouter_reasoning_rejects_conflicting_and_unknown_shapes() -> None:
+    """Closed validation: effort and max_tokens are exclusive; unknown keys 400."""
+    with pytest.raises(OpenAIProtocolError) as both:
+        decode_messages(_body(reasoning={"effort": "high", "max_tokens": 2000}))
+    assert both.value.detail.param == "reasoning"
+    with pytest.raises(OpenAIProtocolError) as unknown:
+        decode_messages(_body(reasoning={"effort": "high", "depth": 3}))
+    assert unknown.value.status_code == 400
+    with pytest.raises(OpenAIProtocolError) as bad_effort:
+        decode_messages(_body(reasoning={"effort": "hyperdrive"}))
+    assert bad_effort.value.detail.param == "reasoning.effort"
+    with pytest.raises(OpenAIProtocolError) as oversized:
+        decode_messages(_body(max_tokens=2000, reasoning={"max_tokens": 2000}))
+    assert oversized.value.detail.param == "reasoning.max_tokens"
+
+
+def test_openrouter_reasoning_wins_over_thinking_and_output_config_with_disclosure() -> None:
+    """Two reasoning channels on one request: the explicit effort wins, disclosed.
+
+    ``thinking`` is dropped (Anthropic rungs still reason at the effort through
+    the shared channel) and an ``output_config.effort`` that disagrees is
+    dropped from the forwarded object so it and the routing decision cannot
+    diverge; the payload seam re-seeds the effort from the shared channel.
+    """
+    decoded = decode_messages(
+        _body(
+            reasoning={"effort": "high"},
+            thinking={"type": "enabled", "budget_tokens": 2048},
+            output_config={"effort": "low", "format": {"type": "text"}},
+        )
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.provider_thinking_config is None
+    assert decoded.request.provider_output_config == {"format": {"type": "text"}}
+    assert decoded.request.reasoning_effort_parameter == "reasoning.effort"
+    assert "thinking->dropped(superseded_by_reasoning)" in decoded.request.ignored_parameters
+    assert (
+        "output_config.effort->dropped(superseded_by_reasoning)"
+        in decoded.request.ignored_parameters
+    )
+    # An agreeing output_config.effort needs no disclosure.
+    agreeing = decode_messages(
+        _body(reasoning={"effort": "high"}, output_config={"effort": "high"})
+    )
+    assert agreeing.request.ignored_parameters == ()
