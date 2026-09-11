@@ -1235,7 +1235,7 @@ def test_mixed_route_keeps_the_prompt_cache_marker_when_any_rung_is_anthropic() 
     public_only, provider_only = route_generation_parameter_requests((fallback,), request)
     assert provider_only.provider_cache_control is None
     assert (
-        "cache_control->not_forwarded(provider_caches_implicitly)" in public_only.ignored_parameters
+        "cache_control->not_forwarded(provider_decides_caching)" in public_only.ignored_parameters
     )
 
 
@@ -2599,7 +2599,7 @@ def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() ->
         request,
     )
     assert (
-        "messages.tool_calls.cache_control->not_forwarded(provider_caches_implicitly)"
+        "messages.tool_calls.cache_control->not_forwarded(provider_decides_caching)"
         in public.ignored_parameters
     )
     anthropic_public, _provider = route_generation_parameter_requests(
@@ -3048,7 +3048,7 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     # rungs.
     assert set(mixed_public.ignored_parameters) == {
         "inference_geo",
-        "tools.cache_control->not_forwarded(provider_caches_implicitly)",
+        "tools.cache_control->not_forwarded(provider_decides_caching)",
         "tools.eager_input_streaming",
         "tools.defer_loading",
         "tools.allowed_callers",
@@ -3294,7 +3294,7 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     # 14,976 cached tokens billed at the cached rate beside this disclosure),
     # so the wording says what actually happens to the marker.
     assert (
-        "messages.content.cache_control->not_forwarded(provider_caches_implicitly)"
+        "messages.content.cache_control->not_forwarded(provider_decides_caching)"
         in foreign_public.ignored_parameters
     )
 

@@ -399,10 +399,11 @@ conversation breakpoints on every request, and flattening them once billed whole
 uncached at ~10x. Responses report both cache legs back out of the folded ledger total, so
 callers see `cache_creation_input_tokens` on the writing turn and `cache_read_input_tokens` on
 later turns. Routes with no Anthropic rung have no field for the markers and disclose them as
-`<path>.cache_control->not_forwarded(provider_caches_implicitly)`: the wording never says
-"ignored", because the OpenAI-family provider still caches the prefix on its own and the ledger
-bills those reads at the cached rate — Harbor saw 14,976 cached tokens billed beside an
-"ignored" marker on 2026-09-11), carries the provider-native tool annotations (`strict`,
+`<path>.cache_control->not_forwarded(provider_decides_caching)`: the wording never says
+"ignored", because caching is then the provider's own decision — OpenAI-family providers cache
+the prefix implicitly and the ledger bills those reads at the cached rate (Harbor saw 14,976
+cached tokens billed beside an "ignored" marker on 2026-09-11), while a generic endpoint may not
+cache at all), carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
 disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
