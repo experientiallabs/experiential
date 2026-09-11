@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from exp.common.judging import HumanScoreReview, JudgeCalibration, JudgeCalibrationService
+from exp.common.judging import HumanScoreReview, JudgeCalibration
 from exp.common.models import ModelCatalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.router.judging.artifacts import (
     coordinate_manual_judge_calibration,
-    find_provisional_calibration,
     require_review_state,
     write_production_rollout,
     write_review_state,
@@ -17,9 +16,10 @@ from exp.optimize.router.judging.artifacts import (
 from exp.optimize.router.judging.contracts import ManualJudgeError
 from exp.optimize.router.judging.service import (
     ManualJudgeCalibrationPlan,
-    _read_setup,
-    _write_lineage_split,
+    find_or_bootstrap_provisional_calibration,
+    write_lineage_split,
 )
+from exp.optimize.router.judging.setup_store import read_setup_artifact
 from exp.runtime.models.registry import RuntimeModelCatalog
 
 
@@ -52,7 +52,7 @@ def bootstrap_provisional_judge(
         raise ManualJudgeError(
             "completed judge calibration cannot be replaced by provisional state"
         )
-    setup = _read_setup(store, state.setup)
+    setup = read_setup_artifact(store, state.setup)
     if setup != plan.setup:
         raise ManualJudgeError("provisional judge plan no longer matches finalized setup")
     try:
@@ -73,31 +73,15 @@ def bootstrap_provisional_judge(
         )
         for task, trace in zip(plan.tasks, plan.traces, strict=True)
     )
-    split = _write_lineage_split(
+    split = write_lineage_split(store, setup, plan, rollout_inputs, created_at, code_revision)
+    provisional = find_or_bootstrap_provisional_calibration(
         store,
         setup,
-        plan,
-        rollout_inputs,
-        created_at,
-        code_revision,
+        split_id=split.split_id,
+        label_review=HumanScoreReview.open(store),
+        created_at=created_at,
+        code_revision=code_revision,
     )
-    provisional = find_provisional_calibration(store, setup, split.split_id)
-    if provisional is None:
-        empty_labels = HumanScoreReview.open(store).finalize(
-            rubric_id=setup.rubric.artifact_id,
-            code_revision=code_revision,
-            created_at=created_at,
-        )
-        provisional = JudgeCalibrationService().bootstrap_provisional(
-            store,
-            rubric_id=setup.rubric.artifact_id,
-            label_set_id=empty_labels.label_set_id,
-            router_lineage_split_id=split.split_id,
-            judge_model=setup.judge_model,
-            judge_prompt=setup.prompt_template.prompt,
-            created_at=created_at,
-            code_revision=code_revision,
-        )
     provisional_input = artifact_input(store.artifacts.read(provisional.calibration_id).manifest)
     if state.provisional_calibration not in (None, provisional_input):
         raise ManualJudgeError("selected provisional judge calibration changed")

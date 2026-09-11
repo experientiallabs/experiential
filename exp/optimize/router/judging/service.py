@@ -10,6 +10,7 @@ from exp.common.core.artifacts import ArtifactInput, stable_id
 from exp.common.judging import (
     HumanLabelSet,
     HumanScoreReview,
+    JudgeCalibration,
     JudgeCalibrationService,
     JudgeScoreObservation,
     RouterLineageAssignment,
@@ -563,25 +564,16 @@ def calibrate_manual_judge(
         )
         for task, reference in zip(plan.tasks, plan.reference_traces, strict=True)
     )
-    split = _write_lineage_split(store, setup, plan, rollout_inputs, created_at, code_revision)
+    split = write_lineage_split(store, setup, plan, rollout_inputs, created_at, code_revision)
     label_review = HumanScoreReview.open(store)
-    provisional = find_provisional_calibration(store, setup, split.split_id)
-    if provisional is None:
-        empty_labels = label_review.finalize(
-            rubric_id=setup.rubric.artifact_id,
-            code_revision=code_revision,
-            created_at=created_at,
-        )
-        provisional = JudgeCalibrationService().bootstrap_provisional(
-            store,
-            rubric_id=setup.rubric.artifact_id,
-            label_set_id=empty_labels.label_set_id,
-            router_lineage_split_id=split.split_id,
-            judge_model=setup.judge_model,
-            judge_prompt=setup.prompt_template.prompt,
-            created_at=created_at,
-            code_revision=code_revision,
-        )
+    provisional = find_or_bootstrap_provisional_calibration(
+        store,
+        setup,
+        split_id=split.split_id,
+        label_review=label_review,
+        created_at=created_at,
+        code_revision=code_revision,
+    )
     provisional_input = artifact_input(store.artifacts.read(provisional.calibration_id).manifest)
     rubric, rubric_input = read_artifact_json(
         store,
@@ -794,7 +786,49 @@ def _validate_labels(
         raise ManualJudgeError("judge calibration label set is incomplete: " + "; ".join(details))
 
 
-def _write_lineage_split(
+def find_or_bootstrap_provisional_calibration(
+    store: ProjectStore,
+    setup: ManualJudgeSetupArtifact,
+    *,
+    split_id: str,
+    label_review: HumanScoreReview,
+    created_at: datetime,
+    code_revision: str,
+) -> JudgeCalibration:
+    """Return the split's provisional calibration, bootstrapping an empty-label one if absent.
+
+    Args:
+        store: Project-local immutable artifact store.
+        setup: Finalized setup binding the rubric, judge model, and prompt template.
+        split_id: Persisted lineage split the calibration is bound to.
+        label_review: Open human score review used to finalize an empty label set.
+        created_at: Artifact completion time.
+        code_revision: Exact producer revision.
+
+    Returns:
+        The existing or newly bootstrapped provisional judge calibration.
+    """
+    provisional = find_provisional_calibration(store, setup, split_id)
+    if provisional is not None:
+        return provisional
+    empty_labels = label_review.finalize(
+        rubric_id=setup.rubric.artifact_id,
+        code_revision=code_revision,
+        created_at=created_at,
+    )
+    return JudgeCalibrationService().bootstrap_provisional(
+        store,
+        rubric_id=setup.rubric.artifact_id,
+        label_set_id=empty_labels.label_set_id,
+        router_lineage_split_id=split_id,
+        judge_model=setup.judge_model,
+        judge_prompt=setup.prompt_template.prompt,
+        created_at=created_at,
+        code_revision=code_revision,
+    )
+
+
+def write_lineage_split(
     store: ProjectStore,
     setup: ManualJudgeSetupArtifact,
     plan: ManualJudgeCalibrationPlan,

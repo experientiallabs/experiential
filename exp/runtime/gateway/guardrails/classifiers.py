@@ -252,7 +252,6 @@ class BoundedSyncClassifier:
         if max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
         self._inner = inner
-        self._max_workers = max_workers
         self._slots = threading.BoundedSemaphore(max_workers)
         self._admitted = 0
         self._admitted_lock = threading.Lock()

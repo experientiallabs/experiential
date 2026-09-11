@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
@@ -87,8 +86,6 @@ from exp.runtime.models.providers.server_tools import (
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
-_logger = logging.getLogger(__name__)
-
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
 
 TOOL_ERROR_FOLD_DISCLOSURE = "messages.content.is_error->content"
@@ -108,9 +105,6 @@ The provider rejects lower values by name ("Expected a value >= 16"), while
 the Anthropic surface legally carries ``max_tokens`` down to 1, so
 Messages-surface requests below the floor are raised to it with disclosure.
 """
-
-GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
-"""Version of the route admission and provider wire-translation contract."""
 
 _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
     {"anthropic_messages", "gemini_generate_content", "bedrock_converse_stream"}
