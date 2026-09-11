@@ -76,17 +76,52 @@ fn messages_api_key(headers: &HeaderMap) -> Result<String, PublicError> {
     })
 }
 
-/// Refuse token counting in the caller's own envelope. Anthropic clients
-/// probe this endpoint; the gateway has no tokenizer authority to answer
-/// truthfully, so it refuses explicitly in Anthropic shape and clients fall
-/// back to their local estimate.
-pub(crate) async fn messages_count_tokens() -> Response {
-    messages_error_response(&PublicError::new(
-        404,
-        "route_not_served",
-        "count_tokens is not served by this gateway.",
-        "invalid_request_error",
-    ))
+/// `POST /v1/messages/count_tokens`: the gateway's own count of the prompt in
+/// Anthropic's `{"input_tokens": N}` shape.
+///
+/// Authenticated and granted exactly like `/v1/messages` (the control plane's
+/// `count_tokens` callback decodes the body with the shared Messages decoder
+/// and checks the alias grant), but nothing is accepted, reserved, or
+/// charged. The gateway has no tokenizer authority for any rung, so the body
+/// discloses the figure as an estimate through the shared
+/// `x-experiential-ignored-parameters` field.
+pub(crate) async fn messages_count_tokens(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Response {
+    state.handled_requests.fetch_add(1, Ordering::Relaxed);
+    let (parts, raw_body) = request.into_parts();
+    let headers = parts.headers;
+    let body = match read_body(raw_body).await {
+        Ok(body) => body,
+        Err(error) => return messages_error_response(&error),
+    };
+    let raw_key = match messages_api_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return messages_error_response(&error),
+    };
+    let authenticate = compact_json(&json!({"raw_key": raw_key}));
+    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+        return messages_error_response(&error);
+    }
+    let body_text = match String::from_utf8(body.to_vec()) {
+        Ok(text) => text,
+        Err(_) => return messages_error_response(&PublicError::invalid_json()),
+    };
+    let anthropic_beta = latin1_header_list(&headers, "anthropic-beta");
+    let argument = compact_json(&json!({
+        "raw_key": raw_key,
+        "body": body_text,
+        "surface": "messages",
+        "anthropic_beta": anthropic_beta,
+    }));
+    match state.bridge.call("count_tokens", argument).await {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
+            Err(_) => messages_error_response(&PublicError::internal()),
+        },
+        Err(error) => messages_error_response(&error),
+    }
 }
 
 pub(crate) async fn messages(
@@ -400,6 +435,7 @@ fn encode_messages_sse(
         admission.ignored_parameters.clone(),
     );
     encoder.set_reasoning_output_exposed(reasoning_output_exposed);
+    encoder.set_pre_dispatch_input_estimate(admission.input_token_estimate);
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string());
     }
@@ -563,6 +599,7 @@ async fn stream_messages(
         // start frame, tracked pre-commit; put them on the caller's
         // `message_start` instead of the zero placeholder.
         encoder.set_initial_usage(usage.clone());
+        encoder.set_pre_dispatch_input_estimate(admission.input_token_estimate);
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {

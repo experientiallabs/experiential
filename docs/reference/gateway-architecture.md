@@ -16,8 +16,13 @@ It serves:
   request-level failures, and a `generate: false` prewarm answered without provider work; the
   bearer key is authenticated before the upgrade is accepted, and a GET without a well-formed
   upgrade answers 426, the status the Codex client maps to its HTTP fallback)
-- `POST /v1/messages` (the Anthropic Messages API; `POST /v1/messages/count_tokens` answers an
-  explicit Anthropic-shaped refusal because the gateway has no tokenizer authority)
+- `POST /v1/messages` (the Anthropic Messages API) and `POST /v1/messages/count_tokens`, which
+  answers Anthropic's `{"input_tokens": N}` from the gateway's own reservation tokenizer (the
+  credit reservation's estimator without its headroom): authenticated and granted exactly like
+  `/v1/messages`, no ledger row, no charge. The gateway has no tokenizer authority for any rung
+  (the Anthropic provider client does not forward `count_tokens`), so every answer is an
+  estimate and the body says so through the shared `x-experiential-ignored-parameters`
+  disclosure (`input_tokens->estimated(gateway_tokenizer)`).
 - `POST /v1/embeddings` (the OpenAI Embeddings API: message-less and never streamed; served
   only by aliases whose catalog capabilities declare `supports_embeddings` on an OpenAI-wire
   connection, billed on the provider's reported `prompt_tokens` with no output leg, and
@@ -677,13 +682,20 @@ The thinking vocabulary names the outcome, never a bare field: `thinking->reason
 `thinking->dropped(unsupported_by_route)` (no rung can reason at any depth). A caller reading a
 bare `thinking` as "my depth was stripped" is the misreading this vocabulary exists to prevent.
 
-On the Messages stream, `message_start.message.usage` carries what the upstream already reported
-before content — an Anthropic upstream's own start-frame input and cache meters, mirrored — and
-`message_delta.usage` carries the final meters (input, output, `cache_read_input_tokens`,
-`cache_creation_input_tokens`, plus the platform's cost extensions). An OpenAI-wire upstream
-reports nothing before its final chunk, so its `message_start` keeps the zero placeholder and the
-final meters ride `message_delta`; the official Anthropic SDK accumulators (Python and TypeScript)
-copy every usage field present on `message_delta`, so their final message shows the true counts.
+On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and
+`message_delta.usage` is the authoritative one. The start frame carries what the upstream already
+reported before content — an Anthropic upstream's own start-frame input and cache meters,
+mirrored — and otherwise the control plane's pre-dispatch count of the prompt (the reservation
+estimator without its headroom, carried on the admission as `input_token_estimate`) in
+Anthropic's documented start shape, `{"input_tokens": N, "output_tokens": 1}`. An OpenAI-wire
+upstream reports nothing before its final chunk, so without the estimate its `message_start`
+showed the zero placeholder that clients reading input from the start frame alone (Claude Code)
+display as 0 input tokens. `message_delta.usage` carries the provider's final meters (input,
+output, `cache_read_input_tokens`, `cache_creation_input_tokens`, plus the platform's cost
+extensions); the official Anthropic SDK accumulators (Python and TypeScript) copy every usage
+field present on `message_delta`, so their final message shows the true counts. The estimate is
+display-only: the encoder keeps it apart from the usage it settles from, so it never reaches
+`message_delta` or the ledger, which bill the provider's report.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
 provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
 caller hits that 400.

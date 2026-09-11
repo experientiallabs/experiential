@@ -130,6 +130,24 @@ def worst_case_input_tokens(request: ServingRequest) -> int:
     planning constants, and decoded-length proxies for opaque carriers, all
     scaled by :data:`INPUT_TOKEN_HEADROOM_PERCENT`.
     """
+    return _prompt_counter(request).total()
+
+
+def counted_input_tokens(request: ServingRequest) -> int:
+    """The counted prompt for one request, before any headroom.
+
+    The same walk as :func:`worst_case_input_tokens` without the reservation
+    scaling: the figure a caller is shown as its input count (the Messages
+    ``message_start`` placeholder for an OpenAI-wire upstream, the
+    ``count_tokens`` answer). It is the gateway's own tokenizer estimate,
+    never a provider report, and it never reaches the ledger: the reservation
+    keeps its headroom and settlement keeps the provider's meters.
+    """
+    return _prompt_counter(request).counted()
+
+
+def _prompt_counter(request: ServingRequest) -> _PromptCounter:
+    """Walk one request's prompt into a counter, once."""
     counter = _PromptCounter()
     match request:
         case EmbeddingsRequest():
@@ -141,7 +159,7 @@ def worst_case_input_tokens(request: ServingRequest) -> int:
             _count_completion_prompt(request, counter)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)
-    return counter.total()
+    return counter
 
 
 def _count_completion_prompt(request: GatewayRequest, counter: _PromptCounter) -> None:
@@ -277,13 +295,16 @@ class _PromptCounter:
             return [self._scrub(item) for item in value]
         return value
 
-    def total(self) -> int:
-        """Tokenize the gathered prompt once and apply the headroom."""
+    def counted(self) -> int:
+        """Tokenize the gathered prompt once, without headroom."""
         counted = 0
         if self._chunks:
             counted = len(reservation_encoder().encode_ordinary("\n".join(self._chunks)))
-        counted += self._fixed + self._opaque_bytes // OPAQUE_BYTES_PER_TOKEN
-        return (counted * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
+        return counted + self._fixed + self._opaque_bytes // OPAQUE_BYTES_PER_TOKEN
+
+    def total(self) -> int:
+        """The counted prompt scaled by the reservation headroom."""
+        return (self.counted() * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
 
 
 def worst_case_output_tokens(

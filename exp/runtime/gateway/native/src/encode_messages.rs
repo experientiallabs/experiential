@@ -214,6 +214,10 @@ pub struct MessagesSseEncoder {
     saw_tool_use: bool,
     refusal_seen: bool,
     usage: Option<Usage>,
+    /// Pre-dispatch prompt estimate shown on `message_start` when no upstream
+    /// start usage is known. Kept apart from `usage` so it can never reach
+    /// `message_delta`, whose meters are the provider's own report.
+    pre_dispatch_input_estimate: Option<u64>,
     ignored_parameters: Vec<String>,
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
@@ -253,6 +257,7 @@ impl MessagesSseEncoder {
             saw_tool_use: false,
             refusal_seen: false,
             usage: None,
+            pre_dispatch_input_estimate: None,
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
             reasoning_output_exposed: false,
@@ -269,6 +274,19 @@ impl MessagesSseEncoder {
                 self.usage = Some(usage);
             }
         }
+    }
+
+    /// Seed `message_start` with the control plane's pre-dispatch prompt
+    /// count for an upstream that reports nothing before its final chunk.
+    ///
+    /// Anthropic's documented start frame carries the prompt's input count
+    /// with `output_tokens: 1`, and clients that read input from
+    /// `message_start` alone (Claude Code) otherwise display the zero
+    /// placeholder. The estimate is display-only: an upstream's own start
+    /// usage (`set_initial_usage`) outranks it whichever is set first, and
+    /// `message_delta` keeps the provider's report.
+    pub fn set_pre_dispatch_input_estimate(&mut self, estimate: Option<u64>) {
+        self.pre_dispatch_input_estimate = estimate;
     }
 
     /// Attach the authenticated carrier before the terminal is encoded.
@@ -315,7 +333,7 @@ impl MessagesSseEncoder {
             "content": [],
             "stop_reason": Value::Null,
             "stop_sequence": Value::Null,
-            "usage": messages_usage(self.usage.as_ref()),
+            "usage": self.start_usage(),
         });
         // Same body-level disclosure as the Chat and Responses encoders: the
         // Anthropic envelope has no field for it, and the official SDK
@@ -329,6 +347,17 @@ impl MessagesSseEncoder {
             ),
             event_frame("ping", &json!({"type": "ping"})),
         ])
+    }
+
+    /// The `message_start` meters: the upstream's own start usage when known,
+    /// else the pre-dispatch estimate in Anthropic's start-frame shape, else
+    /// the zero placeholder.
+    fn start_usage(&self) -> Value {
+        match (self.usage.as_ref(), self.pre_dispatch_input_estimate) {
+            (Some(usage), _) => messages_usage(Some(usage)),
+            (None, Some(estimate)) => json!({"input_tokens": estimate, "output_tokens": 1}),
+            (None, None) => messages_usage(None),
+        }
     }
 
     pub fn saw_terminal(&self) -> bool {

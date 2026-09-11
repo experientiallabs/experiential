@@ -130,3 +130,57 @@ fn a_reply_with_reasoning_text_and_a_tool_call_renders_every_part_on_the_aggrega
         .expect("tool block");
     assert_eq!(tool["name"], json!("lookup"));
 }
+
+#[test]
+fn start_frame_carries_the_pre_dispatch_estimate_when_the_upstream_reports_nothing() {
+    // An OpenAI-wire upstream reports usage only in its final chunk, so the
+    // start frame would otherwise carry the zero placeholder that Claude Code
+    // reads as "0 input tokens". The admission's pre-dispatch prompt estimate
+    // fills it with Anthropic's `output_tokens: 1` placeholder; the estimate
+    // is display-only (message_delta and the ledger keep the provider's
+    // report).
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.set_initial_usage(None);
+    encoder.set_pre_dispatch_input_estimate(Some(1234));
+    let frames = encoder.start().expect("starts");
+    let start: Value = serde_json::from_str(
+        frames[0]
+            .lines()
+            .nth(1)
+            .and_then(|line| line.strip_prefix("data: "))
+            .expect("data line"),
+    )
+    .expect("json");
+    assert_eq!(
+        start["message"]["usage"],
+        json!({"input_tokens": 1234, "output_tokens": 1})
+    );
+}
+
+#[test]
+fn upstream_start_usage_outranks_the_pre_dispatch_estimate() {
+    // An Anthropic upstream's own start meters are the truth; the estimate
+    // never overrides a reported count, whichever order the route sets them.
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.set_pre_dispatch_input_estimate(Some(1234));
+    encoder.set_initial_usage(Some(Usage {
+        input_tokens: Some(30),
+        output_tokens: Some(1),
+        cached_input_tokens: Some(10),
+        cache_creation_input_tokens: None,
+        reasoning_tokens: None,
+    }));
+    let frames = encoder.start().expect("starts");
+    let start: Value = serde_json::from_str(
+        frames[0]
+            .lines()
+            .nth(1)
+            .and_then(|line| line.strip_prefix("data: "))
+            .expect("data line"),
+    )
+    .expect("json");
+    assert_eq!(
+        start["message"]["usage"],
+        json!({"input_tokens": 20, "output_tokens": 1, "cache_read_input_tokens": 10})
+    );
+}

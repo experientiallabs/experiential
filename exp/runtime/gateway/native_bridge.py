@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
+from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -79,6 +80,7 @@ from exp.runtime.gateway.native_continuation import (
 from exp.runtime.gateway.native_continuation import (
     select_bound_continuation_route as _select_bound_continuation_route,
 )
+from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_dispatch import dispatch_signature_headers
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
@@ -169,7 +171,11 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 class NativeControlPlane(
-    NativeBatchRelayMixin, NativeEmbeddingsMixin, NativeImagesMixin, NativeObservabilityMixin
+    NativeBatchRelayMixin,
+    NativeCountTokensMixin,
+    NativeEmbeddingsMixin,
+    NativeImagesMixin,
+    NativeObservabilityMixin,
 ):
     """Authority and accounting callbacks for the native data plane.
 
@@ -673,6 +679,11 @@ class NativeControlPlane(
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": bool(policy is not None and policy.output_checks),
         }
+        if request.surface == GatewayApiSurface.MESSAGES:
+            # Display-only: what `message_start` shows as input when the
+            # upstream reports nothing before its final chunk. The ledger
+            # never reads it; settlement keeps the provider's meters.
+            response["input_token_estimate"] = counted_input_tokens(public_request)
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
