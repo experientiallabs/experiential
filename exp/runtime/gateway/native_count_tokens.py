@@ -25,7 +25,7 @@ from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents
-from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
+from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_count_tokens_body
 from exp.runtime.gateway.native_settlement import optional_text
 
 COUNT_TOKENS_ESTIMATE_DISCLOSURE = "input_tokens->estimated(gateway_tokenizer)"
@@ -42,9 +42,10 @@ class NativeCountTokensMixin:
 
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request body
-                text), optional ``surface`` (defaulting to ``"messages"``),
-                and the optional ``anthropic_beta`` header list, decoded with
-                the same shared decoder ``/v1/messages`` admits through.
+                text), and the optional ``anthropic_beta`` header list. The
+                body is Anthropic's count request (prompt-side fields, no
+                ``max_tokens``), decoded by the count entrypoint of the shared
+                Messages decoder ``/v1/messages`` admits through.
 
         Returns:
             JSON object with ``input_tokens`` (the counted prompt before any
@@ -58,9 +59,8 @@ class NativeCountTokensMixin:
         """
         data = json.loads(argument)
         try:
-            decoded = decode_native_body(
+            decoded = decode_native_count_tokens_body(
                 data["body"],
-                surface=str(data.get("surface", "messages")),
                 anthropic_beta=optional_text(data.get("anthropic_beta")),
             )
         except NativeDecodeError as exc:

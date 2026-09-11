@@ -1047,10 +1047,12 @@ def test_count_tokens_answers_anthropic_shape_from_the_gateway_estimate(
         return int(report["totals"]["requests"])
 
     before = counted_requests()
+    # Anthropic's count body carries no max_tokens.
+    count_body = {k: v for k, v in _messages_body("fast-token").items() if k != "max_tokens"}
     counted = httpx.post(
         f"{engine.base}/v1/messages/count_tokens",
         headers={"x-api-key": engine.raw_key},
-        json=_messages_body("fast-token"),
+        json=count_body,
         timeout=10.0,
     )
     assert counted.status_code == 200, counted.text
@@ -1065,7 +1067,7 @@ def test_count_tokens_answers_anthropic_shape_from_the_gateway_estimate(
     ungranted = httpx.post(
         f"{engine.base}/v1/messages/count_tokens",
         headers={"x-api-key": engine.raw_key},
-        json={**_messages_body("fast-token"), "model": "not-granted"},
+        json={**count_body, "model": "not-granted"},
         timeout=10.0,
     )
     assert ungranted.status_code == 404

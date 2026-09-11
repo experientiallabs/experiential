@@ -5675,10 +5675,12 @@ def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> N
     an attempt: the usage report stays empty.
     """
     control, raw_key = _control_plane(tmp_path)
-    body = _messages_body([{"role": "user", "content": "Hello, world!"}])
-    counted = json.loads(
-        control.count_tokens(json.dumps({"raw_key": raw_key, "body": body, "surface": "messages"}))
+    # Anthropic's count body carries no max_tokens (Claude Code sends
+    # model + messages + system + tools).
+    body = json.dumps(
+        {"model": "coding", "messages": [{"role": "user", "content": "Hello, world!"}]}
     )
+    counted = json.loads(control.count_tokens(json.dumps({"raw_key": raw_key, "body": body})))
     assert isinstance(counted["input_tokens"], int)
     assert counted["input_tokens"] > 0
     assert counted["x-experiential-ignored-parameters"] == [
@@ -5693,13 +5695,8 @@ def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> N
                 {
                     "raw_key": raw_key,
                     "body": json.dumps(
-                        {
-                            "model": "not-granted",
-                            "max_tokens": 8,
-                            "messages": [{"role": "user", "content": "x"}],
-                        }
+                        {"model": "not-granted", "messages": [{"role": "user", "content": "x"}]}
                     ),
-                    "surface": "messages",
                 }
             )
         )
@@ -5707,8 +5704,6 @@ def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> N
 
     with pytest.raises(NativeBridgeError) as malformed:
         control.count_tokens(
-            json.dumps(
-                {"raw_key": raw_key, "body": json.dumps({"model": "coding"}), "surface": "messages"}
-            )
+            json.dumps({"raw_key": raw_key, "body": json.dumps({"model": "coding"})})
         )
     assert json.loads(malformed.value.public_error_json)["status_code"] == 400

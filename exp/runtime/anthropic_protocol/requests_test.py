@@ -9,7 +9,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
-from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
 from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
     GatewayApiSurface,
@@ -343,6 +343,34 @@ def test_missing_max_tokens_is_rejected_with_its_field() -> None:
     with pytest.raises(OpenAIProtocolError) as excinfo:
         decode_messages(payload)
     assert excinfo.value.detail.param == "max_tokens"
+
+
+def test_count_tokens_body_needs_no_max_tokens() -> None:
+    """Anthropic's count request carries only prompt-side fields.
+
+    The count decoder is the Messages decoder with the generation budget
+    optional: a body of ``model`` + ``messages`` (plus system and tools)
+    decodes to a canonical request with no output ceiling, a body that does
+    carry ``max_tokens`` keeps it, and everything else is validated exactly
+    as the generation endpoint validates it.
+    """
+    payload = _body(
+        system="be terse",
+        tools=[{"name": "search", "description": "look up", "input_schema": {"type": "object"}}],
+    )
+    del payload["max_tokens"]
+    decoded = decode_messages_count_tokens(payload)
+    assert decoded.alias == "coding"
+    assert decoded.request.maximum_output_tokens is None
+    assert decoded.request.maximum_output_tokens_parameter is None
+    assert len(decoded.request.tools) == 1
+
+    budgeted = decode_messages_count_tokens(_body())
+    assert budgeted.request.maximum_output_tokens == 128
+
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages_count_tokens({"model": "coding"})
+    assert excinfo.value.detail.param == "messages"
 
 
 def test_image_blocks_are_retained_in_caller_order() -> None:

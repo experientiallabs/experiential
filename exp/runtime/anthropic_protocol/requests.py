@@ -317,6 +317,18 @@ class _MessagesRequest(AnthropicWireModel):
     region set is an evolving provider surface."""
 
 
+class _CountTokensRequest(_MessagesRequest):
+    """The ``count_tokens`` body: a Messages body with no generation budget.
+
+    Anthropic's count endpoint takes the prompt-side fields (``model``,
+    ``messages``, ``system``, ``tools``, ``tool_choice``, ``thinking``) and
+    no ``max_tokens``; a body that carries one is still counted, since the
+    budget changes nothing about the prompt.
+    """
+
+    max_tokens: int | None = Field(default=None, gt=0)
+
+
 def decode_messages(
     payload: JsonObject,
     *,
@@ -340,8 +352,43 @@ def decode_messages(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
             The HTTP layer renders it in the Anthropic error envelope.
     """
+    return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+
+
+def decode_messages_count_tokens(
+    payload: JsonObject,
+    *,
+    anthropic_beta: str | None = None,
+) -> DecodedGatewayRequest:
+    """Decode one Anthropic ``count_tokens`` body for prompt counting.
+
+    Identical to :func:`decode_messages` except that ``max_tokens`` is
+    optional: Anthropic's count request carries only prompt-side fields, so
+    the canonical request has no output budget (``maximum_output_tokens`` is
+    ``None``) and is never dispatched, only counted.
+
+    Args:
+        payload: Parsed JSON request body.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+
+    Returns:
+        Public alias and the canonical request to count.
+
+    Raises:
+        OpenAIProtocolError: The body is invalid, unknown, or unsupported.
+    """
+    return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+
+
+def _decode(
+    payload: JsonObject,
+    wire: type[_MessagesRequest],
+    *,
+    anthropic_beta: str | None,
+) -> DecodedGatewayRequest:
+    """Validate ``payload`` against ``wire`` and build the canonical request."""
     _validate_manifest(payload)
-    request = _validate_wire(payload)
+    request = _validate_wire(payload, wire)
     _require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
@@ -398,7 +445,9 @@ def decode_messages(
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
-            maximum_output_tokens_parameter="max_tokens",
+            maximum_output_tokens_parameter="max_tokens"
+            if request.max_tokens is not None
+            else None,
             stop=_stop_sequences(request.stop_sequences),
             temperature=request.temperature,
             top_p=request.top_p,
@@ -534,10 +583,10 @@ def _validate_manifest(payload: JsonObject) -> None:
             raise unsupported_field(field)
 
 
-def _validate_wire(payload: JsonObject) -> _MessagesRequest:
+def _validate_wire(payload: JsonObject, wire: type[_MessagesRequest]) -> _MessagesRequest:
     """Validate the strict wire model with a field-specific public error."""
     try:
-        return _MessagesRequest.model_validate(payload)
+        return wire.model_validate(payload)
     except ValidationError as exc:
         hint = _rejected_block_hint(payload)
         if hint is not None:

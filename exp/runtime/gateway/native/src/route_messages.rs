@@ -112,7 +112,6 @@ pub(crate) async fn messages_count_tokens(
     let argument = compact_json(&json!({
         "raw_key": raw_key,
         "body": body_text,
-        "surface": "messages",
         "anthropic_beta": anthropic_beta,
     }));
     match state.bridge.call("count_tokens", argument).await {
