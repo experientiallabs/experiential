@@ -20,6 +20,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.anthropic_protocol.media_blocks import AnthropicWireModel
 from exp.runtime.models.providers.reasoning_compat import (
+    MINIMUM_THINKING_BUDGET_TOKENS,
     REASONING_EFFORTS,
     thinking_config_reasoning_effort,
 )
@@ -46,6 +47,8 @@ carry no reasoning on this surface."""
 
 # OpenRouter documents ``enabled: true`` as its default depth (medium).
 _REASONING_ENABLED_DEFAULT_EFFORT: ReasoningEffort = "medium"
+# The one "no reasoning" form every route honors (see resolve_reasoning_channels).
+_THINKING_DISABLED: JsonObject = {"type": "disabled"}
 
 
 class ReasoningConfig(AnthropicWireModel):
@@ -57,7 +60,9 @@ class ReasoningConfig(AnthropicWireModel):
     """
 
     effort: ReasoningEffort | None = None
-    max_tokens: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(default=None, ge=MINIMUM_THINKING_BUDGET_TOKENS)
+    """A thinking budget; Anthropic's floor applies (1024), so a smaller budget
+    is a named 400 here instead of a provider rejection downstream."""
     exclude: bool | None = None
     enabled: bool | None = None
 
@@ -116,9 +121,16 @@ def resolve_reasoning_channels(
 
     * ``effort`` is the canonical tier; ``max_tokens`` is a thinking budget
       (forwarded as a budgeted ``enabled`` config on Anthropic rungs, mapped to
-      the nearest tier elsewhere); ``enabled: false`` is ``none`` and wins over
-      any depth sent beside it; a bare or ``enabled: true`` object is
+      the nearest tier elsewhere); a bare or ``enabled: true`` object is
       OpenRouter's default depth.
+    * ``enabled: false`` (which wins over any depth sent beside it) and
+      ``effort: none`` both mean "no reasoning" and become the one off form
+      every route already honors, ``thinking: {type: disabled}``: Anthropic
+      rungs forward it (an adaptive-only model drops it with disclosure), and
+      effort ladders translate it to their ``none`` without ever snapping to an
+      active tier. Anthropic's own effort ladder has no ``none``, so the effort
+      channel is left empty rather than carrying a tier no Anthropic rung
+      accepts.
     * A ``thinking`` config beside it is dropped with disclosure, and an
       ``output_config.effort`` that disagrees is dropped with disclosure (an
       agreeing one stays, so the caller's forwarded object is untouched).
@@ -144,11 +156,12 @@ def resolve_reasoning_channels(
             disclosures=(),
         )
     disclosures: list[str] = []
-    if reasoning.enabled is False:
-        # An explicit off switch wins over any depth beside it (effort or a
-        # budget): the caller asked for no reasoning, so none is configured.
-        effort: ReasoningEffort = "none"
-        resolved_thinking: JsonObject | None = None
+    effort: ReasoningEffort | None
+    if reasoning.enabled is False or reasoning.effort == "none":
+        # The off switch wins over any depth beside it: the caller asked for
+        # no reasoning, so the request carries the disabled thinking form.
+        effort = None
+        resolved_thinking: JsonObject | None = _THINKING_DISABLED
     elif reasoning.max_tokens is not None:
         if reasoning.max_tokens >= max_tokens:
             raise invalid_field(
@@ -174,7 +187,7 @@ def resolve_reasoning_channels(
         disclosures.append(REASONING_EXCLUDE_DISCLOSURE)
     return ReasoningChannels(
         effort=effort,
-        effort_parameter="reasoning.effort",
+        effort_parameter="reasoning.effort" if effort is not None else None,
         thinking_config=resolved_thinking,
         output_config=output_config,
         disclosures=tuple(disclosures),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from exp.runtime.anthropic_protocol.reasoning_channels import (
     REASONING_EXCLUDE_DISCLOSURE,
@@ -38,29 +39,37 @@ def test_budget_form_becomes_a_budgeted_thinking_config_by_tier() -> None:
     )
     assert channels.thinking_config == {"type": "enabled", "budget_tokens": 4096}
     assert channels.effort == "low"
-    # An explicit off switch beside a budget (or an effort) configures nothing.
-    off = resolve_reasoning_channels(
-        ReasoningConfig(enabled=False, max_tokens=4096),
-        max_tokens=8192,
-        thinking=None,
-        output_config=None,
-    )
-    assert off.effort == "none"
-    assert off.thinking_config is None
-    assert (
-        resolve_reasoning_channels(
-            ReasoningConfig(enabled=False, effort="high"),
-            max_tokens=8192,
-            thinking=None,
-            output_config=None,
-        ).effort
-        == "none"
-    )
+    # A budget under Anthropic's floor is a named 400 here, never a provider reject.
+    with pytest.raises(ValidationError):
+        ReasoningConfig(max_tokens=1023)
     with pytest.raises(OpenAIProtocolError) as oversized:
         resolve_reasoning_channels(
             ReasoningConfig(max_tokens=8192), max_tokens=8192, thinking=None, output_config=None
         )
     assert oversized.value.detail.param == "reasoning.max_tokens"
+
+
+def test_off_forms_become_the_disabled_thinking_config_on_every_route() -> None:
+    """``enabled: false`` (over any depth) and ``effort: none`` are ``thinking: disabled``.
+
+    Anthropic's effort ladder has no ``none``, so the off switch must not ride
+    the effort channel; the disabled thinking form is the one every route
+    already honors (forwarded on Anthropic rungs, translated to ``none`` on
+    effort ladders without snapping to an active tier).
+    """
+    for config in (
+        ReasoningConfig(enabled=False),
+        ReasoningConfig(enabled=False, max_tokens=4096),
+        ReasoningConfig(enabled=False, effort="high"),
+        ReasoningConfig(effort="none"),
+    ):
+        channels = resolve_reasoning_channels(
+            config, max_tokens=8192, thinking={"type": "adaptive"}, output_config=None
+        )
+        assert channels.effort is None
+        assert channels.effort_parameter is None
+        assert channels.thinking_config == {"type": "disabled"}
+        assert channels.disclosures == (REASONING_SUPERSEDES_THINKING_DISCLOSURE,)
 
 
 def test_explicit_effort_supersedes_the_anthropic_channels_with_disclosure() -> None:

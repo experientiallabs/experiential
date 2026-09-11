@@ -1821,7 +1821,9 @@ def test_openrouter_reasoning_effort_rides_the_canonical_effort_channel() -> Non
     # The Anthropic channel alone keeps the surface default for rejections.
     native = decode_messages(_body(output_config={"effort": "low"}))
     assert native.request.reasoning_effort_parameter is None
-    assert decode_messages(_body(reasoning={"effort": "none"})).request.reasoning_effort == "none"
+    off = decode_messages(_body(reasoning={"effort": "none"})).request
+    assert off.reasoning_effort is None
+    assert off.provider_thinking_config == {"type": "disabled"}
     assert decode_messages(_body(reasoning={"effort": "max"})).request.reasoning_effort == "max"
 
 
@@ -1830,7 +1832,8 @@ def test_openrouter_reasoning_enabled_and_budget_forms_translate() -> None:
     enabled = decode_messages(_body(reasoning={"enabled": True}))
     assert enabled.request.reasoning_effort == "medium"
     disabled = decode_messages(_body(reasoning={"enabled": False}))
-    assert disabled.request.reasoning_effort == "none"
+    assert disabled.request.reasoning_effort is None
+    assert disabled.request.provider_thinking_config == {"type": "disabled"}
     # A budget becomes the budgeted thinking config Anthropic rungs forward and
     # non-Anthropic rungs translate by tier (<=4096 low, <=16384 medium, else high).
     budget = decode_messages(_body(max_tokens=64000, reasoning={"max_tokens": 32000}))
@@ -1857,6 +1860,9 @@ def test_openrouter_reasoning_rejects_conflicting_and_unknown_shapes() -> None:
     with pytest.raises(OpenAIProtocolError) as oversized:
         decode_messages(_body(max_tokens=2000, reasoning={"max_tokens": 2000}))
     assert oversized.value.detail.param == "reasoning.max_tokens"
+    with pytest.raises(OpenAIProtocolError) as tiny:
+        decode_messages(_body(max_tokens=2000, reasoning={"max_tokens": 512}))
+    assert tiny.value.detail.param == "reasoning.max_tokens"
 
 
 def test_openrouter_reasoning_wins_over_thinking_and_output_config_with_disclosure() -> None:
