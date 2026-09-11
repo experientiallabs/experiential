@@ -17,7 +17,7 @@ from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
-    ModelCatalog,
+    read_model_catalog_document,
 )
 from exp.common.models.known_models import known_model_metadata
 from exp.optimize.router.activation import load_project_router
@@ -636,7 +636,9 @@ def _activate(
             replace=replace,
             serving_connections=serving_connections,
         )
-        authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
+        authored, _dropped = read_model_catalog_document(
+            authored_snapshot_path(snapshot).read_bytes()
+        )
         catalog_sha256 = normalized.identity_sha256()
         return (
             manager.activate_direct_alias(

@@ -38,6 +38,7 @@ from exp.common.models.model import (
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.common.models.nano_usd_upgrade import upgrade_model_catalog_document
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -790,6 +791,9 @@ class ModelRoles(ContractModel):
         return self
 
 
+MODEL_CATALOG_SCHEMA_VERSION = 3
+"""Authored catalog revision this build writes (3 = integer nano-USD prices)."""
+
 SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION = 10_000
 """Upper bound on an authored catalog version this parser accepts as real.
 
@@ -802,8 +806,13 @@ and fails closed rather than being read as a future contract.
 class ModelCatalog(ContractModel):
     """The local model aliases, connection metadata, and project role assignments."""
 
-    schema_version: int = Field(default=2, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION)
+    schema_version: int = Field(
+        default=MODEL_CATALOG_SCHEMA_VERSION, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
+    )
     """Authored catalog contract revision. Deliberately NOT a ``Literal``.
+
+    Schema 3 prices in integer nano-USD; schema 2 (micro-USD) documents are
+    upgraded at every read boundary by ``upgrade_model_catalog_document``.
 
     Every cross-version hydration parses the authored document first, and a
     changed ``Literal`` value on a known field raises ``literal_error``, which
@@ -936,7 +945,9 @@ def load_model_catalog(path: Path) -> ModelCatalog:
     except tomllib.TOMLDecodeError as exc:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
-        return ModelCatalog.model_validate(_migrate_legacy_model_catalog(raw_catalog))
+        return ModelCatalog.model_validate(
+            upgrade_model_catalog_document(_migrate_legacy_model_catalog(raw_catalog))
+        )
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
 

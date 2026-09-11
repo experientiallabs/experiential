@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -123,28 +124,31 @@ def test_read_pinned_snapshot_same_version_requires_the_exact_digest() -> None:
         read_pinned_normalized_snapshot(catalog.model_dump_json().encode(), "b" * 64)
 
 
-def test_read_pinned_snapshot_refuses_a_micro_usd_schema_document_by_name() -> None:
-    """Schema versions before 4 priced the catalog in micro-USD. A schema-3
-    document read by this nano-USD build would have its price keys dropped as
-    unknown and be served UNPRICED (or, worse, a value coerced across units), so
-    the reader fails closed with a named error for every pre-nano schema, even
-    though those versions are inside the tolerant cross-version range."""
+def test_read_pinned_snapshot_upgrades_schema_3_and_refuses_older_money_units() -> None:
+    """Schema 3 (the previous build's micro-USD snapshot) is UPGRADED at read
+    time by version (see ``nano_usd_upgrade_test`` for the price twin pins);
+    schema 1 and 2 are refused by name; a schema-4 document smuggling a micro
+    key is refused. The refusal is its own error, never a digest mismatch."""
     assert SNAPSHOT_SCHEMA_VERSION == 4
     assert FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION == 4
-    raw = json.loads(_minimal_normalized().model_dump_json())
-    for micro_version in (1, 2, 3):
-        raw["schema_version"] = micro_version
-        with pytest.raises(CatalogSnapshotUnitError, match="micro-USD"):
-            read_pinned_normalized_snapshot(json.dumps(raw).encode(), "b" * 64)
-    # A schema-3 document carrying micro-keyed prices is refused before any
-    # price is read, never coerced.
-    raw["schema_version"] = 3
-    raw["deployments"][0]["gateway"] = {
-        "prices": {"input_micro_usd_per_million_tokens": 1_000_000},
-        "pricing_source": "test",
+    micro: dict[str, Any] = json.loads(_minimal_normalized().model_dump_json())
+    # The previous build wrote every price key under its micro name (nulls too).
+    micro["deployments"][0]["gateway"]["prices"] = {
+        key.replace("_nano_usd_", "_micro_usd_"): value
+        for key, value in micro["deployments"][0]["gateway"]["prices"].items()
     }
-    with pytest.raises(CatalogSnapshotUnitError):
-        read_pinned_normalized_snapshot(json.dumps(raw).encode(), "b" * 64)
+    micro["schema_version"] = 3
+    served = read_pinned_normalized_snapshot(json.dumps(micro).encode(), "b" * 64)
+    assert served.schema_version == 3
+    assert served.deployments[0].gateway.prices == GatewayTokenPrices()
+    for micro_version in (1, 2):
+        micro["schema_version"] = micro_version
+        with pytest.raises(CatalogSnapshotUnitError, match="predates"):
+            read_pinned_normalized_snapshot(json.dumps(micro).encode(), "b" * 64)
+    nano: dict[str, Any] = json.loads(_minimal_normalized().model_dump_json())
+    nano["deployments"][0]["gateway"]["prices"]["input_micro_usd_per_million_tokens"] = 1
+    with pytest.raises(CatalogSnapshotUnitError, match="micro-USD price key"):
+        read_pinned_normalized_snapshot(json.dumps(nano).encode(), "b" * 64)
     assert issubclass(CatalogSnapshotUnitError, ValueError)
     assert not issubclass(CatalogSnapshotUnitError, CatalogSnapshotDigestError)
 

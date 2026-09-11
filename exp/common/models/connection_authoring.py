@@ -8,6 +8,7 @@ from pathlib import Path
 from exp.common.core.artifacts import validate_artifact_id
 from exp.common.core.locks import file_write_lock
 from exp.common.models.catalog import (
+    MODEL_CATALOG_SCHEMA_VERSION,
     ConnectionConfig,
     ModelCatalog,
     ModelRecord,
@@ -81,7 +82,9 @@ def configure_provider_connections(
                 )
             current_connections[selected.name] = proposed
         catalog = ModelCatalog(
-            schema_version=existing.schema_version if existing is not None else 2,
+            schema_version=(
+                existing.schema_version if existing is not None else MODEL_CATALOG_SCHEMA_VERSION
+            ),
             connections=current_connections,
             models=models,
             roles=existing.roles if existing is not None else ModelRoles(),
@@ -174,7 +177,9 @@ def sync_provider_models(
                 )
             current_models[alias] = proposed
         catalog = ModelCatalog(
-            schema_version=existing.schema_version if existing is not None else 2,
+            schema_version=(
+                existing.schema_version if existing is not None else MODEL_CATALOG_SCHEMA_VERSION
+            ),
             connections=current_connections,
             models=current_models,
             gateway_pools=existing.gateway_pools if existing is not None else {},

@@ -22,9 +22,9 @@ from exp.common.models import (
     ModelCatalog,
     NormalizedGatewayCatalog,
     is_foreign_snapshot,
-    load_forward_compatible,
     normalize_gateway_catalog,
-    require_nano_usd_snapshot,
+    read_model_catalog_document,
+    read_normalized_snapshot_document,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -793,14 +793,10 @@ def _load_snapshot(
     authored = snapshot.with_suffix(".models.json")
     try:
         # Forward-compatible read (a NEWER build's unknown fields are dropped, all
-        # else stays strict); a micro-USD (pre-schema-4) snapshot is refused BY NAME.
-        normalized, normalized_dropped = load_forward_compatible(
-            NormalizedGatewayCatalog, snapshot.read_bytes()
-        )
-        authored_catalog, authored_dropped = load_forward_compatible(
-            ModelCatalog, authored.read_bytes()
-        )
-        require_nano_usd_snapshot(normalized)
+        # else strict); the previous build's micro-USD documents are UPGRADED by
+        # version, any other money unit is refused BY NAME.
+        normalized, normalized_dropped = read_normalized_snapshot_document(snapshot.read_bytes())
+        authored_catalog, authored_dropped = read_model_catalog_document(authored.read_bytes())
     except CatalogSnapshotUnitError as exc:
         raise GatewayLifecycleError(f"alias {alias.alias_name!r}: {exc}") from exc
     except (OSError, ValueError) as exc:

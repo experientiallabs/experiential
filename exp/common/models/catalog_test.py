@@ -130,7 +130,8 @@ model = "candidate"
         encoding="utf-8",
     )
     migrated = load_model_catalog(legacy)
-    assert migrated.schema_version == 2
+    # v1 -> v2 (billing source) -> v3 (nano-USD) in one load.
+    assert migrated.schema_version == 3
     assert migrated.models["candidate"].billing_source == BillingSource.CUSTOMER_MANAGED
 
     current = tmp_path / "current.toml"
@@ -147,7 +148,7 @@ def test_legacy_catalog_rejects_current_billing_source_injection(tmp_path: Path)
     path = tmp_path / "injected-v1.toml"
     write_model_catalog(path, _catalog())
     path.write_text(
-        path.read_text(encoding="utf-8").replace("schema_version = 2", "schema_version = 1"),
+        path.read_text(encoding="utf-8").replace("schema_version = 3", "schema_version = 1"),
         encoding="utf-8",
     )
 
@@ -165,7 +166,7 @@ def test_legacy_catalog_rejects_noninteger_schema_one_lookalikes(
     write_model_catalog(path, _catalog())
     path.write_text(
         path.read_text(encoding="utf-8").replace(
-            "schema_version = 2", f"schema_version = {schema_version}"
+            "schema_version = 3", f"schema_version = {schema_version}"
         ),
         encoding="utf-8",
     )
@@ -240,7 +241,7 @@ def test_legacy_catalog_recursively_migrates_sft_base_model_billing(tmp_path: Pa
     current_text = path.read_text(encoding="utf-8")
     legacy_text = "\n".join(
         line for line in current_text.splitlines() if not line.startswith("billing_source =")
-    ).replace("schema_version = 2", "schema_version = 1")
+    ).replace("schema_version = 3", "schema_version = 1")
     path.write_text(legacy_text, encoding="utf-8")
 
     migrated = load_model_catalog(path)
@@ -289,7 +290,7 @@ def test_legacy_catalog_rejects_nested_sft_billing_source_injection(tmp_path: Pa
         ),
     )
     current_text = path.read_text(encoding="utf-8")
-    legacy_text = current_text.replace("schema_version = 2", "schema_version = 1")
+    legacy_text = current_text.replace("schema_version = 3", "schema_version = 1")
     legacy_text = legacy_text.replace('billing_source = "host_managed"\n', "", 1)
     path.write_text(legacy_text, encoding="utf-8")
 
@@ -905,3 +906,43 @@ def test_price_rates_are_bounded_so_a_nano_usd_attempt_always_fits_int8() -> Non
                 {"input_threshold_tokens": 200_000, field: bound + 1}
             )
     assert not any("micro" in name for name in GatewayTokenPrices.model_fields)
+
+
+def test_schema_2_toml_catalog_upgrades_its_micro_usd_prices_on_load(tmp_path: Path) -> None:
+    """A ``models.toml`` authored by the micro-USD build loads with every price
+    renamed and x1000, restamped schema 3, and is written back as schema 3."""
+    path = tmp_path / "models.toml"
+    path.write_text(
+        """
+schema_version = 2
+
+[connections.provider]
+provider = "openai"
+
+[models.candidate]
+connection = "provider"
+model = "candidate"
+billing_source = "customer_managed"
+
+[models.candidate.gateway.prices]
+input_micro_usd_per_million_tokens = 1250000
+output_micro_usd_per_million_tokens = 10000000
+""".strip(),
+        encoding="utf-8",
+    )
+    loaded = load_model_catalog(path)
+    assert loaded.schema_version == 3
+    gateway = loaded.models["candidate"].gateway
+    assert gateway is not None
+    prices = gateway.prices
+    assert prices.input_nano_usd_per_million_tokens == 1_250_000_000
+    assert prices.output_nano_usd_per_million_tokens == 10_000_000_000
+    write_model_catalog(path, loaded)
+    text = path.read_text(encoding="utf-8")
+    assert "schema_version = 3" in text
+    assert "input_nano_usd_per_million_tokens = 1250000000" in text
+    assert "micro" not in text
+    # A schema-3 file still carrying a micro key is refused, never coerced.
+    path.write_text(text.replace("input_nano_usd", "input_micro_usd"), encoding="utf-8")
+    with pytest.raises(ModelCatalogError, match="micro-USD price key"):
+        load_model_catalog(path)

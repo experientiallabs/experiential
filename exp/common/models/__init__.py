@@ -47,8 +47,9 @@ from exp.common.models.gateway_catalog import (
     is_foreign_snapshot,
     load_forward_compatible,
     normalize_gateway_catalog,
+    read_model_catalog_document,
+    read_normalized_snapshot_document,
     read_pinned_normalized_snapshot,
-    require_nano_usd_snapshot,
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.known_models import (
@@ -194,7 +195,8 @@ __all__ = [
     "load_model_catalog",
     "load_pricing_snapshot",
     "is_foreign_snapshot",
-    "require_nano_usd_snapshot",
+    "read_model_catalog_document",
+    "read_normalized_snapshot_document",
     "normalize_gateway_catalog",
     "read_pinned_normalized_snapshot",
     "FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION",

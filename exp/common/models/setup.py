@@ -11,6 +11,7 @@ from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, mod
 from exp.common.core.artifacts import ContractModel
 from exp.common.core.locks import file_write_lock
 from exp.common.models.catalog import (
+    MODEL_CATALOG_SCHEMA_VERSION,
     ConnectionConfig,
     ModelCatalog,
     ModelRecord,
@@ -413,7 +414,9 @@ def _merge_provider_setup(
         judge_reasoning_effort=setup.judge_reasoning_effort,
     )
     catalog = ModelCatalog(
-        schema_version=existing.schema_version if existing is not None else 2,
+        schema_version=(
+            existing.schema_version if existing is not None else MODEL_CATALOG_SCHEMA_VERSION
+        ),
         connections=connections,
         models=models,
         roles=ModelRoles.model_validate(role_values),
