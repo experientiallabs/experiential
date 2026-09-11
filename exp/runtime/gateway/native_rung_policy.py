@@ -80,7 +80,7 @@ def reserve_rung_slot(
         warm_session = sticky.bound_deployment(entry.affinity_fingerprint) == (
             deployment.deployment_id
         )
-    return loads.reserve(
+    result = loads.reserve(
         rung_load_key(deployment),
         organization_id=entry.authorization.organization_id,
         weight=entry.authorization.fair_share_weight,
@@ -94,6 +94,13 @@ def reserve_rung_slot(
         fresh_spill_fraction=fresh_fraction,
         force=force,
     )
+    if isinstance(result, RungShed) and result.reason == "rate_limit":
+        _logger.debug(
+            "gateway rate-limit shed on deployment %r (learned ceiling %s/min)",
+            deployment.deployment_id,
+            result.learned_requests_per_minute,
+        )
+    return result
 
 
 def failed_dispatch_candidate(

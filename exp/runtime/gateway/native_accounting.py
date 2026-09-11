@@ -187,10 +187,9 @@ class NativeAttemptAccounting:
         self._rung_rate_limit_sheds = 0
         self._rung_fresh_session_spills = 0
         # Cache-stakes throttle dispositions on pools authoring a
-        # throttle_cache_threshold: throttles surfaced to the caller because
-        # the warm cache met the threshold, and throttles failed over cold
-        # because it did not. The surfaced branch reserves no further attempt
-        # row, so the counter is its only worker-side trace.
+        # throttle_cache_threshold: throttles surfaced (warm cache met the
+        # threshold; no further attempt row, so this is the only worker-side
+        # trace) and throttles that actually failed over cold (fallback reserved).
         self._throttles_surfaced = 0
         self._throttles_failed_over = 0
         # The sweep also runs on a timer so retained settlements and abandoned
@@ -259,12 +258,6 @@ class NativeAttemptAccounting:
                     self._rung_rate_limit_sheds += 1
                 elif result.reason == "fresh_session_spill":
                     self._rung_fresh_session_spills += 1
-            if result.reason == "rate_limit":
-                _logger.debug(
-                    "gateway rate-limit shed on deployment %r (learned ceiling %s/min)",
-                    deployment.deployment_id,
-                    result.learned_requests_per_minute,
-                )
         return result
 
     def rung_admission_counters(self) -> tuple[int, int]:
@@ -403,6 +396,7 @@ class NativeAttemptAccounting:
         # ONLY by policy sheds can force-admit past the bound rather than
         # manufacture a failure unbounded admission would not have had.
         policy_sheds: list[tuple[int, str]] = []
+        disposition: ThrottleDisposition | None = None
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -412,14 +406,14 @@ class NativeAttemptAccounting:
                 failure=failure,
                 current_depth=current_depth,
             )
-            if disposition is not None:
+            if disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
+                # Terminal by construction, so counted at the decision; the
+                # cold branch counts only once a fallback is reserved below.
                 self._count_throttle_disposition(disposition)
-            if disposition == THROTTLE_FAILOVER_COLD:
-                # A cold failover bypasses the warm rung by policy, so the
-                # dispatched attempt discloses it exactly like a shed: the
-                # throttled rung is the preferred counterfactual the cold
-                # restart is measured against. It never force-admits (the
-                # ladder carries a real failure).
+            elif disposition == THROTTLE_FAILOVER_COLD:
+                # A cold failover bypasses the warm rung by policy and is
+                # disclosed like a shed, with the throttled rung as the
+                # preferred counterfactual. It never force-admits.
                 policy_sheds.append((current_depth, THROTTLE_FAILOVER_COLD))
             last_failure: GatewayFailure | None = failure
         else:
@@ -532,6 +526,10 @@ class NativeAttemptAccounting:
             if forced_overflow:
                 with self._lock:
                     self._rung_saturated_overflows += 1
+            if disposition == THROTTLE_FAILOVER_COLD:
+                # Real only now: a cold decision whose ladder then exhausts
+                # ends as a plain exhausted throttle, counted as neither.
+                self._count_throttle_disposition(disposition)
             self._bind_sticky_dispatch(entry, deployment)
             with self._lock:
                 entry.attempt_counts[candidate] += 1

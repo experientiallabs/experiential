@@ -1777,3 +1777,42 @@ class TestThrottleCacheThreshold:
         )
         assert surfaced["exhausted"] is True
         assert registry.throttle_cache_counters() == (0, 0)
+
+    def test_cold_decision_that_exhausts_the_ladder_counts_no_failover(self) -> None:
+        """A below-threshold throttle with nothing claimable ends as a plain exhausted throttle.
+
+        The decision was to fail over, but no fallback attempt was reserved,
+        so neither disposition is counted and no attempt discloses a cold
+        failover: the metric reports only failovers that happened.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        entry = _admit(registry, deployments, request_id="request-1", throttle_cache_threshold=0.5)
+        # The only fallback rung sits inside its own provider throttle window.
+        registry.health.failed(
+            deployment_health_key(entry.authorization, deployments[1]),
+            GatewayFailure(
+                failure_class=GatewayFailureClass.THROTTLED,
+                safe_message="provider throttled the request",
+                retry_after_seconds=30,
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        exhausted = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert exhausted["exhausted"] is True
+        assert len(ledger.started) == 1
+        assert registry.throttle_cache_counters() == (0, 0)

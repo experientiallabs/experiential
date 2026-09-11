@@ -497,20 +497,31 @@ class RungLoadRegistry:
         The same time-decayed EWMA the cache-priority fairness term weights,
         read for the cross-rung throttle decision: it tells the waterfall how
         much warm provider cache the organization actually holds on the rung
-        that just throttled. Zero when the organization has no retained
-        sample there (never settled with usage on this worker, or its estimate
-        aged past retention), which is deliberately the fail-over answer.
+        that just throttled. Zero when the organization has no live sample
+        there (never settled with usage on this worker, or its last sample is
+        older than the retention horizon), which is deliberately the fail-over
+        answer. Retention is enforced HERE, at read time, not only by the
+        amortized sweep: a rung without an admission policy never reserves
+        through this registry and a throttled attempt settles without usage,
+        so nothing else is guaranteed to have pruned a returning
+        organization's stale evidence before its throttle is decided.
 
         Args:
             key: Physical rung identity.
             organization_id: The requesting organization.
 
         Returns:
-            The estimate in ``[0, 1]``, or ``0.0`` without a signal.
+            The estimate in ``[0, 1]``, or ``0.0`` without a live signal.
         """
+        horizon = self._clock() - EWMA_RETENTION_SECONDS
         with self._lock:
             rung = self._rungs.get(key)
-            return 0.0 if rung is None else _cached_fraction(rung, organization_id)
+            if rung is None:
+                return 0.0
+            signal = rung.cache_fractions.get(organization_id)
+            if signal is None or signal.sampled_at < horizon:
+                return 0.0
+            return signal.fraction
 
     def learned_ceilings(self) -> dict[str, float]:
         """Return live learned request ceilings keyed by rung, for metrics.
