@@ -29,8 +29,10 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import (
+    OPENROUTER_BASE_URL,
     OpenAICompatibleClient,
     OpenAICompatibleResponseError,
+    OpenRouterClient,
     openai_compatible_request,
     openai_compatible_response,
     openai_embedding_request,
@@ -612,3 +614,101 @@ def test_deepseek_client_builds_buffered_requests_with_the_backfill_from_its_ori
     )
     generic_messages = cast("list[JsonObject]", generic._build_request(_request())["messages"])
     assert "reasoning_content" not in generic_messages[2]
+
+
+_NATIVE_REASONING_ORIGIN = "https://hy4-preview--serve.modal.run/v1"
+
+
+def test_reasoning_content_native_rung_resolves_a_carrier_route_on_any_origin() -> None:
+    """The catalog flag, not the hostname, makes a rung a preserved-thinking route.
+
+    A self-hosted vLLM origin serving hy4-preview with ``--reasoning-parser``
+    returns the standard ``reasoning_content`` field and accepts it back, so a
+    rung declaring ``reasoning_content_native`` resolves the Hunyuan carrier
+    route and exposes plaintext when the exposure capability is declared. The
+    ``prompt_cache_key`` node pin stays Tencent-host-keyed: the declaration
+    says nothing about whether the origin tolerates unknown request fields.
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.fireworks_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is True
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_reasoning_content_native_rung_without_exposure_keeps_its_carrier_but_stays_stripped() -> (
+    None
+):
+    """Exposure still fails closed per rung on a flagged origin."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is False
+
+
+def test_an_unflagged_arbitrary_origin_stays_stripped_and_unpinned() -> None:
+    """Without the flag an unknown origin gets no carrier, no exposure, no cache hint."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is False
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_the_flag_matches_the_tencent_hosts_route_identity_for_one_model() -> None:
+    """A flagged origin and the Tencent host derive the same model-keyed route identity.
+
+    The carrier's route binding is the model's identity, so the same model
+    self-hosted resolves the same route digest the Tencent lane does; the
+    carrier domain stays the Hunyuan scheme either way.
+    """
+    flagged = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    tencent = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert flagged.hunyuan_reasoning_route_sha256 == tencent.hunyuan_reasoning_route_sha256
+
+
+def test_openrouter_routes_by_prompt_cache_key_as_its_sticky_session_key() -> None:
+    """OpenRouter documents ``prompt_cache_key`` as its sticky-routing fallback key.
+
+    OpenRouter load-balances one model across upstream providers and pins a
+    conversation to the provider that served it only after a cache hit is
+    observed, keyed by ``session_id`` else the OpenAI-style ``prompt_cache_key``
+    (openrouter.ai/docs/features/prompt-caching, read 2026-09-11). Without the
+    hint, two identical prefixes can land on different providers or nodes, so
+    the cache miss a caller sees is real and the metering of it is correct.
+    Forwarding the tenant-namespaced key makes placement deterministic per
+    conversation, and OpenRouter forwards provider-specific fields upstream,
+    so Tencent's per-node pin rides along on the hy4 lane.
+    """
+    profile = OpenRouterClient(
+        model=_snapshot(provider="openrouter", model_id="tencent/hy4-preview"),
+        base_url=OPENROUTER_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert profile.forwards_prompt_cache_key is True
+    # The OpenRouter origin is neither a Hunyuan nor a Fireworks carrier route.
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.fireworks_reasoning_route_sha256 is None

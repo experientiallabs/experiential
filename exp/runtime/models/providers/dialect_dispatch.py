@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
 TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
+THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
+"""Disclosed when Anthropic-signed thinking history is omitted for a foreign wire."""
 """Disclosure recorded when tool-result images degrade to placeholder text.
 
 A tool screenshot is baked into the caller's conversation history: rejecting

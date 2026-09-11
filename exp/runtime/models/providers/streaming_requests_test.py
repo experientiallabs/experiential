@@ -1,5 +1,6 @@
 """Tests for launch-provider streaming request payload translation."""
 
+import json
 from typing import Literal, cast
 
 import pytest
@@ -22,6 +23,7 @@ from exp.runtime.gateway.contracts import (
     GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
+    RedactedThinkingBlock,
     StructuredTextFormat,
     ThinkingBlock,
 )
@@ -30,6 +32,7 @@ from exp.runtime.models.providers.anthropic_tool_compat import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
+from exp.runtime.models.providers.dialect_dispatch import THINKING_HISTORY_DROP_DISCLOSURE
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -2121,12 +2124,11 @@ def test_anthropic_payload_replays_thinking_blocks_first_and_verbatim() -> None:
 
 
 def test_route_shaping_rejects_thinking_by_name_so_admission_can_coerce() -> None:
-    """History thinking blocks and a live config both reject at SHAPING on a
-    non-Anthropic route: blocks are signed provider state no translation can
-    carry, and the config's named rejection is what lets the admit loop offer
-    the disclosed thinking->reasoning_effort coercion without stealing
-    narrowing preference from an Anthropic rung (coverage for the coercion
-    itself lives in capability_policy_test)."""
+    """A live thinking config rejects at SHAPING on a non-Anthropic route: the
+    config's named rejection is what lets the admit loop offer the disclosed
+    thinking->reasoning_effort coercion without stealing narrowing preference
+    from an Anthropic rung (coverage for the coercion itself lives in
+    capability_policy_test)."""
     anthropic = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
@@ -2134,20 +2136,24 @@ def test_route_shaping_rejects_thinking_by_name_so_admission_can_coerce() -> Non
     )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
 
-    for request in (
-        _thinking_history_request(),
-        _chat_request().model_copy(
-            update={
-                "surface": GatewayApiSurface.MESSAGES,
-                "provider_thinking_config": {"type": "enabled", "budget_tokens": 1024},
-            }
-        ),
-    ):
-        route_generation_parameter_requests((anthropic,), request)
-        with pytest.raises(ProviderParameterError) as raised:
-            route_generation_parameter_requests((anthropic, fallback), request)
-        assert raised.value.param == "thinking"
-        assert raised.value.code == "unsupported_parameter"
+    request = _chat_request().model_copy(
+        update={
+            "surface": GatewayApiSurface.MESSAGES,
+            "provider_thinking_config": {"type": "enabled", "budget_tokens": 1024},
+        }
+    )
+    route_generation_parameter_requests((anthropic,), request)
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((anthropic, fallback), request)
+    assert raised.value.param == "thinking"
+    assert raised.value.code == "unsupported_parameter"
+    # History thinking blocks no longer reject at shaping: they are signed
+    # provider state a foreign wire drops with disclosure (see
+    # test_replayed_anthropic_thinking_drops_with_disclosure_on_a_non_anthropic_route).
+    _public, routed = route_generation_parameter_requests(
+        (anthropic, fallback), _thinking_history_request()
+    )
+    assert THINKING_HISTORY_DROP_DISCLOSURE in routed.ignored_parameters
 
 
 def _encrypted_reasoning_request() -> GatewayRequest:
@@ -4051,8 +4057,53 @@ def _messages_request(
     )
 
 
-def test_replayed_thinking_blocks_still_reject_on_a_non_anthropic_route() -> None:
-    """Signed history blocks replay only on the wire that issued them."""
+def test_replayed_anthropic_thinking_drops_with_disclosure_on_a_non_anthropic_route() -> None:
+    """Signed history blocks replay only on the wire that issued them; elsewhere they drop.
+
+    Claude Code carries Claude's signed thinking blocks into every later turn,
+    so a session that switches to a non-Anthropic model used to die on a named
+    400 ("remove extended-thinking content" is not actionable for a
+    framework-managed history: 2,180 refusals on one alias in 14 days). The
+    route now serves the turn with the same disclosure shape plaintext
+    reasoning_content already uses, and the foreign wire omits the blocks at
+    encoding; a mixed waterfall's Anthropic rung still replays them verbatim.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(
+                role="assistant",
+                content="prior",
+                provider_reasoning=(
+                    ThinkingBlock(text="deep", signature="sig-1"),
+                    RedactedThinkingBlock(data="opaque=="),
+                ),
+            ),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+    )
+    from exp.runtime.models.providers.wire_messages import anthropic_blocks
+
+    profile = _openai_reasoning_profile()
+    _public, routed = route_generation_parameter_requests((profile,), request)
+    assert THINKING_HISTORY_DROP_DISCLOSURE in routed.ignored_parameters
+    # The foreign wire's history renders without any reasoning item or field.
+    payload = dialect_stream_payload(profile, routed)
+    assert "deep" not in json.dumps(payload)
+    assert "opaque==" not in json.dumps(payload)
+    # A mixed waterfall discloses too, and its Anthropic rung keeps the blocks.
+    _public, mixed = route_generation_parameter_requests(
+        (_anthropic_profile("claude-sonnet-4-6"), profile), request
+    )
+    assert THINKING_HISTORY_DROP_DISCLOSURE in mixed.ignored_parameters
+    _role, blocks = anthropic_blocks(mixed.messages[1])
+    assert blocks[0] == {"type": "thinking", "thinking": "deep", "signature": "sig-1"}
+
+
+def test_replayed_anthropic_thinking_stays_verbatim_on_an_anthropic_route() -> None:
+    """The disclosed drop is for foreign wires only; Anthropic keeps its own blocks."""
     request = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,
         messages=(
@@ -4062,11 +4113,15 @@ def test_replayed_thinking_blocks_still_reject_on_a_non_anthropic_route() -> Non
                 content="prior",
                 provider_reasoning=(ThinkingBlock(text="deep", signature="sig-1"),),
             ),
+            GatewayMessage(role="user", content="again"),
         ),
         stream=True,
     )
-    with pytest.raises(ProviderParameterError, match="extended-thinking"):
-        route_generation_parameter_requests((_openai_reasoning_profile(),), request)
+    _public, routed = route_generation_parameter_requests(
+        (_anthropic_profile("claude-sonnet-4-6"),), request
+    )
+    assert THINKING_HISTORY_DROP_DISCLOSURE not in routed.ignored_parameters
+    assert routed.messages[1].provider_reasoning == request.messages[1].provider_reasoning
 
 
 def _tool_error_request(*, content: str = "exit 1") -> GatewayRequest:
@@ -4600,6 +4655,38 @@ def test_a_messages_surface_effort_rejection_matches_the_client_recovery_latch()
     assert raised.value.param == "output_config.effort"
     assert "effort parameter" in str(raised.value)
     assert "not supported" in str(raised.value)
+
+
+def test_a_messages_effort_from_the_openrouter_channel_is_rejected_by_its_own_name() -> None:
+    """A depth sent as OpenRouter's ``reasoning.effort`` is refused under that path.
+
+    The Messages decoder records which caller field carried the effort; the
+    rejection names it so an agent built against OpenRouter's Messages endpoint
+    finds the field it sent, while the Anthropic ``output_config.effort`` default
+    (and Claude Code's recovery latch) is untouched.
+    """
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://c.test",
+            model_id="hermes-4-405b",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning_effort",
+            supported_reasoning_efforts=("medium",),
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        reasoning_effort="high",
+        reasoning_effort_parameter="reasoning.effort",
+    )
+
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.param == "reasoning.effort"
+    assert "effort parameter" in str(raised.value)
 
 
 def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() -> None:

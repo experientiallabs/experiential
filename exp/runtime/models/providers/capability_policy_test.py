@@ -904,8 +904,9 @@ def test_the_thinking_coercion_leaves_anthropic_bearing_routes_alone() -> None:
     """A route with any Anthropic rung keeps its verbatim-service preference:
     narrowing already picks the rung that honors the config, so the coercion
     declines rather than trading real thinking for a translation. Replayed
-    thinking blocks also decline it (no translation can carry signed provider
-    state, and the gateway never fabricates unsigned blocks)."""
+    thinking blocks no longer decline it on a foreign-only route: route
+    shaping drops them there with disclosure, so the live config still
+    translates to the route's effort ladder."""
     mixed = (
         GatewayWireProfile(
             dialect="anthropic_messages",
@@ -934,7 +935,15 @@ def test_the_thinking_coercion_leaves_anthropic_bearing_routes_alone() -> None:
             ),
         ),
     )
-    assert coerce_generation_parameters((_openai_reasoning_profile(),), with_blocks) is None
+    coercion = coerce_generation_parameters((_openai_reasoning_profile(),), with_blocks)
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:low",)
+    assert coercion.request.reasoning_effort == "low"
+    # The signed blocks stay on the request; the foreign wire omits them.
+    assert (
+        coercion.request.messages[1].provider_reasoning
+        == with_blocks.messages[1].provider_reasoning
+    )
 
 
 def test_forced_tool_choice_relaxes_to_auto_only_as_a_disclosed_coercion() -> None:

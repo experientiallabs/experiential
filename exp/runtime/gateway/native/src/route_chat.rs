@@ -886,7 +886,10 @@ async fn stream_response(
                 other => other.clone(),
             };
             if event.is_terminal() {
-                if matches!(event, Event::Completed) {
+                if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {
+                    // The encoder requires the carrier on BOTH completing
+                    // terminals; a stop sequence closing a reasoning tool turn
+                    // used to end the stream short of its terminal frames.
                     let candidate = match encoder.reasoning_carrier_candidate() {
                         Ok(candidate) => candidate,
                         Err(_) => {

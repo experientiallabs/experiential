@@ -5353,3 +5353,311 @@ def test_foundry_deepseek_zero_argument_call_with_a_stray_empty_string_delta_com
         ("view_agent_graph", "{}")
     ]
     assert events[-1]["kind"] == "completed"
+
+
+def test_reasoning_content_native_rung_round_trips_preserved_thinking_off_the_tencent_hosts(
+    tmp_path: Path,
+) -> None:
+    """A self-hosted hy4-preview rung keeps Tencent's preserved-thinking contract.
+
+    Carrier eligibility is the rung's ``reasoning_content_native`` declaration,
+    not the origin hostname: on an arbitrary https origin the flagged rung
+    exposes plaintext, seals a tool turn's reasoning as the Hunyuan carrier, a
+    second replica unseals and forwards it, and a plain turn's plaintext
+    replays verbatim. The same origin without the flag stays stripped.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://hy4-preview--serve.modal.run/v1",
+        capabilities=ModelCapabilities(
+            supports_tools=True, reasoning_output_exposed=True, reasoning_content_native=True
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    assert initial["reasoning_output_exposed"] is True
+    assert initial["fireworks_reasoning_route_sha256"] is None
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+
+    hidden = "reason privately about the lookup"
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": route_sha256,
+                    "content": hidden,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    assert sealed.startswith("x-experiential-hunyuan-reasoning-v1:")
+    assert hidden not in sealed
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_id": initial["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "tool_names": ["lookup"],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+    replica = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    continued = _admit(
+        replica,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": sealed,
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                ],
+            }
+        ),
+    )
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert messages[1]["reasoning_content"] == hidden
+    assert "reasoning_history" not in payload
+
+    plain = _admit(
+        replica,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "List the files."},
+                    {
+                        "role": "assistant",
+                        "content": '{"command": "ls"}',
+                        "reasoning_content": "ls lists the directory.",
+                    },
+                    {"role": "user", "content": "a.txt"},
+                ],
+            }
+        ),
+    )
+    plain_payload = cast(
+        "JsonObject", cast("list[JsonObject]", plain["route"])[0]["upstream_payload"]
+    )
+    plain_messages = cast("list[JsonObject]", plain_payload["messages"])
+    assert plain_messages[1]["reasoning_content"] == "ls lists the directory."
+    assert plain.get("ignored_parameters", []) == []
+
+
+def test_an_unflagged_self_hosted_rung_stays_stripped_with_no_carrier_route(
+    tmp_path: Path,
+) -> None:
+    """Without ``reasoning_content_native`` an arbitrary origin has no preserved thinking."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://hy4-preview--serve.modal.run/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    assert initial["reasoning_output_exposed"] is False
+    assert initial["hunyuan_reasoning_route_sha256"] is None
+    assert initial["fireworks_reasoning_route_sha256"] is None
+
+
+def _messages_body(messages: list[JsonObject]) -> str:
+    """Return one raw Anthropic Messages request body over ``messages``."""
+    return json.dumps({"model": "coding", "max_tokens": 64, "messages": messages})
+
+
+def test_hunyuan_plain_turn_unsigned_thinking_replays_verbatim_on_messages(
+    tmp_path: Path,
+) -> None:
+    """Claude Code echoes the gateway's unsigned thinking block; the rung gets its text back.
+
+    The Messages surface returns an exposing rung's plaintext reasoning as a
+    thinking block with an EMPTY signature. Claude Code replays every content
+    block verbatim, so the next turn carries that block back, and admission
+    forwards the text as ``reasoning_content`` exactly like the Chat wire's
+    plaintext (see ``test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim``).
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    thinking = "The user wants a directory listing; ls is the command."
+    body = _messages_body(
+        [
+            {"role": "user", "content": "List the files."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": thinking, "signature": ""},
+                    {"type": "text", "text": '{"command": "ls"}'},
+                ],
+            },
+            {"role": "user", "content": "a.txt b.txt"},
+        ]
+    )
+    admitted = _admit(control, raw_key, body, surface="messages")
+    messages = _payload_messages(admitted)
+    assert messages[1]["reasoning_content"] == thinking
+    assert admitted["route_reason"] != "reasoning_continuation"
+    assert admitted.get("ignored_parameters", []) == []
+
+
+def test_hunyuan_tool_turn_redacted_carrier_round_trips_on_messages(tmp_path: Path) -> None:
+    """A Messages tool turn replays its sealed carrier from the redacted_thinking block.
+
+    The data plane closes a tool turn with one ``redacted_thinking`` block whose
+    data is the sealed Hunyuan carrier (beside the unsigned display block that
+    streamed live). Claude Code echoes both; admission unseals the carrier to the
+    exact plaintext, forwards it upstream, pins the issuing rung, and drops the
+    display duplicate rather than sending the text twice.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    hidden = "let me reason about the tool call privately"
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": route_sha256,
+                    "content": hidden,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = _messages_body(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": hidden, "signature": ""},
+                    {"type": "tool_use", "id": "call-one", "name": "lookup", "input": {}},
+                    {"type": "redacted_thinking", "data": sealed},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-one", "content": "done"}],
+            },
+        ]
+    )
+    continued = _admit(control, raw_key, body, surface="messages")
+    messages = _payload_messages(continued)
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert messages[1]["reasoning_content"] == hidden
+    tool_calls = messages[1]["tool_calls"]
+    assert isinstance(tool_calls, list)
+    first_call = tool_calls[0]
+    assert isinstance(first_call, dict)
+    assert first_call["id"] == "call-one"
+
+    # A tampered tool turn fails closed at the carrier authority, as on Chat.
+    tampered = json.loads(body)
+    tampered["messages"][1]["content"][1]["input"] = {"tampered": True}
+    with pytest.raises(NativeBridgeError):
+        _admit(control, raw_key, json.dumps(tampered), surface="messages")
+
+
+def test_anthropic_signed_thinking_drops_with_disclosure_on_a_foreign_route(
+    tmp_path: Path,
+) -> None:
+    """A Claude-signed thinking history reaching a non-Anthropic rung serves, disclosed.
+
+    Claude Code carries Claude's signed blocks into every later turn of a
+    session; pointing that session at a Tencent/OpenAI model used to answer a
+    named 400 on every request (2,180 refusals on one alias in 14 days). The
+    blocks are stripped for the foreign wire with the same disclosure shape
+    plaintext reasoning uses, and the turn serves.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    body = _messages_body(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "claude reasoned", "signature": "sig=="},
+                    {"type": "redacted_thinking", "data": "opaque=="},
+                    {"type": "text", "text": "prior answer"},
+                ],
+            },
+            {"role": "user", "content": "again"},
+        ]
+    )
+    admitted = _admit(control, raw_key, body, surface="messages")
+    ignored = cast("list[str]", admitted["ignored_parameters"])
+    assert "messages.thinking->dropped(unsupported_by_provider)" in ignored
+    messages = _payload_messages(admitted)
+    assert messages[1]["content"] == "prior answer"
+    assert "reasoning_content" not in messages[1]

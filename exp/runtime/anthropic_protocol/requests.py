@@ -36,7 +36,11 @@ from exp.common.models.content import (
     MessageContentPart,
     TextContentPart,
 )
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol.gateway_reasoning import (
+    EMPTY_GATEWAY_BLOCK,
+    gateway_reasoning_block,
+)
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
@@ -50,6 +54,10 @@ from exp.runtime.anthropic_protocol.media_blocks import (
     document_part_from_block,
     image_part_from_block,
 )
+from exp.runtime.anthropic_protocol.reasoning_channels import (
+    ReasoningConfig,
+    resolve_reasoning_channels,
+)
 from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -61,7 +69,6 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
-from exp.runtime.models.providers.reasoning_compat import REASONING_EFFORTS
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
@@ -284,6 +291,7 @@ class _MessagesRequest(AnthropicWireModel):
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
+    reasoning: ReasoningConfig | None = None
     context_management: JsonObject | None = None
     output_config: JsonObject | None = None
     diagnostics: JsonObject | None = None
@@ -359,6 +367,16 @@ def decode_messages(
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
+    channels = resolve_reasoning_channels(
+        request.reasoning,
+        max_tokens=request.max_tokens,
+        thinking=cast(JsonObject, payload["thinking"]) if request.thinking is not None else None,
+        output_config=(
+            cast(JsonObject, payload["output_config"])
+            if request.output_config is not None
+            else None
+        ),
+    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
@@ -382,11 +400,7 @@ def decode_messages(
             stream=request.stream,
             include_usage=request.stream,
             metadata=_gateway_metadata(request.metadata),
-            # The raw payload value, not the re-serialized wire model, so the
-            # provider receives the caller's thinking config byte-for-byte.
-            provider_thinking_config=(
-                cast(JsonObject, payload["thinking"]) if request.thinking is not None else None
-            ),
+            provider_thinking_config=channels.thinking_config,
             context_management=_context_management(payload),
             diagnostics=_diagnostics(payload),
             speed=request.speed,
@@ -399,13 +413,10 @@ def decode_messages(
             ),
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
-            ignored_parameters=dropped_beta_disclosures,
-            reasoning_effort=_output_config_effort(request.output_config),
-            provider_output_config=(
-                cast(JsonObject, payload["output_config"])
-                if request.output_config is not None
-                else None
-            ),
+            ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            reasoning_effort=channels.effort,
+            reasoning_effort_parameter=channels.effort_parameter,
+            provider_output_config=channels.output_config,
         )
     except ValidationError as exc:
         raise _validation_error(exc.errors(include_url=False)[0]) from exc
@@ -432,24 +443,6 @@ def _require_served_server_tool_types(tools: tuple[_Tool | _ServerTool, ...]) ->
                 f"Supported server tool types: {supported}. Remove the tool or use a "
                 "supported type.",
             )
-
-
-def _output_config_effort(config: JsonObject | None) -> ReasoningEffort | None:
-    """Map a canonical caller ``output_config.effort`` into the shared field.
-
-    A canonical ladder value rides ``reasoning_effort`` so route narrowing,
-    the coercion policy, and non-Anthropic rungs all see it; the raw object
-    still forwards verbatim on Anthropic rungs with the caller's keys
-    winning, so an unrecognized future effort value stays provider-decided
-    instead of gateway-rejected.
-    """
-    if config is None:
-        return None
-    effort = config.get("effort")
-    if isinstance(effort, str) and effort in REASONING_EFFORTS:
-        # The membership check above is the narrowing proof for this cast.
-        return cast("ReasoningEffort", effort)
-    return None
 
 
 def _context_management(payload: JsonObject) -> JsonObject | None:
@@ -757,6 +750,19 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         if content is None and not tool_calls and not reasoning and not attachments:
             ordered_blocks.clear()
             return
+        if any(block.kind == "sealed_reasoning_content" for block in reasoning):
+            # A gateway tool turn returned its reasoning twice: the unsigned
+            # display block that streamed live and the sealed carrier that
+            # holds the same text authenticated. Only the carrier replays.
+            reasoning[:] = [
+                block for block in reasoning if block.kind != "exposed_reasoning_content"
+            ]
+        # The verbatim block order exists for Anthropic-signed history, whose
+        # signatures the provider verifies in place; gateway-issued blocks
+        # (unsigned plaintext, sealed carriers) never replay on that wire.
+        anthropic_thinking = any(
+            block.kind in {"thinking", "redacted_thinking"} for block in reasoning
+        )
         out.append(
             GatewayMessage(
                 role=message.role,
@@ -768,7 +774,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.
                 provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
-                provider_anthropic_blocks=tuple(ordered_blocks) if reasoning else None,
+                provider_anthropic_blocks=tuple(ordered_blocks) if anthropic_thinking else None,
             )
         )
         text_parts.clear()
@@ -832,12 +838,16 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     f"{param}.content.{block_index}",
                     "thinking blocks are only valid in assistant messages.",
                 )
-            reasoning.append(
-                ThinkingBlock(text=block.thinking, signature=block.signature)
-                if isinstance(block, _ThinkingBlock)
-                else RedactedThinkingBlock(data=block.data)
-            )
-            ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+            gateway_block = gateway_reasoning_block(block, f"{param}.content.{block_index}")
+            if gateway_block is None:
+                reasoning.append(
+                    ThinkingBlock(text=block.thinking, signature=block.signature)
+                    if isinstance(block, _ThinkingBlock)
+                    else RedactedThinkingBlock(data=block.data)
+                )
+                ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+            elif gateway_block is not EMPTY_GATEWAY_BLOCK:
+                reasoning.append(gateway_block)
         elif isinstance(block, _ToolUseBlock):
             if message.role != "assistant":
                 raise invalid_field(

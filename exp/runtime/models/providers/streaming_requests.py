@@ -15,6 +15,9 @@ from exp.runtime.models.providers.dialect_dispatch import (
     SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
+    THINKING_HISTORY_DROP_DISCLOSURE,
+)
+from exp.runtime.models.providers.dialect_dispatch import (
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE as TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
@@ -219,16 +222,9 @@ def route_generation_parameter_requests(
         provider_updates["maximum_output_tokens"] = min(
             (_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT, *route_limits)
         )
-    # The rejection names the field the CALLER sent: Claude Code carries its
-    # effort as Messages output_config.effort and auto-recovers (drops the
-    # field and retries) only when the 400 names that channel, so naming the
-    # translated internal field wedges every turn instead (issue #795).
-    if request.surface == GatewayApiSurface.RESPONSES:
-        effort_path = "reasoning.effort"
-    elif request.surface == GatewayApiSurface.MESSAGES:
-        effort_path = "output_config.effort"
-    else:
-        effort_path = "reasoning_effort"
+    # The rejection names the field the CALLER sent (the request knows which
+    # of its surface's effort fields carried the value; see the property).
+    effort_path = request.caller_effort_parameter
 
     def profile_reasoning_effort(profile: GatewayWireProfile) -> str | None:
         """Return the caller effort or this wire's required provider default."""
@@ -698,15 +694,12 @@ def route_generation_parameter_requests(
     )
     non_anthropic_route = not all(profile.dialect == "anthropic_messages" for profile in profiles)
     if history_thinking_present and non_anthropic_route:
-        raise ProviderParameterError(
-            message=(
-                "The request replays Anthropic extended-thinking blocks that only a "
-                "native Anthropic route can carry. Remove extended-thinking content "
-                "or choose a native Anthropic-only route."
-            ),
-            param="thinking",
-            code="unsupported_parameter",
-        )
+        # Anthropic-signed thinking replays only on its own wire; the blocks are
+        # baked into a framework-managed transcript (Claude Code carries them
+        # into every later turn), so like plaintext reasoning_content the route
+        # serves and discloses the drop: foreign wires omit them at encoding.
+        if THINKING_HISTORY_DROP_DISCLOSURE not in ignored:
+            ignored.append(THINKING_HISTORY_DROP_DISCLOSURE)
     if request.provider_thinking_config is not None and non_anthropic_route:
         # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
         # cross-wire reading. The named rejection here is what lets the admit

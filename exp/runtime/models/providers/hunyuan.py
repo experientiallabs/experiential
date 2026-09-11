@@ -6,7 +6,11 @@ endpoint that returns the model's chain-of-thought in a native ``reasoning_conte
 response field and accepts it back on an assistant turn. This module identifies
 those endpoints so the gateway marks the rung as an exposable-plaintext
 reasoning route whose replay is protected by a gateway-issued opaque carrier,
-mirroring :mod:`exp.runtime.models.providers.fireworks`.
+mirroring :mod:`exp.runtime.models.providers.fireworks`. Host recognition is
+one of two ways a rung earns that route: any other OpenAI-compatible origin
+that speaks the same contract (a self-hosted vLLM origin with a reasoning
+parser) declares it per rung through the ``reasoning_content_native``
+capability, which the compatible client reads alongside this check.
 
 Two OpenAI-compatible origins serve these models:
 

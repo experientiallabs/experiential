@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import ClassVar, Literal, cast
 
 from pydantic import JsonValue
@@ -462,8 +463,19 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
         reasoning_output_exposed: bool = False,
+        reasoning_content_native: bool = False,
     ) -> None:
-        """Create one compatible client with explicit model wire capabilities."""
+        """Create one compatible client with explicit model wire capabilities.
+
+        ``reasoning_content_native`` declares that this origin returns the
+        model's chain-of-thought in the standard ``reasoning_content`` field and
+        accepts it back on assistant turns, so the rung is a preserved-thinking
+        carrier route whatever its hostname (a self-hosted vLLM origin with a
+        reasoning parser). Tencent's own origins carry that contract by
+        recognition and need no declaration. The declaration decides the
+        carrier route and exposure only; the ``prompt_cache_key`` node pin stays
+        keyed on Tencent's hosts.
+        """
         super().__init__(
             model=model,
             api_key=api_key,
@@ -486,12 +498,18 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._fireworks_reasoning_route_sha256 = (
             reasoning_content_route_sha256(model) if is_fireworks_base_url(self._base_url) else None
         )
-        # Tencent Hunyuan returns the model's plaintext reasoning natively and
-        # accepts it back; the gateway exposes it for display and round-trips it
-        # through a domain-separated opaque carrier, so this rung is both a
-        # carrier route and an exposed-plaintext route.
+        # A native ``reasoning_content`` origin returns the model's plaintext
+        # reasoning and accepts it back; the gateway exposes it for display and
+        # round-trips it through a domain-separated opaque carrier, so this rung
+        # is both a carrier route and an exposed-plaintext route. Tencent's own
+        # origins are recognized by host; any other origin declares the contract
+        # per rung. Fireworks keeps its own carrier and wire flag, so the
+        # declaration never doubles a Fireworks rung's route.
+        self._reasoning_content_native = (
+            is_hunyuan_base_url(self._base_url) or reasoning_content_native
+        ) and self._fireworks_reasoning_route_sha256 is None
         self._hunyuan_reasoning_route_sha256 = (
-            reasoning_content_route_sha256(model) if is_hunyuan_base_url(self._base_url) else None
+            reasoning_content_route_sha256(model) if self._reasoning_content_native else None
         )
         # DeepSeek's own API enforces reasoning_content on every assistant
         # message of the current turn in thinking mode (400 otherwise); both the
@@ -535,8 +553,11 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             deepseek_reasoning_history=self._deepseek_reasoning_history,
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
-            # 2026-09-05). Other compatible servers may reject unknown fields,
-            # so the hint stays off them, BYOK or not.
+            # 2026-09-05). The hint stays host-keyed: a rung declaring
+            # ``reasoning_content_native`` says only that its origin speaks the
+            # reasoning_content contract, and a strict compatible server that
+            # does may still reject an unknown top-level field, so the
+            # declaration never widens what is sent, BYOK or not.
             forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
         )
 
@@ -576,6 +597,21 @@ class OpenRouterClient(OpenAICompatibleClient):
         "X-Title": OPENROUTER_TITLE,
     }
     reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning"
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the compatible profile with OpenRouter's sticky-routing hint on.
+
+        OpenRouter load-balances one model across upstream providers and pins a
+        conversation to the provider that served it only once a cache hit has
+        been observed, keyed by ``session_id`` else the OpenAI-style
+        ``prompt_cache_key`` (its documented fallback sticky key). Without the
+        hint two identical prefixes can land on different providers or nodes,
+        so the miss a caller sees is real and its metering is correct.
+        Forwarding the tenant-namespaced key makes placement deterministic per
+        conversation, and OpenRouter forwards provider-specific fields
+        upstream, so a per-node pin such as Tencent's rides along.
+        """
+        return replace(super().gateway_wire_profile(), forwards_prompt_cache_key=True)
 
 
 def _openai_message(

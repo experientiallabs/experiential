@@ -235,20 +235,15 @@ def _coerce_thinking_to_effort(
 
     Returns:
         The disclosed translation or drop, or ``None`` when the request
-        carries no thinking config, the route has an Anthropic rung,
-        replayed thinking blocks make the route unservable regardless, or no
-        translatable tier serves the request end to end.
+        carries no thinking config, the route has an Anthropic rung, or no
+        translatable tier serves the request end to end. Replayed Anthropic
+        thinking blocks no longer block the translation: route shaping strips
+        them from a foreign wire with disclosure.
     """
     config = request.provider_thinking_config
     if config is None or not profiles:
         return None
     if any(profile.dialect == "anthropic_messages" for profile in profiles):
-        return None
-    if any(
-        block.kind in {"thinking", "redacted_thinking"}
-        for message in request.messages
-        for block in message.provider_reasoning
-    ):
         return None
 
     def admitted(coercion: RequestCoercion) -> RequestCoercion | None:

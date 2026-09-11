@@ -473,6 +473,18 @@ class ModelCapabilities(ContractModel):
     wire on a carrier-route identity, so an absent capability fails closed and
     reasoning stays stripped even on an otherwise-exposable endpoint.
     """
+    reasoning_content_native: bool = False
+    """Whether this OpenAI-compatible rung speaks the native ``reasoning_content`` contract.
+
+    The origin returns the model's chain-of-thought in the standard
+    ``reasoning_content`` response field and accepts it back on assistant turns
+    (Tencent Hunyuan's contract, and a self-hosted vLLM origin started with a
+    reasoning parser). Declaring it makes the rung a preserved-thinking carrier
+    route regardless of its hostname, so the same model self-hosted keeps the
+    contract Tencent's own origins carry by recognition. Off by default: an
+    undeclared origin never gets a carrier route, and exposure still requires
+    ``reasoning_output_exposed`` on top.
+    """
     chat_max_tokens_field: ChatMaxTokensField | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)
     maximum_temperature: float | None = Field(default=None, ge=0, le=2)
@@ -566,6 +578,7 @@ class ModelCapabilities(ContractModel):
             "reasoning_effort",
             "sampling_requires_reasoning_none",
             "reasoning_output_exposed",
+            "reasoning_content_native",
             "chat_max_tokens_field",
             "minimum_temperature",
             "maximum_temperature",

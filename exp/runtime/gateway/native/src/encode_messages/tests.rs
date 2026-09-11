@@ -683,9 +683,15 @@ fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
     ));
 
     let events = vec![Event::TextDelta("hi".to_string()), Event::Completed];
-    let aggregated =
-        completed_messages_body_with_ignored("request-abc", "coding", &events, &ignored)
-            .expect("aggregates");
+    let aggregated = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &events,
+        &ignored,
+        None,
+        false,
+    )
+    .expect("aggregates");
     assert_eq!(
         aggregated.body["x-experiential-ignored-parameters"],
         json!(["reasoning_effort", "anthropic-beta.claude-code-20250219"])
@@ -703,4 +709,270 @@ fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
         .body
         .get("x-experiential-ignored-parameters")
         .is_none());
+}
+
+fn exposed_reasoning_events() -> Vec<Event> {
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "route-a".to_string(),
+            delta: "step ".to_string(),
+        },
+        Event::ReasoningContentDelta {
+            route_sha256: "route-a".to_string(),
+            delta: "one".to_string(),
+        },
+        Event::TextDelta("answer".to_string()),
+        Event::Completed,
+    ]
+}
+
+fn tool_turn_reasoning_events() -> Vec<Event> {
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "route-a".to_string(),
+            delta: "think privately".to_string(),
+        },
+        Event::ToolCallStarted {
+            namespace: None,
+            caller: None,
+            index: 0,
+            call_id: "call-1".to_string(),
+            name: "lookup".to_string(),
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "{}".to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                namespace: None,
+                caller: None,
+                call_id: "call-1".to_string(),
+                name: "lookup".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{}".to_string(),
+                custom: false,
+            },
+        },
+        Event::Completed,
+    ]
+}
+
+fn frame_names(frames: &[String]) -> Vec<&str> {
+    frames
+        .iter()
+        .map(|frame| {
+            frame
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("event: "))
+                .expect("named frame")
+        })
+        .collect()
+}
+
+#[test]
+fn exposed_reasoning_streams_as_an_unsigned_thinking_block() {
+    // A Tencent/DeepSeek rung marked reasoning_output_exposed returns its
+    // plaintext reasoning on the Chat wire as `reasoning_content`; on the
+    // Messages wire the same text is a thinking block whose signature stays
+    // empty (Anthropic always signs, so an unsigned block is recognizably the
+    // gateway's plaintext when the caller replays it).
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.set_reasoning_output_exposed(true);
+    let mut frames = encoder.start().expect("starts");
+    for event in &exposed_reasoning_events() {
+        frames.extend(encoder.feed(event).expect("streams reasoning"));
+    }
+    assert_eq!(
+        frame_names(&frames),
+        vec![
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert!(frames[2].contains("{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}"));
+    assert!(frames[3].contains("{\"type\":\"thinking_delta\",\"thinking\":\"step \"}"));
+    assert!(frames[4].contains("{\"type\":\"thinking_delta\",\"thinking\":\"one\"}"));
+    assert!(!frames.iter().any(|frame| frame.contains("signature_delta")));
+    assert!(frames[7].contains("{\"type\":\"text_delta\",\"text\":\"answer\"}"));
+
+    let aggregated = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &exposed_reasoning_events(),
+        &[],
+        None,
+        true,
+    )
+    .expect("aggregates");
+    assert_eq!(
+        aggregated.body["content"],
+        json!([
+            {"type": "thinking", "thinking": "step one", "signature": ""},
+            {"type": "text", "text": "answer"},
+        ])
+    );
+}
+
+#[test]
+fn unexposed_reasoning_stays_dropped_on_the_messages_surface() {
+    // Hidden-reasoning rungs never leak: without exposure the Messages
+    // encoders keep OpenAI-wire reasoning invisible, exactly as before.
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    let mut frames = encoder.start().expect("starts");
+    for event in &exposed_reasoning_events() {
+        frames.extend(encoder.feed(event).expect("streams"));
+    }
+    assert!(!frames.iter().any(|frame| frame.contains("thinking")));
+    let aggregated = completed_messages_body("request-abc", "coding", &exposed_reasoning_events())
+        .expect("aggregates");
+    assert_eq!(
+        aggregated.body["content"],
+        json!([{"type": "text", "text": "answer"}])
+    );
+}
+
+#[test]
+fn tool_turn_reasoning_round_trips_as_a_trailing_redacted_thinking_carrier() {
+    // A tool turn's reasoning must come back as the sealed opaque carrier
+    // (never raw plaintext: a CoT-injection vector on the way back in). The
+    // carrier is only known once every tool call completed, after the
+    // sequential thinking block has closed, so it rides one trailing
+    // `redacted_thinking` block: Anthropic's own "opaque, replay verbatim"
+    // shape, which every Messages client (Claude Code) echoes untouched.
+    let carrier = "x-experiential-hunyuan-reasoning-v1:ZGVw:c2VhbGVk";
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.set_reasoning_output_exposed(true);
+    encoder.set_reasoning_content_carrier(carrier.to_string());
+    let mut frames = encoder.start().expect("starts");
+    for event in &tool_turn_reasoning_events() {
+        frames.extend(encoder.feed(event).expect("streams"));
+    }
+    assert_eq!(
+        frame_names(&frames),
+        vec![
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert!(frames[3].contains("{\"type\":\"thinking_delta\",\"thinking\":\"think privately\"}"));
+    assert!(frames[5].contains("\"type\":\"tool_use\""));
+    assert!(frames[8].contains(&format!(
+        "{{\"type\":\"redacted_thinking\",\"data\":\"{carrier}\"}}"
+    )));
+    assert!(frames[10].contains("\"stop_reason\":\"tool_use\""));
+
+    let aggregated = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &tool_turn_reasoning_events(),
+        &[],
+        Some(carrier),
+        true,
+    )
+    .expect("aggregates");
+    assert_eq!(
+        aggregated.body["content"],
+        json!([
+            {"type": "thinking", "thinking": "think privately", "signature": ""},
+            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+            {"type": "redacted_thinking", "data": carrier},
+        ])
+    );
+    assert_eq!(aggregated.body["stop_reason"], json!("tool_use"));
+
+    // Exposure only governs the plaintext display block; the carrier rides
+    // regardless (Fireworks-style hidden reasoning on a tool turn).
+    let hidden = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &tool_turn_reasoning_events(),
+        &[],
+        Some(carrier),
+        false,
+    )
+    .expect("aggregates");
+    assert_eq!(
+        hidden.body["content"],
+        json!([
+            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+            {"type": "redacted_thinking", "data": carrier},
+        ])
+    );
+}
+
+#[test]
+fn tool_turn_reasoning_without_a_sealed_carrier_fails_closed() {
+    // Mirrors the Chat encoders: reasoning the gateway authority did not seal
+    // never leaves as plaintext on a tool turn.
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.start().expect("starts");
+    let events = tool_turn_reasoning_events();
+    let mut error = None;
+    for event in &events {
+        if let Err(failure) = encoder.feed(event) {
+            error = Some(failure);
+            break;
+        }
+    }
+    let error = error.expect("terminal without a carrier fails");
+    assert_eq!(error.status_code, 502);
+    assert!(error.message.contains("not sealed"));
+
+    let aggregated =
+        completed_messages_body_with_reasoning("request-abc", "coding", &events, &[], None, true);
+    assert!(aggregated.is_err());
+}
+
+#[test]
+fn a_stop_sequence_ending_a_reasoning_tool_turn_still_needs_and_emits_the_carrier() {
+    // Both completing terminals demand the sealed carrier, so the route must
+    // seal on `StoppedAtSequence` too (Greptile on #897): with the carrier the
+    // trailing redacted block and the terminal frames flow; without it the
+    // encoder fails closed instead of ending the stream short.
+    let mut events = tool_turn_reasoning_events();
+    events.pop();
+    events.push(Event::StoppedAtSequence("STOP".to_string()));
+    let carrier = "x-experiential-hunyuan-reasoning-v1:ZGVw:c2VhbGVk";
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.set_reasoning_content_carrier(carrier.to_string());
+    let mut frames = encoder.start().expect("starts");
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("streams"));
+    }
+    let names = frame_names(&frames);
+    assert_eq!(names[names.len() - 2..], ["message_delta", "message_stop"]);
+    assert!(frames
+        .iter()
+        .any(|frame| frame.contains("\"redacted_thinking\"")));
+
+    let mut unsealed = MessagesSseEncoder::new("request-abc", "coding");
+    unsealed.start().expect("starts");
+    let error = events
+        .iter()
+        .find_map(|event| unsealed.feed(event).err())
+        .expect("terminal without a carrier fails");
+    assert!(error.message.contains("not sealed"));
 }

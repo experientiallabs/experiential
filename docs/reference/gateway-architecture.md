@@ -179,7 +179,12 @@ possible billable dispatch is visible to the gateway ledger.
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
-engine-derived ones), mid-conversation `system` turns keep their position on wires that express
+engine-derived ones); OpenRouter's `reasoning` object (`effort`, or a `max_tokens` budget, plus
+`enabled` / `exclude`) is accepted as a second effort channel, mapped onto the same canonical
+effort (a budget becomes a budgeted `thinking` config on Anthropic rungs and the nearest tier
+elsewhere), and when it is present it wins: a `thinking` config beside it and a disagreeing
+`output_config.effort` drop with disclosure, `exclude` is disclosed rather than honored, and an
+effort the route cannot serve is rejected as `reasoning.effort`; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
 config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
 Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.
@@ -417,8 +422,11 @@ an identical prompt hits but the same stem with a new tail (every turn of an age
 routed by the whole prompt and usually misses (Tencent TokenHub, measured 2026-09-05: 2 of 8
 shared-stem turns hit with no hint, 10 of 10 with one). The gateway therefore dispatches a
 `prompt_cache_key` on rungs whose wire profile says the provider routes by it (OpenAI, Tencent
-TokenHub; other OpenAI-compatible servers may reject unknown fields, so they never receive it,
-BYOK or not): never the caller's raw value, which shares a house account across tenants, but a
+TokenHub, and OpenRouter, whose documented sticky routing falls back to that field as the session
+key and forwards it upstream, so a provider's own node pin rides along; other OpenAI-compatible
+servers may reject unknown fields, so they never receive it, BYOK or not, and a vLLM origin
+ignores the field because its prefix cache is per engine process and content-addressed): never
+the caller's raw value, which shares a house account across tenants, but a
 digest namespaced by organization and identity (`exp/runtime/gateway/prompt_cache_affinity.py`).
 A caller `prompt_cache_key` is the material when present; otherwise the conversation stem (the
 leading system/developer messages, which every turn of a session and every request sharing that
@@ -430,8 +438,21 @@ the public request, its digests, and replay identity never carry it. LiteLLM mes
 echoed back verbatim: the object is dropped with a `messages.provider_specific_fields`
 disclosure and the empty forms are accepted like the SDK's own empty keys, while populated
 carriers stay rejected by name.
-Thinking carriers replay only on the Anthropic wire, so route admission requires every waterfall
-rung to speak the `anthropic_messages` dialect; on the Responses surface over Anthropic routes,
+Anthropic-signed thinking replays only on the Anthropic wire: a mixed waterfall's Anthropic rung
+re-emits the caller's blocks verbatim, while every foreign wire omits them at encoding and the
+route discloses `messages.thinking->dropped(unsupported_by_provider)` instead of rejecting (the
+blocks are baked into a framework-managed transcript, so a session that switches from a Claude
+model to any other keeps serving). The Messages surface also carries the gateway's OWN preserved
+thinking, mirroring the Chat surface's `reasoning_content` contract: an exposure-gated rung's
+(`reasoning_output_exposed`) plaintext reasoning streams and aggregates as one UNSIGNED `thinking`
+block (Anthropic signs every block it issues, so an unsigned block is recognizably the gateway's),
+and a tool turn's hidden reasoning leaves only as the sealed carrier, in one trailing
+`redacted_thinking` block (the carrier is known once every tool call completed, after the
+sequential thinking block closed; `redacted_thinking` is Anthropic's opaque replay-verbatim
+shape). On replay the decoder maps an unsigned block to the caller-owned plaintext an exposing
+rung forwards (dropped with disclosure elsewhere) and a carrier-prefixed `redacted_thinking`
+payload to the sealed carrier that admission authenticates and pins to its issuing rung,
+dropping the unsigned display duplicate beside it. On the Responses surface over Anthropic routes,
 thinking text is projected onto the reasoning-summary channel (signatures deliberately dropped)
 so callers receive the reasoning they pay for, while the Chat surface has no reasoning
 representation and drops it like summary deltas. Streaming emits the Anthropic
@@ -522,7 +543,13 @@ ceiling is an `incomplete` answer.
 
 Exposure-gated reasoning rungs (Tencent Hunyuan and DeepSeek, rows stamped
 `reasoning_output_exposed`) accept caller-owned plaintext `reasoning_content` on assistant
-history, including tool-call turns. The decoder preserves the text verbatim, including an
+history, including tool-call turns. A rung becomes a preserved-thinking carrier route either by
+host recognition (Tencent's two OpenAI-compatible origins) or by declaring the rung capability
+`reasoning_content_native`, which says the origin returns the standard `reasoning_content` field
+and accepts it back (a self-hosted vLLM origin started with a reasoning parser). It is off by
+default and fails closed: an undeclared origin has no carrier route, and exposure still requires
+`reasoning_output_exposed`. The `prompt_cache_key` node pin stays keyed on Tencent's hosts, since the
+declaration says nothing about whether an origin tolerates unknown request fields. The decoder preserves the text verbatim, including an
 explicitly empty string: a provider can require the field even when the turn performed no
 reasoning. Missing or null values remain absent. Plaintext is bounded to 8,388,608 characters;
 values exceeding that limit receive a named error with the limit and a retry instruction.

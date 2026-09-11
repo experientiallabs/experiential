@@ -37,8 +37,10 @@ pub struct ReasoningCarrierToolCall {
     pub raw_arguments: String,
 }
 
+/// Shared by the Chat and Messages encoders: both surfaces retain the same
+/// hidden-reasoning candidate and seal it under the same authority.
 #[derive(Default)]
-struct ReasoningCarrierState {
+pub(crate) struct ReasoningCarrierState {
     route_sha256: Option<String>,
     content: String,
     assistant_content: String,
@@ -48,7 +50,7 @@ struct ReasoningCarrierState {
 }
 
 impl ReasoningCarrierState {
-    fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
+    pub(crate) fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
         match event {
             Event::TextDelta(delta) => self.assistant_content.push_str(delta),
             Event::ReasoningContentDelta {
@@ -118,7 +120,7 @@ impl ReasoningCarrierState {
         Ok(())
     }
 
-    fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+    pub(crate) fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
         if self.content.is_empty() || self.tool_ids.is_empty() {
             return Ok(None);
         }
