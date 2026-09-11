@@ -50,6 +50,7 @@ from exp.runtime.models.providers.capability_policy import (
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
+    ProviderResponseError,
 )
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
@@ -525,7 +526,12 @@ def protocol_compatible_indexes(
     Returns:
         Ordered compatible indexes and every rung's rejection in route
         order, so the caller can distinguish a route-wide capability gap
-        from rungs declining for different reasons.
+        from rungs declining for different reasons. A payload builder that
+        cannot represent the conversation as sent (for example an assistant
+        turn with neither text nor a tool call) counts as a rung rejection
+        on ``messages``, so a caller-shaped transcript is refused with a
+        field-specific 400 instead of escaping admission as an internal
+        failure.
     """
     indexes: list[int] = []
     errors: list[ProviderParameterError | ProviderCapabilityError] = []
@@ -547,8 +553,32 @@ def protocol_compatible_indexes(
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             errors.append(exc)
             continue
+        except ProviderResponseError as exc:
+            errors.append(_unrepresentable_messages_error(exc))
+            continue
         indexes.append(index)
     return tuple(indexes), tuple(errors)
+
+
+def _unrepresentable_messages_error(exc: ProviderResponseError) -> ProviderParameterError:
+    """Turn a payload builder's transcript rejection into a ``messages`` parameter error.
+
+    Args:
+        exc: The builder's gateway-authored reason the conversation cannot be
+            encoded on this wire.
+
+    Returns:
+        A field-specific pre-dispatch rejection the shared admit handler maps
+        to a caller-facing invalid request.
+    """
+    return ProviderParameterError(
+        message=(
+            f"This model route cannot encode the conversation as sent: {exc}. "
+            "Fix the message history or choose a different model."
+        ),
+        param="messages",
+        code="invalid_parameter",
+    )
 
 
 def shape_parallel_tool_calls(
