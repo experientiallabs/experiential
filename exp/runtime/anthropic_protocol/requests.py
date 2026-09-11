@@ -37,6 +37,10 @@ from exp.common.models.content import (
     TextContentPart,
 )
 from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol.gateway_reasoning import (
+    EMPTY_GATEWAY_BLOCK,
+    gateway_reasoning_block,
+)
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
@@ -746,6 +750,19 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         if content is None and not tool_calls and not reasoning and not attachments:
             ordered_blocks.clear()
             return
+        if any(block.kind == "sealed_reasoning_content" for block in reasoning):
+            # A gateway tool turn returned its reasoning twice: the unsigned
+            # display block that streamed live and the sealed carrier that
+            # holds the same text authenticated. Only the carrier replays.
+            reasoning[:] = [
+                block for block in reasoning if block.kind != "exposed_reasoning_content"
+            ]
+        # The verbatim block order exists for Anthropic-signed history, whose
+        # signatures the provider verifies in place; gateway-issued blocks
+        # (unsigned plaintext, sealed carriers) never replay on that wire.
+        anthropic_thinking = any(
+            block.kind in {"thinking", "redacted_thinking"} for block in reasoning
+        )
         out.append(
             GatewayMessage(
                 role=message.role,
@@ -757,7 +774,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.
                 provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
-                provider_anthropic_blocks=tuple(ordered_blocks) if reasoning else None,
+                provider_anthropic_blocks=tuple(ordered_blocks) if anthropic_thinking else None,
             )
         )
         text_parts.clear()
@@ -821,12 +838,16 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     f"{param}.content.{block_index}",
                     "thinking blocks are only valid in assistant messages.",
                 )
-            reasoning.append(
-                ThinkingBlock(text=block.thinking, signature=block.signature)
-                if isinstance(block, _ThinkingBlock)
-                else RedactedThinkingBlock(data=block.data)
-            )
-            ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+            gateway_block = gateway_reasoning_block(block, f"{param}.content.{block_index}")
+            if gateway_block is None:
+                reasoning.append(
+                    ThinkingBlock(text=block.thinking, signature=block.signature)
+                    if isinstance(block, _ThinkingBlock)
+                    else RedactedThinkingBlock(data=block.data)
+                )
+                ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+            elif gateway_block is not EMPTY_GATEWAY_BLOCK:
+                reasoning.append(gateway_block)
         elif isinstance(block, _ToolUseBlock):
             if message.role != "assistant":
                 raise invalid_field(

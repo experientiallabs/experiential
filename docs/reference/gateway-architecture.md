@@ -435,8 +435,21 @@ the public request, its digests, and replay identity never carry it. LiteLLM mes
 echoed back verbatim: the object is dropped with a `messages.provider_specific_fields`
 disclosure and the empty forms are accepted like the SDK's own empty keys, while populated
 carriers stay rejected by name.
-Thinking carriers replay only on the Anthropic wire, so route admission requires every waterfall
-rung to speak the `anthropic_messages` dialect; on the Responses surface over Anthropic routes,
+Anthropic-signed thinking replays only on the Anthropic wire: a mixed waterfall's Anthropic rung
+re-emits the caller's blocks verbatim, while every foreign wire omits them at encoding and the
+route discloses `messages.thinking->dropped(unsupported_by_provider)` instead of rejecting (the
+blocks are baked into a framework-managed transcript, so a session that switches from a Claude
+model to any other keeps serving). The Messages surface also carries the gateway's OWN preserved
+thinking, mirroring the Chat surface's `reasoning_content` contract: an exposure-gated rung's
+(`reasoning_output_exposed`) plaintext reasoning streams and aggregates as one UNSIGNED `thinking`
+block (Anthropic signs every block it issues, so an unsigned block is recognizably the gateway's),
+and a tool turn's hidden reasoning leaves only as the sealed carrier, in one trailing
+`redacted_thinking` block (the carrier is known once every tool call completed, after the
+sequential thinking block closed; `redacted_thinking` is Anthropic's opaque replay-verbatim
+shape). On replay the decoder maps an unsigned block to the caller-owned plaintext an exposing
+rung forwards (dropped with disclosure elsewhere) and a carrier-prefixed `redacted_thinking`
+payload to the sealed carrier that admission authenticates and pins to its issuing rung,
+dropping the unsigned display duplicate beside it. On the Responses surface over Anthropic routes,
 thinking text is projected onto the reasoning-summary channel (signatures deliberately dropped)
 so callers receive the reasoning they pay for, while the Chat surface has no reasoning
 representation and drops it like summary deltas. Streaming emits the Anthropic

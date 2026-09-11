@@ -11,9 +11,11 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
+    ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayNamedToolChoice,
     RedactedThinkingBlock,
+    SealedReasoningContentBlock,
     ThinkingBlock,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -277,13 +279,18 @@ def test_thinking_history_blocks_ride_the_opaque_carrier_in_order() -> None:
     assert redacted.data == "opaque=="
 
     # A thinking-only assistant turn (cut off mid-thinking) is legal history.
+    # Anthropic signs the block even when max_tokens cuts it short; an
+    # UNSIGNED block is the gateway's own exposed reasoning (see
+    # test_unsigned_thinking_block_decodes_as_gateway_plaintext_reasoning).
     only = decode_messages(
         _body(
             messages=[
                 {"role": "user", "content": "go"},
                 {
                     "role": "assistant",
-                    "content": [{"type": "thinking", "thinking": "partial"}],
+                    "content": [
+                        {"type": "thinking", "thinking": "partial", "signature": "sig-cut"}
+                    ],
                 },
                 {"role": "user", "content": "continue"},
             ]
@@ -1881,3 +1888,152 @@ def test_openrouter_reasoning_wins_over_thinking_and_output_config_with_disclosu
         _body(reasoning={"effort": "high"}, output_config={"effort": "high"})
     )
     assert agreeing.request.ignored_parameters == ()
+
+
+_CARRIER = "x-experiential-hunyuan-reasoning-v1:ZGVwbG95bWVudC0x:c2VhbGVkLWVudmVsb3Bl"
+"""One syntactically complete Hunyuan carrier (deployment hint + envelope)."""
+
+
+def test_unsigned_thinking_block_decodes_as_gateway_plaintext_reasoning() -> None:
+    """A thinking block with no signature is the gateway's own exposed reasoning.
+
+    Anthropic signs every thinking block it issues; the Messages surface
+    renders a Tencent/DeepSeek rung's plaintext reasoning as an UNSIGNED
+    thinking block, so on replay it decodes exactly like Chat's plaintext
+    ``reasoning_content``: caller-owned history that exposing rungs forward
+    and every other rung drops with disclosure. It is not an Anthropic block,
+    so no verbatim block order is retained for the Anthropic wire.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "the user wants ls", "signature": ""},
+                        {"type": "text", "text": '{"command": "ls"}'},
+                    ],
+                },
+                {"role": "user", "content": "a.txt"},
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert assistant.content == '{"command": "ls"}'
+    assert [block.kind for block in assistant.provider_reasoning] == ["exposed_reasoning_content"]
+    exposed = assistant.provider_reasoning[0]
+    assert isinstance(exposed, ExposedReasoningContentBlock)
+    assert exposed.content == "the user wants ls"
+    assert assistant.provider_anthropic_blocks is None
+
+    # An unsigned block with no text carries nothing worth replaying.
+    empty = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "", "signature": ""},
+                        {"type": "text", "text": "ok"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ]
+        )
+    )
+    assert empty.request.messages[1].provider_reasoning == ()
+
+
+def test_redacted_thinking_carrying_a_gateway_carrier_decodes_sealed() -> None:
+    """A redacted_thinking block whose data is a gateway carrier is the sealed carrier.
+
+    The Messages tool turn returns its reasoning as one trailing
+    redacted_thinking block holding the sealed carrier (Anthropic's opaque
+    replay-verbatim shape). On replay it decodes to the same sealed block the
+    Chat wire's carrier decodes to, and the unsigned display block that
+    streamed beside it is dropped: the carrier holds that text authenticated.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "think privately", "signature": ""},
+                        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+                        {"type": "redacted_thinking", "data": _CARRIER},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                    ],
+                },
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert assistant.tool_calls[0].call_id == "call-1"
+    assert [block.kind for block in assistant.provider_reasoning] == ["sealed_reasoning_content"]
+    sealed = assistant.provider_reasoning[0]
+    assert isinstance(sealed, SealedReasoningContentBlock)
+    assert sealed.carrier == _CARRIER
+    assert sealed.deployment_hint == "deployment-1"
+    assert assistant.provider_anthropic_blocks is None
+
+    # A carrier-prefixed payload that is not a complete carrier names its block.
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "go"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+                            {
+                                "type": "redacted_thinking",
+                                "data": "x-experiential-hunyuan-reasoning-v1:broken",
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                        ],
+                    },
+                ]
+            )
+        )
+    assert rejected.value.detail.param == "messages.1.content.1"
+
+
+def test_anthropic_signed_thinking_still_decodes_verbatim_beside_gateway_blocks() -> None:
+    """A provider-signed block keeps its Anthropic contract; only unsigned ones are ours."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                        {"type": "redacted_thinking", "data": "opaque=="},
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert [block.kind for block in assistant.provider_reasoning] == [
+        "thinking",
+        "redacted_thinking",
+    ]
+    assert assistant.provider_anthropic_blocks is not None

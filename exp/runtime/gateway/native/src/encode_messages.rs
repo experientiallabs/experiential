@@ -8,11 +8,20 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Map, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
-use crate::encode::{compact_json, stable_public_id};
+use crate::encode::{
+    compact_json, stable_public_id, ReasoningCarrierCandidate, ReasoningCarrierState,
+};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 
 const REFUSAL_MESSAGE: &str = "provider refused the request";
+
+/// The provider block index under which an exposure-gated rung's plaintext
+/// reasoning (`ReasoningContentDelta`, an OpenAI-wire event with no block
+/// index of its own) is scheduled as one Messages thinking block. Anthropic
+/// dialects index their thinking blocks from zero and never share a stream
+/// with an OpenAI-wire rung, so the reserved value cannot collide.
+const EXPOSED_REASONING_BLOCK_INDEX: u32 = u32::MAX;
 
 /// The sanitized failure for provider refusals on this surface, mirroring
 /// `refusal_failure` in the python encoder.
@@ -206,6 +215,9 @@ pub struct MessagesSseEncoder {
     refusal_seen: bool,
     usage: Option<Usage>,
     ignored_parameters: Vec<String>,
+    reasoning: ReasoningCarrierState,
+    reasoning_content_carrier: Option<String>,
+    reasoning_output_exposed: bool,
 }
 
 impl MessagesSseEncoder {
@@ -241,7 +253,38 @@ impl MessagesSseEncoder {
             saw_tool_use: false,
             refusal_seen: false,
             usage: None,
+            reasoning: ReasoningCarrierState::default(),
+            reasoning_content_carrier: None,
+            reasoning_output_exposed: false,
         }
+    }
+
+    /// Attach the authenticated carrier before the terminal is encoded.
+    ///
+    /// Mirrors `ChatSseEncoder::set_reasoning_content_carrier`: a tool turn's
+    /// hidden reasoning leaves only as the sealed carrier, here as one trailing
+    /// `redacted_thinking` block (Anthropic's opaque replay-verbatim shape).
+    pub fn set_reasoning_content_carrier(&mut self, carrier: String) {
+        self.reasoning_content_carrier = Some(carrier);
+    }
+
+    /// Show the model's plaintext reasoning to the caller as a thinking block.
+    ///
+    /// Off by default so hidden-reasoning providers never leak; on only for
+    /// rungs the catalog marks `reasoning_output_exposed` (Tencent/DeepSeek),
+    /// whose plaintext the Chat wire already returns as `reasoning_content`.
+    /// The block carries an EMPTY signature: Anthropic signs every thinking
+    /// block it issues, so an unsigned block is recognizably the gateway's own
+    /// plaintext when the caller replays it.
+    pub fn set_reasoning_output_exposed(&mut self, exposed: bool) {
+        self.reasoning_output_exposed = exposed;
+    }
+
+    /// Return the validated carrier candidate accumulated by a live stream.
+    pub fn reasoning_carrier_candidate(
+        &self,
+    ) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+        self.reasoning.candidate()
     }
 
     /// Emit the `message_start` and `ping` lifecycle events once.
@@ -292,6 +335,7 @@ impl MessagesSseEncoder {
                 "Messages stream received an event after its terminal.",
             ));
         }
+        self.reasoning.observe(event)?;
         match event {
             Event::TextDelta(text) => self.text_delta(text),
             Event::ProviderTextDelta { delta, .. } => self.text_delta(delta),
@@ -301,6 +345,17 @@ impl MessagesSseEncoder {
                 self.refusal_seen = true;
                 Ok(Vec::new())
             }
+            Event::ReasoningContentDelta { delta, .. } => {
+                // An exposure-gated rung's plaintext reasoning streams as one
+                // unsigned thinking block, the Messages twin of the Chat
+                // wire's `reasoning_content` deltas; elsewhere it stays
+                // dropped. The sealed tool-turn carrier rides independently.
+                if self.reasoning_output_exposed && !delta.is_empty() {
+                    self.thinking_delta(EXPOSED_REASONING_BLOCK_INDEX, delta)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
             Event::ProviderRefusalDelta { .. } => {
                 self.refusal_seen = true;
                 Ok(Vec::new())
@@ -309,8 +364,7 @@ impl MessagesSseEncoder {
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
-            | Event::EncryptedReasoning { .. }
-            | Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
+            | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
             Event::ThinkingSignature { index, signature } => {
                 self.thinking_signature(*index, signature)
@@ -415,8 +469,22 @@ impl MessagesSseEncoder {
                 if self.refusal_seen {
                     return Ok(vec![error_frame(&refusal_failure())]);
                 }
+                let mut frames = Vec::new();
+                if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
+                    && self.reasoning.candidate()?.is_some()
+                {
+                    // The carrier is known only once every tool call has
+                    // completed, after the sequential thinking block closed,
+                    // so it travels as one trailing opaque block.
+                    let carrier = self.reasoning_content_carrier.clone().ok_or_else(|| {
+                        invalid_provider_stream(
+                            "Messages reasoning content was not sealed by the gateway authority.",
+                        )
+                    })?;
+                    frames.extend(self.redacted_thinking(&carrier)?);
+                }
                 self.draining = true;
-                let mut frames = self.advance();
+                frames.extend(self.advance());
                 frames.push(event_frame(
                     "message_delta",
                     &json!({
@@ -859,7 +927,7 @@ impl MessagesSseEncoder {
 
 mod aggregate;
 
-pub use aggregate::{completed_messages_body, completed_messages_body_with_ignored};
+pub use aggregate::{completed_messages_body, completed_messages_body_with_reasoning};
 
 /// Attach the `x-experiential-ignored-parameters` disclosure to one message
 /// object when any control was dropped; an empty list adds nothing.

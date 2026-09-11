@@ -22,7 +22,7 @@ use crate::admission::{
 };
 use crate::encode::compact_json;
 use crate::encode_messages::{
-    anthropic_error_body, completed_messages_body_with_ignored, MessagesSseEncoder,
+    anthropic_error_body, completed_messages_body_with_reasoning, MessagesSseEncoder,
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -32,6 +32,7 @@ use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
     latin1_header_list, read_body, send_bounded, settle_stream_end, sse_body_response,
 };
+use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
@@ -231,7 +232,7 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
             if admission.stream {
                 // The withheld refusal output and its failing terminal flush
                 // outward as the stream's only frames.
-                let body = match encode_messages_sse(admission, &events) {
+                let body = match encode_messages_sse(admission, &events, None, false) {
                     Ok(body) => body,
                     Err(error) => return messages_error_response(&error),
                 };
@@ -244,18 +245,23 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
     }
     let mut headers = commit_independent(admission, None);
     headers.extend(commit_dependent(admission, settled.depth));
+    // A settled attempt carries no semantic output, so no reasoning was
+    // issued and nothing needs sealing; exposure only governs display.
+    let exposed = admission.reasoning_exposed_at(settled.depth);
     if admission.stream {
-        let body = match encode_messages_sse(admission, &events) {
+        let body = match encode_messages_sse(admission, &events, None, exposed) {
             Ok(body) => body,
             Err(error) => return messages_error_response(&error),
         };
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_messages_body_with_ignored(
+    let aggregated = match completed_messages_body_with_reasoning(
         &admission.request_id,
         &admission.alias,
         &events,
         &admission.ignored_parameters,
+        None,
+        exposed,
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => return messages_error_response(&error),
@@ -279,11 +285,30 @@ async fn respond_from_messages_events(
     stream_body: bool,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
-    let aggregated = match completed_messages_body_with_ignored(
+    // A tool turn's hidden reasoning leaves only as the sealed carrier, so it
+    // is sealed under the gateway authority before the body is assembled,
+    // exactly like the Chat surface (`respond_from_chat_events`).
+    let carrier = if refusal_completed.is_some() {
+        None
+    } else {
+        match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
+            Ok(carrier) => carrier,
+            Err(failure) => {
+                guard
+                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
+                    .await;
+                return messages_error_response(&failure.public_error());
+            }
+        }
+    };
+    let exposed = admission.reasoning_exposed_at(depth);
+    let aggregated = match completed_messages_body_with_reasoning(
         &admission.request_id,
         &admission.alias,
         &events,
         &admission.ignored_parameters,
+        carrier.as_deref(),
+        exposed,
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
@@ -354,7 +379,7 @@ async fn respond_from_messages_events(
     let mut headers = commit_independent(&admission, None);
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
-        let body = match encode_messages_sse(&admission, &events) {
+        let body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
             Ok(body) => body,
             Err(error) => return messages_error_response(&error),
         };
@@ -363,12 +388,21 @@ async fn respond_from_messages_events(
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
 
-fn encode_messages_sse(admission: &Admission, events: &[Event]) -> Result<Vec<u8>, PublicError> {
+fn encode_messages_sse(
+    admission: &Admission,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+    reasoning_output_exposed: bool,
+) -> Result<Vec<u8>, PublicError> {
     let mut encoder = MessagesSseEncoder::new_with_ignored(
         &admission.request_id,
         &admission.alias,
         admission.ignored_parameters.clone(),
     );
+    encoder.set_reasoning_output_exposed(reasoning_output_exposed);
+    if let Some(carrier) = reasoning_content_carrier {
+        encoder.set_reasoning_content_carrier(carrier.to_string());
+    }
     let mut body = Vec::new();
     for frame in encoder.start()? {
         body.extend_from_slice(frame.as_bytes());
@@ -506,6 +540,7 @@ async fn stream_messages(
         let mut committed = committed;
         let mut encoder =
             MessagesSseEncoder::new_with_ignored(&request_id, &alias, ignored_parameters);
+        encoder.set_reasoning_output_exposed(admission.reasoning_exposed_at(committed.depth));
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;
@@ -580,6 +615,31 @@ async fn stream_messages(
                 other => other.clone(),
             };
             if event.is_terminal() {
+                if matches!(event, Event::Completed) {
+                    // Mirrors the Chat stream: a completed tool turn with
+                    // hidden reasoning is sealed before its terminal frames.
+                    let candidate = match encoder.reasoning_carrier_candidate() {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            fail_stream!(Failure::new(
+                                FailureClass::MalformedResponse,
+                                "provider returned malformed reasoning continuation data",
+                            ))
+                        }
+                    };
+                    match seal_reasoning_candidate(
+                        &guard.bridge,
+                        &request_id,
+                        committed.depth,
+                        candidate,
+                    )
+                    .await
+                    {
+                        Ok(Some(carrier)) => encoder.set_reasoning_content_carrier(carrier),
+                        Ok(None) => {}
+                        Err(failure) => fail_stream!(failure),
+                    }
+                }
                 terminal = Some(event.clone());
                 if !settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
                     .await

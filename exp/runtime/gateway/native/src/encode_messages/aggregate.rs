@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::encode::stable_public_id;
+use crate::encode::{reasoning_carrier_candidate, stable_public_id};
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
 
@@ -29,16 +29,22 @@ pub fn completed_messages_body(
     model: &str,
     events: &[Event],
 ) -> Result<AggregatedMessage, PublicError> {
-    completed_messages_body_with_ignored(request_id, model, events, &[])
+    completed_messages_body_with_reasoning(request_id, model, events, &[], None, false)
 }
 
-/// Build one non-streaming Anthropic message with ignored-control disclosure,
-/// mirroring `completed_chat_body_with_ignored`.
-pub fn completed_messages_body_with_ignored(
+/// Build one non-streaming Anthropic message carrying the turn's reasoning,
+/// mirroring `completed_chat_body_with_carrier`: an exposure-gated rung's
+/// plaintext reasoning leads the content as one UNSIGNED thinking block, and a
+/// tool turn's hidden reasoning closes it as one `redacted_thinking` block
+/// holding the sealed carrier (never plaintext: a CoT-injection vector on the
+/// way back in). The block sequence equals the streaming encoder's.
+pub fn completed_messages_body_with_reasoning(
     request_id: &str,
     model: &str,
     events: &[Event],
     ignored_parameters: &[String],
+    reasoning_content_carrier: Option<&str>,
+    reasoning_output_exposed: bool,
 ) -> Result<AggregatedMessage, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
@@ -101,6 +107,21 @@ pub fn completed_messages_body_with_ignored(
     // compatible streams) emit every tool completion only at their terminal
     // sentinel, after later text.
     let mut slots: Vec<Option<Value>> = Vec::new();
+    let reasoning = reasoning_carrier_candidate(events)?;
+    if reasoning_output_exposed {
+        let reasoning_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ReasoningContentDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !reasoning_text.is_empty() {
+            slots.push(Some(
+                json!({"type": "thinking", "thinking": reasoning_text, "signature": ""}),
+            ));
+        }
+    }
     let mut tool_positions: HashMap<u32, usize> = HashMap::new();
     let mut server_positions: HashMap<u32, usize> = HashMap::new();
     let mut thinking_positions: HashMap<u32, usize> = HashMap::new();
@@ -228,6 +249,20 @@ pub fn completed_messages_body_with_ignored(
             }
             _ => {}
         }
+    }
+    if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_))
+        && saw_tool_use
+        && reasoning.is_some()
+    {
+        let carrier = reasoning_content_carrier.ok_or_else(|| {
+            PublicError::new(
+                502,
+                "invalid_provider_stream",
+                "Messages reasoning content was not sealed by the gateway authority.",
+                "api_error",
+            )
+        })?;
+        slots.push(Some(json!({"type": "redacted_thinking", "data": carrier})));
     }
     let content: Vec<Value> = slots.into_iter().flatten().collect();
     let mut body = json!({

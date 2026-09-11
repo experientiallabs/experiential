@@ -1283,13 +1283,15 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
     }
 
 
-def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
+def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
     engine: _ServingEngine,
 ) -> None:
-    """Replayed thinking HISTORY needs an Anthropic-only route and rejects
-    with no upstream dispatch; a live thinking CONFIG instead serves through
-    the admission coercion (dropped with disclosure on this non-reasoning
-    OpenAI-compatible route) because Claude Code pins one on every model."""
+    """Replayed Anthropic thinking HISTORY serves on a non-Anthropic route with
+    the drop disclosed and the blocks omitted upstream (Claude Code carries
+    Claude's signed blocks into every later turn of a session, so the old
+    pre-dispatch 400 killed every session that switched models); a live
+    thinking CONFIG likewise serves through the admission coercion (dropped
+    with disclosure on this non-reasoning OpenAI-compatible route)."""
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
 
@@ -1313,13 +1315,14 @@ def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
         f"{engine.base}/v1/messages",
         headers={"x-api-key": engine.raw_key},
         json={
-            **_messages_body("must-not-dispatch"),
+            **_messages_body("thinking-history-serves"),
             "messages": [
                 {"role": "user", "content": "go"},
                 {
                     "role": "assistant",
                     "content": [
                         {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                        {"type": "redacted_thinking", "data": "opaque=="},
                         {"type": "text", "text": "done"},
                     ],
                 },
@@ -1328,11 +1331,18 @@ def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
         },
         timeout=10.0,
     )
-    assert history.status_code == 400
-    assert "thinking" in history.json()["error"]["message"]
-
+    assert history.status_code == 200
+    assert (
+        "messages.thinking->dropped(unsupported_by_provider)"
+        in history.json()["x-experiential-ignored-parameters"]
+    )
     with _SseUpstream.payloads_lock:
-        assert len(_SseUpstream.payloads) == dispatched_before
+        dispatched_history = _SseUpstream.payloads[dispatched_before:]
+    assert len(dispatched_history) == 1
+    sent = json.dumps(dispatched_history[0])
+    assert "private" not in sent
+    assert "opaque==" not in sent
+    assert "done" in sent
 
 
 def test_encrypted_reasoning_include_rejects_non_responses_routes(

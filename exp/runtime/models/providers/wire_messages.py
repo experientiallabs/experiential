@@ -97,10 +97,14 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             # Plaintext reasoning replays only on an exposure-gated Chat rung;
             # route narrowing disclosed the drop for this wire.
             continue
+        if block.kind in {"thinking", "redacted_thinking"}:
+            # Anthropic-signed thinking replays only on its own wire; route
+            # shaping disclosed the drop for this one.
+            continue
         if block.kind != "encrypted_reasoning":
-            # Anthropic thinking cannot replay on the OpenAI wire; route
+            # A gateway reasoning carrier belongs to the Chat wire; route
             # admission rejects the combination before dispatch.
-            raise ProviderResponseError("thinking blocks cannot replay on the Responses wire")
+            raise ProviderResponseError("reasoning carriers cannot replay on the Responses wire")
         # Reasoning items precede the assistant action they belong to, and
         # the encrypted payload is the round-trip authority; the display-only
         # summary is deliberately empty on replay. The item id and status are
@@ -569,10 +573,17 @@ def openai_chat_message(
             }
             for call in message.tool_calls
         ]
-    if message.provider_reasoning:
-        if len(message.provider_reasoning) != 1:
+    # Anthropic-signed thinking replays only on its own wire; route shaping
+    # disclosed the drop for this one, so the Chat wire omits those blocks.
+    chat_reasoning = tuple(
+        block
+        for block in message.provider_reasoning
+        if block.kind not in {"thinking", "redacted_thinking"}
+    )
+    if chat_reasoning:
+        if len(chat_reasoning) != 1:
             raise ProviderResponseError("Chat reasoning history requires exactly one carrier")
-        block = message.provider_reasoning[0]
+        block = chat_reasoning[0]
         if block.kind == "exposed_reasoning_content":
             if reasoning_output_exposed or deepseek_reasoning_history:
                 payload["reasoning_content"] = block.content
