@@ -16,7 +16,6 @@ from exp.common.models import (
     ModelResponse,
     ModelSnapshot,
 )
-from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.content import (
     AudioContentPart,
     DocumentContentPart,
@@ -25,6 +24,7 @@ from exp.common.models.content import (
     TextContentPart,
     VideoContentPart,
 )
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,

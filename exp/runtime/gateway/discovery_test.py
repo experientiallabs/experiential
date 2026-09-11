@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.discovery import (
     public_model_list,

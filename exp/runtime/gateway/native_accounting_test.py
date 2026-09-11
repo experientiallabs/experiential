@@ -10,10 +10,10 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import (
-    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
 )
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.contracts import (

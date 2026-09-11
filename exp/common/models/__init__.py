@@ -2,7 +2,6 @@
 
 from exp.common.models.catalog import (
     ConnectionConfig,
-    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayLongContextTier,
     GatewayTokenPrices,
@@ -32,6 +31,7 @@ from exp.common.models.discovery import (
     serves_role,
 )
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.gateway_catalog import (
     FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     GATEWAY_EXCLUDED_PROVIDERS,

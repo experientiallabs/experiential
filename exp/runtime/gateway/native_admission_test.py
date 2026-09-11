@@ -7,7 +7,6 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import (
-    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
     GatewayServiceTierPrices,
@@ -20,6 +19,7 @@ from exp.common.models.content import (
     TextContentPart,
     VideoContentPart,
 )
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.contracts import (

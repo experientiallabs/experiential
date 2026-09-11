@@ -9,12 +9,12 @@ import pytest
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
-    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
     ModelCatalog,
     ModelRecord,
 )
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,

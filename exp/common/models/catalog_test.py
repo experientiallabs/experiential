@@ -20,7 +20,6 @@ from exp.common.models import (
     ModelRecord,
     ModelRoles,
     ModelSnapshot,
-    ReasoningEffort,
     SFTModelProvenance,
     load_model_catalog,
     write_model_catalog,
@@ -356,42 +355,6 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
         "max",
     )
     assert "input_nano_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize(
-    "values",
-    (("high", "low"), ("high", "high")),
-)
-def test_gateway_reasoning_efforts_require_unique_canonical_order(
-    values: tuple[ReasoningEffort, ...],
-) -> None:
-    """Ambiguous provider effort sets fail when the catalog is authored."""
-    with pytest.raises(ValueError):
-        GatewayDeploymentCapabilities(supported_reasoning_efforts=values)
-
-
-def test_required_gateway_reasoning_effort_needs_supported_values() -> None:
-    """A mandatory wire parameter cannot omit its provider value domain."""
-    with pytest.raises(ValueError, match="at least one supported reasoning effort"):
-        GatewayDeploymentCapabilities(reasoning_effort_required=True)
-
-
-def test_required_gateway_reasoning_effort_needs_an_explicit_default() -> None:
-    """A mandatory wire parameter cannot force admission to guess its value."""
-    with pytest.raises(ValueError, match="needs reasoning_default_effort"):
-        GatewayDeploymentCapabilities(
-            supported_reasoning_efforts=("low", "high"),
-            reasoning_effort_required=True,
-        )
-
-
-def test_gateway_reasoning_default_must_be_supported() -> None:
-    """A provider default outside the exact domain fails catalog loading."""
-    with pytest.raises(ValueError, match="must be one of the supported"):
-        GatewayDeploymentCapabilities(
-            supported_reasoning_efforts=("low", "high"),
-            reasoning_default_effort="max",
-        )
 
 
 @pytest.mark.parametrize("capabilities", (None, ModelCapabilities()))
@@ -802,25 +765,6 @@ def test_declared_foundry_endpoint_spellings_keep_their_stored_identity() -> Non
 
     assert root.identity_sha256() == with_models.identity_sha256()
     assert root.identity_sha256() != with_v1_root.identity_sha256()
-
-
-def test_astra_responses_capability_slots_default_off() -> None:
-    """The three GPT-6 Astra Responses capability slots exist and default off.
-
-    These are declaration slots for async function calling, mid-turn steering,
-    and mid-conversation reasoning-effort updates. They default False (no
-    deployment advertises a behavior the decoder/turn lifecycle does not yet
-    honor) and, being defaulted, stay identity-invisible (see
-    gateway_catalog_test's identity-digest pin). The platform's
-    generation-capability vocabulary is drift-locked to these field names, so
-    they must remain present for that projection to admit the keys.
-    """
-    caps = GatewayDeploymentCapabilities()
-    assert caps.supports_async_tools is False
-    assert caps.supports_mid_turn_steering is False
-    assert caps.supports_reasoning_effort_update is False
-    # Defaulted addition contributes zero identity bytes.
-    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
 
 
 def test_for_service_tier_reprices_whole_request_for_flex_and_priority() -> None:
