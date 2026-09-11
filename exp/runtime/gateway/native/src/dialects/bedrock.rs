@@ -402,6 +402,7 @@ mod bedrock_tests {
                     "input_tokens": 9,
                     "output_tokens": 4,
                     "cached_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
                     "reasoning_tokens": null,
                 }),
                 json!({"kind": "completed"}),

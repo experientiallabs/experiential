@@ -52,15 +52,17 @@ pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
-    /// Cache-write tokens inside the input total, present only when the
-    /// provider reported a POSITIVE count: Anthropic `cache_creation_input_tokens`
-    /// (the sum of its 5-minute and 1-hour `cache_creation` legs), Bedrock
+    /// Cache-write tokens inside the input total, exactly as the wire reported
+    /// them, zero included: Anthropic `cache_creation_input_tokens` (the sum of
+    /// its 5-minute and 1-hour `cache_creation` legs), Bedrock
     /// `cacheWriteInputTokens`, OpenAI `prompt_tokens_details.cache_write_tokens`
     /// (Chat) / `input_tokens_details.cache_write_tokens` (Responses). `None`
-    /// covers both "the wire has no such count" (Gemini, relays that strip the
-    /// detail) and "reported zero", so settlement prices `None` as zero writes
-    /// and never approximates one. Rides the settle callback (`cache_creation_input_tokens`)
-    /// and the client usage blocks (Claude Code displays it).
+    /// means the wire gave NO usable write count (Gemini, OpenAI models and
+    /// compatible relays that omit the detail) — never "reported zero" — so a
+    /// consumer may approximate only a `None` leg and must price a reported
+    /// `0` as zero writes. Rides the settle callback
+    /// (`cache_creation_input_tokens`) and the client usage blocks (Claude
+    /// Code displays it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,

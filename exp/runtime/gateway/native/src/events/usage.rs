@@ -67,14 +67,6 @@ fn optional_usage_detail(
     }
 }
 
-/// Keep a cache-write leg only when it is positive: `Usage.cache_creation_input_tokens`
-/// is `None` for "no positive write count reported", whether the wire omits
-/// the field (relays that strip details, Gemini) or reports zero (a cache
-/// hit, or an OpenAI model that does not bill writes and reports `0`).
-fn positive_cache_write(count: Option<u64>) -> Option<u64> {
-    count.filter(|count| *count > 0)
-}
-
 /// Sum persistable legs into one ledger count. Individually persistable legs
 /// whose total is not are a provider contract violation, never a clamped or
 /// wrapped total.
@@ -124,8 +116,9 @@ fn fold_openai_shaped_reasoning(
 /// the provider's `total_tokens` shows it was reported additively.
 /// `input_tokens_details.cache_write_tokens` (the prompt-cache write leg
 /// OpenAI bills at a premium on GPT-5.6 and later; reported as `0` on models
-/// that do not bill writes) rides as `cache_creation_input_tokens` when
-/// positive. Both details are subsets of `input_tokens`.
+/// that do not bill writes) rides as `cache_creation_input_tokens` exactly as
+/// reported, zero included; an absent detail leaves the leg unknown. Both
+/// details are subsets of `input_tokens`.
 pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -159,12 +152,12 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
             "cached_tokens",
             "OpenAI cached_tokens",
         )?,
-        cache_creation_input_tokens: positive_cache_write(optional_usage_detail(
+        cache_creation_input_tokens: optional_usage_detail(
             object,
             "input_tokens_details",
             "cache_write_tokens",
             "OpenAI cache_write_tokens",
-        )?),
+        )?,
         reasoning_tokens,
     }))
 }
@@ -175,8 +168,8 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
 /// when the provider's `total_tokens` shows it was reported additively.
 /// `prompt_tokens_details.cache_write_tokens` (OpenAI's billed cache-write
 /// leg, a subset of `prompt_tokens` like `cached_tokens`) rides as
-/// `cache_creation_input_tokens` when positive; compatible relays that omit
-/// the detail leave it unknown.
+/// `cache_creation_input_tokens` exactly as reported, zero included;
+/// compatible relays that omit the detail leave it unknown.
 pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     let object = value
         .as_object()
@@ -206,12 +199,12 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
             "cached_tokens",
             "cached_tokens",
         )?,
-        cache_creation_input_tokens: positive_cache_write(optional_usage_detail(
+        cache_creation_input_tokens: optional_usage_detail(
             object,
             "prompt_tokens_details",
             "cache_write_tokens",
             "cache_write_tokens",
-        )?),
+        )?,
         reasoning_tokens,
     })
 }
@@ -266,9 +259,10 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
 }
 
 /// Parse Bedrock `metadata.usage`: cache read and write legs fold into total
-/// input, cached input reports the read leg, a positive write leg rides as
+/// input, cached input reports the read leg, the write leg rides as
 /// `cache_creation_input_tokens` (Converse bills it at the provider's
-/// cache-write rate), and absent counts are zero (`require_integer` parity).
+/// cache-write rate; the wire omits zero-valued legs, so absent is a
+/// reported zero), and absent counts are zero (`require_integer` parity).
 /// Legs and the folded total beyond the persistable ledger range are provider
 /// contract violations and fail the stream rather than reaching settlement as
 /// a value the ledger could never write. Converse bills a reasoning model's thinking inside `outputTokens`
@@ -297,7 +291,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "Bedrock outputTokens",
         )?),
         cached_input_tokens: Some(cache_read),
-        cache_creation_input_tokens: positive_cache_write(Some(cache_write)),
+        cache_creation_input_tokens: Some(cache_write),
         reasoning_tokens: None,
     })
 }

@@ -540,7 +540,9 @@ def test_anthropic_results_fold_cache_legs_into_input_and_name_the_subsets() -> 
     read = results["line-1"]
     assert (read.input_tokens, read.output_tokens) == (4510, 16)
     assert read.cached_input_tokens == 4501
-    assert read.cache_creation_input_tokens is None
+    # The Anthropic wire reports its write leg on every turn, so a read turn
+    # carries a reported zero rather than an unknown leg.
+    assert read.cache_creation_input_tokens == 0
 
 
 def test_anthropic_canceled_and_expired_lines_carry_a_reason() -> None:

@@ -77,8 +77,9 @@ fn settle_argument(
             "output_tokens": usage.output_tokens,
             "cached_input_tokens": usage.cached_input_tokens,
             // The billed cache-write subset of input_tokens (see
-            // `events::Usage`); null when the wire reported no positive
-            // count, which the control plane prices as zero writes.
+            // `events::Usage`): a reported zero rides as 0; null means the
+            // wire gave no usable count (the control plane may approximate
+            // only that case).
             "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
         })),
@@ -473,8 +474,8 @@ mod tests {
     #[test]
     fn settle_argument_carries_the_cache_write_leg_beside_the_other_counts() {
         // The control plane prices the write subset at the cache-write rate,
-        // so the settle payload names it; an unknown leg rides as null (the
-        // control plane's backward-compatible parse reads null as zero writes).
+        // so the settle payload names it; an unknown leg rides as null, which
+        // the control plane may approximate, while a reported zero rides as 0.
         let with_write = Usage {
             input_tokens: Some(9080),
             output_tokens: Some(32),

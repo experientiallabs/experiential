@@ -36,14 +36,14 @@ class GatewayUsage(ContractModel):
     output_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    """Billed cache-write tokens inside the input total, present only when the
-    provider reported a POSITIVE count: Anthropic ``cache_creation_input_tokens``
+    """Billed cache-write tokens inside the input total, exactly as the wire
+    reported them, zero included: Anthropic ``cache_creation_input_tokens``
     (5-minute + 1-hour legs), Bedrock ``cacheWriteInputTokens``, OpenAI
     ``prompt_tokens_details.cache_write_tokens`` (Chat) /
     ``input_tokens_details.cache_write_tokens`` (Responses; billed at 1.25x
-    input on GPT-5.6 and later). ``None`` means no positive count was reported
-    (a wire without one, or zero) and is priced as zero writes, never
-    approximated from the fresh input."""
+    input on GPT-5.6 and later). ``None`` means the wire gave NO usable write
+    count (Gemini, OpenAI models and compatible relays that omit the detail),
+    never a reported zero; a consumer may approximate only a ``None`` leg."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
