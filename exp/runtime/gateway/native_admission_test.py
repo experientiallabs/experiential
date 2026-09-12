@@ -814,7 +814,7 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
     )
 
     assert tuple(item.deployment_id for item in narrowed.deployments) == ("gpt",)
-    assert "thinking->reasoning_effort:medium" in public.ignored_parameters
+    assert "thinking->reasoning_effort:medium(budget_tokens)" in public.ignored_parameters
     assert provider.provider_thinking_config is None
     assert provider.reasoning_effort == "medium"
     assert accounting.recorded == 1
@@ -1558,3 +1558,209 @@ class TestAffinityOrderedRungs:
         expiring.bind(b"fingerprint", "dep-house", ttl_seconds=600.0)
         clock[0] = 601.0
         assert expiring.bound_deployment(b"fingerprint") is None
+
+
+def test_an_image_refusal_is_never_blamed_on_the_thinking_field() -> None:
+    """A modality refusal names ``messages`` even when ``thinking`` rides along.
+
+    On a text-only reasoning route (hy4-preview's shape) an image block is
+    refused at capability preflight. Claude Code sends a ``thinking`` field on
+    every request, and route shaping rejects that field by name on a foreign
+    wire before preflight ever runs, so with no correction the caller read
+    "The parameter 'thinking' is not supported by this model route" for a
+    pasted screenshot (25 such 400s on 2026-09-11; removing thinking still
+    failed). The rejection the caller sees must be the one the coerced request
+    hits: the image, on ``messages``.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("hy4", provider="tencent", gateway=text_only),),
+        GatewayApiSurface.MESSAGES,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://tokenhub.test/v1",
+                model_id="hy4-preview",
+                supports_reasoning=True,
+                reasoning_wire_format="reasoning_effort",
+                supported_reasoning_efforts=("none", "low", "medium", "high"),
+                reasoning_effort="high",
+            ),
+            client,
+        ),
+    )
+    image_turn: JsonObject = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": _TOOL_IMAGE_PNG},
+            },
+            {"type": "text", "text": "What is this?"},
+        ],
+    }
+    for thinking in ({"type": "disabled"}, {"type": "enabled"}, {"type": "adaptive"}):
+        body: JsonObject = {
+            "model": "hy4-preview",
+            "max_tokens": 48,
+            "thinking": thinking,
+            "messages": [image_turn],
+        }
+        request = decode_messages(body).request.model_copy(update={"include_usage": True})
+        with pytest.raises(ProviderCapabilityError) as refused:
+            admitted_route_requests(
+                route,
+                wires,
+                request,
+                accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+                authorization=route.snapshot.authorization,
+            )
+        assert refused.value.capability == "image_input", thinking
+
+    # The control: the same body without thinking is refused the same way.
+    control = decode_messages(
+        {"model": "hy4-preview", "max_tokens": 48, "messages": [image_turn]}
+    ).request.model_copy(update={"include_usage": True})
+    with pytest.raises(ProviderCapabilityError) as refused:
+        admitted_route_requests(
+            route,
+            wires,
+            control,
+            accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+            authorization=route.snapshot.authorization,
+        )
+    assert refused.value.capability == "image_input"
+
+
+def test_a_tiny_max_tokens_on_a_default_reasoning_lane_dispatches_without_thinking() -> None:
+    """Through the admit loop: hy4's shape at ``max_tokens: 32`` with no
+    reasoning signal dispatches at ``reasoning_effort: none`` with the headroom
+    disclosure recorded and counted, so the caller gets text instead of a
+    thinking block truncated at the ceiling."""
+    reasoning = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("hy4", provider="tencent", gateway=reasoning),),
+        GatewayApiSurface.MESSAGES,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://tokenhub.test/v1",
+                model_id="hy4-preview",
+                supports_reasoning=True,
+                reasoning_wire_format="reasoning_effort",
+                supported_reasoning_efforts=("none", "low", "medium", "high"),
+                reasoning_effort="high",
+            ),
+            client,
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        maximum_output_tokens=32,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+    accounting = _AdmissionCoercionCounter()
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.reasoning_effort == "none"
+    assert "reasoning_effort->none(max_tokens_headroom)" in public.ignored_parameters
+    assert accounting.recorded == 1
+
+    roomy = request.model_copy(update={"maximum_output_tokens": 4096})
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        roomy,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.reasoning_effort is None
+    assert public.ignored_parameters == ()
+
+
+def test_the_headroom_rule_reads_the_rungs_that_survive_narrowing() -> None:
+    """A rung with no reasoning default that narrowing removes (its output
+    ceiling is below the caller's ``max_tokens``) must not veto the headroom
+    coercion for the default-on rung that actually serves; and a surviving
+    rung without a default still does, because it already answers in text."""
+    plain = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment("text-only", gateway=plain),
+            _deployment("hy4", provider="tencent", gateway=plain),
+        ),
+        GatewayApiSurface.MESSAGES,
+    )
+    client = cast(NativeWireClient, object())
+    hy4 = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://tokenhub.test/v1",
+        model_id="hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+        reasoning_effort="high",
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        maximum_output_tokens=32,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+
+    narrowed_out = GatewayWireProfile(
+        dialect="openai_compatible", url="https://plain.test/v1", maximum_output_tokens=16
+    )
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        ((narrowed_out, client), (hy4, client)),
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("hy4",)
+    assert provider.reasoning_effort == "none"
+    assert "reasoning_effort->none(max_tokens_headroom)" in public.ignored_parameters
+
+    surviving = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test/v1")
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        ((surviving, client), (hy4, client)),
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert len(narrowed.deployments) == 2
+    assert provider.reasoning_effort is None
+    assert public.ignored_parameters == ()

@@ -165,7 +165,7 @@ def test_output_config_is_carried_verbatim_and_maps_canonical_effort() -> None:
 def test_thinking_config_is_carried_verbatim() -> None:
     """The caller's thinking object survives byte-for-byte on the canonical request."""
     config: JsonObject = {"type": "enabled", "budget_tokens": 1024}
-    decoded = decode_messages(_body(thinking=config))
+    decoded = decode_messages(_body(max_tokens=4096, thinking=config))
     assert decoded.request.provider_thinking_config == config
     assert decode_messages(_body()).request.provider_thinking_config is None
 
@@ -1683,6 +1683,7 @@ def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
 
     decoded = decode_messages(
         _body(
+            max_tokens=16000,
             messages=[{"role": "user", "content": "hi"}],
             thinking={"type": "enabled", "budget_tokens": 8192},
         )
@@ -1693,7 +1694,7 @@ def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
 
     coercion = coerce_generation_parameters((profile,), decoded.request)
     assert coercion is not None
-    assert coercion.disclosures == ("thinking->reasoning_effort:medium",)
+    assert coercion.disclosures == ("thinking->reasoning_effort:medium(budget_tokens)",)
     _public, provider = route_generation_parameter_requests((profile,), coercion.request)
     payload = dialect_stream_payload(profile, provider)
     assert payload["reasoning"] == {"effort": "medium"}
@@ -1904,6 +1905,7 @@ def test_openrouter_reasoning_wins_over_thinking_and_output_config_with_disclosu
     """
     decoded = decode_messages(
         _body(
+            max_tokens=4096,
             reasoning={"effort": "high"},
             thinking={"type": "enabled", "budget_tokens": 2048},
             output_config={"effort": "low", "format": {"type": "text"}},
@@ -2106,3 +2108,67 @@ def test_claude_code_beta_header_set_decodes_with_per_token_disclosures() -> Non
     assert decoded.request.reasoning_effort == "high"
     assert decoded.request.provider_thinking_config == {"type": "enabled"}
     assert [tool.name for tool in decoded.request.tools] == ["Bash"]
+
+
+def test_a_thinking_budget_at_or_above_max_tokens_is_refused_at_the_boundary() -> None:
+    """Anthropic's own rule, applied before any reservation or provider call.
+
+    A budget at or above ``max_tokens`` can only end as thinking cut off at the
+    ceiling with no text (Anthropic answers "max_tokens must be greater than
+    thinking budget_tokens"), so the gateway refuses it on ``thinking.budget_tokens``
+    like the sibling ``reasoning.max_tokens`` channel. A budget below Anthropic's
+    1024 minimum is NOT refused: an Anthropic rung replaces it with the derived
+    legal budget (disclosed) and an effort rung reads it as a depth hint, so it
+    is accepted and carried verbatim. ``count_tokens`` has no ceiling to check.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages_count_tokens
+
+    with pytest.raises(OpenAIProtocolError) as equal:
+        decode_messages(_body(max_tokens=4096, thinking={"type": "enabled", "budget_tokens": 4096}))
+    assert equal.value.status_code == 400
+    assert equal.value.detail.param == "thinking.budget_tokens"
+    assert "max_tokens" in equal.value.detail.message
+    with pytest.raises(OpenAIProtocolError) as above:
+        decode_messages(_body(max_tokens=256, thinking={"type": "enabled", "budget_tokens": 4096}))
+    assert above.value.detail.param == "thinking.budget_tokens"
+
+    small = decode_messages(
+        _body(max_tokens=4096, thinking={"type": "enabled", "budget_tokens": 100})
+    )
+    assert small.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 100}
+
+    counted = decode_messages_count_tokens(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+        }
+    )
+    assert counted.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 4096}
+
+
+def test_a_superseded_thinking_budget_is_never_refused() -> None:
+    """The refusal reads the RESOLVED channel: an explicit ``reasoning.effort``
+    discards the thinking config beside it, so its budget cannot starve the
+    reply and the request decodes at that effort with the supersession
+    disclosed. A ``reasoning.max_tokens`` budget is its own channel's check."""
+    decoded = decode_messages(
+        _body(
+            max_tokens=2048,
+            thinking={"type": "enabled", "budget_tokens": 4096},
+            reasoning={"effort": "high"},
+        )
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.provider_thinking_config is None
+    assert "thinking->dropped(superseded_by_reasoning)" in decoded.request.ignored_parameters
+
+    # reasoning: {enabled: false} resolves to a disabled config with no budget.
+    off = decode_messages(
+        _body(
+            max_tokens=2048,
+            thinking={"type": "enabled", "budget_tokens": 4096},
+            reasoning={"enabled": False},
+        )
+    )
+    assert off.request.provider_thinking_config == {"type": "disabled"}

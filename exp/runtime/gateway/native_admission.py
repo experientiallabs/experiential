@@ -46,6 +46,7 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_route_rejections,
     coerce_strict_tool_schemas,
     coerce_structured_text_schema,
+    reserve_thinking_headroom,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -174,15 +175,42 @@ def admitted_route_requests(
             admits=candidate_serves,
         )
         if coercion is None:
+            # No coercion SERVES, but one may still APPLY: the probe refused
+            # every candidate because the coerced request dies one layer
+            # later, on a blocker that has nothing to do with the coerced
+            # field. Re-raising the verbatim rejection here would name that
+            # field (an image on a text-only route read as "thinking is not
+            # supported by this model route", because shaping rejects the
+            # foreign-wire thinking config before preflight ever sees the
+            # image; 25 such 400s on 2026-09-11). Carry the unprobed
+            # coercion forward instead and let the stage that actually
+            # refuses it name the caller's remedy. Nothing is recorded for a
+            # request that never serves.
+            coercion = coerce_generation_parameters(
+                tuple(profile for profile, _client in resolved_wires),
+                admitted_request,
+            )
+        if coercion is None:
             raise
         compatible_indexes = compatible_generation_parameter_profile_indexes(
             tuple(profile for profile, _client in resolved_wires),
             coercion.request,
         )
         admitted_request = coercion.request
-        coercion_disclosures = coercion.disclosures
+        coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
     route = select_route_deployments(route, compatible_indexes)
     resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
+    # The headroom rule reads the rungs that SURVIVED narrowing: a rung with
+    # no reasoning default (or no ``none`` tier) that narrowing has already
+    # removed must not veto the coercion for the default-on rung that will
+    # actually serve. Every surviving rung accepted the request verbatim and
+    # offers ``none``, so the coerced request narrows to the same set.
+    headroom = reserve_thinking_headroom(
+        tuple(profile for profile, _client in resolved_wires), admitted_request
+    )
+    if headroom is not None:
+        admitted_request = headroom.request
+        coercion_disclosures = (*coercion_disclosures, *headroom.disclosures)
     public_request, provider_request = route_generation_parameter_requests(
         tuple(profile for profile, _client in resolved_wires),
         admitted_request,

@@ -418,6 +418,7 @@ def _decode(
             else None
         ),
     )
+    _require_thinking_budget_below_max_tokens(channels.thinking_config, request.max_tokens)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
@@ -601,6 +602,44 @@ def _marked_text_blocks(
             entry["cache_control"] = block.cache_control.model_dump(mode="json", exclude_none=True)
         rebuilt.append(entry)
     return tuple(rebuilt)
+
+
+def _require_thinking_budget_below_max_tokens(
+    thinking_config: JsonObject | None,
+    max_tokens: int | None,
+) -> None:
+    """Refuse a thinking budget that leaves no room for the reply.
+
+    Anthropic requires ``thinking.budget_tokens < max_tokens`` (its own 400 reads
+    "max_tokens must be greater than thinking budget_tokens"), and the same
+    arithmetic holds on every route: a budget at or above the ceiling can only
+    end as thinking cut off at ``max_tokens`` with no text, so the request is
+    refused here, before a reservation or a provider round trip, exactly like
+    the sibling ``reasoning.max_tokens`` channel. A budget BELOW Anthropic's
+    1024 minimum is not refused: on an Anthropic rung route shaping replaces
+    it with the derived legal budget (disclosed), and on an effort rung it is
+    only a depth hint read through the tier table, so nothing about it can
+    fail. A ``count_tokens`` body carries no ``max_tokens`` and is not checked.
+    The check reads the RESOLVED thinking channel, after reasoning-channel
+    precedence: a ``thinking`` config that an explicit ``reasoning`` effort
+    supersedes is discarded, and a discarded budget cannot starve anything.
+
+    Args:
+        thinking_config: The thinking config the canonical request will carry.
+        max_tokens: The caller's reply ceiling, ``None`` for ``count_tokens``.
+
+    Raises:
+        OpenAIProtocolError: The budget is not below ``max_tokens``.
+    """
+    if thinking_config is None or max_tokens is None:
+        return
+    budget = thinking_config.get("budget_tokens")
+    if isinstance(budget, int) and not isinstance(budget, bool) and budget >= max_tokens:
+        raise invalid_field(
+            "thinking.budget_tokens",
+            "thinking.budget_tokens must be below max_tokens so the reply has room after "
+            "thinking. Raise max_tokens or lower the budget.",
+        )
 
 
 def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:

@@ -284,9 +284,11 @@ def thinking_config_reasoning_effort(config: Mapping[str, object]) -> ReasoningE
     ==================================  ========
 
     ``adaptive`` means the model picks its own depth, whose closest effort
-    analog is the provider default (medium, OpenAI's own default). Callers
-    must snap the returned tier to the route's supported ladder and disclose
-    the translation.
+    analog is the provider default (medium, OpenAI's own default); the
+    admission coercion resolves a budget-less config against the LANE's
+    catalog default first and consults this table only for an explicit
+    budget. Callers must snap the returned tier to the route's supported
+    ladder and disclose the translation.
 
     Args:
         config: Verbatim caller ``thinking`` object.

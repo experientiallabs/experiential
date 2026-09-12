@@ -1554,7 +1554,10 @@ def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
         headers={"x-api-key": engine.raw_key},
         json={
             **_messages_body("thinking-config-serves"),
-            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            # Below the 64-token ceiling: a budget at or above max_tokens is
+            # refused at the boundary (Anthropic's own rule), while one under
+            # Anthropic's 1024 minimum is only a depth hint on this route.
+            "thinking": {"type": "enabled", "budget_tokens": 32},
         },
         timeout=10.0,
     )

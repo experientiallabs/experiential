@@ -393,8 +393,14 @@ configs outright, an `enabled` config translates to adaptive with the dropped
 because those models cannot turn thinking off; a bare `{type: enabled}` with no budget, which
 Claude Code sends, is legal at the gateway boundary: an Anthropic rung receives the gateway's
 derived budget (`thinking.budget_tokens->derived`, or `thinking->dropped(no_legal_budget)` when
-none fits under `max_tokens`) and an effort route reads it as the default depth), requires
-`max_tokens`, validates `cache_control` (carrying it everywhere the Anthropic wire caches
+none fits under `max_tokens`) and an effort route reads it as the LANE's default depth: the
+rung's catalog `reasoning_default_effort`, medium when no rung pins one; a budget at or above
+`max_tokens` is refused on `thinking.budget_tokens` at the boundary, Anthropic's own rule, while a
+budget under Anthropic's 1024 minimum is only a depth hint and is carried), requires
+`max_tokens` (a ceiling under 1024 with no reasoning signal of the caller's own, on a route whose
+every rung reasons by default and offers a `none` tier, dispatches at `reasoning_effort: none`
+disclosed as `reasoning_effort->none(max_tokens_headroom)`, so the reply is text rather than
+thinking cut off at the ceiling), validates `cache_control` (carrying it everywhere the Anthropic wire caches
 natively: `tool_use` blocks, tool definitions, the top-level automatic marker, and block-level
 markers on system and message text runs and on `tool_result` breakpoints all forward verbatim.
 Marked runs re-emit the caller's exact block structure while the flattened string stays the
@@ -679,12 +685,27 @@ through `ignored_parameters`, logged, and counted in the `admission_parameter_co
 metric; every serving surface carries that list to the caller as a body-level
 `x-experiential-ignored-parameters` key (Chat chunk and completion, Responses envelope, and the
 Anthropic message on both `message_start` and the aggregated body), so a drop is never silent; nothing coercible keeps the first rung's own field-scoped rejection.
-The thinking vocabulary names the outcome, never a bare field: `thinking->reasoning_effort:<tier>`
-(the config was TRANSLATED onto the route's effort ladder and applies at that tier),
+When a coercion APPLIES but none SERVES (every candidate dies one layer later, on a blocker
+unrelated to the coerced field), admission carries the unprobed coercion forward so the stage
+that actually refuses names the caller's remedy: an image on a text-only reasoning route is
+refused on `messages`, never as an unsupported `thinking` field that merely rode along.
+The thinking vocabulary names the outcome, never a bare field:
+`thinking->reasoning_effort:<tier>(<source>)` (the config was TRANSLATED onto the route's effort
+ladder and applies at that tier; the source names what asked for it: `budget_tokens` for an
+explicit budget through the tier table, `lane_default` for a budget-less `enabled` or `adaptive`
+config read as the rung's catalog `reasoning_default_effort`, `gateway_default` for the same
+config on a route whose rungs pin no default (medium), `disabled` for the off switch),
 `thinking->dropped(superseded_by_effort)` (the caller's own `output_config.effort` or
-`reasoning.effort` already states the depth, which is what serves), and
-`thinking->dropped(unsupported_by_route)` (no rung can reason at any depth). A caller reading a
-bare `thinking` as "my depth was stripped" is the misreading this vocabulary exists to prevent.
+`reasoning.effort` already states the depth, which is what serves),
+`thinking->dropped(unsupported_by_route)` (no rung can reason at any depth), and
+`thinking->dropped(no_servable_tier)` (the route reasons, but no tier of its ladder serves this
+request beside its other controls, so the rung answers at its own default depth). The translation
+runs on every route with a non-Anthropic rung once every rung has declined the config verbatim, a
+mixed route included (its Anthropic rung, when it can honor the config, is kept by narrowing before
+this layer is consulted); only an all-Anthropic route leaves the config to Anthropic shaping. The
+named `thinking` rejection therefore never reaches a caller whose route carries a reasoning rung.
+A caller reading a bare `thinking` as "my depth was stripped" is the misreading this vocabulary
+exists to prevent.
 
 On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and
 `message_delta.usage` is the authoritative one. Every Messages usage object (`message_start`,
