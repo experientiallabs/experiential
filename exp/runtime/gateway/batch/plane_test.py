@@ -186,6 +186,73 @@ def test_malformed_payloads_and_bad_base64_are_client_errors() -> None:
     assert status == 400 and "base64" in body["error"]["message"]
 
 
+def test_oversized_file_and_line_fields_are_client_errors() -> None:
+    """Bounded caller fields render 400s instead of leaking model validation errors."""
+    plane = _plane()
+    content = _chat_line("x" * 257).encode("utf-8")
+    status, file_object = _call(
+        plane,
+        "file_create",
+        filename="input.jsonl",
+        purpose="batch",
+        content_b64=base64.b64encode(content).decode("ascii"),
+    )
+    assert status == 200
+    status, body = _call(
+        plane,
+        "batch_create",
+        input_file_id=file_object["id"],
+        endpoint="/v1/chat/completions",
+    )
+    assert status == 400
+    assert body["error"]["code"] == "invalid_request_error"
+    assert body["error"]["message"] == (
+        "every input line was rejected: line 1 custom_id exceeds 256 characters"
+    )
+
+    status, body = _call(
+        plane,
+        "file_create",
+        filename="x" * 513,
+        purpose="batch",
+        content_b64=base64.b64encode(_chat_line("a").encode("utf-8")).decode("ascii"),
+    )
+    assert status == 400
+    assert body["error"]["code"] == "invalid_request_error"
+    assert body["error"]["message"] == "filename exceeds 512 characters"
+
+
+def test_oversized_custom_id_is_a_line_error_in_a_mixed_batch() -> None:
+    """An oversized ID rejects its line without discarding valid peers."""
+    plane = _plane()
+    oversized_id = "x" * 257
+    content = "\n".join((_chat_line("valid"), _chat_line(oversized_id))).encode("utf-8")
+    status, file_object = _call(
+        plane,
+        "file_create",
+        filename="input.jsonl",
+        purpose="batch",
+        content_b64=base64.b64encode(content).decode("ascii"),
+    )
+    assert status == 200
+    status, batch_object = _call(
+        plane,
+        "batch_create",
+        input_file_id=file_object["id"],
+        endpoint="/v1/chat/completions",
+    )
+    assert status == 200
+    assert batch_object["request_counts"]["total"] == 1
+    assert batch_object["errors"]["data"] == [
+        {
+            "code": "invalid_custom_id",
+            "message": "line 2 custom_id exceeds 256 characters",
+            "line": 2,
+            "custom_id": oversized_id,
+        }
+    ]
+
+
 def test_unknown_ids_map_to_404() -> None:
     """Missing files and batches produce not_found envelopes."""
     plane = _plane()

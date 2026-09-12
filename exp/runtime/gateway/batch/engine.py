@@ -20,6 +20,8 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.batch.contracts import (
     BATCH_SURFACES,
     COMPLETION_WINDOW_SECONDS,
+    MAXIMUM_CUSTOM_ID_CHARACTERS,
+    MAXIMUM_FILENAME_CHARACTERS,
     TERMINAL_STATUSES,
     BatchCounts,
     BatchDeployment,
@@ -117,6 +119,8 @@ class BatchEngine:
         """
         if purpose != "batch":
             raise BatchSubmitError("files uploaded to this gateway must use purpose 'batch'")
+        if len(filename) > MAXIMUM_FILENAME_CHARACTERS:
+            raise BatchSubmitError(f"filename exceeds {MAXIMUM_FILENAME_CHARACTERS} characters")
         parse_input_jsonl(content)
         record = BatchFile(
             file_id=_new_id("file"),
@@ -222,6 +226,19 @@ class BatchEngine:
                         line_number=line_number,
                         code="missing_custom_id",
                         message=f"line {line_number} carries no custom_id",
+                    )
+                )
+                continue
+            if len(custom_id) > MAXIMUM_CUSTOM_ID_CHARACTERS:
+                errors.append(
+                    BatchLineError(
+                        line_number=line_number,
+                        custom_id=custom_id,
+                        code="invalid_custom_id",
+                        message=(
+                            f"line {line_number} custom_id exceeds "
+                            f"{MAXIMUM_CUSTOM_ID_CHARACTERS} characters"
+                        ),
                     )
                 )
                 continue
