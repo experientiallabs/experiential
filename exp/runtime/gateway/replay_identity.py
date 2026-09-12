@@ -171,6 +171,8 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
             return sha256_json(request)
         case GatewayRequest():
             envelope = provider_replay_authority(request)
+            if request.request_tags:
+                envelope = {**(envelope or {}), "request_tags": dict(request.request_tags)}
             if envelope is None:
                 return sha256_json(request)
             return sha256_json({"request_sha256": sha256_json(request), **envelope})

@@ -45,6 +45,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import (
     ThinkingBlock as ThinkingBlock,
 )
+from exp.runtime.gateway.request_tags import RequestTags
 from exp.runtime.gateway.stream_contracts import (
     GatewayEvent as GatewayEvent,
 )
@@ -494,6 +495,9 @@ class GatewayRequest(ContractModel):
     """Lossless canonical request shared by protocol and provider implementations."""
 
     surface: GatewayApiSurface
+    request_tags: RequestTags = Field(default_factory=dict, exclude=True)
+    """Caller attribution only, excluded from provider payloads and token estimates.
+    Included explicitly by ``canonical_request_sha256`` for keyed consistency."""
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
     tools: tuple[GatewayToolDefinition, ...] = ()
     tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
@@ -922,6 +926,8 @@ class AuthorizationSnapshot(ContractModel):
     surface: GatewayApiSurface
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
+    request_tags: RequestTags = Field(default_factory=dict)
+    """Validated caller attribution for the host ledger, never authorization policy."""
     caller_operation_sha256: Sha256 | None = None
     refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)

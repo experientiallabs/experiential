@@ -5,21 +5,15 @@ normalization, and SSE encoding. Shared Python contracts own decoding,
 authorization, payload construction, continuation state, and durable ledger
 transactions. Every boundary call takes and returns one JSON string.
 
-Admission returns the full ordered certified route (one wire configuration
-per deployment) plus the frozen retry-policy facts, accepting the request
-without starting any attempt. The data plane then reserves each physical
-dispatch through ``start_attempt`` immediately before network work and lands
-each attempt's durable terminal through ``settle`` (finalizing the request
-only on the terminal attempt); candidate selection stays here: the frozen
-waterfall policy, health circuits, and budget skipping.
+Admission returns ordered wire configurations and frozen retry policy. Each
+physical dispatch reserves through ``start_attempt`` before network work and
+settles through ``settle``; only the terminal attempt finalizes the request.
+Candidate selection, health circuits and budget skipping stay in this plane.
 
-Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
-attribute carries the sanitized OpenAI-shaped error the data plane returns to
-the caller through the shared boundary mapping. Requests the native path
-cannot serve (resolved clients exposing no native wire profile) are answered
-with an ``{"escalate": reason}`` admission disposition after the accepted
-request is finalized content-free; the data plane classifies the reason for
-metrics and fails the request closed with the shared internal error.
+Boundary errors raise :class:`NativeBridgeError` carrying sanitized protocol
+errors. Unsupported native routes finalize content-free and return an escalation
+disposition; the data plane records the reason and fails closed, never falling
+back to a different serving implementation.
 """
 
 from __future__ import annotations
@@ -117,8 +111,10 @@ from exp.runtime.gateway.native_settlement import (
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
+from exp.runtime.gateway.request_tags import RequestTags
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.settled_billing import NativeSettledBillingMixin, SettledRequestBilling
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -176,6 +172,7 @@ class NativeControlPlane(
     NativeEmbeddingsMixin,
     NativeImagesMixin,
     NativeObservabilityMixin,
+    NativeSettledBillingMixin,
 ):
     """Authority and accounting callbacks for the native data plane.
 
@@ -195,6 +192,7 @@ class NativeControlPlane(
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         cache_sample_gate: Callable[[str], bool] | None = None,
+        settled_billing_reader: Callable[[str], SettledRequestBilling | None] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
     ) -> None:
@@ -218,6 +216,8 @@ class NativeControlPlane(
                 cache-priority EWMA; the host excludes promo-funded attempts
                 so subsidized replay cannot buy fair-share weight. ``None``
                 admits every sample; a raising gate skips the sample.
+            settled_billing_reader: Optional bounded host read of complete settled
+                request money, used before terminal wire encoding and replay storage.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
         """
@@ -241,6 +241,7 @@ class NativeControlPlane(
         self._readiness_probe = readiness_probe
         self._usage_reporter = usage_reporter
         self._budget_error_factory = budget_error_factory
+        self._settled_billing_reader = settled_billing_reader
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
         # The accounting registry owns in-flight requests, per-dispatch
@@ -292,8 +293,7 @@ class NativeControlPlane(
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.
 
-        The raw body is decoded with the same ``decode_chat`` the python
-        engine uses, and every deployment's upstream payload is built with
+        The raw body uses the shared protocol decoder, and each upstream payload uses
         the same shared payload builders, so the two engines cannot drift at
         the protocol or provider boundary. No attempt row is written here:
         each physical dispatch is reserved by :meth:`start_attempt`.
@@ -302,7 +302,7 @@ class NativeControlPlane(
             argument: JSON object with ``raw_key``, ``body`` (raw request
                 body text), optional ``surface`` (``"chat"`` or
                 ``"responses"``, defaulting to chat), and optional
-                ``app_referer``/``app_title`` caller app identity.
+                ``app_referer``/``app_title`` app identity and ``request_tags`` map.
 
         Returns:
             JSON wire configuration carrying the full ordered certified
@@ -326,6 +326,7 @@ class NativeControlPlane(
             surface=surface,
             idempotency_key=optional_text(data.get("idempotency_key")),
             client_request_id=optional_text(data.get("client_request_id")),
+            request_tags=data.get("request_tags", {}),
             anthropic_beta=optional_text(data.get("anthropic_beta")),
         )
         request = decoded.request
@@ -848,6 +849,7 @@ class NativeControlPlane(
             surface=str(data.get("surface", "chat")),
             idempotency_key=optional_text(data.get("idempotency_key")),
             client_request_id=optional_text(data.get("client_request_id")),
+            request_tags=data.get("request_tags", {}),
         )
         request = decoded.request
         # Only the standard Idempotency-Key names a retriable operation;
@@ -944,6 +946,7 @@ class NativeControlPlane(
         idempotency_key: str | None = None,
         client_request_id: str | None = None,
         anthropic_beta: str | None = None,
+        request_tags: RequestTags | None = None,
     ) -> DecodedGatewayRequest:
         """Decode one raw request body with the shared surface decoder."""
         try:
@@ -953,6 +956,7 @@ class NativeControlPlane(
                 idempotency_key=idempotency_key,
                 client_request_id=client_request_id,
                 anthropic_beta=anthropic_beta,
+                request_tags=request_tags,
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc

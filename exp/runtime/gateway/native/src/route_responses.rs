@@ -75,6 +75,10 @@ pub(crate) async fn responses(
     // x-client-request-id (its session id) across distinct sequential
     // requests, so that header is correlation and affinity identity, never
     // an operation key.
+    let request_tags = match crate::request_tags::request_tags(&headers) {
+        Ok(tags) => tags,
+        Err(error) => return error_response(&error),
+    };
     let idempotency_key = latin1_header(&headers, "idempotency-key");
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
@@ -85,6 +89,7 @@ pub(crate) async fn responses(
             "surface": "responses",
             "idempotency_key": idempotency_key,
             "client_request_id": client_request_id,
+            "request_tags": request_tags,
         }));
         let scope_text = match state.bridge.call("claim_scope", scope_argument).await {
             Ok(text) => text,
@@ -125,6 +130,7 @@ pub(crate) async fn responses(
         "surface": "responses",
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
+        "request_tags": request_tags,
         "client_ip": client_ip(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
@@ -400,7 +406,7 @@ async fn respond_from_responses_events(
             }
         };
     let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body_with_carrier(
+    let mut aggregated = match completed_responses_body_with_carrier(
         &admission.request_id,
         &admission.alias,
         created_at,
@@ -503,6 +509,7 @@ async fn respond_from_responses_events(
         }
         return error_response(&PublicError::internal());
     }
+    crate::billing::body(&guard.bridge, &admission.request_id, &mut aggregated.body).await;
     let mut headers = commit_independent(&admission, client_request_id.as_deref());
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
@@ -512,7 +519,7 @@ async fn respond_from_responses_events(
             &events,
             reasoning_content_carrier.as_deref(),
         ) {
-            Ok(body) => body,
+            Ok(body) => crate::billing::sse(&guard.bridge, &admission.request_id, body).await,
             Err(error) => return error_response(&error),
         };
         if let Some(mut owner) = lease.take() {
@@ -940,7 +947,11 @@ async fn stream_responses(
             replayable,
             &mut capture,
             &cached_headers,
-            terminal_frames.into_iter().map(Bytes::from).collect(),
+            crate::billing::frames(&guard.bridge, &request_id, terminal_frames)
+                .await
+                .into_iter()
+                .map(Bytes::from)
+                .collect(),
         )
         .await;
     });

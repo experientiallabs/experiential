@@ -49,6 +49,9 @@ class GatewayControlStore(Protocol):
         ``client_ip`` is the caller IP from the TRUSTED proxy hop (``X-Real-IP``, else the
         rightmost ``X-Forwarded-For`` entry), frozen onto the snapshot for the hosted
         authority's per-key IP allow/deny enforcement; ``None`` when unavailable.
+        A ``GatewayRequest`` carries validated caller ``request_tags``; copy them
+        onto the snapshot for ledger attribution and use ``canonical_request_sha256``
+        to digest the request including its tags. Tags never grant authority.
         """
         ...
 

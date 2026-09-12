@@ -158,10 +158,15 @@ pub(crate) async fn messages(
     // decoder can retain allowlisted tokens (e.g. the 1M context window)
     // for Anthropic dispatch and disclose the rest.
     let anthropic_beta = latin1_header_list(&headers, "anthropic-beta");
+    let request_tags = match crate::request_tags::request_tags(&headers) {
+        Ok(tags) => tags,
+        Err(error) => return messages_error_response(&error),
+    };
     let admit_argument = compact_json(&json!({
         "raw_key": raw_key,
         "body": body_text,
         "surface": "messages",
+        "request_tags": request_tags,
         "anthropic_beta": anthropic_beta,
         "client_ip": client_ip(&headers),
     }));
@@ -336,7 +341,7 @@ async fn respond_from_messages_events(
         }
     };
     let exposed = admission.reasoning_exposed_at(depth);
-    let aggregated = match completed_messages_body_with_reasoning(
+    let mut aggregated = match completed_messages_body_with_reasoning(
         &admission.request_id,
         &admission.alias,
         &events,
@@ -410,11 +415,12 @@ async fn respond_from_messages_events(
         // Success is only reported once the terminal accounting write landed.
         return messages_error_response(&PublicError::internal());
     }
+    crate::billing::body(&guard.bridge, &admission.request_id, &mut aggregated.body).await;
     let mut headers = commit_independent(&admission, None);
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
         let body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
-            Ok(body) => body,
+            Ok(body) => crate::billing::sse(&guard.bridge, &admission.request_id, body).await,
             Err(error) => return messages_error_response(&error),
         };
         return sse_body_response(&headers, body);
@@ -702,6 +708,11 @@ async fn stream_messages(
                         "gateway could not encode the provider stream",
                     ))
                 }
+            };
+            let encoded = if terminal.is_some() {
+                crate::billing::frames(&guard.bridge, &request_id, encoded).await
+            } else {
+                encoded
             };
             for data in encoded {
                 if !send_bounded(&sender, deadline, Bytes::from(data)).await {
