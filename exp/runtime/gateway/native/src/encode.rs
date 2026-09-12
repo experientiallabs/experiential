@@ -172,6 +172,7 @@ pub struct ChatSseEncoder {
     model: String,
     created_at: i64,
     include_usage: bool,
+    billing: Option<crate::billing::SettledBilling>,
     ignored_parameters: Vec<String>,
     started: bool,
     terminal: bool,
@@ -197,6 +198,7 @@ impl ChatSseEncoder {
             model: model.to_string(),
             created_at,
             include_usage,
+            billing: None,
             ignored_parameters,
             started: false,
             terminal: false,
@@ -207,6 +209,11 @@ impl ChatSseEncoder {
             reasoning_content_carrier: None,
             reasoning_output_exposed: false,
         }
+    }
+
+    /// Attach request-wide settled money independently of provider token counts.
+    pub fn set_billing(&mut self, billing: Option<crate::billing::SettledBilling>) {
+        self.billing = billing;
     }
 
     /// Attach an authenticated carrier before the terminal is encoded.
@@ -404,10 +411,8 @@ impl ChatSseEncoder {
                     frames.push(self.chunk(json!({"reasoning_content": carrier}), None));
                 }
                 frames.push(self.chunk(json!({}), Some(finish_reason)));
-                if self.include_usage {
-                    if let Some(usage) = &self.usage {
-                        frames.push(self.usage_chunk(usage));
-                    }
+                if self.include_usage && (self.usage.is_some() || self.billing.is_some()) {
+                    frames.push(self.usage_chunk());
                 }
                 frames.push("data: [DONE]\n\n".to_string());
                 Ok(frames)
@@ -453,15 +458,18 @@ impl ChatSseEncoder {
         chat_data(&payload)
     }
 
-    fn usage_chunk(&self, usage: &Usage) -> String {
-        let payload = json!({
+    fn usage_chunk(&self) -> String {
+        let mut payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",
             "created": self.created_at,
             "model": self.model,
             "choices": [],
-            "usage": streaming_chat_usage(usage),
+            "usage": self.usage.as_ref().map(streaming_chat_usage),
         });
+        if let Some(billing) = &self.billing {
+            billing.annotate(&mut payload);
+        }
         chat_data(&payload)
     }
 }

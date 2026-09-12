@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 
+from pydantic import TypeAdapter, ValidationError
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
+from exp.runtime.gateway.request_tags import RequestTags
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
@@ -15,6 +18,8 @@ from exp.runtime.openai_protocol.requests import (
     decode_embeddings,
     decode_responses,
 )
+
+_TAGS = TypeAdapter(RequestTags)
 
 
 class NativeDecodeError(Exception):
@@ -37,6 +42,7 @@ def decode_native_body(
     idempotency_key: str | None = None,
     client_request_id: str | None = None,
     anthropic_beta: str | None = None,
+    request_tags: RequestTags | None = None,
 ) -> DecodedGatewayRequest:
     """Decode one raw request body with the shared surface decoder.
 
@@ -51,6 +57,7 @@ def decode_native_body(
         anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
             Meaningful only on the Messages surface, where allowlisted
             tokens are retained for Anthropic dispatch.
+        request_tags: Validated native header map, revalidated at the typed boundary.
 
     Returns:
         The public alias and canonical request.
@@ -61,14 +68,28 @@ def decode_native_body(
     """
     payload = _load_object_body(body)
     try:
+        tags = _TAGS.validate_python({} if request_tags is None else request_tags)
         if surface == "messages":
-            return decode_messages(payload, anthropic_beta=anthropic_beta)
-        decoder = decode_responses if surface == "responses" else decode_chat
-        return decoder(
-            payload,
-            idempotency_key=idempotency_key,
-            client_request_id=client_request_id,
+            decoded = decode_messages(payload, anthropic_beta=anthropic_beta)
+        else:
+            decoder = decode_responses if surface == "responses" else decode_chat
+            decoded = decoder(
+                payload,
+                idempotency_key=idempotency_key,
+                client_request_id=client_request_id,
+            )
+        return decoded.model_copy(
+            update={"request": decoded.request.model_copy(update={"request_tags": tags})}
         )
+    except ValidationError as exc:
+        raise NativeDecodeError(
+            OpenAIProtocolError(
+                status_code=400,
+                code="invalid_parameter",
+                message="Invalid X-Explabs-Tags. Send a flat map of valid tag keys and values.",
+                param="X-Explabs-Tags",
+            )
+        ) from exc
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc
 

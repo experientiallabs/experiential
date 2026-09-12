@@ -1,7 +1,4 @@
-//! The native OpenAI Responses surface: the `/v1/responses` handler with its
-//! keyed-replay protocol, bounded continuation retention through the control
-//! plane's `remember`, and the Responses-shaped settled, aggregated, guarded,
-//! and live-streaming response paths.
+//! Native Responses: keyed replay, bounded continuations and terminal publication.
 
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +16,7 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
     wire_drift_response, Admission,
 };
+use crate::billing::SettledBilling;
 use crate::encode::{compact_json, reasoning_carrier_candidate};
 use crate::encode_responses::{
     completed_responses_body, completed_responses_body_with_carrier, ResponsesSseEncoder,
@@ -67,14 +65,12 @@ pub(crate) async fn responses(
         Err(_) => return error_response(&PublicError::invalid_json()),
     };
 
-    // Replay-keyed Responses runs the python engine's exact idempotency
-    // protocol natively, sharing the same bounded replay store and
-    // tenant-scoped key derivation the chat surface uses (the surface is
-    // part of the key, so chat and Responses operations never collide).
-    // Only the standard Idempotency-Key opts into replay: Codex reuses
-    // x-client-request-id (its session id) across distinct sequential
-    // requests, so that header is correlation and affinity identity, never
-    // an operation key.
+    // Replay keys include the API surface. Only Idempotency-Key opts in;
+    // Codex's reused X-Client-Request-Id is session correlation, not an operation.
+    let request_tags = match crate::request_tags::request_tags(&headers) {
+        Ok(tags) => tags,
+        Err(error) => return error_response(&error),
+    };
     let idempotency_key = latin1_header(&headers, "idempotency-key");
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
@@ -85,6 +81,7 @@ pub(crate) async fn responses(
             "surface": "responses",
             "idempotency_key": idempotency_key,
             "client_request_id": client_request_id,
+            "request_tags": request_tags,
         }));
         let scope_text = match state.bridge.call("claim_scope", scope_argument).await {
             Ok(text) => text,
@@ -125,13 +122,13 @@ pub(crate) async fn responses(
         "surface": "responses",
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
+        "request_tags": request_tags,
         "client_ip": client_ip(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
         Err(error) => {
-            // A failed keyed admission abandons ownership so waiting
-            // duplicates fail closed instead of hanging.
+            // Abandon failed ownership so joiners fail closed.
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -234,8 +231,15 @@ pub(crate) async fn responses(
             error_response(&error)
         }
         Won::Settled(settled) => {
-            settled_responses_response(&admission, settled, created_at, lease, client_request_id)
-                .await
+            settled_responses_response(
+                &admission,
+                settled,
+                created_at,
+                lease,
+                client_request_id,
+                SettledBilling::read(&state.bridge, &admission.request_id, deadline).await,
+            )
+            .await
         }
         Won::Committed(committed) => {
             let committed = *committed;
@@ -283,15 +287,14 @@ pub(crate) async fn responses(
     }
 }
 
-/// Answer one Responses attempt that the waterfall already settled: a
-/// successful terminal with no semantic output, or an exhausted ladder
-/// flushing withheld refusal output ahead of the failing terminal.
+/// Publish a settled empty Responses completion or the ladder's withheld refusal.
 async fn settled_responses_response(
     admission: &Admission,
     settled: SettledAttempt,
     created_at: f64,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
+    billing: Option<SettledBilling>,
 ) -> Response {
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
@@ -307,10 +310,11 @@ async fn settled_responses_response(
     let mut headers = commit_independent(admission, client_request_id.as_deref());
     headers.extend(commit_dependent(admission, settled.depth));
     if admission.stream {
-        let body = match encode_responses_sse(admission, created_at, &events, None) {
-            Ok(body) => body,
-            Err(error) => return error_response(&error),
-        };
+        let body =
+            match encode_responses_sse(admission, created_at, &events, None, billing.as_ref()) {
+                Ok(body) => body,
+                Err(error) => return error_response(&error),
+            };
         if failed {
             // A failed flush is not a replayable success.
             if let Some(mut owner) = lease.take() {
@@ -335,7 +339,7 @@ async fn settled_responses_response(
         return sse_body_response(&headers, body);
     }
     let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body(
+    let mut aggregated = match completed_responses_body(
         &admission.request_id,
         &admission.alias,
         created_at,
@@ -350,6 +354,9 @@ async fn settled_responses_response(
             owner.abandon().await;
         }
         return error_response(&failure.clone().boundary().public_error());
+    }
+    if let Some(billing) = billing {
+        billing.annotate(&mut aggregated.body);
     }
     if let Some(mut owner) = lease.take() {
         let mut sorted = headers.clone();
@@ -383,6 +390,7 @@ async fn respond_from_responses_events(
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
     stream_body: bool,
+    deadline: Instant,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
     let reasoning_content_carrier =
@@ -400,7 +408,7 @@ async fn respond_from_responses_events(
             }
         };
     let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body_with_carrier(
+    let mut aggregated = match completed_responses_body_with_carrier(
         &admission.request_id,
         &admission.alias,
         created_at,
@@ -448,9 +456,7 @@ async fn respond_from_responses_events(
         }
         return error_response(&error);
     }
-    // Retention runs while the attempt row is still in flight so the control
-    // plane can resolve its namespaced continuation context, and before the
-    // body is answered so an oversize continuation fails closed like python.
+    // Retain while in flight to resolve the namespace and reject oversize continuations.
     let mut retention = ResponsesRetention::default();
     for event in &events {
         retention.track(event);
@@ -489,8 +495,7 @@ async fn respond_from_responses_events(
             .await
     };
     if let Err(error) = remembered {
-        // The provider outcome already settled above, exactly like the python
-        // executor; only the HTTP result reports the retention failure.
+        // The provider outcome is settled; only HTTP reports the retention failure.
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
@@ -503,6 +508,7 @@ async fn respond_from_responses_events(
         }
         return error_response(&PublicError::internal());
     }
+    let billing = SettledBilling::read(&guard.bridge, &admission.request_id, deadline).await;
     let mut headers = commit_independent(&admission, client_request_id.as_deref());
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
@@ -511,6 +517,7 @@ async fn respond_from_responses_events(
             created_at,
             &events,
             reasoning_content_carrier.as_deref(),
+            billing.as_ref(),
         ) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
@@ -530,6 +537,9 @@ async fn respond_from_responses_events(
             };
         }
         return sse_body_response(&headers, body);
+    }
+    if let Some(billing) = billing {
+        billing.annotate(&mut aggregated.body);
     }
     if let Some(mut owner) = lease.take() {
         let mut sorted = headers.clone();
@@ -598,6 +608,7 @@ async fn completed_responses(
         lease,
         client_request_id,
         false,
+        deadline,
     )
     .await
 }
@@ -607,6 +618,7 @@ fn encode_responses_sse(
     created_at: f64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
+    billing: Option<&SettledBilling>,
 ) -> Result<Vec<u8>, PublicError> {
     let envelope = admission.envelope.clone().unwrap_or_default();
     let mut encoder = ResponsesSseEncoder::new(
@@ -624,6 +636,7 @@ fn encode_responses_sse(
     }
     for event in events {
         for frame in encoder.feed(event)? {
+            let frame = crate::billing::terminal_frame(billing, event, frame);
             body.extend_from_slice(frame.as_bytes());
         }
     }
@@ -699,6 +712,7 @@ async fn guarded_responses(
         lease,
         client_request_id,
         stream_body,
+        deadline,
     )
     .await
 }
@@ -734,9 +748,7 @@ async fn stream_responses(
         let mut guard = guard;
         let mut committed = committed;
         let mut lease = lease;
-        // Keyed streams capture every public frame so the owner can publish
-        // the exact byte stream; terminal frames flow through the shared
-        // publication tail, matching the chat surface.
+        // Keyed streams capture exact bytes, including the shared terminal publication tail.
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
@@ -746,8 +758,7 @@ async fn stream_responses(
         let mut terminal: Option<Event> = None;
         let mut retention = ResponsesRetention::default();
         let mut reasoning_content_carrier: Option<String> = None;
-        // Terminal frames are withheld until continuation retention lands,
-        // mirroring the python stream body's ordering.
+        // Withhold terminal frames until continuation retention lands.
         let terminal_frames: Vec<String>;
 
         macro_rules! fail_stream {
@@ -940,7 +951,11 @@ async fn stream_responses(
             replayable,
             &mut capture,
             &cached_headers,
-            terminal_frames.into_iter().map(Bytes::from).collect(),
+            crate::billing::frames(&guard.bridge, &request_id, deadline, terminal_frames)
+                .await
+                .into_iter()
+                .map(Bytes::from)
+                .collect(),
         )
         .await;
     });
