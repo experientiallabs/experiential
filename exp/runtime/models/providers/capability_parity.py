@@ -15,8 +15,8 @@ from typing import Literal, cast
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
-from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.content import MEDIA_HANDLE_PROVIDERS
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_rejects_forced_tool_choice,
@@ -30,7 +30,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.videos import VIDEO_DIALECTS, VIDEO_URL_DIALECTS
 
-CAPABILITY_PARITY_SCHEMA_VERSION = 6
+CAPABILITY_PARITY_SCHEMA_VERSION = 7
 """Version of the parity-row contract; bump on any field change."""
 
 
@@ -44,6 +44,25 @@ class DeploymentCapabilityParity(ContractModel):
     supports_streaming: bool
     supports_developer_messages: bool
     supports_strict_tools: bool
+    supports_custom_tools: bool
+    """Whether the catalog declares free-form custom tools preserved on this
+    rung. Read with ``dialect``: public Chat still refuses custom tools even
+    when a Responses-native deployment declares this."""
+    supports_grammar_tools: bool
+    """Whether the catalog declares grammar-constrained custom tools preserved
+    on this rung. Requires ``supports_custom_tools`` on the declaration."""
+    supports_tool_call_limit: bool
+    """Whether the catalog declares that Responses ``max_tool_calls`` is preserved."""
+    supports_prompt_cache_boundaries: bool
+    """Whether the catalog declares explicit prompt-cache boundaries preserved.
+
+    This is not implicit prefix caching. False means explicit boundaries are
+    not declared as preserved.
+    """
+    reports_model_status: bool
+    """Whether the catalog declares provider model-status metadata preserved."""
+    reports_reasoning_tokens: bool
+    """Whether the catalog declares a distinct reasoning-token count is reported."""
     supports_forced_tool_choice: bool
     """Whether this rung can force a tool (``tool_choice`` ``required`` or a
     named tool) on any request. Engine ground truth, not a declaration: the
@@ -148,6 +167,12 @@ def deployment_capability_parity(
         supports_streaming=capabilities.supports_streaming,
         supports_developer_messages=capabilities.supports_developer_messages,
         supports_strict_tools=capabilities.supports_strict_tools,
+        supports_custom_tools=capabilities.supports_custom_tools,
+        supports_grammar_tools=capabilities.supports_grammar_tools,
+        supports_tool_call_limit=capabilities.supports_tool_call_limit,
+        supports_prompt_cache_boundaries=capabilities.supports_prompt_cache_boundaries,
+        reports_model_status=capabilities.reports_model_status,
+        reports_reasoning_tokens=capabilities.reports_reasoning_tokens,
         # The model's own rule on every wire: a relay (OpenRouter, Azure)
         # forwards Anthropic's 400 unchanged, so scoping this to the native
         # dialect only let relayed rungs dispatch a request known to fail.

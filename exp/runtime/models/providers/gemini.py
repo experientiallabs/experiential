@@ -246,16 +246,34 @@ def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
 
 
 def _gemini_usage(payload: JsonObject) -> Usage | None:
-    """Read Gemini's usage metadata with cached tokens treated as an input subset."""
+    """Read Gemini usage, folding additive thoughts into billed output tokens.
+
+    Google defines ``thoughtsTokenCount`` as additive to ``candidatesTokenCount``
+    (``totalTokenCount`` is prompt + candidates + thoughts, and response pricing
+    is the sum of output and thinking tokens). An omitted thoughts count stays
+    zero through the shared integer reader, matching the native mapper's fold
+    when the field is present.
+
+    Args:
+        payload: Decoded completed Gemini response.
+
+    Returns:
+        Observed token usage, or ``None`` when the payload omits usage metadata.
+
+    Raises:
+        ProviderResponseError: A usage field is present but not a non-negative integer.
+    """
     raw = payload.get("usageMetadata")
     if raw is None:
         return None
     usage = require_object(raw, "Gemini usageMetadata")
+    candidates_tokens = require_integer(
+        usage.get("candidatesTokenCount"), "Gemini candidatesTokenCount"
+    )
+    thoughts_tokens = require_integer(usage.get("thoughtsTokenCount"), "Gemini thoughtsTokenCount")
     return Usage(
         input_tokens=require_integer(usage.get("promptTokenCount"), "Gemini promptTokenCount"),
-        output_tokens=require_integer(
-            usage.get("candidatesTokenCount"), "Gemini candidatesTokenCount"
-        ),
+        output_tokens=candidates_tokens + thoughts_tokens,
         cached_input_tokens=require_integer(
             usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),

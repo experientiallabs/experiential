@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 
-from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,

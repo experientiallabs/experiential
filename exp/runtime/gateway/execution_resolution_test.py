@@ -8,11 +8,11 @@ import pytest
 
 from exp.common.models import BillingSource, ModelCapabilities, ModelSnapshot
 from exp.common.models.catalog import (
-    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayServiceTierPrices,
     GatewayTokenPrices,
 )
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.execution_resolution import (
     GatewayWireContractError,

@@ -13,7 +13,6 @@ from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
-    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayLongContextTier,
     GatewayRungDispatchPolicy,
@@ -22,6 +21,7 @@ from exp.common.models.catalog import (
     ModelRecord,
     SFTModelProvenance,
 )
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.gateway_catalog import (
     FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     SANE_MAX_SNAPSHOT_SCHEMA_VERSION,

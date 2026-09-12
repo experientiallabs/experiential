@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from exp.common.models import ModelCapabilities, ModelClient, ModelRequest, ModelResponse
-from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.models.providers.async_transport import (
     RequestDeadline,

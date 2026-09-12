@@ -334,7 +334,8 @@ of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and set
 subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
 their output total are folded by the native usage mappers before the counts leave the data plane:
 Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
-`output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
+`output_tokens` on both the native Rust mapper and the Python Gemini provider;
+on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
 `total_tokens` decides: `input + output` is the subset shape (OpenAI, OpenRouter, Fireworks,
 DeepSeek) and passes through untouched, `input + output + reasoning` is the additive shape (xAI,
 natively or relayed by Azure Foundry) and folds; without a decisive total, a reasoning count above
@@ -698,7 +699,17 @@ display-only: the encoder keeps it apart from the usage it settles from, so it n
 `message_delta` or the ledger, which bill the provider's report.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
 provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
-caller hits that 400.
+caller hits that 400. Schema version 7 adds six disclosure fields copied from the
+declaration: `supports_prompt_cache_boundaries`, `supports_custom_tools`,
+`supports_grammar_tools`, `supports_tool_call_limit`, `reports_model_status`, and
+`reports_reasoning_tokens`. False means the capability is not declared; consumers
+must not assume support. Prompt-cache-boundary support is explicit caller-selected
+breakpoints and retention, not implicit prefix caching. Custom-tool and grammar-tool
+flags must be read with the row's `dialect` and the caller's public API surface:
+public Chat still refuses custom and grammar tools even when a Responses-native
+deployment declares them. Gemini `modelStatus` stays unpreserved, so
+`reports_model_status` remains false unless an authored deployment explicitly
+declares otherwise.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,
