@@ -1218,3 +1218,89 @@ def test_output_config_effort_high_beside_thinking_keeps_high_on_the_hy4_route()
     assert coercion is not None
     assert coercion.request.reasoning_effort == "high"
     assert coercion.disclosures == ("thinking->dropped(superseded_by_effort)",)
+
+
+def test_default_on_reasoning_turns_off_when_max_tokens_cannot_hold_thinking() -> None:
+    """A tiny Messages ceiling on a lane that thinks by default dispatches at
+    ``none``, disclosed, instead of returning thinking cut off at ``max_tokens``
+    with no text. The rule reads only the catalog default and the ladder, and
+    never second-guesses a caller who stated a reasoning signal."""
+    from exp.runtime.models.providers.capability_policy import reserve_thinking_headroom
+
+    route = _hy4_route()
+    tiny = _messages_request(maximum_output_tokens=32)
+    coercion = reserve_thinking_headroom(route, tiny)
+    assert coercion is not None
+    assert coercion.disclosures == ("reasoning_effort->none(max_tokens_headroom)",)
+    assert coercion.request.reasoning_effort == "none"
+
+    # Anthropic's minimum budget is the threshold: a ceiling that could hold a
+    # legal budget is left to the lane's default.
+    assert reserve_thinking_headroom(route, _messages_request(maximum_output_tokens=1024)) is None
+    assert reserve_thinking_headroom(route, _messages_request()) is None
+    # A stated reasoning signal of any kind is the caller's decision.
+    assert (
+        reserve_thinking_headroom(
+            route, tiny.model_copy(update={"provider_thinking_config": {"type": "enabled"}})
+        )
+        is None
+    )
+    assert (
+        reserve_thinking_headroom(route, tiny.model_copy(update={"reasoning_effort": "low"}))
+        is None
+    )
+    assert (
+        reserve_thinking_headroom(
+            route, tiny.model_copy(update={"provider_output_config": {"effort": "low"}})
+        )
+        is None
+    )
+    # Chat Completions keeps the OpenAI-wire behavior (empty content, finish
+    # length) its callers expect.
+    assert (
+        reserve_thinking_headroom(
+            route, tiny.model_copy(update={"surface": GatewayApiSurface.CHAT_COMPLETIONS})
+        )
+        is None
+    )
+    # A rung with no active default already answers in text; a rung that
+    # cannot turn reasoning off keeps its own behavior.
+    tencent, openrouter = route
+    assert (
+        reserve_thinking_headroom((replace(tencent, reasoning_effort=None), openrouter), tiny)
+        is None
+    )
+    assert (
+        reserve_thinking_headroom(
+            (replace(tencent, supported_reasoning_efforts=("low", "medium", "high")), openrouter),
+            tiny,
+        )
+        is None
+    )
+
+
+def test_temperature_forwards_beside_a_translated_thinking_config_on_an_effort_rung() -> None:
+    """Anthropic refuses sampling controls beside an enabled thinking config;
+    an effort rung has no such rule, so the translated request carries the
+    caller's temperature to the provider untouched and nothing is disclosed
+    about it: a constraint of Anthropic's wire is not a constraint of the
+    route that serves the request."""
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    tencent, _openrouter = _hy4_route()
+    request = _messages_request(
+        provider_thinking_config={"type": "enabled", "budget_tokens": 2048},
+        temperature=0.3,
+        maximum_output_tokens=4096,
+    )
+    coercion = coerce_generation_parameters((tencent,), request)
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:low(budget_tokens)",)
+    public, provider = route_generation_parameter_requests((tencent,), coercion.request)
+    payload = dialect_stream_payload(tencent, provider)
+    assert payload["temperature"] == 0.3
+    assert payload["reasoning_effort"] == "low"
+    assert not any("temperature" in item for item in public.ignored_parameters)

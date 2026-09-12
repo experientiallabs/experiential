@@ -378,6 +378,7 @@ def _decode(
     _validate_manifest(payload)
     request = validate_wire(payload, wire)
     _require_served_server_tool_types(request.tools)
+    _require_thinking_budget_below_max_tokens(request)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
@@ -601,6 +602,36 @@ def _marked_text_blocks(
             entry["cache_control"] = block.cache_control.model_dump(mode="json", exclude_none=True)
         rebuilt.append(entry)
     return tuple(rebuilt)
+
+
+def _require_thinking_budget_below_max_tokens(request: _MessagesRequest) -> None:
+    """Refuse a thinking budget that leaves no room for the reply.
+
+    Anthropic requires ``thinking.budget_tokens < max_tokens`` (its own 400 reads
+    "max_tokens must be greater than thinking budget_tokens"), and the same
+    arithmetic holds on every route: a budget at or above the ceiling can only
+    end as thinking cut off at ``max_tokens`` with no text, so the request is
+    refused here, before a reservation or a provider round trip, exactly like
+    the sibling ``reasoning.max_tokens`` channel. A budget BELOW Anthropic's
+    1024 minimum is not refused: on an Anthropic rung route shaping replaces
+    it with the derived legal budget (disclosed), and on an effort rung it is
+    only a depth hint read through the tier table, so nothing about it can
+    fail. A ``count_tokens`` body carries no ``max_tokens`` and is not checked.
+
+    Args:
+        request: The validated wire request.
+
+    Raises:
+        OpenAIProtocolError: The budget is not below ``max_tokens``.
+    """
+    if request.thinking is None or request.thinking.budget_tokens is None:
+        return
+    if request.max_tokens is not None and request.thinking.budget_tokens >= request.max_tokens:
+        raise invalid_field(
+            "thinking.budget_tokens",
+            "thinking.budget_tokens must be below max_tokens so the reply has room after "
+            "thinking. Raise max_tokens or lower the budget.",
+        )
 
 
 def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:

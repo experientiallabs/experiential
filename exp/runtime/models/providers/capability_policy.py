@@ -24,6 +24,7 @@ from pydantic import JsonValue
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
@@ -234,6 +235,63 @@ def _coerce_adaptive_budget(
     # cannot re-emit adaptive thinking through output_config.
     dropped, disclosures = _drop_thinking_and_effort(request)
     return RequestCoercion(request=dropped, disclosures=disclosures)
+
+
+THINKING_HEADROOM_DISCLOSURE = "reasoning_effort->none(max_tokens_headroom)"
+"""Disclosure recorded when default-on reasoning is turned off because the
+caller's ``max_tokens`` cannot hold any thinking (see
+:func:`reserve_thinking_headroom`)."""
+
+
+def reserve_thinking_headroom(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Turn default-on reasoning off when the caller's ceiling cannot hold thinking.
+
+    A lane that reasons by default (every rung pins an active catalog
+    ``reasoning_default_effort``) spends the caller's ``max_tokens`` on thinking
+    first, so a Messages request with a small ceiling and no reasoning signal
+    of its own ends as thinking cut off at ``max_tokens`` with no text at all
+    (hy4-preview at ``max_tokens: 32``, 48 such attempts in one day). Anthropic
+    refuses any ENABLED config whose budget cannot fit under the ceiling and
+    admits none below 1024 tokens, so a ceiling under that minimum is one no
+    caller could expect thinking to fit; rather than refuse (a client that
+    never asked for thinking has nothing to remove) the request dispatches at
+    ``reasoning_effort: none`` with disclosure and the model answers in text.
+    Only a route whose EVERY rung reasons by default AND offers a ``none``
+    tier is coerced: a rung without an active default already answers in
+    text, and a rung that cannot turn reasoning off (Anthropic's adaptive
+    generation) keeps its own behavior. A caller who stated any reasoning
+    signal (``thinking``, ``output_config.effort``, ``reasoning``) is never
+    second-guessed here.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request before narrowing.
+
+    Returns:
+        The disclosed coercion, or ``None`` when the rule does not apply.
+    """
+    if request.surface != GatewayApiSurface.MESSAGES:
+        return None
+    if request.provider_thinking_config is not None or request.reasoning_effort is not None:
+        return None
+    if request.provider_output_config is not None and "effort" in request.provider_output_config:
+        return None
+    ceiling = request.maximum_output_tokens
+    if not profiles or ceiling is None or ceiling >= MINIMUM_THINKING_BUDGET_TOKENS:
+        return None
+    for profile in profiles:
+        default = profile.reasoning_effort
+        if default is None or default == "none" or default not in REASONING_EFFORTS:
+            return None
+        if "none" not in profile_reasoning_efforts(profile):
+            return None
+    return RequestCoercion(
+        request=request.model_copy(update={"reasoning_effort": "none"}),
+        disclosures=(THINKING_HEADROOM_DISCLOSURE,),
+    )
 
 
 def _requested_thinking_tier(
