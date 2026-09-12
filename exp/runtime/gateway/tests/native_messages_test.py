@@ -1106,8 +1106,12 @@ def test_start_frame_estimate_counts_the_whole_claude_code_prompt(
     """
     payloads = _stream_payloads(engine, _claude_code_body("fast-token", stream=True))
     message_start = next(payload for payload in payloads if payload["type"] == "message_start")
-    start_usage = message_start["message"]["usage"]
-    assert start_usage["input_tokens"] > 1_000, start_usage
+    message = message_start["message"]
+    assert isinstance(message, dict)
+    start_usage = message["usage"]
+    assert isinstance(start_usage, dict)
+    input_tokens = start_usage["input_tokens"]
+    assert isinstance(input_tokens, int) and input_tokens > 1_000, start_usage
     assert {k: v for k, v in start_usage.items() if k != "input_tokens"} == {
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
@@ -1124,7 +1128,7 @@ def test_start_frame_estimate_counts_the_whole_claude_code_prompt(
         timeout=10.0,
     )
     assert counted.status_code == 200, counted.text
-    assert counted.json()["input_tokens"] == start_usage["input_tokens"]
+    assert counted.json()["input_tokens"] == input_tokens
 
 
 def test_uncached_completion_reports_both_cache_legs_as_zero(engine: _ServingEngine) -> None:
