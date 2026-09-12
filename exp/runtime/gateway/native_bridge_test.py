@@ -5625,6 +5625,101 @@ def test_hunyuan_tool_turn_redacted_carrier_round_trips_on_messages(tmp_path: Pa
         _admit(control, raw_key, json.dumps(tampered), surface="messages")
 
 
+def test_claude_code_tool_continuation_with_trailing_system_reminder_serves_on_messages(
+    tmp_path: Path,
+) -> None:
+    """Claude Code's exact replay of a gateway tool turn is admitted, carrier and all.
+
+    Claude Code 2.1 (``mid-conversation-system`` beta) replays the tool turn's
+    blocks as ``[thinking, text, redacted_thinking, tool_use]`` and closes the
+    continuation with a ``system`` message carrying its token budget AFTER the
+    ``tool_result`` turn. The window after the last user turn therefore ends on
+    ``system``; every carrier-bound call has its result, so the carrier unseals,
+    pins the issuing rung, and the reminder forwards in place. Harbor's hy4
+    rollouts died on this shape at their first thinking turn (965 refusals in
+    seven hours on 2026-09-12).
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    hidden = "I should read the file first."
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": initial["hunyuan_reasoning_route_sha256"],
+                    "content": hidden,
+                    "assistant_content": "Reading the file.",
+                    "tool_calls": [{"call_id": "toolu_01", "name": "Read", "raw_arguments": "{}"}],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["Read"],
+                "failure": None,
+            }
+        )
+    )
+    body = _messages_body(
+        [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": hidden, "signature": ""},
+                    {"type": "text", "text": "Reading the file."},
+                    {"type": "redacted_thinking", "data": sealed},
+                    {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_01", "content": "done"}],
+            },
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<total_tokens>100</total_tokens>",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+        ]
+    )
+    continued = _admit(control, raw_key, body, surface="messages")
+    assert continued["route_reason"] == "reasoning_continuation"
+    messages = _payload_messages(continued)
+    assert messages[1]["reasoning_content"] == hidden
+    assert messages[1]["content"] == "Reading the file."
+    assert messages[2] == {"role": "tool", "content": "done", "tool_call_id": "toolu_01"}
+    assert messages[3] == {"role": "system", "content": "<total_tokens>100</total_tokens>"}
+
+    # Dropping the tool result leaves the carrier-bound call unanswered: the
+    # continuation is refused however the caller closes the request.
+    unanswered = json.loads(body)
+    del unanswered["messages"][2]
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, json.dumps(unanswered), surface="messages")
+    assert "complete tool results" in refused.value.public_error_json
+
+
 def test_anthropic_signed_thinking_drops_with_disclosure_on_a_foreign_route(
     tmp_path: Path,
 ) -> None:
