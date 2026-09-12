@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import ThreadingHTTPServer
@@ -19,6 +20,17 @@ from openai.types.responses import Response
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayApiSurface
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
+from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.contracts import (
+    GuardrailAction,
+    GuardrailCapabilityKind,
+    GuardrailCheck,
+    GuardrailCheckStage,
+    GuardrailPolicy,
+)
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
@@ -34,11 +46,24 @@ class _TagsUpstream(_SseUpstream):
 
     received_headers: list[dict[str, str]] = []
     payloads: list[JsonObject] = []
+    omit_usage: bool = False
 
     def do_POST(self) -> None:  # noqa: N802 - HTTP server method.
         """Record wire headers while the shared fixture records the payload."""
         self.received_headers.append({key.lower(): value for key, value in self.headers.items()})
-        super().do_POST()
+        if not self.omit_usage:
+            super().do_POST()
+            return
+        self.payloads.append(json.loads(self.rfile.read(int(self.headers["content-length"]))))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(
+            b'data: {"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        self.wfile.flush()
 
 
 @dataclass
@@ -49,12 +74,51 @@ class _Gateway:
     origins: list[str] = field(default_factory=list)
     accepted: list[AuthorizationSnapshot] = field(default_factory=list)
     billing: SettledRequestBilling | None = None
+    billing_reads: list[str] = field(default_factory=list)
+    billing_delay: float = 0.0
+    controls: list[NativeControlPlane] = field(default_factory=list)
+
+    def read_billing(self, request_id: str) -> SettledRequestBilling | None:
+        """Record each host read so duplicate callbacks cannot hide behind fixed facts."""
+        self.billing_reads.append(request_id)
+        if self.billing_delay:
+            time.sleep(self.billing_delay)
+        return self.billing
+
+    def enable_output_guardrail(self) -> None:
+        """Exercise buffered publication through the real allowing guardrail engine."""
+        policy = GuardrailPolicy(
+            policy_id="test-output",
+            organization_id="local",
+            identity_id="default",
+            checks=(
+                GuardrailCheck(
+                    check_id="allow-output",
+                    capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                    stage=GuardrailCheckStage.OUTPUT,
+                    action=GuardrailAction.BLOCK,
+                    timeout_ms=1000,
+                    adapter_id="scripted",
+                ),
+            ),
+        )
+        for control in self.controls:
+            control._guardrails = GuardrailEngine(
+                store=MappingGuardrailStore((policy,)),
+                monotonic=time.monotonic,
+                client=DirectClassifierClient(
+                    ClassifierRegistry({"scripted": ScriptedClassifier()})
+                ),
+            )
 
 
 @pytest.fixture
-def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Gateway]:
+def gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[_Gateway]:
     """Serve real native workers and capture snapshots at the ledger boundary."""
     _TagsUpstream.payloads.clear()
+    _TagsUpstream.omit_usage = False
     _TagsUpstream.received_headers.clear()
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _TagsUpstream)
     provider_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
@@ -66,6 +130,7 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Gatewa
         tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
     )
     result = _Gateway(raw_key)
+    request_timeout = float(getattr(request, "param", 120.0))
     original = SyncGroupCommitLedger.accept_request
 
     def record(ledger: SyncGroupCommitLedger, *, authorization: AuthorizationSnapshot) -> None:
@@ -87,9 +152,11 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Gatewa
         ready = threading.Event()
         control = NativeControlPlane(
             components,
+            request_timeout_seconds=request_timeout,
             continuation_store=continuations,
-            settled_billing_reader=lambda _request_id: result.billing,
+            settled_billing_reader=result.read_billing,
         )
+        result.controls.append(control)
         shutdown = native.shutdown_handle()
         shutdowns.append(shutdown)
 
@@ -104,7 +171,12 @@ def gateway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Gatewa
                 native.serve(
                     control,
                     json.dumps(
-                        {"host": "127.0.0.1", "port": port, "graceful_timeout_seconds": 2.0}
+                        {
+                            "host": "127.0.0.1",
+                            "port": port,
+                            "graceful_timeout_seconds": 2.0,
+                            "request_timeout_seconds": request_timeout,
+                        }
                     ),
                     shutdown,
                     listening,
@@ -300,19 +372,24 @@ def test_invalid_headers_never_admit_or_forward(gateway: _Gateway, surface: str)
 
 @pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("prompt", ["hello", "empty-token", "truncated-token", "no-usage"])
+@pytest.mark.parametrize("guarded", [False, True])
 def test_billing_is_in_terminal_bytes_and_keyed_replay(
-    gateway: _Gateway, surface: str, stream: bool
+    gateway: _Gateway, surface: str, stream: bool, prompt: str, guarded: bool
 ) -> None:
-    """All three protocol terminals carry host truth; keyed replays keep exact bytes."""
+    """All terminal paths read host truth once and keyed replays keep exact bytes."""
+    if guarded:
+        gateway.enable_output_guardrail()
+    _TagsUpstream.omit_usage = prompt == "no-usage"
     gateway.billing = SettledRequestBilling(paid_nano_usd=1234567, byok_nano_usd=9, is_byok=True)
     body: JsonObject = {
         "model": "coding",
         "max_tokens": 32,
-        "messages": [{"role": "user", "content": "hello"}],
+        "messages": [{"role": "user", "content": prompt}],
         "stream": stream,
     }
     if surface == "responses":
-        body = {"model": "coding", "input": "hello", "stream": stream}
+        body = {"model": "coding", "input": prompt, "stream": stream}
     elif surface == "chat/completions" and stream:
         body["stream_options"] = {"include_usage": True}
     headers = {"Authorization": "Bearer " + gateway.key, "Idempotency-Key": "billing-check"}
@@ -337,6 +414,9 @@ def test_billing_is_in_terminal_bytes_and_keyed_replay(
     assert usage["cost"] == 0.001234567
     assert usage["is_byok"] is True
     assert usage["cost_details"]["upstream_inference_cost"] == 0.000000009
+    assert len(gateway.billing_reads) == 1
+    if prompt == "no-usage" and surface != "messages":
+        assert "prompt_tokens" not in usage and "input_tokens" not in usage
     if surface != "messages":
         gateway.billing = SettledRequestBilling(paid_nano_usd=0, byok_nano_usd=0, is_byok=False)
         replay = httpx.post(
@@ -344,3 +424,37 @@ def test_billing_is_in_terminal_bytes_and_keyed_replay(
         )
         assert replay.content == answer.content
         assert len(_TagsUpstream.payloads) == 1
+        assert len(gateway.billing_reads) == 1
+
+
+@pytest.mark.parametrize("gateway", [0.5], indirect=True)
+@pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
+def test_slow_billing_cannot_truncate_settled_success(gateway: _Gateway, surface: str) -> None:
+    """A bounded but late host read must not consume the terminal delivery window."""
+    gateway.billing = SettledRequestBilling(paid_nano_usd=1234567, byok_nano_usd=0, is_byok=False)
+    gateway.billing_delay = 0.8
+    body: JsonObject = {
+        "model": "coding",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": True,
+    }
+    if surface == "responses":
+        body = {"model": "coding", "input": "hello", "stream": True}
+    elif surface == "chat/completions":
+        body["stream_options"] = {"include_usage": True}
+    answer = httpx.post(
+        gateway.origins[0] + "/" + surface,
+        json=body,
+        headers={"Authorization": "Bearer " + gateway.key},
+        timeout=3,
+    )
+    assert answer.status_code == 200
+    terminal = {
+        "chat/completions": "data: [DONE]",
+        "responses": '"type":"response.completed"',
+        "messages": '"type":"message_stop"',
+    }[surface]
+    assert terminal in answer.text
+    assert '"cost"' not in answer.text
+    assert len(gateway.billing_reads) == 1

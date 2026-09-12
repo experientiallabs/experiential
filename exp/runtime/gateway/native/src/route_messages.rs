@@ -220,7 +220,19 @@ pub(crate) async fn messages(
 
     match won {
         Won::Failed(error) => messages_error_response(&error),
-        Won::Settled(settled) => settled_messages_response(&admission, settled).await,
+        Won::Settled(settled) => {
+            settled_messages_response(
+                &admission,
+                settled,
+                crate::billing::SettledBilling::read(
+                    &state.bridge,
+                    &admission.request_id,
+                    deadline,
+                )
+                .await,
+            )
+            .await
+        }
         Won::Committed(committed) => {
             let committed = *committed;
             if admission.output_guardrail {
@@ -262,7 +274,11 @@ async fn messages_wire_drift_response(
 /// Answer one attempt that the waterfall already settled: a successful
 /// terminal with no semantic output, or an exhausted ladder flushing its
 /// bounded withheld refusal output ahead of the failing terminal.
-async fn settled_messages_response(admission: &Admission, settled: SettledAttempt) -> Response {
+async fn settled_messages_response(
+    admission: &Admission,
+    settled: SettledAttempt,
+    billing: Option<crate::billing::SettledBilling>,
+) -> Response {
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     if refusal_completed.is_none() {
@@ -271,10 +287,11 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
             if admission.stream {
                 // The withheld refusal output and its failing terminal flush
                 // outward as the stream's only frames.
-                let body = match encode_messages_sse(admission, &events, None, false) {
-                    Ok(body) => body,
-                    Err(error) => return messages_error_response(&error),
-                };
+                let body =
+                    match encode_messages_sse(admission, &events, None, false, billing.as_ref()) {
+                        Ok(body) => body,
+                        Err(error) => return messages_error_response(&error),
+                    };
                 let mut headers = commit_independent(admission, None);
                 headers.extend(commit_dependent(admission, settled.depth));
                 return sse_body_response(&headers, body);
@@ -288,13 +305,13 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
     // issued and nothing needs sealing; exposure only governs display.
     let exposed = admission.reasoning_exposed_at(settled.depth);
     if admission.stream {
-        let body = match encode_messages_sse(admission, &events, None, exposed) {
+        let body = match encode_messages_sse(admission, &events, None, exposed, billing.as_ref()) {
             Ok(body) => body,
             Err(error) => return messages_error_response(&error),
         };
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_messages_body_with_reasoning(
+    let mut aggregated = match completed_messages_body_with_reasoning(
         &admission.request_id,
         &admission.alias,
         &events,
@@ -307,6 +324,9 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
     };
     if let Some(failure) = &aggregated.failure {
         return messages_error_response(&failure.clone().boundary().public_error());
+    }
+    if let Some(billing) = billing {
+        billing.annotate(&mut aggregated.body);
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
@@ -322,6 +342,7 @@ async fn respond_from_messages_events(
     usage: Option<Usage>,
     tool_names: Vec<String>,
     stream_body: bool,
+    deadline: Instant,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
     // A tool turn's hidden reasoning leaves only as the sealed carrier, so it
@@ -415,15 +436,25 @@ async fn respond_from_messages_events(
         // Success is only reported once the terminal accounting write landed.
         return messages_error_response(&PublicError::internal());
     }
-    crate::billing::body(&guard.bridge, &admission.request_id, &mut aggregated.body).await;
+    let billing =
+        crate::billing::SettledBilling::read(&guard.bridge, &admission.request_id, deadline).await;
     let mut headers = commit_independent(&admission, None);
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
-        let body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
-            Ok(body) => crate::billing::sse(&guard.bridge, &admission.request_id, body).await,
+        let body = match encode_messages_sse(
+            &admission,
+            &events,
+            carrier.as_deref(),
+            exposed,
+            billing.as_ref(),
+        ) {
+            Ok(body) => body,
             Err(error) => return messages_error_response(&error),
         };
         return sse_body_response(&headers, body);
+    }
+    if let Some(billing) = billing {
+        billing.annotate(&mut aggregated.body);
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
@@ -433,6 +464,7 @@ fn encode_messages_sse(
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
     reasoning_output_exposed: bool,
+    billing: Option<&crate::billing::SettledBilling>,
 ) -> Result<Vec<u8>, PublicError> {
     let mut encoder = MessagesSseEncoder::new_with_ignored(
         &admission.request_id,
@@ -450,6 +482,7 @@ fn encode_messages_sse(
     }
     for event in events {
         for frame in encoder.feed(event)? {
+            let frame = crate::billing::terminal_frame(billing, event, frame);
             body.extend_from_slice(frame.as_bytes());
         }
     }
@@ -494,6 +527,7 @@ async fn completed_messages(
         committed.usage,
         committed.tool_names,
         false,
+        deadline,
     )
     .await
 }
@@ -552,6 +586,7 @@ async fn guarded_messages(
         committed.usage,
         committed.tool_names,
         stream_body,
+        deadline,
     )
     .await
 }
@@ -710,7 +745,7 @@ async fn stream_messages(
                 }
             };
             let encoded = if terminal.is_some() {
-                crate::billing::frames(&guard.bridge, &request_id, encoded).await
+                crate::billing::frames(&guard.bridge, &request_id, deadline, encoded).await
             } else {
                 encoded
             };

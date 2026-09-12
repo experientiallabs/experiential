@@ -66,7 +66,11 @@ An embedder can supply `NativeControlPlane(settled_billing_reader=...)` returnin
 `SettledRequestBilling` for a native-owned request ID. The reader supplies complete
 settled request amounts across all attempts in nano-USD, never a current-price
 estimate. It must be bounded and content-free. With no reader or no summary, billing
-extensions are omitted rather than asserting zero.
+extensions are omitted rather than asserting zero. The native read never queues
+behind busy bridge workers and waits at most 100ms or half the remaining request
+lifetime, whichever is smaller. A timeout omits the annotation without delaying the
+terminal until its delivery deadline; a timed-out callback retains its worker slot
+until it finishes.
 
 Chat Completions, Responses, and Messages add `usage.cost` and `usage.is_byok` to
 terminal responses; BYOK summaries also add
@@ -74,10 +78,17 @@ terminal responses; BYOK summaries also add
 to each protocol. Streaming adds these only to the terminal usage event, never to
 the Messages start-frame estimate. Keyed Chat/Responses store the annotated bytes
 before publishing them, so replay returns exactly the original billing facts.
-Messages continues to ignore `Idempotency-Key`.
+Messages continues to ignore `Idempotency-Key`. Empty and truncated completions
+use the same billing projection. On Chat and Responses, if provider token usage is
+unknown but settled money is known, usage contains billing only, never token zeros.
+Chat streaming still requires `stream_options.include_usage=true` for that event.
+Buffered streams read billing once and enrich only terminal frames.
 
 The embedder's request ledger remains billing authority. These fields are a view of
-that ledger, not an independent debit or a token-pricing implementation.
+that ledger, not an independent debit or a token-pricing implementation. USD JSON
+numbers are display values: their binary floating-point representation does not
+preserve every nano-dollar at multi-million-dollar request amounts. Exact
+accounting and reconciliation use the host ledger's integer nano-USD amounts.
 
 ## Request attribution tags
 

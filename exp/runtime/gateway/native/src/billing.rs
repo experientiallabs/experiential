@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettledBilling {
     paid_nano_usd: u64,
@@ -16,20 +16,31 @@ pub struct SettledBilling {
 
 impl SettledBilling {
     /// Missing or failed annotation never substitutes an invented zero cost.
-    pub async fn read(bridge: &Bridge, request_id: &str) -> Option<Self> {
+    pub async fn read(
+        bridge: &Bridge,
+        request_id: &str,
+        deadline: std::time::Instant,
+    ) -> Option<Self> {
+        // Preserve time to publish the paid success even if the ledger stalls.
+        let budget = (deadline.saturating_duration_since(std::time::Instant::now()) / 2)
+            .min(std::time::Duration::from_millis(100));
+        if budget < std::time::Duration::from_millis(1) {
+            return None;
+        }
         let answer = bridge
-            .call(
+            .call_optional(
                 "settled_billing",
                 compact_json(&json!({"request_id": request_id})),
+                budget,
             )
-            .await
-            .ok()?;
+            .await?;
         serde_json::from_str::<Option<Self>>(&answer).ok().flatten()
     }
 
     fn dollars(value: u64) -> Value {
-        // Parse an exact decimal spelling; never use floating arithmetic to
-        // compute the charged amount before JSON rendering.
+        // Format ledger nanos before conversion to the wire's JSON number.
+        // serde_json stores that number as f64; this is a display projection,
+        // not an exact full-u64 accounting representation.
         serde_json::from_str(&format!(
             "{}.{:09}",
             value / 1_000_000_000,
@@ -45,7 +56,13 @@ impl SettledBilling {
         } else {
             value
         };
-        let Some(usage) = holder.get_mut("usage").and_then(Value::as_object_mut) else {
+        let Some(usage) = holder.get_mut("usage") else {
+            return;
+        };
+        if usage.is_null() {
+            *usage = json!({});
+        }
+        let Some(usage) = usage.as_object_mut() else {
             return;
         };
         usage.insert("cost".into(), Self::dollars(self.paid_nano_usd));
@@ -70,7 +87,8 @@ impl SettledBilling {
                 let Ok(mut payload) = serde_json::from_str::<Value>(data.trim_end()) else {
                     return line.to_owned();
                 };
-                if payload["type"] == "message_start" {
+                let holder = payload.get("response").unwrap_or(&payload);
+                if payload["type"] == "message_start" || holder.get("usage").is_none() {
                     return line.to_owned();
                 }
                 self.annotate(&mut payload);
@@ -84,27 +102,26 @@ impl SettledBilling {
     }
 }
 
-/// Annotate a completed non-streaming body after settlement.
-pub async fn body(bridge: &Bridge, request_id: &str, value: &mut Value) {
-    if let Some(billing) = SettledBilling::read(bridge, request_id).await {
-        billing.annotate(value);
-    }
-}
-
-/// Annotate a buffered SSE result before a keyed owner stores it.
-pub async fn sse(bridge: &Bridge, request_id: &str, bytes: Vec<u8>) -> Vec<u8> {
-    match (
-        SettledBilling::read(bridge, request_id).await,
-        std::str::from_utf8(&bytes),
-    ) {
-        (Some(billing), Ok(text)) => billing.annotate_sse(text).into_bytes(),
-        _ => bytes,
+/// Buffered encoders pass content through without another JSON parse or copy.
+pub fn terminal_frame(
+    billing: Option<&SettledBilling>,
+    event: &crate::events::Event,
+    frame: String,
+) -> String {
+    match billing.filter(|_| event.is_terminal()) {
+        Some(billing) => billing.annotate_sse(&frame),
+        None => frame,
     }
 }
 
 /// Annotate terminal frames only, leaving already-emitted content untouched.
-pub async fn frames(bridge: &Bridge, request_id: &str, frames: Vec<String>) -> Vec<String> {
-    match SettledBilling::read(bridge, request_id).await {
+pub async fn frames(
+    bridge: &Bridge,
+    request_id: &str,
+    deadline: std::time::Instant,
+    frames: Vec<String>,
+) -> Vec<String> {
+    match SettledBilling::read(bridge, request_id, deadline).await {
         Some(billing) => frames
             .iter()
             .map(|frame| billing.annotate_sse(frame))
@@ -116,6 +133,16 @@ pub async fn frames(bridge: &Bridge, request_id: &str, frames: Vec<String>) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dollar_numbers_are_display_values_not_full_range_nano_counters() {
+        let nanos = 10_000_000_000_000_001;
+        assert_eq!(
+            format!("{}.{:09}", nanos / 1_000_000_000, nanos % 1_000_000_000),
+            "10000000.000000001"
+        );
+        assert_eq!(compact_json(&SettledBilling::dollars(nanos)), "10000000.0");
+    }
 
     #[test]
     fn annotates_each_protocol_without_changing_token_shapes() {
@@ -135,6 +162,27 @@ mod tests {
             assert_eq!(holder["usage"]["is_byok"], false);
             assert!(holder["usage"].get("cost_details").is_none());
         }
+    }
+
+    #[test]
+    fn buffered_content_passes_through_without_parsing_or_copying() {
+        let billing = SettledBilling {
+            paid_nano_usd: 1,
+            byok_nano_usd: 0,
+            is_byok: false,
+        };
+        let content = "data: { \"content\" : \"large content\" }\n\n".to_string();
+        let allocation = content.as_ptr();
+        let result = terminal_frame(
+            Some(&billing),
+            &crate::events::Event::TextDelta("x".into()),
+            content,
+        );
+        assert_eq!(result.as_ptr(), allocation);
+        let terminal = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":null}}\n\n".to_string();
+        let result = terminal_frame(Some(&billing), &crate::events::Event::Completed, terminal);
+        assert!(result.contains("\"cost\":1e-9"));
+        assert!(!result.contains("input_tokens"));
     }
 
     #[test]
