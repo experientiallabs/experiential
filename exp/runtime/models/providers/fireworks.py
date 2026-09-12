@@ -123,6 +123,13 @@ def _require_complete_tool_results(messages: Sequence[GatewayMessage]) -> None:
     A provider answers some tool rounds without reasoning, so an active window mixes
     carrier-bearing turns with plain ones. Every tool call in the window is tracked for
     result identity, while completion is required only of the rounds that carry state.
+
+    The window is everything after the latest user turn, so it can also hold
+    mid-conversation ``system`` and ``developer`` messages: Claude Code closes a
+    tool continuation with a trailing system reminder (its token budget) after the
+    ``tool_result`` turn. Those messages neither call tools nor answer them, so the
+    walk passes over them; a continuation is complete when every carrier-bound call
+    has its one result, whatever message the caller ends the request on.
     """
     pending: set[str] = set()
     window_call_ids: set[str] = set()
@@ -147,7 +154,5 @@ def _require_complete_tool_results(messages: Sequence[GatewayMessage]) -> None:
                 )
             pending.discard(call_id)
             completed_call_ids.add(call_id)
-    if pending or not messages or messages[-1].role != "tool":
-        raise _reasoning_parameter_error(
-            "reasoning_content can replay only in a completed tool continuation."
-        )
+    if pending:
+        raise _reasoning_parameter_error("reasoning_content tool calls need complete tool results.")
