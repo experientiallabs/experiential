@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import shlex
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -532,3 +533,29 @@ def test_first_run_unknown_setup_outcome_delivers_the_only_raw_key(
     assert "export EXP_GATEWAY_KEY=exp_vk_unknown_secret" in transcript
     assert "Preserve this one-time gateway key: exp_vk_unknown_secret" in transcript
     assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript
+
+
+def test_project_gateway_key_command_shell_quotes_the_key_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copyable export treats every character in the key path as data."""
+    output = io.StringIO()
+    monkeypatch.setattr(
+        run_app,
+        "_console",
+        Console(file=output, width=1_000, force_terminal=False, no_color=True, highlight=False),
+    )
+    key_file = Path("/tmp/key path'quoted;line\nbreak")
+    compatibility = ProjectGatewayCompatibility(
+        alias="project-a",
+        alias_revision_id="revision-a",
+        identity_id="identity-a",
+        key_file=key_file,
+        policy_id="policy-a",
+        changed=False,
+    )
+
+    run_app._emit_gateway_ready(port=8000, compatibility=compatibility, ghost=False)
+
+    command = f"export EXP_GATEWAY_KEY=\"$(tr -d '\\n' < {shlex.quote(str(key_file))})\""
+    assert output.getvalue().endswith(f"{command}\n")
