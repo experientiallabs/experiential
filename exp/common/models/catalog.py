@@ -465,7 +465,13 @@ class GatewayDeploymentCapabilities(ContractModel):
     ordered set here because their supported values vary by model.
     """
     reasoning_default_effort: ReasoningEffort | None = None
-    """Explicit provider default used only when the wire requires this field."""
+    """The depth this deployment reasons at when the caller names none.
+
+    Emitted on a wire that requires an explicit effort, and read by Messages
+    admission as the depth a budget-less ``thinking`` config (``adaptive``, or
+    Claude Code's bare ``{type: enabled}``) asks for on an effort rung, so a
+    lane's think-mode depth is set here, not in code.
+    """
     reasoning_effort_required: bool = False
     """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False

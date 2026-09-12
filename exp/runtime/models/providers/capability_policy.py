@@ -17,11 +17,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
@@ -39,6 +40,7 @@ from exp.runtime.models.providers.generation_route_compat import (
 )
 from exp.runtime.models.providers.reasoning_compat import (
     MINIMUM_THINKING_BUDGET_TOKENS,
+    REASONING_EFFORTS,
     anthropic_adaptive_only_thinking,
     anthropic_budgeted_enabled_only,
     anthropic_thinking_budget_tokens,
@@ -87,9 +89,42 @@ THINKING_TRANSLATED_DISCLOSURE = "thinking.type->enabled"
 """Disclosure recorded when an adaptive thinking config is translated to a
 budgeted ``enabled`` config for a budgeted-enabled Anthropic route."""
 
+THINKING_NO_SERVABLE_TIER_DROP_DISCLOSURE = "thinking->dropped(no_servable_tier)"
+"""Disclosure recorded when the route CAN reason but no tier of its ladder
+serves this request end to end beside the caller's other controls, so the
+config drops and the rung answers at its own default depth. Distinct from
+``unsupported_by_route`` (no rung reasons at all) so a caller can tell "this
+model never thinks" from "this request could not state a depth"."""
+
 THINKING_EFFORT_DISCLOSURE_PREFIX = "thinking->reasoning_effort:"
 """Disclosure prefix recorded when a thinking config translates to the effort
-a non-Anthropic reasoning route speaks; the effective tier follows the colon."""
+a reasoning route speaks; the effective tier and the source that named it
+follow, rendered by :func:`thinking_effort_disclosure`."""
+
+ThinkingEffortSource = Literal["budget_tokens", "lane_default", "gateway_default", "disabled"]
+"""What named the depth a thinking config translated to.
+
+``budget_tokens``: the caller's own budget through the documented tier table.
+``lane_default``: a budget-less config (``adaptive``, or the bare ``enabled``
+Claude Code sends) read as the rung's catalog default depth
+(``reasoning_default_effort``). ``gateway_default``: the same config on a
+route whose rungs pin no default, so the provider-default analog (medium)
+stands in. ``disabled``: the explicit off switch.
+"""
+
+
+def thinking_effort_disclosure(tier: str, source: ThinkingEffortSource) -> str:
+    """Render ``thinking->reasoning_effort:<tier>(<source>)`` for one translation.
+
+    Args:
+        tier: The EFFECTIVE tier after the nearest-tier snap onto the ladder.
+        source: What asked for that depth (see :data:`ThinkingEffortSource`).
+
+    Returns:
+        The disclosure string admission records in ``ignored_parameters``.
+    """
+    return f"{THINKING_EFFORT_DISCLOSURE_PREFIX}{tier}({source})"
+
 
 THINKING_BUDGET_IGNORED_DISCLOSURE = "thinking.budget_tokens"
 """Disclosure recorded when a caller budget was illegal and a derived budget
@@ -201,38 +236,89 @@ def _coerce_adaptive_budget(
     return RequestCoercion(request=dropped, disclosures=disclosures)
 
 
+def _requested_thinking_tier(
+    profiles: Sequence[GatewayWireProfile],
+    config: Mapping[str, object],
+) -> tuple[ReasoningEffort, ThinkingEffortSource]:
+    """Resolve the depth one thinking config asks for on a route of effort rungs.
+
+    An explicit ``budget_tokens`` names the depth through the documented tier
+    table (:func:`thinking_config_reasoning_effort`). A budget-less config
+    (``adaptive``, or the bare ``enabled`` Claude Code sends in think mode)
+    asks the MODEL to pick its depth, and on an effort rung the model's own
+    depth is its catalog default (``reasoning_default_effort``, carried on the
+    wire profile as ``reasoning_effort``): the first rung in route order that
+    pins an active default it can serve names the tier, so an operator sets a
+    lane's think-mode depth by catalog, not by code. A route whose rungs pin no
+    default falls back to medium, the provider-default analog. A ``none``
+    default is not a depth (that rung reasons only when asked), so it is
+    skipped rather than reading an active config as no reasoning.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        config: Verbatim caller ``thinking`` object.
+
+    Returns:
+        The requested tier and the source that named it.
+    """
+    if config.get("type") == "disabled":
+        return "none", "disabled"
+    budget = config.get("budget_tokens")
+    if isinstance(budget, int) and not isinstance(budget, bool):
+        return thinking_config_reasoning_effort(config), "budget_tokens"
+    for profile in profiles:
+        default = profile.reasoning_effort
+        if (
+            default is not None
+            and default in REASONING_EFFORTS
+            and default != "none"
+            and default in profile_reasoning_efforts(profile)
+        ):
+            # Membership in REASONING_EFFORTS is the runtime check the cast
+            # relies on; the profile field is a plain string.
+            return cast("ReasoningEffort", default), "lane_default"
+    return "medium", "gateway_default"
+
+
 def _coerce_thinking_to_effort(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
     *,
     admits: Callable[[GatewayRequest], bool] | None = None,
 ) -> RequestCoercion | None:
-    """Translate a thinking config for an all-non-Anthropic route.
+    """Translate a thinking config onto the route's effort ladder.
 
     Claude Code pins a ``thinking`` config on every model, so the named
     rejection at route shaping would make whole sessions unusable against
-    OpenAI-family reasoning models the provider itself serves fine. On a
-    route with NO Anthropic rung the config translates to the nearest effort
-    the route actually serves (the tier table in
-    :func:`thinking_config_reasoning_effort`, then nearest-first over the
-    route's ladder), disclosed as ``thinking->reasoning_effort:<tier>``.
-    The combined ladder is a union of per-rung ladders, so the naive nearest
-    tier may be served only by rungs that reject some other control;
-    candidates are therefore tried in nearness order (ties prefer the lower
-    tier) and the translation is the closest tier that survives full route
-    construction and the caller's admission probe, mirroring the
-    explicit-effort snap in :func:`coerce_generation_parameters`. A route
-    with no reasoning rung drops every reasoning signal with disclosure
-    instead. An explicit caller effort is the same channel already stated in
-    the route's own vocabulary, so it wins verbatim and the config drops
-    with one disclosure. Routes with an Anthropic rung are left alone:
-    narrowing already prefers the rung that honors the config verbatim, and
-    stealing that preference here would trade real thinking for a
-    translation. Replayed thinking blocks are signed provider state no
-    translation can carry, so their presence declines the coercion (and the
-    gateway never fabricates unsigned blocks on the response side: our own
-    decode routes replayed blocks to Anthropic-only routes, so a fabricated
-    block would wedge the caller's next turn).
+    reasoning models the provider itself serves fine through an effort. Once
+    every rung has declined the config verbatim (an all-non-Anthropic route
+    always does; a mixed route reaches here only when its Anthropic rung
+    declined too, for the config or for another control), the config
+    translates to the nearest effort the route actually serves, disclosed as
+    ``thinking->reasoning_effort:<tier>(<source>)``. The requested tier comes
+    from :func:`_requested_thinking_tier`: an explicit budget through the tier
+    table, a budget-less config from the lane's catalog default depth (medium
+    when no rung pins one). The combined ladder is a union of per-rung
+    ladders, so the naive nearest tier may be served only by rungs that reject
+    some other control; candidates are therefore tried in nearness order (ties
+    prefer the lower tier) and the translation is the closest tier that
+    survives full route construction and the caller's admission probe,
+    mirroring the explicit-effort snap in :func:`coerce_generation_parameters`.
+
+    Where no tier serves, the config DROPS with disclosure rather than
+    rejecting: the route's answer is then its own default behavior, stated
+    openly, which is the rule every first-party-pinned field follows here (a
+    zero-reasoning route drops a pinned effort the same way). A route with no
+    reasoning rung discloses ``unsupported_by_route``; a route that reasons
+    but cannot state any tier beside this request's other controls discloses
+    ``no_servable_tier``. The drop is offered only when the admission probe
+    accepts it, so a request whose real blocker is another control keeps that
+    rejection. An explicit caller effort is the same channel already stated in
+    the route's own vocabulary, so it wins verbatim and the config drops with
+    one disclosure. Replayed thinking blocks are signed provider state no
+    translation can carry; route shaping strips them from a foreign wire with
+    disclosure, so their presence never blocks the translation (and the
+    gateway never fabricates unsigned blocks on the response side).
 
     Args:
         profiles: Ordered wire profiles for every live route deployment.
@@ -243,15 +329,16 @@ def _coerce_thinking_to_effort(
 
     Returns:
         The disclosed translation or drop, or ``None`` when the request
-        carries no thinking config, the route has an Anthropic rung, or no
-        translatable tier serves the request end to end. Replayed Anthropic
-        thinking blocks no longer block the translation: route shaping strips
-        them from a foreign wire with disclosure.
+        carries no thinking config or no offered request passes the probe.
     """
     config = request.provider_thinking_config
     if config is None or not profiles:
         return None
-    if any(profile.dialect == "anthropic_messages" for profile in profiles):
+    if all(profile.dialect == "anthropic_messages" for profile in profiles):
+        # The config is native on every rung: shaping forwards, fills, or
+        # family-gates it itself and never raises the unsupported-parameter
+        # rejection, so whatever declined the request here lies elsewhere and
+        # a translation would replace real thinking for nothing.
         return None
 
     def admitted(coercion: RequestCoercion) -> RequestCoercion | None:
@@ -273,9 +360,9 @@ def _coerce_thinking_to_effort(
                 disclosures=(THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE,),
             )
         )
-    requested_tier = thinking_config_reasoning_effort(config)
+    requested_tier, source = _requested_thinking_tier(profiles, config)
     candidates = set(ladder)
-    if requested_tier == "none":
+    if source == "disabled":
         # A disabled config asked for NO reasoning; snapping it to an active
         # level would enable reasoning the caller explicitly turned off, so
         # only an exact 'none' translates and anything else takes the
@@ -305,35 +392,38 @@ def _coerce_thinking_to_effort(
             continue
         return RequestCoercion(
             request=translated_request,
-            disclosures=(f"{THINKING_EFFORT_DISCLOSURE_PREFIX}{candidate}",),
+            disclosures=(thinking_effort_disclosure(candidate, source),),
         )
-    if candidates:
-        # Active tiers exist but none serves this request end to end, so the
-        # original rejection stands: dropping the config here would silently
-        # disable reasoning the caller asked for.
-        return None
-    dropped, disclosures = _drop_thinking_and_effort(request)
+    dropped, disclosures = _drop_thinking_and_effort(
+        request,
+        disclosure=(
+            THINKING_NO_SERVABLE_TIER_DROP_DISCLOSURE if candidates else THINKING_DROP_DISCLOSURE
+        ),
+    )
     return admitted(RequestCoercion(request=dropped, disclosures=disclosures))
 
 
 def _drop_thinking_and_effort(
     request: GatewayRequest,
+    *,
+    disclosure: str = THINKING_DROP_DISCLOSURE,
 ) -> tuple[GatewayRequest, tuple[str, ...]]:
-    """Null the thinking config and effort channels for a route that cannot reason.
+    """Null the thinking config and effort channels for a route that cannot honor them.
 
     Shared drop for the routes that cannot honor a reasoning signal: the
     thinking config, the caller effort, and the Messages ``output_config.effort``
     channel all go, and a ``clear_thinking`` context edit rides on the thinking
-    config and is stripped with it. Every removal is disclosed. History thinking
-    blocks are NOT touched — Anthropic accepts replayed blocks without a live
-    thinking config.
+    config and is stripped with it. Every removal is disclosed; ``disclosure``
+    names why the config went (no reasoning rung, or no servable tier). History
+    thinking blocks are NOT touched: Anthropic accepts replayed blocks without a
+    live thinking config.
     """
     updates: dict[str, object] = {"provider_thinking_config": None}
     disclosures: list[str] = []
     if request.reasoning_effort is not None:
         updates["reasoning_effort"] = None
         disclosures.append(EFFORT_DROP_DISCLOSURE)
-    disclosures.append(THINKING_DROP_DISCLOSURE)
+    disclosures.append(disclosure)
     if request.provider_output_config is not None and "effort" in request.provider_output_config:
         remaining = {
             key: value for key, value in request.provider_output_config.items() if key != "effort"

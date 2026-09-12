@@ -204,7 +204,10 @@ class GatewayWireProfile:
     """Exact provider field used to carry normalized reasoning effort."""
 
     reasoning_effort: str | None = None
-    """Optional provider default used when the wire requires an explicit effort."""
+    """The rung's catalog default depth (``reasoning_default_effort``).
+
+    Emitted when the wire requires an explicit effort, and the depth a
+    budget-less caller ``thinking`` config translates to on this rung."""
 
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values declared by this deployment, in canonical order."""

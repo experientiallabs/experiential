@@ -1693,7 +1693,7 @@ def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
 
     coercion = coerce_generation_parameters((profile,), decoded.request)
     assert coercion is not None
-    assert coercion.disclosures == ("thinking->reasoning_effort:medium",)
+    assert coercion.disclosures == ("thinking->reasoning_effort:medium(budget_tokens)",)
     _public, provider = route_generation_parameter_requests((profile,), coercion.request)
     payload = dialect_stream_payload(profile, provider)
     assert payload["reasoning"] == {"effort": "medium"}

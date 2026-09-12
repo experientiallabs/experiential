@@ -814,7 +814,7 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
     )
 
     assert tuple(item.deployment_id for item in narrowed.deployments) == ("gpt",)
-    assert "thinking->reasoning_effort:medium" in public.ignored_parameters
+    assert "thinking->reasoning_effort:medium(budget_tokens)" in public.ignored_parameters
     assert provider.provider_thinking_config is None
     assert provider.reasoning_effort == "medium"
     assert accounting.recorded == 1
