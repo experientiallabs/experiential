@@ -64,7 +64,12 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
     .expect("json");
     assert_eq!(
         start["message"]["usage"],
-        json!({"input_tokens": 230, "output_tokens": 25, "cache_read_input_tokens": 2000})
+        json!({
+            "input_tokens": 230,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 2000,
+            "output_tokens": 25,
+        })
     );
 
     let mut bare = MessagesSseEncoder::new("request-abc", "coding");
@@ -80,7 +85,12 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
     .expect("json");
     assert_eq!(
         start["message"]["usage"],
-        json!({"input_tokens": 0, "output_tokens": 0})
+        json!({
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+        })
     );
 }
 
@@ -136,9 +146,9 @@ fn start_frame_carries_the_pre_dispatch_estimate_when_the_upstream_reports_nothi
     // An OpenAI-wire upstream reports usage only in its final chunk, so the
     // start frame would otherwise carry the zero placeholder that Claude Code
     // reads as "0 input tokens". The admission's pre-dispatch prompt estimate
-    // fills it with Anthropic's `output_tokens: 1` placeholder; the estimate
-    // is display-only (message_delta and the ledger keep the provider's
-    // report).
+    // fills it with Anthropic's `output_tokens: 1` placeholder and both cache
+    // legs at zero (nothing is cached before dispatch); the estimate is
+    // display-only (message_delta and the ledger keep the provider's report).
     let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
     encoder.set_initial_usage(None);
     encoder.set_pre_dispatch_input_estimate(Some(1234));
@@ -153,7 +163,12 @@ fn start_frame_carries_the_pre_dispatch_estimate_when_the_upstream_reports_nothi
     .expect("json");
     assert_eq!(
         start["message"]["usage"],
-        json!({"input_tokens": 1234, "output_tokens": 1})
+        json!({
+            "input_tokens": 1234,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 1,
+        })
     );
 }
 
@@ -181,6 +196,11 @@ fn upstream_start_usage_outranks_the_pre_dispatch_estimate() {
     .expect("json");
     assert_eq!(
         start["message"]["usage"],
-        json!({"input_tokens": 20, "output_tokens": 1, "cache_read_input_tokens": 10})
+        json!({
+            "input_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 10,
+            "output_tokens": 1,
+        })
     );
 }

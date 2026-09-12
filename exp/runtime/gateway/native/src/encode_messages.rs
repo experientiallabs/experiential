@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::{
@@ -87,39 +87,54 @@ pub(super) fn stop_sequence_value(terminal: &Event) -> Value {
     }
 }
 
-/// The Anthropic usage shape from `messages_usage`: cached reads come back
-/// out of the normalized input total, and unknown usage reports zero counts
-/// because the Anthropic shape requires both fields.
+/// Anthropic's usage object for every Messages frame that carries one:
+/// `message_start.message.usage`, `message_delta.usage`, and the
+/// non-streamed body's `usage`. All four token legs are always present,
+/// `0` when the provider reported none, because Anthropic clients (the
+/// official SDK accumulators, Claude Code's context meter) read the cache
+/// legs by key and treat an absent key as "not Anthropic's shape".
+///
+/// Mapping from the normalized `Usage` (whose `input_tokens` is the FOLDED
+/// total the ledger bills: uncached + cache reads + cache writes):
+///
+/// | Anthropic field                | source                                              |
+/// |--------------------------------|-----------------------------------------------------|
+/// | `input_tokens`                 | `input_tokens - cached_input_tokens - cache_creation_input_tokens` (uncached input, saturating) |
+/// | `cache_creation_input_tokens`  | `cache_creation_input_tokens`, else `0` (Anthropic-wire rungs only) |
+/// | `cache_read_input_tokens`      | `cached_input_tokens`, else `0` (Anthropic `cache_read_input_tokens`, OpenAI-wire `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`, Gemini `cachedContentTokenCount`, Bedrock `cacheReadInputTokens`) |
+/// | `output_tokens`                | `output_tokens` (reasoning folded in where the provider bills it additively) |
+///
+/// Unknown usage (no provider report) renders every leg as `0`.
 pub(super) fn messages_usage(usage: Option<&Usage>) -> Value {
     let usage = match usage {
         Some(usage) if usage.has_token_counts() => usage,
-        _ => return json!({"input_tokens": 0, "output_tokens": 0}),
+        _ => return usage_object(0, 0, 0, 0),
     };
     let cached = usage.cached_input_tokens.unwrap_or(0);
     let creation = usage.cache_creation_input_tokens.unwrap_or(0);
-    let mut body = Map::new();
     // Both cache legs come back out of the folded ledger total so callers
     // see the provider's own shape: input_tokens excludes cached reads and
     // cache writes, each reported on its own leg.
-    body.insert(
-        "input_tokens".to_string(),
-        json!(usage
+    usage_object(
+        usage
             .input_tokens
             .unwrap_or(0)
             .saturating_sub(cached)
-            .saturating_sub(creation)),
-    );
-    body.insert(
-        "output_tokens".to_string(),
-        json!(usage.output_tokens.unwrap_or(0)),
-    );
-    if cached > 0 {
-        body.insert("cache_read_input_tokens".to_string(), json!(cached));
-    }
-    if creation > 0 {
-        body.insert("cache_creation_input_tokens".to_string(), json!(creation));
-    }
-    Value::Object(body)
+            .saturating_sub(creation),
+        creation,
+        cached,
+        usage.output_tokens.unwrap_or(0),
+    )
+}
+
+/// The four-leg Anthropic usage object in Anthropic's own field order.
+fn usage_object(input: u64, cache_creation: u64, cache_read: u64, output: u64) -> Value {
+    json!({
+        "input_tokens": input,
+        "cache_creation_input_tokens": cache_creation,
+        "cache_read_input_tokens": cache_read,
+        "output_tokens": output,
+    })
 }
 
 /// Frame one named, compact, UTF-8-preserving Anthropic SSE event.
@@ -350,12 +365,14 @@ impl MessagesSseEncoder {
     }
 
     /// The `message_start` meters: the upstream's own start usage when known,
-    /// else the pre-dispatch estimate in Anthropic's start-frame shape, else
-    /// the zero placeholder.
+    /// else the pre-dispatch estimate in Anthropic's start-frame shape (the
+    /// counted prompt as `input_tokens`, both cache legs `0` because nothing
+    /// is cached before dispatch, and Anthropic's `output_tokens: 1`
+    /// placeholder), else the zero placeholder.
     fn start_usage(&self) -> Value {
         match (self.usage.as_ref(), self.pre_dispatch_input_estimate) {
             (Some(usage), _) => messages_usage(Some(usage)),
-            (None, Some(estimate)) => json!({"input_tokens": estimate, "output_tokens": 1}),
+            (None, Some(estimate)) => usage_object(estimate, 0, 0, 1),
             (None, None) => messages_usage(None),
         }
     }
