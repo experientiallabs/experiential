@@ -11,6 +11,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast
+from urllib.parse import urlencode
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ReasoningEffort
@@ -204,9 +205,10 @@ class HttpProviderModelLister:
         models = []
         page_token: str | None = None
         for _ in range(_MAXIMUM_GEMINI_PAGES):
-            url = f"{base_url}/models?pageSize=200"
+            query_parameters = {"pageSize": "200"}
             if page_token is not None:
-                url = f"{url}&pageToken={page_token}"
+                query_parameters["pageToken"] = page_token
+            url = f"{base_url}/models?{urlencode(query_parameters)}"
             body = self._read(endpoint, url, headers)
             for entry in _entries(endpoint.provider, body.get("models")):
                 identity = _text(entry.get("name"))
