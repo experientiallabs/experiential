@@ -233,6 +233,11 @@ const REFUSAL_MESSAGE: &str = "provider refused the request";
 /// including the executor's per-failure retry classification: whether the
 /// same deployment may be redialed and whether a later certified deployment
 /// may serve the request instead.
+/// Safe message of [`Failure::empty_completion`]; content-free and stable so
+/// the ledger and the public error name the same shape.
+pub const EMPTY_COMPLETION_MESSAGE: &str =
+    "provider completed the turn without any output; retry the request";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub failure_class: FailureClass,
@@ -309,6 +314,18 @@ impl Failure {
             refusal_reason: Some(reason),
             ..Self::new(FailureClass::Refusal, &safe_message)
         }
+    }
+
+    /// The provider closed the turn as complete and billed output tokens
+    /// while sending nothing the caller can receive: no text, no tool call,
+    /// and no reasoning the surface renders (OpenRouter's DeepSeek rungs
+    /// answer a reasoning-only turn this way, live 2026-09-12). Nothing was
+    /// committed outward, so one bounded redial of the same deployment (the
+    /// empty answer is not deterministic) and then the ladder are both safe;
+    /// on the last rung the caller gets this message instead of an empty
+    /// success that bills tokens.
+    pub fn empty_completion() -> Self {
+        Self::new(FailureClass::ProviderInternal, EMPTY_COMPLETION_MESSAGE).with_retry(true, true)
     }
 
     /// Attach one already-validated provider parameter path.

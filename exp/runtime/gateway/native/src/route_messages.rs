@@ -22,7 +22,8 @@ use crate::admission::{
 };
 use crate::encode::compact_json;
 use crate::encode_messages::{
-    anthropic_error_body, completed_messages_body_with_reasoning, MessagesSseEncoder,
+    anthropic_error_body, completed_messages_body_with_reasoning, AggregatedMessage,
+    MessagesSseEncoder,
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -35,7 +36,10 @@ use crate::respond::{
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
-use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
+use crate::waterfall::{
+    acquire_attempt, billed_empty_completion, CommittedAttempt, SettledAttempt, WaterfallContext,
+    Won,
+};
 
 /// Anthropic-enveloped variant of `error_response` for the Messages surface,
 /// mirroring `anthropic_error_response` in the python engine.
@@ -378,6 +382,23 @@ async fn respond_from_messages_events(
             .await;
         return messages_error_response(&error);
     }
+    if refusal_completed.is_none()
+        && aggregated_empty_completion(&events, &aggregated, usage.as_ref())
+    {
+        // Same guard as the live stream: a committed turn that rendered no
+        // block and billed for it is a failed attempt, never `content: []`.
+        let failure = Failure::empty_completion();
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref().or(usage.as_ref()),
+                &aggregated.tool_names,
+                Some(&failure),
+                true,
+            )
+            .await;
+        return messages_error_response(&failure.public_error());
+    }
     let settled = if let Some(refusal) = &refusal_completed {
         // The caller saw the refusal output, so the public result completes;
         // the ledger still records the provider's typed refusal.
@@ -420,6 +441,25 @@ async fn respond_from_messages_events(
         return sse_body_response(&headers, body);
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
+}
+
+/// Whether an aggregated Messages turn is a billed empty completion: its
+/// terminal is `Completed`, its usage counts output, and no content block
+/// survived aggregation (every committed event was one this surface drops).
+fn aggregated_empty_completion(
+    events: &[Event],
+    aggregated: &AggregatedMessage,
+    usage: Option<&Usage>,
+) -> bool {
+    let Some(terminal) = events.iter().rev().find(|event| event.is_terminal()) else {
+        return false;
+    };
+    let content_empty = aggregated
+        .body
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    content_empty && billed_empty_completion(terminal, aggregated.usage.as_ref().or(usage))
 }
 
 fn encode_messages_sse(
@@ -680,6 +720,17 @@ async fn stream_messages(
                         Ok(Some(carrier)) => encoder.set_reasoning_content_carrier(carrier),
                         Ok(None) => {}
                         Err(failure) => fail_stream!(failure),
+                    }
+                    if !encoder.has_content_blocks()
+                        && billed_empty_completion(&event, usage.as_ref())
+                    {
+                        // The deployment committed on events this surface
+                        // cannot render (hidden reasoning on an unexposed
+                        // rung), so the caller would receive `content: []`
+                        // with `end_turn` and a bill: fail the attempt
+                        // instead. Post-commit, so no ladder; the typed
+                        // error is the answer.
+                        fail_stream!(Failure::empty_completion());
                     }
                 }
                 terminal = Some(event.clone());

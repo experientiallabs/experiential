@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -34,6 +35,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
 
 pytest.importorskip("exp_gateway_native")
 
@@ -136,6 +138,58 @@ def _terminal_frames(finish_reason: str, *, cached: bool = True) -> bytes:
         (
             _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
             _sse_frame({"choices": [], "usage": usage}),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _reasoning_only_stop_frames() -> bytes:
+    """Encode the live OpenRouter DeepSeek reasoning-only turn (2026-09-12).
+
+    Hidden reasoning streams on OpenRouter's ``reasoning`` delta field, the
+    content stays empty, the choice finishes ``stop``, and usage bills the
+    reasoning as completion tokens. This unexposed rung strips the reasoning,
+    so nothing semantic reaches the caller while the tokens are billed.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "", "reasoning": "Let me"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "", "reasoning": " read the logs first."},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+            ),
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 9,
+                        "completion_tokens": 147,
+                        "total_tokens": 156,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                        "completion_tokens_details": {"reasoning_tokens": 148},
+                    },
+                }
+            ),
             b"data: [DONE]\n\n",
         )
     )
@@ -249,6 +303,8 @@ class _SseUpstream(BaseHTTPRequestHandler):
                 self.wfile.write(_terminal_frames("tool_calls"))
             elif prompt == "empty-token":
                 self.wfile.write(_zero_output_terminal_frames("stop"))
+            elif prompt == "reasoning-only-token":
+                self.wfile.write(_reasoning_only_stop_frames())
             elif prompt == "truncated-token":
                 self.wfile.write(_zero_output_terminal_frames("length"))
             elif prompt == "uncached-token":
@@ -1535,6 +1591,99 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
         "cache_read_input_tokens": 2,
         "output_tokens": 0,
     }
+
+
+_EMPTY_COMPLETION_MESSAGE = "provider completed the turn without any output; retry the request"
+
+
+def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str | None]]:
+    """Read the most recent request's settled attempt rows (ordinal, state, failure class).
+
+    An exhausted ladder answers with the bare Anthropic error envelope and no
+    request-id header, so the request is found as the newest accepted row.
+    """
+    database_path = GatewayManagement(engine.root).database_path
+    deadline = time.monotonic() + 10.0
+    while True:
+        with sqlite3.connect(database_path) as connection:
+            latest = connection.execute(
+                "SELECT request_id FROM gateway_requests ORDER BY accepted_at DESC, rowid DESC"
+                " LIMIT 1"
+            ).fetchone()
+            rows = (
+                connection.execute(
+                    "SELECT attempt_ordinal, state, failure_class FROM gateway_attempts"
+                    " WHERE request_id = ? ORDER BY attempt_ordinal",
+                    (latest[0],),
+                ).fetchall()
+                if latest is not None
+                else []
+            )
+        if rows and all(state not in {"dispatched", "running"} for _, state, _ in rows):
+            break
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    return [(int(ordinal), str(state), failure) for ordinal, state, failure in rows]
+
+
+def test_messages_non_stream_billed_empty_stop_fails_instead_of_an_empty_end_turn(
+    engine: _ServingEngine,
+) -> None:
+    """A ``stop`` that billed reasoning yet rendered no block is a typed 502.
+
+    Production 2026-09-12 (deepseek-v4-flash via OpenRouter, Claude Code's
+    body): ``message_start`` then ``message_delta`` with ``end_turn``, zero
+    content blocks, and 42 to 750 billed output tokens, which Claude Code
+    reports as "[Your previous response had no visible output]". The single
+    rung here is redialed once (its bounded cap) and both dispatches settle
+    ``failed`` as ``provider_internal``; a route with a second rung would
+    fail over instead.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 502, response.text
+    body = response.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "api_error"
+    assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "provider_internal"),
+        (1, "failed", "provider_internal"),
+    ]
+
+
+def test_messages_stream_billed_empty_stop_is_refused_before_the_first_frame(
+    engine: _ServingEngine,
+) -> None:
+    """The streamed request never opens a stream that would end ``end_turn`` on nothing.
+
+    Nothing semantic was ever committed, so the exhausted ladder answers the
+    same typed error envelope as the non-streaming request instead of a
+    `message_start` followed by an empty `end_turn`.
+    """
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token", stream=True),
+        timeout=30.0,
+    ) as response:
+        status = response.status_code
+        raw = b"".join(response.iter_bytes()).decode()
+    assert status == 502, raw
+    assert "message_start" not in raw
+    body = json.loads(raw)
+    assert body["type"] == "error"
+    assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "provider_internal"),
+        (1, "failed", "provider_internal"),
+    ]
 
 
 def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(

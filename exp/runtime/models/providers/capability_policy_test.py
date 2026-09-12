@@ -1304,3 +1304,77 @@ def test_temperature_forwards_beside_a_translated_thinking_config_on_an_effort_r
     assert payload["temperature"] == 0.3
     assert payload["reasoning_effort"] == "low"
     assert not any("temperature" in item for item in public.ignored_parameters)
+
+
+def _ladder_profile(model_id: str, *efforts: ReasoningEffort) -> GatewayWireProfile:
+    """Build one OpenAI-compatible reasoning rung with an explicit effort ladder."""
+    return GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://provider.test",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=tuple(efforts),
+    )
+
+
+def test_superseded_thinking_snaps_an_off_ladder_effort_onto_the_route() -> None:
+    """Claude Code's adaptive thinking beside an off-ladder effort composes both coercions.
+
+    The live deepseek-v4-flash route (2026-09-12) serves ``output_config.effort:
+    high`` (the config drops as superseded) but refused ``medium`` and ``low``
+    with the effort-unsupported 400: superseding alone left an effort no rung
+    served, and the explicit snap alone left a thinking config every rung
+    rejected. The two now compose into one disclosed coercion, and the snapped
+    effort lands on the Messages ``output_config`` channel as well.
+    """
+    route = (
+        _ladder_profile("deepseek-v4-flash", "high", "xhigh"),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://other.test",
+            model_id="deepseek-v4-flash",
+        ),
+    )
+    for requested in ("medium", "low"):
+        request = _messages_request(
+            reasoning_effort=requested,
+            provider_output_config={"effort": requested, "format": {"type": "text"}},
+            provider_thinking_config={"type": "adaptive"},
+        )
+        coercion = coerce_generation_parameters(route, request)
+        assert coercion is not None, requested
+        assert coercion.request.provider_thinking_config is None
+        assert coercion.request.reasoning_effort == "high"
+        assert coercion.request.provider_output_config == {
+            "effort": "high",
+            "format": {"type": "text"},
+        }
+        assert coercion.disclosures == (
+            "thinking->dropped(superseded_by_effort)",
+            "reasoning_effort->high",
+        )
+    # An on-ladder effort keeps the one-disclosure supersede it always had.
+    on_ladder = _messages_request(
+        reasoning_effort="high",
+        provider_output_config={"effort": "high"},
+        provider_thinking_config={"type": "adaptive"},
+    )
+    coercion = coerce_generation_parameters(route, on_ladder)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.request.provider_output_config == {"effort": "high"}
+    assert coercion.disclosures == ("thinking->dropped(superseded_by_effort)",)
+
+
+def test_effort_snap_carries_the_messages_output_config_channel() -> None:
+    """A snapped effort is rewritten on ``output_config`` too, never left stale."""
+    request = _messages_request(
+        reasoning_effort="xhigh",
+        provider_output_config={"effort": "xhigh"},
+    )
+    coercion = coerce_generation_parameters((_reasoning_profile("gpt-5.1"),), request)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.request.provider_output_config == {"effort": "high"}
+    assert coercion.disclosures == ("reasoning_effort->high",)
