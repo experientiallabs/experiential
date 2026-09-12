@@ -331,6 +331,14 @@ impl MessagesSseEncoder {
         self.terminal
     }
 
+    /// Whether any content block has been scheduled so far: the route reads
+    /// this at a `Completed` terminal, because a committed stream whose only
+    /// events the surface cannot render (hidden reasoning on an unexposed
+    /// rung) would otherwise encode as `content: []` with `end_turn`.
+    pub fn has_content_blocks(&self) -> bool {
+        !self.blocks.is_empty()
+    }
+
     /// Encode one ordered normalized provider event into zero or more frames.
     pub fn feed(&mut self, event: &Event) -> Result<Vec<String>, PublicError> {
         if !self.started {
@@ -936,7 +944,9 @@ impl MessagesSseEncoder {
 mod aggregate;
 mod usage;
 
-pub use aggregate::{completed_messages_body, completed_messages_body_with_reasoning};
+pub use aggregate::{
+    completed_messages_body, completed_messages_body_with_reasoning, AggregatedMessage,
+};
 pub(crate) use usage::messages_usage;
 use usage::usage_object;
 

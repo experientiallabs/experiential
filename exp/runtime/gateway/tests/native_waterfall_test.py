@@ -133,14 +133,68 @@ def _terminal_frames(*, prompt_tokens: int = 2, completion_tokens: int = 2) -> b
     )
 
 
+def _reasoning_only_stop_frames() -> bytes:
+    """Encode the live OpenRouter DeepSeek reasoning-only turn (2026-09-12).
+
+    Hidden reasoning streams on OpenRouter's ``reasoning`` delta field, the
+    content stays empty, the choice finishes ``stop``, and usage bills the
+    reasoning as completion tokens; the gateway strips the reasoning on this
+    unexposed rung, so nothing semantic reaches the caller.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "", "reasoning": "Let me"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "", "reasoning": " read the logs first."},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+            ),
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 15613,
+                        "completion_tokens": 147,
+                        "total_tokens": 15760,
+                        "completion_tokens_details": {"reasoning_tokens": 148},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
 class _PrimaryUpstream(BaseHTTPRequestHandler):
     """The first certified deployment; behavior is selected by the prompt.
 
     ``always-500`` fails every dispatch, ``retry-then-succeed`` fails once
     per process then answers, ``refuse`` streams a refusal-only completion,
     ``silent-length`` exhausts the output budget with no content (a
-    thinking-only turn: ``finish_reason: length``, zero deltas), and anything
-    else streams a plain success.
+    thinking-only turn: ``finish_reason: length``, zero deltas),
+    ``silent-stop-then-succeed`` answers its first dispatch per process with
+    a billed reasoning-only ``stop`` (OpenRouter's DeepSeek shape: hidden
+    ``reasoning`` deltas, empty content, 147 completion tokens) and then a
+    plain success, and anything else streams a plain success.
     """
 
     retry_counts: dict[str, int] = {}
@@ -177,10 +231,19 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.end_headers()
                 return
+        empty_stop = False
+        if prompt == "silent-stop-then-succeed":
+            with self.lock:
+                seen = self.retry_counts.get(prompt, 0)
+                self.retry_counts[prompt] = seen + 1
+            empty_stop = seen == 0
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if empty_stop:
+                self.wfile.write(_reasoning_only_stop_frames())
+                return
             if prompt == "silent-length":
                 self.wfile.write(
                     _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]})
@@ -396,6 +459,41 @@ def test_transient_primary_failure_redials_the_same_deployment(
     assert response.headers["x-gateway-route-depth"] == "0"
     rows = _attempt_rows(engine, response.headers["x-request-id"])
     assert rows == [(0, 0, "failed"), (1, 0, "completed")]
+
+
+def test_billed_empty_stop_redials_instead_of_settling_an_empty_success(
+    engine: _ServingEngine,
+) -> None:
+    """A ``stop`` that billed reasoning but delivered nothing is a failed attempt.
+
+    Reproduced on production 2026-09-12 (deepseek-v4-flash via OpenRouter, 2 of
+    6 replays on both the Chat and Messages surfaces): the rung answered a
+    reasoning-only turn, the gateway stripped the hidden reasoning, and the
+    waterfall settled the output-less terminal as a completed empty answer
+    that billed 42 to 750 output tokens. The empty completion now takes the
+    ladder like any pre-commit failure: the primary is redialed and serves,
+    and the ledger names the empty attempt ``provider_internal``.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("silent-stop-then-succeed"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "from-primary"
+    assert response.headers["x-gateway-route-depth"] == "0"
+    request_id = response.headers["x-request-id"]
+    assert _attempt_rows(engine, request_id) == [(0, 0, "failed"), (1, 0, "completed")]
+    with sqlite3.connect(engine.database_path) as connection:
+        failed = connection.execute(
+            "SELECT failure_class, output_tokens FROM gateway_attempts"
+            " WHERE request_id = ? AND attempt_ordinal = 0",
+            (request_id,),
+        ).fetchone()
+    assert failed[0] == "provider_internal"
+    # The empty attempt keeps the tokens the provider billed for it.
+    assert failed[1] == 147
 
 
 def test_refusal_failover_withholds_the_refused_route(engine: _ServingEngine) -> None:
@@ -620,9 +718,9 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    # Seven scenario requests, the output-less continuation scenario's four
+    # Eight scenario requests, the output-less continuation scenario's four
     # (two first turns and their two continuations), and this probe.
-    assert report["totals"]["requests"] == 12
+    assert report["totals"]["requests"] == 13
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
@@ -630,6 +728,6 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
     assert open_attempts == 0
-    # Twelve single-dispatch requests plus the four extra physical attempts the
-    # redial and failover scenarios spend.
-    assert terminal_attempts == total_attempts == 16
+    # Thirteen single-dispatch requests plus the five extra physical attempts
+    # the redial, empty-completion, and failover scenarios spend.
+    assert terminal_attempts == total_attempts == 18

@@ -38,6 +38,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
 )
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
+    snap_effort_onto_route,
 )
 from exp.runtime.models.providers.reasoning_compat import (
     MINIMUM_THINKING_BUDGET_TOKENS,
@@ -412,9 +413,34 @@ def _coerce_thinking_to_effort(
         dropped, disclosures = _drop_thinking_and_effort(request)
         return admitted(RequestCoercion(request=dropped, disclosures=disclosures))
     if request.reasoning_effort is not None:
+        superseded = request.model_copy(update={"provider_thinking_config": None})
+        if request.reasoning_effort in ladder:
+            return admitted(
+                RequestCoercion(
+                    request=superseded,
+                    disclosures=(THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE,),
+                )
+            )
+        # The explicit effort is off the route's ladder, so superseding the
+        # config alone still leaves a request no rung admits. The two
+        # coercions compose here: the config drops and the effort snaps to
+        # the nearest level a rung serves, each disclosed. Left to the
+        # explicit-effort snap alone, the snapped candidate would still carry
+        # the thinking config every non-Anthropic rung rejects by name, and
+        # acceptance would depend on the VALUE (Claude Code's effort=high
+        # served, effort=medium refused on a [high, xhigh] rung).
+        snapped = snap_effort_onto_route(
+            profiles, superseded, request.reasoning_effort, ladder, admits=admits
+        )
+        if snapped is not None:
+            snapped_request, snap_disclosure = snapped
+            return RequestCoercion(
+                request=snapped_request,
+                disclosures=(THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE, snap_disclosure),
+            )
         return admitted(
             RequestCoercion(
-                request=request.model_copy(update={"provider_thinking_config": None}),
+                request=superseded,
                 disclosures=(THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE,),
             )
         )
@@ -589,31 +615,13 @@ def coerce_generation_parameters(
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
         return None
-    # A heterogeneous waterfall can carry a nearby effort only on rungs that
-    # reject some other control, so candidates are tried in nearness order
-    # and the snap is the closest level that actually admits a rung.
-    for candidate in efforts_by_nearness(request.reasoning_effort, ladder):
-        snapped_request = request.model_copy(update={"reasoning_effort": candidate})
-        try:
-            indexes = compatible_generation_parameter_profile_indexes(profiles, snapped_request)
-            # Per-rung admission is not enough: the narrowed rung set changes
-            # with the candidate, and a route-wide gate (for example the
-            # homogeneous encrypted-reasoning channel) can reject a mixed set
-            # that a farther candidate would narrow past. Only a candidate
-            # that survives full route construction is a real snap.
-            route_generation_parameter_requests(
-                tuple(profiles[index] for index in indexes),
-                snapped_request,
-            )
-        except (ProviderParameterError, ProviderCapabilityError):
-            continue
-        if admits is not None and not admits(snapped_request):
-            continue
-        return RequestCoercion(
-            request=snapped_request,
-            disclosures=(f"reasoning_effort->{candidate}",),
-        )
-    return None
+    snapped = snap_effort_onto_route(
+        profiles, request, request.reasoning_effort, ladder, admits=admits
+    )
+    if snapped is None:
+        return None
+    snapped_request, snap_disclosure = snapped
+    return RequestCoercion(request=snapped_request, disclosures=(snap_disclosure,))
 
 
 def _coerce_disabled_thinking(

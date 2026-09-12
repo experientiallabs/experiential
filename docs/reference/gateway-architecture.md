@@ -178,7 +178,13 @@ or tool-call semantic event commits the deployment, after which the gateway neve
 providers. Typed refusal fallback is disabled unless the active alias revision explicitly enables
 it. Opted-in refusal deltas are withheld only in a bounded in-memory buffer: a refusal-only terminal
 result can advance to the next certified deployment, while mixed semantic output or buffer overflow
-commits and flushes the original route. Provider-internal retry layers are disabled so every
+commits and flushes the original route. A `stop` that bills output or reasoning tokens yet carried no
+semantic event (a reasoning-only turn on a rung whose reasoning the gateway strips) is a typed
+`provider_internal` failure, not an empty success: it redials once, then takes the ladder, and on the
+last rung the caller receives that error rather than `content: []` with `end_turn`; a zero-token stop
+and a budget truncation before the first delta stay honest output-less answers. The Messages surface
+applies the same rule after commitment, when every committed event was one it cannot render.
+Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by

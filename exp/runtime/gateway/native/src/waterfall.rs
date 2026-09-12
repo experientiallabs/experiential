@@ -726,11 +726,27 @@ async fn run_attempt(
                         opened: true,
                     };
                 }
-                // A successful terminal with no semantic output: retain the
-                // output-less continuation while the attempt is still in
-                // flight, settle, then answer with the tracked usage ahead of
-                // the terminal so the encoders keep the client-visible token
-                // accounting.
+                if billed_empty_completion(&event, usage.as_ref()) {
+                    // A `stop` that billed output tokens yet carried no
+                    // semantic event is the provider's fault, not an answer
+                    // (a reasoning-only turn on a rung whose reasoning the
+                    // gateway strips): it takes the ladder like any other
+                    // pre-commit failure instead of settling an empty success.
+                    return AttemptEnd::Ladder {
+                        failure: Failure::empty_completion(),
+                        refusal_eligible: false,
+                        exhaustion_flush: Vec::new(),
+                        usage,
+                        tool_names,
+                        opened: true,
+                    };
+                }
+                // A successful terminal with no semantic output and nothing
+                // billed for it (a budget exhausted before the first delta,
+                // a zero-token stop): retain the output-less continuation
+                // while the attempt is still in flight, settle, then answer
+                // with the tracked usage ahead of the terminal so the
+                // encoders keep the client-visible token accounting.
                 let retention_failure = match &ctx.output_less_retention {
                     Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
                     None => None,
@@ -763,9 +779,77 @@ async fn run_attempt(
     }
 }
 
+/// Whether a successful terminal with no semantic output is a billed empty
+/// completion: the turn ended `Completed` (the provider's plain `stop`) while
+/// its reported usage counts at least one output or reasoning token. A budget
+/// truncation (`Incomplete`), a stop sequence, a paused turn, an unreported
+/// usage, or a zero-token stop are honest output-less endings and stay
+/// settled as they are; only a paid-for `stop` that delivered nothing fails.
+pub(crate) fn billed_empty_completion(terminal: &Event, usage: Option<&Usage>) -> bool {
+    if !matches!(terminal, Event::Completed) {
+        return false;
+    }
+    let Some(usage) = usage else {
+        return false;
+    };
+    usage.output_tokens.is_some_and(|tokens| tokens > 0)
+        || usage.reasoning_tokens.is_some_and(|tokens| tokens > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
+        Usage {
+            input_tokens: Some(9),
+            output_tokens,
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens,
+        }
+    }
+
+    #[test]
+    fn a_billed_stop_with_no_output_is_an_empty_completion() {
+        // The live OpenRouter DeepSeek shape: reasoning billed, nothing sent.
+        assert!(billed_empty_completion(
+            &Event::Completed,
+            Some(&usage(Some(147), Some(148)))
+        ));
+        // One EOS token and nothing else is still a paid-for empty answer.
+        assert!(billed_empty_completion(
+            &Event::Completed,
+            Some(&usage(Some(1), Some(0)))
+        ));
+        // A wire that reports thinking outside the output leg still counts it.
+        assert!(billed_empty_completion(
+            &Event::Completed,
+            Some(&usage(Some(0), Some(30)))
+        ));
+        let failure = Failure::empty_completion();
+        assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+        assert!(failure.retryable_same_deployment && failure.failover_eligible);
+    }
+
+    #[test]
+    fn honest_output_less_endings_are_not_empty_completions() {
+        // A zero-token stop is the provider saying nothing, not billing for it.
+        assert!(!billed_empty_completion(
+            &Event::Completed,
+            Some(&usage(Some(0), None))
+        ));
+        // No usage report proves nothing was spent.
+        assert!(!billed_empty_completion(&Event::Completed, None));
+        // Truncation, a stop sequence, and a paused turn keep their own shapes.
+        let billed = usage(Some(16), None);
+        assert!(!billed_empty_completion(&Event::Incomplete, Some(&billed)));
+        assert!(!billed_empty_completion(
+            &Event::StoppedAtSequence("END".to_string()),
+            Some(&billed)
+        ));
+        assert!(!billed_empty_completion(&Event::PausedTurn, Some(&billed)));
+    }
 
     fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         DeploymentWire {

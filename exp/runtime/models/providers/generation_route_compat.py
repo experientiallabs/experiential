@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Collection, Sequence
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
 
@@ -94,3 +95,64 @@ def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequ
         for message in request.messages
         for block in message.provider_reasoning
     )
+
+
+def request_with_reasoning_effort(request: GatewayRequest, effort: str) -> GatewayRequest:
+    """Return the request carrying ``effort`` on every channel that states one.
+
+    The Messages surface carries the caller's effort inside ``output_config``
+    as well as on ``reasoning_effort`` (decode maps the one onto the other), and
+    an Anthropic rung forwards that object verbatim, so a snapped effort must
+    land on both or the disclosed value and the dispatched one would differ.
+    """
+    updates: dict[str, object] = {"reasoning_effort": effort}
+    if request.provider_output_config is not None and "effort" in request.provider_output_config:
+        updates["provider_output_config"] = {**request.provider_output_config, "effort": effort}
+    return request.model_copy(update=updates)
+
+
+def snap_effort_onto_route(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    requested: str,
+    ladder: Collection[str],
+    *,
+    admits: Callable[[GatewayRequest], bool] | None,
+) -> tuple[GatewayRequest, str] | None:
+    """Snap one off-ladder effort to the nearest level a rung actually serves.
+
+    A heterogeneous waterfall can carry a nearby effort only on rungs that
+    reject some other control, so candidates are tried in nearness order and
+    the snap is the closest level that admits a rung. Per-rung admission is
+    not enough: the narrowed rung set changes with the candidate, and a
+    route-wide gate (for example the homogeneous encrypted-reasoning channel)
+    can reject a mixed set that a farther candidate would narrow past, so only
+    a candidate that survives full route construction and the caller's probe
+    is a real snap.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: The request to snap; any thinking config it carries is what
+            the candidate rungs will be asked to accept.
+        requested: The caller's effort the snap measures nearness from.
+        ladder: Union of every rung's accepted efforts.
+        admits: Optional caller probe that must accept the candidate.
+
+    Returns:
+        The snapped request and its ``reasoning_effort->X`` disclosure, or
+        ``None`` when no candidate serves.
+    """
+    for candidate in efforts_by_nearness(requested, ladder):
+        snapped_request = request_with_reasoning_effort(request, candidate)
+        try:
+            indexes = compatible_generation_parameter_profile_indexes(profiles, snapped_request)
+            route_generation_parameter_requests(
+                tuple(profiles[index] for index in indexes),
+                snapped_request,
+            )
+        except (ProviderParameterError, ProviderCapabilityError):
+            continue
+        if admits is not None and not admits(snapped_request):
+            continue
+        return snapped_request, f"reasoning_effort->{candidate}"
+    return None
