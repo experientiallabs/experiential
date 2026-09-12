@@ -120,21 +120,22 @@ def _content_chunk(text: str) -> bytes:
     )
 
 
-def _terminal_frames(finish_reason: str) -> bytes:
-    """Encode the finishing chunk, usage chunk, and done sentinel."""
+def _terminal_frames(finish_reason: str, *, cached: bool = True) -> bytes:
+    """Encode the finishing chunk, usage chunk, and done sentinel.
+
+    Args:
+        finish_reason: The provider finish reason on the closing choice.
+        cached: Whether the usage chunk reports a cached prefix through
+            ``prompt_tokens_details.cached_tokens`` (an uncached completion
+            omits the details object entirely, as OpenAI-compatible servers do).
+    """
+    usage: JsonObject = {"prompt_tokens": 9, "completion_tokens": 4}
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": 2}
     return b"".join(
         (
             _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
-            _sse_frame(
-                {
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": 9,
-                        "completion_tokens": 4,
-                        "prompt_tokens_details": {"cached_tokens": 2},
-                    },
-                }
-            ),
+            _sse_frame({"choices": [], "usage": usage}),
             b"data: [DONE]\n\n",
         )
     )
@@ -250,6 +251,10 @@ class _SseUpstream(BaseHTTPRequestHandler):
                 self.wfile.write(_zero_output_terminal_frames("stop"))
             elif prompt == "truncated-token":
                 self.wfile.write(_zero_output_terminal_frames("length"))
+            elif prompt == "uncached-token":
+                self.wfile.write(_content_chunk("hello "))
+                self.wfile.write(_content_chunk("world"))
+                self.wfile.write(_terminal_frames("stop", cached=False))
             else:
                 self.wfile.write(_content_chunk("hello "))
                 self.wfile.write(_content_chunk("world"))
@@ -887,7 +892,12 @@ def test_non_streaming_message_answers_the_anthropic_shape_and_accounts(
         "content": [{"type": "text", "text": "hello world"}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": 7, "output_tokens": 4, "cache_read_input_tokens": 2},
+        "usage": {
+            "input_tokens": 7,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 2,
+            "output_tokens": 4,
+        },
     }
     assert _completed_attempts(engine.base) == completed_before + 1
 
@@ -954,21 +964,199 @@ def test_streaming_message_emits_the_full_anthropic_lifecycle(
     assert text == "hello world"
     message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "end_turn"
+    # OpenAI-wire ``prompt_tokens_details.cached_tokens`` comes back as the
+    # cache-read leg with ``input_tokens`` the uncached remainder; the
+    # creation leg is present at 0 (nothing on this wire reports cache writes).
     assert message_delta["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 4,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 4,
     }
     # An OpenAI-wire upstream reports nothing before its final chunk, so the
     # start frame carries the gateway's pre-dispatch prompt estimate (what a
     # client that reads input from message_start, e.g. Claude Code, shows)
-    # with Anthropic's ``output_tokens: 1`` placeholder; the authoritative
+    # in Anthropic's start shape: both cache legs 0 (nothing is cached before
+    # dispatch) and the ``output_tokens: 1`` placeholder; the authoritative
     # meters stay on message_delta above and are what the ledger bills.
     message_start = next(payload for payload in payloads if payload["type"] == "message_start")
     start_usage = message_start["message"]["usage"]
-    assert start_usage["output_tokens"] == 1
     assert isinstance(start_usage["input_tokens"], int) and start_usage["input_tokens"] > 0
-    assert "cache_read_input_tokens" not in start_usage
+    assert {k: v for k, v in start_usage.items() if k != "input_tokens"} == {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    }
+
+
+def _claude_code_body(prompt: str, *, stream: bool = False) -> JsonObject:
+    """Return a Claude Code-shaped Messages body: system array, tools, many turns.
+
+    Several thousand tokens of prompt, so a start-frame estimate that missed
+    the system blocks, the tool definitions, or the earlier turns would be
+    off by an order of magnitude rather than by tokenizer drift. ``prompt``
+    is the final user turn, which also selects the loopback upstream's reply.
+    """
+    system_block = (
+        "You are Claude Code, an interactive CLI tool that helps users with software "
+        "engineering tasks. Use the instructions below and the tools available to you. "
+    ) * 40
+    tools: list[JsonObject] = [
+        {
+            "name": f"Tool{index}",
+            "description": f"Tool {index}. " + "Reads a file from the local filesystem. " * 8,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "The absolute path"},
+                    "offset": {"type": "number", "description": "The first line to read"},
+                    "limit": {"type": "number", "description": "How many lines to read"},
+                },
+                "required": ["file_path"],
+                "additionalProperties": False,
+            },
+        }
+        for index in range(12)
+    ]
+    messages: list[JsonObject] = []
+    for turn in range(6):
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Turn {turn}: " + "explain the module layout in detail. " * 10,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading the file now. " * 5},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{turn:03d}",
+                        "name": "Tool0",
+                        "input": {"file_path": "/repo/src/main.py"},
+                    },
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"toolu_{turn:03d}",
+                        "content": [{"type": "text", "text": "def main():\n    pass\n" * 20}],
+                    }
+                ],
+            }
+        )
+    messages.append({"role": "user", "content": prompt})
+    payload: JsonObject = {
+        "model": "coding",
+        "max_tokens": 64,
+        "system": [
+            {"type": "text", "text": system_block, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Project instructions: " + system_block[:2000]},
+        ],
+        "messages": messages,
+        "tools": tools,
+        "metadata": {"user_id": "harbor"},
+    }
+    if stream:
+        payload["stream"] = True
+    return payload
+
+
+def _stream_payloads(engine: _ServingEngine, body: JsonObject) -> list[JsonObject]:
+    """Stream one Messages request and return its decoded SSE data payloads."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=body,
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200, response.read()
+        raw = b"".join(response.iter_bytes()).decode()
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def test_start_frame_estimate_counts_the_whole_claude_code_prompt(
+    engine: _ServingEngine,
+) -> None:
+    """The pre-dispatch estimate covers system, every turn, and the tools.
+
+    Harbor's Claude Code (2026-09-11) read a ``message_start`` of
+    ``input_tokens: 10`` as a stub. The start frame's estimate is the same
+    count ``count_tokens`` answers for the same prompt, so a Claude Code
+    session of several thousand tokens shows thousands there, in Anthropic's
+    start shape (both cache legs 0, ``output_tokens: 1``).
+    """
+    payloads = _stream_payloads(engine, _claude_code_body("fast-token", stream=True))
+    message_start = next(payload for payload in payloads if payload["type"] == "message_start")
+    message = message_start["message"]
+    assert isinstance(message, dict)
+    start_usage = message["usage"]
+    assert isinstance(start_usage, dict)
+    input_tokens = start_usage["input_tokens"]
+    assert isinstance(input_tokens, int) and input_tokens > 1_000, start_usage
+    assert {k: v for k, v in start_usage.items() if k != "input_tokens"} == {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    }
+
+    count_body = {
+        k: v for k, v in _claude_code_body("fast-token").items() if k not in {"max_tokens"}
+    }
+    counted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json=count_body,
+        timeout=10.0,
+    )
+    assert counted.status_code == 200, counted.text
+    assert counted.json()["input_tokens"] == input_tokens
+
+
+def test_uncached_completion_reports_both_cache_legs_as_zero(engine: _ServingEngine) -> None:
+    """A provider reporting no cached tokens yields zero legs, not missing keys.
+
+    Anthropic's shape carries ``cache_creation_input_tokens`` and
+    ``cache_read_input_tokens`` on every usage object; the official SDK
+    accumulators and Claude Code read them by key, so an uncached completion
+    renders them as 0 on ``message_delta`` and on the non-streamed body.
+    """
+    expected = {
+        "input_tokens": 9,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 4,
+    }
+    payloads = _stream_payloads(engine, _messages_body("uncached-token", stream=True))
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["usage"] == expected
+
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("uncached-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.json()["usage"] == expected
 
 
 def test_tool_calls_translate_to_tool_use_blocks(engine: _ServingEngine) -> None:
@@ -1312,8 +1500,9 @@ def test_messages_non_stream_zero_output_keeps_real_input_tokens(
     assert body["stop_reason"] == stop_reason
     assert body["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 0,
     }
 
 
@@ -1342,8 +1531,9 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
     assert message_delta["delta"]["stop_reason"] == stop_reason
     assert message_delta["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 0,
     }
 
 

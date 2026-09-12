@@ -34,13 +34,22 @@ if TYPE_CHECKING:
 TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
 THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
 
-CACHE_CONTROL_NOT_FORWARDED_SUFFIX = "->not_forwarded(provider_decides_caching)"
-"""Suffix for cache-marker disclosures on routes with no Anthropic rung: the
-marker has no wire field there, so it is not forwarded, and whether the prefix
-is cached is the provider's own decision (OpenAI-family providers cache
-implicitly and the ledger bills those reads at the cached rate; a generic
-endpoint may not cache at all). The wording states exactly that and never
-claims caching is off or on."""
+CACHE_CONTROL_NOT_FORWARDED_SUFFIX = (
+    "->not_forwarded(provider_decides_caching;"
+    " cache reads reported in usage.cache_read_input_tokens)"
+)
+"""Suffix for cache-marker disclosures on routes with no Anthropic rung.
+
+The marker has no wire field there, so it is not forwarded, and whether the
+prefix is cached is the provider's own decision: OpenAI-family and most
+OpenAI-compatible servers cache implicitly, without breakpoints, while a
+generic endpoint may never cache. Whatever the provider does shows up on the
+Anthropic usage leg named here (billed at the cached rate when nonzero, `0`
+when the provider caches nothing). The disclosure travels in
+``x-experiential-ignored-parameters``, so it has to say where the caller's
+caching is reported: a bare "not forwarded" next to a billed
+``cache_read_input_tokens`` read as "caching is ignored" (Harbor, 2026-09-11).
+The wording never claims caching is off or on."""
 """Disclosed when Anthropic-signed thinking history is omitted for a foreign wire."""
 """Disclosure recorded when tool-result images degrade to placeholder text.
 

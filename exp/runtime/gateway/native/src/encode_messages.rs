@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::{
@@ -85,41 +85,6 @@ pub(super) fn stop_sequence_value(terminal: &Event) -> Value {
         Event::StoppedAtSequence(sequence) => Value::String(sequence.clone()),
         _ => Value::Null,
     }
-}
-
-/// The Anthropic usage shape from `messages_usage`: cached reads come back
-/// out of the normalized input total, and unknown usage reports zero counts
-/// because the Anthropic shape requires both fields.
-pub(super) fn messages_usage(usage: Option<&Usage>) -> Value {
-    let usage = match usage {
-        Some(usage) if usage.has_token_counts() => usage,
-        _ => return json!({"input_tokens": 0, "output_tokens": 0}),
-    };
-    let cached = usage.cached_input_tokens.unwrap_or(0);
-    let creation = usage.cache_creation_input_tokens.unwrap_or(0);
-    let mut body = Map::new();
-    // Both cache legs come back out of the folded ledger total so callers
-    // see the provider's own shape: input_tokens excludes cached reads and
-    // cache writes, each reported on its own leg.
-    body.insert(
-        "input_tokens".to_string(),
-        json!(usage
-            .input_tokens
-            .unwrap_or(0)
-            .saturating_sub(cached)
-            .saturating_sub(creation)),
-    );
-    body.insert(
-        "output_tokens".to_string(),
-        json!(usage.output_tokens.unwrap_or(0)),
-    );
-    if cached > 0 {
-        body.insert("cache_read_input_tokens".to_string(), json!(cached));
-    }
-    if creation > 0 {
-        body.insert("cache_creation_input_tokens".to_string(), json!(creation));
-    }
-    Value::Object(body)
 }
 
 /// Frame one named, compact, UTF-8-preserving Anthropic SSE event.
@@ -350,12 +315,14 @@ impl MessagesSseEncoder {
     }
 
     /// The `message_start` meters: the upstream's own start usage when known,
-    /// else the pre-dispatch estimate in Anthropic's start-frame shape, else
-    /// the zero placeholder.
+    /// else the pre-dispatch estimate in Anthropic's start-frame shape (the
+    /// counted prompt as `input_tokens`, both cache legs `0` because nothing
+    /// is cached before dispatch, and Anthropic's `output_tokens: 1`
+    /// placeholder), else the zero placeholder.
     fn start_usage(&self) -> Value {
         match (self.usage.as_ref(), self.pre_dispatch_input_estimate) {
             (Some(usage), _) => messages_usage(Some(usage)),
-            (None, Some(estimate)) => json!({"input_tokens": estimate, "output_tokens": 1}),
+            (None, Some(estimate)) => usage_object(estimate, 0, 0, 1),
             (None, None) => messages_usage(None),
         }
     }
@@ -967,8 +934,11 @@ impl MessagesSseEncoder {
 }
 
 mod aggregate;
+mod usage;
 
 pub use aggregate::{completed_messages_body, completed_messages_body_with_reasoning};
+pub(crate) use usage::messages_usage;
+use usage::usage_object;
 
 /// Attach the `x-experiential-ignored-parameters` disclosure to one message
 /// object when any control was dropped; an empty list adds nothing.
@@ -989,3 +959,5 @@ pub(super) fn disclose_ignored_parameters(message: &mut Value, ignored_parameter
 mod tests;
 #[cfg(test)]
 mod tests_claude_code;
+#[cfg(test)]
+mod tests_usage;
