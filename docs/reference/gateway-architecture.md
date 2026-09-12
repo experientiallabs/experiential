@@ -404,13 +404,14 @@ conversation breakpoints on every request, and flattening them once billed whole
 uncached at ~10x. Responses report both cache legs back out of the folded ledger total, so
 callers see `cache_creation_input_tokens` on the writing turn and `cache_read_input_tokens` on
 later turns. Routes with no Anthropic rung have no field for the markers and disclose them as
-`<path>.cache_control->not_forwarded(provider_caches_automatically; cache reads reported in
-usage.cache_read_input_tokens)`: the wording never says "ignored" and names where the caching
-shows up, because the disclosure rides in `x-experiential-ignored-parameters` and a bare
-"not forwarded" beside a billed cache read was read as "caching is ignored" (Harbor, 2026-09-11:
-`cache_read_input_tokens: 256` on a Tencent rung under the old wording). OpenAI-family and other
-OpenAI-compatible providers cache the prefix implicitly, without breakpoints, and the ledger
-bills those reads at the cached rate; a provider that never caches reports the leg as 0),
+`<path>.cache_control->not_forwarded(provider_decides_caching; cache reads reported in
+usage.cache_read_input_tokens)`: the wording never says "ignored", never claims caching is on or
+off (OpenAI-family and most OpenAI-compatible providers cache the prefix implicitly, without
+breakpoints, and the ledger bills those reads at the cached rate; a generic endpoint may never
+cache), and names where whatever the provider does shows up, because the disclosure rides in
+`x-experiential-ignored-parameters` and a bare "not forwarded" beside a billed cache read was
+read as "caching is ignored" (Harbor, 2026-09-11: `cache_read_input_tokens: 256` on a Tencent
+rung under the old wording; a provider that never caches reports the leg as 0),
 carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with

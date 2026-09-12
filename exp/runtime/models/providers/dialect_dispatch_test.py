@@ -15,10 +15,10 @@ def test_cache_control_disclosure_names_where_cache_reads_show_up() -> None:
 
     It travels in ``x-experiential-ignored-parameters`` beside a billed
     ``cache_read_input_tokens`` on OpenAI-compatible routes, so it has to say
-    that the provider caches on its own and where the reads are reported.
+    that caching is the provider's decision and where any reads are reported.
     """
     assert CACHE_CONTROL_NOT_FORWARDED_SUFFIX == (
-        "->not_forwarded(provider_caches_automatically;"
+        "->not_forwarded(provider_decides_caching;"
         " cache reads reported in usage.cache_read_input_tokens)"
     )
     assert "ignored" not in CACHE_CONTROL_NOT_FORWARDED_SUFFIX
