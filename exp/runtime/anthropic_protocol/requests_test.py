@@ -2145,3 +2145,30 @@ def test_a_thinking_budget_at_or_above_max_tokens_is_refused_at_the_boundary() -
         }
     )
     assert counted.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 4096}
+
+
+def test_a_superseded_thinking_budget_is_never_refused() -> None:
+    """The refusal reads the RESOLVED channel: an explicit ``reasoning.effort``
+    discards the thinking config beside it, so its budget cannot starve the
+    reply and the request decodes at that effort with the supersession
+    disclosed. A ``reasoning.max_tokens`` budget is its own channel's check."""
+    decoded = decode_messages(
+        _body(
+            max_tokens=2048,
+            thinking={"type": "enabled", "budget_tokens": 4096},
+            reasoning={"effort": "high"},
+        )
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.provider_thinking_config is None
+    assert "thinking->dropped(superseded_by_reasoning)" in decoded.request.ignored_parameters
+
+    # reasoning: {enabled: false} resolves to a disabled config with no budget.
+    off = decode_messages(
+        _body(
+            max_tokens=2048,
+            thinking={"type": "enabled", "budget_tokens": 4096},
+            reasoning={"enabled": False},
+        )
+    )
+    assert off.request.provider_thinking_config == {"type": "disabled"}

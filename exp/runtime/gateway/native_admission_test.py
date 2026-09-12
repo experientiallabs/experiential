@@ -1702,3 +1702,65 @@ def test_a_tiny_max_tokens_on_a_default_reasoning_lane_dispatches_without_thinki
     )
     assert provider.reasoning_effort is None
     assert public.ignored_parameters == ()
+
+
+def test_the_headroom_rule_reads_the_rungs_that_survive_narrowing() -> None:
+    """A rung with no reasoning default that narrowing removes (its output
+    ceiling is below the caller's ``max_tokens``) must not veto the headroom
+    coercion for the default-on rung that actually serves; and a surviving
+    rung without a default still does, because it already answers in text."""
+    plain = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment("text-only", gateway=plain),
+            _deployment("hy4", provider="tencent", gateway=plain),
+        ),
+        GatewayApiSurface.MESSAGES,
+    )
+    client = cast(NativeWireClient, object())
+    hy4 = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://tokenhub.test/v1",
+        model_id="hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+        reasoning_effort="high",
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        maximum_output_tokens=32,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+
+    narrowed_out = GatewayWireProfile(
+        dialect="openai_compatible", url="https://plain.test/v1", maximum_output_tokens=16
+    )
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        ((narrowed_out, client), (hy4, client)),
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("hy4",)
+    assert provider.reasoning_effort == "none"
+    assert "reasoning_effort->none(max_tokens_headroom)" in public.ignored_parameters
+
+    surviving = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test/v1")
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        ((surviving, client), (hy4, client)),
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert len(narrowed.deployments) == 2
+    assert provider.reasoning_effort is None
+    assert public.ignored_parameters == ()

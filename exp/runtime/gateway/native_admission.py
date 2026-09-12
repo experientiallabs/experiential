@@ -156,12 +156,6 @@ def admitted_route_requests(
     coercion_disclosures: tuple[str, ...] = ()
     full_route = route
     full_wires = resolved_wires
-    headroom = reserve_thinking_headroom(
-        tuple(profile for profile, _client in resolved_wires), admitted_request
-    )
-    if headroom is not None:
-        admitted_request = headroom.request
-        coercion_disclosures = headroom.disclosures
 
     def candidate_serves(candidate: GatewayRequest) -> bool:
         return _candidate_serves(full_route, full_wires, candidate)
@@ -206,6 +200,17 @@ def admitted_route_requests(
         coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
     route = select_route_deployments(route, compatible_indexes)
     resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
+    # The headroom rule reads the rungs that SURVIVED narrowing: a rung with
+    # no reasoning default (or no ``none`` tier) that narrowing has already
+    # removed must not veto the coercion for the default-on rung that will
+    # actually serve. Every surviving rung accepted the request verbatim and
+    # offers ``none``, so the coerced request narrows to the same set.
+    headroom = reserve_thinking_headroom(
+        tuple(profile for profile, _client in resolved_wires), admitted_request
+    )
+    if headroom is not None:
+        admitted_request = headroom.request
+        coercion_disclosures = (*coercion_disclosures, *headroom.disclosures)
     public_request, provider_request = route_generation_parameter_requests(
         tuple(profile for profile, _client in resolved_wires),
         admitted_request,

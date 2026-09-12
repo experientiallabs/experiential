@@ -378,7 +378,6 @@ def _decode(
     _validate_manifest(payload)
     request = validate_wire(payload, wire)
     _require_served_server_tool_types(request.tools)
-    _require_thinking_budget_below_max_tokens(request)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
@@ -419,6 +418,7 @@ def _decode(
             else None
         ),
     )
+    _require_thinking_budget_below_max_tokens(channels.thinking_config, request.max_tokens)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
@@ -604,7 +604,10 @@ def _marked_text_blocks(
     return tuple(rebuilt)
 
 
-def _require_thinking_budget_below_max_tokens(request: _MessagesRequest) -> None:
+def _require_thinking_budget_below_max_tokens(
+    thinking_config: JsonObject | None,
+    max_tokens: int | None,
+) -> None:
     """Refuse a thinking budget that leaves no room for the reply.
 
     Anthropic requires ``thinking.budget_tokens < max_tokens`` (its own 400 reads
@@ -617,16 +620,21 @@ def _require_thinking_budget_below_max_tokens(request: _MessagesRequest) -> None
     it with the derived legal budget (disclosed), and on an effort rung it is
     only a depth hint read through the tier table, so nothing about it can
     fail. A ``count_tokens`` body carries no ``max_tokens`` and is not checked.
+    The check reads the RESOLVED thinking channel, after reasoning-channel
+    precedence: a ``thinking`` config that an explicit ``reasoning`` effort
+    supersedes is discarded, and a discarded budget cannot starve anything.
 
     Args:
-        request: The validated wire request.
+        thinking_config: The thinking config the canonical request will carry.
+        max_tokens: The caller's reply ceiling, ``None`` for ``count_tokens``.
 
     Raises:
         OpenAIProtocolError: The budget is not below ``max_tokens``.
     """
-    if request.thinking is None or request.thinking.budget_tokens is None:
+    if thinking_config is None or max_tokens is None:
         return
-    if request.max_tokens is not None and request.thinking.budget_tokens >= request.max_tokens:
+    budget = thinking_config.get("budget_tokens")
+    if isinstance(budget, int) and not isinstance(budget, bool) and budget >= max_tokens:
         raise invalid_field(
             "thinking.budget_tokens",
             "thinking.budget_tokens must be below max_tokens so the reply has room after "
