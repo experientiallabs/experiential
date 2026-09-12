@@ -404,11 +404,14 @@ conversation breakpoints on every request, and flattening them once billed whole
 uncached at ~10x. Responses report both cache legs back out of the folded ledger total, so
 callers see `cache_creation_input_tokens` on the writing turn and `cache_read_input_tokens` on
 later turns. Routes with no Anthropic rung have no field for the markers and disclose them as
-`<path>.cache_control->not_forwarded(provider_decides_caching)`: the wording never says
-"ignored", because caching is then the provider's own decision — OpenAI-family providers cache
-the prefix implicitly and the ledger bills those reads at the cached rate (Harbor saw 14,976
-cached tokens billed beside an "ignored" marker on 2026-09-11), while a generic endpoint may not
-cache at all), carries the provider-native tool annotations (`strict`,
+`<path>.cache_control->not_forwarded(provider_caches_automatically; cache reads reported in
+usage.cache_read_input_tokens)`: the wording never says "ignored" and names where the caching
+shows up, because the disclosure rides in `x-experiential-ignored-parameters` and a bare
+"not forwarded" beside a billed cache read was read as "caching is ignored" (Harbor, 2026-09-11:
+`cache_read_input_tokens: 256` on a Tencent rung under the old wording). OpenAI-family and other
+OpenAI-compatible providers cache the prefix implicitly, without breakpoints, and the ledger
+bills those reads at the cached rate; a provider that never caches reports the leg as 0),
+carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
 disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
@@ -683,19 +686,31 @@ The thinking vocabulary names the outcome, never a bare field: `thinking->reason
 bare `thinking` as "my depth was stripped" is the misreading this vocabulary exists to prevent.
 
 On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and
-`message_delta.usage` is the authoritative one. The start frame carries what the upstream already
+`message_delta.usage` is the authoritative one. Every Messages usage object (`message_start`,
+`message_delta`, and the non-streamed body) carries Anthropic's four legs, always present and
+`0` when the provider reported none: `input_tokens` (uncached input), `cache_creation_input_tokens`,
+`cache_read_input_tokens`, and `output_tokens`. The cache legs come out of the normalized
+folded total the ledger bills: an Anthropic rung's own `cache_read_input_tokens` /
+`cache_creation_input_tokens`, an OpenAI-wire rung's `prompt_tokens_details.cached_tokens`
+(Chat) or `input_tokens_details.cached_tokens` (Responses), Gemini's `cachedContentTokenCount`,
+Bedrock's `cacheReadInputTokens`; only the Anthropic wire reports cache writes, every other
+rung carries `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
 reported before content — an Anthropic upstream's own start-frame input and cache meters,
 mirrored — and otherwise the control plane's pre-dispatch count of the prompt (the reservation
-estimator without its headroom, carried on the admission as `input_token_estimate`) in
-Anthropic's documented start shape, `{"input_tokens": N, "output_tokens": 1}`. An OpenAI-wire
-upstream reports nothing before its final chunk, so without the estimate its `message_start`
-showed the zero placeholder that clients reading input from the start frame alone (Claude Code)
-display as 0 input tokens. `message_delta.usage` carries the provider's final meters (input,
-output, `cache_read_input_tokens`, `cache_creation_input_tokens`, plus the platform's cost
-extensions); the official Anthropic SDK accumulators (Python and TypeScript) copy every usage
-field present on `message_delta`, so their final message shows the true counts. The estimate is
-display-only: the encoder keeps it apart from the usage it settles from, so it never reaches
-`message_delta` or the ledger, which bill the provider's report.
+estimator without its headroom, carried on the admission as `input_token_estimate`, the same
+count `count_tokens` answers) in Anthropic's documented start shape,
+`{"input_tokens": N, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}`
+(nothing is cached before dispatch). The count covers the system blocks, every turn's content
+blocks (tool_use and tool_result included), and each tool definition, so a Claude Code session
+reads in the thousands there; a two-digit figure is a two-digit prompt (Claude Code's own
+startup probes), never a stub. An OpenAI-wire upstream reports nothing before its final chunk,
+so without the estimate its `message_start` showed the zero placeholder that clients reading
+input from the start frame alone (Claude Code) display as 0 input tokens. `message_delta.usage`
+carries the provider's final meters plus the platform's cost extensions; the official Anthropic
+SDK accumulators (Python and TypeScript) copy every usage field present on `message_delta`, so
+their final message shows the true counts. The estimate is display-only: the encoder keeps it
+apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
+bill the provider's report.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
 provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
 caller hits that 400.

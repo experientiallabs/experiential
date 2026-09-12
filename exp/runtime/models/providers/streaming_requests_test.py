@@ -32,7 +32,10 @@ from exp.runtime.models.providers.anthropic_tool_compat import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
-from exp.runtime.models.providers.dialect_dispatch import THINKING_HISTORY_DROP_DISCLOSURE
+from exp.runtime.models.providers.dialect_dispatch import (
+    CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
+    THINKING_HISTORY_DROP_DISCLOSURE,
+)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -1234,9 +1237,7 @@ def test_mixed_route_keeps_the_prompt_cache_marker_when_any_rung_is_anthropic() 
     # No rung can cache: dropped with disclosure.
     public_only, provider_only = route_generation_parameter_requests((fallback,), request)
     assert provider_only.provider_cache_control is None
-    assert (
-        "cache_control->not_forwarded(provider_decides_caching)" in public_only.ignored_parameters
-    )
+    assert f"cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}" in public_only.ignored_parameters
 
 
 def test_route_shaping_omits_parallel_control_when_tool_choice_disables_tools() -> None:
@@ -2599,7 +2600,7 @@ def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() ->
         request,
     )
     assert (
-        "messages.tool_calls.cache_control->not_forwarded(provider_decides_caching)"
+        f"messages.tool_calls.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         in public.ignored_parameters
     )
     anthropic_public, _provider = route_generation_parameter_requests(
@@ -3048,7 +3049,7 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     # rungs.
     assert set(mixed_public.ignored_parameters) == {
         "inference_geo",
-        "tools.cache_control->not_forwarded(provider_decides_caching)",
+        f"tools.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}",
         "tools.eager_input_streaming",
         "tools.defer_loading",
         "tools.allowed_callers",
@@ -3294,7 +3295,7 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     # 14,976 cached tokens billed at the cached rate beside this disclosure),
     # so the wording says what actually happens to the marker.
     assert (
-        "messages.content.cache_control->not_forwarded(provider_decides_caching)"
+        f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         in foreign_public.ignored_parameters
     )
 

@@ -20,6 +20,7 @@ from exp.common.models.content import (
     VideoContentPart,
 )
 from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.attempt_tokens import (
     AUDIO_BYTES_PER_TOKEN,
     DOCUMENT_BYTES_PER_TOKEN,
@@ -668,3 +669,99 @@ def test_counted_input_tokens_is_the_estimate_before_headroom() -> None:
         == (counted * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
     )
     assert counted < worst_case_input_tokens(request)
+
+
+def _claude_code_messages_payload(*, system: bool = True, tools: bool = True) -> JsonObject:
+    """A Claude Code-shaped Messages body: system array, tool definitions, six turns."""
+    system_block = (
+        "You are Claude Code, an interactive CLI tool that helps users with software "
+        "engineering tasks. Use the instructions below and the tools available to you. "
+    ) * 40
+    messages: list[JsonObject] = []
+    for turn in range(6):
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Turn {turn}: " + "explain the module layout in detail. " * 10,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading the file now. " * 5},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{turn:03d}",
+                        "name": "Read",
+                        "input": {"file_path": "/repo/src/main.py"},
+                    },
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"toolu_{turn:03d}",
+                        "content": [{"type": "text", "text": "def main():\n    pass\n" * 20}],
+                    }
+                ],
+            }
+        )
+    messages.append({"role": "user", "content": "Now summarize."})
+    payload: JsonObject = {"model": "coding", "max_tokens": 32_000, "messages": messages}
+    if system:
+        payload["system"] = [
+            {"type": "text", "text": system_block, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Project instructions: " + system_block[:2000]},
+        ]
+    if tools:
+        payload["tools"] = [
+            {
+                "name": f"Tool{index}",
+                "description": f"Tool {index}. " + "Reads a file from the local filesystem. " * 8,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "The absolute path"},
+                        "offset": {"type": "number", "description": "The first line to read"},
+                    },
+                    "required": ["file_path"],
+                },
+            }
+            for index in range(12)
+        ]
+    return payload
+
+
+def test_messages_estimate_counts_system_every_turn_and_the_tools() -> None:
+    """A Claude Code-shaped Messages request counts in the thousands, not tens.
+
+    The start-frame / ``count_tokens`` figure is the counted prompt of the
+    DECODED Messages request: the system array (folded into the leading
+    system turn), every user, assistant, tool_use and tool_result block, and
+    each tool definition. Dropping the system blocks or the tools lowers the
+    count by at least what they contribute, so neither can be silently
+    skipped by a later decoder change.
+    """
+    full = counted_input_tokens(decode_messages(_claude_code_messages_payload()).request)
+    assert full > 1_000, full
+    without_system = counted_input_tokens(
+        decode_messages(_claude_code_messages_payload(system=False)).request
+    )
+    without_tools = counted_input_tokens(
+        decode_messages(_claude_code_messages_payload(tools=False)).request
+    )
+    # Two system blocks totalling about 1,500 tokens (counted 1,492 on the
+    # reservation BPE); twelve tools plus the fixed tool-use preamble.
+    assert full - without_system > 1_200, (full, without_system)
+    assert full - without_tools > TOOLS_PRESENT_TOKENS + 12 * 30, (full, without_tools)
