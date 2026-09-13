@@ -48,6 +48,10 @@ Capability kinds name the inspection job, not a vendor:
 
 Built-in adapter kinds:
 
+- `regex`: local RE2 matching and deterministic text replacement. Configure
+  custom expressions or the `email`, `credit_card`, and `api_key` built-in
+  families. Card candidates require a valid Luhn checksum. These rules find
+  specific patterns, not all personal information or every secret format.
 - `keyword`: coarse, test-oriented needle matching. Case-folded substrings of
   message text, completion text, or tool-call arguments. This is not a
   production prompt-injection or content-safety classifier.
@@ -57,6 +61,48 @@ Built-in adapter kinds:
   including a hosted PII redactor, by `adapter_id`.
 
 Other adapters may still be injected in code when composing a `GuardrailEngine`.
+
+### Regex rules
+
+For example, redact emails, card candidates, and an internal account format
+before provider dispatch and before delivering the completion:
+
+```json
+{
+  "adapters": [{
+    "adapter_id": "sensitive-patterns",
+    "kind": "regex",
+    "builtin_patterns": ["email", "credit_card"],
+    "patterns": ["ACCT-[0-9]{8}"],
+    "replacement": "[REDACTED]"
+  }],
+  "policies": [{
+    "policy_id": "redact-patterns",
+    "organization_id": "organization-one",
+    "identity_id": "identity-one",
+    "protected": true,
+    "checks": [
+      {"check_id": "redact-input", "capability": "pii", "stage": "input",
+       "action": "modify", "adapter_id": "sensitive-patterns", "timeout_ms": 250},
+      {"check_id": "redact-output", "capability": "pii", "stage": "output",
+       "action": "modify", "adapter_id": "sensitive-patterns", "timeout_ms": 250}
+    ]
+  }]
+}
+```
+
+`block` refuses a match instead of replacing it. Replacements are literal
+strings, not capture-group substitutions. Overlapping spans are combined
+before replacement. Zero-length matches do not flag text. Tool arguments are
+inspected but never rewritten: a flagged input tool argument under `modify`
+is refused, and output modifications with tool calls are blocked.
+
+RE2 does not support backreferences or look-around. Each custom pattern is
+limited to 1,024 UTF-8 bytes, with at most 32 patterns per adapter and 256 KiB
+of compile memory per expression. Each inspected text is limited to 1 MiB
+and 4,096 matches across its patterns. Exceeding these bounds is classifier
+uncertainty, governed by the policy's fail-closed setting. Use a model-backed
+PII detector for contextual entities such as names and addresses.
 
 Each check has an action (`allow`, `modify`, `block`, `error`), a per-check
 timeout, and an adapter identity. `modify` may rewrite request messages or
