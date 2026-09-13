@@ -530,5 +530,6 @@ def test_first_run_unknown_setup_outcome_delivers_the_only_raw_key(
 
     transcript = output.getvalue()
     assert "export EXP_GATEWAY_KEY=exp_vk_unknown_secret" in transcript
-    assert "Preserve this one-time gateway key: exp_vk_unknown_secret" in transcript
+    assert transcript.count("exp_vk_unknown_secret") == 1
+    assert "Preserve the one-time gateway key printed above." in transcript
     assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript
