@@ -11,6 +11,10 @@ from __future__ import annotations
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.models.providers.deepseek import (
+    fold_trailing_instruction_turns,
+    is_deepseek_model_id,
+)
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
@@ -249,6 +253,10 @@ def openai_compatible_stream_payload(
         request.messages,
         route_sha256=reasoning_route_sha256,
     )
+    if deepseek_reasoning_history or is_deepseek_model_id(model_id):
+        # DeepSeek ends a tools+reasoning turn empty when the conversation
+        # ends on an instruction; see fold_trailing_instruction_turns.
+        messages = fold_trailing_instruction_turns(messages)
     payload: JsonObject = {
         "model": model_id,
         "messages": [

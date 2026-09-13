@@ -331,3 +331,49 @@ def test_other_compatible_origins_keep_the_exposure_gated_behaviour() -> None:
     assert first_call["reasoning_content"] == ""
     assert second_call["reasoning_content"] == "I should read b next."
     assert "reasoning_content" not in final_text
+
+
+def _claude_code_shape() -> GatewayRequest:
+    """Claude Code's live shape: leading system, user turn, trailing system reminder, tools."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="You are Claude Code."),
+            GatewayMessage(role="user", content="Diagnose the regression."),
+            GatewayMessage(role="system", content="# Environment\nPlatform: linux"),
+        ),
+        tools=(
+            GatewayToolDefinition(
+                name="Read", description="Read a file.", parameters={"type": "object"}
+            ),
+        ),
+        reasoning_effort="high",
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_deepseek_rungs_fold_a_trailing_system_turn_into_the_user_turn() -> None:
+    """DeepSeek V4 ends a tools+reasoning turn empty when the conversation ends on system."""
+    payload = openai_compatible_stream_payload(
+        "deepseek/deepseek-v4-flash",
+        _claude_code_shape(),
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[1]["content"] == "Diagnose the regression.\n\n# Environment\nPlatform: linux"
+
+
+def test_deepseek_origin_folds_too_and_other_rungs_keep_the_trailing_system_turn() -> None:
+    folded = openai_compatible_stream_payload(
+        "deepseek-chat", _claude_code_shape(), deepseek_reasoning_history=True
+    )
+    assert [m["role"] for m in cast(list[JsonObject], folded["messages"])] == ["system", "user"]
+    kept = openai_compatible_stream_payload("tencent/hy4-preview", _claude_code_shape())
+    assert [m["role"] for m in cast(list[JsonObject], kept["messages"])] == [
+        "system",
+        "user",
+        "system",
+    ]
