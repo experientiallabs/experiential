@@ -40,10 +40,16 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
+    OutputGuardrailMode,
     request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import HttpJsonClassifier
+from exp.runtime.gateway.guardrails.regex import (
+    BuiltinPattern,
+    RegexAdapterDocument,
+    RegexClassifier,
+)
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
 
@@ -1166,3 +1172,238 @@ def test_signed_tool_ids_count_toward_output_subject_limit(limit_offset: int) ->
             )
         )
         assert classifier.output_calls == 1
+
+
+def _regex_engine(
+    *,
+    action: GuardrailAction = GuardrailAction.MODIFY,
+    extra: tuple[GuardrailCheck, ...] = (),
+    max_response_bytes: int = 1_048_576,
+) -> tuple[GuardrailEngine, GuardrailPolicy]:
+    """Compose one engine whose output chain uses the deterministic detector.
+
+    Args:
+        action: Action of the deterministic output check.
+        extra: Additional output checks appended to the chain.
+        max_response_bytes: Completion bound for the identity.
+
+    Returns:
+        The engine and its resolved policy.
+    """
+    detector = RegexClassifier(
+        RegexAdapterDocument(adapter_id="scripted", builtin_patterns=(BuiltinPattern.EMAIL,))
+    )
+    engine, _ = _engine(
+        classifier=detector,
+        checks=(
+            _check("output-one", stage=GuardrailCheckStage.OUTPUT, action=action),
+            *extra,
+        ),
+        max_response_bytes=max_response_bytes,
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+    return engine, policy
+
+
+def test_deterministic_modify_chain_streams() -> None:
+    """One deterministic modify check on a plain stream releases incrementally."""
+    engine, policy = _regex_engine()
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.STREAM
+    )
+
+
+def test_an_authored_regex_chain_keeps_the_buffered_path() -> None:
+    """An expression of unknown span offers no redactor, so the stream buffers."""
+    detector = RegexClassifier(
+        RegexAdapterDocument(adapter_id="scripted", patterns=(r"SECRET-[0-9]+",))
+    )
+    engine, _ = _engine(
+        classifier=detector,
+        checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+@pytest.mark.parametrize(
+    ("streaming", "tools_offered", "reasoning_text_requested"),
+    [(False, False, False), (True, True, False), (True, False, True)],
+)
+def test_request_shape_keeps_the_buffered_path(
+    streaming: bool,
+    tools_offered: bool,
+    reasoning_text_requested: bool,
+) -> None:
+    """Unary, tool-offering, and reasoning-text requests stay buffered."""
+    engine, policy = _regex_engine()
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=streaming,
+            tools_offered=tools_offered,
+            reasoning_text_requested=reasoning_text_requested,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_blocking_check_keeps_the_buffered_path() -> None:
+    """A check that can block cannot run after bytes are already out."""
+    engine, policy = _regex_engine(action=GuardrailAction.BLOCK)
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_nondeterministic_adapter_keeps_the_buffered_path() -> None:
+    """An adapter with no streaming redactor needs the whole completion."""
+    engine, _ = _engine(
+        classifier=ScriptedClassifier(),
+        checks=(
+            _check(
+                "output-one",
+                stage=GuardrailCheckStage.OUTPUT,
+                action=GuardrailAction.MODIFY,
+            ),
+        ),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_second_output_check_keeps_the_buffered_path() -> None:
+    """A chain cannot compose redactions over partially released text."""
+    engine, policy = _regex_engine(
+        extra=(
+            _check(
+                "output-two",
+                stage=GuardrailCheckStage.OUTPUT,
+                action=GuardrailAction.MODIFY,
+            ),
+        )
+    )
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_unguarded_identity_reports_no_output_work() -> None:
+    """An identity with no output check runs neither path."""
+    engine, _ = _engine(classifier=ScriptedClassifier(), checks=(_check("input-one"),))
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.OFF
+    )
+    assert (
+        engine.output_mode(
+            None,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.OFF
+    )
+
+
+def test_released_segment_is_redacted_and_bounded() -> None:
+    """The released prefix is redacted and the unsettled tail stays buffered."""
+    engine, policy = _regex_engine()
+    segment = engine.release_output_segment(
+        policy=policy,
+        pending="write to ada@example.com " + "x" * 600 + " done",
+        final=False,
+        settled_bytes=0,
+    )
+    assert "ada@example.com" not in segment.release
+    assert segment.flagged
+    assert segment.pending
+
+
+def test_oversized_stream_fails_closed_and_releases_nothing() -> None:
+    """A completion past the identity bound is terminal, as it is when buffered."""
+    engine, policy = _regex_engine(max_response_bytes=16)
+    with pytest.raises(GuardrailRejected) as failure:
+        engine.release_output_segment(
+            policy=policy,
+            pending="x" * 64,
+            final=True,
+            settled_bytes=0,
+        )
+    assert failure.value.failure.safe_details.get("action") == GuardrailAction.ERROR.value
+
+
+class _FailingDetector(RegexClassifier):
+    """Deterministic adapter whose redactor faults instead of deciding."""
+
+    def release_boundary(self, text: str) -> int:
+        """Fail instead of naming a boundary."""
+        del text
+        raise RuntimeError("detector unavailable")
+
+    def redact(self, text: str) -> tuple[bool, str]:
+        """Fail instead of redacting."""
+        del text
+        raise RuntimeError("detector unavailable")
+
+
+def test_adapter_failure_mid_stream_fails_closed() -> None:
+    """An adapter error releases nothing, for protected and open identities alike."""
+    detector = _FailingDetector(
+        RegexAdapterDocument(adapter_id="scripted", builtin_patterns=(BuiltinPattern.EMAIL,))
+    )
+    engine, _ = _engine(
+        classifier=detector,
+        checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+    with pytest.raises(GuardrailRejected):
+        engine.release_output_segment(
+            policy=policy,
+            pending="anything",
+            final=True,
+            settled_bytes=0,
+        )

@@ -34,7 +34,13 @@ from exp.runtime.gateway.guardrails.native import (
     encode_output_decision,
     enforce_native_input,
     enforce_native_output,
+    enforce_native_output_segment,
     parse_output_payload,
+)
+from exp.runtime.gateway.guardrails.regex import (
+    BuiltinPattern,
+    RegexAdapterDocument,
+    RegexClassifier,
 )
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
@@ -311,3 +317,65 @@ def test_native_callback_returns_while_adapter_ignores_cancellation() -> None:
                 break
             time.sleep(0.02)
         assert inspects.detached_inspect_count() == 0
+
+
+def test_output_segment_without_an_engine_fails_closed() -> None:
+    """An unguarded process cannot release bytes through the streaming seam."""
+    decision = json.loads(
+        enforce_native_output_segment(
+            None,
+            None,
+            json.dumps({"pending": "text", "final": True, "settled_bytes": 0}),
+        )
+    )
+    assert decision["action"] == "error"
+    assert "release" not in decision
+    assert decision["failure"]["failure_class"] == "guardrail"
+
+
+def test_output_segment_releases_redacted_text() -> None:
+    """A deterministic chain returns redacted release text and the held tail."""
+    detector = RegexClassifier(
+        RegexAdapterDocument(
+            adapter_id="detector",
+            builtin_patterns=(BuiltinPattern.EMAIL,),
+            stream_window_characters=64,
+        )
+    )
+    policy = GuardrailPolicy(
+        policy_id="member-policy",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        protected=True,
+        checks=(
+            GuardrailCheck(
+                check_id="output-redact",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.OUTPUT,
+                action=GuardrailAction.MODIFY,
+                timeout_ms=100,
+                adapter_id="detector",
+            ),
+        ),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"detector": detector})),
+        monotonic=lambda: 0.0,
+    )
+    decision = json.loads(
+        enforce_native_output_segment(
+            engine,
+            policy,
+            json.dumps(
+                {
+                    "pending": "mail ada@example.com now " + "y" * 200 + " done ",
+                    "final": False,
+                    "settled_bytes": 0,
+                }
+            ),
+        )
+    )
+    assert decision["action"] == "allow"
+    assert "ada@example.com" not in decision["release"]
+    assert decision["flagged"] is True

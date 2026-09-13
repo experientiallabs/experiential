@@ -23,6 +23,11 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheckStage,
     GuardrailCompletion,
 )
+from exp.runtime.gateway.guardrails.regex import (
+    BuiltinPattern,
+    RegexAdapterDocument,
+    RegexClassifier,
+)
 
 
 def _check() -> GuardrailCheck:
@@ -95,3 +100,20 @@ def test_client_inspects_output_through_the_same_internal_seam() -> None:
     )
 
     assert verdict.flagged is False
+
+
+def test_non_streamable_adapter_offers_no_redactor() -> None:
+    """An adapter that cannot decide about a prefix keeps the buffered path."""
+    client = DirectClassifierClient(ClassifierRegistry({"scripted": ScriptedClassifier()}))
+
+    assert client.stream_redactor(check=_check()) is None
+
+
+def test_deterministic_adapter_offers_its_redactor() -> None:
+    """The deterministic detector surfaces itself as the streaming redactor."""
+    detector = RegexClassifier(
+        RegexAdapterDocument(adapter_id="scripted", builtin_patterns=(BuiltinPattern.EMAIL,))
+    )
+    client = DirectClassifierClient(ClassifierRegistry({"scripted": detector}))
+
+    assert client.stream_redactor(check=_check()) is detector

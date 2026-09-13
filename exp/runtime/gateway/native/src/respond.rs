@@ -12,12 +12,74 @@ use bytes::Bytes;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::encode::compact_json;
+use crate::encode::{chat_data, compact_json, ChatSseEncoder};
+use crate::encode_responses::ResponsesSseEncoder;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::relay::remaining;
 use crate::replay::{CachedResponse, OwnerLease};
 use crate::settlement::AttemptGuard;
+
+/// Build a chat encoder's sanitized failure frame and done sentinel when the
+/// stream has not already reached a terminal.
+pub(crate) fn failure_frames(encoder: &mut ChatSseEncoder, failure: &Failure) -> Vec<Bytes> {
+    if encoder.saw_terminal() {
+        return Vec::new();
+    }
+    encoder
+        .feed(&Event::Failed(failure.clone()))
+        .unwrap_or_else(|_| {
+            vec![
+                chat_data(&failure.public_error().json_body()),
+                "data: [DONE]\n\n".to_string(),
+            ]
+        })
+        .into_iter()
+        .map(Bytes::from)
+        .collect()
+}
+
+/// Emit the Responses encoder's sanitized failure lifecycle when the stream
+/// has not already reached a terminal.
+pub(crate) async fn emit_responses_failure(
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    deadline: Instant,
+    encoder: &mut ResponsesSseEncoder,
+    failure: &Failure,
+) {
+    if encoder.saw_terminal() {
+        return;
+    }
+    let frames = encoder
+        .feed(&Event::Failed(failure.clone()))
+        .unwrap_or_default();
+    for frame in frames {
+        if !send_bounded(sender, deadline, Bytes::from(frame)).await {
+            return;
+        }
+    }
+}
+
+/// Return the event the caller should see, tracking visible refusal text.
+///
+/// A typed refusal that follows refusal text the caller already saw closes
+/// the stream publicly; the ledger still records the provider's refusal.
+pub(crate) fn outward_event(event: &Event, visible_refusal: &mut bool) -> Event {
+    if matches!(
+        event,
+        Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+    ) {
+        *visible_refusal = true;
+    }
+    match event {
+        Event::Failed(failure)
+            if failure.failure_class == FailureClass::Refusal && *visible_refusal =>
+        {
+            Event::Completed
+        }
+        other => other.clone(),
+    }
+}
 
 /// Largest accepted request body on every native-served route. Bounded so
 /// one client cannot hold unbounded gateway memory; far above any real chat

@@ -26,11 +26,13 @@ use crate::encode_messages::{
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
+use crate::guardrails::{released_events, StreamRedactor};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
-    latin1_header_list, read_body, send_bounded, settle_stream_end, sse_body_response,
+    latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
+    sse_body_response,
 };
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
@@ -218,10 +220,11 @@ pub(crate) async fn messages(
         Won::Settled(settled) => settled_messages_response(&admission, settled).await,
         Won::Committed(committed) => {
             let committed = *committed;
-            if admission.output_guardrail {
+            let incremental = admission.stream_incremental(committed.depth);
+            if admission.output_guardrail.enforces() && !incremental {
                 guarded_messages(admission, guard, committed, deadline, permit).await
             } else if admission.stream {
-                stream_messages(admission, guard, committed, deadline, permit).await
+                stream_messages(admission, guard, committed, deadline, permit, incremental).await
             } else {
                 completed_messages(admission, guard, committed, deadline, permit).await
             }
@@ -556,6 +559,7 @@ async fn stream_messages(
     committed: CommittedAttempt,
     deadline: Instant,
     permit: tokio::sync::OwnedSemaphorePermit,
+    incremental_guardrail: bool,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let header_pairs = {
@@ -580,6 +584,9 @@ async fn stream_messages(
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;
         let mut terminal: Option<Event> = None;
+        // Deterministic output redaction as bytes flow: only the trailing
+        // window the detector cannot yet decide about is withheld.
+        let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
@@ -638,21 +645,19 @@ async fn stream_messages(
             track_event(&event, &mut usage, &mut tool_names);
             // Mirror the relay's first-token time onto the guard as tokens stream.
             guard.record_first_token(committed.relay.first_token_at());
-            if matches!(
-                event,
-                Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-            ) {
-                visible_refusal = true;
-            }
-            // A typed refusal after visible refusal output completes
-            // publicly; the ledger still records the provider's refusal.
-            let outward = match &event {
-                Event::Failed(failure)
-                    if failure.failure_class == FailureClass::Refusal && visible_refusal =>
-                {
-                    Event::Completed
-                }
-                other => other.clone(),
+            let outward = outward_event(&event, &mut visible_refusal);
+            // A byte that reaches the caller has already been through the
+            // detector, and a terminal flushes whatever is still buffered.
+            let outward_events = match released_events(
+                redactor.as_mut(),
+                &guard.bridge,
+                outward,
+                event.is_terminal(),
+            )
+            .await
+            {
+                Ok(events) => events,
+                Err(failure) => fail_stream!(failure),
             };
             if event.is_terminal() {
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {
@@ -689,35 +694,37 @@ async fn stream_messages(
                     return;
                 }
             }
-            let encoded = match encoder.feed(&outward) {
-                Ok(encoded) => encoded,
-                Err(_) => {
-                    if terminal.is_some() {
-                        // The attempt already settled by its provider
-                        // terminal; the stream simply ends short.
+            for outward in outward_events {
+                let encoded = match encoder.feed(&outward) {
+                    Ok(encoded) => encoded,
+                    Err(_) => {
+                        if terminal.is_some() {
+                            // The attempt already settled by its provider
+                            // terminal; the stream simply ends short.
+                            return;
+                        }
+                        fail_stream!(Failure::new(
+                            FailureClass::Internal,
+                            "gateway could not encode the provider stream",
+                        ))
+                    }
+                };
+                for data in encoded {
+                    if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                        settle_stream_end(
+                            &mut guard,
+                            terminal.as_ref(),
+                            usage.as_ref(),
+                            &tool_names,
+                            true,
+                        )
+                        .await;
                         return;
                     }
-                    fail_stream!(Failure::new(
-                        FailureClass::Internal,
-                        "gateway could not encode the provider stream",
-                    ))
                 }
-            };
-            for data in encoded {
-                if !send_bounded(&sender, deadline, Bytes::from(data)).await {
-                    settle_stream_end(
-                        &mut guard,
-                        terminal.as_ref(),
-                        usage.as_ref(),
-                        &tool_names,
-                        true,
-                    )
-                    .await;
+                if outward.is_terminal() {
                     return;
                 }
-            }
-            if terminal.is_some() {
-                return;
             }
         }
     });

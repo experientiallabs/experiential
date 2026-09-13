@@ -95,11 +95,13 @@ fn shutdown_handle() -> ShutdownHandle {
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `start_attempt`, `sign_dispatch`, `settle`, `abandon`, `remember`,
-/// `enforce_output`, `models`, `model_detail`, `usage_json`, `usage_page`,
+/// `enforce_output`, `enforce_output_segment`, `models`, `model_detail`,
+/// `usage_json`, `usage_page`,
 /// `metrics_json`, `metrics_text`, `readiness`, and
 /// `close_thread_resources`, each taking and returning one JSON string.
 /// `config_json` carries host, port, and concurrency bounds.
-/// `enforce_output` is called only when admission sets `output_guardrail`;
+/// `enforce_output` is called only when admission sets `output_guardrail` to
+/// `buffer`, and `enforce_output_segment` only when it sets `stream`;
 /// `close_thread_resources` is called once per bridge worker thread as it
 /// exits so per-thread caches release with the pool.
 #[pyfunction]

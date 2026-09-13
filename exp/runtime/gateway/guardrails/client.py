@@ -13,6 +13,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCompletion,
 )
+from exp.runtime.gateway.guardrails.streaming import StreamableClassifier, StreamingRedactor
 
 _INTERNAL_CLASSIFICATION: ContextVar[bool] = ContextVar(
     "exp_gateway_guardrail_internal",
@@ -89,6 +90,16 @@ class InternalClassifierClient(Protocol):
         """Inspect one winning completion through the bound adapter."""
         ...
 
+    def stream_redactor(self, *, check: GuardrailCheck) -> StreamingRedactor | None:
+        """Return the check's deterministic redactor, or ``None``.
+
+        A redactor here is the capability signal that makes a check eligible
+        for incremental output enforcement. A transport that cannot prove an
+        adapter is deterministic returns ``None``, which keeps the check on
+        the buffered path.
+        """
+        ...
+
 
 class DirectClassifierClient:
     """Call registered adapters in-process under the recursion guard.
@@ -139,6 +150,18 @@ class DirectClassifierClient:
                 completion=completion,
                 check=check,
             )
+
+    def stream_redactor(self, *, check: GuardrailCheck) -> StreamingRedactor | None:
+        """Return the bound adapter's deterministic redactor, or ``None``.
+
+        Only an adapter that offers one, such as the RE2 detector, can decide
+        about a prefix of a completion. Every other adapter, including every
+        remote or model-backed one, stays on the buffered path.
+        """
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, StreamableClassifier):
+            return None
+        return adapter.stream_redactor()
 
 
 class ClassifierLookup(Protocol):

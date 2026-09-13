@@ -25,13 +25,15 @@ use crate::encode_responses::{
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
+use crate::guardrails::{released_events, StreamRedactor};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
-    error_response, escalation_error, finish_stream_terminal, json_response, latin1_header,
-    read_body, send_bounded, settle_stream_end, sse_body_response,
+    emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
+    json_response, latin1_header, outward_event, read_body, send_bounded, settle_stream_end,
+    sse_body_response,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -239,7 +241,8 @@ pub(crate) async fn responses(
         }
         Won::Committed(committed) => {
             let committed = *committed;
-            if admission.output_guardrail {
+            let incremental = admission.stream_incremental(committed.depth);
+            if admission.output_guardrail.enforces() && !incremental {
                 guarded_responses(
                     state,
                     admission,
@@ -263,6 +266,7 @@ pub(crate) async fn responses(
                     permit,
                     lease,
                     client_request_id,
+                    incremental,
                 )
                 .await
             } else {
@@ -714,6 +718,7 @@ async fn stream_responses(
     permit: tokio::sync::OwnedSemaphorePermit,
     lease: Option<OwnerLease>,
     client_request_id: Option<String>,
+    incremental_guardrail: bool,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let mut header_pairs = commit_independent(&admission, client_request_id.as_deref());
@@ -746,6 +751,9 @@ async fn stream_responses(
         let mut terminal: Option<Event> = None;
         let mut retention = ResponsesRetention::default();
         let mut reasoning_content_carrier: Option<String> = None;
+        // Deterministic output redaction as bytes flow: only the trailing
+        // window the detector cannot yet decide about is withheld.
+        let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
         // Terminal frames are withheld until continuation retention lands,
         // mirroring the python stream body's ordering.
         let terminal_frames: Vec<String>;
@@ -784,7 +792,7 @@ async fn stream_responses(
         }
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
-        loop {
+        'stream: loop {
             let event = if let Some(event) = prefix.pop_front() {
                 event
             } else {
@@ -804,23 +812,34 @@ async fn stream_responses(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
-            retention.track(&event);
+            if redactor.is_none() {
+                // A guarded stream retains what the caller actually saw, so
+                // a continuation replays the redacted text, never the raw
+                // completion; retention then runs over the released events.
+                retention.track(&event);
+            }
             // Mirror the relay's first-token time onto the guard as tokens stream.
             guard.record_first_token(committed.relay.first_token_at());
-            if matches!(
-                event,
-                Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-            ) {
-                visible_refusal = true;
-            }
-            let outward = match &event {
-                Event::Failed(failure)
-                    if failure.failure_class == FailureClass::Refusal && visible_refusal =>
-                {
-                    Event::Completed
-                }
-                other => other.clone(),
+            let outward = outward_event(&event, &mut visible_refusal);
+            // A byte that reaches the caller has already been through the
+            // detector, and a terminal flushes whatever is still buffered.
+            let guarded = redactor.is_some();
+            let outward_events = match released_events(
+                redactor.as_mut(),
+                &guard.bridge,
+                outward,
+                event.is_terminal(),
+            )
+            .await
+            {
+                Ok(events) => events,
+                Err(failure) => fail_stream!(failure),
             };
+            if guarded {
+                for released in &outward_events {
+                    retention.track(released);
+                }
+            }
             // The terminal is recorded before its frames flush, so a
             // disconnect during the final flush still settles by the
             // provider's outcome instead of as a cancellation.
@@ -861,34 +880,36 @@ async fn stream_responses(
                     }
                 }
             }
-            let encoded = match encoder.feed(&outward) {
-                Ok(encoded) => encoded,
-                Err(_) => {
-                    fail_stream!(Failure::new(
-                        FailureClass::Internal,
-                        "gateway could not encode the provider stream",
-                    ))
+            for outward in outward_events {
+                let encoded = match encoder.feed(&outward) {
+                    Ok(encoded) => encoded,
+                    Err(_) => {
+                        fail_stream!(Failure::new(
+                            FailureClass::Internal,
+                            "gateway could not encode the provider stream",
+                        ))
+                    }
+                };
+                if outward.is_terminal() {
+                    terminal_frames = encoded;
+                    break 'stream;
                 }
-            };
-            if terminal.is_some() {
-                terminal_frames = encoded;
-                break;
-            }
-            for data in encoded {
-                let data = Bytes::from(data);
-                if lease.is_some() {
-                    replayable = capture_frame(&mut capture, &data, replayable);
-                }
-                if !send_bounded(&sender, deadline, data).await {
-                    settle_stream_end(
-                        &mut guard,
-                        terminal.as_ref(),
-                        usage.as_ref(),
-                        &tool_names,
-                        true,
-                    )
-                    .await;
-                    return;
+                for data in encoded {
+                    let data = Bytes::from(data);
+                    if lease.is_some() {
+                        replayable = capture_frame(&mut capture, &data, replayable);
+                    }
+                    if !send_bounded(&sender, deadline, data).await {
+                        settle_stream_end(
+                            &mut guard,
+                            terminal.as_ref(),
+                            usage.as_ref(),
+                            &tool_names,
+                            true,
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
         }
@@ -960,25 +981,4 @@ async fn stream_responses(
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-/// Emit the Responses encoder's sanitized failure lifecycle when the stream
-/// has not already reached a terminal.
-async fn emit_responses_failure(
-    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
-    deadline: Instant,
-    encoder: &mut ResponsesSseEncoder,
-    failure: &Failure,
-) {
-    if encoder.saw_terminal() {
-        return;
-    }
-    let frames = encoder
-        .feed(&Event::Failed(failure.clone()))
-        .unwrap_or_default();
-    for frame in frames {
-        if !send_bounded(sender, deadline, Bytes::from(frame)).await {
-            return;
-        }
-    }
 }

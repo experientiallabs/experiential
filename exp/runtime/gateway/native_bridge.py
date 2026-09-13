@@ -43,7 +43,12 @@ from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
+from exp.runtime.gateway.guardrails.native import (
+    enforce_native_input,
+    enforce_native_output,
+    enforce_native_output_segment,
+    native_output_mode,
+)
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -662,7 +667,7 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": bool(policy is not None and policy.output_checks),
+            "output_guardrail": native_output_mode(self._guardrails, policy, public_request).value,
         }
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent (not
@@ -784,6 +789,12 @@ class NativeControlPlane(
                 is kept so the deadline sweep can still close it.
         """
         return self._accounting.abandon(argument)
+
+    def enforce_output_segment(self, argument: str) -> str:
+        """Release the settled part of one streamed ``stream`` mode tail."""
+        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
+        policy = None if entry is None else entry.policy
+        return enforce_native_output_segment(self._guardrails, policy, argument)
 
     def enforce_output(self, argument: str) -> str:
         """Run one output-chain callback for a native buffered completion."""

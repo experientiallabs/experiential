@@ -52,17 +52,41 @@ pub(crate) struct Admission {
     /// omit it.
     #[serde(default)]
     pub envelope: Option<ResponsesEnvelope>,
-    /// When true, buffer the winning completion and call `enforce_output` once
-    /// before any caller byte or replay retention. Unguarded admissions omit
-    /// the flag (default false) and never invoke that callback.
+    /// How the identity's output chain must be enforced for this request.
+    /// Unguarded admissions omit the field and never call a guardrail
+    /// callback. See [`OutputGuardrailMode`].
     #[serde(default)]
-    pub output_guardrail: bool,
+    pub output_guardrail: OutputGuardrailMode,
     /// The control plane's pre-dispatch count of the prompt (the reservation
     /// estimator without its headroom). Messages admissions carry it so the
     /// caller's `message_start` shows a real input figure when the upstream
     /// reports nothing before its final chunk; display-only, never settled.
     #[serde(default)]
     pub input_token_estimate: Option<u64>,
+}
+
+/// How one admission's output chain is enforced on the data plane.
+///
+/// `Buffer` collects the whole winning completion and calls `enforce_output`
+/// once before any caller byte or replay retention: the only safe shape for a
+/// check that can block or for a detector that needs the full text. `Stream`
+/// releases the completion incrementally through `enforce_output_segment`,
+/// holding back only the bounded trailing window the detector cannot yet
+/// decide about. The control plane picks the mode at admit time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputGuardrailMode {
+    #[default]
+    Off,
+    Buffer,
+    Stream,
+}
+
+impl OutputGuardrailMode {
+    /// Whether this admission runs any output guardrail work at all.
+    pub(crate) fn enforces(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 impl Admission {
@@ -80,6 +104,20 @@ impl Admission {
         self.route
             .get(depth)
             .is_some_and(|wire| wire.reasoning_output_exposed)
+    }
+
+    /// Whether the attempt at `depth` may enforce its output chain as bytes
+    /// stream, instead of buffering the whole completion first.
+    ///
+    /// Admission already proved the chain is one deterministic modify-only
+    /// check over a streamed request that offers no tools and asks for no
+    /// reasoning text. The remaining fact belongs to the winning rung: a
+    /// deployment that returns plaintext reasoning to the caller keeps the
+    /// buffered path, where a rewrite still drops that channel wholesale.
+    pub(crate) fn stream_incremental(&self, depth: usize) -> bool {
+        self.output_guardrail == OutputGuardrailMode::Stream
+            && self.stream
+            && !self.reasoning_exposed_at(depth)
     }
 
     /// The per-chunk transport bound of the deployment serving `depth`.
@@ -209,7 +247,7 @@ pub(crate) async fn apply_output_guardrail(
     bridge: &Bridge,
     events: Vec<Event>,
 ) -> Result<Vec<Event>, Failure> {
-    if !admission.output_guardrail {
+    if !admission.output_guardrail.enforces() {
         return Ok(events);
     }
     guardrails::enforce_collected_output(bridge, &admission.request_id, events).await
