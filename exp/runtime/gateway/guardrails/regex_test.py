@@ -55,13 +55,14 @@ def _document(adapter: JsonObject, *, action: str = "modify") -> JsonObject:
         ("日本語 😀 alice@example.com fin", "日本語 😀 [REDACTED] fin"),
         ("alice@example.com and bob@example.org", "[REDACTED] and [REDACTED]"),
         ("No personal information", "No personal information"),
+        ("Cards: 4111111111111111 5555555555554444", "Cards: [REDACTED] [REDACTED]"),
     ],
 )
-def test_email_redaction_preserves_surrounding_text_on_both_stages(
+def test_builtin_redaction_preserves_surrounding_text_on_both_stages(
     content: str, expected: str
 ) -> None:
     """Real input/output chains preserve Unicode and only replace detected spans."""
-    engine = engine_from_document(_document({"builtin_patterns": ["email"]}))
+    engine = engine_from_document(_document({"builtin_patterns": ["email", "credit_card"]}))
     policy = engine.policy_for("org", "identity")
     assert policy is not None
     request = GatewayRequest(
@@ -88,10 +89,14 @@ def test_email_redaction_preserves_surrounding_text_on_both_stages(
         ("4111 1111 1111 1111", "[REDACTED]"),
         ("4111-1111-1111-1111", "[REDACTED]"),
         ("4111111111111111", "[REDACTED]"),
+        ("4111111111111111 5555555555554444", "[REDACTED] [REDACTED]"),
+        ("4111 1111 1111 1111 5555 5555 5555 4444", "[REDACTED]"),
+        ("4111-1111-1111-1111 378282246310005", "[REDACTED] [REDACTED]"),
+        ("4111111111111111, 5555555555554444", "[REDACTED], [REDACTED]"),
         ("4111111111111112", "4111111111111112"),
         ("0000000000000000", "0000000000000000"),
         ("141111111111111111111", "141111111111111111111"),
-        ("4111 1111 1111 1111 0000", "4111 1111 1111 1111 0000"),
+        ("4111 1111 1111 1111 0000", "[REDACTED] 0000"),
     ],
 )
 def test_card_candidates_require_luhn(text: str, expected: str) -> None:
@@ -216,3 +221,12 @@ def test_input_tool_arguments_never_escape_a_redaction_rule(protected: bool) -> 
     )
     with pytest.raises(GuardrailRejected):
         asyncio.run(engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12))
+
+
+def test_card_candidate_work_is_bounded() -> None:
+    """A long ambiguous run cannot force unlimited candidate validation."""
+    classifier = RegexClassifier(
+        RegexAdapterDocument(adapter_id="cards", builtin_patterns=(BuiltinPattern.CREDIT_CARD,))
+    )
+    with pytest.raises(ValueError, match="match limit"):
+        classifier._redact("4111 " * 5000)

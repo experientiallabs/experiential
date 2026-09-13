@@ -50,7 +50,10 @@ Built-in adapter kinds:
 
 - `regex`: local RE2 matching and deterministic text replacement. Configure
   custom expressions or the `email`, `credit_card`, and `api_key` built-in
-  families. Card candidates require a valid Luhn checksum. These rules find
+  families. Card candidates require a valid Luhn checksum. Space- or hyphen-separated
+  digit groups are inspected for adjacent cards; overlapping valid spans are
+  redacted together. A valid card followed by another numeric group is still
+  redacted, while uninterrupted numbers longer than 19 digits are not split. These rules find
   specific patterns, not all personal information or every secret format.
 - `keyword`: coarse, test-oriented needle matching. Case-folded substrings of
   message text, completion text, or tool-call arguments. This is not a
@@ -100,7 +103,7 @@ is refused, and output modifications with tool calls are blocked.
 RE2 does not support backreferences or look-around. Each custom pattern is
 limited to 1,024 UTF-8 bytes, with at most 32 patterns per adapter and 256 KiB
 of compile memory per expression. Each inspected text is limited to 1 MiB
-and 4,096 matches across its patterns. Exceeding these bounds is classifier
+and 4,096 matches or card candidates across its patterns. Exceeding these bounds is classifier
 uncertainty, governed by the policy's fail-closed setting. Use a model-backed
 PII detector for contextual entities such as names and addresses.
 

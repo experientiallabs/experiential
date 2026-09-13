@@ -29,7 +29,7 @@ class BuiltinPattern(StrEnum):
 
 _BUILTINS = {
     BuiltinPattern.EMAIL: r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
-    BuiltinPattern.CREDIT_CARD: r"\b[0-9](?:[ -]?[0-9]){12,18}\b",
+    BuiltinPattern.CREDIT_CARD: r"\b[0-9](?:[ -]?[0-9]){12,}\b",
     BuiltinPattern.API_KEY: (
         r"\b(?:sk-(?:proj-|ant-api[0-9]+-)?[A-Za-z0-9_-]{20,}"
         r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
@@ -93,15 +93,8 @@ def _compile(pattern: str) -> _Pattern:
         raise ValueError("invalid RE2 expression; check syntax and simplify the pattern") from None
 
 
-def _valid_card(text: str, start: int, end: int) -> bool:
-    """Validate a whole card candidate with Luhn, rejecting slices of longer numbers."""
-    if (start and text[start - 1].isdigit()) or (end < len(text) and text[end].isdigit()):
-        return False
-    if start >= 2 and text[start - 1] in " -" and text[start - 2].isdigit():
-        return False
-    if end + 1 < len(text) and text[end] in " -" and text[end + 1].isdigit():
-        return False
-    digits = [int(char) for char in text[start:end] if char in "0123456789"]
+def _valid_card(digits: list[int]) -> bool:
+    """Require a nonuniform 13 to 19 digit candidate with a valid Luhn checksum."""
     if not 13 <= len(digits) <= 19 or len(set(digits)) == 1:
         return False
     total = 0
@@ -109,6 +102,29 @@ def _valid_card(text: str, start: int, end: int) -> bool:
         doubled = digit * 2 if index % 2 else digit
         total += doubled - 9 if doubled > 9 else doubled
     return total % 10 == 0
+
+
+def _card_candidates(text: str, start: int, end: int) -> Iterator[tuple[int, int]]:
+    """Inspect card spans at digit-group boundaries, including adjacent cards.
+
+    Spaces and hyphens can separate cards or groups within a card. Check all
+    13 to 19 digit spans at those boundaries. Never split an uninterrupted
+    digit group into smaller candidates.
+    """
+    for first in range(start, end):
+        if text[first] not in "0123456789":
+            continue
+        if first > start and text[first - 1] in "0123456789":
+            continue
+        digits = 0
+        for last in range(first, min(end, first + 38)):
+            if text[last] not in "0123456789":
+                continue
+            digits += 1
+            if digits > 19:
+                break
+            if digits >= 13 and (last + 1 == end or text[last + 1] in " -"):
+                yield first, last + 1
 
 
 class RegexClassifier:
@@ -143,8 +159,16 @@ class RegexClassifier:
                 start, end = match.span()
                 if start == end:
                     continue
-                if not is_card or _valid_card(text, start, end):
+                if not is_card:
                     spans.append((start, end))
+                    continue
+                for first, last in _card_candidates(text, start, end):
+                    matches += 1
+                    if matches > _MAX_MATCHES:
+                        raise ValueError("regex subject exceeds the match limit")
+                    digits = [int(char) for char in text[first:last] if char in "0123456789"]
+                    if _valid_card(digits):
+                        spans.append((first, last))
         if not spans:
             return False, text
         merged: list[tuple[int, int]] = []
