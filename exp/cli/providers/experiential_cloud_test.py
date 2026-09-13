@@ -86,6 +86,32 @@ def test_platform_origin_defaults_to_production_and_strips_override_slashes() ->
         hosted_platform_url({HOSTED_PLATFORM_URL_ENV: "https://platform.preview.test///"})
         == "https://platform.preview.test"
     )
+    assert (
+        hosted_platform_url({HOSTED_PLATFORM_URL_ENV: "http://127.0.0.1:3000/"})
+        == "http://127.0.0.1:3000"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "file:///tmp/platform.html",
+        "javascript:alert(1)",
+        "http://platform.preview.test",
+        "https://user:secret@platform.preview.test",
+        "https://platform.preview.test/cli/auth",
+        "https://platform.preview.test?tenant=a",
+        "https://platform.preview.test#approval",
+        "https://platform.preview.test:invalid",
+        "https://platform.preview.test\\@redirect.test",
+        "https://platform.preview.test/\x01redirect",
+        "https://platform.preview.test/\nredirect",
+    ],
+)
+def test_platform_origin_rejects_unsafe_overrides(value: str) -> None:
+    """Browser login rejects values that are not trusted Platform origins."""
+    with pytest.raises(ValueError, match=HOSTED_PLATFORM_URL_ENV):
+        hosted_platform_url({HOSTED_PLATFORM_URL_ENV: value})
 
 
 def test_browser_login_builds_the_platform_authorization_url(running_login: BrowserLogin) -> None:

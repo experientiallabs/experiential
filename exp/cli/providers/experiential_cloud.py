@@ -12,6 +12,7 @@ a loopback callback to receive the new organization key.
 from __future__ import annotations
 
 import html
+import ipaddress
 import os
 import secrets
 import select
@@ -243,11 +244,55 @@ def hosted_platform_url(environment: Mapping[str, str] | None = None) -> str:
         environment: Optional process environment. ``None`` reads ``os.environ``.
 
     Returns:
-        ``EXP_PLATFORM_URL`` when non-empty, otherwise the production Platform origin.
+        A validated ``EXP_PLATFORM_URL`` origin, otherwise the production Platform origin.
+
+    Raises:
+        ValueError: The configured override is not a trusted Platform origin.
     """
     source: Mapping[str, str] = os.environ if environment is None else environment
     value = source.get(HOSTED_PLATFORM_URL_ENV, "").strip()
-    return value.rstrip("/") or HOSTED_PLATFORM_DEFAULT_URL
+    return _validated_platform_origin(value) if value else HOSTED_PLATFORM_DEFAULT_URL
+
+
+def _validated_platform_origin(value: str) -> str:
+    """Return one trusted browser origin from the Platform override.
+
+    Args:
+        value: Non-empty environment override after surrounding whitespace is removed.
+
+    Returns:
+        The normalized HTTPS origin, or an HTTP loopback origin for local development.
+
+    Raises:
+        ValueError: The value is not a credential-free trusted origin.
+    """
+    if "\\" in value or any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        raise ValueError(f"{HOSTED_PLATFORM_URL_ENV} must not contain whitespace or controls")
+    parsed = urlparse(value)
+    hostname = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{HOSTED_PLATFORM_URL_ENV} must use a valid port") from exc
+    if parsed.scheme not in {"http", "https"} or hostname is None:
+        raise ValueError(f"{HOSTED_PLATFORM_URL_ENV} must be an absolute HTTP(S) origin")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{HOSTED_PLATFORM_URL_ENV} must not embed credentials")
+    if parsed.params or parsed.query or parsed.fragment or parsed.path.strip("/"):
+        raise ValueError(f"{HOSTED_PLATFORM_URL_ENV} must not include a path, query, or fragment")
+    try:
+        loopback = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        loopback = hostname.rstrip(".").lower() == "localhost"
+    if parsed.scheme != "https" and not loopback:
+        raise ValueError(f"{HOSTED_PLATFORM_URL_ENV} must use HTTPS unless it targets loopback")
+    normalized_host = hostname.lower()
+    if ":" in normalized_host:
+        normalized_host = f"[{normalized_host}]"
+    authority = normalized_host if port is None else f"{normalized_host}:{port}"
+    return f"{parsed.scheme}://{authority}"
 
 
 def hosted_platform_login(

@@ -47,6 +47,21 @@ class _AccountModelLister:
         )
 
 
+def test_login_command_reports_invalid_platform_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The command reports an invalid Platform override as actionable usage feedback."""
+    monkeypatch.setenv("EXP_PLATFORM_URL", "https://platform.preview.test:invalid")
+    monkeypatch.setattr(
+        auth,
+        "Console",
+        lambda **_kwargs: Console(file=io.StringIO(), force_terminal=True, no_color=True),
+    )
+
+    with pytest.raises(typer.BadParameter, match="EXP_PLATFORM_URL must use a valid port"):
+        auth.login(tmp_path)
+
+
 def test_login_persists_platform_key_in_the_shared_cloud_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
