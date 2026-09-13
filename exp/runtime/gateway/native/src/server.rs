@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
 use crate::errors::PublicError;
+use crate::guardrails::plan::DetectorMap;
 use crate::replay::ReplayStore;
 use crate::respond::{bearer_key, error_response, json_response, unknown_route_error};
 use crate::route_batches::{
@@ -118,6 +119,10 @@ pub(crate) struct AppState {
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
+    /// Deterministic guardrail rules compiled once by the control plane,
+    /// keyed by policy `adapter_id`. An admission whose output chain names
+    /// only these adapters is enforced here instead of in python.
+    pub(crate) guardrail_detectors: Arc<DetectorMap>,
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
@@ -129,6 +134,7 @@ pub async fn run(
     config: ServeConfig,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     on_listening: Option<Py<PyAny>>,
+    guardrail_detectors: Arc<DetectorMap>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
     let http = crate::upstream::build_client(connect_timeout)?;
@@ -147,6 +153,7 @@ pub async fn run(
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
+        guardrail_detectors,
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
         state.permits.clone(),

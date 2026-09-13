@@ -218,8 +218,8 @@ pub(crate) async fn messages(
         Won::Settled(settled) => settled_messages_response(&admission, settled).await,
         Won::Committed(committed) => {
             let committed = *committed;
-            if admission.output_guardrail {
-                guarded_messages(admission, guard, committed, deadline, permit).await
+            if admission.buffers_output() {
+                guarded_messages(state, admission, guard, committed, deadline, permit).await
             } else if admission.stream {
                 stream_messages(admission, guard, committed, deadline, permit).await
             } else {
@@ -493,6 +493,7 @@ async fn completed_messages(
 }
 
 async fn guarded_messages(
+    state: AppState,
     admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
@@ -522,7 +523,7 @@ async fn guarded_messages(
             return messages_error_response(&error);
         }
     };
-    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+    let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
             guard

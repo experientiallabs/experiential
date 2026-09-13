@@ -10,11 +10,11 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::bridge::Bridge;
 use crate::encode_responses::ResponsesEnvelope;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
 use crate::guardrails;
+use crate::guardrails::plan::OutputPlan;
 use crate::metrics::METRICS;
 use crate::respond::error_response;
 use crate::server::AppState;
@@ -57,6 +57,12 @@ pub(crate) struct Admission {
     /// the flag (default false) and never invoke that callback.
     #[serde(default)]
     pub output_guardrail: bool,
+    /// The resolved output chain when every check binds a deterministic
+    /// detector. The data plane enforces it in place, so the request pays no
+    /// python callback. A chain with any non-deterministic adapter omits the
+    /// plan and sets `output_guardrail` instead.
+    #[serde(default)]
+    pub guardrail_output_plan: Option<OutputPlan>,
     /// The control plane's pre-dispatch count of the prompt (the reservation
     /// estimator without its headroom). Messages admissions carry it so the
     /// caller's `message_start` shows a real input figure when the upstream
@@ -73,6 +79,12 @@ impl Admission {
             refusal_failover: self.refusal_failover,
             throttle_redial: self.throttle_redial,
         }
+    }
+
+    /// Whether the winning completion must be buffered for an output chain,
+    /// natively or across the python boundary.
+    pub(crate) fn buffers_output(&self) -> bool {
+        self.output_guardrail || self.guardrail_output_plan.is_some()
     }
 
     /// Whether the rung at `depth` returns plaintext reasoning to the caller.
@@ -204,13 +216,23 @@ pub(crate) async fn acquire_permit(
     }
 }
 
+/// Enforce the winning completion's output chain before any caller byte.
+///
+/// A deterministic chain is enforced natively against the compiled detectors
+/// this server was started with. Every other guarded admission crosses the
+/// python boundary exactly as before, and an unguarded admission does
+/// neither.
 pub(crate) async fn apply_output_guardrail(
+    state: &AppState,
     admission: &Admission,
-    bridge: &Bridge,
     events: Vec<Event>,
+    deadline: Instant,
 ) -> Result<Vec<Event>, Failure> {
+    if let Some(plan) = admission.guardrail_output_plan.as_ref() {
+        return guardrails::plan::enforce(plan, &state.guardrail_detectors, events, deadline);
+    }
     if !admission.output_guardrail {
         return Ok(events);
     }
-    guardrails::enforce_collected_output(bridge, &admission.request_id, events).await
+    guardrails::enforce_collected_output(&state.bridge, &admission.request_id, events).await
 }

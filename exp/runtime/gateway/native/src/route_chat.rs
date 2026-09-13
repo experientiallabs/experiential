@@ -33,7 +33,7 @@ use crate::respond::{
     read_body, send_bounded, settle_stream_end, sse_body_response,
 };
 use crate::server::AppState;
-use crate::settlement::AttemptGuard;
+use crate::settlement::{settle_guarded_failure, AttemptGuard};
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
 
 pub(crate) async fn chat(
@@ -233,8 +233,9 @@ pub(crate) async fn chat(
         }
         Won::Committed(committed) => {
             let committed = *committed;
-            if admission.output_guardrail {
+            if admission.buffers_output() {
                 guarded_chat_response(
+                    state,
                     admission,
                     guard,
                     committed,
@@ -686,6 +687,7 @@ async fn completed_response(
 
 #[allow(clippy::too_many_arguments)]
 async fn guarded_chat_response(
+    state: AppState,
     admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
@@ -706,36 +708,14 @@ async fn guarded_chat_response(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
-                .settle(
-                    "failed",
-                    committed.usage.as_ref(),
-                    &committed.tool_names,
-                    Some(&failure),
-                    true,
-                )
-                .await;
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
+            settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await;
             return error_response(&error);
         }
     };
-    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+    let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
-            guard
-                .settle(
-                    "failed",
-                    committed.usage.as_ref(),
-                    &committed.tool_names,
-                    Some(&failure),
-                    true,
-                )
-                .await;
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
+            settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await;
             return error_response(&failure.public_error());
         }
     };

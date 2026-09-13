@@ -41,12 +41,16 @@ mod tool_serialization;
 mod upstream;
 mod waterfall;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::bridge::Bridge;
+use crate::guardrails::detector::{Detector, DetectorSpec};
+use crate::guardrails::plan::DetectorMap;
 use crate::server::ServeConfig;
 
 /// Embedder-owned stop signal for one `serve` call.
@@ -80,6 +84,74 @@ impl ShutdownHandle {
     }
 }
 
+/// One compiled deterministic guardrail rule, owned by the control plane.
+///
+/// The control plane compiles each authored `regex` adapter once at policy
+/// load and reuses the handle for every request: in python for the input
+/// chain, and inside the data plane for a deterministic output chain. A rule
+/// the native detector cannot express raises at construction, and the caller
+/// keeps the python adapter for it.
+#[pyclass]
+pub struct RegexDetector {
+    inner: Arc<Detector>,
+}
+
+#[pymethods]
+impl RegexDetector {
+    /// Compile one authored rule from its JSON specification.
+    ///
+    /// `spec_json` carries `patterns`, `builtin_patterns`, and the literal
+    /// `replacement`.
+    #[new]
+    fn new(spec_json: &str) -> PyResult<Self> {
+        let spec: DetectorSpec = serde_json::from_str(spec_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid detector spec: {error}")))?;
+        let detector = Detector::compile(&spec).map_err(PyValueError::new_err)?;
+        Ok(Self {
+            inner: Arc::new(detector),
+        })
+    }
+
+    /// Redact one subject, returning `None` when nothing matched.
+    ///
+    /// The scan runs with the GIL released. A subject over the inspection
+    /// ceiling, or one that produces more matches than the ceiling allows,
+    /// raises so the caller fails closed.
+    fn redact(&self, py: Python<'_>, text: &str) -> PyResult<Option<String>> {
+        let detector = self.inner.clone();
+        py.detach(|| detector.redact(text))
+            .map_err(|limit| PyValueError::new_err(limit.message()))
+    }
+
+    /// Whether one subject matches at all, without building a replacement.
+    fn matches(&self, py: Python<'_>, text: &str) -> PyResult<bool> {
+        let detector = self.inner.clone();
+        py.detach(|| detector.matches(text))
+            .map_err(|limit| PyValueError::new_err(limit.message()))
+    }
+}
+
+impl RegexDetector {
+    /// Share the compiled rule with the serving runtime.
+    fn compiled(&self) -> Arc<Detector> {
+        self.inner.clone()
+    }
+}
+
+/// Collect the adapter-keyed detectors handed to `serve`.
+fn collect_detectors(detectors: Option<&Bound<'_, PyDict>>) -> PyResult<DetectorMap> {
+    let mut compiled: DetectorMap = HashMap::new();
+    let Some(mapping) = detectors else {
+        return Ok(compiled);
+    };
+    for (key, value) in mapping.iter() {
+        let adapter_id: String = key.extract()?;
+        let detector: PyRef<'_, RegexDetector> = value.extract()?;
+        compiled.insert(adapter_id, detector.compiled());
+    }
+    Ok(compiled)
+}
+
 /// Create one stop handle to pass to `serve`.
 #[pyfunction]
 fn shutdown_handle() -> ShutdownHandle {
@@ -102,17 +174,22 @@ fn shutdown_handle() -> ShutdownHandle {
 /// `enforce_output` is called only when admission sets `output_guardrail`;
 /// `close_thread_resources` is called once per bridge worker thread as it
 /// exits so per-thread caches release with the pool.
+/// `guardrail_detectors` maps a policy `adapter_id` to one compiled
+/// `RegexDetector`, so an admission whose output chain is deterministic runs
+/// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None))]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
     config_json: &str,
     shutdown: Option<&ShutdownHandle>,
     on_listening: Option<Py<PyAny>>,
+    guardrail_detectors: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
+    let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
     let bridge = Arc::new(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
     );
@@ -122,7 +199,7 @@ fn serve(
             .enable_all()
             .build()
             .map_err(|error| format!("tokio runtime construction failed: {error}"))?;
-        runtime.block_on(server::run(bridge, config, stop, on_listening))
+        runtime.block_on(server::run(bridge, config, stop, on_listening, detectors))
     });
     outcome.map_err(PyRuntimeError::new_err)
 }
@@ -678,6 +755,7 @@ fn error_payload(error: &errors::PublicError) -> String {
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
+    module.add_class::<RegexDetector>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;

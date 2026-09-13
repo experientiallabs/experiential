@@ -40,6 +40,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
+from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -219,6 +220,10 @@ class NativeControlPlane(
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
+        # Deterministic rules compile once here, never per request.
+        self._guardrail_detectors = deterministic.compile_native_detectors(
+            {} if guardrails is None else guardrails.deterministic_specifications
+        )
         # The accounting registry owns in-flight requests, per-dispatch
         # reservations, deployment-health circuits, and the deadline sweep.
         self._accounting = NativeAttemptAccounting(
@@ -230,6 +235,11 @@ class NativeControlPlane(
         # a fresh process pays that once at bind time, never on its first
         # request, and a corrupt table fails startup with its own message.
         reservation_encoder()
+
+    @property
+    def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:
+        """Return the compiled deterministic rules the data plane enforces."""
+        return dict(self._guardrail_detectors)
 
     @property
     def request_timeout_seconds(self) -> float:
@@ -364,6 +374,7 @@ class NativeControlPlane(
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
+                detectors=self._guardrail_detectors,
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
@@ -629,6 +640,7 @@ class NativeControlPlane(
             self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
+        plan = deterministic.native_output_plan(policy, self._guardrail_detectors)
         self._accounting.register(
             InflightRequest(
                 authorization=authorization,
@@ -662,13 +674,15 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": bool(policy is not None and policy.output_checks),
+            "output_guardrail": bool(policy and policy.output_checks and plan is None),
         }
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent (not
             # null) on pools that keep throttles failover-only, so an
             # unauthored pool's admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
+        if plan is not None:
+            response["guardrail_output_plan"] = plan
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
             # upstream reports nothing before its final chunk. The ledger

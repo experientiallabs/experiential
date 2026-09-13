@@ -10,6 +10,7 @@ import pytest
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailAction,
@@ -196,6 +197,55 @@ def test_native_input_block_never_resolves_a_route(tmp_path: Path) -> None:
         _admit(control, issued, _chat_body())
 
     assert order == ["input"]
+
+
+def test_a_deterministic_output_policy_admits_without_the_python_callback(
+    tmp_path: Path,
+) -> None:
+    """A regex-only output chain is resolved into the admission for Rust."""
+    engine = engine_from_document(
+        {
+            "adapters": [{"kind": "regex", "adapter_id": "pii", "builtin_patterns": ["email"]}],
+            "policies": [
+                {
+                    "policy_id": "member-policy",
+                    "organization_id": "local",
+                    "identity_id": "default",
+                    "protected": True,
+                    "checks": [
+                        {
+                            "check_id": "output-pii",
+                            "capability": "pii",
+                            "stage": "output",
+                            "action": "modify",
+                            "adapter_id": "pii",
+                            "timeout_ms": 100,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    control, raw_key = _native_with_engine(tmp_path, engine)
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert admission["output_guardrail"] is False
+    assert admission["guardrail_output_plan"] == {
+        "protected": True,
+        "max_response_bytes": 1_048_576,
+        "policy_id": "member-policy",
+        "organization_id": "local",
+        "identity_id": "default",
+        "checks": [
+            {
+                "action": "modify",
+                "adapter_id": "pii",
+                "check_id": "output-pii",
+                "capability": "pii",
+                "timeout_ms": 100,
+            }
+        ],
+    }
 
 
 def _native_with_engine(

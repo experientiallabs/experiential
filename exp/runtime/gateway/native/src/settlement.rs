@@ -17,6 +17,30 @@ use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass};
 use crate::events::Usage;
 use crate::metrics::METRICS;
+use crate::replay::OwnerLease;
+use crate::waterfall::CommittedAttempt;
+
+/// Settle one guarded attempt as failed and release its owner lease.
+pub(crate) async fn settle_guarded_failure(
+    guard: &mut AttemptGuard,
+    committed: &mut CommittedAttempt,
+    lease: &mut Option<OwnerLease>,
+    failure: &Failure,
+) {
+    let usage = committed.usage.clone();
+    guard
+        .settle(
+            "failed",
+            usage.as_ref(),
+            &committed.tool_names,
+            Some(failure),
+            true,
+        )
+        .await;
+    if let Some(mut owner) = lease.take() {
+        owner.abandon().await;
+    }
+}
 
 /// Format one wall-clock instant as an RFC 3339 / ISO 8601 UTC string with
 /// millisecond precision, e.g. `2026-08-30T12:34:56.789+00:00`.

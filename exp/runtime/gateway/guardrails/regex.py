@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from enum import StrEnum
 from typing import Literal, Protocol, cast
@@ -144,6 +145,24 @@ class RegexClassifier:
             ]
         )
         self._replacement = document.replacement
+        self._document = document
+
+    def native_specification(self) -> str:
+        """Return the JSON rule the native deterministic detector compiles.
+
+        The data plane compiles this once per policy load and then enforces
+        matching output chains without a Python callback. The document is
+        content-free: authored expressions, built-in families, and the
+        literal replacement.
+        """
+        return json.dumps(
+            {
+                "patterns": list(self._document.patterns),
+                "builtin_patterns": [kind.value for kind in self._document.builtin_patterns],
+                "replacement": self._document.replacement,
+            },
+            separators=(",", ":"),
+        )
 
     def _redact(self, text: str) -> tuple[bool, str]:
         """Union matched spans before replacement so overlapping rules cannot leak tails."""

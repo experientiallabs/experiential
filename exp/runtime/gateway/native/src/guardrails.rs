@@ -1,7 +1,16 @@
-//! JSON-typed output-chain boundary for identity-scoped guardrails.
+//! Output-chain enforcement for identity-scoped guardrails.
 //!
-//! Rust owns buffering and delivery. Python owns policy lookup and classifier
-//! adapters. This module never logs request text, completions, or replacements.
+//! Rust owns buffering and delivery. A chain whose checks all bind
+//! deterministic detectors runs natively through `plan`, with the compiled
+//! rules in `detector`. Every other chain crosses the JSON-typed python
+//! boundary below, which keeps policy lookup and non-deterministic adapters
+//! (`http_json` and future model-based classifiers) in python.
+//!
+//! This module never logs request text, completions, or replacements.
+
+pub mod detector;
+pub mod plan;
+mod syntax;
 
 use serde::Deserialize;
 use serde_json::{json, Value};

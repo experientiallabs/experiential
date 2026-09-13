@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Mapping
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
@@ -16,6 +18,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailRejected,
     GuardrailToolCall,
 )
+from exp.runtime.gateway.guardrails.deterministic import NativeDetector, native_input_request
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 
 
@@ -25,14 +28,20 @@ def enforce_native_input(
     authorization: AuthorizationSnapshot,
     request: GatewayRequest,
     deadline_monotonic: float,
+    detectors: Mapping[str, NativeDetector] | None = None,
 ) -> tuple[GatewayRequest, GuardrailPolicy | None]:
     """Apply input enforcement after continuation and before native routing.
+
+    A chain built only from adapters with a compiled native detector runs
+    inline here, so it pays neither the contract projection nor the
+    isolation-worker round trip. Every other chain uses the engine.
 
     Args:
         engine: Optional composed engine. ``None`` skips all guardrail work.
         authorization: Frozen authenticated identity.
         request: Canonical request after continuation expansion.
         deadline_monotonic: Remaining request-wide deadline.
+        detectors: Compiled deterministic detectors, keyed by adapter.
 
     Returns:
         The validated or transformed request and the assigned policy, if any.
@@ -47,6 +56,16 @@ def enforce_native_input(
     policy = engine.policy_for(authorization.organization_id, authorization.identity_id)
     if policy is None:
         return request, None
+    if detectors:
+        native = native_input_request(
+            policy,
+            detectors,
+            request,
+            monotonic=time.monotonic,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if native is not None:
+            return native, policy
     return (
         run_on_native_loop(
             engine.enforce_input(

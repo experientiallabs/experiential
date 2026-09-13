@@ -133,6 +133,11 @@ def engine_from_document(
         store=MappingGuardrailStore(policies),
         client=DirectClassifierClient(ClassifierRegistry(adapters)),
         monotonic=time.monotonic,
+        deterministic_specifications={
+            adapter_id: adapter.native_specification()
+            for adapter_id, adapter in adapters.items()
+            if isinstance(adapter, RegexClassifier)
+        },
     )
 
 

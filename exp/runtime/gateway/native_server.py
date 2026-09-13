@@ -7,6 +7,8 @@ import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, cast
 
+from exp.runtime.gateway.guardrails.deterministic import NativeDetector
+
 if TYPE_CHECKING:
     from exp_gateway_native import ShutdownHandle
 
@@ -19,6 +21,11 @@ class NativeServerControlPlane(Protocol):
     @property
     def request_timeout_seconds(self) -> float:
         """Return the shared request deadline."""
+        ...
+
+    @property
+    def guardrail_detectors(self) -> dict[str, NativeDetector]:
+        """Return the compiled deterministic guardrail rules, keyed by adapter."""
         ...
 
 
@@ -104,6 +111,7 @@ def serve_native_gateway(
             json.dumps(config),
             shutdown,
             on_listening,
+            control_plane.guardrail_detectors,
         )
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.

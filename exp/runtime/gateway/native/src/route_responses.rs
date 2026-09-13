@@ -239,7 +239,7 @@ pub(crate) async fn responses(
         }
         Won::Committed(committed) => {
             let committed = *committed;
-            if admission.output_guardrail {
+            if admission.buffers_output() {
                 guarded_responses(
                     state,
                     admission,
@@ -668,7 +668,7 @@ async fn guarded_responses(
             return error_response(&error);
         }
     };
-    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+    let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
             guard
