@@ -12,6 +12,7 @@ loader. Each source is declared, never guessed:
 | `langfuse` | Langfuse traces with observations, or bare observations carrying `traceId`. |
 | `langsmith` | LangSmith runs, or a `runs` envelope. |
 | `mastra` | Mastra spans, or a `spans` envelope. |
+| `opik` | Opik spans, or a `spans` envelope. |
 | `phoenix` | Phoenix and OpenInference spans, native nested, flat dotted, or OTLP JSON. |
 | `chat-json` | OpenAI-style chat conversations, one object, an array, or bare message arrays. |
 

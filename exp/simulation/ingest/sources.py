@@ -22,6 +22,7 @@ from exp.simulation.ingest.chat_json import CHAT_JSON_SOURCE
 from exp.simulation.ingest.langfuse import LANGFUSE_SOURCE
 from exp.simulation.ingest.langsmith import LANGSMITH_SOURCE
 from exp.simulation.ingest.mastra import MASTRA_SOURCE
+from exp.simulation.ingest.opik import OPIK_SOURCE
 from exp.simulation.ingest.otel_genai import load_otel_genai_file
 from exp.simulation.ingest.otlp import (
     OtlpTraceFormatError,
@@ -56,6 +57,7 @@ _LOADERS: dict[str, _TraceFileLoader] = {
     "langfuse": LANGFUSE_SOURCE.load,
     "langsmith": LANGSMITH_SOURCE.load,
     "mastra": MASTRA_SOURCE.load,
+    "opik": OPIK_SOURCE.load,
     "otel-genai": load_otel_genai_file,
     "otlp": load_otlp_file,
     "phoenix": PHOENIX_SOURCE.load,
