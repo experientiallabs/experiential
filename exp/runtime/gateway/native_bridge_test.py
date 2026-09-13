@@ -5804,13 +5804,21 @@ def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> N
     assert json.loads(malformed.value.public_error_json)["status_code"] == 400
 
 
-def _scheduled_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str]:
+def _scheduled_pool_control_plane(
+    root: Path, *, throttle_cache_threshold: float | None = None
+) -> tuple[NativeControlPlane, str]:
     """Load the control plane over a pool authoring a throttle backoff-and-redial schedule.
 
     Seeds the standard certified two-deployment pool, then authors the
     schedule the way the hosted platform does: as catalog data on the pool
-    record behind a fresh alias revision, with no cache-stakes threshold so
-    every rung is worth waiting for.
+    record behind a fresh alias revision. Without a cache-stakes threshold
+    every rung is worth waiting for; with one, the per-rung budget reads the
+    cache at stake.
+
+    Args:
+        root: The gateway root to seed.
+        throttle_cache_threshold: The pool's cache-stakes threshold, or
+            ``None`` to author none.
     """
     from exp.common.models.catalog import load_model_catalog, write_model_catalog
     from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
@@ -5822,6 +5830,7 @@ def _scheduled_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str]:
     pool = catalog.gateway_pools["coding"].model_copy(
         update={
             "failover_mode": "maximize_cache",
+            "throttle_cache_threshold": throttle_cache_threshold,
             "throttle_redial": GatewayThrottleRedialPolicy(
                 max_attempts=3, base_delay_ms=500, max_delay_ms=8_000
             ),
@@ -5855,7 +5864,11 @@ def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility
     every wire entry carries a zero redial budget, so the data plane's throttle handling is
     byte-identical to before. A pool authoring the schedule (and no
     threshold) hands the data plane the exact schedule and gives every rung the
-    schedule's full redial budget.
+    schedule's full redial budget. With a threshold and no settled cache
+    sample on this worker, the first rung fails over cold at once (nothing
+    known to be at stake, a colder rung follows) while the last rung, with no
+    cold alternative after it, still carries the full budget: the throttle
+    surfaces only once the gateway truly cannot serve.
     """
     control, raw_key = _pool_control_plane(tmp_path / "plain")
     plain = _admit(control, raw_key, _chat_body())
@@ -5875,3 +5888,11 @@ def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility
     route = scheduled["route"]
     assert isinstance(route, list)
     assert [wire["throttle_redial_budget"] for wire in route] == [3, 3]
+
+    control, raw_key = _scheduled_pool_control_plane(
+        tmp_path / "gated", throttle_cache_threshold=0.5
+    )
+    gated = _admit(control, raw_key, _chat_body())
+    route = gated["route"]
+    assert isinstance(route, list)
+    assert [wire["throttle_redial_budget"] for wire in route] == [0, 3]

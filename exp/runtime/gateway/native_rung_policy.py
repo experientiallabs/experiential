@@ -201,6 +201,8 @@ def throttle_redial_budgets(
     loads: RungLoadRegistry,
     route: GatewayRoute,
     organization_id: str,
+    *,
+    sticky_deployment_id: str | None = None,
 ) -> tuple[int, ...]:
     """Size, per rung, how many post-backoff redials this request may spend there.
 
@@ -209,20 +211,46 @@ def throttle_redial_budgets(
     without a ``throttle_redial`` schedule (the historical failover-only
     throttle). With a schedule and no ``throttle_cache_threshold`` every rung
     gets the schedule's full ``max_attempts``: the operator asked for backoff
-    on this pool. With both, the budget scales with the cache at stake: the
-    full ``max_attempts`` when the requesting organization's observed cached
-    fraction on the rung meets the threshold, a proportional share
-    (``floor(max_attempts * fraction / threshold)``) below it, and zero with
-    no cache evidence, so a request with little to lose fails over sooner and
-    one with nothing to lose fails over at once. The same cache-stakes gate
-    that would otherwise surface the throttle now decides how long to wait.
+    on this pool. With both, the budget is decided rung by rung under three
+    rules, in this order:
+
+    1. No cold alternative: the LAST rung of the admitted route gets the full
+       ``max_attempts`` regardless of cache evidence. ``route`` is the route
+       as admitted, already narrowed to the rungs that are live and can serve
+       this request, and a throttle advances cold only to later rungs, so a
+       throttle on the last rung has nowhere to fail over. A zero budget
+       there would surface the 429 at once while a bounded wait could still
+       have served the request. A single-rung route is the same case.
+    2. Warm sticky session: the rung the request's affinity fingerprint is
+       bound to in the worker's ``StickySpillRegistry``
+       (``sticky_deployment_id``) gets the full ``max_attempts``. The binding
+       is direct evidence that the conversation's provider cache lives on
+       that rung, the same warm standing ``reserve_rung_slot`` honors.
+    3. Otherwise the budget scales with the cache at stake: the full
+       ``max_attempts`` when the requesting organization's observed cached
+       fraction on the rung meets the threshold, a proportional share
+       (``floor(max_attempts * fraction / threshold)``) below it, and zero
+       with no cache evidence, so a request with little to lose fails over
+       sooner and one with nothing to lose fails over at once.
+
+    Rules 1 and 2 exist because the fraction rule 3 reads is the WORKER-LOCAL
+    time-decayed EWMA of the organization's settled cached fraction on the
+    rung: it is zero when the organization has no live sample on this worker
+    (a throttled attempt settles without usage, and a conversation trickling
+    a few requests per hour across many workers leaves most of them without
+    one) even when the same conversation is over ninety percent cached at the
+    provider. Missing evidence must therefore never zero the budget when
+    waiting is the only move (rule 1) or the obviously right one (rule 2).
     The fraction is the admission-time EWMA, at most seconds older than the
     reading a failure-time decision would take.
 
     Args:
         loads: The worker's per-rung load registry holding the cache EWMA.
-        route: The resolved ordered route about to be admitted.
+        route: The admitted route, narrowed to the rungs that can serve this
+            request, in dispatch order.
         organization_id: The requesting organization.
+        sticky_deployment_id: The rung the request's affinity fingerprint
+            holds a live sticky binding to, or ``None`` without one.
 
     Returns:
         One redial budget per route deployment, in route order.
@@ -234,8 +262,12 @@ def throttle_redial_budgets(
     threshold = snapshot.throttle_cache_threshold
     if threshold is None or threshold <= 0:
         return tuple(schedule.max_attempts for _ in route.deployments)
+    last_depth = len(route.deployments) - 1
     budgets: list[int] = []
-    for deployment in route.deployments:
+    for depth, deployment in enumerate(route.deployments):
+        if depth == last_depth or deployment.deployment_id == sticky_deployment_id:
+            budgets.append(schedule.max_attempts)
+            continue
         fraction = loads.cached_fraction(rung_load_key(deployment), organization_id)
         share = min(1.0, fraction / threshold)
         budgets.append(int(schedule.max_attempts * share))

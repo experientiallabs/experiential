@@ -1512,6 +1512,24 @@ class TestAffinityOrderedRungs:
         )
         assert rendezvous_placement.fingerprint is not None
         assert rendezvous_placement.sticky_preferred is False
+        assert rendezvous_placement.sticky_deployment_id is None
+        # A binding to the rung rendezvous already ranks first moves nothing
+        # and is not disclosed as sticky, but placement still names the bound
+        # rung: the one registry read is what admission-time policy reuses.
+        accounting.sticky.bind(
+            rendezvous_placement.fingerprint, _order(rendezvous)[0], ttl_seconds=600.0
+        )
+        front, _wires_out, front_placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(front) == _order(rendezvous)
+        assert front_placement.sticky_preferred is False
+        assert front_placement.sticky_deployment_id == _order(rendezvous)[0]
         # Bind the conversation to a rung rendezvous did NOT rank first (the
         # spill target a congested preferred rung shed it onto).
         spill_target = _order(rendezvous)[1]
@@ -1526,6 +1544,7 @@ class TestAffinityOrderedRungs:
         )
         assert _order(sticky)[0] == spill_target
         assert sticky_placement.sticky_preferred is True
+        assert sticky_placement.sticky_deployment_id == spill_target
         assert _order(sticky)[1:] == tuple(
             name for name in _order(rendezvous) if name != spill_target
         )
@@ -1551,6 +1570,7 @@ class TestAffinityOrderedRungs:
         )
         assert _order(bypassed) == _order(rendezvous)
         assert bypassed_placement.sticky_preferred is False
+        assert bypassed_placement.sticky_deployment_id is None
         assert accounting.sticky.bound_deployment(rendezvous_placement.fingerprint) is None
         # An expired binding is ignored without needing a suppression event.
         clock = [0.0]

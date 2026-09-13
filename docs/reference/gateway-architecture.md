@@ -207,11 +207,22 @@ over down the ladder exactly like any failover-eligible failure, and only when e
 exhausted does the typed 429 reach the caller, carrying the largest `Retry-After` any rung stated.
 How long each rung is worth waiting on is decided at admission per rung and carried on the wire
 entry as `throttle_redial_budget`, the post-backoff redials this request may spend there: the
-full `max_attempts` on every rung when no `throttle_cache_threshold` is authored, otherwise the
-full budget where the organization's cached fraction meets the threshold, a proportional share
-(`floor(max_attempts * fraction / threshold)`) below it, and zero with no cache evidence, so the
-gate now means "how long to wait here" rather than "surface": high stake spends the whole
-backoff budget, low stake fails over sooner, no stake fails over at once. Every redial is its own durably reserved
+full `max_attempts` on every rung when no `throttle_cache_threshold` is authored; otherwise three
+rules apply per rung, in order. (1) No cold alternative: the last rung of the admitted route (the
+route already narrowed to rungs that are live and can serve the request, so a single-rung route is
+the same case) gets the full `max_attempts` regardless of cache evidence, because a throttle only
+advances cold to later rungs and a zero budget there would surface the 429 while a bounded wait
+could still serve. (2) Warm sticky session: a rung the request's affinity fingerprint holds a live
+worker-local sticky binding to gets the full `max_attempts`, the binding being direct evidence that
+the conversation's provider cache lives there. (3) Otherwise the budget scales with the cache at
+stake: the full budget where the organization's cached fraction meets the threshold, a
+proportional share (`floor(max_attempts * fraction / threshold)`) below it, and zero with no cache
+evidence, so the gate means "how long to wait here" rather than "surface": high stake spends the
+whole backoff budget, low stake fails over sooner, no stake fails over at once. Rules 1 and 2
+exist because the fraction is a worker-local EWMA that reads zero on any worker without a recent
+settled sample from the organization, which at a few requests per hour spread across workers is
+most of them, even for a conversation that is over ninety percent cached at the provider; missing
+evidence must never strand a request on a pool whose operator asked for backoff. Every redial is its own durably reserved
 attempt row (the attempt ordinal increments), claimed through the rung's own throttle window
 (this request is the one deliberately probing the rung back; other requests still avoid it), and
 disclosed as `dispatch_reason: throttle_backoff`; the cold advance after the budget is

@@ -377,41 +377,110 @@ def test_failed_dispatch_candidate_names_backoff_then_cold_under_a_redial_schedu
 
 
 def test_throttle_redial_budgets_scale_with_the_schedule_and_the_cache_at_stake() -> None:
-    """No schedule: zero. Schedule alone: the full cap. Plus threshold: scaled by warm cache."""
+    """No schedule: zero. Schedule alone: the full cap. Plus threshold: scaled by warm cache.
+
+    The proportional rule is read on rungs that still have a cold alternative
+    after them; the last rung of the admitted route always gets the full
+    budget (there is nowhere to fail over), so a three-rung ladder shows both.
+    """
     deployments = (
         _deployment("deployment-a", connection_sha256="b" * 64),
         _deployment("deployment-b", connection_sha256="c" * 64),
+        _deployment("deployment-c", connection_sha256="e" * 64),
     )
     loads = RungLoadRegistry()
     plain = _entry(deployments, failover_mode="maximize_cache")
-    assert throttle_redial_budgets(loads, plain.route, "organization-one") == (0, 0)
+    assert throttle_redial_budgets(loads, plain.route, "organization-one") == (0, 0, 0)
     scheduled = _entry(deployments, throttle_redial=_REDIAL)
-    assert throttle_redial_budgets(loads, scheduled.route, "organization-one") == (2, 2)
+    assert throttle_redial_budgets(loads, scheduled.route, "organization-one") == (2, 2, 2)
     gated = _entry(deployments, throttle_cache_threshold=0.5, throttle_redial=_REDIAL)
-    # No cache evidence: nothing to wait for, fail over at once.
-    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 0)
+    # No cache evidence: nothing to wait for where a colder rung follows, so
+    # the first two fail over at once; the last rung waits the whole schedule.
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 0, 2)
     # Another organization's warm cache on the rung does not count...
     loads.record_settle(
         ("deployment-a", "b" * 64), "organization-other", cached_tokens=9, input_tokens=10
     )
-    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 0)
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 0, 2)
     # ...the requesting organization's own does, rung by rung: a fraction at
     # or above the threshold earns the whole budget.
     loads.record_settle(
         ("deployment-a", "b" * 64), "organization-one", cached_tokens=9, input_tokens=10
     )
-    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (2, 0)
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (2, 0, 2)
     # Below the threshold the budget is the proportional share, so a request
     # with little cache at stake fails over sooner rather than never waiting.
     loads.record_settle(
         ("deployment-b", "c" * 64), "organization-one", cached_tokens=3, input_tokens=10
     )
-    budgets = throttle_redial_budgets(loads, gated.route, "organization-one")
-    assert budgets[0] == 2
-    assert budgets[1] == 1
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (2, 1, 2)
     # A zero threshold means every cache reading meets it: the full budget.
     free = _entry(deployments, throttle_cache_threshold=0.0, throttle_redial=_REDIAL)
-    assert throttle_redial_budgets(loads, free.route, "organization-one") == (2, 2)
+    assert throttle_redial_budgets(loads, free.route, "organization-one") == (2, 2, 2)
     # Entries built without the admission step default to the full budget.
-    assert scheduled.throttle_redial_budgets == (2, 2)
-    assert plain.throttle_redial_budgets == (0, 0)
+    assert scheduled.throttle_redial_budgets == (2, 2, 2)
+    assert plain.throttle_redial_budgets == (0, 0, 0)
+
+
+def test_throttle_redial_budget_is_the_full_schedule_where_no_cold_alternative_follows() -> None:
+    """A rung with nothing to fail over to waits the whole schedule without cache evidence.
+
+    The worker-local EWMA reads zero for an organization with no settled
+    sample on this worker even when its conversation is warm at the
+    provider; on the only (or last) live rung a zero budget would surface the
+    throttle at once with a bounded wait still able to serve.
+    """
+    single = (_deployment("deployment-a", connection_sha256="b" * 64),)
+    loads = RungLoadRegistry()
+    gated = _entry(single, throttle_cache_threshold=0.5, throttle_redial=_REDIAL)
+    assert loads.cached_fraction(("deployment-a", "b" * 64), "organization-one") == 0.0
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (2,)
+    # Two live rungs: the first still fails over cold at once (proportional
+    # rule, no evidence), the last waits the schedule.
+    pair = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+    )
+    gated = _entry(pair, throttle_cache_threshold=0.5, throttle_redial=_REDIAL)
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 2)
+    # Without a schedule the rule is inert: the last rung stays failover-only.
+    plain = _entry(single, failover_mode="maximize_cache", throttle_cache_threshold=0.5)
+    assert throttle_redial_budgets(loads, plain.route, "organization-one") == (0,)
+
+
+def test_throttle_redial_budget_is_the_full_schedule_on_the_warm_sticky_rung() -> None:
+    """A live sticky binding on a rung is cache evidence for the whole schedule there.
+
+    The binding says the conversation's provider cache lives on that rung,
+    so the missing worker-local EWMA sample cannot zero its budget; a rung the
+    binding does not name keeps the proportional rule, and a binding to a
+    rung outside the route changes nothing.
+    """
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+        _deployment("deployment-c", connection_sha256="e" * 64),
+    )
+    loads = RungLoadRegistry()
+    gated = _entry(
+        deployments,
+        failover_mode="maximize_cache_affinity",
+        throttle_cache_threshold=0.5,
+        throttle_redial=_REDIAL,
+    )
+    assert throttle_redial_budgets(
+        loads, gated.route, "organization-one", sticky_deployment_id="deployment-a"
+    ) == (2, 0, 2)
+    assert throttle_redial_budgets(
+        loads, gated.route, "organization-one", sticky_deployment_id="deployment-b"
+    ) == (0, 2, 2)
+    assert throttle_redial_budgets(
+        loads, gated.route, "organization-one", sticky_deployment_id="deployment-elsewhere"
+    ) == (0, 0, 2)
+    # The binding does not lower a budget the EWMA already earned elsewhere.
+    loads.record_settle(
+        ("deployment-a", "b" * 64), "organization-one", cached_tokens=9, input_tokens=10
+    )
+    assert throttle_redial_budgets(
+        loads, gated.route, "organization-one", sticky_deployment_id="deployment-b"
+    ) == (2, 2, 2)

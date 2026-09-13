@@ -525,9 +525,15 @@ class NativeControlPlane(
             # How long a throttle is worth waiting on per rung for THIS
             # request (the pool's schedule scaled by the cache at stake),
             # decided here so the data plane never waits on a rung whose
-            # throttle should fail over cold at once.
+            # throttle should fail over cold at once. `route` is the admitted
+            # route (dead and incompatible rungs already removed), so its last
+            # rung is the one with no cold alternative; the sticky binding is
+            # the one placement already read.
             redial_budgets = throttle_redial_budgets(
-                self._accounting.loads, route, authorization.organization_id
+                self._accounting.loads,
+                route,
+                authorization.organization_id,
+                sticky_deployment_id=placement.sticky_deployment_id,
             )
             for deployment, (profile, client), budget in zip(
                 route.deployments, resolved_wires, redial_budgets, strict=True

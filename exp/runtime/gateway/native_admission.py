@@ -437,7 +437,7 @@ def _affinity_ordered_rungs(
         for deployment in route.deployments
     )
     order = rendezvous_order(fingerprint, weighted_rungs)
-    order, sticky_index = sticky_first_order(
+    order, sticky_index, sticky_deployment_id = sticky_first_order(
         order,
         route,
         fingerprint=fingerprint,
@@ -459,6 +459,7 @@ def _affinity_ordered_rungs(
     placement = AffinityPlacement(
         fingerprint=fingerprint,
         sticky_preferred=sticky_index is not None and order[0] == sticky_index,
+        sticky_deployment_id=sticky_deployment_id,
     )
     return (
         reorder_route_deployments(route, order),
