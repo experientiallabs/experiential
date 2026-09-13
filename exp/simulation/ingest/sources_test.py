@@ -81,6 +81,23 @@ _MINIMAL_VENDOR_EXPORTS: dict[str, JsonValue] = {
             }
         ]
     },
+    "mlflow": [
+        {
+            "trace_id": "trace-1",
+            "span_id": "span-0",
+            "name": "chat",
+            "span_type": "LLM",
+            "start_time_ns": 1_700_000_000_000_000_000,
+            "end_time_ns": 1_700_000_001_000_000_000,
+            "attributes": {
+                "mlflow.spanType": "LLM",
+                "llm.request.model": "gpt-test",
+                "llm.system": "openai",
+            },
+            "inputs": {"messages": [_USER]},
+            "outputs": {"content": "here is the plan"},
+        }
+    ],
     "otel-genai": [
         {
             "trace_id": "9" * 32,
@@ -150,6 +167,7 @@ def test_declared_sources_are_the_supported_set() -> None:
         "langfuse",
         "langsmith",
         "mastra",
+        "mlflow",
         "otel-genai",
         "otlp",
         "phoenix",
