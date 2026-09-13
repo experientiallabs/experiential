@@ -32,7 +32,7 @@ from exp.common.models import (
 )
 
 _NO_REASONING_EFFORT = "__unset_reasoning_effort__"
-_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 _COMPLETION_PRICE_FIELDS = (
     ("input_cost_per_million_tokens_usd", "Input cost per million tokens in USD"),
     ("output_cost_per_million_tokens_usd", "Output cost per million tokens in USD"),
@@ -230,7 +230,7 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         supports_reasoning=False,
         reasoning_effort=None,
     )
-    reasoning_effort = _ask_reasoning_effort(console=console) if supports_completions else None
+    reasoning_effort = ask_reasoning_effort(console=console) if supports_completions else None
     if reasoning_effort is not None:
         capabilities = capabilities.model_copy(
             update={
@@ -456,7 +456,12 @@ def _optional_positive_int(label: str, *, console: Console) -> int | None:
     return value if value > 0 else None
 
 
-def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
+def parse_reasoning_effort(value: str) -> ReasoningEffort | None:
+    """Return the reasoning effort named by a picker value, or ``None`` for no pin."""
+    return next((effort for effort in REASONING_EFFORTS if effort == value), None)
+
+
+def ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
     """Choose an optional reasoning-effort pin for one manually declared completion model.
 
     Args:
@@ -477,7 +482,7 @@ def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
                 label="unset",
                 detail="never send the reasoning parameter",
             ),
-            *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),
+            *(PickerOption(value=effort, label=effort) for effort in REASONING_EFFORTS),
         ],
         default=_NO_REASONING_EFFORT,
     )
@@ -485,7 +490,7 @@ def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
         raise SetupCancelled
     if result.action is PickerAction.BACK:
         return None
-    return next((effort for effort in _REASONING_EFFORTS if effort == result.values[0]), None)
+    return parse_reasoning_effort(result.values[0])
 
 
 def _known_bool(item: AvailableModel, field: str) -> bool | None:

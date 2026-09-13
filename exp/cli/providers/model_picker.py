@@ -16,15 +16,16 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import get_args
 
 from rich.console import Console
 
 from exp.cli.providers.declaration import (
+    REASONING_EFFORTS,
     can_declare_role,
     declare_model,
     declare_role_metadata,
     eligible_for_role,
+    parse_reasoning_effort,
     role_row_detail,
 )
 from exp.cli.providers.provider_picker import (
@@ -59,8 +60,6 @@ _CandidateAssignment = tuple[
     tuple[AvailableModel, ...],
 ]
 _MANUAL_MODEL_ROW = "declare-model-manually"
-_NO_REASONING_EFFORT = "__unset_reasoning_effort__"
-_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 
 
 @dataclass(frozen=True)
@@ -340,43 +339,6 @@ def _declare_gateway_model(
     )
 
 
-def _parse_reasoning_effort(value: str) -> ReasoningEffort | None:
-    """Return the reasoning effort named by a picker value, or ``None`` for no pin."""
-    return next((effort for effort in _REASONING_EFFORTS if effort == value), None)
-
-
-def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
-    """Choose an optional reasoning-effort pin for one manually declared completion model.
-
-    Args:
-        console: Terminal used for the screen.
-
-    Returns:
-        The chosen effort, or ``None`` so the parameter is never sent.
-
-    Raises:
-        SetupCancelled: The user cancelled setup.
-    """
-    result = choose_one(
-        console,
-        title="Reasoning effort (pin only for models accepting the OpenAI reasoning parameter)",
-        options=[
-            PickerOption(
-                value=_NO_REASONING_EFFORT,
-                label="unset",
-                detail="never send the reasoning parameter",
-            ),
-            *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),
-        ],
-        default=_NO_REASONING_EFFORT,
-    )
-    if result.action is PickerAction.CANCEL:
-        raise SetupCancelled
-    if result.action is PickerAction.BACK:
-        return None
-    return _parse_reasoning_effort(result.values[0])
-
-
 class _RoleEffortBack:
     """Sentinel marking a back navigation from one role effort screen."""
 
@@ -417,14 +379,14 @@ def _ask_role_reasoning_effort(
     result = choose_one(
         console,
         title=f"{role_name.capitalize()} effort ({alias})",
-        options=[PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS],
+        options=[PickerOption(value=effort, label=effort) for effort in REASONING_EFFORTS],
         default=default or item.capabilities.reasoning_effort,
     )
     if result.action is PickerAction.CANCEL:
         raise SetupCancelled
     if result.action is PickerAction.BACK:
         return _ROLE_EFFORT_BACK
-    return _parse_reasoning_effort(result.values[0])
+    return parse_reasoning_effort(result.values[0])
 
 
 def assign_roles(

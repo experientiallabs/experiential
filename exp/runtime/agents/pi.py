@@ -109,6 +109,7 @@ class PiAgentRuntime:
         executable: str = "pi",
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        """Validate and bind the Pi executable and its finite positive timeout."""
         if not executable:
             raise ValueError("Pi executable must be a non-empty command or path")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:

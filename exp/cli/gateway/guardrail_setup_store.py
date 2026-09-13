@@ -416,7 +416,7 @@ def is_setup_owned_policy(
     if not isinstance(bindings, dict):
         return False
     adapter_id = setup_adapter_id(organization_id, identity_id)
-    expected = {capability: adapter_id for capability in capability_order()}
+    expected = dict.fromkeys(capability_order(), adapter_id)
     return bindings == expected
 
 
@@ -671,7 +671,7 @@ def _owned_policy_document(policy_id: str, adapter_id: str, plan: GuardrailSetup
     Returns:
         A presence-strict standard preset with ``protected`` true.
     """
-    bindings: JsonObject = {capability: adapter_id for capability in capability_order()}
+    bindings: JsonObject = dict.fromkeys(capability_order(), adapter_id)
     return {
         "policy_id": policy_id,
         "organization_id": plan.organization_id,

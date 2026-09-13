@@ -34,6 +34,7 @@ class DeferredTyperGroup(TyperGroup):
         known_names: tuple[str, ...],
         **kwargs: object,
     ) -> None:
+        """Record the lazy import target and the child command names it will provide."""
         # Typer/Click pass a wide kwargs bag; forwarding as typed kwargs is not practical here.
         super().__init__(*args, **kwargs)  # ty: ignore[invalid-argument-type]
         self._import_path = import_path

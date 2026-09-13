@@ -39,6 +39,7 @@ class ProjectPaths:
     project_id: str
 
     def __post_init__(self) -> None:
+        """Coerce the root to a ``Path`` and validate the project identifier."""
         object.__setattr__(self, "root", Path(self.root))
         validate_local_id(self.project_id, label="project ID")
 

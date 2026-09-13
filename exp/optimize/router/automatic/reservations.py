@@ -259,7 +259,7 @@ def router_feature_reservation(
     price = capabilities.input_cost_per_million_tokens_usd if capabilities is not None else None
     if price is None:
         return None
-    features = set(RouterFeatureExtractor().from_task(task) for task in tasks)
+    features = {RouterFeatureExtractor().from_task(task) for task in tasks}
     required_tokens = max(
         (router_feature_token_upper_bound(feature) for feature in features), default=0
     )
