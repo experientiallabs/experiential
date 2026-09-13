@@ -486,7 +486,7 @@ def _emit_setup_unknown_recovery(
         markup=True,
     )
     _console.print(
-        f"Preserve this one-time gateway key: {setup.raw_key}",
+        "Preserve the one-time gateway key printed above.",
         markup=False,
     )
     _console.print(
