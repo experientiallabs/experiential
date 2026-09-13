@@ -35,7 +35,11 @@ from exp.runtime.models.providers.base import (
     ProviderHttpClient,
     ReasoningWireFormat,
 )
-from exp.runtime.models.providers.deepseek import is_deepseek_base_url
+from exp.runtime.models.providers.deepseek import (
+    fold_trailing_instruction_turns,
+    is_deepseek_base_url,
+    is_deepseek_model_id,
+)
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -110,11 +114,15 @@ def openai_compatible_request(
     Raises:
         ValueError: A request message cannot be represented without losing tool context.
     """
+    messages: Sequence[ModelMessage] = request.messages
+    if deepseek_reasoning_history or is_deepseek_model_id(model_id):
+        # Same DeepSeek trailing-instruction rule as the streaming builder.
+        messages = fold_trailing_instruction_turns(messages)
     payload: JsonObject = {
         "model": model_id,
         "messages": [
             _openai_message(message, deepseek_reasoning_history=deepseek_reasoning_history)
-            for message in request.messages
+            for message in messages
         ],
         "stream": False,
     }

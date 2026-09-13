@@ -712,3 +712,20 @@ def test_openrouter_routes_by_prompt_cache_key_as_its_sticky_session_key() -> No
     # The OpenRouter origin is neither a Hunyuan nor a Fireworks carrier route.
     assert profile.hunyuan_reasoning_route_sha256 is None
     assert profile.fireworks_reasoning_route_sha256 is None
+
+
+def test_buffered_request_folds_a_trailing_system_turn_for_deepseek_only() -> None:
+    """The buffered builder applies the same DeepSeek trailing-instruction rule."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(role="system", content="Reminder: be terse."),
+        ),
+        tools=(),
+    )
+    folded = cast(
+        list[JsonObject], openai_compatible_request("DeepSeek-V4-Flash", request)["messages"]
+    )
+    assert folded == [{"role": "user", "content": "Create a ticket.\n\nReminder: be terse."}]
+    kept = cast(list[JsonObject], openai_compatible_request("fake-model", request)["messages"])
+    assert [message["role"] for message in kept] == ["user", "system"]
