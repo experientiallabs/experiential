@@ -26,6 +26,7 @@ from exp.runtime.gateway.guardrails.http_json import (
     validate_classifier_url,
 )
 from exp.runtime.gateway.guardrails.preset import policy_from_authored
+from exp.runtime.gateway.guardrails.regex import RegexAdapterDocument, RegexClassifier
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
 _CONFIG_NAME = "guardrails.json"
@@ -183,7 +184,9 @@ def _adapter(
         return _keyword_adapter(item)
     if kind == "http_json":
         return _http_json_adapter(item, http_client=http_client)
-    raise ValueError("adapter kind must be keyword or http_json")
+    if kind == "regex":
+        return RegexClassifier(RegexAdapterDocument.model_validate(item))
+    raise ValueError("adapter kind must be keyword, regex, or http_json")
 
 
 def _keyword_adapter(item: dict[str, object]) -> KeywordClassifier:

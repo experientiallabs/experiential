@@ -29,6 +29,7 @@ dependencies = [
     # Realistic input-token estimates for per-attempt reservations (free-tier windows and the
     # paid worst-case ceiling) count the prompt with the o200k BPE instead of a byte bound.
     "tiktoken>=0.9,<1",
+    "google-re2>=1.1,<2",
 ]
 
 [project.optional-dependencies]
