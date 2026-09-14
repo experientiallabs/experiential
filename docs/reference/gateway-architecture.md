@@ -232,6 +232,29 @@ that author no schedule keep byte-identical behavior; the hosted platform's reco
 authoring for house GPT lanes, whose traffic is cache-heavy, is a schedule of three redials from a
 500 ms base capped at 8 s beside its existing 0.5 threshold.
 
+A reasoning continuation (a Chat request replaying a gateway-sealed `reasoning_content` carrier
+on an assistant tool turn after the latest user message) resolves as `route_reason:
+reasoning_continuation`: the carrier is authenticated against the exact deployment and credential
+that sealed it, and that issuing rung dispatches first with the unsealed reasoning replayed, so
+the model's thinking continues across the tool call. The rung is NOT the whole ladder. The pool's
+other certified rungs follow in pool order as failover fallbacks, and every one of them is frozen
+at admission from the request with the post-user-boundary sealed reasoning removed: only the
+issuing rung's credential can unseal a carrier (each provider's carrier is AEAD domain-separated
+to its own credential, a non-carrier rung yields no authority, and the payload builders reject a
+block sealed for another route by name), so the fallback keeps the messages, visible text, tool
+calls and tool results and drops just that turn's thinking. A failover-eligible operational
+failure on the issuing rung (a throttle after the pool's `throttle_redial` budget is spent there,
+provider quota, unavailability, transport) therefore advances to the next rung exactly like any
+last-rung failure, and that attempt is recorded with `route_reason:
+reasoning_continuation_failover`; a caller error (`invalid_request`, a refusal without the
+opt-in) still surfaces without touching a fallback. The stated loss on a failover is the model's
+thinking continuity across that tool call and the issuing provider's prompt cache for the turn,
+never correctness of the visible conversation. Because its fallbacks run without the reasoning,
+the issuing rung gets the full `throttle_redial` budget (rule 2 above, beside the sticky rung),
+and affinity or cache-marker reordering never demotes it from first position. A continuation
+whose sealed carriers all precede the latest user message carries no active reasoning and routes
+as a plain request; a single-rung pool has no fallback and surfaces the failure as before.
+
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
@@ -637,7 +660,8 @@ Route narrowing prefers exposing rungs and discloses
 `messages.reasoning_content->dropped(unsupported_by_provider)` when a rung cannot replay it,
 including routes with no exposing rung. Gateway-issued carriers are recognized by their
 scheme prefix and retain strict parsing, authentication, and route binding; malformed carriers
-never become plaintext history.
+never become plaintext history, and a carrier never reaches a rung other than the one that sealed
+it (the failover past a failed issuing rung strips it, see the reasoning-continuation ladder above).
 
 DeepSeek's own origin (`https://api.deepseek.com`, `is_deepseek_base_url`) is a reasoning-HISTORY
 route by origin, independent of the exposure stamp (`GatewayWireProfile.deepseek_reasoning_history`).

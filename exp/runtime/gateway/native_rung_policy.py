@@ -225,7 +225,12 @@ def throttle_redial_budgets(
        bound to in the worker's ``StickySpillRegistry``
        (``sticky_deployment_id``) gets the full ``max_attempts``. The binding
        is direct evidence that the conversation's provider cache lives on
-       that rung, the same warm standing ``reserve_rung_slot`` honors.
+       that rung, the same warm standing ``reserve_rung_slot`` honors. The
+       issuing rung of a reasoning continuation
+       (``route.reasoning_pinned_deployment_id``) is the same case: it alone
+       can replay the request's thinking, so failing over past it costs the
+       turn's continuity as well as its cache, and it waits the whole
+       schedule before its fallbacks are tried.
     3. Otherwise the budget scales with the cache at stake: the full
        ``max_attempts`` when the requesting organization's observed cached
        fraction on the rung meets the threshold, a proportional share
@@ -263,9 +268,14 @@ def throttle_redial_budgets(
     if threshold is None or threshold <= 0:
         return tuple(schedule.max_attempts for _ in route.deployments)
     last_depth = len(route.deployments) - 1
+    pinned_deployment_id = route.reasoning_pinned_deployment_id
     budgets: list[int] = []
     for depth, deployment in enumerate(route.deployments):
-        if depth == last_depth or deployment.deployment_id == sticky_deployment_id:
+        if (
+            depth == last_depth
+            or deployment.deployment_id == sticky_deployment_id
+            or deployment.deployment_id == pinned_deployment_id
+        ):
             budgets.append(schedule.max_attempts)
             continue
         fraction = loads.cached_fraction(rung_load_key(deployment), organization_id)

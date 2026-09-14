@@ -493,7 +493,7 @@ class NativeAttemptAccounting:
                     ),
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
-                    route_reason=route.route_reason,
+                    route_reason=route.attempt_route_reason(route.deployments[candidate]),
                     fallback_reason=route.fallback_reason,
                     dispatch_reason=dispatch_reason,
                     preferred_deployment=preferred_deployment,

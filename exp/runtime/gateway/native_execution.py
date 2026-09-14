@@ -740,6 +740,7 @@ def select_route_deployments(
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
+        reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
     )
 
 
@@ -797,6 +798,7 @@ def reorder_route_deployments(
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
+        reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
     )
 
 

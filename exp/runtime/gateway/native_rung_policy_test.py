@@ -448,6 +448,30 @@ def test_throttle_redial_budget_is_the_full_schedule_where_no_cold_alternative_f
     assert throttle_redial_budgets(loads, plain.route, "organization-one") == (0,)
 
 
+def test_throttle_redial_budget_is_the_full_schedule_on_the_reasoning_pinned_rung() -> None:
+    """The issuing rung of a reasoning continuation waits the whole schedule.
+
+    Its fallbacks dispatch without the request's thinking, so a throttle there
+    is worth every redial the pool authored before the ladder advances, whatever
+    the worker-local cache EWMA reads; the fallbacks keep the proportional rule.
+    """
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+        _deployment("deployment-c", connection_sha256="e" * 64),
+    )
+    loads = RungLoadRegistry()
+    gated = _entry(deployments, throttle_cache_threshold=0.5, throttle_redial=_REDIAL)
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 0, 2)
+    pinned = gated.route.model_copy(
+        update={
+            "route_reason": "reasoning_continuation",
+            "reasoning_pinned_deployment_id": "deployment-a",
+        }
+    )
+    assert throttle_redial_budgets(loads, pinned, "organization-one") == (2, 0, 2)
+
+
 def test_throttle_redial_budget_is_the_full_schedule_on_the_warm_sticky_rung() -> None:
     """A live sticky binding on a rung is cache evidence for the whole schedule there.
 

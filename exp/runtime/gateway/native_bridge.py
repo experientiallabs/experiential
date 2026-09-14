@@ -100,6 +100,7 @@ from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,
     has_active_reasoning_content,
+    rung_provider_request,
     seal_reasoning_carrier_content,
     strip_stale_reasoning_history,
     unseal_reasoning_history,
@@ -538,12 +539,17 @@ class NativeControlPlane(
             for deployment, (profile, client), budget in zip(
                 route.deployments, resolved_wires, redial_budgets, strict=True
             ):
+                # A reasoning-pinned route's fallback rung is frozen WITHOUT
+                # the pinned provider's sealed reasoning (it cannot unseal
+                # it), so a failover past the issuing rung dispatches the
+                # conversation minus that turn's thinking, never a foreign
+                # sealed block.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,
                     profile,
                     client,
-                    provider_request=provider_request,
+                    provider_request=rung_provider_request(route, deployment, provider_request),
                     public_request=public_request,
                     authorization=authorization,
                     throttle_redial_budget=budget,

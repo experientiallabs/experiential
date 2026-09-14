@@ -818,7 +818,14 @@ def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(
 
 
 def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
-    """A fallback-issued carrier replays only to its exact deployment and credential."""
+    """A fallback-issued carrier replays only to its exact deployment and credential.
+
+    The issuing rung leads the continuation's ladder with the unsealed
+    reasoning; the pool's other rung follows as a failover fallback whose
+    frozen payload carries no reasoning at all (it cannot unseal it), so the
+    plaintext is replayed to exactly one deployment while a failure on it can
+    still be served.
+    """
     _manager, raw_key = _configured_pool_gateway(
         tmp_path,
         base_urls=(
@@ -913,8 +920,238 @@ def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: P
     )
 
     continued_route = cast("list[JsonObject]", continuation["route"])
-    assert [item["deployment_id"] for item in continued_route] == [route[1]["deployment_id"]]
+    assert [item["deployment_id"] for item in continued_route] == [
+        route[1]["deployment_id"],
+        route[0]["deployment_id"],
+    ]
     assert continued_route[0]["model_id"] == "beta-model-exact"
+    assert continuation["route_reason"] == "reasoning_continuation"
+    issuing_payload = cast("JsonObject", continued_route[0]["upstream_payload"])
+    issuing_messages = cast("list[JsonObject]", issuing_payload["messages"])
+    assert issuing_messages[1]["reasoning_content"] == "fallback-private-reasoning"
+    assert issuing_payload["reasoning_history"] == "interleaved"
+    fallback_payload = cast("JsonObject", continued_route[1]["upstream_payload"])
+    fallback_messages = cast("list[JsonObject]", fallback_payload["messages"])
+    assert "reasoning_content" not in json.dumps(fallback_payload)
+    assert "reasoning_history" not in fallback_payload
+    assert fallback_messages[1]["tool_calls"] == issuing_messages[1]["tool_calls"]
+    assert fallback_messages[2] == issuing_messages[2]
+
+
+def _reasoning_failover_pool(
+    root: Path,
+) -> tuple[NativeControlPlane, str, str, list[JsonObject]]:
+    """Seal one Hunyuan tool turn on the issuing rung of a two-rung pool.
+
+    The pool's first rung is a Hunyuan carrier route (it seals and unseals
+    the reasoning under its own credential); the second is a plain
+    OpenAI-compatible rung that yields no carrier authority at all.
+
+    Returns:
+        The control plane, raw key, the continuation body carrying the sealed
+        carrier, and the initial admission's wire route.
+    """
+    _manager, raw_key = _configured_pool_gateway(
+        root,
+        base_urls=("https://api.hunyuan.cloud.tencent.com/v1", "http://127.0.0.1:10/v1"),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+            ModelCapabilities(supports_tools=True),
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    assert initial["route_depth"] == 0
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": 0,
+                    "route_sha256": route_sha256,
+                    "content": "private reasoning only the issuing rung can unseal",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    return control, raw_key, body, cast("list[JsonObject]", initial["route"])
+
+
+def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list[tuple[int, str]]:
+    """Return each reserved attempt's ``(route_depth, route_reason)`` for one request."""
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute(
+            "select route_depth, route_reason from gateway_attempts "
+            "where request_id = ? order by attempt_ordinal",
+            (request_id,),
+        ).fetchall()
+    return [(int(depth), str(reason)) for depth, reason in rows]
+
+
+def test_pinned_continuation_surfaces_a_caller_error_on_the_issuing_rung(tmp_path: Path) -> None:
+    """A non-operational failure on the pinned rung never fails over past it.
+
+    ``invalid_request`` is not failover-eligible, so the fallback rung the
+    pinned ladder now carries is never claimed: the ladder exhausts with the
+    caller's own error exactly as a one-rung pin did.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    continued = _admit(control, raw_key, body)
+    assert [wire["deployment_id"] for wire in cast("list[JsonObject]", continued["route"])] == [
+        "alpha",
+        "beta",
+    ]
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    failure = {
+        "failure_class": "invalid_request",
+        "safe_message": "the provider rejected the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": False,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": failure,
+                "finalize": False,
+            }
+        )
+    )
+    exhausted = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": continued["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert exhausted["exhausted"] is True
+    assert exhausted["failure"]["failure_class"] == "invalid_request"
+    assert _attempt_route_reasons(control, _admitted_request_id(continued)) == [
+        (0, "reasoning_continuation")
+    ]
+
+
+def test_pinned_continuation_fails_over_past_a_throttled_issuing_rung(tmp_path: Path) -> None:
+    """A throttle on the pinned rung continues on the pool's other rung without the reasoning.
+
+    Production shape (hy4-preview, 2026-09-13): the Tencent house account hit
+    its daily quota and every continuation carrying a Hunyuan carrier died
+    after one throttled attempt because its ladder had one rung. The ladder
+    now carries the pool's remaining rung: its frozen payload keeps the
+    messages, the tool call and the tool result but no sealed reasoning (the
+    plain rung could never unseal it), and the ledger records that attempt as
+    ``reasoning_continuation_failover`` beside the pinned first attempt's
+    ``reasoning_continuation``.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    continued = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", continued["route"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert [wire["deployment_id"] for wire in route] == ["alpha", "beta"]
+    pinned_payload = cast("JsonObject", route[0]["upstream_payload"])
+    pinned_messages = cast("list[JsonObject]", pinned_payload["messages"])
+    assert (
+        pinned_messages[1]["reasoning_content"]
+        == "private reasoning only the issuing rung can unseal"
+    )
+    fallback_payload = cast("JsonObject", route[1]["upstream_payload"])
+    fallback_messages = cast("list[JsonObject]", fallback_payload["messages"])
+    assert "reasoning_content" not in json.dumps(fallback_payload)
+    assert "x-experiential-hunyuan-reasoning" not in json.dumps(fallback_payload)
+    assert fallback_messages[1]["tool_calls"] == pinned_messages[1]["tool_calls"]
+    assert fallback_messages[2] == {"role": "tool", "tool_call_id": "call-one", "content": "done"}
+    assert fallback_messages[0] == pinned_messages[0]
+
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    throttled = {
+        "failure_class": "throttled",
+        "safe_message": "provider throttled the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": throttled,
+                "finalize": False,
+            }
+        )
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": continued["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": throttled,
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    assert _attempt_route_reasons(control, _admitted_request_id(continued)) == [
+        (0, "reasoning_continuation"),
+        (1, "reasoning_continuation_failover"),
+    ]
 
 
 def test_bridge_error_payload_is_openai_shaped() -> None:
