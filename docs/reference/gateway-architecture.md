@@ -251,7 +251,12 @@ opt-in) still surfaces without touching a fallback. The stated loss on a failove
 thinking continuity across that tool call and the issuing provider's prompt cache for the turn,
 never correctness of the visible conversation. Because its fallbacks run without the reasoning,
 the issuing rung gets the full `throttle_redial` budget (rule 2 above, beside the sticky rung),
-and affinity or cache-marker reordering never demotes it from first position. A continuation
+affinity or cache-marker reordering never demotes it from first position while it is
+dispatchable, and a rung dispatch-policy shed of the issuing rung (its authored per-worker
+`requests_per_minute`, `tokens_per_minute` or `concurrency_bound`, which trip under ordinary
+load) force-admits it as `saturated_overflow` exactly as a one-rung ladder did instead of
+spilling sideways to a stripped fallback: only a real failover-eligible failure on the pinned
+rung moves the ladder past it. A continuation
 whose sealed carriers all precede the latest user message carries no active reasoning and routes
 as a plain request; a single-rung pool has no fallback and surfaces the failure as before.
 

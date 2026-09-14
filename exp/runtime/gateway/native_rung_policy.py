@@ -197,6 +197,29 @@ def failed_dispatch_candidate(
     return candidate, disposition
 
 
+def shed_keeps_pin(route: GatewayRoute, candidate: int) -> bool:
+    """Whether a policy shed of ``candidate`` must force-admit it rather than spill sideways.
+
+    True only for the issuing rung of a reasoning-pinned route. Its fallbacks
+    dispatch without the request's sealed reasoning, a loss reserved for a real
+    failover-eligible failure on the pinned rung (a throttle once its redial
+    budget is spent, provider quota, unavailability, transport), never for a
+    per-worker rate or concurrency shed the rung itself authored, which trips
+    under ordinary load. The shed is disclosed as ``saturated_overflow`` exactly
+    as a one-rung ladder's is.
+
+    Args:
+        route: The admitted route.
+        candidate: Route position of the rung that shed.
+
+    Returns:
+        Whether the accounting keeps the candidate and admits it past the policy.
+    """
+    return route.reasoning_pinned_deployment_id is not None and not route.requires_reasoning_strip(
+        route.deployments[candidate]
+    )
+
+
 def throttle_redial_budgets(
     loads: RungLoadRegistry,
     route: GatewayRoute,

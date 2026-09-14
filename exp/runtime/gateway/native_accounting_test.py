@@ -149,7 +149,7 @@ class _RecordingLedger:
         preferred_deployment: ExactModelDeployment | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
-        del snapshot, maximum_cost_nano_usd, route_reason, fallback_reason
+        del snapshot, maximum_cost_nano_usd, fallback_reason
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
@@ -163,6 +163,7 @@ class _RecordingLedger:
                 "route_depth": route_depth,
                 "reserved_input_tokens": reserved_input_tokens,
                 "reserved_output_tokens": reserved_output_tokens,
+                "route_reason": route_reason,
                 "dispatch_reason": dispatch_reason,
                 "preferred_deployment_id": (
                     None if preferred_deployment is None else preferred_deployment.deployment_id
@@ -556,8 +557,13 @@ def _admit(
     throttle_redial: GatewayThrottleRedialPolicy | None = None,
     affinity_fingerprint: bytes | None = None,
     sticky_preferred: bool = False,
+    reasoning_pinned_deployment_id: str | None = None,
 ) -> InflightRequest:
-    """Register one admitted request over the given rung ladder."""
+    """Register one admitted request over the given rung ladder.
+
+    ``reasoning_pinned_deployment_id`` admits the request as a reasoning
+    continuation pinned to that rung (route reason ``reasoning_continuation``).
+    """
     authorization = _authorization(_DIGEST).model_copy(
         update={
             "request_id": request_id,
@@ -578,7 +584,10 @@ def _admit(
         ),
         deployment=deployments[0],
         fallback_deployments=deployments[1:],
-        route_reason="direct",
+        route_reason=(
+            "direct" if reasoning_pinned_deployment_id is None else "reasoning_continuation"
+        ),
+        reasoning_pinned_deployment_id=reasoning_pinned_deployment_id,
     )
     entry = InflightRequest(
         authorization=authorization,
@@ -1070,6 +1079,55 @@ class TestRateLimitSheds:
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
         assert registry.rung_admission_counters() == (1, 0)
         assert registry.rung_rate_counters() == (1, 0)
+
+    def test_rate_shed_force_admits_a_reasoning_pinned_rung_until_a_real_failure(self) -> None:
+        """A pinned continuation never spills to a stripped fallback on a policy shed.
+
+        The issuing rung's per-worker rate window is already used by another
+        request; the continuation is still force-admitted THERE
+        (``saturated_overflow``), because its fallbacks run without the
+        request's thinking and a rate fact trips under ordinary load. A real
+        failover-eligible throttle on that attempt then advances to the
+        fallback, recorded as ``reasoning_continuation_failover``.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = _rated_pair(requests_per_minute=1)
+        _admit(registry, deployments, request_id="request-1")
+        _admit(
+            registry,
+            deployments,
+            request_id="request-2",
+            reasoning_pinned_deployment_id="deployment-a",
+        )
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        kept = _start(registry, ordinal=0, request_id="request-2")
+        assert kept["route_depth"] == 0
+        assert ledger.started[1]["deployment_id"] == "deployment-a"
+        assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
+        assert ledger.started[1]["route_reason"] == "reasoning_continuation"
+        assert registry.rung_admission_counters() == (1, 1)
+        throttled: JsonObject = {
+            "failure_class": "throttled",
+            "safe_message": "provider throttled the request",
+            "retryable_same_deployment": False,
+            "failover_eligible": True,
+        }
+        _settle(
+            registry,
+            attempt_id=str(kept["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=throttled,
+            request_id="request-2",
+        )
+        advanced = _start(
+            registry, ordinal=1, current_depth=0, failure=throttled, request_id="request-2"
+        )
+        assert advanced["route_depth"] == 1
+        assert ledger.started[2]["deployment_id"] == "deployment-b"
+        assert ledger.started[2]["route_reason"] == "reasoning_continuation_failover"
+        assert ledger.started[2]["dispatch_reason"] != "saturated_overflow"
 
     def test_token_rate_counts_the_worst_case_reservation(self) -> None:
         """An over-cap request bursts into an empty window; the next one spills.

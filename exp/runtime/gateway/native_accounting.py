@@ -49,7 +49,11 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
     rung_load_key,
 )
-from exp.runtime.gateway.native_rung_policy import failed_dispatch_candidate, reserve_rung_slot
+from exp.runtime.gateway.native_rung_policy import (
+    failed_dispatch_candidate,
+    reserve_rung_slot,
+    shed_keeps_pin,
+)
 from exp.runtime.gateway.native_settlement import (
     all_routes_throttled_failure,
     all_routes_unavailable_failure,
@@ -471,7 +475,10 @@ class NativeAttemptAccounting:
             if isinstance(ticket, RungShed):
                 policy_sheds.append((candidate, ticket.reason))
                 self._health.release_probe(keys[candidate])
-                candidate = claim_route_from(self._health, keys, candidate + 1)
+                # The issuing rung of a reasoning continuation is force-admitted, never spilled.
+                forced_overflow = last_failure is None and shed_keeps_pin(route, candidate)
+                if not forced_overflow:
+                    candidate = claim_route_from(self._health, keys, candidate + 1)
                 continue
             throttle_backoff = candidate == redial_depth
             dispatch_reason, preferred_deployment = dispatch_disclosure(
