@@ -10,7 +10,6 @@ from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
-from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import ToolCall
@@ -39,7 +38,7 @@ from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
 )
 from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
@@ -48,6 +47,7 @@ from exp.runtime.openai_protocol.manifest import (
 )
 from exp.runtime.openai_protocol.media_parts import message_content
 from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
+from exp.runtime.openai_protocol.rejections import _validation_protocol_error
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
@@ -63,7 +63,6 @@ from exp.runtime.openai_protocol.structured_text import (
     responses_structured_text,
 )
 from exp.runtime.openai_protocol.wire_models import (
-    HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
     HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
     _AssistantToolCall,
@@ -510,166 +509,6 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
         return model.model_validate(payload)
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
-
-
-_LOCATION_NOISE = {"body", "non-streaming", "streaming"}
-_UNION_BRANCH_TYPES = {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}
-_OUTPUT_ITEM_VARIANTS = {
-    "message",
-    "function_call",
-    "function_call_output",
-    "reasoning",
-    "additional_tools",
-    "custom_tool_call",
-    "custom_tool_call_output",
-    # Hosted-tool echo variants share the same union-branch label shape.
-    *HOSTED_TOOL_ITEM_TYPES_TOOL,
-    *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
-}
-
-
-def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
-    """Drop pydantic union-branch labels so the path names request fields."""
-    cleaned: list[str] = []
-    for part in location:
-        text = str(part)
-        if text in _LOCATION_NOISE:
-            continue
-        # Typed-dict union branches are labeled with their class name, which
-        # no request field ever shares: every public field is lower case.
-        if isinstance(part, str) and (
-            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES or text[:1].isupper()
-        ):
-            continue
-        if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
-            continue
-        # A discriminated part whose tag is also its payload field name
-        # (``file.file``, ``image_url.image_url``) reports the tag once.
-        if cleaned and cleaned[-1] == text and not text.isdigit():
-            continue
-        cleaned.append(text)
-    return tuple(cleaned)
-
-
-_WIRE_TYPE_NAMES = {
-    "str": "a string",
-    "int": "an integer",
-    "float": "a number",
-    "bool": "a boolean",
-    "list": "an array",
-    "tuple": "an array",
-    "dict": "an object",
-    "NoneType": "null",
-}
-"""JSON-shape names for python input types, used in expected/got messages."""
-
-_EXPECTED_BY_ERROR_TYPE = {
-    "string_type": "a string",
-    "string_too_short": "a non-empty string",
-    "int_type": "an integer",
-    "int_parsing": "an integer",
-    "float_type": "a number",
-    "float_parsing": "a number",
-    "bool_type": "a boolean",
-    "list_type": "an array",
-    "tuple_type": "an array",
-    "dict_type": "an object",
-    "model_type": "an object",
-    "model_attributes_type": "an object",
-    "missing": "a value",
-    "none_required": "null",
-}
-"""Shape-level expectations for the pydantic error types worth naming."""
-
-
-def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
-    """Describe what shape a field expected versus what arrived.
-
-    Only structural facts appear: expectations come from this gateway's own
-    wire models and the got side is the JSON type of the caller's value,
-    never the value itself and never provider prose.
-    """
-    expected: list[str] = []
-    got: str | None = None
-    for detail in details:
-        if detail["type"] == "string_too_long":
-            # The bound and the arriving LENGTH are both display-safe facts
-            # (the value itself is never echoed); stating them saves the
-            # caller from bisecting the ceiling out of a bare rejection.
-            context = detail.get("ctx") or {}
-            maximum = context.get("max_length")
-            value = detail.get("input")
-            if isinstance(maximum, int) and isinstance(value, str):
-                return (
-                    f"Invalid value for '{param}': expected at most "
-                    f"{maximum:,} characters, but got {len(value):,}."
-                )
-        phrase = _EXPECTED_BY_ERROR_TYPE.get(detail["type"])
-        if detail["type"] in {"literal_error", "enum"}:
-            context = detail.get("ctx") or {}
-            allowed = context.get("expected")
-            if isinstance(allowed, str):
-                phrase = f"one of {allowed}"
-        if phrase is not None and phrase not in expected:
-            expected.append(phrase)
-        # A missing-field complaint carries the parent object as its input,
-        # so it contributes no honest "got" type.
-        if detail["type"] != "missing" and "input" in detail:
-            got = _WIRE_TYPE_NAMES.get(type(detail["input"]).__name__, got)
-    if not expected:
-        return None
-    description = " or ".join(expected)
-    if got is not None:
-        return f"Invalid value for '{param}': expected {description}, but got {got} instead."
-    return f"Invalid value for '{param}': expected {description}."
-
-
-def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
-    """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
-
-    Union validation reports every branch's complaints. Errors group by
-    their branch (the location minus its final field segment); among the
-    most field-specific groups, the branch the caller actually meant is the
-    one with the fewest complaints, so its deepest cleaned location names
-    the real field (an echoed item's ``input.1.caller``), never a union
-    branch label such as ``input.str``. The chosen field's own complaints
-    then name the expected shape against the arriving JSON type.
-    """
-    groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
-    for detail in error.errors(include_url=False):
-        groups.setdefault(tuple(detail["loc"][:-1]), []).append(
-            (_cleaned_location(detail["loc"]), detail)
-        )
-    if not groups:
-        return invalid_field("body")
-    deepest = max(len(location) for members in groups.values() for location, _ in members)
-    candidates = [
-        members
-        for members in groups.values()
-        if any(len(location) == deepest for location, _ in members)
-    ]
-    best = min(candidates, key=len)
-    location = max((cleaned for cleaned, _ in best), key=len, default=())
-    param = ".".join(location) or "body"
-    details = [detail for cleaned, detail in best if cleaned == location]
-    if param == "body":
-        # A whole-request rule (such as the attachment count ceiling) has no
-        # field of its own, so its own wording is the only useful message.
-        for detail in details:
-            if detail["type"] == "value_error":
-                return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
-    for detail in details:
-        # A field validator's own wording states this gateway's exact value
-        # constraint (only our wire models raise these, so the text is
-        # display-safe and never echoes the caller's value).
-        if detail["type"] == "value_error":
-            return invalid_field(
-                param,
-                f"Invalid value for {param!r}: "
-                + detail["msg"].removeprefix("Value error, ")
-                + ".",
-            )
-    return invalid_field(param, _shape_message(param, details))
 
 
 def _validated_operation_headers(
