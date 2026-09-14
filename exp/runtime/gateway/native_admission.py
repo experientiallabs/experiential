@@ -369,9 +369,7 @@ def _prefer_cache_capable_rungs(
         return route, resolved_wires
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
         return route, resolved_wires
-    if route.reasoning_pinned_deployment_id is not None:
-        # The issuing rung of a reasoning continuation stays first: it is the
-        # only rung that can replay the request's thinking.
+    if _keeps_issuing_rung_first(route):
         return route, resolved_wires
     marker_capable = tuple(
         index
@@ -387,6 +385,21 @@ def _prefer_cache_capable_rungs(
     return (
         reorder_route_deployments(route, order),
         tuple(resolved_wires[index] for index in order),
+    )
+
+
+def _keeps_issuing_rung_first(route: GatewayRoute) -> bool:
+    """Whether a reasoning continuation's issuing rung is on the route and must lead it.
+
+    The issuing rung alone can replay the request's thinking, so while it is
+    still dispatchable no cache-marker or affinity reorder may demote it and
+    its fallbacks stay in pool order. Once admission has narrowed it out as
+    dead the pin is stale: every surviving rung runs without the reasoning,
+    so the pool's normal ordering applies to them.
+    """
+    pinned = route.reasoning_pinned_deployment_id
+    return pinned is not None and any(
+        deployment.deployment_id == pinned for deployment in route.deployments
     )
 
 
@@ -427,9 +440,7 @@ def _affinity_ordered_rungs(
         identity_id=authorization.identity_id,
         material=material,
     )
-    if len(resolved_wires) < 2 or route.reasoning_pinned_deployment_id is not None:
-        # A reasoning continuation keeps its issuing rung first (it alone can
-        # replay the request's thinking); its fallbacks stay in pool order.
+    if len(resolved_wires) < 2 or _keeps_issuing_rung_first(route):
         return route, resolved_wires, AffinityPlacement(fingerprint=fingerprint)
     weighted_rungs = tuple(
         (

@@ -196,6 +196,71 @@ def test_cache_marked_requests_dispatch_marker_honoring_rungs_first() -> None:
     assert route.deployment.deployment_id == "shim"
 
 
+def test_reasoning_pin_holds_the_issuing_rung_first_only_while_it_survives() -> None:
+    """Ordering never demotes a live issuing rung, and a stale pin changes nothing.
+
+    While the rung that sealed the request's reasoning is still on the route
+    it leads (it alone can replay the thinking), so neither the cache-marker
+    preference nor affinity rendezvous reorders past it. Once admission has
+    narrowed that rung out as dead every survivor runs without the reasoning,
+    and the pool's normal ordering applies to them exactly as on a plain route.
+    """
+    pinned = _mixed_route("maximize_cache").model_copy(
+        update={
+            "route_reason": "reasoning_continuation",
+            "reasoning_pinned_deployment_id": "shim",
+        }
+    )
+    route, wires = _prefer_cache_capable_rungs(pinned, _wires(), _marked_request())
+    assert route is pinned
+    assert wires[0][0].dialect == "openai_compatible"
+    # The issuing rung ("issuer") was narrowed out at admission: the pin is
+    # stale and the marker-honoring rung is dispatched first as usual.
+    stale = pinned.model_copy(update={"reasoning_pinned_deployment_id": "issuer"})
+    route, wires = _prefer_cache_capable_rungs(stale, _wires(), _marked_request())
+    assert route.deployment.deployment_id == "native"
+    assert route.reasoning_pinned_deployment_id == "issuer"
+    assert wires[0][0].dialect == "anthropic_messages"
+
+    affinity_route, affinity_wires = _affinity_fixture()
+    live_pin = affinity_route.model_copy(
+        update={
+            "route_reason": "reasoning_continuation",
+            "reasoning_pinned_deployment_id": "dep-openrouter",
+        }
+    )
+    rendezvous, _wires_out, _placement = _affinity_ordered_rungs(
+        affinity_route,
+        affinity_wires,
+        _session_request("session-pinned"),
+        accounting=_affinity_accounting(),
+        authorization=affinity_route.snapshot.authorization,
+        continuation=None,
+    )
+    ordered, ordered_wires, placement = _affinity_ordered_rungs(
+        live_pin,
+        affinity_wires,
+        _session_request("session-pinned"),
+        accounting=_affinity_accounting(),
+        authorization=live_pin.snapshot.authorization,
+        continuation=None,
+    )
+    assert ordered is live_pin
+    assert ordered_wires is affinity_wires
+    assert placement.fingerprint is not None
+    stale_pin = live_pin.model_copy(update={"reasoning_pinned_deployment_id": "dep-dead"})
+    reordered, _wires_out, _placement = _affinity_ordered_rungs(
+        stale_pin,
+        affinity_wires,
+        _session_request("session-pinned"),
+        accounting=_affinity_accounting(),
+        authorization=stale_pin.snapshot.authorization,
+        continuation=None,
+    )
+    assert _order(reordered) == _order(rendezvous)
+    assert reordered.reasoning_pinned_deployment_id == "dep-dead"
+
+
 def test_video_requests_skip_rungs_whose_wire_cannot_carry_them() -> None:
     """A waterfall lands a video on the Gemini rung, past Anthropic and inline-only Bedrock."""
     video_route = GatewayDeploymentMetadata(
