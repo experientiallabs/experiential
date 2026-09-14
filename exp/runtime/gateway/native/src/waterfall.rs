@@ -59,6 +59,9 @@ pub const MAXIMUM_WITHHELD_REFUSAL_EVENTS: usize = 256;
 pub struct DeploymentWire {
     pub provider: String,
     pub deployment_id: String,
+    /// Canonical identity of this actual stage, not the requested root model.
+    #[serde(default)]
+    pub exact_model_id: String,
     pub dialect: String,
     pub url: String,
     pub headers: HashMap<String, String>,
@@ -124,6 +127,9 @@ pub struct DeploymentWire {
     /// ladder advances; zero keeps the rung's throttle failover-only.
     #[serde(default)]
     pub throttle_redial_budget: u32,
+    /// Stage-local schedule; its budget is zero when this stage disables redial.
+    #[serde(default)]
+    pub throttle_redial: Option<ThrottleRedial>,
 }
 
 /// The frozen retry-policy facts returned by admission.
@@ -302,7 +308,7 @@ fn throttle_backoff_delay(
     throttle_redials_at_depth: u32,
     total_attempts: u32,
 ) -> Option<Duration> {
-    let schedule = ctx.policy.throttle_redial?;
+    let schedule = wire.throttle_redial.or(ctx.policy.throttle_redial)?;
     if wire.throttle_redial_budget == 0
         || failure.failure_class != FailureClass::Throttled
         || total_attempts >= ctx.policy.maximum_total_attempts

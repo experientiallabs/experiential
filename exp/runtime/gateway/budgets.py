@@ -656,6 +656,7 @@ def require_attempt_budget(
     attempt_id: str,
     period_start: str,
     maximum_cost_nano_usd: int | None,
+    root_pool_id: str | None = None,
 ) -> None:
     """Atomically require room beneath every limit applicable to one attempt.
 
@@ -671,7 +672,7 @@ def require_attempt_budget(
         WHERE organization_id = ? AND period_start = ? AND (
             scope_kind = 'team'
             OR (scope_kind = 'identity' AND identity_id = ?)
-            OR (scope_kind = 'pool' AND alias_id = ? AND pool_id = ?)
+            OR (scope_kind = 'pool' AND alias_id = ? AND pool_id IN (?, ?))
             OR (scope_kind = 'deployment' AND alias_id = ? AND pool_id = ?
                 AND deployment_id = ?)
         )
@@ -683,6 +684,7 @@ def require_attempt_budget(
             identity_id,
             alias_id,
             pool_id,
+            root_pool_id or pool_id,
             alias_id,
             pool_id,
             deployment_id,

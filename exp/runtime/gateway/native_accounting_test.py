@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -116,6 +117,31 @@ def _route(
     )
 
 
+def test_typed_preflight_rejection_survives_public_and_ledger_terminal() -> None:
+    """Expected unavailable root preflight never becomes an internal-error settlement."""
+    ledger = _RecordingLedger()
+    ledger.typed_rejection = GatewayFailure(
+        failure_class=GatewayFailureClass.UNAVAILABLE,
+        safe_message="root funding preflight is unavailable",
+    )
+    accounting = NativeAttemptAccounting(ledger)
+    route = _route((_deployment("first", connection_sha256="b" * 64),))
+    entry = InflightRequest(
+        authorization=route.snapshot.authorization,
+        route=route,
+        request=_request(),
+        deadline_monotonic=time.monotonic() + 10,
+    )
+    accounting.register(entry)
+    with pytest.raises(NativeBridgeError) as raised:
+        accounting.start_attempt(
+            json.dumps({"request_id": entry.authorization.request_id, "attempt_ordinal": 0})
+        )
+    assert json.loads(raised.value.public_error_json)["status_code"] == 503
+    assert ledger.finished_requests == [ledger.typed_rejection]
+    assert not ledger.started
+
+
 class _RecordingLedger:
     """Blocking write-ledger fake recording every waterfall write."""
 
@@ -127,6 +153,7 @@ class _RecordingLedger:
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
         self.fail_finishes = 0
+        self.typed_rejection: GatewayFailure | None = None
         self._counter = 0
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
@@ -150,6 +177,8 @@ class _RecordingLedger:
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
         del snapshot, maximum_cost_nano_usd, fallback_reason
+        if self.typed_rejection is not None:
+            raise AttemptRejectedError("root preflight required", failure=self.typed_rejection)
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")

@@ -31,6 +31,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
+from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 from exp.runtime.router.runtime import RouterRuntime
@@ -425,7 +426,14 @@ class CatalogRouteResolver:
             raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
         target = authorization.target
         if isinstance(target, DirectTarget):
-            pools = (self._pool(view, target.pool_id),)
+            root_pool = self._pool(view, target.pool_id)
+            plan = model_execution_snapshot(view.catalog, authorization, root_pool)
+            if deployment_id not in plan.deployment_ids:
+                raise GatewayRoutingError(
+                    "reasoning carrier deployment is not reachable in current authority"
+                )
+            stage = plan.stage_for_depth(plan.deployment_ids.index(deployment_id))
+            pools = (self._pool(view, stage.pool_id),)
         else:
             if target.catalog_sha256 != authorization.catalog_sha256:
                 raise GatewayRoutingError(
@@ -445,26 +453,26 @@ class CatalogRouteResolver:
         deployment = view.deployments.get(deployment_id)
         if deployment is None or deployment.exact_model_id != pool.exact_model_id:
             raise GatewayRoutingError("reasoning carrier deployment identity is invalid")
-        # The pool's normal ladder minus the issuing rung, in pool order, so a
-        # failover past the pin walks the same rungs a fresh request would.
-        fallbacks: list[ExactModelDeployment] = []
-        for fallback_id in pool.deployment_ids:
-            if fallback_id == deployment_id:
-                continue
-            fallback = view.deployments.get(fallback_id)
-            if fallback is None or fallback.exact_model_id != pool.exact_model_id:
-                raise GatewayRoutingError("frozen pool deployment identity is invalid")
-            fallbacks.append(fallback)
+        plan = model_execution_snapshot(view.catalog, authorization, pool)
+        if isinstance(target, DirectTarget):
+            plan = model_execution_snapshot(
+                view.catalog, authorization, self._pool(view, target.pool_id)
+            )
+        pinned_depth = plan.deployment_ids.index(deployment_id)
+        if plan.model_stages:
+            # A pin may lead its own segment, never resurrect preceding ancestors.
+            pinned_stage = plan.stage_for_depth(pinned_depth).stage_index
+            eligible = tuple(
+                i
+                for i in range(len(plan.deployment_ids))
+                if plan.stage_for_depth(i).stage_index >= pinned_stage and i != pinned_depth
+            )
+        else:
+            eligible = tuple(i for i in range(len(plan.deployment_ids)) if i != pinned_depth)
+        snapshot = project_stage_selection(plan, (pinned_depth, *eligible))
+        fallbacks = [view.deployments[d] for d in snapshot.deployment_ids[1:]]
         return GatewayRoute(
-            snapshot=ExecutionSnapshot(
-                authorization=authorization,
-                exact_model_id=pool.exact_model_id,
-                pool_id=pool.pool_id,
-                deployment_ids=(deployment_id, *(item.deployment_id for item in fallbacks)),
-                failover_mode=pool.failover_mode,
-                throttle_cache_threshold=pool.throttle_cache_threshold,
-                throttle_redial=pool.throttle_redial,
-            ),
+            snapshot=snapshot,
             deployment=deployment,
             fallback_deployments=tuple(fallbacks),
             route_reason=REASONING_CONTINUATION_ROUTE_REASON,
@@ -535,22 +543,21 @@ class CatalogRouteResolver:
         fallback_reason: str | None,
     ) -> GatewayRoute:
         """Build one ordered execution route from a certified exact-model pool."""
+        try:
+            snapshot = model_execution_snapshot(view.catalog, authorization, pool)
+        except ValueError as exc:
+            raise GatewayRoutingError(str(exc)) from exc
         deployments: list[ExactModelDeployment] = []
-        for deployment_id in pool.deployment_ids:
+        for depth, deployment_id in enumerate(snapshot.deployment_ids):
             deployment = view.deployments.get(deployment_id)
-            if deployment is None or deployment.exact_model_id != pool.exact_model_id:
+            if (
+                deployment is None
+                or deployment.exact_model_id != snapshot.stage_for_depth(depth).exact_model_id
+            ):
                 raise GatewayRoutingError("frozen pool deployment identity is invalid")
             deployments.append(deployment)
         return GatewayRoute(
-            snapshot=ExecutionSnapshot(
-                authorization=authorization,
-                exact_model_id=pool.exact_model_id,
-                pool_id=pool.pool_id,
-                deployment_ids=pool.deployment_ids,
-                failover_mode=pool.failover_mode,
-                throttle_cache_threshold=pool.throttle_cache_threshold,
-                throttle_redial=pool.throttle_redial,
-            ),
+            snapshot=snapshot,
             deployment=deployments[0],
             fallback_deployments=tuple(deployments[1:]),
             route_reason=route_reason,

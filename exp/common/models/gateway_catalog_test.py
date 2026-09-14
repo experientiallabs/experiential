@@ -310,7 +310,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     }
     assert fingerprint == {
         "schema_version": 4,
-        "normalized": ["deployments", "pools", "schema_version"],
+        "normalized": ["deployments", "model_chains", "pools", "schema_version"],
         "deployment": [
             "billing_source",
             "capabilities",

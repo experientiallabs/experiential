@@ -61,6 +61,7 @@ class AffinityPlacement:
     fingerprint: bytes | None = None
     sticky_preferred: bool = False
     sticky_deployment_id: str | None = None
+    recovery_reason: str | None = None
 
 
 def sticky_first_order(

@@ -166,6 +166,7 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
     DeploymentWire {
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
+        exact_model_id: "exact-model".to_string(),
         dialect: "openai_compatible".to_string(),
         url: url.to_string(),
         headers: HashMap::new(),
@@ -187,6 +188,7 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
         throttle_redial_budget,
+        throttle_redial: None,
     }
 }
 

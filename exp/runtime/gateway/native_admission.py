@@ -35,6 +35,7 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import require_prompt_fits_context_window
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
@@ -365,6 +366,25 @@ def _prefer_cache_capable_rungs(
     ``cache_control`` ``ignored_parameters`` entries. ``maximize_availability``
     pools keep their certified order untouched.
     """
+    if route.snapshot.model_stages:
+        order: list[int] = []
+        start = 0
+        for stage in route.snapshot.model_stages:
+            indexes = tuple(range(start, start + len(stage.deployment_ids)))
+            ranked = indexes
+            if stage.failover_mode == "maximize_cache" and request_carries_cache_markers(
+                provider_request
+            ):
+                ranked = tuple(
+                    i for i in indexes if resolved_wires[i][0].dialect == "anthropic_messages"
+                ) + tuple(
+                    i for i in indexes if resolved_wires[i][0].dialect != "anthropic_messages"
+                )
+            order.extend(ranked)
+            start += len(stage.deployment_ids)
+        return reorder_route_deployments(route, tuple(order)), tuple(
+            resolved_wires[i] for i in order
+        )
     if route.snapshot.failover_mode != "maximize_cache":
         return route, resolved_wires
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
@@ -428,6 +448,15 @@ def _affinity_ordered_rungs(
     wires still dispatches the marker-honoring group first, ordered within
     each group. The other two failover modes are untouched.
     """
+    if route.snapshot.model_stages or accounting.recovery_host is not None:
+        return stage_affinity_ordered_rungs(
+            route,
+            resolved_wires,
+            provider_request,
+            accounting=accounting,
+            authorization=authorization,
+            continuation=continuation,
+        )
     if route.snapshot.failover_mode != "maximize_cache_affinity":
         return route, resolved_wires, AffinityPlacement()
     material = affinity_seed_material(

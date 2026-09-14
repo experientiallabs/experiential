@@ -24,6 +24,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPoolId,
     FailoverMode,
 )
+from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
 from exp.runtime.gateway.reasoning_blocks import (
     EncryptedReasoningBlock as EncryptedReasoningBlock,
@@ -940,13 +941,9 @@ class AuthorizationSnapshot(ContractModel):
     and never a credential; ``None`` when no trusted hop yields an address (an
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
-    """Relative weight of this organization for fair-share rung admission.
-
-    Populated by the hosted store's ``authorize_request`` from its own org data
-    (paying tiers heavier than promo/free); the default 1 gives every caller an
-    equal share, which is byte-identical to pre-fair-share behavior. Read only
-    on rungs whose ``GatewayRungDispatchPolicy.fair_share`` is authored on.
-    """
+    """Organization weight used only on rungs authoring weighted fair-share admission."""
+    descendant_start_authorized: bool = False
+    """Host proved root funding and policy gates before permitting a sticky child start."""
 
 
 class ExecutionSnapshot(ContractModel):
@@ -965,8 +962,37 @@ class ExecutionSnapshot(ContractModel):
     # cached fraction on the throttled rung against it. ``None`` leaves the
     # failover mode's own throttle rule in force.
     throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
-    # The pool's backoff-and-redial schedule for throttled rungs, carried so
-    # the admission can hand the data plane its frozen retry facts and the
-    # per-attempt decision can honor a post-backoff redial. ``None`` keeps
-    # throttles failover-only.
     throttle_redial: GatewayThrottleRedialPolicy | None = None
+    model_stages: tuple[ModelExecutionStage, ...] = ()
+    traversal_events: tuple[ModelTraversalEvent, ...] = ()
+
+    @model_validator(mode="after")
+    def _require_stage_projection(self) -> ExecutionSnapshot:
+        """Require the ordered stage leaves to exactly cover the dispatch cursor."""
+        if (
+            self.model_stages
+            and tuple(d for s in self.model_stages for d in s.deployment_ids) != self.deployment_ids
+        ):
+            raise ValueError("execution stages must exactly cover ordered deployment_ids")
+        return self
+
+    def stage_for_depth(self, depth: int) -> ModelExecutionStage:
+        """Return the exact destination authority, never substitute the root model."""
+        if not 0 <= depth < len(self.deployment_ids):
+            raise ValueError("execution route depth is outside the authorized plan")
+        if not self.model_stages:
+            return ModelExecutionStage(
+                stage_index=0,
+                exact_model_id=self.exact_model_id,
+                pool_id=self.pool_id,
+                deployment_ids=self.deployment_ids,
+                failover_mode=self.failover_mode,
+                throttle_cache_threshold=self.throttle_cache_threshold,
+                throttle_redial=self.throttle_redial,
+            )
+        cursor = 0
+        for stage in self.model_stages:
+            cursor += len(stage.deployment_ids)
+            if depth < cursor:
+                return stage
+        raise ValueError("execution stage projection is incomplete")

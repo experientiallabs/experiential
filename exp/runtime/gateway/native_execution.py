@@ -37,6 +37,7 @@ from exp.runtime.gateway.execution_resolution import (
 )
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
@@ -222,6 +223,9 @@ class InflightRequest:
     # Whether the route's depth 0 was chosen by a live sticky binding rather
     # than rendezvous order, for the ``affinity_sticky`` disclosure.
     sticky_preferred: bool = False
+    recovery_recorded_attempts: set[str] = field(default_factory=set)
+    recovery_reason: str | None = None
+    overflow_used: bool = False
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -733,9 +737,7 @@ def select_route_deployments(
         return route
     selected = tuple(deployments[index] for index in indexes)
     return GatewayRoute(
-        snapshot=route.snapshot.model_copy(
-            update={"deployment_ids": tuple(item.deployment_id for item in selected)}
-        ),
+        snapshot=project_stage_selection(route.snapshot, indexes),
         deployment=selected[0],
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
@@ -789,11 +791,13 @@ def reorder_route_deployments(
         raise ValueError("route reorder requires a permutation of every deployment")
     if order == tuple(range(len(deployments))):
         return route
+    if route.snapshot.model_stages and tuple(
+        route.snapshot.stage_for_depth(i).stage_index for i in order
+    ) != tuple(route.snapshot.stage_for_depth(i).stage_index for i in range(len(deployments))):
+        raise ValueError("route scheduling cannot cross a model reference boundary")
     selected = tuple(deployments[index] for index in order)
     return GatewayRoute(
-        snapshot=route.snapshot.model_copy(
-            update={"deployment_ids": tuple(item.deployment_id for item in selected)}
-        ),
+        snapshot=project_stage_selection(route.snapshot, order),
         deployment=selected[0],
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
@@ -847,9 +851,13 @@ def deployment_wire_entry(
         The JSON-compatible wire entry consumed by the data plane.
     """
     capabilities = deployment.gateway.capabilities
+    stage = route.snapshot.stage_for_depth(
+        route.snapshot.deployment_ids.index(deployment.deployment_id)
+    )
     return {
         "provider": deployment.provider,
         "deployment_id": deployment.deployment_id,
+        "exact_model_id": deployment.exact_model_id,
         "dialect": profile.dialect,
         "url": profile.url,
         "headers": dict(profile.headers) if headers is None else dict(headers),
@@ -873,6 +881,9 @@ def deployment_wire_entry(
         # failover (the pool's schedule scaled by this request's cache at
         # stake); zero keeps the historical failover-only throttle.
         "throttle_redial_budget": throttle_redial_budget,
+        "throttle_redial": None
+        if stage.throttle_redial is None
+        else stage.throttle_redial.model_dump(mode="json"),
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
         # serving defaults when a deployment declares nothing.

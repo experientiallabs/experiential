@@ -120,6 +120,7 @@ from exp.runtime.gateway.native_settlement import (
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
+from exp.runtime.gateway.recovery import RecoveryHost
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -172,6 +173,7 @@ class NativeControlPlane(
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         cache_sample_gate: Callable[[str], bool] | None = None,
+        recovery_host: RecoveryHost | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
     ) -> None:
@@ -220,12 +222,12 @@ class NativeControlPlane(
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
-        # The accounting registry owns in-flight requests, per-dispatch
-        # reservations, deployment-health circuits, and the deadline sweep.
+        # Shared accounting owns reservations, health, recovery and deadline cleanup.
         self._accounting = NativeAttemptAccounting(
             self._write_ledger,
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
+            recovery_host=recovery_host,
         )
         # Every reservation tokenizes its prompt; build the packaged BPE now so
         # a fresh process pays that once at bind time, never on its first
@@ -659,6 +661,7 @@ class NativeControlPlane(
                 affinity_fingerprint=placement.fingerprint,
                 sticky_preferred=placement.sticky_preferred,
                 throttle_redial_budgets=redial_budgets,
+                recovery_reason=placement.recovery_reason,
             )
         )
         response: JsonObject = {

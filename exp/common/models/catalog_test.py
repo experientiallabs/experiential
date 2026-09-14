@@ -196,6 +196,7 @@ def test_authored_schema_version_window_and_shape_are_pinned() -> None:
             ModelCatalog.model_validate({**authored, "schema_version": rejected})
     assert sorted(ModelCatalog.model_fields) == [
         "connections",
+        "gateway_model_chains",
         "gateway_pools",
         "models",
         "roles",

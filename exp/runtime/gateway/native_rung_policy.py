@@ -78,7 +78,10 @@ def reserve_rung_slot(
     # (embeddings, images) must never be classed fresh wholesale.
     fresh_fraction = (
         policy.fresh_session_spill_fraction
-        if entry.route.snapshot.failover_mode == "maximize_cache_affinity"
+        if entry.route.snapshot.stage_for_depth(
+            entry.route.snapshot.deployment_ids.index(deployment.deployment_id)
+        ).failover_mode
+        == "maximize_cache_affinity"
         and entry.affinity_fingerprint is not None
         else None
     )
@@ -148,8 +151,9 @@ def failed_dispatch_candidate(
         (else ``None``).
     """
     route = entry.route
-    threshold = route.snapshot.throttle_cache_threshold
-    redial = route.snapshot.throttle_redial
+    stage = route.snapshot.stage_for_depth(current_depth)
+    threshold = stage.throttle_cache_threshold
+    redial = stage.throttle_redial
     deployment = route.deployments[current_depth]
     cached_fraction = loads.cached_fraction(
         rung_load_key(deployment), entry.authorization.organization_id
@@ -162,7 +166,7 @@ def failed_dispatch_candidate(
         attempt_counts=entry.attempt_counts,
         total_attempts=entry.total_attempts,
         refusal_failover=entry.authorization.refusal_failover,
-        failover_mode=route.snapshot.failover_mode,
+        failover_mode=stage.failover_mode,
         throttle_cache_threshold=threshold,
         cached_fraction=cached_fraction,
         throttle_redial=redial,
@@ -284,18 +288,20 @@ def throttle_redial_budgets(
         One redial budget per route deployment, in route order.
     """
     snapshot = route.snapshot
-    schedule = snapshot.throttle_redial
-    if schedule is None:
-        return tuple(0 for _ in route.deployments)
-    threshold = snapshot.throttle_cache_threshold
-    if threshold is None or threshold <= 0:
-        return tuple(schedule.max_attempts for _ in route.deployments)
     last_depth = len(route.deployments) - 1
     pinned_deployment_id = route.reasoning_pinned_deployment_id
     budgets: list[int] = []
     for depth, deployment in enumerate(route.deployments):
+        stage = snapshot.stage_for_depth(depth)
+        schedule = stage.throttle_redial
+        threshold = stage.throttle_cache_threshold
+        if schedule is None:
+            budgets.append(0)
+            continue
         if (
-            depth == last_depth
+            threshold is None
+            or threshold <= 0
+            or depth == last_depth
             or deployment.deployment_id == sticky_deployment_id
             or deployment.deployment_id == pinned_deployment_id
         ):

@@ -319,8 +319,14 @@ class SQLiteAttemptLedger:
                 raise GatewayLedgerError("route context must be a short display-safe code")
         if deployment.deployment_id not in snapshot.deployment_ids:
             raise GatewayLedgerError("attempt deployment is absent from the execution snapshot")
-        if deployment.exact_model_id != snapshot.exact_model_id:
-            raise GatewayLedgerError("attempt deployment changes the selected exact model")
+        stage = snapshot.stage_for_depth(route_depth)
+        if (
+            deployment.deployment_id != snapshot.deployment_ids[route_depth]
+            or deployment.deployment_id not in stage.deployment_ids
+        ):
+            raise GatewayLedgerError("attempt deployment differs from its authorized stage cursor")
+        if deployment.exact_model_id != stage.exact_model_id:
+            raise GatewayLedgerError("attempt deployment changes the selected stage exact model")
         if (
             preferred_deployment is not None
             and preferred_deployment.deployment_id == deployment.deployment_id
@@ -378,8 +384,8 @@ class SQLiteAttemptLedger:
                 route_depth,
                 deployment.deployment_id,
                 deployment.provider,
-                snapshot.exact_model_id,
-                snapshot.pool_id,
+                stage.exact_model_id,
+                stage.pool_id,
                 snapshot.authorization.catalog_sha256,
                 deployment.billing_source.value,
                 deployment.gateway.pricing_source,
@@ -443,7 +449,8 @@ class SQLiteAttemptLedger:
             organization_id=snapshot.authorization.organization_id,
             identity_id=str(request["identity_id"]),
             alias_id=str(request["alias_id"]),
-            pool_id=snapshot.pool_id,
+            pool_id=stage.pool_id,
+            root_pool_id=snapshot.pool_id,
             deployment_id=deployment.deployment_id,
             attempt_id=attempt_id,
             period_start=period_start,

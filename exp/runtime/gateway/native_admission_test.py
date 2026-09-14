@@ -503,6 +503,8 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
 
+        recovery_host = None
+
         recorded = 0
 
         def record_admission_coercions(self, count: int) -> None:
@@ -570,6 +572,8 @@ def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
 
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
+
+        recovery_host = None
 
         recorded = 0
 
@@ -648,6 +652,8 @@ def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_discl
 
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
+
+        recovery_host = None
 
         recorded = 0
 
@@ -743,6 +749,8 @@ def _tool_screenshot_route_request(*, stream: bool) -> GatewayRequest:
 
 class _AdmissionCoercionCounter:
     """Count coercion recordings without a live ledger."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         self.recorded = 0
@@ -908,7 +916,7 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
     # House rung: billing_customer_managed False and no tier pricing, so it does
     # not forward service_tier.
     wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
-    accounting = cast(NativeAttemptAccounting, object())
+    accounting = cast(NativeAttemptAccounting, _CoercionCounter())
 
     for tier in ("flex", "priority"):
         request = GatewayRequest(
@@ -991,7 +999,7 @@ def test_tier_priced_host_lane_admits_the_named_tier() -> None:
         route,
         wires,
         request,
-        accounting=cast(NativeAttemptAccounting, object()),
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
         authorization=route.snapshot.authorization,
     )
     # The tier survives to the provider request on the tier-priced house lane.
@@ -1005,7 +1013,7 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
     (the customer pays the provider directly)."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
-    accounting = cast(NativeAttemptAccounting, object())
+    accounting = cast(NativeAttemptAccounting, _CoercionCounter())
     client = cast(NativeWireClient, object())
     streaming = GatewayDeploymentCapabilities(supports_streaming=True)
 
@@ -1091,6 +1099,8 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
 
 class _CoercionCounter:
     """Count coercion recordings without a live ledger."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         """Start at zero recorded coercions."""
@@ -1318,7 +1328,7 @@ def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> N
             _wires(),
             request,
             # Never reached: the refusal precedes every coercion or reservation.
-            accounting=cast(NativeAttemptAccounting, object()),
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
             authorization=route.snapshot.authorization,
         )
 
@@ -1402,6 +1412,8 @@ def _order(route: GatewayRoute) -> tuple[str, ...]:
 
 class _AffinityAccounting:
     """Just the sticky and health registries affinity ordering reads."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         """Compose fresh empty registries."""

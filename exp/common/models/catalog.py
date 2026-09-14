@@ -31,6 +31,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.files import write_text_atomic
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
@@ -660,7 +661,8 @@ class GatewayDeploymentMetadata(ContractModel):
     pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
     pricing_effective_at: AwareDatetime | None = None
     dispatch: GatewayRungDispatchPolicy | None = None
-    """Optional dispatch policy for this rung; ``None`` is fully inert."""
+    cache_retention_seconds: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
+    """Conservative declared cache lifetime; unknown means no plausible warmth claim."""
 
 
 class ModelRecord(ContractModel):
@@ -815,6 +817,7 @@ class ModelCatalog(ContractModel):
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
     gateway_pools: dict[str, GatewayPoolRecord] = Field(default_factory=dict)
+    gateway_model_chains: dict[str, GatewayModelChain] = Field(default_factory=dict)
     roles: ModelRoles = Field(default_factory=ModelRoles)
 
     @field_validator("schema_version", mode="before")
