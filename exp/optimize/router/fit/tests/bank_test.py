@@ -311,3 +311,46 @@ def _world_protocol() -> EvaluationProtocol:
         judge_calibration_id="calibration-a",
         pricing_snapshot_id="pricing-a",
     )
+
+
+def test_novelty_floor_ignores_duplicate_embeddings() -> None:
+    """Duplicate tasks in the fit dataset do not collapse novelty floor to 1.0."""
+    from exp.common.routing.bank import _novelty_floor
+
+    # 10 identical vectors of (1.0, 0.0) and 10 identical vectors of (0.0, 1.0)
+    cluster_a = np.repeat([[1.0, 0.0]], 10, axis=0)
+    cluster_b = np.repeat([[0.0, 1.0]], 10, axis=0)
+    embeddings = np.vstack([cluster_a, cluster_b]).astype(np.float32)
+
+    # With duplicates ignored, nearest distinct neighbor similarity is 0.0, not 1.0
+    floor = _novelty_floor(embeddings)
+    assert floor == pytest.approx(0.0)
+
+
+def test_novelty_floor_unequal_duplicate_clusters_do_not_skew_percentile() -> None:
+    """Large duplicate clusters do not dominate distinct neighbor percentiles."""
+    from exp.common.routing.bank import _novelty_floor
+
+    # One huge cluster of 100 identical vectors and two distinct single vectors
+    cluster_huge = np.repeat([[1.0, 0.0]], 100, axis=0)
+    distinct_1 = np.asarray([[0.0, 1.0]])
+    distinct_2 = np.asarray([[0.6, 0.8]])
+    embeddings = np.vstack([cluster_huge, distinct_1, distinct_2]).astype(np.float32)
+
+    # The 3 distinct vectors are (1, 0), (0, 1), (0.6, 0.8)
+    # Nearest neighbor similarities:
+    # (1, 0) -> (0.6, 0.8) = 0.6
+    # (0, 1) -> (0.6, 0.8) = 0.8
+    # (0.6, 0.8) -> (0, 1) = 0.8
+    # Nearest values across distinct vectors: [0.6, 0.8, 0.8]
+    # 5th percentile is approximately 0.6
+    floor = _novelty_floor(embeddings)
+    assert 0.59 <= floor <= 0.65
+
+
+def test_novelty_floor_all_duplicate_bank_preserves_conservative_fallback() -> None:
+    """An all-duplicate bank with no distinct-neighbor evidence falls back to 1.0."""
+    from exp.common.routing.bank import _novelty_floor
+
+    cluster_all_same = np.repeat([[0.6, 0.8]], 50, axis=0).astype(np.float32)
+    assert _novelty_floor(cluster_all_same) == 1.0
