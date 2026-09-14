@@ -727,6 +727,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             target=target,
             catalog_sha256=str(row["catalog_sha256"]),
             canonical_request_sha256=canonical_request_sha256(request),
+            request_tags=request.request_tags if isinstance(request, GatewayRequest) else {},
             deadline_monotonic=deadline_monotonic,
             surface=request.surface,
             caller_operation_sha256=caller_operation,
