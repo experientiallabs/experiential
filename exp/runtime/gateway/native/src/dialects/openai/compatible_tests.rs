@@ -14,10 +14,11 @@ fn frame(choice: Value) -> SseEvent {
 }
 
 fn annotation(finish: Option<&str>) -> Value {
+    let filtered = finish == Some("content_filter");
     json!({
         "index": 0, "finish_reason": finish,
         "content_filter_results": {
-            "hate": {"filtered": finish == Some("content_filter"), "severity": "safe"}
+            "hate": {"filtered": filtered, "severity": if filtered { "high" } else { "safe" }}
         },
         "content_filter_offsets": {"check_offset": 49, "start_offset": 47, "end_offset": 49}
     })

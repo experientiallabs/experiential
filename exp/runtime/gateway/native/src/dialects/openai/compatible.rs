@@ -112,18 +112,13 @@ impl Normalizer {
         // finish reason below: an annotation can terminate with content_filter.
         // An explicitly invalid delta or an unrecognized missing-delta frame
         // remains malformed.
+        let is_filter_annotation = ["content_filter_results", "content_filter_offsets"]
+            .iter()
+            .all(|field| choice.get(*field).is_some_and(Value::is_object));
         let empty_delta = serde_json::Map::new();
         let delta = match choice.get("delta") {
             Some(Value::Object(delta)) => delta,
-            None if choice
-                .get("content_filter_results")
-                .is_some_and(Value::is_object)
-                && choice
-                    .get("content_filter_offsets")
-                    .is_some_and(Value::is_object) =>
-            {
-                &empty_delta
-            }
+            None if is_filter_annotation => &empty_delta,
             _ => return Err(malformed("OpenAI-compatible delta must be an object")),
         };
         if let Some(Value::String(content)) = delta.get("content") {
