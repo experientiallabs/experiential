@@ -92,6 +92,10 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Throttled rungs re-dialed after backoff.",
     ),
     (
+        "throttle_backoff_forced_admissions",
+        "Redials forced past a rung shed.",
+    ),
+    (
         "reconciled_expired_requests",
         "Crashed requests reconciled at startup.",
     ),

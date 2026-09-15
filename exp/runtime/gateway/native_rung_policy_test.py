@@ -38,6 +38,8 @@ from exp.runtime.gateway.native_execution import InflightRequest, deployment_hea
 from exp.runtime.gateway.native_rung_policy import (
     failed_dispatch_candidate,
     reserve_rung_slot,
+    shed_keeps_pin,
+    shed_keeps_rung,
     throttle_redial_budgets,
 )
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
@@ -508,3 +510,28 @@ def test_throttle_redial_budget_is_the_full_schedule_on_the_warm_sticky_rung() -
     assert throttle_redial_budgets(
         loads, gated.route, "organization-one", sticky_deployment_id="deployment-b"
     ) == (2, 2, 2)
+
+
+def test_shed_keeps_rung_force_admits_the_redialed_rung_and_the_first_pinned_dispatch() -> None:
+    """A backoff redial keeps its rung through a shed; a pinned issuing rung only pre-failure."""
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+    )
+    route = _entry(deployments).route
+    # The redialed rung is kept whatever the failure history or pin state.
+    assert shed_keeps_rung(route, 0, 0, _THROTTLE) is True
+    assert shed_keeps_rung(route, 0, 0, None) is True
+    # A shed on any other rung of a failed ladder spills sideways.
+    assert shed_keeps_rung(route, 1, 0, _THROTTLE) is False
+    assert shed_keeps_rung(route, 1, None, _THROTTLE) is False
+    # Without a pin, a first-dispatch shed spills too.
+    assert shed_keeps_rung(route, 0, None, None) is False
+    assert shed_keeps_pin(route, 0) is False
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "deployment-a"})
+    assert shed_keeps_pin(pinned, 0) is True
+    assert shed_keeps_pin(pinned, 1) is False
+    # The pinned issuing rung is kept on its first dispatch, not after a real failure on it.
+    assert shed_keeps_rung(pinned, 0, None, None) is True
+    assert shed_keeps_rung(pinned, 0, None, _THROTTLE) is False
+    assert shed_keeps_rung(pinned, 1, None, None) is False

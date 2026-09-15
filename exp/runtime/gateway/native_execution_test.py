@@ -1023,6 +1023,17 @@ def test_dispatch_disclosure_names_a_backoff_redial_on_every_pool() -> None:
         "affinity",
         None,
     )
+    # A redial the rung's own policy shed and the accounting force-admitted
+    # stays throttle_backoff: neither the shed reason nor saturated_overflow
+    # may relabel the attempt the caller waited the backoff for.
+    for pool in (route, affinity):
+        assert dispatch_disclosure(
+            pool,
+            0,
+            policy_sheds=[(0, "rate_limit")],
+            forced_overflow=True,
+            throttle_backoff=True,
+        ) == (THROTTLE_BACKOFF, None)
 
 
 def test_wire_entry_carries_the_throttle_redial_budget() -> None:

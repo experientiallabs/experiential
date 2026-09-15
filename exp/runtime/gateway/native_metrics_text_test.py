@@ -48,6 +48,7 @@ def _control_plane() -> JsonObject:
         "throttle_surfaced_cache_preserving": 2,
         "throttle_failover_cold": 5,
         "throttle_backoff_redials": 7,
+        "throttle_backoff_forced_admissions": 6,
         "sticky_spill_bindings": 4,
         # JSON-snapshot-only: per-rung learned ceilings never render as text,
         # so the exposition carries no per-rung label cardinality.
@@ -140,6 +141,9 @@ exp_gateway_throttle_failover_cold_total 5
 # HELP exp_gateway_throttle_backoff_redials_total Throttled rungs re-dialed after backoff.
 # TYPE exp_gateway_throttle_backoff_redials_total counter
 exp_gateway_throttle_backoff_redials_total 7
+# HELP exp_gateway_throttle_backoff_forced_admissions_total Redials forced past a rung shed.
+# TYPE exp_gateway_throttle_backoff_forced_admissions_total counter
+exp_gateway_throttle_backoff_forced_admissions_total 6
 # HELP exp_gateway_reconciled_expired_requests_total Crashed requests reconciled at startup.
 # TYPE exp_gateway_reconciled_expired_requests_total counter
 exp_gateway_reconciled_expired_requests_total 0

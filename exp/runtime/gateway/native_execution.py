@@ -307,6 +307,11 @@ def dispatch_disclosure(
     bypassed rung itself (the counterfactual the bypass is measured against).
     A post-backoff redial of a throttled rung is ``throttle_backoff`` on every
     pool: the chosen rung is the preferred rung, so no counterfactual is named.
+    That holds when the redialed rung's own dispatch policy shed the redial
+    and the accounting force-admitted it there anyway: the shed is remembered
+    in ``policy_sheds`` and counted, but ``throttle_backoff`` wins over
+    ``saturated_overflow`` and over the shed reason, because the caller waited
+    the backoff for exactly this rung and the attempt row must say so.
 
     Args:
         route: Frozen ordered route for this request.

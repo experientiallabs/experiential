@@ -220,6 +220,42 @@ def shed_keeps_pin(route: GatewayRoute, candidate: int) -> bool:
     )
 
 
+def shed_keeps_rung(
+    route: GatewayRoute,
+    candidate: int,
+    redial_depth: int | None,
+    last_failure: GatewayFailure | None,
+) -> bool:
+    """Whether a policy shed of ``candidate`` force-admits it instead of spilling sideways.
+
+    Two rungs are kept. The rung a post-backoff throttle redial re-dials
+    (``candidate == redial_depth``): the data plane already waited the pool's
+    ``throttle_redial`` schedule to keep the caller's provider cache on that
+    rung, the redial count is bounded by the rung's admission-time budget and
+    the request's attempt cap, and the provider's own 429 window governs the
+    load actually placed there, so the rung's per-worker rate or concurrency
+    facts must not convert the paid-for redial into a cold failover that a
+    prompt of this size may never finish within a fallback's first-byte
+    allowance. And the issuing rung of a reasoning-pinned route on a first
+    dispatch (``shed_keeps_pin``), before any real failure on it. Every other
+    shed spills sideways to the next claimable rung.
+
+    Args:
+        route: The admitted route.
+        candidate: Route position of the rung that shed.
+        redial_depth: The rung a post-backoff redial re-dials, or ``None``
+            when this reservation is not a redial.
+        last_failure: The classified failure that ended the previous
+            dispatch, or ``None`` on the request's first reservation.
+
+    Returns:
+        Whether the accounting keeps the candidate and admits it past the policy.
+    """
+    if candidate == redial_depth:
+        return True
+    return last_failure is None and shed_keeps_pin(route, candidate)
+
+
 def throttle_redial_budgets(
     loads: RungLoadRegistry,
     route: GatewayRoute,
