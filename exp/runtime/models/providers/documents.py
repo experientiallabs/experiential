@@ -36,9 +36,6 @@ Chat Completions ``file`` parts carry ``file_data`` or an uploaded
 ``file_id`` only, so the ``openai_compatible`` dialect is deliberately absent.
 """
 
-PDF_CAPABILITY = "pdf_input"
-"""Capability literal naming a wire's ability to carry a caller PDF."""
-
 PDF_URL_CAPABILITY = "pdf_url_input"
 """Capability literal naming a provider-side fetch of a caller document URL."""
 

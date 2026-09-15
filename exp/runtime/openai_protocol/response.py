@@ -6,12 +6,10 @@ import json
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import AssistantAction
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
-    GatewayMessage,
     GatewayRequest,
     GatewayUsage,
 )
@@ -150,25 +148,3 @@ def _ignored_parameters_extension(request: GatewayRequest) -> JsonObject:
     if not request.ignored_parameters:
         return {}
     return {"x-experiential-ignored-parameters": list(request.ignored_parameters)}
-
-
-def assistant_message(events: tuple[GatewayEvent, ...]) -> GatewayMessage | None:
-    """Build continuation history without converting typed refusals into assistant text."""
-    if any(event.kind == GatewayEventKind.REFUSAL_DELTA for event in events):
-        return None
-    text = "".join(
-        event.text_delta or "" for event in events if event.kind == GatewayEventKind.TEXT_DELTA
-    )
-    tool_calls = tuple(
-        event.tool_call
-        for event in events
-        if event.kind == GatewayEventKind.TOOL_CALL_COMPLETED and event.tool_call is not None
-    )
-    if not text and not tool_calls:
-        return None
-    action = AssistantAction(content=text or None, tool_calls=tool_calls)
-    return GatewayMessage(
-        role="assistant",
-        content=action.content,
-        tool_calls=action.tool_calls,
-    )
