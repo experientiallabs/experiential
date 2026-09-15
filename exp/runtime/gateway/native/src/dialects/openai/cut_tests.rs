@@ -255,6 +255,8 @@ fn a_frame_without_choices_is_metadata_only() {
     for bad in [
         serde_json::json!({"choices": {"index": 0}}),
         serde_json::json!({"id": "x", "delta": {"content": "smuggled"}}),
+        serde_json::json!({"id": "x", "choices": null, "message": {"content": "flat"}}),
+        serde_json::json!({"id": "x", "choices": null, "finish_reason": "stop"}),
     ] {
         let mut strict = Normalizer::new(Dialect::OpenAiCompatible);
         let frame = SseEvent {
@@ -267,6 +269,57 @@ fn a_frame_without_choices_is_metadata_only() {
             .safe_message
             .contains("choices must be an array"));
     }
+}
+
+#[test]
+fn novita_trailing_sla_metrics_frame_with_null_choices_is_metadata() {
+    // The exact key set from the production operator line (novita
+    // deepseek-v4.1-flash, 48 attempts 2026-09-15): a trailing chunk after the
+    // finish with `choices: null`, no usage, and the relay's own
+    // `sla_metrics`. It carries nothing a decoder needs, so the stream still
+    // settles by its finish and its usage; a fixed metadata allowlist that
+    // did not know `sla_metrics` (or `choices` itself) failed the whole
+    // completed answer as malformed.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"content": "Hi"}),
+            None,
+        ))
+        .expect("text normalizes");
+    let finish = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "id": "chatcmpl-novita", "object": "chat.completion.chunk", "created": 1_789_000_000,
+            "model": "deepseek/deepseek-v4.1-flash",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+        })
+        .to_string(),
+    };
+    assert!(normalizer
+        .feed(&finish)
+        .expect("finish normalizes")
+        .is_empty());
+    let trailing = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "id": "chatcmpl-novita", "object": "chat.completion.chunk", "created": 1_789_000_000,
+            "model": "deepseek/deepseek-v4.1-flash", "system_fingerprint": null,
+            "choices": null,
+            "sla_metrics": {"ttft_ms": 412, "tpot_ms": 9, "tokens_per_second": 108.3},
+        })
+        .to_string(),
+    };
+    assert!(normalizer
+        .feed(&trailing)
+        .expect("a choices-less frame with only relay metadata is not malformed")
+        .is_empty());
+    let events = normalizer.feed(&done()).expect("stream completes");
+    assert!(matches!(
+        events.as_slice(),
+        [Event::Usage(usage), Event::Completed] if usage.output_tokens == Some(3)
+    ));
 }
 
 #[test]

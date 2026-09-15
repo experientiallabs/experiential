@@ -20,24 +20,35 @@ fn wire_text(value: Option<&Value>, label: &str) -> Result<Option<String>, Failu
     }
 }
 
-/// Whether a choices-less chunk carries only the OpenAI chunk envelope's
-/// metadata keys (identity, timing, usage, Azure's prompt-filter report), so
-/// nothing a decoder would need is being skipped.
+/// Whether a choices-less chunk carries nothing a decoder would need: no
+/// top-level key that any OpenAI-family shape uses for content, a finish, a
+/// tool call, or an error. Everything else on such a frame is envelope
+/// metadata — identity, timing, usage, Azure's prompt-filter report, and
+/// provider-specific extras such as Novita's `sla_metrics` (a trailing
+/// `choices: null` chunk with no usage; 48 attempts on 2026-09-15 failed a
+/// finished stream closed on it under the earlier fixed allowlist). An
+/// allowlist cannot keep up with what relays append; the content keys are
+/// the closed set worth guarding.
 fn is_metadata_only_frame(payload: &serde_json::Map<String, Value>) -> bool {
-    const METADATA_KEYS: [&str; 9] = [
-        "id",
-        "object",
-        "created",
-        "model",
-        "system_fingerprint",
-        "service_tier",
-        "usage",
-        "prompt_filter_results",
-        "obfuscation",
+    const CONTENT_KEYS: [&str; 14] = [
+        "delta",
+        "message",
+        "content",
+        "text",
+        "tool_calls",
+        "function_call",
+        "finish_reason",
+        "refusal",
+        "reasoning_content",
+        "completion",
+        "output",
+        "candidates",
+        "error",
+        "detail",
     ];
-    payload
+    !payload
         .keys()
-        .all(|key| METADATA_KEYS.contains(&key.as_str()))
+        .any(|key| CONTENT_KEYS.contains(&key.as_str()))
 }
 
 /// Process-wide mint counter: two streams decoded in the same clock tick

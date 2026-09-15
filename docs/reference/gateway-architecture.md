@@ -76,11 +76,11 @@ Two relay shapes decode leniently instead of failing: a tool call streamed with 
 empty `id` gets a gateway-minted id (`call_gw<index>_<clock>`; a real id restated later is
 ignored, since the caller already holds the minted one), and an entry with an empty name
 and no arguments is a placeholder, dropped without starting a call (a nameless entry that
-does carry arguments still fails: a name cannot be invented). A Chat frame with no `choices`
-key whose keys are all chunk metadata (`id`, `usage`, …) is a trailing usage chunk and is
-read as such; one carrying anything else stays malformed. A Responses reasoning-summary
-`done` text that differs from its relayed deltas is logged, not failed (the summary is
-display-only prose).
+does carry arguments still fails: a name cannot be invented). A Chat frame with `choices` absent
+or null and no content-bearing key (`delta`, `message`, `finish_reason`, `error`, …) is a trailing
+metadata chunk (usage, Novita's `sla_metrics`) and is read as such; one carrying content stays
+malformed, naming the frame's key names. A Responses reasoning-summary `done` text that differs
+from its relayed deltas is logged, not failed (the summary is display-only prose).
 
 A stream that closes cleanly WITHOUT its terminal frame is judged by what it served: before
 any output it is `provider stream ended without a terminal event` (failover-eligible, nothing
