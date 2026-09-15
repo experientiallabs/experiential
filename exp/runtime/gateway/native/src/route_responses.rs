@@ -201,6 +201,7 @@ pub(crate) async fn responses(
         http: &state.http,
         request_id: &admission.request_id,
         raw_key: &raw_key,
+        caller_scope: admission.caller_scope.as_deref(),
         route: &admission.route,
         policy: admission.policy(),
         deadline,

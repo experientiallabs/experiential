@@ -589,7 +589,7 @@ async fn run_attempt(
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
-    let mut repair = AttemptRepair::begin(wire, ctx.raw_key, repaired);
+    let mut repair = AttemptRepair::begin(wire, ctx.caller_scope, repaired);
     let response = match open_stream(
         ctx.http,
         &wire.url,

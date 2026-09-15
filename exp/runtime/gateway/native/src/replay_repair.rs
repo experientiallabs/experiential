@@ -14,12 +14,14 @@
 //! it was served (production, 2026-09-15: about 74 refused dials a minute,
 //! 82% of one tenant's agent turns, every one a fast unbilled 400 that still
 //! counted against the provider's request rate). The memory holds only
-//! digests of refused payloads, salted by the presenting key (the caller's
-//! identity; the continuation store's own key does not exist for a stateless
-//! turn, and a prefix-derived conversation key would merge parallel sessions
-//! of one agent template), for a bounded time and count, per worker: a
-//! conversation converges after each worker has repaired it once, and a
-//! shared store would buy nothing worth its roll hazards.
+//! digests of refused payloads, salted by the caller's stable identity as
+//! admission names it (organization and identity ids; the continuation
+//! store's own key does not exist for a stateless turn, a prefix-derived
+//! conversation key would merge parallel sessions of one agent template, and
+//! the request's bearer is the front's ephemeral exchanged token in a hosted
+//! worker), for a bounded time and count, per worker: a conversation
+//! converges after each worker has repaired it once, and a shared store
+//! would buy nothing worth its roll hazards.
 //!
 //! Telemetry: the refused dial and its re-dial run under ONE reservation, so
 //! the ledger records one attempt and never the refusal. What does record it:
@@ -27,8 +29,10 @@
 //! Responses transport carries no response headers), the data-plane counters
 //! `encrypted_reasoning_stripped` (a refusal repaired on this attempt) and
 //! `encrypted_reasoning_stripped_proactive` (stripped from memory before the
-//! first dial), and one content-free operator line naming the mode, each
-//! written only once the dial has actually opened.
+//! first dial; a same-request re-dial reusing the rung's stripped payload is
+//! logged as `remembered` and counted by neither), and one content-free
+//! operator line naming the mode, each written only once the dial has
+//! actually opened.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
@@ -103,7 +107,18 @@ impl ReplayRepairMemory {
                 state.insertion_order.push_back(digest);
             }
         }
-        while state.insertion_order.len() > MEMORY_CAPACITY {
+        // The order queue also carries digests that already expired on
+        // recall; popping them costs nothing, and the map alone is what the
+        // capacity bounds.
+        while state.last_seen.len() > MEMORY_CAPACITY {
+            match state.insertion_order.pop_front() {
+                Some(oldest) => {
+                    state.last_seen.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        while state.insertion_order.len() > 2 * MEMORY_CAPACITY {
             if let Some(oldest) = state.insertion_order.pop_front() {
                 state.last_seen.remove(&oldest);
             }
@@ -123,8 +138,9 @@ impl ReplayRepairMemory {
                 true
             }
             Some(_) => {
+                // Expired: drop the entry in constant time and leave its
+                // place in the insertion order to the capacity sweep.
                 state.last_seen.remove(digest);
-                state.insertion_order.retain(|entry| entry != digest);
                 false
             }
             None => false,
@@ -274,7 +290,7 @@ pub fn without_encrypted_reasoning_where(
 /// repair once the dial that carried it has opened.
 pub(crate) struct AttemptRepair<'a> {
     wire: &'a DeploymentWire,
-    scope: &'a str,
+    scope: Option<&'a str>,
     repaired: &'a mut Option<Value>,
     stripped: bool,
     proactive: bool,
@@ -285,7 +301,7 @@ impl<'a> AttemptRepair<'a> {
     /// Prepare the first dial of this attempt.
     pub(crate) fn begin(
         wire: &'a DeploymentWire,
-        scope: &'a str,
+        scope: Option<&'a str>,
         repaired: &'a mut Option<Value>,
     ) -> Self {
         let mut repair = Self {
@@ -298,7 +314,7 @@ impl<'a> AttemptRepair<'a> {
         };
         if repair.repaired.is_some() {
             repair.stripped = true;
-        } else if wire.upstream_body.is_none() {
+        } else if let (None, Some(scope)) = (&wire.upstream_body, scope) {
             let remembered = |content: &str| MEMORY.recall(&payload_digest(scope, content));
             if let Some(stripped) =
                 without_encrypted_reasoning_where(&wire.upstream_payload, remembered)
@@ -362,11 +378,13 @@ impl<'a> AttemptRepair<'a> {
             None => Vec::new(),
         };
         let refused = if quoted.is_empty() { present } else { quoted };
-        MEMORY.remember(
-            refused
-                .into_iter()
-                .map(|content| payload_digest(self.scope, content)),
-        );
+        if let Some(scope) = self.scope {
+            MEMORY.remember(
+                refused
+                    .into_iter()
+                    .map(|content| payload_digest(scope, content)),
+            );
+        }
         *self.repaired = Some(stripped);
         self.stripped = true;
         self.reactive = true;
@@ -378,16 +396,17 @@ impl<'a> AttemptRepair<'a> {
         if !self.stripped {
             return;
         }
+        // A same-request re-dial that reuses the rung's stripped payload
+        // recalled nothing and may repeat under throttle: logged as
+        // `remembered`, counted by neither counter.
         let mode = if self.reactive {
             METRICS.record_encrypted_reasoning_stripped();
             "reactive"
-        } else {
+        } else if self.proactive {
             METRICS.record_encrypted_reasoning_stripped_proactive();
-            if self.proactive {
-                "proactive"
-            } else {
-                "remembered"
-            }
+            "proactive"
+        } else {
+            "remembered"
         };
         let line = json!({
             "event": "encrypted_reasoning_stripped",
@@ -537,6 +556,10 @@ mod tests {
         }
         assert!(!memory.recall(&one));
         assert!(memory.is_empty());
+        // An expired digest is learned again and bounded like any other.
+        memory.remember([one]);
+        assert!(memory.recall(&one));
+        assert_eq!(memory.len(), 1);
     }
 
     #[test]

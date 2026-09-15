@@ -114,6 +114,9 @@ pub struct WaterfallContext<'a> {
     /// The presented virtual key, forwarded so hosted budget-error policy
     /// can shape a rejected reservation for the caller.
     pub raw_key: &'a str,
+    /// The caller's stable identity from admission, scoping the per-caller
+    /// replay-repair memory; `None` disables that memory for the request.
+    pub caller_scope: Option<&'a str>,
     pub route: &'a [DeploymentWire],
     pub policy: RoutePolicy,
     pub deadline: Instant,

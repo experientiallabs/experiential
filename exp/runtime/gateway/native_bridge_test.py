@@ -492,6 +492,9 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     messages = cast("list[JsonObject]", payload["messages"])
     assert continued["route_reason"] == "reasoning_continuation"
     assert messages[1]["reasoning_content"] == hidden
+    # The data plane's per-caller repair memory keys on this, never on the raw key.
+    organization, identity = str(continued["caller_scope"]).split(":", maxsplit=1)
+    assert organization and identity == "default"
 
     transplanted = json.loads(continuation_body)
     transplanted["messages"][0]["content"] = "Use this carrier under a different prompt"

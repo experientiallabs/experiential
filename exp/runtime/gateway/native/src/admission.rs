@@ -73,6 +73,13 @@ pub(crate) struct Admission {
     /// `length`), never a completed empty answer.
     #[serde(default)]
     pub maximum_output_tokens: Option<u64>,
+    /// The caller's stable identity (organization and identity ids), the
+    /// scope of the data plane's per-caller replay-repair memory. The
+    /// request's own bearer cannot serve: in a hosted worker it is the
+    /// front's ephemeral exchanged token, different on every request.
+    /// Absent from an older control plane, which disables that memory.
+    #[serde(default)]
+    pub caller_scope: Option<String>,
 }
 
 impl Admission {

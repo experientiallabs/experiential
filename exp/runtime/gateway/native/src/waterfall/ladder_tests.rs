@@ -345,6 +345,7 @@ impl Harness {
             http: &self.http,
             request_id: "request-throttle",
             raw_key,
+            caller_scope: Some(raw_key),
             route,
             policy: RoutePolicy {
                 maximum_total_attempts: 8,

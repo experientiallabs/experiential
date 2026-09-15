@@ -675,11 +675,11 @@ class NativeControlPlane(
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": bool(policy is not None and policy.output_checks),
+            "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:
-            # The pool's frozen backoff-and-redial schedule; absent (not
-            # null) on pools that keep throttles failover-only, so an
-            # unauthored pool's admission is byte-identical.
+            # The pool's frozen backoff-and-redial schedule; absent (not null) on
+            # pools that keep throttles failover-only: their admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
