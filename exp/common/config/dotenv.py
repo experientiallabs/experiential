@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 ENV_FILE = ".env"
+_INVALID_ENV_FILE = (
+    "environment file must be a readable regular UTF-8 text file: {path}; "
+    "repair or replace it, or remove it to continue without one"
+)
 
 
 def load_env_file(path: str | Path = ENV_FILE) -> None:
@@ -13,11 +18,29 @@ def load_env_file(path: str | Path = ENV_FILE) -> None:
 
     Args:
         path: File containing ``KEY=VALUE`` lines.
+
+    Raises:
+        ValueError: The existing path is not a readable regular UTF-8 text file.
     """
     env_path = Path(path)
-    if not env_path.exists():
+    try:
+        descriptor = os.open(env_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
         return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+    except OSError as exc:
+        raise ValueError(_INVALID_ENV_FILE.format(path=env_path)) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(_INVALID_ENV_FILE.format(path=env_path))
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            contents = handle.read()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(_INVALID_ENV_FILE.format(path=env_path)) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    for raw_line in contents.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
