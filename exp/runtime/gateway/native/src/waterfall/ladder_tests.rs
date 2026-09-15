@@ -324,12 +324,24 @@ impl Harness {
         throttle_redial: Option<ThrottleRedial>,
         deadline: Duration,
     ) -> (Won, AttemptGuard) {
-        self.run_as("key", route, throttle_redial, deadline).await
+        self.run_as(
+            "key",
+            Some("org:key-holder"),
+            route,
+            throttle_redial,
+            deadline,
+        )
+        .await
     }
 
+    /// Run with the bearer the data plane sees and the caller identity
+    /// admission names. In a hosted worker the two differ: the in-pod front
+    /// exchanges the caller's key for an ephemeral per-request token, so
+    /// `raw_key` changes on every turn while `caller_scope` does not.
     async fn run_as(
         &self,
         raw_key: &str,
+        caller_scope: Option<&str>,
         route: &[DeploymentWire],
         throttle_redial: Option<ThrottleRedial>,
         deadline: Duration,
@@ -345,7 +357,7 @@ impl Harness {
             http: &self.http,
             request_id: "request-throttle",
             raw_key,
-            caller_scope: Some(raw_key),
+            caller_scope,
             route,
             policy: RoutePolicy {
                 maximum_total_attempts: 8,
@@ -852,9 +864,13 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
 #[test]
 fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
     block_on(async {
-        // Turn one: the rung refuses the foreign payload (the verdict quotes
-        // its head and tail), the stripped re-dial serves. The local payload
-        // of the same conversation is not what was refused.
+        // Every turn presents a FRESH bearer, as a hosted worker sees them
+        // (the front exchanges the caller's key for an ephemeral token per
+        // request); only the admitted caller identity is stable. Turn one:
+        // the rung refuses the foreign payload (the verdict quotes its head
+        // and tail), the stripped re-dial serves. The local payload of the
+        // same conversation is not what was refused.
+        let caller = Some("org-remembered:identity-a");
         let foreign = "rsn_a_remembered_refused_payload_hA==";
         let local = "gAAA_a_remembered_refused_payload_local==";
         let harness = Harness::new();
@@ -864,7 +880,15 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
         ])
         .await;
         let route = [responses_wire("a", &rung.url, &[foreign, local])];
-        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let (won, guard) = harness
+            .run_as(
+                "ephemeral-turn-1",
+                caller,
+                &route,
+                None,
+                Duration::from_secs(60),
+            )
+            .await;
         let Won::Committed(committed) = finish(guard, won).await else {
             panic!("the stripped re-dial serves turn one");
         };
@@ -872,13 +896,22 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
         drop(committed);
         assert_eq!(rung.bodies.lock().expect("lock").len(), 2);
 
-        // Turn two, same caller, same history: only the remembered payload
-        // is stripped, before any dial, so the rung sees exactly one dial
-        // that still carries the local payload; the disclosure holds.
+        // Turn two, same caller identity under a different bearer, same
+        // history: only the remembered payload is stripped, before any dial,
+        // so the rung sees exactly one dial that still carries the local
+        // payload; the disclosure holds.
         let later = Harness::new();
         let rung = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
         let route = [responses_wire("a", &rung.url, &[foreign, local])];
-        let (won, guard) = later.run(&route, None, Duration::from_secs(60)).await;
+        let (won, guard) = later
+            .run_as(
+                "ephemeral-turn-2",
+                caller,
+                &route,
+                None,
+                Duration::from_secs(60),
+            )
+            .await;
         let Won::Committed(committed) = finish(guard, won).await else {
             panic!("the remembered strip serves turn two");
         };
@@ -898,13 +931,20 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
         assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
         assert_eq!(story["settles"][0]["outcome"], "completed");
 
-        // Another caller replaying the same payload is not affected by this
-        // caller's memory: its first dial carries both payloads.
+        // Another caller identity replaying the same payload is not affected
+        // by this caller's memory, even under the bearer turn one presented:
+        // its first dial carries both payloads.
         let stranger = Harness::new();
         let rung = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
         let route = [responses_wire("a", &rung.url, &[foreign, local])];
         let (won, guard) = stranger
-            .run_as("other-key", &route, None, Duration::from_secs(60))
+            .run_as(
+                "ephemeral-turn-1",
+                Some("org-remembered:identity-b"),
+                &route,
+                None,
+                Duration::from_secs(60),
+            )
             .await;
         let Won::Committed(committed) = finish(guard, won).await else {
             panic!("the stranger's replay serves as sent");
@@ -914,5 +954,30 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
         let body: Value =
             serde_json::from_str(&rung.bodies.lock().expect("lock")[0]).expect("body");
         assert_eq!(body["input"].as_array().expect("input").len(), 6);
+
+        // An admission that names no caller identity (an older control
+        // plane) repairs reactively and remembers nothing.
+        let unscoped = Harness::new();
+        let rung = spawn_rung(vec![
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+            Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME]),
+        ])
+        .await;
+        let route = [responses_wire("a", &rung.url, &[foreign, local])];
+        let (won, guard) = unscoped
+            .run_as(
+                "ephemeral-turn-3",
+                None,
+                &route,
+                None,
+                Duration::from_secs(60),
+            )
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the reactive repair still serves without a caller scope");
+        };
+        assert!(committed.encrypted_reasoning_stripped);
+        drop(committed);
+        assert_eq!(rung.bodies.lock().expect("lock").len(), 2);
     });
 }
