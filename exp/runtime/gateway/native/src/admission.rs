@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::bridge::Bridge;
 use crate::encode_responses::ResponsesEnvelope;
+use crate::errors::empty_completion_headers;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
 use crate::guardrails;
@@ -155,6 +156,7 @@ pub(crate) fn served_headers(
     let mut headers = commit_independent(admission, client_request_id);
     headers.extend(commit_dependent(admission, served.depth));
     headers.extend(replay_repair_headers(served.encrypted_reasoning_stripped));
+    headers.extend(empty_completion_headers(served.empty_completion));
     headers
 }
 

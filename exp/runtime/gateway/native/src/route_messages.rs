@@ -37,7 +37,7 @@ use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::waterfall::{
     acquire_attempt, billed_empty_completion, unreported_empty_completion, CommittedAttempt,
-    SettledAttempt, WaterfallContext, Won,
+    Served, SettledAttempt, WaterfallContext, Won,
 };
 
 /// Anthropic-enveloped variant of `error_response` for the Messages surface,
@@ -382,24 +382,25 @@ async fn respond_from_messages_events(
             .await;
         return messages_error_response(&error);
     }
-    if refusal_completed.is_none()
-        && aggregated_empty_completion(&events, &aggregated, usage.as_ref())
-    {
-        // Same guard as the live stream: a committed turn that rendered no
-        // block and billed for it is a failed attempt, never `content: []`.
-        let failure = Failure::empty_completion();
+    let empty_completion = refusal_completed.is_none()
+        && aggregated_empty_completion(&events, &aggregated, usage.as_ref());
+    let settled = if empty_completion {
+        // The committed rung closed the turn with nothing this surface can
+        // render (an OpenAI empty message item, hidden reasoning). Post-commit
+        // there is no ladder: the caller receives the empty turn as a typed
+        // 200 under `x-gateway-warning: empty_completion` -- never a 502 the
+        // SDKs auto-retry -- while the ledger records the typed
+        // `empty_completion` failure at $0, exactly like a visible refusal.
         guard
             .settle(
                 "failed",
                 aggregated.usage.as_ref().or(usage.as_ref()),
                 &aggregated.tool_names,
-                Some(&failure),
+                Some(&Failure::empty_completion()),
                 true,
             )
-            .await;
-        return messages_error_response(&failure.public_error());
-    }
-    let settled = if let Some(refusal) = &refusal_completed {
+            .await
+    } else if let Some(refusal) = &refusal_completed {
         // The caller saw the refusal output, so the public result completes;
         // the ledger still records the provider's typed refusal.
         guard
@@ -431,6 +432,10 @@ async fn respond_from_messages_events(
         // Success is only reported once the terminal accounting write landed.
         return messages_error_response(&PublicError::internal());
     }
+    let served = Served {
+        empty_completion,
+        ..served
+    };
     let headers = served_headers(&admission, None, served);
     if stream_body {
         let body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
@@ -622,6 +627,7 @@ async fn stream_messages(
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;
         let mut terminal: Option<Event> = None;
+        let mut empty_completion = false;
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
@@ -728,18 +734,32 @@ async fn stream_messages(
                             || unreported_empty_completion(&event, usage.as_ref()))
                     {
                         // The deployment committed on events this surface
-                        // cannot render (hidden reasoning on an unexposed
-                        // rung), so the caller would receive `content: []`
-                        // with `end_turn` and a bill: fail the attempt
-                        // instead. Post-commit, so no ladder; the typed
-                        // error is the answer.
-                        fail_stream!(Failure::empty_completion());
+                        // cannot render (an OpenAI empty message item, hidden
+                        // reasoning on an unexposed rung). Post-commit there
+                        // is no ladder and the headers are already on the
+                        // wire, so the terminal frames (`end_turn`, no
+                        // blocks) are the caller's typed answer -- never an
+                        // `error` event the SDKs auto-retry -- while the
+                        // ledger records the typed `empty_completion` failure.
+                        empty_completion = true;
                     }
                 }
                 terminal = Some(event.clone());
-                if !settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
-                    .await
-                {
+                let settled = if empty_completion {
+                    guard
+                        .settle(
+                            "failed",
+                            usage.as_ref(),
+                            &tool_names,
+                            Some(&Failure::empty_completion()),
+                            true,
+                        )
+                        .await
+                } else {
+                    settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
+                        .await
+                };
+                if !settled {
                     return;
                 }
             }

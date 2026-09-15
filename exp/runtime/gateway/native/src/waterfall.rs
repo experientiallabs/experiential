@@ -87,6 +87,9 @@ pub struct SettledAttempt {
     pub events: Vec<Event>,
     /// See [`CommittedAttempt::encrypted_reasoning_stripped`].
     pub encrypted_reasoning_stripped: bool,
+    /// See [`Served::empty_completion`]: the ladder exhausted on empty turns
+    /// and these events are the typed empty answer.
+    pub empty_completion: bool,
 }
 
 /// The facts of the attempt that served, as the response surfaces name them.
@@ -94,6 +97,11 @@ pub struct SettledAttempt {
 pub struct Served {
     pub depth: usize,
     pub encrypted_reasoning_stripped: bool,
+    /// The answer is an empty turn the ladder could not improve on (every
+    /// rung, or the committed rung, closed with nothing): the caller holds a
+    /// typed 200 under `x-gateway-warning: empty_completion`, the ledger the
+    /// typed `empty_completion` failure.
+    pub empty_completion: bool,
 }
 
 impl CommittedAttempt {
@@ -102,6 +110,7 @@ impl CommittedAttempt {
         Served {
             depth: self.depth,
             encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
+            empty_completion: false,
         }
     }
 }
@@ -112,6 +121,7 @@ impl SettledAttempt {
         Served {
             depth: self.depth,
             encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
+            empty_completion: self.empty_completion,
         }
     }
 }
@@ -439,6 +449,28 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         depth,
                         events: exhaustion_flush,
                         encrypted_reasoning_stripped,
+                        empty_completion: false,
+                    });
+                }
+                if failure.failure_class == FailureClass::EmptyCompletion {
+                    // Every rung the ladder could reach closed this
+                    // conversation with nothing. That is the model's answer,
+                    // not an outage: the last attempt is settled `failed` /
+                    // `empty_completion` above ($0, the ledger's record), and
+                    // the caller receives the empty turn as a typed 200
+                    // (`x-gateway-warning: empty_completion`) that no SDK
+                    // auto-retries -- a 502 here made one Claude Code session
+                    // re-send a 44k-token prompt every minute (2026-09-15).
+                    let mut events = Vec::with_capacity(2);
+                    if let Some(tracked) = usage {
+                        events.push(Event::Usage(tracked));
+                    }
+                    events.push(Event::Completed);
+                    return Won::Settled(SettledAttempt {
+                        depth,
+                        events,
+                        encrypted_reasoning_stripped,
+                        empty_completion: true,
                     });
                 }
                 let boundary = with_largest_retry_after(boundary, largest_retry_after);
@@ -913,6 +945,7 @@ async fn settle_output_less(
         depth,
         events,
         encrypted_reasoning_stripped,
+        empty_completion: false,
     })
 }
 

@@ -1622,12 +1622,6 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
     }
 
 
-_EMPTY_COMPLETION_MESSAGE = (
-    "the model ended its turn without producing any output; adjust the request (for example, "
-    "end the conversation on a user turn or ask for a text answer) and resend"
-)
-
-
 def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str | None]]:
     """Read the most recent request's settled attempt rows (ordinal, state, failure class).
 
@@ -1659,18 +1653,21 @@ def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str |
     return [(int(ordinal), str(state), failure) for ordinal, state, failure in rows]
 
 
-def test_messages_non_stream_billed_empty_stop_fails_instead_of_an_empty_end_turn(
+def test_messages_non_stream_billed_empty_stop_is_a_typed_empty_end_turn(
     engine: _ServingEngine,
 ) -> None:
-    """A ``stop`` that billed reasoning yet rendered no block is a typed 400.
+    """A ``stop`` that billed reasoning yet rendered no block is a TYPED empty turn.
 
     Production 2026-09-12 (deepseek-v4-flash via OpenRouter, Claude Code's
     body): ``message_start`` then ``message_delta`` with ``end_turn``, zero
-    content blocks, and 42 to 750 billed output tokens, which Claude Code
-    reports as "[Your previous response had no visible output]". The single
-    rung here is redialed once (its bounded cap) and both dispatches settle
-    ``failed`` as ``empty_completion``; a route with a second rung would
-    fail over instead.
+    content blocks, and 42 to 750 billed output tokens, settled as a completed
+    success. The single rung here is redialed once (its bounded cap) and both
+    dispatches settle ``failed`` as ``empty_completion`` at $0; a route with a
+    second rung would fail over instead. The ladder exhausted on empty turns
+    answers the caller a 200 ``end_turn`` with no content under
+    ``x-gateway-warning: empty_completion`` -- never a 5xx, which every SDK
+    auto-retries (2026-09-15: one Claude Code session re-sent a 44k-token
+    prompt every minute for an hour against the earlier 502).
     """
     response = httpx.post(
         f"{engine.base}/v1/messages",
@@ -1678,25 +1675,28 @@ def test_messages_non_stream_billed_empty_stop_fails_instead_of_an_empty_end_tur
         json=_messages_body("reasoning-only-token"),
         timeout=30.0,
     )
-    assert response.status_code == 400, response.text
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
     body = response.json()
-    assert body["type"] == "error"
-    assert body["error"]["type"] == "invalid_request_error"
-    assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
+    assert body["type"] == "message"
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == []
     assert _latest_attempt_states(engine) == [
         (0, "failed", "empty_completion"),
         (1, "failed", "empty_completion"),
     ]
 
 
-def test_messages_stream_billed_empty_stop_is_refused_before_the_first_frame(
+def test_messages_stream_billed_empty_stop_is_a_typed_empty_end_turn_stream(
     engine: _ServingEngine,
 ) -> None:
-    """The streamed request never opens a stream that would end ``end_turn`` on nothing.
+    """The streamed request opens only after the ladder settled: a typed empty stream.
 
-    Nothing semantic was ever committed, so the exhausted ladder answers the
-    same typed error envelope as the non-streaming request instead of a
-    `message_start` followed by an empty `end_turn`.
+    Nothing semantic was ever committed, so the exhausted ladder's settled
+    events encode as one ``message_start`` / ``message_delta end_turn`` /
+    ``message_stop`` stream with no content block and the warning header on
+    the response (a settled stream still builds its headers before its first
+    frame), never an ``error`` event.
     """
     with httpx.stream(
         "POST",
@@ -1706,12 +1706,21 @@ def test_messages_stream_billed_empty_stop_is_refused_before_the_first_frame(
         timeout=30.0,
     ) as response:
         status = response.status_code
+        warning = response.headers.get("x-gateway-warning")
         raw = b"".join(response.iter_bytes()).decode()
-    assert status == 400, raw
-    assert "message_start" not in raw
-    body = json.loads(raw)
-    assert body["type"] == "error"
-    assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
+    assert status == 200, raw
+    assert warning == "empty_completion"
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    kinds = [payload["type"] for payload in payloads]
+    assert "message_start" in kinds and "message_stop" in kinds
+    assert "error" not in kinds
+    assert "content_block_start" not in kinds
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
     assert _latest_attempt_states(engine) == [
         (0, "failed", "empty_completion"),
         (1, "failed", "empty_completion"),
@@ -1779,15 +1788,16 @@ def test_chat_capped_silent_stop_stream_ends_with_length(engine: _ServingEngine)
     assert finish_reasons == ["length"]
 
 
-def test_chat_uncapped_silent_stop_fails_instead_of_an_empty_completion(
+def test_chat_uncapped_silent_stop_is_a_typed_empty_completion(
     engine: _ServingEngine,
 ) -> None:
-    """Without a cap the same wire is the provider delivering nothing: a typed 400.
+    """Without a cap the same wire is the provider delivering nothing: a typed empty turn.
 
     No budget could have been exhausted, nothing was sent and nothing was
     accounted, so the attempt takes the ladder like the billed empty stop:
     the single rung is redialed once and both dispatches settle ``failed`` as
-    ``empty_completion``.
+    ``empty_completion`` at $0; the exhausted ladder then answers the empty
+    turn as a 200 ``stop`` with null content under the warning header.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -1795,13 +1805,54 @@ def test_chat_uncapped_silent_stop_fails_instead_of_an_empty_completion(
         json={"model": "coding", "messages": [{"role": "user", "content": "silent-stop-token"}]},
         timeout=30.0,
     )
-    assert response.status_code == 400, response.text
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
     body = response.json()
-    assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["message"]["content"] is None
     assert _latest_attempt_states(engine) == [
         (0, "failed", "empty_completion"),
         (1, "failed", "empty_completion"),
     ]
+
+
+def test_responses_uncapped_silent_stop_is_a_typed_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """The Responses surface renders the exhausted empty ladder as a completed empty output."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "silent-stop-token"},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"] == []
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_capped_length_truncation_carries_no_empty_completion_warning(
+    engine: _ServingEngine,
+) -> None:
+    """An honest budget truncation is not an empty completion: no warning header."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_tokens": 40,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "x-gateway-warning" not in response.headers
 
 
 def test_responses_capped_silent_stop_is_incomplete_max_output_tokens(

@@ -243,6 +243,27 @@ const REFUSAL_MESSAGE: &str = "provider refused the request";
 /// may serve the request instead.
 /// Safe message of [`Failure::empty_completion`]; content-free and stable so
 /// the ledger and the public error name the same shape.
+/// Response header that names a completed answer the caller should read
+/// with care; `empty_completion` is its one value today: every rung (or the
+/// committed rung) closed the turn with nothing, and the 200 the caller holds
+/// is that empty turn, not a delivered answer. Rides every non-streaming
+/// response and every settled stream; a live stream has already sent its
+/// headers, so there the terminal frames alone carry the shape.
+pub const GATEWAY_WARNING_HEADER: &str = "x-gateway-warning";
+pub const EMPTY_COMPLETION_WARNING: &str = "empty_completion";
+
+/// The `x-gateway-warning: empty_completion` header pair when `flagged`.
+pub fn empty_completion_headers(flagged: bool) -> Vec<(String, String)> {
+    if flagged {
+        vec![(
+            GATEWAY_WARNING_HEADER.to_string(),
+            EMPTY_COMPLETION_WARNING.to_string(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 pub const EMPTY_COMPLETION_MESSAGE: &str = "the model ended its turn without producing any output; \
      adjust the request (for example, end the conversation on a user turn or ask for a text answer) and resend";
 
@@ -340,10 +361,14 @@ impl Failure {
     /// 2026-09-15). Pre-commit the redial and the ladder stay on (the empty
     /// answer is not deterministic), but the class is [`FailureClass::
     /// EmptyCompletion`]: the model's answer to the request content, so it
-    /// never feeds the rung's health circuit and the caller receives a 400
-    /// (the refusal precedent) rather than a 502 that every SDK auto-retries
-    /// -- 2026-09-15 one Claude Code session re-sent the same 44k-token
-    /// prompt every minute for an hour against a 502.
+    /// never feeds the rung's health circuit, and once the ladder is
+    /// exhausted (or post-commit, where there is no ladder) the caller
+    /// receives the empty turn as a typed 200 under
+    /// [`GATEWAY_WARNING_HEADER`] rather than a 502 that every SDK
+    /// auto-retries -- 2026-09-15 one Claude Code session re-sent the same
+    /// 44k-token prompt every minute for an hour against a 502. The 400
+    /// mapping below is the defensive shape for any path that still renders
+    /// the failure itself: 4xx, so no client retries it.
     pub fn empty_completion() -> Self {
         Self::new(FailureClass::EmptyCompletion, EMPTY_COMPLETION_MESSAGE).with_retry(true, true)
     }
