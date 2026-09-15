@@ -874,6 +874,13 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # An image-output lane (the platform projects `supports_image_generation`
+        # from the model's output modalities): the data plane answers an empty
+        # completion there at once instead of redialing a second whole image.
+        "image_output": (
+            deployment.capabilities is not None
+            and deployment.capabilities.supports_image_generation is True
+        ),
         # How many times a throttle here is re-dialed with backoff before
         # failover (the pool's schedule scaled by this request's cache at
         # stake); zero keeps the historical failover-only throttle.

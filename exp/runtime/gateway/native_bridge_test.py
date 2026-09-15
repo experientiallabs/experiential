@@ -1329,6 +1329,32 @@ def test_admit_stamps_the_callers_output_cap(tmp_path: Path) -> None:
     assert admission["maximum_output_tokens"] == 40
 
 
+def test_admit_marks_an_image_output_lane_on_the_wire(tmp_path: Path) -> None:
+    """A lane the platform projects as image-generating rides the wire as `image_output`.
+
+    The data plane answers an empty completion on such a rung at once
+    (no redial, no ladder): the chat normalizers carry no image event, so an
+    image generation always ends output-less and a redial would bill the
+    house a second whole image (2026-09-15, gpt-5.4-image-2).
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path, capabilities=ModelCapabilities(supports_image_generation=True)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+    admission = _admit_started(control, raw_key, _chat_body())
+    assert admission["image_output"] is True
+
+    text_control, text_key = _control_plane(tmp_path / "text")
+    assert text_control.authenticate(json.dumps({"raw_key": text_key})) == "{}"
+    text_admission = _admit_started(text_control, text_key, _chat_body())
+    assert text_admission["image_output"] is False
+
+
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""

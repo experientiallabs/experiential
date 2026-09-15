@@ -235,6 +235,7 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        image_output: false,
         idempotency_key: format!("op-{deployment_id}"),
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,

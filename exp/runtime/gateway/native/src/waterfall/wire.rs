@@ -66,6 +66,15 @@ pub struct DeploymentWire {
     /// no such control: the relay serializes the turn to one tool call.
     #[serde(default)]
     pub serialize_tool_calls: bool,
+    /// The served model emits images (`supports_image_generation` on the
+    /// lane) that the chat normalizers carry no event for, so a turn with no
+    /// renderable output is the EXPECTED shape of an image generation, not a
+    /// transient empty answer: the waterfall neither redials nor advances the
+    /// ladder on it (each attempt bills the house a whole image -- $0.24 list
+    /// for one doubled gpt-5.4-image-2 request, 2026-09-15) and the caller
+    /// receives the typed empty answer at once. Absent on older admissions.
+    #[serde(default)]
+    pub image_output: bool,
     pub idempotency_key: String,
     /// Deployment override for the flat first-byte allowance; the serving
     /// configuration's default applies when absent.

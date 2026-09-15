@@ -17,6 +17,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        image_output: false,
         model_id: String::new(),
         billing_customer_managed: false,
         idempotency_key: "op".to_string(),
@@ -275,4 +276,21 @@ fn a_stop_with_no_usage_report_and_no_output_is_an_unreported_empty_completion()
         None
     ));
     assert!(!unreported_empty_completion(&Event::PausedTurn, None));
+}
+
+#[test]
+fn an_image_output_rung_answers_its_empty_completion_without_redial_or_ladder() {
+    // The chat normalizers carry no image event, so an image generation is
+    // always an empty completion: a redial would bill the house a second
+    // whole image for the same nothing.
+    let mut image = wire(None, None);
+    image.image_output = true;
+    let failure = empty_completion_failure(&image);
+    assert_eq!(failure.failure_class, FailureClass::EmptyCompletion);
+    assert!(!failure.retryable_same_deployment && !failure.failover_eligible);
+    // Every other rung keeps the redial and the ladder: the empty answer is
+    // not deterministic there.
+    let text = wire(None, None);
+    let failure = empty_completion_failure(&text);
+    assert!(failure.retryable_same_deployment && failure.failover_eligible);
 }
