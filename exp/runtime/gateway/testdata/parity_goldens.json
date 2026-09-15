@@ -125,6 +125,13 @@
     "type": "api_error",
     "message": "parity probe message"
    }
+  },
+  "empty_completion": {
+   "error": {
+    "message": "parity probe message",
+    "type": "invalid_request_error"
+   },
+   "type": "error"
   }
  },
  "anthropic_error_inputs": {
@@ -271,6 +278,14 @@
    "param": null,
    "retry_after_seconds": null,
    "status_code": 502
+  },
+  "empty_completion": {
+   "code": "empty_completion",
+   "error_type": "invalid_request_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 400
   }
  },
  "anthropic_error_with_param": {

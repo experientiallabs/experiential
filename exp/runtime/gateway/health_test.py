@@ -42,6 +42,34 @@ def test_unsupported_capability_rejections_never_open_the_circuit() -> None:
     assert registry.claim(_KEY)
 
 
+def test_empty_completions_never_open_the_circuit_but_release_probe_state() -> None:
+    """An empty completion is the model's answer to the content, not rung deadness.
+
+    2026-09-15: one Claude Code session re-sent the same prompt every minute
+    and OpenAI answered each with a 4-token empty message; as a
+    ``provider_internal`` those failures would have opened the luna rung's
+    circuit on that worker for every other caller. The class never counts
+    toward the threshold and never resets genuine progress, while a probe
+    that answered empty is still consumed like any other outcome.
+    """
+    registry = DeploymentHealthRegistry(failure_threshold=2, clock=lambda: 100.0)
+
+    for _ in range(50):
+        registry.failed(_KEY, _failure(GatewayFailureClass.EMPTY_COMPLETION))
+    assert registry.claim(_KEY)
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    registry.failed(_KEY, _failure(GatewayFailureClass.EMPTY_COMPLETION))
+    assert registry.claim(_KEY)
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    assert not registry.claim(_KEY)
+
+    state = registry._states[_KEY]  # noqa: SLF001 - probe bookkeeping is the assertion.
+    state.half_open_probe = True
+    registry.failed(_KEY, _failure(GatewayFailureClass.EMPTY_COMPLETION))
+    assert not state.half_open_probe
+
+
 def test_caller_invalid_requests_do_not_reset_operational_failure_progress() -> None:
     """Interleaved caller faults neither add to nor clear genuine failure counts."""
     registry = DeploymentHealthRegistry(failure_threshold=2, clock=lambda: 100.0)
