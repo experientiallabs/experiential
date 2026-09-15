@@ -758,7 +758,14 @@ reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_eff
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
+nothing to honor at any effort — unless every rung of the route is authored
+`clamps_sampling_to_range` (a per-rung catalog capability, off by default), in which case a
+`temperature`/`top_p` outside the route interval is clamped to the nearest bound and disclosed as
+`temperature->clamped(1.0)` / `top_p->clamped(0.99)`: on a fixed-sampling lane the singleton is
+the only value the provider will run, so the caller's number carries nothing the refusal could
+protect, and the request serves at the singleton the way the provider's own default and
+OpenRouter's silent clamp already do. One refusing rung keeps the route on the 400; a rung that
+does not carry the control at all keeps the disclosed drop. `top_k` follows the same honor-or-narrow shape: selection prefers a
 rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
 DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
 than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`

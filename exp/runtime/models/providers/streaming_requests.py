@@ -52,6 +52,9 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     serves_reasoning_summary,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
+    clamp_route_numeric_parameter as _clamp_route_numeric_parameter,
+)
+from exp.runtime.models.providers.generation_parameter_validation import (
     effective_profile_reasoning_effort as _effective_profile_reasoning_effort,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -269,13 +272,37 @@ def route_generation_parameter_requests(
             sampling_supported(profile, top_p=top_p) for profile in profiles
         )
 
+    def clamp(field: str, value: float, clamped: float) -> None:
+        """Forward the route-clamped value and disclose the substitution."""
+        provider_updates[field] = clamped
+        path = f"{field}->clamped({clamped})"
+        if clamped != value and path not in ignored:
+            ignored.append(path)
+
+    # Every rung authored ``clamps_sampling_to_range`` (a fixed-sampling lane
+    # whose singleton the caller's value cannot change): the value is clamped
+    # to the route interval and disclosed rather than refused.
+    route_clamps_sampling = all(profile.clamps_sampling_to_range for profile in profiles)
+
     # Sampling a rung cannot carry is DROPPED with disclosure; the 400 stays only
-    # for an out-of-range value on a supporting route (2026-09-06: 1,483/289 orgs).
+    # for an out-of-range value on a supporting route (2026-09-06: 1,483/289 orgs)
+    # that does not clamp.
     if request.temperature is not None:
         if srn_only_block():
             ignore("temperature", "temperature->dropped(set_reasoning_effort_none)")
         elif not all(sampling_supported(profile) for profile in profiles):
             ignore("temperature", "temperature->dropped(unsupported_by_provider)")
+        elif route_clamps_sampling:
+            clamp(
+                "temperature",
+                request.temperature,
+                _clamp_route_numeric_parameter(
+                    profiles,
+                    value=request.temperature,
+                    minimum=lambda profile: profile.minimum_temperature,
+                    maximum=lambda profile: profile.maximum_temperature,
+                ),
+            )
         else:
             _require_route_numeric_parameter(
                 profiles,
@@ -290,6 +317,17 @@ def route_generation_parameter_requests(
             ignore("top_p", "top_p->dropped(set_reasoning_effort_none)")
         elif not all(sampling_supported(profile, top_p=True) for profile in profiles):
             ignore("top_p", "top_p->dropped(unsupported_by_provider)")
+        elif route_clamps_sampling:
+            clamp(
+                "top_p",
+                request.top_p,
+                _clamp_route_numeric_parameter(
+                    profiles,
+                    value=request.top_p,
+                    minimum=lambda profile: profile.minimum_top_p,
+                    maximum=lambda profile: profile.maximum_top_p,
+                ),
+            )
         else:
             _require_route_numeric_parameter(
                 profiles,

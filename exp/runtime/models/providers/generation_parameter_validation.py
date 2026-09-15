@@ -69,6 +69,43 @@ def lane_default_reasoning_effort(profiles: Sequence[GatewayWireProfile]) -> str
     return None
 
 
+def route_numeric_bounds(
+    profiles: Sequence[GatewayWireProfile],
+    *,
+    minimum: Callable[[GatewayWireProfile], float | int],
+    maximum: Callable[[GatewayWireProfile], float | int | None],
+) -> tuple[float | int, float | int | None]:
+    """Return the interval every rung of the route accepts for one control.
+
+    The route's floor is the largest rung floor and its ceiling the smallest
+    declared rung ceiling (``None`` when no rung declares one), so a value in
+    the interval is accepted by every deployment the waterfall may reach.
+    """
+    route_minimum = max(minimum(profile) for profile in profiles)
+    maxima = tuple(bound for profile in profiles if (bound := maximum(profile)) is not None)
+    return route_minimum, (min(maxima) if maxima else None)
+
+
+def clamp_route_numeric_parameter(
+    profiles: Sequence[GatewayWireProfile],
+    *,
+    value: float | int,
+    minimum: Callable[[GatewayWireProfile], float | int],
+    maximum: Callable[[GatewayWireProfile], float | int | None],
+) -> float | int:
+    """Return the caller value clamped to the interval every rung accepts.
+
+    Used only on routes whose every rung declares ``clamps_sampling_to_range``;
+    an in-range value comes back unchanged so the caller sees no disclosure.
+    """
+    route_minimum, route_maximum = route_numeric_bounds(profiles, minimum=minimum, maximum=maximum)
+    if value < route_minimum:
+        return route_minimum
+    if route_maximum is not None and value > route_maximum:
+        return route_maximum
+    return value
+
+
 def require_route_numeric_parameter(
     profiles: Sequence[GatewayWireProfile],
     *,
@@ -88,9 +125,7 @@ def require_route_numeric_parameter(
             param=param,
             code="unsupported_parameter",
         )
-    route_minimum = max(minimum(profile) for profile in profiles)
-    maxima = tuple(bound for profile in profiles if (bound := maximum(profile)) is not None)
-    route_maximum = min(maxima) if maxima else None
+    route_minimum, route_maximum = route_numeric_bounds(profiles, minimum=minimum, maximum=maximum)
     if value >= route_minimum and (route_maximum is None or value <= route_maximum):
         return
     range_text = (

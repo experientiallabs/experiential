@@ -218,6 +218,12 @@ class GatewayWireProfile:
     sampling_requires_reasoning_none: bool = False
     """Whether sampling controls require an exact ``none`` reasoning effort."""
 
+    clamps_sampling_to_range: bool = False
+    """Whether an out-of-range caller ``temperature``/``top_p`` is clamped to
+    this rung's declared interval and disclosed instead of refused (authored
+    per rung for fixed-sampling lanes; the route clamps only when every rung
+    declares it)."""
+
     fireworks_reasoning_route_sha256: str | None = None
     """Exact Fireworks route identity that authorizes opaque reasoning replay."""
 

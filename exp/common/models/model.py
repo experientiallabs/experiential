@@ -468,6 +468,22 @@ class ModelCapabilities(ContractModel):
     reasoning_effort: ReasoningEffort | None = None
     sampling_requires_reasoning_none: bool = False
     """Whether temperature and top-p are valid only with ``reasoning_effort='none'``."""
+    clamps_sampling_to_range: bool = False
+    """Whether a caller ``temperature``/``top_p`` outside this rung's declared
+    interval is clamped to the nearest bound and disclosed instead of refused.
+
+    Off by default: an out-of-range value on a supporting route is a 400
+    (``invalid_parameter``), the caller's error. Authored on per rung for a
+    FIXED-sampling lane — Anthropic's post-4.6 Claude generation accepts only
+    ``temperature: 1.0`` (and ``top_p >= 0.99`` on the 4.6 pair) and answers
+    every other value with its own 400 — where the singleton means the caller's
+    value carries no semantics the provider could honor anyway, so serving at
+    the singleton with ``temperature->clamped(1.0)`` disclosed is what the
+    provider would do and what OpenRouter does silently. The route clamps only
+    when EVERY rung declares it; a route with one refusing rung keeps the 400.
+    Inert on a rung that does not support the control at all (that path drops
+    the field with disclosure already).
+    """
     reasoning_output_exposed: bool = False
     """Whether this rung's native plaintext reasoning is surfaced to the caller.
 
@@ -583,6 +599,7 @@ class ModelCapabilities(ContractModel):
             "supports_reasoning",
             "reasoning_effort",
             "sampling_requires_reasoning_none",
+            "clamps_sampling_to_range",
             "reasoning_output_exposed",
             "reasoning_content_native",
             "chat_max_tokens_field",

@@ -1521,6 +1521,110 @@ def test_route_rejects_out_of_range_provider_controls() -> None:
     assert "between 0.0 and 1.0" in str(raised.value)
 
 
+def _fixed_sampling_claude_profile(
+    *, clamps: bool, top_p_interval: bool = False
+) -> GatewayWireProfile:
+    """Build one Anthropic fixed-sampling rung (temperature pinned to 1.0).
+
+    ``top_p_interval`` models the 4.6 pair, which still accepts the
+    near-default ``[0.99, 1.0]`` nucleus interval; the post-4.6 generation
+    refuses ``top_p`` outright.
+    """
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-opus-5" if not top_p_interval else "claude-opus-4-6",
+        supports_temperature=True,
+        minimum_temperature=1.0,
+        maximum_temperature=1.0,
+        supports_top_p=top_p_interval,
+        minimum_top_p=0.99,
+        maximum_top_p=1.0,
+        clamps_sampling_to_range=clamps,
+    )
+
+
+def test_fixed_sampling_route_refuses_out_of_range_temperature_by_default() -> None:
+    """The authored default keeps the status quo: a value the singleton cannot
+    honor is the caller's error (5,659 refusals over 7 days, 203 orgs, mostly
+    0.0/0.1/0.2/0.7 on the Claude lanes, 2026-09-15)."""
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (_fixed_sampling_claude_profile(clamps=False),), _chat_request(temperature=0.2)
+        )
+    assert raised.value.code == "invalid_parameter"
+    assert raised.value.param == "temperature"
+    assert "between 1.0 and 1.0" in str(raised.value)
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.2, 0.7, 1.3])
+def test_clamping_route_forwards_the_singleton_and_discloses(temperature: float) -> None:
+    """With ``clamps_sampling_to_range`` authored on every rung, the caller's
+    value is replaced by the route singleton and the substitution is disclosed
+    on the public request, so the provider payload carries exactly the one
+    value the fixed-sampling model accepts."""
+    public, provider = route_generation_parameter_requests(
+        (_fixed_sampling_claude_profile(clamps=True),), _chat_request(temperature=temperature)
+    )
+
+    assert provider.temperature == 1.0
+    assert public.temperature == temperature
+    assert "temperature->clamped(1.0)" in public.ignored_parameters
+    payload = anthropic_messages_stream_payload(
+        "claude-opus-5", provider, supports_temperature=True
+    )
+    assert payload["temperature"] == 1.0
+
+
+def test_clamping_route_leaves_an_in_range_value_undisclosed() -> None:
+    """The singleton itself is not a substitution, so nothing is disclosed."""
+    public, provider = route_generation_parameter_requests(
+        (_fixed_sampling_claude_profile(clamps=True),), _chat_request(temperature=1.0)
+    )
+    assert provider.temperature == 1.0
+    assert not any(path.startswith("temperature") for path in public.ignored_parameters)
+
+
+def test_clamping_route_clamps_top_p_to_the_near_default_interval() -> None:
+    """The 4.6 pair's ``[0.99, 1.0]`` nucleus interval clamps like temperature."""
+    public, provider = route_generation_parameter_requests(
+        (_fixed_sampling_claude_profile(clamps=True, top_p_interval=True),),
+        _chat_request(top_p=0.8),
+    )
+    assert provider.top_p == 0.99
+    assert "top_p->clamped(0.99)" in public.ignored_parameters
+
+
+def test_clamping_route_still_drops_a_control_no_rung_supports() -> None:
+    """The flag never widens what a rung carries: ``top_p`` on the post-4.6
+    generation (``supports_top_p=False``) keeps the existing disclosed drop."""
+    public, provider = route_generation_parameter_requests(
+        (_fixed_sampling_claude_profile(clamps=True),), _chat_request(top_p=0.8)
+    )
+    assert provider.top_p is None
+    assert "top_p->dropped(unsupported_by_provider)" in public.ignored_parameters
+
+
+def test_clamping_requires_every_rung_of_the_route() -> None:
+    """One rung without the flag keeps the route on the refusing contract, so an
+    operator authoring the flag on a lead rung cannot silently change what a
+    fallback rung refuses."""
+    profiles = (
+        _fixed_sampling_claude_profile(clamps=True),
+        GatewayWireProfile(
+            dialect="bedrock_converse_stream",
+            url="https://bedrock.test",
+            model_id="us.anthropic.claude-opus-5",
+            supports_temperature=True,
+            minimum_temperature=1.0,
+            maximum_temperature=1.0,
+        ),
+    )
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(profiles, _chat_request(temperature=0.2))
+    assert raised.value.param == "temperature"
+
+
 def test_srn_sampling_drops_and_discloses_instead_of_rejecting() -> None:
     """On a reasoning route (srn), temperature/top_p sent with reasoning on is dropped
     and disclosed, not rejected: the model accepts sampling, just not at this effort."""

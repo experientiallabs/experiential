@@ -95,6 +95,7 @@ def _resolved_wire_profile(
                 else profile.maximum_top_k
             ),
             sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+            clamps_sampling_to_range=capabilities.clamps_sampling_to_range,
             supported_reasoning_efforts=(
                 gateway_capabilities.supported_reasoning_efforts
                 or profile.supported_reasoning_efforts

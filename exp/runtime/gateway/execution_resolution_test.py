@@ -114,6 +114,25 @@ def test_profile_ranges_intersect_with_the_catalog_contract() -> None:
     assert resolved.model_id == "provider-model"
 
 
+def test_profile_resolution_carries_the_sampling_clamp_flag() -> None:
+    """The authored per-rung clamp flag reaches the wire profile; absent, it is off."""
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test/v1/messages",
+        minimum_temperature=1.0,
+        maximum_temperature=1.0,
+    )
+    clamping = ModelCapabilities(clamps_sampling_to_range=True)
+    resolved = _resolved_wire_profile(
+        _deployment(clamping), _resolved(_NativeClient(profile), clamping)
+    )
+    assert resolved.clamps_sampling_to_range is True
+
+    plain = ModelCapabilities()
+    resolved = _resolved_wire_profile(_deployment(plain), _resolved(_NativeClient(profile), plain))
+    assert resolved.clamps_sampling_to_range is False
+
+
 def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
     """Deployment metadata replaces a family guess with provider-published values."""
     capabilities = ModelCapabilities(
