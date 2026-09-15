@@ -37,7 +37,7 @@ use crate::rate_limit_headers::harvest_rate_limit_headers;
 use crate::relay::{
     collection_public_error, ended_without_terminal, remaining, track_event, UpstreamRelay,
 };
-use crate::replay_repair::{log_encrypted_reasoning_stripped, without_encrypted_reasoning};
+use crate::replay_repair::AttemptRepair;
 use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::{
     jitter_unit, track_retry_after, with_largest_retry_after, BackoffQuery, ThrottleRedial,
@@ -586,20 +586,17 @@ async fn run_attempt(
     let open_bound = remaining(ctx.deadline)
         .min(phase_timeout)
         .min(remaining(first_byte_deadline));
-    // A dial of this rung already stripped the refused encrypted reasoning
-    // in this request: send the remembered payload straight away.
-    let mut encrypted_reasoning_stripped = repaired.is_some();
+    // What is already known repairs the first dial: the payload this request
+    // stripped on an earlier dial of the rung, else the payloads this worker
+    // remembers the caller's provider refusing.
+    let mut repair = AttemptRepair::begin(wire, ctx.raw_key, repaired);
     let response = match open_stream(
         ctx.http,
         &wire.url,
         &headers,
         &wire.idempotency_key,
-        repaired.as_ref().unwrap_or(&wire.upstream_payload),
-        if repaired.is_some() {
-            None
-        } else {
-            wire.upstream_body.as_deref()
-        },
+        repair.payload(),
+        repair.raw_body(),
         open_bound,
         dialect,
     )
@@ -613,12 +610,7 @@ async fn run_attempt(
             // with those items stripped, before the caller's 400 may surface.
             // A payload with nothing to strip, or a refusal of the stripped
             // payload itself, surfaces.
-            let stripped = (!encrypted_reasoning_stripped
-                && failure.encrypted_reasoning_rejected
-                && wire.upstream_body.is_none())
-            .then(|| without_encrypted_reasoning(&wire.upstream_payload))
-            .flatten();
-            let Some(stripped) = stripped else {
+            if !repair.repair_after(&failure) {
                 return AttemptEnd::Ladder {
                     failure: customer_owned(failure, wire),
                     refusal_eligible: false,
@@ -628,11 +620,7 @@ async fn run_attempt(
                     opened: false,
                     encrypted_reasoning_stripped: false,
                 };
-            };
-            // The refusal is the fact worth remembering, whatever the
-            // re-dial then does: a later dial of this rung must not earn it
-            // again.
-            let stripped = repaired.insert(stripped);
+            }
             // The stripped dial is a physical attempt of its own and gets a
             // fresh first-byte window, exactly like a same-rung redial; the
             // refused open and its error-body read must not eat into it.
@@ -645,21 +633,14 @@ async fn run_attempt(
                 &wire.url,
                 &headers,
                 &wire.idempotency_key,
-                stripped,
+                repair.payload(),
                 None,
                 open_bound,
                 dialect,
             )
             .await
             {
-                Ok(response) => {
-                    // Counted and logged only once the repaired dial opened:
-                    // a refused re-dial is a failure, not a repair.
-                    METRICS.record_encrypted_reasoning_stripped();
-                    log_encrypted_reasoning_stripped(ctx.request_id, wire);
-                    encrypted_reasoning_stripped = true;
-                    response
-                }
+                Ok(response) => response,
                 Err(failure) => {
                     return AttemptEnd::Ladder {
                         failure: customer_owned(failure, wire),
@@ -674,6 +655,10 @@ async fn run_attempt(
             }
         }
     };
+    // Counted and logged only once the dial that carried the repair opened:
+    // a refused re-dial is a failure, not a repair.
+    repair.opened(ctx.request_id);
+    let encrypted_reasoning_stripped = repair.stripped();
     guard.mark_opened();
     // The opened response's allowlisted rate-limit headers settle with this
     // attempt whatever its terminal outcome; a failed OPEN instead carries

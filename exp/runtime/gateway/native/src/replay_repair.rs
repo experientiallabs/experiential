@@ -5,19 +5,40 @@
 //! replay with `invalid_encrypted_content`. The waterfall re-dials the same
 //! rung once with those items stripped and remembers the stripped payload
 //! for the rest of the request's ladder on that rung; this module owns the
-//! strip, the caller-facing disclosure header, and the operator line.
+//! strip, the caller-facing disclosure header, the operator line, and the
+//! per-worker memory that lets a LATER request of the same conversation skip
+//! the refused dial altogether.
+//!
+//! A stateless caller keeps the foreign items in its history, so without
+//! memory every later turn of that conversation paid one refused dial before
+//! it was served (production, 2026-09-15: about 74 refused dials a minute,
+//! 82% of one tenant's agent turns, every one a fast unbilled 400 that still
+//! counted against the provider's request rate). The memory holds only
+//! digests of refused payloads, salted by the presenting key (the caller's
+//! identity; the continuation store's own key does not exist for a stateless
+//! turn, and a prefix-derived conversation key would merge parallel sessions
+//! of one agent template), for a bounded time and count, per worker: a
+//! conversation converges after each worker has repaired it once, and a
+//! shared store would buy nothing worth its roll hazards.
 //!
 //! Telemetry: the refused dial and its re-dial run under ONE reservation, so
 //! the ledger records one attempt and never the refusal. What does record it:
 //! the `x-gateway-replay-repair` header on HTTP responses (the WebSocket
-//! Responses transport carries no response headers), the data-plane counter
-//! `encrypted_reasoning_stripped`, and one content-free operator line, each
-//! written only once the re-dial has actually opened. A stateless caller
-//! keeps the foreign items in its history, so the repair recurs on every
-//! later turn of that conversation until the caller drops them.
+//! Responses transport carries no response headers), the data-plane counters
+//! `encrypted_reasoning_stripped` (a refusal repaired on this attempt) and
+//! `encrypted_reasoning_stripped_proactive` (stripped from memory before the
+//! first dial), and one content-free operator line naming the mode, each
+//! written only once the dial has actually opened.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
+use crate::errors::Failure;
+use crate::metrics::METRICS;
 use crate::waterfall::DeploymentWire;
 
 /// Response header disclosing a data-plane repair of the caller's replayed
@@ -27,6 +48,17 @@ pub const REPLAY_REPAIR_HEADER: &str = "x-gateway-replay-repair";
 /// The one repair the waterfall performs: the replayed reasoning items whose
 /// `encrypted_content` the rung refused were stripped and the rung re-dialed.
 pub const ENCRYPTED_REASONING_STRIPPED: &str = "encrypted_reasoning_stripped";
+
+/// How long a refused payload stays remembered after its last replay.
+const MEMORY_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Most remembered payload digests per worker (about 48 bytes each).
+const MEMORY_CAPACITY: usize = 100_000;
+
+/// The fixed head and verdict of OpenAI's refusal sentence, which quotes the
+/// refused payload as its first and last characters around an ellipsis.
+const REFUSAL_SENTENCE_HEAD: &str = "The encrypted content ";
+const REFUSAL_SENTENCE_VERDICT: &str = " could not be verified";
 
 /// The disclosure header pairs of one served attempt; empty when the input
 /// reached the provider exactly as replayed.
@@ -41,8 +73,139 @@ pub fn replay_repair_headers(encrypted_reasoning_stripped: bool) -> Vec<(String,
     }
 }
 
+/// The per-worker memory of refused encrypted reasoning payloads.
+pub static MEMORY: LazyLock<ReplayRepairMemory> = LazyLock::new(ReplayRepairMemory::default);
+
+/// Digests of refused payloads, each with the instant it was last replayed;
+/// an entry expires [`MEMORY_TTL`] after that, and the oldest insertions go
+/// first once [`MEMORY_CAPACITY`] is reached.
+#[derive(Default)]
+pub struct ReplayRepairMemory {
+    state: Mutex<MemoryState>,
+}
+
+#[derive(Default)]
+struct MemoryState {
+    last_seen: HashMap<[u8; 32], Instant>,
+    insertion_order: VecDeque<[u8; 32]>,
+}
+
+impl ReplayRepairMemory {
+    /// Remember these refused payload digests as of now.
+    pub fn remember(&self, digests: impl IntoIterator<Item = [u8; 32]>) {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for digest in digests {
+            if state.last_seen.insert(digest, now).is_none() {
+                state.insertion_order.push_back(digest);
+            }
+        }
+        while state.insertion_order.len() > MEMORY_CAPACITY {
+            if let Some(oldest) = state.insertion_order.pop_front() {
+                state.last_seen.remove(&oldest);
+            }
+        }
+    }
+
+    /// Whether this digest is remembered and unexpired; a hit refreshes it.
+    pub fn recall(&self, digest: &[u8; 32]) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.last_seen.get_mut(digest) {
+            Some(seen) if now.duration_since(*seen) <= MEMORY_TTL => {
+                *seen = now;
+                true
+            }
+            Some(_) => {
+                state.last_seen.remove(digest);
+                state.insertion_order.retain(|entry| entry != digest);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// How many digests are held.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_seen
+            .len()
+    }
+
+    /// Whether nothing is held.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The memory key of one payload for one caller: a digest, never the payload.
+pub fn payload_digest(scope: &str, encrypted_content: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(encrypted_content.as_bytes());
+    hasher.finalize().into()
+}
+
+/// The `(head, tail)` OpenAI quoted for the refused payload ("The encrypted
+/// content rsn_...hA== could not be verified. Reason: ..."): a payload
+/// matches when it starts with the head and ends with the tail. A short
+/// payload is quoted whole, so head and tail are then the whole token.
+pub fn refused_payload_hint(detail: &str) -> Option<(String, String)> {
+    let start = detail.find(REFUSAL_SENTENCE_HEAD)? + REFUSAL_SENTENCE_HEAD.len();
+    let rest = &detail[start..];
+    let end = rest.find(REFUSAL_SENTENCE_VERDICT)?;
+    let quoted = rest[..end].trim();
+    if quoted.is_empty() {
+        return None;
+    }
+    Some(match quoted.split_once("...") {
+        Some((head, tail)) => (head.to_string(), tail.to_string()),
+        None => (quoted.to_string(), quoted.to_string()),
+    })
+}
+
+/// Whether one payload is the one a refusal hint quoted.
+fn matches_hint(encrypted_content: &str, (head, tail): &(String, String)) -> bool {
+    encrypted_content.len() >= head.len().max(tail.len())
+        && encrypted_content.starts_with(head)
+        && encrypted_content.ends_with(tail)
+}
+
+/// Every replayed `encrypted_content` in the payload's input, in order.
+fn encrypted_payloads(payload: &Value) -> Vec<&str> {
+    payload
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+                .filter_map(|item| item.get("encrypted_content").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The Responses payload with every replayed reasoning item that carries
 /// `encrypted_content` removed, or `None` when there is nothing to strip.
+pub fn without_encrypted_reasoning(payload: &Value) -> Option<Value> {
+    without_encrypted_reasoning_where(payload, |_| true)
+}
+
+/// The Responses payload with the replayed reasoning items whose
+/// `encrypted_content` `strip` selects removed, or `None` when it selects
+/// nothing.
 ///
 /// OpenAI binds an encrypted reasoning payload to the organization (Azure:
 /// the tenant) that sealed it and refuses every other with
@@ -59,20 +222,21 @@ pub fn replay_repair_headers(encrypted_reasoning_stripped: bool) -> Vec<(String,
 /// and refuses the id without it ("was provided without its required
 /// 'reasoning' item"), while an id-less item is accepted as caller-authored.
 /// Every kept item keeps its position; nothing outside `input` changes.
-pub fn without_encrypted_reasoning(payload: &Value) -> Option<Value> {
+pub fn without_encrypted_reasoning_where(
+    payload: &Value,
+    mut strip: impl FnMut(&str) -> bool,
+) -> Option<Value> {
     let mut repaired = payload.clone();
     let items = repaired.get_mut("input")?.as_array_mut()?;
-    let before = items.len();
-    let mut keep: Vec<bool> = Vec::with_capacity(before);
+    let mut keep: Vec<bool> = Vec::with_capacity(items.len());
     let mut governed = false;
     for item in items.iter_mut() {
         let kind = item.get("type").and_then(Value::as_str);
         let role = item.get("role").and_then(Value::as_str);
-        if kind == Some("reasoning")
-            && item
-                .get("encrypted_content")
-                .is_some_and(|content| !content.is_null())
-        {
+        let encrypted = (kind == Some("reasoning"))
+            .then(|| item.get("encrypted_content").and_then(Value::as_str))
+            .flatten();
+        if encrypted.is_some_and(&mut strip) {
             keep.push(false);
             governed = true;
             continue;
@@ -101,15 +265,139 @@ pub fn without_encrypted_reasoning(payload: &Value) -> Option<Value> {
     Some(repaired)
 }
 
-/// Emit the content-free operator line for one stripped re-dial.
-pub fn log_encrypted_reasoning_stripped(request_id: &str, wire: &DeploymentWire) {
-    let line = json!({
-        "event": "encrypted_reasoning_stripped",
-        "request_id": request_id,
-        "provider": wire.provider,
-        "deployment_id": wire.deployment_id,
-    });
-    eprintln!("exp-gateway-native: {line}");
+/// The repair state of one physical attempt on one rung.
+///
+/// `begin` applies what is already known: the payload this request stripped
+/// on an earlier dial of the rung (`repaired`), else the payloads the worker
+/// remembers as refused for this caller. `repair_after` decides one reactive
+/// re-dial when the provider still refuses, and `opened` counts and logs the
+/// repair once the dial that carried it has opened.
+pub(crate) struct AttemptRepair<'a> {
+    wire: &'a DeploymentWire,
+    scope: &'a str,
+    repaired: &'a mut Option<Value>,
+    stripped: bool,
+    proactive: bool,
+    reactive: bool,
+}
+
+impl<'a> AttemptRepair<'a> {
+    /// Prepare the first dial of this attempt.
+    pub(crate) fn begin(
+        wire: &'a DeploymentWire,
+        scope: &'a str,
+        repaired: &'a mut Option<Value>,
+    ) -> Self {
+        let mut repair = Self {
+            wire,
+            scope,
+            repaired,
+            stripped: false,
+            proactive: false,
+            reactive: false,
+        };
+        if repair.repaired.is_some() {
+            repair.stripped = true;
+        } else if wire.upstream_body.is_none() {
+            let remembered = |content: &str| MEMORY.recall(&payload_digest(scope, content));
+            if let Some(stripped) =
+                without_encrypted_reasoning_where(&wire.upstream_payload, remembered)
+            {
+                *repair.repaired = Some(stripped);
+                repair.stripped = true;
+                repair.proactive = true;
+            }
+        }
+        repair
+    }
+
+    /// The payload to dial now.
+    pub(crate) fn payload(&self) -> &Value {
+        self.repaired
+            .as_ref()
+            .unwrap_or(&self.wire.upstream_payload)
+    }
+
+    /// The pre-serialized body to dial now (body-signing dialects only, and
+    /// never once the payload was repaired).
+    pub(crate) fn raw_body(&self) -> Option<&str> {
+        if self.repaired.is_some() {
+            None
+        } else {
+            self.wire.upstream_body.as_deref()
+        }
+    }
+
+    /// Whether the dialed payload had encrypted reasoning stripped.
+    pub(crate) fn stripped(&self) -> bool {
+        self.stripped
+    }
+
+    /// Decide the reactive re-dial after a refused open: `true` when the
+    /// provider refused replayed encrypted reasoning, this attempt has not
+    /// repaired reactively yet, and the payload still carried something to
+    /// strip. The refused payloads (the one OpenAI quoted, else every one
+    /// still present) are remembered for later requests of this caller.
+    pub(crate) fn repair_after(&mut self, failure: &Failure) -> bool {
+        if self.reactive
+            || !failure.encrypted_reasoning_rejected
+            || self.wire.upstream_body.is_some()
+        {
+            return false;
+        }
+        let Some(stripped) = without_encrypted_reasoning(self.payload()) else {
+            return false;
+        };
+        let present = encrypted_payloads(self.payload());
+        let hint = failure
+            .provider_detail
+            .as_deref()
+            .and_then(refused_payload_hint);
+        let quoted: Vec<&str> = match &hint {
+            Some(hint) => present
+                .iter()
+                .copied()
+                .filter(|content| matches_hint(content, hint))
+                .collect(),
+            None => Vec::new(),
+        };
+        let refused = if quoted.is_empty() { present } else { quoted };
+        MEMORY.remember(
+            refused
+                .into_iter()
+                .map(|content| payload_digest(self.scope, content)),
+        );
+        *self.repaired = Some(stripped);
+        self.stripped = true;
+        self.reactive = true;
+        true
+    }
+
+    /// Count and log the repair once the dial carrying it has opened.
+    pub(crate) fn opened(&self, request_id: &str) {
+        if !self.stripped {
+            return;
+        }
+        let mode = if self.reactive {
+            METRICS.record_encrypted_reasoning_stripped();
+            "reactive"
+        } else {
+            METRICS.record_encrypted_reasoning_stripped_proactive();
+            if self.proactive {
+                "proactive"
+            } else {
+                "remembered"
+            }
+        };
+        let line = json!({
+            "event": "encrypted_reasoning_stripped",
+            "mode": mode,
+            "request_id": request_id,
+            "provider": self.wire.provider,
+            "deployment_id": self.wire.deployment_id,
+        });
+        eprintln!("exp-gateway-native: {line}");
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +464,94 @@ mod tests {
         assert!(without_encrypted_reasoning(&repaired).is_none());
         assert!(without_encrypted_reasoning(&json!({"model": "m", "input": "text"})).is_none());
         assert!(without_encrypted_reasoning(&json!({"model": "m", "messages": []})).is_none());
+    }
+
+    #[test]
+    fn the_refusal_hint_names_the_quoted_payload() {
+        let hint = refused_payload_hint(
+            "The encrypted content rsn_...hA== could not be verified. Reason: Encrypted content could not be decrypted or parsed. trace_id: 9f3c",
+        )
+        .expect("hint");
+        assert_eq!(hint, ("rsn_".to_string(), "hA==".to_string()));
+        assert!(matches_hint("rsn_sealed_elsewhere_hA==", &hint));
+        assert!(!matches_hint("gAAA_local_hA==", &hint));
+        assert!(!matches_hint("rsn_sealed_elsewhere==", &hint));
+        // A short payload is quoted whole.
+        let whole =
+            refused_payload_hint("The encrypted content abc could not be verified.").expect("hint");
+        assert!(matches_hint("abc", &whole));
+        assert!(!matches_hint("abcd", &whole));
+        assert!(refused_payload_hint("Invalid value for 'input[1].id'.").is_none());
+        assert!(refused_payload_hint("The encrypted content  could not be verified").is_none());
+    }
+
+    #[test]
+    fn selective_stripping_removes_only_the_selected_payloads() {
+        let payload = json!({
+            "model": "gpt-test",
+            "input": [
+                {"role": "user", "content": "plan"},
+                {"type": "reasoning", "id": "rs_a", "summary": [], "encrypted_content": "rsn_foreign_hA=="},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "exec", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"type": "reasoning", "id": "rs_b", "summary": [], "encrypted_content": "gAAA_local=="},
+                {"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "exec", "arguments": "{}"},
+            ],
+        });
+        let repaired =
+            without_encrypted_reasoning_where(&payload, |content| content.starts_with("rsn_"))
+                .expect("one item to strip");
+        let kept = repaired["input"].as_array().expect("input");
+        assert_eq!(kept.len(), 5);
+        assert!(
+            kept[1].get("id").is_none(),
+            "the governed call loses its id"
+        );
+        assert_eq!(kept[3]["encrypted_content"], "gAAA_local==");
+        assert_eq!(
+            kept[4]["id"], "fc_2",
+            "a turn whose reasoning stayed keeps its ids"
+        );
+        assert!(without_encrypted_reasoning_where(&payload, |_| false).is_none());
+    }
+
+    #[test]
+    fn the_memory_recalls_within_its_window_and_refreshes_on_a_hit() {
+        let memory = ReplayRepairMemory::default();
+        let one = payload_digest("key-a", "rsn_one==");
+        let same_content_other_caller = payload_digest("key-b", "rsn_one==");
+        assert_ne!(one, same_content_other_caller);
+        assert!(!memory.recall(&one));
+        memory.remember([one]);
+        assert!(memory.recall(&one));
+        assert!(!memory.recall(&same_content_other_caller));
+        assert_eq!(memory.len(), 1);
+        // Re-remembering an entry neither duplicates nor reorders it.
+        memory.remember([one]);
+        assert_eq!(memory.len(), 1);
+        // An expired entry is forgotten on recall.
+        {
+            let mut state = memory.state.lock().expect("lock");
+            *state.last_seen.get_mut(&one).expect("entry") =
+                Instant::now() - MEMORY_TTL - Duration::from_secs(1);
+        }
+        assert!(!memory.recall(&one));
+        assert!(memory.is_empty());
+    }
+
+    #[test]
+    fn the_memory_evicts_its_oldest_insertion_at_capacity() {
+        let memory = ReplayRepairMemory::default();
+        let digests: Vec<[u8; 32]> = (0..=MEMORY_CAPACITY)
+            .map(|index| payload_digest("key", &index.to_string()))
+            .collect();
+        memory.remember(digests.iter().copied());
+        assert_eq!(memory.len(), MEMORY_CAPACITY);
+        assert!(
+            !memory.recall(&digests[0]),
+            "the first insertion went first"
+        );
+        assert!(memory.recall(&digests[MEMORY_CAPACITY]));
     }
 
     #[test]

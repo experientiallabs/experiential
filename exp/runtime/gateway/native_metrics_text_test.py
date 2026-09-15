@@ -76,6 +76,7 @@ def _snapshot() -> JsonObject:
             },
             "open_retries": 2,
             "encrypted_reasoning_stripped": 1,
+            "encrypted_reasoning_stripped_proactive": 3,
             "settlement_retries": 1,
             "settlement_give_ups": 0,
             "active_requests": 1,
@@ -185,6 +186,9 @@ exp_gateway_open_retries_total 2
 # HELP exp_gateway_encrypted_reasoning_stripped_total Redials without refused encrypted reasoning.
 # TYPE exp_gateway_encrypted_reasoning_stripped_total counter
 exp_gateway_encrypted_reasoning_stripped_total 1
+# HELP exp_gateway_encrypted_reasoning_stripped_proactive_total Strips from remembered refusals.
+# TYPE exp_gateway_encrypted_reasoning_stripped_proactive_total counter
+exp_gateway_encrypted_reasoning_stripped_proactive_total 3
 # HELP exp_gateway_settlement_retries_total Settlement deliveries retried after a failed write.
 # TYPE exp_gateway_settlement_retries_total counter
 exp_gateway_settlement_retries_total 1

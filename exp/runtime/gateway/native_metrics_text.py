@@ -27,6 +27,10 @@ _DATA_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "encrypted_reasoning_stripped",
         "Redials without refused encrypted reasoning.",
     ),
+    (
+        "encrypted_reasoning_stripped_proactive",
+        "Strips from remembered refusals.",
+    ),
     ("settlement_retries", "Settlement deliveries retried after a failed write."),
     ("settlement_give_ups", "Settlements whose bounded retries were all exhausted."),
 )

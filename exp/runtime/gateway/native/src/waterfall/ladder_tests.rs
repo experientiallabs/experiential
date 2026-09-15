@@ -242,13 +242,12 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
     }
 }
 
-/// One native Responses rung whose replayed input carries a reasoning item
-/// sealed elsewhere beside the caller's visible turns.
-fn responses_wire(
-    deployment_id: &str,
-    url: &str,
-    with_encrypted_reasoning: bool,
-) -> DeploymentWire {
+/// One native Responses rung whose replayed input carries these reasoning
+/// payloads (sealed elsewhere, as far as the scripted rung is concerned)
+/// beside the caller's visible turns. Every test names its own payloads: the
+/// per-worker repair memory is process-global, so a payload one test's
+/// refusal remembers would be stripped proactively in another.
+fn responses_wire(deployment_id: &str, url: &str, encrypted: &[&str]) -> DeploymentWire {
     // The Codex shape: the call replays with the provider id of its turn.
     let mut input = vec![
         json!({"role": "user", "content": "plan the change"}),
@@ -256,10 +255,10 @@ fn responses_wire(
         json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
         json!({"role": "user", "content": "now apply it"}),
     ];
-    if with_encrypted_reasoning {
+    for (offset, content) in encrypted.iter().enumerate() {
         input.insert(
-            1,
-            json!({"type": "reasoning", "summary": [], "encrypted_content": "rsn_sealed_elsewhere=="}),
+            1 + offset,
+            json!({"type": "reasoning", "summary": [], "encrypted_content": content}),
         );
     }
     DeploymentWire {
@@ -324,6 +323,16 @@ impl Harness {
         throttle_redial: Option<ThrottleRedial>,
         deadline: Duration,
     ) -> (Won, AttemptGuard) {
+        self.run_as("key", route, throttle_redial, deadline).await
+    }
+
+    async fn run_as(
+        &self,
+        raw_key: &str,
+        route: &[DeploymentWire],
+        throttle_redial: Option<ThrottleRedial>,
+        deadline: Duration,
+    ) -> (Won, AttemptGuard) {
         let mut guard = AttemptGuard::new(
             self.bridge.clone(),
             Arc::new(AtomicUsize::new(0)),
@@ -334,7 +343,7 @@ impl Harness {
             bridge: &self.bridge,
             http: &self.http,
             request_id: "request-throttle",
-            raw_key: "key",
+            raw_key,
             route,
             policy: RoutePolicy {
                 maximum_total_attempts: 8,
@@ -660,8 +669,8 @@ fn a_refused_encrypted_reasoning_item_is_stripped_and_the_same_rung_redialed() {
         .await;
         let rung_b = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
         let route = [
-            responses_wire("a", &rung_a.url, true),
-            responses_wire("b", &rung_b.url, true),
+            responses_wire("a", &rung_a.url, &["rsn_a_refused_encrypted_reasoning_item_is_stripped_and_the_same_rung_redialed_hA=="]),
+            responses_wire("b", &rung_b.url, &["rsn_a_refused_encrypted_reasoning_item_is_stripped_and_the_same_rung_redialed_hA=="]),
         ];
         let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
         let won = finish(guard, won).await;
@@ -724,8 +733,16 @@ fn a_second_refusal_of_the_stripped_replay_surfaces_the_providers_400() {
         .await;
         let rung_b = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
         let route = [
-            responses_wire("a", &rung_a.url, true),
-            responses_wire("b", &rung_b.url, true),
+            responses_wire(
+                "a",
+                &rung_a.url,
+                &["rsn_a_second_refusal_of_the_stripped_replay_surfaces_the_providers_400_hA=="],
+            ),
+            responses_wire(
+                "b",
+                &rung_b.url,
+                &["rsn_a_second_refusal_of_the_stripped_replay_surfaces_the_providers_400_hA=="],
+            ),
         ];
         let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
         let won = finish(guard, won).await;
@@ -752,7 +769,7 @@ fn the_verdict_on_a_replay_with_nothing_to_strip_surfaces_at_once() {
     block_on(async {
         let harness = Harness::new();
         let rung_a = spawn_rung(vec![Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY)]).await;
-        let route = [responses_wire("a", &rung_a.url, false)];
+        let route = [responses_wire("a", &rung_a.url, &[])];
         let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
         let won = finish(guard, won).await;
         let Won::Failed(error) = won else {
@@ -782,9 +799,9 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
         let route = [
             DeploymentWire {
                 throttle_redial_budget: 2,
-                ..responses_wire("a", &rung_a.url, true)
+                ..responses_wire("a", &rung_a.url, &["rsn_a_remembered_repair_is_redialed_without_earning_the_refusal_again_hA=="])
             },
-            responses_wire("b", &rung_b.url, true),
+            responses_wire("b", &rung_b.url, &["rsn_a_remembered_repair_is_redialed_without_earning_the_refusal_again_hA=="]),
         ];
         let (won, guard) = harness
             .run(&route, Some(SCHEDULE), Duration::from_secs(60))
@@ -827,5 +844,73 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
         assert_eq!(settles.len(), 2);
         assert_eq!(settles[0]["outcome"], "failed");
         assert_eq!(settles[1]["outcome"], "completed");
+    });
+}
+
+#[test]
+fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
+    block_on(async {
+        // Turn one: the rung refuses the foreign payload (the verdict quotes
+        // its head and tail), the stripped re-dial serves. The local payload
+        // of the same conversation is not what was refused.
+        let foreign = "rsn_a_remembered_refused_payload_hA==";
+        let local = "gAAA_a_remembered_refused_payload_local==";
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+            Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME]),
+        ])
+        .await;
+        let route = [responses_wire("a", &rung.url, &[foreign, local])];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the stripped re-dial serves turn one");
+        };
+        assert!(committed.encrypted_reasoning_stripped);
+        drop(committed);
+        assert_eq!(rung.bodies.lock().expect("lock").len(), 2);
+
+        // Turn two, same caller, same history: only the remembered payload
+        // is stripped, before any dial, so the rung sees exactly one dial
+        // that still carries the local payload; the disclosure holds.
+        let later = Harness::new();
+        let rung = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
+        let route = [responses_wire("a", &rung.url, &[foreign, local])];
+        let (won, guard) = later.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the remembered strip serves turn two");
+        };
+        assert!(committed.encrypted_reasoning_stripped);
+        drop(committed);
+        let bodies = rung.bodies.lock().expect("lock").clone();
+        assert_eq!(bodies.len(), 1);
+        let sent: Value = serde_json::from_str(&bodies[0]).expect("body");
+        let payloads: Vec<&str> = sent["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .filter_map(|item| item.get("encrypted_content").and_then(Value::as_str))
+            .collect();
+        assert_eq!(payloads, vec![local]);
+        let story = later.story().await;
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        assert_eq!(story["settles"][0]["outcome"], "completed");
+
+        // Another caller replaying the same payload is not affected by this
+        // caller's memory: its first dial carries both payloads.
+        let stranger = Harness::new();
+        let rung = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
+        let route = [responses_wire("a", &rung.url, &[foreign, local])];
+        let (won, guard) = stranger
+            .run_as("other-key", &route, None, Duration::from_secs(60))
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the stranger's replay serves as sent");
+        };
+        assert!(!committed.encrypted_reasoning_stripped);
+        drop(committed);
+        let body: Value =
+            serde_json::from_str(&rung.bodies.lock().expect("lock")[0]).expect("body");
+        assert_eq!(body["input"].as_array().expect("input").len(), 6);
     });
 }
