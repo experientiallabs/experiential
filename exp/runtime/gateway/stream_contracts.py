@@ -173,6 +173,12 @@ class GatewayFailureClass(StrEnum):
     # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
     PROVIDER_QUOTA = "provider_quota"
     REFUSAL = "refusal"
+    # The provider closed the turn as complete and delivered nothing the caller
+    # can receive (an OpenAI empty assistant message; a reasoning-only turn on a
+    # rung whose reasoning the gateway strips). The model's answer to the
+    # request content, like REFUSAL: never a deployment-circuit failure, and a
+    # 400 the SDKs do not auto-retry.
+    EMPTY_COMPLETION = "empty_completion"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"
     CANCELLED = "cancelled"

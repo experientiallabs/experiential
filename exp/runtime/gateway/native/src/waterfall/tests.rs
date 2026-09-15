@@ -223,8 +223,16 @@ fn a_billed_stop_with_no_output_is_an_empty_completion() {
         Some(&usage(Some(0), Some(30)))
     ));
     let failure = Failure::empty_completion();
-    assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+    // The model's answer was nothing: its own class (never the health
+    // circuit's operational set), a 400 the SDKs do not auto-retry, and the
+    // pre-commit redial + ladder kept.
+    assert_eq!(failure.failure_class, FailureClass::EmptyCompletion);
     assert!(failure.retryable_same_deployment && failure.failover_eligible);
+    let public = failure.public_error();
+    assert_eq!(public.status_code, 400);
+    assert_eq!(public.code, "empty_completion");
+    assert_eq!(public.error_type, "invalid_request_error");
+    assert_eq!(FailureClass::EmptyCompletion.as_str(), "empty_completion");
 }
 
 #[test]

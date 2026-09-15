@@ -141,6 +141,13 @@ pub enum FailureClass {
     /// `QuotaExceeded`, which is the CALLER's gateway credit.
     ProviderQuota,
     Refusal,
+    /// The provider closed the turn as complete and delivered nothing the
+    /// caller can receive: no text, no tool call, no renderable reasoning
+    /// (an OpenAI empty assistant message, a reasoning-only turn on a rung
+    /// whose reasoning the gateway strips). Like a refusal it is the model's
+    /// answer to the request content, not rung deadness: it never opens the
+    /// deployment's health circuit and answers a 4xx no client auto-retries.
+    EmptyCompletion,
     MalformedResponse,
     ProviderInternal,
     Cancelled,
@@ -164,6 +171,7 @@ impl FailureClass {
             FailureClass::ProviderNotFound => "provider_not_found",
             FailureClass::ProviderQuota => "provider_quota",
             FailureClass::Refusal => "refusal",
+            FailureClass::EmptyCompletion => "empty_completion",
             FailureClass::MalformedResponse => "malformed_response",
             FailureClass::ProviderInternal => "provider_internal",
             FailureClass::Cancelled => "cancelled",
@@ -235,8 +243,8 @@ const REFUSAL_MESSAGE: &str = "provider refused the request";
 /// may serve the request instead.
 /// Safe message of [`Failure::empty_completion`]; content-free and stable so
 /// the ledger and the public error name the same shape.
-pub const EMPTY_COMPLETION_MESSAGE: &str =
-    "provider completed the turn without any output; retry the request";
+pub const EMPTY_COMPLETION_MESSAGE: &str = "the model ended its turn without producing any output; \
+     adjust the request (for example, end the conversation on a user turn or ask for a text answer) and resend";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
@@ -324,16 +332,20 @@ impl Failure {
         }
     }
 
-    /// The provider closed the turn as complete and billed output tokens
-    /// while sending nothing the caller can receive: no text, no tool call,
-    /// and no reasoning the surface renders (OpenRouter's DeepSeek rungs
-    /// answer a reasoning-only turn this way, live 2026-09-12). Nothing was
-    /// committed outward, so one bounded redial of the same deployment (the
-    /// empty answer is not deterministic) and then the ladder are both safe;
-    /// on the last rung the caller gets this message instead of an empty
-    /// success that bills tokens.
+    /// The provider closed the turn as complete while sending nothing the
+    /// caller can receive: no text, no tool call, and no reasoning the
+    /// surface renders (OpenRouter's DeepSeek rungs answer a reasoning-only
+    /// turn this way, live 2026-09-12; OpenAI returns a 4-token empty
+    /// assistant message to some Claude Code conversations, live
+    /// 2026-09-15). Pre-commit the redial and the ladder stay on (the empty
+    /// answer is not deterministic), but the class is [`FailureClass::
+    /// EmptyCompletion`]: the model's answer to the request content, so it
+    /// never feeds the rung's health circuit and the caller receives a 400
+    /// (the refusal precedent) rather than a 502 that every SDK auto-retries
+    /// -- 2026-09-15 one Claude Code session re-sent the same 44k-token
+    /// prompt every minute for an hour against a 502.
     pub fn empty_completion() -> Self {
-        Self::new(FailureClass::ProviderInternal, EMPTY_COMPLETION_MESSAGE).with_retry(true, true)
+        Self::new(FailureClass::EmptyCompletion, EMPTY_COMPLETION_MESSAGE).with_retry(true, true)
     }
 
     /// Attach one already-validated provider parameter path.
@@ -446,6 +458,12 @@ impl Failure {
             // convention is that status with its own code. The provider billed
             // the processed input, so a 502 would misdescribe a charged call.
             FailureClass::Refusal => (400, "refusal", "invalid_request_error"),
+            // An empty completion is the same family: the model's answer to
+            // the content was nothing. A 4xx is the shape no OpenAI or
+            // Anthropic SDK retries (both retry 408/409/429/5xx only), so a
+            // conversation that keeps yielding an empty turn surfaces once
+            // instead of looping; the message names the remedy.
+            FailureClass::EmptyCompletion => (400, "empty_completion", "invalid_request_error"),
             FailureClass::Unavailable => (503, "gateway_unavailable", "api_error"),
             _ => (502, "all_routes_failed", "api_error"),
         };

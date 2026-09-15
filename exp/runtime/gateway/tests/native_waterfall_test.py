@@ -472,7 +472,7 @@ def test_billed_empty_stop_redials_instead_of_settling_an_empty_success(
     waterfall settled the output-less terminal as a completed empty answer
     that billed 42 to 750 output tokens. The empty completion now takes the
     ladder like any pre-commit failure: the primary is redialed and serves,
-    and the ledger names the empty attempt ``provider_internal``.
+    and the ledger names the empty attempt ``empty_completion``.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -491,7 +491,7 @@ def test_billed_empty_stop_redials_instead_of_settling_an_empty_success(
             " WHERE request_id = ? AND attempt_ordinal = 0",
             (request_id,),
         ).fetchone()
-    assert failed[0] == "provider_internal"
+    assert failed[0] == "empty_completion"
     # The empty attempt keeps the tokens the provider billed for it.
     assert failed[1] == 147
 

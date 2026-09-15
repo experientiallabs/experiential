@@ -1622,7 +1622,10 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
     }
 
 
-_EMPTY_COMPLETION_MESSAGE = "provider completed the turn without any output; retry the request"
+_EMPTY_COMPLETION_MESSAGE = (
+    "the model ended its turn without producing any output; adjust the request (for example, "
+    "end the conversation on a user turn or ask for a text answer) and resend"
+)
 
 
 def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str | None]]:
@@ -1659,14 +1662,14 @@ def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str |
 def test_messages_non_stream_billed_empty_stop_fails_instead_of_an_empty_end_turn(
     engine: _ServingEngine,
 ) -> None:
-    """A ``stop`` that billed reasoning yet rendered no block is a typed 502.
+    """A ``stop`` that billed reasoning yet rendered no block is a typed 400.
 
     Production 2026-09-12 (deepseek-v4-flash via OpenRouter, Claude Code's
     body): ``message_start`` then ``message_delta`` with ``end_turn``, zero
     content blocks, and 42 to 750 billed output tokens, which Claude Code
     reports as "[Your previous response had no visible output]". The single
     rung here is redialed once (its bounded cap) and both dispatches settle
-    ``failed`` as ``provider_internal``; a route with a second rung would
+    ``failed`` as ``empty_completion``; a route with a second rung would
     fail over instead.
     """
     response = httpx.post(
@@ -1675,14 +1678,14 @@ def test_messages_non_stream_billed_empty_stop_fails_instead_of_an_empty_end_tur
         json=_messages_body("reasoning-only-token"),
         timeout=30.0,
     )
-    assert response.status_code == 502, response.text
+    assert response.status_code == 400, response.text
     body = response.json()
     assert body["type"] == "error"
-    assert body["error"]["type"] == "api_error"
+    assert body["error"]["type"] == "invalid_request_error"
     assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
     assert _latest_attempt_states(engine) == [
-        (0, "failed", "provider_internal"),
-        (1, "failed", "provider_internal"),
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
     ]
 
 
@@ -1704,14 +1707,14 @@ def test_messages_stream_billed_empty_stop_is_refused_before_the_first_frame(
     ) as response:
         status = response.status_code
         raw = b"".join(response.iter_bytes()).decode()
-    assert status == 502, raw
+    assert status == 400, raw
     assert "message_start" not in raw
     body = json.loads(raw)
     assert body["type"] == "error"
     assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
     assert _latest_attempt_states(engine) == [
-        (0, "failed", "provider_internal"),
-        (1, "failed", "provider_internal"),
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
     ]
 
 
@@ -1779,12 +1782,12 @@ def test_chat_capped_silent_stop_stream_ends_with_length(engine: _ServingEngine)
 def test_chat_uncapped_silent_stop_fails_instead_of_an_empty_completion(
     engine: _ServingEngine,
 ) -> None:
-    """Without a cap the same wire is the provider delivering nothing: a typed 502.
+    """Without a cap the same wire is the provider delivering nothing: a typed 400.
 
     No budget could have been exhausted, nothing was sent and nothing was
     accounted, so the attempt takes the ladder like the billed empty stop:
     the single rung is redialed once and both dispatches settle ``failed`` as
-    ``provider_internal``.
+    ``empty_completion``.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -1792,12 +1795,12 @@ def test_chat_uncapped_silent_stop_fails_instead_of_an_empty_completion(
         json={"model": "coding", "messages": [{"role": "user", "content": "silent-stop-token"}]},
         timeout=30.0,
     )
-    assert response.status_code == 502, response.text
+    assert response.status_code == 400, response.text
     body = response.json()
     assert body["error"]["message"] == _EMPTY_COMPLETION_MESSAGE
     assert _latest_attempt_states(engine) == [
-        (0, "failed", "provider_internal"),
-        (1, "failed", "provider_internal"),
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
     ]
 
 

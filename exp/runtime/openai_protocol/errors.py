@@ -209,6 +209,10 @@ def public_failure_error(
         # safety system"); the provider billed the processed input, so a 502
         # would misdescribe a charged call as an infrastructure fault.
         GatewayFailureClass.REFUSAL: (400, "refusal", "invalid_request_error"),
+        # The same family: the model's answer to the content was nothing. A
+        # 4xx is what no OpenAI or Anthropic SDK auto-retries, so a
+        # conversation that keeps yielding an empty turn surfaces once.
+        GatewayFailureClass.EMPTY_COMPLETION: (400, "empty_completion", "invalid_request_error"),
         GatewayFailureClass.UNAVAILABLE: (503, "gateway_unavailable", "api_error"),
     }
     status, code, error_type = mappings.get(

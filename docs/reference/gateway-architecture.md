@@ -208,9 +208,9 @@ providers. Typed refusal fallback is disabled unless the active alias revision e
 it. Opted-in refusal deltas are withheld only in a bounded in-memory buffer: a refusal-only terminal
 result can advance to the next certified deployment, while mixed semantic output or buffer overflow
 commits and flushes the original route. A `stop` that bills output or reasoning tokens yet carried no
-semantic event (a reasoning-only turn on a rung whose reasoning the gateway strips) is a typed
-`provider_internal` failure, not an empty success: it redials once, then takes the ladder, and on the
-last rung the caller receives that error rather than `content: []` with `end_turn`; a zero-token stop
+semantic event (a stripped reasoning-only turn, OpenAI's 4-token empty message) is a typed
+`empty_completion` failure: it redials once, takes the ladder, and on the last rung answers 400
+`empty_completion` (the refusal precedent: no circuit deadness, no SDK auto-retry), never `content: []`; a zero-token stop
 that REPORTS zero tokens and a budget truncation before the first delta stay honest output-less
 answers. A `stop` with no semantic event and NO usage report at all is read by the caller's own
 output cap (the admission carries `maximum_output_tokens`): on a capped request it is a budget the

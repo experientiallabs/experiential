@@ -223,6 +223,12 @@ class DeploymentHealthRegistry:
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1
                 return
+            if failure.failure_class == GatewayFailureClass.EMPTY_COMPLETION:
+                # The model answered the content with nothing: the caller's
+                # conversation, not rung deadness. One stuck Claude Code
+                # session re-sending the same prompt every minute must not
+                # open the rung for everyone else (2026-09-15, gpt-5.6-luna).
+                return
             if failure.failure_class in _HARD_FAILURES:
                 state.consecutive_failures = self._failure_threshold
                 state.open_until = now + self._open_seconds
