@@ -32,7 +32,7 @@ from exp.runtime.gateway.native_execution import (
     throttle_disposition,
 )
 from exp.runtime.gateway.routing import GatewayRoute
-from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
+from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed, RungShedReason
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 
 _logger = logging.getLogger(__name__)
@@ -225,20 +225,27 @@ def shed_keeps_rung(
     candidate: int,
     redial_depth: int | None,
     last_failure: GatewayFailure | None,
+    shed_reason: RungShedReason,
 ) -> bool:
     """Whether a policy shed of ``candidate`` force-admits it instead of spilling sideways.
 
-    Two rungs are kept. The rung a post-backoff throttle redial re-dials
-    (``candidate == redial_depth``): the data plane already waited the pool's
-    ``throttle_redial`` schedule to keep the caller's provider cache on that
-    rung, the redial count is bounded by the rung's admission-time budget and
-    the request's attempt cap, and the provider's own 429 window governs the
-    load actually placed there, so the rung's per-worker rate or concurrency
-    facts must not convert the paid-for redial into a cold failover that a
-    prompt of this size may never finish within a fallback's first-byte
-    allowance. And the issuing rung of a reasoning-pinned route on a first
-    dispatch (``shed_keeps_pin``), before any real failure on it. Every other
-    shed spills sideways to the next claimable rung.
+    Two cases keep the rung. A post-backoff throttle redial
+    (``candidate == redial_depth``) shed by the rung's RATE WINDOW
+    (``rate_limit``, the authored per-worker ``requests_per_minute`` or
+    ``tokens_per_minute``): the per-minute windows are pacing, and a redial
+    that already waited the pool's ``throttle_redial`` schedule has paid its
+    pacing on the provider's own 429 clock, so converting it into a cold
+    failover would abandon the cache the caller waited to keep for a prompt a
+    fallback may never finish within its first-byte allowance. The redial
+    count stays bounded by the rung's admission-time budget and the request's
+    attempt cap. The rung's ``concurrency_bound`` (``queue_bound``, and the
+    ``fresh_session_spill`` early threshold on it) and its ``fair_share_shed``
+    are NOT bypassed by a redial: the bound is the per-worker hard ceiling that
+    protects the provider connection and the other tenants on the rung, and it
+    stays hard for everyone, so a redial shed by it spills sideways exactly
+    like any other dispatch. The other case is the issuing rung of a
+    reasoning-pinned route on its first dispatch (``shed_keeps_pin``), before
+    any real failure on it, for every shed reason. Every other shed spills.
 
     Args:
         route: The admitted route.
@@ -247,11 +254,12 @@ def shed_keeps_rung(
             when this reservation is not a redial.
         last_failure: The classified failure that ended the previous
             dispatch, or ``None`` on the request's first reservation.
+        shed_reason: Why the rung's dispatch policy refused the reservation.
 
     Returns:
         Whether the accounting keeps the candidate and admits it past the policy.
     """
-    if candidate == redial_depth:
+    if candidate == redial_depth and shed_reason == "rate_limit":
         return True
     return last_failure is None and shed_keeps_pin(route, candidate)
 

@@ -268,15 +268,21 @@ attempt row (the attempt ordinal increments), claimed through the rung's own thr
 (this request is the one deliberately probing the rung back; other requests still avoid it), and
 disclosed as `dispatch_reason: throttle_backoff`; the cold advance after the budget is
 `throttle_failover_cold`. The redial is admitted on the warm rung even when that rung's own
-dispatch-policy facts (its authored per-worker `requests_per_minute`, `tokens_per_minute` or
-`concurrency_bound`) would shed it: the caller already waited the backoff to keep its cache there,
-the redial count is bounded by the rung's admission-time budget and the request's attempt cap, and
-the provider's 429 window is what governs the load actually placed on the rung, so a shed there is
-force-admitted rather than converted into a cold failover of a prompt a fallback may never finish
-within its first-byte allowance. The attempt row stays `throttle_backoff` (never `rate_limit` or
-`saturated_overflow`); the shed is still counted in `rung_admission_sheds` and the forced redial
-in the worker's `throttle_backoff_forced_admissions` counter. Sheds on any other rung, and sheds of
-a first dispatch, spill sideways exactly as without a schedule. The worker's
+per-worker RATE WINDOW (its authored `requests_per_minute` or `tokens_per_minute`, the
+`rate_limit` shed) would shed it: the per-minute windows are pacing, and a redial that already
+waited the backoff has paid its pacing on the provider's own 429 clock; the caller waited to keep
+its cache there, and the redial count is bounded by the rung's admission-time budget and the
+request's attempt cap, so the shed is force-admitted rather than converted into a cold failover of
+a prompt a fallback may never finish within its first-byte allowance. The attempt row stays
+`throttle_backoff` (never `rate_limit` or `saturated_overflow`); the shed is still counted in
+`rung_admission_sheds` and the forced redial in the worker's `throttle_backoff_forced_admissions`
+counter. The rung's `concurrency_bound` (the `queue_bound` shed and the `fresh_session_spill`
+early threshold on it) and its fair share are NOT bypassed by a redial: the bound is the per-worker
+hard ceiling that protects the provider connection and the other tenants on the rung and stays
+hard for everyone, so a redial shed by it spills sideways exactly like any other dispatch. Sheds
+on any other rung, and sheds of a first dispatch, spill sideways exactly as without a schedule; a
+forced redial the rung's hard deployment budget then rejects carries no forced state to the rung
+the ladder advances to. The worker's
 `throttle_backoff_redials` counter beside `throttle_surfaced_cache_preserving` and
 `throttle_failover_cold` traces the three outcomes. Pools
 that author no schedule keep byte-identical behavior; the hosted platform's recommended

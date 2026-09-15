@@ -512,26 +512,32 @@ def test_throttle_redial_budget_is_the_full_schedule_on_the_warm_sticky_rung() -
     ) == (2, 2, 2)
 
 
-def test_shed_keeps_rung_force_admits_the_redialed_rung_and_the_first_pinned_dispatch() -> None:
-    """A backoff redial keeps its rung through a shed; a pinned issuing rung only pre-failure."""
+def test_shed_keeps_rung_force_admits_a_rate_shed_redial_and_the_first_pinned_dispatch() -> None:
+    """A backoff redial passes only the rate window; a pinned issuing rung passes any shed once."""
     deployments = (
         _deployment("deployment-a", connection_sha256="b" * 64),
         _deployment("deployment-b", connection_sha256="c" * 64),
     )
     route = _entry(deployments).route
-    # The redialed rung is kept whatever the failure history or pin state.
-    assert shed_keeps_rung(route, 0, 0, _THROTTLE) is True
-    assert shed_keeps_rung(route, 0, 0, None) is True
+    # The redialed rung is kept through its rate window whatever the failure history...
+    assert shed_keeps_rung(route, 0, 0, _THROTTLE, "rate_limit") is True
+    assert shed_keeps_rung(route, 0, 0, None, "rate_limit") is True
+    # ...but never through the hard bound, its fresh-session threshold, or fair share.
+    assert shed_keeps_rung(route, 0, 0, _THROTTLE, "queue_bound") is False
+    assert shed_keeps_rung(route, 0, 0, _THROTTLE, "fresh_session_spill") is False
+    assert shed_keeps_rung(route, 0, 0, _THROTTLE, "fair_share_shed") is False
     # A shed on any other rung of a failed ladder spills sideways.
-    assert shed_keeps_rung(route, 1, 0, _THROTTLE) is False
-    assert shed_keeps_rung(route, 1, None, _THROTTLE) is False
+    assert shed_keeps_rung(route, 1, 0, _THROTTLE, "rate_limit") is False
+    assert shed_keeps_rung(route, 1, None, _THROTTLE, "rate_limit") is False
     # Without a pin, a first-dispatch shed spills too.
-    assert shed_keeps_rung(route, 0, None, None) is False
+    assert shed_keeps_rung(route, 0, None, None, "rate_limit") is False
     assert shed_keeps_pin(route, 0) is False
     pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "deployment-a"})
     assert shed_keeps_pin(pinned, 0) is True
     assert shed_keeps_pin(pinned, 1) is False
-    # The pinned issuing rung is kept on its first dispatch, not after a real failure on it.
-    assert shed_keeps_rung(pinned, 0, None, None) is True
-    assert shed_keeps_rung(pinned, 0, None, _THROTTLE) is False
-    assert shed_keeps_rung(pinned, 1, None, None) is False
+    # The pinned issuing rung is kept on its first dispatch for every shed
+    # reason, not after a real failure on it.
+    for reason in ("rate_limit", "queue_bound", "fair_share_shed", "fresh_session_spill"):
+        assert shed_keeps_rung(pinned, 0, None, None, reason) is True
+        assert shed_keeps_rung(pinned, 0, None, _THROTTLE, reason) is False
+        assert shed_keeps_rung(pinned, 1, None, None, reason) is False
