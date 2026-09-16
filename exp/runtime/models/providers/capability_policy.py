@@ -520,6 +520,8 @@ def coerce_generation_parameters(
         The disclosed substitution to retry with, or ``None`` when nothing
         coercible applies.
     """
+    if request.logprobs is True:
+        return None
     disabled_thinking = _coerce_disabled_thinking(profiles, request)
     if disabled_thinking is not None:
         if admits is not None and not admits(disabled_thinking.request):

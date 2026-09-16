@@ -9,7 +9,15 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
@@ -571,8 +579,8 @@ class _ChatRequest(_WireModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    logprobs: bool | None = None
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    logprobs: StrictBool | None = None
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
@@ -600,6 +608,8 @@ class _ChatRequest(_WireModel):
             raise ValueError("max_tokens and max_completion_tokens are mutually exclusive")
         if self.stream_options is not None and not self.stream:
             raise ValueError("stream_options requires stream=true")
+        if self.top_logprobs is not None and self.logprobs is not True:
+            raise ValueError("top_logprobs requires logprobs=true")
         return self
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
@@ -47,6 +47,12 @@ from exp.runtime.gateway.reasoning_blocks import (
     ThinkingBlock as ThinkingBlock,
 )
 from exp.runtime.gateway.stream_contracts import (
+    ChoiceLogprobs as ChoiceLogprobs,
+)
+from exp.runtime.gateway.stream_contracts import (
+    ChoiceLogprobsDelta as ChoiceLogprobsDelta,
+)
+from exp.runtime.gateway.stream_contracts import (
     GatewayEvent as GatewayEvent,
 )
 from exp.runtime.gateway.stream_contracts import (
@@ -63,6 +69,12 @@ from exp.runtime.gateway.stream_contracts import (
 )
 from exp.runtime.gateway.stream_contracts import (
     GatewayUsage as GatewayUsage,
+)
+from exp.runtime.gateway.stream_contracts import (
+    LogprobCandidate as LogprobCandidate,
+)
+from exp.runtime.gateway.stream_contracts import (
+    TokenLogprob as TokenLogprob,
 )
 
 GatewayAliasName = ArtifactId
@@ -511,8 +523,8 @@ class GatewayRequest(ContractModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    logprobs: bool | None = None
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    logprobs: StrictBool | None = None
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     reasoning_effort_parameter: (
         Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None

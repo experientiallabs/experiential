@@ -431,6 +431,7 @@ pub struct Normalizer {
     // A call the provider cut mid-fragment was dropped under an ending that
     // did not declare truncation; the terminal then settles Incomplete.
     dropped_cut_call: bool,
+    chat_logprobs: bool,
 }
 
 impl Normalizer {
@@ -466,7 +467,12 @@ impl Normalizer {
             request_words: Vec::new(),
             deferred_tool_failure: None,
             dropped_cut_call: false,
+            chat_logprobs: false,
         }
+    }
+
+    pub fn enable_chat_logprobs(&mut self, enabled: bool) {
+        self.chat_logprobs = enabled;
     }
 
     /// Reserve retained-output budget for accumulated tool-argument text.

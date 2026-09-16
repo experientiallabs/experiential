@@ -480,14 +480,14 @@ class GatewayDeploymentCapabilities(ContractModel):
     """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
-
     ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
     field). A concrete value lets admission reject an over-limit list locally with a
     named parameter error instead of forwarding it and surfacing the provider's
     opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
     minimum_output_tokens: int | None = Field(default=None, ge=1)
-    """Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6 on Bedrock: 16); a
-    smaller caller ceiling is floored to it with disclosure on every surface (see the profile)."""
+    """Provider output-token floor; smaller ceilings are floored with disclosure."""
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
+    """Verified Chat probability efforts on reasoning models; empty means unknown."""
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values this deployment can preserve without normalization.
 

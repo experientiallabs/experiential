@@ -84,11 +84,7 @@ CHAT_MANIFEST = CompatibilityManifest(
         # any rung, so false is already satisfied and store:true is rejected:
         # silently dropping a retention request would be dishonest.
         _field("store", CompatibilityDisposition.SUPPORTED),
-        # top_logprobs stays UNSUPPORTED: the gateway response contract does not
-        # project logprob arrays yet, so it cannot be honored on any rung —
-        # rejecting is the honest outcome (never a silent drop of a probability
-        # request). Admit it only once response normalization emits logprobs.
-        _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution (OpenAI spec). Accepted and recorded gateway-side,
         # never forwarded to the model: `safety_identifier` is the current

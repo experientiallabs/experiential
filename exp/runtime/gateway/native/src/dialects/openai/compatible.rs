@@ -194,6 +194,19 @@ impl Normalizer {
         let choice = choices[0]
             .as_object()
             .ok_or_else(|| malformed("OpenAI-compatible choice must be an object"))?;
+        let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+        if self.chat_logprobs
+            && (choice_index != 0 || choice.get("index").is_some_and(|value| !value.is_u64()))
+        {
+            return Err(malformed("OpenAI-compatible stream choice index must be 0"));
+        }
+        if self.chat_logprobs {
+            if let Some(event) =
+                crate::logprobs::parse(choice.get("logprobs"), choice_index as u32)?
+            {
+                events.push(Event::ChoiceLogprobsDelta(event));
+            }
+        }
         // Azure asynchronous content-filter annotations carry no delta. Treat
         // their metadata-only choice as an empty delta, then still process the
         // finish reason below: an annotation can terminate with content_filter.

@@ -90,6 +90,7 @@ def completed_body(
         ]
         or None,
     }
+    probability_value = _chat_logprobs(events)
     usage = next(
         (
             event.usage
@@ -114,7 +115,7 @@ def completed_body(
                     if tool_calls
                     else "stop"
                 ),
-                "logprobs": None,
+                "logprobs": probability_value,
             }
         ],
         "usage": chat_usage(usage),
@@ -140,6 +141,49 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
         "total_tokens": usage.input_tokens + usage.output_tokens,
         "prompt_tokens_details": details or None,
         "completion_tokens_details": output_details or None,
+    }
+
+
+def _chat_logprobs(events: tuple[GatewayEvent, ...]) -> JsonObject | None:
+    """Aggregate ordered choice probability observations into Chat output."""
+    observations = tuple(
+        event.choice_logprobs_delta
+        for event in events
+        if event.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA
+    )
+    if not observations:
+        return None
+    if any(observation is None for observation in observations):
+        raise OpenAIProtocolError(
+            status_code=502,
+            code="invalid_provider_stream",
+            message="Chat probability event omitted its payload.",
+            error_type="api_error",
+        )
+    observations = tuple(observation for observation in observations if observation is not None)
+    if any(observation.choice_index != 0 for observation in observations):
+        raise OpenAIProtocolError(
+            status_code=502,
+            code="invalid_provider_stream",
+            message="Chat probability events support choice index 0 only.",
+            error_type="api_error",
+        )
+    values = tuple(
+        observation.logprobs for observation in observations if observation.logprobs is not None
+    )
+    if not values:
+        return None
+    content = tuple(record for value in values for record in (value.content or ()))
+    refusal = tuple(record for value in values for record in (value.refusal or ()))
+    # A probability object is retained even when both channels are null. This
+    # distinguishes an observed empty update from no provider metadata.
+    return {
+        "content": [record.model_dump(mode="json") for record in content]
+        if any(value.content is not None for value in values)
+        else None,
+        "refusal": [record.model_dump(mode="json") for record in refusal]
+        if any(value.refusal is not None for value in values)
+        else None,
     }
 
 

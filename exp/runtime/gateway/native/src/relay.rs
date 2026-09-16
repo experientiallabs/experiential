@@ -60,6 +60,7 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         }
         Event::HostedToolItemProgress { payload, .. } => payload.len(),
         Event::ProviderTextAnnotation { annotation, .. } => annotation.len(),
+        Event::ChoiceLogprobsDelta(delta) => delta.retained_bytes(),
         _ => 64,
     }
 }
@@ -251,6 +252,10 @@ impl UpstreamRelay {
         S: Into<String>,
     {
         self.normalizer.set_request_words(words);
+    }
+
+    pub fn set_chat_logprobs(&mut self, enabled: bool) {
+        self.normalizer.enable_chat_logprobs(enabled);
     }
 
     /// Name the customer-managed provider this relay dispatches on, so every

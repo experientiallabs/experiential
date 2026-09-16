@@ -1,14 +1,12 @@
 """Python control plane for the native (Rust) gateway data plane.
 
 The native engine (`exp_gateway_native`) owns sockets, upstream streaming,
-normalization, and SSE encoding. Shared Python contracts own decoding,
-authorization, payload construction, continuation state, and durable ledger
-transactions. Every boundary call takes and returns one JSON string.
+normalization, and SSE encoding. Python owns decoding, authorization, dispatch,
+continuation and accounting. Boundary calls take and return one JSON string.
 
 Admission returns the full ordered certified route (one wire configuration
 per deployment) plus the frozen retry-policy facts, accepting the request
-without starting any attempt. The data plane then reserves each physical
-dispatch through ``start_attempt`` immediately before network work and lands
+without starting attempts. The data plane reserves each ``start_attempt`` and lands
 each attempt's durable terminal through ``settle`` (finalizing the request
 only on the terminal attempt); candidate selection stays here: the frozen
 waterfall policy, health circuits, and budget skipping.
@@ -128,6 +126,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     normalized_provider_failure,
 )
+from exp.runtime.models.providers.logprobs import require_unmodified_probability_output
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
@@ -518,6 +517,7 @@ class NativeControlPlane(
                     continuation=continuation_context,
                 )
             )
+            require_unmodified_probability_output(request, bool(policy and policy.output_checks))
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
             signers: list[GatewayDispatchSigner | None] = []

@@ -8,6 +8,7 @@ from collections.abc import Iterable
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
+    ChoiceLogprobs,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -84,6 +85,13 @@ class ChatSseEncoder:
             return (self._chunk(delta={"content": event.text_delta}),)
         if event.kind == GatewayEventKind.REFUSAL_DELTA:
             return (self._chunk(delta={"refusal": event.text_delta}),)
+        if event.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            update = event.choice_logprobs_delta
+            if update is None:
+                raise self._state_error("Chat probability event omitted its payload.")
+            if update.choice_index != 0:
+                raise self._state_error("Chat probability events support choice index 0 only.")
+            return (self._chunk(delta={}, logprobs=_choice_logprobs_json(update.logprobs)),)
         if event.kind in {
             GatewayEventKind.REASONING_SUMMARY_DELTA,
             # The Chat wire has no reasoning representation, so provider
@@ -175,7 +183,13 @@ class ChatSseEncoder:
         frames.append("data: [DONE]\n\n")
         return tuple(frames)
 
-    def _chunk(self, *, delta: JsonObject, finish_reason: str | None = None) -> str:
+    def _chunk(
+        self,
+        *,
+        delta: JsonObject,
+        finish_reason: str | None = None,
+        logprobs: JsonObject | None = None,
+    ) -> str:
         """Build one official Chat completion chunk SSE frame."""
         payload: JsonObject = {
             "id": self.completion_id,
@@ -187,7 +201,7 @@ class ChatSseEncoder:
                     "index": 0,
                     "delta": delta,
                     "finish_reason": finish_reason,
-                    "logprobs": None,
+                    "logprobs": logprobs,
                 }
             ],
         }
@@ -864,6 +878,15 @@ def _required_text(value: str | None) -> str:
     if value is None:
         raise ChatSseEncoder._state_error("Provider event omitted required text.")
     return value
+
+
+def _choice_logprobs_json(value: ChoiceLogprobs | None) -> JsonObject | None:
+    """Serialize one typed Chat probability observation for an SSE choice."""
+    if value is None:
+        return None
+    # The event contract is a closed ContractModel, so this cast is confined
+    # to the JSON boundary and cannot admit arbitrary provider metadata.
+    return value.model_dump(mode="json")
 
 
 def _chat_data(payload: JsonObject) -> str:

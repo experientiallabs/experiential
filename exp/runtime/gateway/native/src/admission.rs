@@ -83,6 +83,16 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
+    /// Reject a control-plane mismatch before reserving or dispatching an attempt.
+    pub(crate) fn preserves_chat_probabilities(&self) -> bool {
+        self.route.iter().all(|wire| {
+            wire.upstream_payload.get("logprobs") != Some(&Value::Bool(true))
+                || (wire.dialect == "openai_compatible"
+                    && !self.output_guardrail
+                    && wire.stop_sequences.is_empty())
+        })
+    }
+
     pub(crate) fn policy(&self) -> RoutePolicy {
         RoutePolicy {
             maximum_total_attempts: self.maximum_total_attempts.max(1),

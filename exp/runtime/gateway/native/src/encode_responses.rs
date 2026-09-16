@@ -117,6 +117,9 @@ impl ResponsesSseEncoder {
             ));
         }
         match event {
+            Event::ChoiceLogprobsDelta(_) => Err(invalid_provider_stream(
+                "Chat token probabilities cannot be projected on this surface.",
+            )),
             Event::TextDelta(delta) => self.content_delta(MessageKey::Synthetic, None, true, delta),
             Event::RefusalDelta(delta) => {
                 self.content_delta(MessageKey::Synthetic, None, false, delta)

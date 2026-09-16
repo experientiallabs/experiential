@@ -137,6 +137,7 @@ pub struct WaterfallContext<'a> {
     /// divided by four. An allowance heuristic only, never a billing
     /// quantity.
     pub approximate_input_tokens: f64,
+    pub chat_logprobs: bool,
     /// The bridge `remember` argument retaining an output-less turn: a
     /// successful terminal reached before any semantic output still answers
     /// the caller with a response id, and a response id the caller received

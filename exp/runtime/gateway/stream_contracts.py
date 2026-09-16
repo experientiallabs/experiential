@@ -7,11 +7,46 @@ that module re-exports every name here, so import paths are unchanged.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
+
+ByteValue = Annotated[int, Field(strict=True, ge=0, le=255)]
+"""One byte from a provider token representation."""
+
+LogProbability = Annotated[float, Field(strict=True, allow_inf_nan=False)]
+"""One finite natural-log probability."""
+
+
+class LogprobCandidate(ContractModel):
+    """One alternate token and its provider probability."""
+
+    token: str
+    logprob: LogProbability
+    bytes: tuple[ByteValue, ...] | None = None
+
+
+class TokenLogprob(LogprobCandidate):
+    """The selected token probability and bounded alternate candidates."""
+
+    top_logprobs: tuple[LogprobCandidate, ...] = Field(max_length=20)
+
+
+class ChoiceLogprobs(ContractModel):
+    """Probability records for one Chat choice's content or refusal channel."""
+
+    content: tuple[TokenLogprob, ...] | None = None
+    refusal: tuple[TokenLogprob, ...] | None = None
+
+
+class ChoiceLogprobsDelta(ContractModel):
+    """One ordered probability observation scoped to a Chat choice."""
+
+    choice_index: int = Field(strict=True, ge=0, le=2**32 - 1)
+    logprobs: ChoiceLogprobs | None
 
 
 class GatewayUsage(ContractModel):
@@ -64,6 +99,7 @@ class GatewayEventKind(StrEnum):
 
     TEXT_DELTA = "text_delta"
     REFUSAL_DELTA = "refusal_delta"
+    CHOICE_LOGPROBS_DELTA = "choice_logprobs_delta"
     REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
     THINKING_DELTA = "thinking_delta"
     THINKING_SIGNATURE = "thinking_signature"
@@ -101,6 +137,7 @@ class GatewayEvent(ContractModel):
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    choice_logprobs_delta: ChoiceLogprobsDelta | None = None
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:
@@ -115,6 +152,9 @@ class GatewayEvent(ContractModel):
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")
+        elif self.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            if self.choice_logprobs_delta is None:
+                raise ValueError("choice logprobs deltas require their payload")
         elif self.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
             if (
                 self.text_delta is None
