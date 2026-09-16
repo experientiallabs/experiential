@@ -35,16 +35,27 @@ pub struct ChoiceLogprobsDelta {
     pub logprobs: Option<ChoiceLogprobs>,
 }
 
+// Budget both retained structures and their JSON representation. Doubling the
+// structure sizes leaves room for vector capacity; token text can expand to six
+// bytes per escaped control byte, and a byte-array value takes at most four
+// JSON bytes (three digits plus a separator). Fixed structures also cover keys,
+// punctuation and numeric fields. This is a conservative budget, not an
+// allocator measurement, and requires no serialization on the streaming path.
+const STRUCTURE_HEADROOM: usize = 2;
+const JSON_TEXT_EXPANSION: usize = 6;
+const JSON_BYTE_EXPANSION: usize = 4;
+
 impl ChoiceLogprobsDelta {
+    /// Estimate retained and encoded size without allocating an encoded copy.
     pub fn retained_bytes(&self) -> usize {
         fn candidate_bytes(candidate: &LogprobCandidate) -> usize {
-            64usize
-                .saturating_add(candidate.token.len().saturating_mul(6))
+            (std::mem::size_of::<LogprobCandidate>() * STRUCTURE_HEADROOM)
+                .saturating_add(candidate.token.len().saturating_mul(JSON_TEXT_EXPANSION))
                 .saturating_add(
                     candidate
                         .bytes
                         .as_ref()
-                        .map_or(0, |v| v.len().saturating_mul(4)),
+                        .map_or(0, |v| v.len().saturating_mul(JSON_BYTE_EXPANSION)),
                 )
         }
         fn records_bytes(records: Option<&Vec<TokenLogprob>>) -> usize {
@@ -52,13 +63,13 @@ impl ChoiceLogprobsDelta {
                 records
                     .iter()
                     .map(|record| {
-                        96usize
-                            .saturating_add(record.token.len().saturating_mul(6))
+                        (std::mem::size_of::<TokenLogprob>() * STRUCTURE_HEADROOM)
+                            .saturating_add(record.token.len().saturating_mul(JSON_TEXT_EXPANSION))
                             .saturating_add(
                                 record
                                     .bytes
                                     .as_ref()
-                                    .map_or(0, |v| v.len().saturating_mul(4)),
+                                    .map_or(0, |v| v.len().saturating_mul(JSON_BYTE_EXPANSION)),
                             )
                             .saturating_add(
                                 record
@@ -71,7 +82,7 @@ impl ChoiceLogprobsDelta {
                     .sum()
             })
         }
-        64usize
+        (std::mem::size_of::<Self>() * STRUCTURE_HEADROOM)
             .saturating_add(records_bytes(
                 self.logprobs.as_ref().and_then(|v| v.content.as_ref()),
             ))

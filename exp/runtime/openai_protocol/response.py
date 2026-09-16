@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import cast
 
+from pydantic import JsonValue
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -146,45 +148,33 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
 
 def _chat_logprobs(events: tuple[GatewayEvent, ...]) -> JsonObject | None:
     """Aggregate ordered choice probability observations into Chat output."""
-    observations = tuple(
-        event.choice_logprobs_delta
-        for event in events
-        if event.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA
-    )
-    if not observations:
-        return None
-    if any(observation is None for observation in observations):
-        raise OpenAIProtocolError(
-            status_code=502,
-            code="invalid_provider_stream",
-            message="Chat probability event omitted its payload.",
-            error_type="api_error",
-        )
-    observations = tuple(observation for observation in observations if observation is not None)
-    if any(observation.choice_index != 0 for observation in observations):
-        raise OpenAIProtocolError(
-            status_code=502,
-            code="invalid_provider_stream",
-            message="Chat probability events support choice index 0 only.",
-            error_type="api_error",
-        )
-    values = tuple(
-        observation.logprobs for observation in observations if observation.logprobs is not None
-    )
-    if not values:
-        return None
-    content = tuple(record for value in values for record in (value.content or ()))
-    refusal = tuple(record for value in values for record in (value.refusal or ()))
-    # A probability object is retained even when both channels are null. This
-    # distinguishes an observed empty update from no provider metadata.
-    return {
-        "content": [record.model_dump(mode="json") for record in content]
-        if any(value.content is not None for value in values)
-        else None,
-        "refusal": [record.model_dump(mode="json") for record in refusal]
-        if any(value.refusal is not None for value in values)
-        else None,
-    }
+    content: list[JsonValue] | None = None
+    refusal: list[JsonValue] | None = None
+    observed = False
+    for event in events:
+        if event.kind != GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            continue
+        update = event.choice_logprobs_delta
+        if update is None or update.choice_index != 0:
+            raise OpenAIProtocolError(
+                status_code=502,
+                code="invalid_provider_stream",
+                message="Chat probability events require a payload for choice index 0.",
+                error_type="api_error",
+            )
+        value = update.logprobs
+        if value is None:
+            continue
+        observed = True
+        if value.content is not None:
+            if content is None:
+                content = []
+            content.extend(record.model_dump(mode="json") for record in value.content)
+        if value.refusal is not None:
+            if refusal is None:
+                refusal = []
+            refusal.extend(record.model_dump(mode="json") for record in value.refusal)
+    return {"content": content, "refusal": refusal} if observed else None
 
 
 def _ignored_parameters_extension(request: GatewayRequest) -> JsonObject:
