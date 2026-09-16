@@ -59,6 +59,7 @@ fn content_probabilities_commit_before_text_and_prevent_failover() {
             panic!("must commit");
         };
         assert_eq!(committed.depth, 0);
+        assert!(committed.relay.first_token_at().is_none());
         assert!(matches!(committed.prefix[0], Event::ChoiceLogprobsDelta(_)));
         let terminal = committed
             .relay
@@ -99,4 +100,29 @@ fn refusal_probabilities_and_empty_metadata_do_not_escape_abandoned_attempts() {
             );
         });
     }
+}
+
+#[test]
+fn empty_probability_prefix_is_bounded_without_committing() {
+    const MANY_EMPTY: [&str; 257] = [EMPTY; 257];
+    block_on(async {
+        let harness = Harness::new();
+        let first = spawn_rung(vec![Answer::Stream(&MANY_EMPTY)]).await;
+        let next = spawn_rung(vec![Answer::Stream(&[EMPTY, CONTENT, FINISH])]).await;
+        let route = [
+            probability_wire("a", &first.url),
+            probability_wire("b", &next.url),
+        ];
+        let (won, guard) = run_probabilities(&harness, &route).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("fallback must commit");
+        };
+        assert_eq!(committed.depth, 1);
+        assert_eq!(committed.prefix.len(), 2);
+        assert!(
+            matches!(&committed.prefix[0], Event::ChoiceLogprobsDelta(delta)
+            if delta.logprobs.as_ref().unwrap().content.as_ref().unwrap().is_empty())
+        );
+        assert!(committed.relay.first_token_at().is_none());
+    });
 }

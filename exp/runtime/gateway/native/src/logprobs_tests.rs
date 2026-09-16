@@ -86,3 +86,28 @@ fn aggregate_chat_body_contains_all_probability_records() {
         "a"
     );
 }
+
+#[test]
+fn malformed_unrequested_probabilities_do_not_change_ordinary_chat() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let frame = crate::sse::SseEvent {
+        event: None,
+        data: r#"{"choices":[{"index":0,"delta":{"content":"ok"},"logprobs":"bad"}]}"#.to_string(),
+    };
+    assert!(matches!(&normalizer.feed(&frame).unwrap()[0], Event::TextDelta(text) if text == "ok"));
+}
+
+#[test]
+fn retained_probability_budget_covers_escaped_json_and_empty_records() {
+    let event = update(
+        Some(serde_json::json!([
+            {"token":"\u{0000}","logprob":-9999.0,"bytes":[0,255],"top_logprobs":[]},
+            {"token":"","logprob":0.0,"bytes":null,"top_logprobs":[]}
+        ])),
+        None,
+    );
+    let Event::ChoiceLogprobsDelta(delta) = event else {
+        unreachable!()
+    };
+    assert!(delta.retained_bytes() >= serde_json::to_vec(&delta).unwrap().len());
+}

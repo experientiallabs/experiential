@@ -58,7 +58,7 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["truncation"] == CompatibilityDisposition.SUPPORTED
     assert responses["prompt_cache_options"] == CompatibilityDisposition.SUPPORTED
     assert chat["logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert chat["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
+    assert chat["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
     # Every enable-thinking spelling is admitted and translated, never dropped.
