@@ -47,6 +47,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
 )
 REQUIRED_WHEEL_MODULES = frozenset(
     {
+        "exp/py.typed",
         "exp/cli/gateway/app.py",
         "exp/cli/gateway/budget.py",
         "exp/common/judging/calibration.py",
@@ -81,6 +82,7 @@ REQUIRED_SDIST_MEMBERS = frozenset(
         "docs/release-scope.md",
         "docs/usage.md",
         "pyproject.toml",
+        "exp/py.typed",
         "exp/optimize/router/automatic/service.py",
         "exp/optimize/router/composition.py",
         "exp/optimize/router/evaluation/setup.py",
