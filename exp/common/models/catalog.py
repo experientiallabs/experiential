@@ -76,18 +76,13 @@ def _normalize_base_url(value: str) -> str:
 
 
 def infer_azure_api_surface(endpoint: str) -> AzureApiSurface | None:
-    """Infer the Azure wire surface one resource endpoint serves.
-
-    Azure AI Foundry resources (``*.services.ai.azure.com``) serve the model-inference surface,
-    which carries provider-specific sampling fields such as ``top_k``. Azure OpenAI resources
-    (``*.openai.azure.com``) serve only the deployment surface.
+    """Infer model inference for Foundry endpoints or deployments for Azure OpenAI.
 
     Args:
         endpoint: Azure resource endpoint from a connection.
 
     Returns:
-        The surface the host is known to serve, or ``None`` for an unrecognized host such as a
-        private endpoint or a local recording proxy.
+        The known surface, or ``None`` for private endpoints, recording proxies, or unknown hosts.
     """
     host = urlsplit(endpoint).hostname
     if host is None:
@@ -101,10 +96,7 @@ def infer_azure_api_surface(endpoint: str) -> AzureApiSurface | None:
 
 
 def strip_model_inference_root(value: str) -> str:
-    """Remove the route suffix one Azure model-inference endpoint spelling carries.
-
-    The model-inference surface serves ``/models`` directly off the resource, so the bare resource,
-    its terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root all name one resource.
+    """Reduce bare Azure resources and terminal ``/models`` or ``/openai/v1`` roots to one spelling.
 
     Args:
         value: Endpoint or endpoint path, with or without a trailing slash.
@@ -414,69 +406,51 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
-    """Whether this deployment's wire and model can carry caller image parts.
+    """Whether the deployment's wire and model carry caller images.
 
-    Image input is declaration-driven and never assumed: a route that does
-    not declare it rejects an image request at admission, so a picture is
-    never dropped and answered from the surrounding text alone.
+    Undeclared image support rejects the request at admission, never drops the image.
     """
     supports_image_url_input: bool = False
-    """Whether this route's provider fetches a caller image URL itself.
+    """Whether the provider fetches caller image URLs, beyond inline base64 support.
 
-    Inline base64 rides every image-capable wire, but only some wires accept a
-    remote URL. A route that does not declare this rejects a URL image at
-    admission, which lets a waterfall narrow to a rung that can carry it.
+    Undeclared URL support rejects at admission so a waterfall can select a capable rung.
     """
     supports_video_input: bool = False
-    """Whether this deployment's wire and model can carry caller video parts.
+    """Whether the deployment's wire and model carry caller video parts.
 
-    Video is narrower than images: only the Gemini, Bedrock Converse, and
-    OpenAI-compatible ``video_url`` wires define a video carrier, and only
-    some models on those wires accept one. Like images the declaration is
-    never assumed, so a route without it rejects a video at admission rather
-    than answering from the surrounding text.
+    Only specific Gemini, Bedrock Converse, and OpenAI-compatible ``video_url`` models
+    accept video. Undeclared support rejects at admission, never drops the video.
     """
     supports_video_url_input: bool = False
-    """Whether this route's provider fetches a caller video URL itself.
+    """Whether the provider fetches caller video URLs.
 
-    Bedrock accepts inline bytes (or an S3 location the gateway does not
-    author) only; Gemini and the OpenAI-compatible video wires fetch an
-    http(s) URL on the caller's behalf.
+    Gemini and OpenAI-compatible video wires fetch HTTP(S) URLs. Bedrock accepts inline
+    bytes or an S3 location the gateway does not author.
     """
     supports_audio_input: bool = False
-    """Whether this deployment's wire and model can carry caller audio parts.
+    """Whether the deployment's wire and model carry caller audio parts.
 
-    Audio is the narrowest attachment: only the OpenAI-compatible Chat
-    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
-    model serves, and on those wires only specific models (the gpt-audio
-    family, audio-capable Gemini models) accept one. The declaration is never
-    assumed, so a route without it rejects audio at admission rather than
-    answering from the surrounding text. Audio has no remote URL carrier on
-    any public surface, so there is no separate URL declaration.
+    Only audio-capable OpenAI-compatible Chat ``input_audio`` and Gemini ``inline_data``
+    models accept clips. Undeclared support rejects at admission, never drops the audio.
+    No public audio surface carries remote URLs, so there is no separate URL declaration.
     """
     supports_pdf_input: bool = False
-    """Whether this deployment's wire and model can carry caller PDF documents.
+    """Whether the deployment's wire and model carry caller PDFs.
 
-    Like image input this is declaration-driven and never assumed: a route
-    that does not declare it rejects a document request at admission, so a
-    PDF is never dropped and answered from the surrounding text alone.
+    Undeclared document support rejects the request at admission, never drops the PDF.
     """
     supports_pdf_url_input: bool = False
-    """Whether this route's provider fetches a caller PDF URL itself.
+    """Whether the provider fetches caller PDF URLs.
 
-    Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
-    source) wires fetch a remote document; Chat Completions ``file`` parts,
-    Gemini, and Bedrock accept inline bytes only.
+    Only Responses ``file_url`` and Messages ``url`` sources fetch remote documents;
+    Chat Completions ``file`` parts, Gemini, and Bedrock accept inline bytes only.
     """
     supports_media_handle_input: bool = False
-    """Whether this route forwards handles to media the caller uploaded to its provider.
+    """Whether this route forwards provider-bound handles to uploaded media.
 
-    A handle (an OpenAI or Anthropic ``file_id``, a Gemini Files URI, a
-    ``gs://`` object on Vertex, an ``s3://`` object on Bedrock) is scoped to
-    the provider that minted it and never portable, so admission requires
-    both this declaration and a handle provider equal to the route's
-    provider. Providers whose inference wire defines no uploaded-media
-    reference (Fireworks, OpenRouter) never declare it.
+    OpenAI/Anthropic ``file_id``, Gemini Files URIs, Vertex ``gs://``, and Bedrock ``s3://``
+    require this declaration and a matching route provider. Handles are never portable;
+    Fireworks and OpenRouter define no uploaded-media references and never declare support.
     """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
@@ -526,20 +500,15 @@ class GatewayDeploymentCapabilities(ContractModel):
     decoder recognizes the item (it must not hit the unknown-item reject path)
     and applies the effort forward."""
     time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
-    """Deployment override for the lane's flat time-to-first-byte allowance.
+    """Flat time-to-first-byte allowance; ``None`` uses the serving default.
 
-    ``None`` uses the serving configuration's default. The effective bound on
-    the wait for a provider's response headers is this base plus the
-    input-scaled allowance below, so very large prompts are not misread as a
-    dead lane.
+    The response-header deadline adds this base to the input-scaled allowance below.
     """
     time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
-    """Deployment override for the input-scaled time-to-first-byte allowance.
+    """Seconds added per million approximate input tokens for response headers.
 
-    Seconds added per million approximate input tokens (the request body's
-    bytes divided by four; an allowance heuristic, never a billing quantity).
-    ``None`` uses the serving configuration's default; ``0`` disables scaling
-    for this deployment.
+    Tokens are request bytes divided by four, never a billing quantity. ``None`` uses
+    the serving default; ``0`` disables scaling for this deployment.
     """
 
     @property
