@@ -179,10 +179,10 @@ class GatewayWireProfile:
     """Largest top-k value accepted by the provider wire, when known."""
 
     supports_logprobs: bool = False
-    """Provider metadata for logprob support.
+    """Whether this exact model accepts Chat token probability requests."""
 
-    Dispatch stays disabled until normalized output projection exists.
-    """
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
+    """Explicit probability-compatible efforts for reasoning models; empty is unknown."""
 
     supports_frequency_penalty: bool = False
     """Whether this exact route accepts the ``frequency_penalty`` sampling control.

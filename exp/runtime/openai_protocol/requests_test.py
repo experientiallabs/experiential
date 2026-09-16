@@ -24,6 +24,10 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
+from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
@@ -836,19 +840,33 @@ def test_responses_decoder_preserves_top_p() -> None:
     assert decoded.request.top_p == 1
 
 
-def test_chat_decoder_rejects_unprojectable_top_logprobs() -> None:
-    """Alternate-token probability output is rejected at the public boundary."""
-    with pytest.raises(OpenAIProtocolError) as raised:
+@pytest.mark.parametrize("count", [0, 1, 20])
+def test_chat_decoder_preserves_top_logprobs(count: int) -> None:
+    """Standard probability controls survive decoding for route admission."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hello"}],
+            "logprobs": True,
+            "top_logprobs": count,
+        }
+    )
+    assert decoded.request.logprobs is True
+    assert decoded.request.top_logprobs == count
+
+
+@pytest.mark.parametrize("count", [True, False, 1.0, "1", -1, 21])
+def test_chat_decoder_rejects_invalid_top_logprobs(count: int | float | str) -> None:
+    """The probability count is strictly an integer in the documented range."""
+    with pytest.raises(OpenAIProtocolError):
         decode_chat(
             {
                 "model": "coding",
                 "messages": [{"role": "user", "content": "hello"}],
                 "logprobs": True,
-                "top_logprobs": 5,
+                "top_logprobs": count,
             }
         )
-    assert raised.value.detail.code == "unsupported_parameter"
-    assert raised.value.detail.param == "top_logprobs"
 
 
 def test_chat_decoder_accepts_store_false_opt_out() -> None:
@@ -4597,3 +4615,48 @@ def test_chat_decoder_rejects_misplaced_or_malformed_reasoning_details() -> None
             }
         )
     assert unknown.value.detail.param == "messages.0.compaction"
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0])
+def test_chat_logprobs_requires_strict_boolean(value: int | str) -> None:
+    """Reject non-boolean logprobs values at the public boundary."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": value,
+            }
+        )
+
+
+def test_chat_logprobs_narrows_to_capable_compatible_rungs_and_forwards_zero() -> None:
+    """Filter incapable rungs while preserving an explicitly requested zero."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "top_logprobs": 0,
+        }
+    )
+    incapable = GatewayWireProfile(dialect="openai_compatible", url="https://a.test")
+    capable = GatewayWireProfile(
+        dialect="openai_compatible", url="https://b.test", supports_logprobs=True
+    )
+    assert compatible_generation_parameter_profile_indexes(
+        (incapable, capable), decoded.request
+    ) == (1,)
+    from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
+
+    shaped = decoded.request.model_copy(update={"stream": True})
+    payload = dialect_stream_payload(capable, shaped)
+    assert payload["logprobs"] is True
+    assert payload["top_logprobs"] == 0
+
+
+def test_responses_logprobs_remains_rejected() -> None:
+    """Keep native Responses probability requests outside this Chat slice."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses({"model": "coding", "input": "hi", "top_logprobs": 0})
+    assert raised.value.detail.param == "top_logprobs"

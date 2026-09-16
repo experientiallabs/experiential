@@ -211,6 +211,7 @@ pub(crate) async fn responses(
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        chat_logprobs: false,
         // A turn that ends before any semantic output is still a response
         // the caller can continue from; the waterfall retains it in flight.
         output_less_retention: Some(remember_argument(

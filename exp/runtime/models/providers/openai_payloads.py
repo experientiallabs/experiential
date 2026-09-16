@@ -333,9 +333,12 @@ def openai_compatible_stream_payload(
         payload["frequency_penalty"] = request.frequency_penalty
     if request.presence_penalty is not None and supports_presence_penalty:
         payload["presence_penalty"] = request.presence_penalty
-    # Compatible streaming responses also normalize logprobs to null, so an
-    # accepted public control is intentionally ignored until projection exists.
-    del supports_logprobs
+    if request.logprobs is True:
+        if not supports_logprobs:
+            raise ProviderResponseError("logprobs was admitted without provider support")
+        payload["logprobs"] = True
+        if request.top_logprobs is not None:
+            payload["top_logprobs"] = request.top_logprobs
     if request.stop:
         payload["stop"] = list(request.stop)
     if request.service_tier is not None and forwards_service_tier:

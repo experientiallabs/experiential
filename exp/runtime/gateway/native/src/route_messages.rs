@@ -213,6 +213,7 @@ pub(crate) async fn messages(
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        chat_logprobs: false,
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
     };

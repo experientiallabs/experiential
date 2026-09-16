@@ -414,80 +414,51 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
-    """Whether this deployment's wire and model can carry caller image parts.
-
-    Image input is declaration-driven and never assumed: a route that does
-    not declare it rejects an image request at admission, so a picture is
-    never dropped and answered from the surrounding text alone.
-    """
+    """Whether this wire and model accept images; undeclared support rejects at admission."""
     supports_image_url_input: bool = False
-    """Whether this route's provider fetches a caller image URL itself.
+    """Whether the provider fetches caller image URLs.
 
-    Inline base64 rides every image-capable wire, but only some wires accept a
-    remote URL. A route that does not declare this rejects a URL image at
-    admission, which lets a waterfall narrow to a rung that can carry it.
-    """
+    Inline base64 works on every image-capable wire. Undeclared URL support
+    rejects at admission so the route can narrow to a capable rung."""
     supports_video_input: bool = False
-    """Whether this deployment's wire and model can carry caller video parts.
+    """Whether this wire and model accept caller video.
 
-    Video is narrower than images: only the Gemini, Bedrock Converse, and
-    OpenAI-compatible ``video_url`` wires define a video carrier, and only
-    some models on those wires accept one. Like images the declaration is
-    never assumed, so a route without it rejects a video at admission rather
-    than answering from the surrounding text.
-    """
+    Only Gemini, Bedrock Converse and compatible video_url wires carry video,
+    and only declared models accept it. Undeclared support rejects at admission."""
     supports_video_url_input: bool = False
-    """Whether this route's provider fetches a caller video URL itself.
+    """Whether the provider fetches caller video URLs.
 
-    Bedrock accepts inline bytes (or an S3 location the gateway does not
-    author) only; Gemini and the OpenAI-compatible video wires fetch an
-    http(s) URL on the caller's behalf.
-    """
+    Bedrock accepts inline bytes or caller S3 locations; Gemini and compatible
+    video wires fetch HTTP URLs. The gateway does not author S3 locations."""
     supports_audio_input: bool = False
-    """Whether this deployment's wire and model can carry caller audio parts.
+    """Whether this wire and model accept caller audio.
 
-    Audio is the narrowest attachment: only the OpenAI-compatible Chat
-    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
-    model serves, and on those wires only specific models (the gpt-audio
-    family, audio-capable Gemini models) accept one. The declaration is never
-    assumed, so a route without it rejects audio at admission rather than
-    answering from the surrounding text. Audio has no remote URL carrier on
-    any public surface, so there is no separate URL declaration.
-    """
+    Only compatible input_audio and Gemini inline_data carry audio, and only
+    declared models accept it. Undeclared support rejects at admission. No
+    public surface carries audio URLs, so no separate URL declaration exists."""
     supports_pdf_input: bool = False
-    """Whether this deployment's wire and model can carry caller PDF documents.
-
-    Like image input this is declaration-driven and never assumed: a route
-    that does not declare it rejects a document request at admission, so a
-    PDF is never dropped and answered from the surrounding text alone.
-    """
+    """Whether this wire and model accept PDFs; undeclared support rejects at admission."""
     supports_pdf_url_input: bool = False
-    """Whether this route's provider fetches a caller PDF URL itself.
+    """Whether the provider fetches caller PDF URLs.
 
-    Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
-    source) wires fetch a remote document; Chat Completions ``file`` parts,
-    Gemini, and Bedrock accept inline bytes only.
-    """
+    Only Responses file_url and Anthropic url sources fetch remote PDFs;
+    compatible Chat, Gemini and Bedrock require inline bytes."""
     supports_media_handle_input: bool = False
-    """Whether this route forwards handles to media the caller uploaded to its provider.
+    """Whether this route forwards caller-uploaded provider media handles.
 
-    A handle (an OpenAI or Anthropic ``file_id``, a Gemini Files URI, a
-    ``gs://`` object on Vertex, an ``s3://`` object on Bedrock) is scoped to
-    the provider that minted it and never portable, so admission requires
-    both this declaration and a handle provider equal to the route's
-    provider. Providers whose inference wire defines no uploaded-media
-    reference (Fireworks, OpenRouter) never declare it.
-    """
+    OpenAI/Anthropic file_id, Gemini Files, Vertex gs:// and Bedrock s3://
+    handles belong to their issuing provider. Admission requires this declaration
+    and matching provider ownership. Fireworks and OpenRouter never declare it."""
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
-
     ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
     field). A concrete value lets admission reject an over-limit list locally with a
     named parameter error instead of forwarding it and surfacing the provider's
     opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
     minimum_output_tokens: int | None = Field(default=None, ge=1)
-    """Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6 on Bedrock: 16); a
-    smaller caller ceiling is floored to it with disclosure on every surface (see the profile)."""
+    """Provider output-token floor; smaller ceilings are floored with disclosure."""
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
+    """Verified Chat probability efforts on reasoning models; empty means unknown."""
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values this deployment can preserve without normalization.
 

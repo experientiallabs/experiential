@@ -40,6 +40,7 @@ from exp.runtime.models.providers.dialect_dispatch import (
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
+    ProviderResponseError,
     UnsupportedReasoningEffortError,
 )
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
@@ -228,27 +229,23 @@ def test_openai_compatible_stream_payload_omits_absent_top_p() -> None:
     assert "temperature" not in payload
 
 
-def test_openai_compatible_stream_payload_omits_unproven_controls() -> None:
-    """Unknown compatible routes drop top-k and logprobs instead of guessing wire support."""
-    request = _chat_request().model_copy(update={"top_k": 40, "logprobs": True, "top_logprobs": 5})
-    payload = openai_compatible_stream_payload("exact-model", request)
-    assert "top_k" not in payload
-    assert "logprobs" not in payload
-    assert "top_logprobs" not in payload
+def test_openai_compatible_stream_payload_rejects_unproven_logprobs() -> None:
+    """A probability request is never silently dropped at the dispatch boundary."""
+    request = _chat_request().model_copy(update={"logprobs": True, "top_logprobs": 5})
+    with pytest.raises(ProviderResponseError):
+        openai_compatible_stream_payload("exact-model", request)
 
 
-def test_openai_compatible_stream_payload_ignores_logprobs_even_when_flagged() -> None:
-    """Logprob controls stay off the wire until normalized output can preserve them."""
-    request = _chat_request().model_copy(update={"top_k": 40, "logprobs": True, "top_logprobs": 5})
-    payload = openai_compatible_stream_payload(
-        "exact-model",
-        request,
-        supports_top_k=True,
-        supports_logprobs=True,
-    )
-    assert payload["top_k"] == 40
-    assert "logprobs" not in payload
-    assert "top_logprobs" not in payload
+@pytest.mark.parametrize("count", [None, 0, 5, 20])
+def test_openai_compatible_stream_payload_forwards_logprobs(count: int | None) -> None:
+    """The frozen wire preserves opt-in and the explicit count, including zero."""
+    request = _chat_request().model_copy(update={"logprobs": True, "top_logprobs": count})
+    payload = openai_compatible_stream_payload("exact-model", request, supports_logprobs=True)
+    assert payload["logprobs"] is True
+    if count is None:
+        assert "top_logprobs" not in payload
+    else:
+        assert payload["top_logprobs"] == count
 
 
 def test_anthropic_stream_payload_omits_logprobs_even_when_flagged() -> None:

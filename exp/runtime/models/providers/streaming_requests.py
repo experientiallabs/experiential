@@ -60,6 +60,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_numeric_parameter as _require_route_numeric_parameter,
 )
 from exp.runtime.models.providers.instruction_turns import disclose_system_fold
+from exp.runtime.models.providers.logprobs import require_chat_logprobs
 from exp.runtime.models.providers.messages_payloads import (
     anthropic_messages_stream_payload as anthropic_messages_stream_payload,
 )
@@ -145,6 +146,7 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
+    require_chat_logprobs(profiles, request)
     for profile in profiles:
         if fireworks_continuation_required(profile, request):
             require_responses_continuation_channel(request)
@@ -911,33 +913,8 @@ def route_generation_parameter_requests(
             )
             provider_updates["serialize_tool_calls"] = True
 
-    # A true logprob request changes the requested result. Until the normalized
-    # response can return those arrays, reject it rather than pretending it ran.
-    if request.logprobs is True:
-        path = (
-            "top_logprobs"
-            if request.surface.value == "responses" and request.top_logprobs is not None
-            else "logprobs"
-        )
-        raise ProviderParameterError(
-            message=(
-                f"The parameter {path!r} is not supported by this gateway response contract. "
-                "Remove the field and resend the request."
-            ),
-            param=path,
-            code="unsupported_parameter",
-        )
     if request.logprobs is False:
         ignore("logprobs")
-    if request.top_logprobs is not None:
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'top_logprobs' is not supported by this gateway response "
-                "contract. Remove the field and resend the request."
-            ),
-            param="top_logprobs",
-            code="unsupported_parameter",
-        )
 
     ignored_parameters = tuple(ignored)
     public_request = request.model_copy(update={"ignored_parameters": ignored_parameters})

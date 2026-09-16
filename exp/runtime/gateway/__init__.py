@@ -9,6 +9,8 @@ from exp.runtime.gateway.compatibility import (
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    ChoiceLogprobs,
+    ChoiceLogprobsDelta,
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
@@ -21,9 +23,11 @@ from exp.runtime.gateway.contracts import (
     GatewayTarget,
     GatewayToolDefinition,
     GatewayUsage,
+    LogprobCandidate,
     ProjectSelection,
     ProjectTarget,
     StructuredTextFormat,
+    TokenLogprob,
 )
 from exp.runtime.gateway.interfaces import (
     AttemptLedger,
@@ -118,6 +122,8 @@ __all__ = [
     "GatewayControlStore",
     "GatewayEvent",
     "GatewayEventKind",
+    "ChoiceLogprobs",
+    "ChoiceLogprobsDelta",
     "GatewayFailure",
     "GatewayFailureClass",
     "GatewayMessage",
@@ -126,6 +132,8 @@ __all__ = [
     "GatewayTarget",
     "GatewayToolDefinition",
     "GatewayUsage",
+    "LogprobCandidate",
+    "TokenLogprob",
     "GrantAuthority",
     "GrantAliasCommand",
     "GrantMutationAuthority",

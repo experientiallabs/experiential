@@ -50,7 +50,7 @@ class Plane:
                 and self.counts[depth] <= self.max_redials
             ):
                 candidate = depth
-            elif failure.get("failover_eligible") and depth + 1 < len(self.counts):
+            elif (failure.get("failover_eligible") or failure.get("failure_class") == "refusal") and depth + 1 < len(self.counts):
                 candidate = depth + 1
             else:
                 return json.dumps({"exhausted": True, "failure": failure})
@@ -396,6 +396,7 @@ impl Harness {
             time_to_first_byte: Duration::from_secs(5),
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
             approximate_input_tokens: 10.0,
+            chat_logprobs: false,
             output_less_retention: None,
             output_token_cap: None,
         };
@@ -693,3 +694,5 @@ fn a_low_stake_request_gets_fewer_redials_than_a_high_stake_one() {
         assert_eq!(flags(&low), vec![false, true, false]);
     });
 }
+
+mod logprobs_tests;

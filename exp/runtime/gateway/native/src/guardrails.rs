@@ -78,6 +78,7 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
     for event in events {
         match event {
             Event::RefusalDelta(_)
+            | Event::ChoiceLogprobsDelta(_)
             | Event::ProviderRefusalDelta { .. }
             | Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }

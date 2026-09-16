@@ -34,6 +34,8 @@ use serde_json::Value;
 
 use crate::errors::Failure;
 
+pub use crate::logprobs::{ChoiceLogprobs, ChoiceLogprobsDelta};
+
 /// Normalized token usage mirroring `GatewayUsage` semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -143,6 +145,9 @@ impl ProviderAssistantMessagePhase {
 pub enum Event {
     TextDelta(String),
     RefusalDelta(String),
+    /// Ordered probability metadata for one Chat choice. This is independent
+    /// of text because providers may send a metadata-only chunk.
+    ChoiceLogprobsDelta(ChoiceLogprobsDelta),
     /// One text delta for a specific provider-owned assistant message item.
     ProviderTextDelta {
         output_index: u32,
@@ -369,6 +374,9 @@ pub fn simplified_event(event: &Event) -> Value {
     match event {
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
+        Event::ChoiceLogprobsDelta(delta) => {
+            serde_json::json!({"kind": "choice_logprobs_delta", "choice_index": delta.choice_index, "logprobs": delta.logprobs})
+        }
         Event::ProviderTextDelta {
             output_index,
             item_id,

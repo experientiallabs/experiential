@@ -133,6 +133,7 @@ fn is_semantic(event: &Event) -> bool {
             | Event::RefusalDelta(_)
             | Event::ProviderTextDelta { .. }
             | Event::ProviderRefusalDelta { .. }
+            | Event::ChoiceLogprobsDelta { .. }
             | Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
@@ -664,6 +665,14 @@ async fn run_attempt(
         };
         relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
+        let payload_requests_logprobs = wire
+            .upstream_payload
+            .get("logprobs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        relay.set_chat_logprobs(
+            ctx.chat_logprobs && payload_requests_logprobs && dialect == Dialect::OpenAiCompatible,
+        );
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
         if !wire.model_id.is_empty() {
             relay.set_request_words([wire.model_id.clone()]);
@@ -709,44 +718,51 @@ async fn run_attempt(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
-            let refusal_text = match &event {
-                Event::RefusalDelta(text) | Event::ProviderRefusalDelta { delta: text, .. } => {
-                    Some(text)
-                }
-                _ => None,
-            };
-            if let Some(text) = refusal_text {
-                if ctx.policy.refusal_failover {
-                    let event_bytes = text.len();
-                    if withheld_bytes + event_bytes > MAXIMUM_WITHHELD_REFUSAL_BYTES
-                        || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
+            if crate::logprobs::withhold_before_commit(&event, ctx.policy.refusal_failover) {
+                let event_bytes = crate::relay::event_retained_bytes(&event);
+                if withheld_bytes.saturating_add(event_bytes) > MAXIMUM_WITHHELD_REFUSAL_BYTES
+                    || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
+                {
+                    let visible_refusal = withheld.iter().any(crate::logprobs::is_refusal_text)
+                        || crate::logprobs::is_refusal_text(&event);
+                    if !withheld.iter().any(crate::logprobs::is_refusal)
+                        && !crate::logprobs::is_refusal(&event)
                     {
-                        // Buffer overflow commits and flushes.
-                        let mut prefix = std::mem::take(&mut withheld);
-                        prefix.push(event);
-                        return AttemptEnd::Committed(Box::new(CommittedAttempt {
-                            depth,
-                            prefix,
-                            relay,
+                        return AttemptEnd::Ladder {
+                            failure: Failure::new(
+                                FailureClass::MalformedResponse,
+                                crate::dialects::OUTPUT_OVERFLOW_MESSAGE,
+                            )
+                            .with_retry(false, true),
+                            refusal_eligible: false,
+                            exhaustion_flush: Vec::new(),
                             usage,
                             tool_names,
-                            visible_refusal: true,
+                            opened: true,
                             encrypted_reasoning_stripped,
-                        }));
+                        };
                     }
-                    withheld_bytes += event_bytes;
-                    withheld.push(event);
-                    continue;
+                    let mut prefix = std::mem::take(&mut withheld);
+                    prefix.push(event);
+                    return AttemptEnd::Committed(Box::new(CommittedAttempt {
+                        depth,
+                        prefix,
+                        relay,
+                        usage,
+                        tool_names,
+                        visible_refusal,
+                        encrypted_reasoning_stripped,
+                    }));
                 }
+                withheld_bytes += event_bytes;
+                withheld.push(event);
+                continue;
             }
             if is_semantic(&event) {
                 // First outward semantic output freezes this deployment; any
                 // withheld refusals flush ahead of it.
-                let visible_refusal = !withheld.is_empty()
-                    || matches!(
-                        event,
-                        Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-                    );
+                let visible_refusal = withheld.iter().any(crate::logprobs::is_refusal_text)
+                    || crate::logprobs::is_refusal_text(&event);
                 let mut prefix = std::mem::take(&mut withheld);
                 prefix.push(event);
                 return AttemptEnd::Committed(Box::new(CommittedAttempt {
@@ -766,7 +782,10 @@ async fn run_attempt(
             }
             match &event {
                 Event::Failed(failure) => {
-                    if !redialed && withheld.is_empty() && repair.repair_after(failure) {
+                    if !redialed
+                        && !withheld.iter().any(crate::logprobs::is_refusal)
+                        && repair.repair_after(failure)
+                    {
                         // The rung opened the stream and refused the replayed
                         // encrypted reasoning on its first frame: the same repair
                         // as a pre-stream 4xx, nothing outward was committed.
@@ -776,7 +795,9 @@ async fn run_attempt(
                         continue 'dial;
                     }
                     let typed_refusal = failure.failure_class == FailureClass::Refusal;
-                    let exhaustion_flush = if !withheld.is_empty() && !typed_refusal {
+                    let exhaustion_flush = if withheld.iter().any(crate::logprobs::is_refusal_text)
+                        && !typed_refusal
+                    {
                         let mut flush = std::mem::take(&mut withheld);
                         flush.push(event.clone());
                         flush
@@ -795,7 +816,7 @@ async fn run_attempt(
                     };
                 }
                 _ => {
-                    if !withheld.is_empty() {
+                    if withheld.iter().any(crate::logprobs::is_refusal) {
                         // A refusal-only stream that terminated successfully is
                         // a provider refusal: withhold the output and advance,
                         // matching the python executor's converted terminal.
@@ -843,6 +864,7 @@ async fn run_attempt(
                                 ctx,
                                 guard,
                                 Event::Incomplete,
+                                withheld,
                                 usage,
                                 tool_names,
                                 depth,
@@ -873,6 +895,7 @@ async fn run_attempt(
                         ctx,
                         guard,
                         event,
+                        withheld,
                         usage,
                         tool_names,
                         depth,
@@ -890,10 +913,12 @@ async fn run_attempt(
 /// attempt is still in flight, settle, then answer with the tracked usage
 /// ahead of the terminal so the encoders keep the client-visible token
 /// accounting.
+#[allow(clippy::too_many_arguments)]
 async fn settle_output_less(
     ctx: &WaterfallContext<'_>,
     guard: &mut AttemptGuard,
     terminal: Event,
+    mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
     depth: usize,
@@ -919,7 +944,6 @@ async fn settle_output_less(
         // attempt's retention failure; only the HTTP result reports it.
         return AttemptEnd::Retention(error);
     }
-    let mut events = Vec::with_capacity(2);
     if let Some(tracked) = usage {
         events.push(Event::Usage(tracked));
     }

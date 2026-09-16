@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import cast
 
+from pydantic import JsonValue
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -90,6 +92,7 @@ def completed_body(
         ]
         or None,
     }
+    probability_value = _chat_logprobs(events)
     usage = next(
         (
             event.usage
@@ -114,7 +117,7 @@ def completed_body(
                     if tool_calls
                     else "stop"
                 ),
-                "logprobs": None,
+                "logprobs": probability_value,
             }
         ],
         "usage": chat_usage(usage),
@@ -141,6 +144,37 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
         "prompt_tokens_details": details or None,
         "completion_tokens_details": output_details or None,
     }
+
+
+def _chat_logprobs(events: tuple[GatewayEvent, ...]) -> JsonObject | None:
+    """Aggregate ordered choice probability observations into Chat output."""
+    content: list[JsonValue] | None = None
+    refusal: list[JsonValue] | None = None
+    observed = False
+    for event in events:
+        if event.kind != GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            continue
+        update = event.choice_logprobs_delta
+        if update is None or update.choice_index != 0:
+            raise OpenAIProtocolError(
+                status_code=502,
+                code="invalid_provider_stream",
+                message="Chat probability events require a payload for choice index 0.",
+                error_type="api_error",
+            )
+        value = update.logprobs
+        if value is None:
+            continue
+        observed = True
+        if value.content is not None:
+            if content is None:
+                content = []
+            content.extend(record.model_dump(mode="json") for record in value.content)
+        if value.refusal is not None:
+            if refusal is None:
+                refusal = []
+            refusal.extend(record.model_dump(mode="json") for record in value.refusal)
+    return {"content": content, "refusal": refusal} if observed else None
 
 
 def _ignored_parameters_extension(request: GatewayRequest) -> JsonObject:

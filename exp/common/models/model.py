@@ -445,7 +445,7 @@ class ModelCapabilities(ContractModel):
     temperature capability for ``top_p`` and omit the less portable controls. Reasoning models
     that pin their sampling reject temperature and nucleus sampling, so clients omit both when
     the route says they are unsupported. ``supports_logprobs`` remains provider metadata, but
-    public logprob requests fail locally until normalized responses can expose their values.
+    direct model responses cannot return probabilities; gateway Chat has its own lossless contract.
     ``supports_reasoning`` is an explicit wire capability, not an inference from
     ``reasoning_effort``. ``reasoning_effort`` pins an explicit reasoning-effort level only when
     that capability is true.
@@ -653,8 +653,8 @@ class ModelRequest(ContractModel):
         temperature: Optional sampling temperature.
         top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
         top_k: Optional maximum number of candidate tokens considered during sampling.
-        logprobs: Optional request for token log probabilities. Gateway serving rejects a true
-            request until normalized responses can return them losslessly.
+        logprobs: Optional probability control, unsupported by direct ModelResponse projection.
+            Gateway Chat serving uses a separate lossless response contract.
         top_logprobs: Optional count for alternate token probabilities, subject to the same
             lossless-response requirement as ``logprobs``.
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
