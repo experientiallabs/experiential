@@ -20,6 +20,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
+    GatewayFailure,
     GatewayMessage,
     GatewayRequest,
     GatewayUsage,
@@ -565,3 +566,116 @@ def test_cancelled_write_task_yields_none() -> None:
         assert await abandoned_write_outcome(write) is None
 
     asyncio.run(scenario())
+
+
+def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
+    tmp_path: Path,
+) -> None:
+    """The hosted-ledger seam probes the host's apply hook, not the engine facade.
+
+    A host whose ``apply_finish_attempt`` predates ``upstream_provider`` (the
+    platform hook at the 0.7.88 repin) must settle cleanly with the keyword
+    withheld; the engine's own core still persists the named upstream.
+    """
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    recorded: list[dict[str, object]] = []
+    original = core.apply_finish_attempt
+
+    def legacy_apply(
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+    ) -> None:
+        """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        recorded.append({"attempt_id": attempt_id, "finalize": finalize_request})
+        original(
+            connection,
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+            first_token_at=first_token_at,
+            retry_after_seconds=retry_after_seconds,
+            ratelimit_limit_requests=ratelimit_limit_requests,
+            ratelimit_remaining_requests=ratelimit_remaining_requests,
+            ratelimit_limit_tokens=ratelimit_limit_tokens,
+            ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+        )
+
+    with mock.patch.object(core, "apply_finish_attempt", legacy_apply):
+        grouped = GroupCommitAttemptLedger(core)
+        facade = SyncGroupCommitLedger(grouped)
+        authorization = _authorize(store, clock, raw_key, "legacy-host-hook")
+        facade.accept_request(authorization=authorization)
+        attempt_id = facade.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        facade.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=1,
+                usage=GatewayUsage(input_tokens=10, output_tokens=4),
+            ),
+            failure=None,
+            upstream_provider="Azure",
+        )
+        facade.flush()
+        grouped.close()
+    assert recorded == [{"attempt_id": attempt_id, "finalize": True}]
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == ("completed", None)
+    finally:
+        connection.close()
+
+    # The engine's own core accepts the keyword, so the label lands.
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "current-host-hook")
+    facade.accept_request(authorization=authorization)
+    attempt_id = facade.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        route_reason="direct_alias",
+        fallback_reason=None,
+    )
+    facade.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=10, output_tokens=4),
+        ),
+        failure=None,
+        upstream_provider="Azure",
+    )
+    facade.flush()
+    grouped.close()
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT upstream_provider FROM gateway_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone() == ("Azure",)
+    finally:
+        connection.close()
