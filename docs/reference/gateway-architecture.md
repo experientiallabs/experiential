@@ -464,7 +464,7 @@ of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and set
 subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
 their output total are folded by the native usage mappers before the counts leave the data plane:
 Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
-`output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
+`output_tokens` in the native and Python Gemini paths; on Chat and Responses, the provider's own
 `total_tokens` decides: `input + output` is the subset shape (OpenAI, OpenRouter, Fireworks,
 DeepSeek) and passes through untouched, `input + output + reasoning` is the additive shape (xAI,
 natively or relayed by Azure Foundry) and folds; without a decisive total, a reasoning count above
@@ -930,9 +930,10 @@ SDK accumulators (Python and TypeScript) copy every usage field present on `mess
 their final message shows the true counts. The estimate is display-only: the encoder keeps it
 apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
 bill the provider's report.
-The per-deployment `capability_parity` export joins catalog declarations with the engine's
-provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
-caller hits that 400.
+The per-deployment `capability_parity` export joins catalog declarations with provider-family ground truth so catalogs can warn about gaps and route around them.
+Schema version 7 additionally projects `supports_prompt_cache_boundaries`, `supports_custom_tools`, `supports_grammar_tools`, `supports_tool_call_limit`, `reports_model_status`, and the existing `reports_reasoning_tokens` declaration.
+These declarations default false and never enable a request feature. Cache boundaries mean explicit breakpoints and retention, not implicit prefix caching. Read tool flags with the row's `dialect` and public API surface: Chat still refuses custom and grammar tools; Responses still refuses `max_tool_calls`.
+Gemini `modelStatus` is not preserved; catalogs must leave `reports_model_status` false until the response contract carries it.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,

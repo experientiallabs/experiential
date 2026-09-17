@@ -378,6 +378,28 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_streaming_tool_arguments: bool = False
     supports_strict_tools: bool = False
     supports_parallel_tool_calls: bool = False
+    supports_custom_tools: bool = False
+    """Whether this deployment's relevant native wire can preserve free-form custom tools.
+
+    False means the capability is not declared. Public Chat still refuses
+    custom tools even when a Responses-native deployment declares this,
+    because Chat accepts function tools only. Read the flag with the parity
+    row's dialect and the caller's public API surface.
+    """
+    supports_grammar_tools: bool = False
+    """Whether grammar-constrained custom tools can be preserved on this deployment.
+
+    This requires ``supports_custom_tools``. False means the capability is
+    not declared; it does not describe Chat, which still refuses custom and
+    grammar tools.
+    """
+    supports_tool_call_limit: bool = False
+    """Whether a caller's Responses ``max_tool_calls`` limit can be preserved.
+
+    False means the capability is not declared. The public Responses
+    surface currently refuses the field, so no authored catalog should set
+    this until a route honors the cap.
+    """
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
@@ -411,6 +433,13 @@ class GatewayDeploymentCapabilities(ContractModel):
     Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
     source) wires fetch a remote document; Chat Completions ``file`` parts,
     Gemini, and Bedrock accept inline bytes only.
+    """
+    supports_prompt_cache_boundaries: bool = False
+    """Whether explicit caller-selected prompt-cache boundaries can be preserved.
+
+    This covers Chat ``prompt_cache_options`` and ``prompt_cache_retention``.
+    False means those explicit boundaries are not declared as preserved; it
+    does not mean implicit prefix caching is absent.
     """
     supports_media_handle_input: bool = False
     """Whether this route forwards handles to media the caller uploaded to its provider.
@@ -452,6 +481,13 @@ class GatewayDeploymentCapabilities(ContractModel):
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+    reports_model_status: bool = False
+    """Whether provider model-status metadata is preserved in the normalized response.
+
+    False means the capability is not declared. Gemini ``modelStatus`` is
+    currently unpreserved, so no authored catalog should set this until the
+    response contract carries that field.
+    """
     supports_async_tools: bool = False
     """Whether a tool may be flagged ``async`` so the model keeps generating
     while the caller runs it, with the result returned later on the tool call's
@@ -502,6 +538,21 @@ class GatewayDeploymentCapabilities(ContractModel):
             or self.reasoning_default_effort is not None
             or self.reasoning_effort_required
         )
+
+    @model_validator(mode="after")
+    def _require_custom_tools_for_grammar(self) -> GatewayDeploymentCapabilities:
+        """Reject grammar-tool support that is not backed by custom-tool support.
+
+        Returns:
+            The validated declaration.
+
+        Raises:
+            ValueError: ``supports_grammar_tools`` is true while
+                ``supports_custom_tools`` is false.
+        """
+        if self.supports_grammar_tools and not self.supports_custom_tools:
+            raise ValueError("supports_grammar_tools requires supports_custom_tools=true")
+        return self
 
     @model_validator(mode="after")
     def _require_valid_reasoning_contract(self) -> GatewayDeploymentCapabilities:

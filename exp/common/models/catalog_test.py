@@ -957,3 +957,35 @@ output_micro_usd_per_million_tokens = 10000000
     path.write_text(text.replace("input_nano_usd", "input_micro_usd"), encoding="utf-8")
     with pytest.raises(ModelCatalogError, match="micro-USD price key"):
         load_model_catalog(path)
+
+
+def test_schema_drift_disclosure_slots_default_off() -> None:
+    """The five schema-drift disclosure slots exist and default off.
+
+    False means the capability is not declared. Defaulted fields stay
+    identity-invisible, so the pinned catalog digest does not move.
+    """
+    caps = GatewayDeploymentCapabilities()
+    assert caps.supports_prompt_cache_boundaries is False
+    assert caps.supports_custom_tools is False
+    assert caps.supports_grammar_tools is False
+    assert caps.supports_tool_call_limit is False
+    assert caps.reports_model_status is False
+    assert caps.reports_reasoning_tokens is False
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+
+
+def test_grammar_tools_require_custom_tools() -> None:
+    """Grammar-tool support cannot be declared without custom-tool support."""
+    with pytest.raises(ValueError, match="requires supports_custom_tools=true"):
+        GatewayDeploymentCapabilities(supports_grammar_tools=True)
+
+
+def test_custom_and_grammar_tools_can_be_declared_together() -> None:
+    """Grammar-tool support is accepted when custom-tool support is also declared."""
+    caps = GatewayDeploymentCapabilities(
+        supports_custom_tools=True,
+        supports_grammar_tools=True,
+    )
+    assert caps.supports_custom_tools is True
+    assert caps.supports_grammar_tools is True
