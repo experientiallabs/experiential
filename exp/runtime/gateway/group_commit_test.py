@@ -679,3 +679,87 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         ).fetchone() == ("Azure",)
     finally:
         connection.close()
+
+
+def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_path: Path) -> None:
+    """``GroupCommitAttemptLedger.finish_attempt`` probes the host hook the same way.
+
+    The async facade captures the hook, probes it and queues its own lambda
+    independently of the blocking facade, so it gets its own legacy-hook case:
+    an old-signature ``apply_finish_attempt`` settles a full async lifecycle
+    with ``upstream_provider`` withheld, the row completed and the column NULL.
+    """
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    recorded: list[str] = []
+    original = core.apply_finish_attempt
+
+    def legacy_apply(
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+    ) -> None:
+        """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        recorded.append(attempt_id)
+        original(
+            connection,
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+            first_token_at=first_token_at,
+            retry_after_seconds=retry_after_seconds,
+            ratelimit_limit_requests=ratelimit_limit_requests,
+            ratelimit_remaining_requests=ratelimit_remaining_requests,
+            ratelimit_limit_tokens=ratelimit_limit_tokens,
+            ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+        )
+
+    with mock.patch.object(core, "apply_finish_attempt", legacy_apply):
+        grouped = GroupCommitAttemptLedger(core)
+
+        async def lifecycle() -> str:
+            """Accept, dispatch and settle one request through the async facade."""
+            authorization = _authorize(store, clock, raw_key, "async-legacy-host-hook")
+            await grouped.accept_request(authorization=authorization)
+            attempt_id = await grouped.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+                route_reason="direct_alias",
+                fallback_reason=None,
+            )
+            await grouped.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=GatewayEvent(
+                    kind=GatewayEventKind.COMPLETED,
+                    sequence_number=1,
+                    usage=GatewayUsage(input_tokens=10, output_tokens=4),
+                ),
+                failure=None,
+                upstream_provider="Azure",
+            )
+            await grouped.flush()
+            return attempt_id
+
+        attempt_id = asyncio.run(lifecycle())
+        grouped.close()
+    assert recorded == [attempt_id]
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == ("completed", None)
+    finally:
+        connection.close()
