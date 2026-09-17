@@ -130,8 +130,8 @@ uv run pytest -q
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
 - The root CLI is locked to `build`, `optimize`, `config`, and `run`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
-  and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
+  to `router`, `model`, and `claas` (whose commands are exactly `burst` and `serve`); the config
+  group is locked to `budget`, `gateway`, `judge`, `providers`, and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
 - Every paid CLI command uses `exp.cli.shared.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in

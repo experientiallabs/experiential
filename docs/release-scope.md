@@ -111,3 +111,21 @@ reported usage, not account limits, price-invoice agreement, production availabi
 These exclusions are product boundaries, not evidence that the corresponding hosted services are
 unsafe or unsupported forever. Any future claim requires separately authorized, finite-budget,
 denominator-preserving evidence.
+
+## Independent CLaaS learning service
+
+CLaaS exposes separate finite burst and full-run lifetimes with a durable exact-experience buffer,
+OpenAI-compatible nonstreaming generation, delayed scalar/binary/text feedback, and resumable
+native veRL LoRA training. Modal hosts the same service process in a temporary named Sandbox.
+It does not connect the production Rust gateway to training, generate scenarios, mine failure
+signals, assign rewards, evaluate candidates, or deploy an adapter. Those belong to external
+workflows and existing agent/environment interfaces.
+
+Deterministic local evidence drives the real HTTP listener, official SDK, SQLite queue, and an
+existing tool-using scaffold with an injected runtime. It covers multiple updates per allocation,
+empty bursts, exact retry replay, delayed feedback, and lost-acknowledgement recovery. These tests
+prove orchestration behavior, not CUDA training or improved model quality. CUDA tests are explicit
+opt-ins and skipped without authorized GPU hardware. No live CUDA or Modal execution is claimed
+by the CPU test suite. The initial backend supports one BF16 CUDA device and fixed sampling;
+streaming, multi-GPU training, continuous production adapter hot-swapping, recurring scheduling,
+and automatic evaluation/promotion are outside this release surface.

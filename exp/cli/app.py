@@ -32,7 +32,7 @@ add_deferred_typer(
     module="exp.cli.optimize.app",
     attr="optimize_app",
     help="Optimize supported frozen project artifacts.",
-    known_names=("router", "model"),
+    known_names=("router", "model", "claas"),
 )
 app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)

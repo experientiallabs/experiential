@@ -152,3 +152,160 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 `build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
+
+## Independent continual learning
+
+`exp optimize claas burst RUN.json` drains a frozen snapshot of exact, training-ready experience
+and writes `run-report.json` plus resumable checkpoints. `exp optimize claas serve RUN.json`
+keeps one learner and its HTTP generation endpoint alive for a finite full run. Both commands
+accept `--modal MODAL.json` to host the same process in a temporary Modal Sandbox. The foreground
+command waits for completion; interruption requests a checkpointed shutdown.
+
+Install `experiential[claas-verl]` for CUDA burst training, or
+`experiential[claas-rollout]` for a Linux CUDA run with generation. Add `claas-modal` to the launch
+machine for remote hosting. Use Python 3.12 for the pinned training dependency stack. The public
+backend pins veRL 0.9.0 and vLLM 0.22.0. A run owns exactly one visible BF16-capable GPU.
+Set `CUDA_VISIBLE_DEVICES=0` inside the worker process. Full runs
+retain both engine lifetimes but alternate their GPU memory ownership through upstream sleep,
+wake, and LoRA synchronization. CUDA graph startup happens once per run; a new burst or full run
+still has a cold start. A burst only needs the training engine.
+
+The run file is the JSON representation of `RunLaunchConfiguration`. This example requires your
+immutable model/tokenizer commit and paths; the model must support the selected LoRA modules:
+
+```json
+{
+  "directory": "/absolute/path/to/learning-state",
+  "compute_reservation_usd": 3.0,
+  "spec": {
+    "scope": {"user_id": "local", "application_id": "my-agent"},
+    "adapter_id": "my-agent-adapter",
+    "base_model": "MODEL_REPOSITORY",
+    "model_revision": "REPLACE_WITH_40_CHARACTER_MODEL_COMMIT",
+    "tokenizer_id": "MODEL_REPOSITORY",
+    "tokenizer_revision": "REPLACE_WITH_40_CHARACTER_TOKENIZER_COMMIT",
+    "initial_policy_revision": "initial",
+    "objective": "sdpo",
+    "target_modules": ["q_proj", "v_proj"],
+    "max_sequence_tokens": 4096,
+    "max_batch_examples": 4
+  },
+  "run": {
+    "mode": "run",
+    "maximum_updates": 20,
+    "maximum_run_seconds": 1200,
+    "minimum_ready_examples": 4
+  },
+  "runtime": {
+    "checkpoint_root": "/absolute/path/to/learning-state/checkpoints",
+    "decoder": "qwen35",
+    "maximum_output_tokens": 512
+  }
+}
+```
+
+Choose `text`, `hermes`, or `qwen35` decoding to match the student's native output format.
+`compute_reservation_usd` is the operator's conservative full-run estimate used by shared CLI
+spend consent. It is not a provider invoice meter. Include GPU, CPU, RAM, startup, cleanup, and
+storage charges in that estimate. Runtime/update limits bound the run, while a Modal Sandbox
+also has a hard lifetime limit. The launcher never schedules future runs automatically.
+An explicit zero estimate declares that existing local hardware incurs no billable infrastructure
+cost for this run. The local adapter starts a process on the current host and never rents a GPU.
+Use a positive estimate when that host is metered; Modal always requires a positive estimate.
+
+Set `EXPERIENTIAL_CLAAS_TOKEN` to a strong secret before serving; only its environment-variable
+name appears in persisted configuration. The endpoint is independent of the production gateway:
+
+```console
+exp optimize claas serve RUN.json --root ROOT --yes
+```
+
+```python
+import os
+from exp.runtime.claas.client import LearningClient
+
+with LearningClient(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key=os.environ["EXPERIENTIAL_CLAAS_TOKEN"],
+    model="my-agent-adapter",
+) as learner:
+    response = learner.sdk.responses.create(
+        model=learner.model, input="Choose the next tool action.", max_output_tokens=128
+    )
+    learner.submit_feedback(response.id, text="Check the tool result before answering.")
+    learner.trigger_train()
+```
+
+The learner supports nonstreaming text and function tools through `/v1/responses`,
+`/v1/chat/completions`, and `/v1/completions`. Responses requests supply complete history.
+Unsupported sampling controls, media, streaming, and server-side continuations fail explicitly.
+Use `Idempotency-Key` to replay an admitted generation without resampling. Feedback targets the
+standard returned response ID. `/v1/train` schedules an update and returns immediately;
+`/v1/status` reports queue and update state, while `/v1/drain` waits for a bounded ready snapshot.
+All routes require the bearer credential.
+
+Feedback may arrive later as `success=True/False`, scalar `reward` in [-1, 1], or `text`.
+SDPO waits for text, REINFORCE waits for a scalar, and `hybrid` waits for both. Sparse missing
+signals remain pending; absence is never converted into a zero reward. Exact duplicate feedback
+is idempotent; conflicting changes require a new experience. Only complete ready examples train.
+The durable buffer retains original student token IDs, sampled log probabilities, tokenizer and
+policy identities. Arbitrary provider traces cannot be imported as if they were exact RL samples.
+
+For a later training-only burst, use `"mode": "burst"` with the same immutable recipe/state,
+then import `TrainingExample` JSONL if needed:
+
+```console
+exp optimize claas burst BURST.json --import exact-experience.jsonl --root ROOT --yes
+```
+
+A burst opens the trainer once, performs multiple bounded updates, persists optimizer/teacher/
+adapter state before acknowledging consumed records, and closes. An empty burst skips trainer
+initialization. A selected Modal host still reserves its configured Sandbox resources until exit.
+Pending, rejected, and ready records left by a limit remain visible in the report. Policy-lag and
+exact-token checks can reject stale data instead of silently treating it as current-policy data.
+One application/user scope owns each directory and adapter; use separate directories for others.
+Consumed evidence is retained and counts toward finite storage limits. A full queue rejects new
+work; it does not silently delete evidence or replay old training steps. There is no automatic
+retention/compaction policy.
+
+Scaffolds and worlds remain outside CLaaS. Reuse the existing `AgentRuntime` and
+`EnvironmentRuntime` interfaces through `run_learning_episode`:
+
+```python
+from exp.optimize.workflows.learning.scaffold import run_learning_episode
+
+result = run_learning_episode(client=learner, agent=agent, environment=world, task=task)
+# The application evaluates the episode and chooses which response gets feedback.
+learner.submit_feedback(result.response_ids[-1], text=evaluation_feedback)
+```
+
+`world` can call a hosted world model or implement a real tool environment. The workflow does not
+mine failures, assign rewards, or copy episode-level feedback onto every action. Applications own
+those decisions, traffic import, scenario generation, and held-out evaluation. A completed run
+produces artifacts only; it does not hot-swap or deploy a production model.
+
+For Modal, provision an App, a version-2 Volume, and an immutable image containing the same
+Experiential build with its selected CUDA dependencies and GNU `/usr/bin/sync`. Reference them with
+`ModalLaunch` JSON: `app_name`, `environment_name`, `volume_name`, `image_id`, `gpu`, resource
+limits, and `timeout_seconds`. Full runs additionally reference an existing Modal Secret using
+`authentication_secret_name`; it must provide the configured authentication environment key.
+Never put the token itself in JSON. Use state/checkpoint paths under `/state`,
+`"persistence": "modal-volume"`, and `"host": "0.0.0.0"` for a remote full run. The Sandbox
+lifetime must exceed startup + run + cleanup by more than 30 seconds.
+
+```console
+exp optimize claas serve REMOTE_RUN.json --modal MODAL.json --run-id my-run --root ROOT --yes
+exp optimize claas burst REMOTE_BURST.json --modal MODAL.json --run-id my-burst \
+  --import exact-experience.jsonl --root ROOT --yes
+```
+
+The adapter binds the Volume to one App and permits one live writer. Resume that remote Volume
+in place. JSONL is transported before launch; copying a local SQLite queue or checkpoint directory
+onto the remote mount is unsupported. Remote durability uses explicit Volume commits before API
+acknowledgements. A failed or forced stop is reported as failure and requires inspecting retained
+state, not assuming that every leased batch finished. Embedded in-process GPU operations retain
+ownership while cleanup joins them, so their Python timeouts are soft if native work stalls.
+The local CLI supervises the entire learner POSIX session, including Ray workers in separate
+process groups, and escalates from graceful termination to forced cleanup after the configured bounds. Modal supplies the remote hard lifetime limit.
+Neither host acknowledges an interrupted update as completed; inspect the retained queue,
+checkpoint, and host/run receipts before resuming.

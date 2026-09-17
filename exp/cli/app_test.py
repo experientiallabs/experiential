@@ -10,7 +10,7 @@ from exp.cli.app import app
 
 EXPECTED_SUBCOMMANDS = {
     "config": {"budget", "gateway", "judge", "providers", "telemetry"},
-    "optimize": {"model", "router"},
+    "optimize": {"model", "router", "claas"},
 }
 
 
@@ -29,3 +29,15 @@ def test_root_cli_and_subgroups_are_exact() -> None:
         assert isinstance(command, TyperGroup)
         context = Context(command, parent=root_context, info_name=name)
         assert set(command.list_commands(context)) == expected
+
+
+def test_claas_subcommands_are_exact() -> None:
+    """The finite learning group is nested under optimize, with no root command added."""
+    root = get_group(app)
+    context = Context(root)
+    optimize = root.get_command(context, "optimize")
+    assert isinstance(optimize, TyperGroup)
+    optimize_context = Context(optimize, parent=context)
+    claas = optimize.get_command(optimize_context, "claas")
+    assert isinstance(claas, TyperGroup)
+    assert set(claas.list_commands(Context(claas, parent=optimize_context))) == {"burst", "serve"}
