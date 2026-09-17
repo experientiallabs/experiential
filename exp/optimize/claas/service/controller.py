@@ -13,7 +13,11 @@ from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.service.configuration import RunConfiguration, RunReport, RunStatus
 from exp.optimize.claas.service.contracts import LearnerRuntime, LearnerRuntimeFactory
-from exp.optimize.claas.training_contracts import ClaasTrainingSpec, TrainingExample
+from exp.optimize.claas.training_contracts import (
+    ClaasTrainingError,
+    ClaasTrainingSpec,
+    TrainingExample,
+)
 
 
 async def _await_cleanup[T](task: asyncio.Task[T]) -> T:
@@ -177,7 +181,7 @@ class LearningController:
                 or token.tokenizer_revision != self.spec.tokenizer_revision
                 or len(token.response_token_ids) > request.maximum_output_tokens
             ):
-                raise ValueError(
+                raise ClaasTrainingError(
                     "runtime generation evidence differs from the requested student or limit"
                 )
             self.buffer.record_generation(request, result)
@@ -267,7 +271,9 @@ class LearningController:
             async with asyncio.timeout_at(self._deadline):
                 result = await runtime.train(batch)
             if runtime.policy_revision != result.checkpoint.policy_revision:
-                raise ValueError("runtime did not select its acknowledged optimizer revision")
+                raise ClaasTrainingError(
+                    "runtime did not select its acknowledged optimizer revision"
+                )
             self.buffer.acknowledge(batch, result)
             await self._persist()
             self._updates += 1
@@ -296,7 +302,7 @@ class LearningController:
     def _require_runtime(self) -> LearnerRuntime:
         """Require the single resident runtime opened by this controller."""
         if self._runtime is None:
-            raise ValueError("learning runtime has not been opened")
+            raise ClaasTrainingError("learning runtime has not been opened")
         return self._runtime
 
     async def _background(self) -> None:

@@ -15,6 +15,7 @@ from exp.optimize.claas.service.configuration import RunConfiguration
 from exp.optimize.claas.service.contracts import RunMode
 from exp.optimize.claas.service.controller import LearningController
 from exp.optimize.claas.training_contracts import (
+    ClaasTrainingError,
     ClaasTrainingSpec,
     TrainingBatch,
     TrainingCheckpoint,
@@ -347,7 +348,7 @@ def test_runtime_revision_mismatch_does_not_consume_batch(tmp_path: Path) -> Non
         runtime = WrongRevision()
         controller = LearningController(tmp_path, spec(), runtime, RunConfiguration(mode="burst"))
         await controller.import_examples((item(),))
-        with pytest.raises(ValueError, match="did not select"):
+        with pytest.raises(ClaasTrainingError, match="did not select"):
             await controller.drain()
         status = await controller.status()
         assert status.buffer.inflight == 1
