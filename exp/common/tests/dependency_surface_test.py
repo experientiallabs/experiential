@@ -30,6 +30,10 @@ def test_forbidden_provider_imports_are_absent() -> None:
             "exp.common.vendor",
         },
         allowed={
+            ("optimize/claas/backends/verl/engine.py", "transformers.modeling_outputs"),
+            ("optimize/claas/backends/verl/generation.py", "transformers"),
+            ("optimize/claas/backends/verl/inputs.py", "transformers"),
+            ("optimize/claas/backends/verl/resident.py", "transformers"),
             ("runtime/models/providers/bedrock.py", "boto3"),
             ("runtime/models/providers/bedrock.py", "botocore.auth"),
             ("runtime/models/providers/bedrock.py", "botocore.awsrequest"),
