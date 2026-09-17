@@ -23,7 +23,8 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        # veRL 0.9 pins tensordict wheels supporting Python 3.12 and 3.13.
+        run: uv sync --python 3.12 --extra dev
       - name: Crate changes require a crate version bump
         if: github.event_name == 'pull_request'
         env:
@@ -97,7 +98,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        # veRL 0.9 pins tensordict wheels supporting Python 3.12 and 3.13.
+        run: uv sync --python 3.12 --extra dev
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}

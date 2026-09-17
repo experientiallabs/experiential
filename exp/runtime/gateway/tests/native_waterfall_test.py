@@ -1,6 +1,6 @@
 """Integration tests for the native engine's certified deployment waterfall.
 
-One live ``exp_gateway_native`` serving subprocess runs rust-only (no
+Each test's live ``exp_gateway_native`` serving subprocess runs rust-only (no
 fallback engine configured) over a seeded root whose granted alias is a
 certified two-deployment pool. Two loopback mock
 providers stand in for the ordered deployments; the first deployment's
@@ -10,7 +10,7 @@ shape: persistent 500s (same-deployment redial then failover), one transient
 alias revision's opt-in), and a plain success. Every test asserts the durable
 per-attempt rows (ordinals counting all physical dispatches, depths naming
 the deployment position) through the request identity echoed in
-``x-request-id``, and the module-level conservation check proves the ledger
+``x-request-id``, and the conservation scenario proves the ledger
 holds no open rows once traffic settles.
 """
 
@@ -188,10 +188,10 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
     """The first certified deployment; behavior is selected by the prompt.
 
     ``always-500`` fails every dispatch, ``retry-then-succeed`` fails once
-    per process then answers, ``refuse`` streams a refusal-only completion,
+    per fixture then answers, ``refuse`` streams a refusal-only completion,
     ``silent-length`` exhausts the output budget with no content (a
     thinking-only turn: ``finish_reason: length``, zero deltas),
-    ``silent-stop-then-succeed`` answers its first dispatch per process with
+    ``silent-stop-then-succeed`` answers its first dispatch per fixture with
     a billed reasoning-only ``stop`` (OpenRouter's DeepSeek shape: hidden
     ``reasoning`` deltas, empty content, 147 completion tokens) and then a
     plain success, and anything else streams a plain success.
@@ -347,9 +347,9 @@ def _attempt_rows(engine: _ServingEngine, request_id: str) -> list[tuple[int, in
         time.sleep(0.05)
 
 
-@pytest.fixture(scope="module", name="engine")
+@pytest.fixture(name="engine")
 def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
-    """Serve one shared native engine subprocess over a certified pool root.
+    """Serve one isolated native engine subprocess over a certified pool root.
 
     The alias revision opts into refusal failover so the refusal scenario can
     advance; the other scenarios are unaffected by the flag.
@@ -358,6 +358,8 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         The live serving facts as a :class:`_ServingEngine`.
     """
     root = tmp_path_factory.mktemp("native-waterfall-root")
+    with _PrimaryUpstream.lock:
+        _PrimaryUpstream.retry_counts.clear()
     primary = ThreadingHTTPServer((_HOST, 0), _PrimaryUpstream)
     secondary = ThreadingHTTPServer((_HOST, 0), _SecondaryUpstream)
     threads = [
@@ -501,8 +503,8 @@ def test_refusal_failover_withholds_the_refused_route(engine: _ServingEngine) ->
 
     The alias revision opts into refusal failover, so the withheld refusal
     deltas never reach the caller; the ledger records the refused attempt and
-    the secondary serves the visible completion. Refusals never count toward
-    the primary's failure circuit, so later scenarios still dial it first.
+    the secondary serves the visible completion. Refusals do not count toward
+    the primary's failure circuit.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -696,7 +698,7 @@ def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     twice (its bounded cap) before failover; the terminal attempt completes
     on route depth one and the response carries the winning deployment's
     output and route headers. The two operational failures open the primary's
-    health circuit, which the streaming scenario below observes.
+    health circuit.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -716,11 +718,22 @@ def test_streaming_request_skips_the_open_primary_circuit(
 ) -> None:
     """An open primary circuit routes a streamed request straight to depth one.
 
-    The previous scenario's two operational failures opened the primary's
-    circuit, so this streamed request dispatches once on the fallback and its
-    committed headers name the winning deployment position before the first
-    byte flows.
+    Establish two operational failures on this engine first. The subsequent
+    streamed request dispatches once on the fallback and its committed headers
+    name the winning deployment position before the first byte flows.
     """
+    opening = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("always-500"),
+        timeout=30.0,
+    )
+    assert opening.status_code == 200
+    assert _attempt_rows(engine, opening.headers["x-request-id"]) == [
+        (0, 0, "failed"),
+        (1, 0, "failed"),
+        (2, 1, "completed"),
+    ]
     collected = b""
     with httpx.stream(
         "POST",
@@ -743,10 +756,23 @@ def test_streaming_request_skips_the_open_primary_circuit(
 def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None:
     """Every accepted request settles: no open attempts, matched totals.
 
-    Runs last in the module (pytest preserves definition order), so it sees
-    the traffic of every scenario above plus its own success probe, which the
-    still-open primary circuit routes to the fallback in one dispatch.
+    Drive this engine's own retry, refusal, failover, and success traffic.
+    Compare every admitted request and physical dispatch with durable rows,
+    independently of other scenarios or the test scheduler.
     """
+    for prompt, expected in (
+        ("retry-then-succeed", [(0, 0, "failed"), (1, 0, "completed")]),
+        ("refuse", [(0, 0, "failed"), (1, 1, "completed")]),
+        ("always-500", [(0, 0, "failed"), (1, 0, "failed"), (2, 1, "completed")]),
+    ):
+        scenario = httpx.post(
+            f"{engine.base}/v1/chat/completions",
+            headers={"authorization": f"Bearer {engine.raw_key}"},
+            json=_chat_payload(prompt),
+            timeout=30.0,
+        )
+        assert scenario.status_code == 200
+        assert _attempt_rows(engine, scenario.headers["x-request-id"]) == expected
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
         headers={"authorization": f"Bearer {engine.raw_key}"},
@@ -754,18 +780,23 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
         timeout=30.0,
     )
     assert response.status_code == 200
+    request_id = response.headers["x-request-id"]
+    attempts = _attempt_rows(engine, request_id)
+    assert len(attempts) == 1
+    assert attempts[0][0] == 0
+    assert attempts[0][2] == "completed"
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    # Eight scenario requests, the integer-timestamp scenario's two, the
-    # output-less continuation scenario's four (two first turns and their two
-    # continuations), and this probe.
-    assert report["totals"]["requests"] == 15
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
+        (total_requests,) = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()
+        probe = connection.execute(
+            "SELECT terminal_state FROM gateway_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
         (open_attempts,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
+    assert probe == ("completed",)
+    assert report["totals"]["requests"] == total_requests == 4
     assert open_attempts == 0
-    # Fifteen single-dispatch requests plus the five extra physical attempts
-    # the redial, empty-completion, and failover scenarios spend.
-    assert terminal_attempts == total_attempts == 20
+    assert terminal_attempts == total_attempts == 8

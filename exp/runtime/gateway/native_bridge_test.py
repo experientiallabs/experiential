@@ -1598,16 +1598,28 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
 
 
 def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
-    """An admitted request the data plane never settles is closed by the sweep."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
+    """An active attempt survives before its deadline and is cancelled by a later sweep."""
+    control, raw_key = _control_plane(tmp_path)
     abandoned = _admit_started(control, raw_key, _chat_body())
-    time.sleep(0.05)
-    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+    accounting = control._accounting  # noqa: SLF001 - the timer normally drives the sweep.
+    entry = accounting.entry(str(abandoned["request_id"]))
+    assert entry is not None
+    accounting.sweep_expired()
+    assert accounting.entry(str(abandoned["request_id"])) is entry
+    # Replace only accounting's clock, leaving real scheduling and admission clocks alone.
+    with (
+        mock.patch("exp.runtime.gateway.native_accounting.time", wraps=time) as clock,
+        mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
+    ):
+        clock.monotonic.return_value = entry.deadline_monotonic + 1
         second = _admit(control, raw_key, _chat_body())
-    assert control._accounting.entry(str(abandoned["request_id"])) is None  # noqa: SLF001
-    assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
+    assert accounting.entry(str(abandoned["request_id"])) is None
+    assert accounting.entry(str(second["request_id"])) is not None
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 2
+    metrics = control.metrics_snapshot()["control_plane"]
+    assert isinstance(metrics, dict)
+    assert metrics["sweep_abandoned_attempts_cancelled"] == 1
 
 
 @pytest.mark.parametrize(

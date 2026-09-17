@@ -33,6 +33,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Independent learning service, with compute selected explicitly at run startup.
+claas = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+claas-verl = ["experiential[claas]", "verl==0.9.0", "transformers>=5.5.4,<5.6", "peft>=0.18,<0.19", "torch>=2.9,<2.14", "safetensors>=0.6,<0.9", "psutil>=7,<8"]
+claas-rollout = ["experiential[claas-verl]", "vllm==0.22.0; sys_platform == 'linux'"]
+claas-modal = ["modal>=1.5.5,<2"]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 dev = [
@@ -45,6 +50,8 @@ dev = [
     "ruff>=0.5",
     "ty>=0.0.1a1",
     "experiential[sft]",
+    "experiential[claas-verl]",
+    "experiential[claas-modal]",
     # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
     "maturin>=1.7,<2",
     # WebSocket client for the Responses-over-WebSocket gateway e2e tests.
