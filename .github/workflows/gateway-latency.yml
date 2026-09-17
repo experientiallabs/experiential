@@ -33,7 +33,8 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        # veRL 0.9 pins tensordict wheels supporting Python 3.12 and 3.13.
+        run: uv sync --python 3.12 --extra dev
       - name: Measure Experiential gateway latency against a local mock
         env:
           EXP_TELEMETRY: "0"
