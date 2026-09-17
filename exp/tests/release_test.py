@@ -76,6 +76,9 @@ REQUIRED_CAPTURE_REQUIREMENTS = frozenset(
 REQUIRED_WHEEL_MODULES = frozenset(
     {
         "exp/cli/gateway/app.py",
+        "exp/cli/optimize/claas/app.py",
+        "exp/optimize/claas/service/launch_configuration.py",
+        "exp/optimize/claas/backends/verl/runtime.py",
         "exp/cli/gateway/budget.py",
         "exp/common/judging/calibration.py",
         "exp/common/judging/labels.py",
@@ -3529,6 +3532,8 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     usage = (docs / "usage.md").read_text(encoding="utf-8")
     assert "exp optimize router" in usage
     assert "exp optimize model" in usage
+    assert "exp optimize claas burst" in usage
+    assert "exp optimize claas serve" in usage
     assert "exp config gateway" in usage
     assert "exp config gateway pool certify" in usage
     assert "exp --root ROOT" in usage

@@ -145,3 +145,23 @@ assert load_router.__module__ == "exp.optimize.router.activation"
 assert load_router is nested_load_router
 """
     )
+
+
+def test_claas_help_does_not_load_compute_or_http_backends() -> None:
+    """All learning help paths remain usable without optional CUDA or Modal dependencies."""
+    _run(
+        """
+import sys
+from typer.testing import CliRunner
+from exp.cli.app import app
+for arguments in (["optimize", "claas", "--help"],
+                  ["optimize", "claas", "burst", "--help"],
+                  ["optimize", "claas", "serve", "--help"]):
+    result = CliRunner().invoke(app, arguments)
+    assert result.exit_code == 0, result.output
+for module in ("torch", "verl", "vllm", "modal", "fastapi", "uvicorn", "ray",
+               "exp.optimize.claas.service.launcher",
+               "exp.optimize.claas.backends.verl.runtime"):
+    assert module not in sys.modules, module
+"""
+    )
