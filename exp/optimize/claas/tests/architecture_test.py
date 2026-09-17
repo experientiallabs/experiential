@@ -80,7 +80,7 @@ def test_learner_has_no_gateway_or_simulation_imports() -> None:
 
 
 def test_owned_model_engines_do_not_spawn_vllm_processes() -> None:
-    """Use veRL's supported resident engines, with only the explicit Modal sync subprocess."""
+    """Permit only the resident engines, local learner host, and explicit Modal volume sync."""
     violations: list[str] = []
     for path, tree in _sources():
         aliases = dict(_imports(path, tree))
@@ -95,8 +95,18 @@ def test_owned_model_engines_do_not_spawn_vllm_processes() -> None:
                 and called == "asyncio.create_subprocess_exec"
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == "sync"
+                and node.args[0].value == "/usr/bin/sync"
             )
-            if not volume_sync:
+            local_learner = (
+                path.relative_to(_EXP).as_posix() == "optimize/claas/backends/local/hosting.py"
+                and called == "subprocess.Popen"
+                and node.args
+                and isinstance(node.args[0], ast.List)
+                and len(node.args[0].elts) == 4
+                and ast.unparse(node.args[0].elts[0]) == "sys.executable"
+                and [ast.literal_eval(item) for item in node.args[0].elts[1:]]
+                == ["-m", "exp.optimize.claas.service.launcher", "--config-stdin"]
+            )
+            if not volume_sync and not local_learner:
                 violations.append(f"{path.relative_to(_EXP)}:{node.lineno} calls {called}")
     assert not violations, "model process ownership bypasses the engine: " + "; ".join(violations)
