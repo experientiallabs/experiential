@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 
-from pydantic import AwareDatetime, Field, JsonValue, model_validator
+from pydantic import AwareDatetime, JsonValue, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -32,7 +32,7 @@ class HumanScore(ContractModel):
     rollout_id: ArtifactId
     lineage_id: ArtifactId
     dimension_id: ArtifactId
-    score: int = Field(ge=0)
+    score: int
     created_at: AwareDatetime
     supersedes_label_id: ArtifactId | None = None
 
@@ -204,7 +204,7 @@ class HumanScoreReview:
         Args:
             score: New score with no correction predecessor.
         """
-        self._mutate(lambda history: history.append(score), rubric_id=score.rubric_id)
+        self._mutate(lambda history: history.append(score), rubric_id=score.rubric_id, score=score)
 
     def correct(self, score: HumanScore) -> None:
         """Persist one correction while retaining its superseded historical label.
@@ -212,7 +212,7 @@ class HumanScoreReview:
         Args:
             score: New score that names the earlier label it supersedes.
         """
-        self._mutate(lambda history: history.correct(score), rubric_id=score.rubric_id)
+        self._mutate(lambda history: history.correct(score), rubric_id=score.rubric_id, score=score)
 
     def upsert(
         self,
@@ -400,6 +400,9 @@ class HumanScoreReview:
         if rubric.rubric_id != rubric_id:
             raise ValueError("stored rubric record does not match its artifact identity")
         history = self._history.for_rubric(rubric_id)
+        for label in history.scores:
+            if not rubric.axis(label.dimension_id).contains_score(label.score):
+                raise ValueError("human label history contains a score outside its rubric axis")
         label_set = HumanLabelSet(
             schema_version=1,
             created_at=created_at,
@@ -439,12 +442,14 @@ class HumanScoreReview:
         transition: Callable[[HumanScoreHistory], HumanScoreHistory],
         *,
         rubric_id: ArtifactId,
+        score: HumanScore | None = None,
     ) -> None:
         """Apply one score transition while build selection and review state are locked.
 
         Args:
             transition: Pure history transition to apply to the latest persisted namespace.
             rubric_id: Immutable rubric whose source task set must remain selected.
+            score: New label whose axis bounds must be checked before mutation.
         """
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
 
@@ -458,6 +463,13 @@ class HumanScoreReview:
 
         with coordinate_completed_build_selection(self._store):
             _require_rubric_matches_selected_build(self._store, rubric_id)
+            if score is not None:
+                _require_score_on_rubric_axis(
+                    self._store,
+                    rubric_id=rubric_id,
+                    dimension_id=score.dimension_id,
+                    score=score.score,
+                )
             self._store.update_review(update)
         self._root_review, self._history = selected[0]
 

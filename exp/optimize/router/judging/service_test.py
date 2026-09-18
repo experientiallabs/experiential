@@ -25,6 +25,7 @@ from exp.common.judging import (
     HumanScore,
     HumanScoreHistory,
     HumanScoreReview,
+    JudgeDefinition,
     PromptDefinition,
     RubricDimension,
     RubricReview,
@@ -531,6 +532,36 @@ def test_setup_failure_is_read_only_and_setup_never_calls_a_model(tmp_path: Path
         commit_manual_judge_setup(store, plan, confirmed=False)
     assert store.read_review() == before_review
     assert store.artifacts.list_ids() == before_artifacts
+
+
+def test_named_judge_definition_binds_syllabus_and_axes_to_persisted_setup(tmp_path: Path) -> None:
+    """A reusable judge keeps its exact syllabus and mixed ranges when bound to a project."""
+    store = _built_store(tmp_path)
+    definition = JudgeDefinition(
+        name="Support",
+        syllabus="Assess whether the user's issue was resolved.",
+        dimensions=(
+            *JudgeDefinition.task_success().dimensions,
+            scored_axis("quality", "Quality", "Helpfulness.", min_score=-2, max_score=2),
+        ),
+    )
+    plan = prepare_manual_judge_setup(
+        store, _catalog(), definition=definition, created_at=_TIME, code_revision="test-revision"
+    )
+    assert plan.dimensions == definition.dimensions
+    assert definition.syllabus in plan.prompt_template.prompt.text
+    committed = commit_manual_judge_setup(store, plan, confirmed=True)
+    assert committed.prompt_template == plan.prompt_template
+    assert commit_manual_judge_setup(store, plan, confirmed=True) == committed
+    with pytest.raises(ManualJudgeError, match="not both"):
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            definition=definition,
+            dimensions=_wide_axes(),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
 
 
 def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(

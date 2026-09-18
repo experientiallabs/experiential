@@ -17,13 +17,13 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ModelSnapshot
 
-_MAX_AXIS_SCORE = 10
+MAX_AXIS_SCORE_POINTS = 101
 
 
 class ScoreAnchor(ContractModel):
     """Plain-language meaning for one integer score on a rubric axis."""
 
-    score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
+    score: int
     description: str = Field(min_length=1)
 
 
@@ -33,14 +33,16 @@ class RubricDimension(ContractModel):
     dimension_id: ArtifactId
     name: str = Field(min_length=1, max_length=256)
     description: str = Field(min_length=1)
-    min_score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
-    max_score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
+    min_score: int
+    max_score: int
     anchors: tuple[ScoreAnchor, ...]
 
     @model_validator(mode="after")
     def _require_valid_range_and_anchors(self) -> RubricDimension:
         if self.min_score >= self.max_score:
             raise ValueError("rubric axis range must be inclusive with min_score below max_score")
+        if self.max_score - self.min_score + 1 > MAX_AXIS_SCORE_POINTS:
+            raise ValueError("rubric axes support at most 101 integer score points")
         permitted = self.permitted_scores()
         scores = tuple(anchor.score for anchor in self.anchors)
         if not scores:
@@ -109,6 +111,8 @@ def scored_axis(
     Returns:
         A validated axis with one anchor per integer in the range.
     """
+    if not 2 <= max_score - min_score + 1 <= MAX_AXIS_SCORE_POINTS:
+        raise ValueError("axis range must contain 2 through 101 integer score points")
     stem = name if anchor_stem is None else anchor_stem
     return RubricDimension(
         dimension_id=dimension_id,
@@ -144,23 +148,20 @@ def default_task_success_axis() -> RubricDimension:
 
 
 def score_bounds(dimensions: tuple[RubricDimension, ...]) -> tuple[int, int]:
-    """Return the shared inclusive axis range.
+    """Return the inclusive envelope of the independently bounded axes.
 
     Args:
         dimensions: Non-empty ordered rubric axes.
 
     Returns:
-        The inclusive ``(min_score, max_score)`` shared by every axis.
+        The smallest schema bounds covering every axis. Scores still require per-axis validation.
 
     Raises:
-        ValueError: The rubric has no axes, or axes use different ranges.
+        ValueError: The rubric has no axes.
     """
     if not dimensions:
         raise ValueError("a rubric must contain at least one axis")
-    ranges = {(item.min_score, item.max_score) for item in dimensions}
-    if len(ranges) != 1:
-        raise ValueError("every rubric axis must share the same inclusive score range")
-    return next(iter(ranges))
+    return min(item.min_score for item in dimensions), max(item.max_score for item in dimensions)
 
 
 class Rubric(ArtifactEnvelope):
@@ -234,8 +235,8 @@ class DimensionScoreMap(ContractModel):
     """A monotonic mapping from raw judge scores to expected human scores."""
 
     dimension_id: ArtifactId
-    min_score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
-    max_score: int = Field(ge=0, le=_MAX_AXIS_SCORE)
+    min_score: int
+    max_score: int
     calibrated_scores: tuple[float, ...]
 
     @model_validator(mode="after")
@@ -243,6 +244,8 @@ class DimensionScoreMap(ContractModel):
         if self.min_score >= self.max_score:
             raise ValueError("score-map range must be inclusive with min_score below max_score")
         expected_length = self.max_score - self.min_score + 1
+        if expected_length > MAX_AXIS_SCORE_POINTS:
+            raise ValueError("score maps support at most 101 integer score points")
         if len(self.calibrated_scores) != expected_length:
             raise ValueError("calibrated rubric scores must cover every integer in the axis range")
         if any(
@@ -292,6 +295,8 @@ def identity_score_map(
     Returns:
         A monotonic identity map covering every permitted raw score.
     """
+    if not 2 <= max_score - min_score + 1 <= MAX_AXIS_SCORE_POINTS:
+        raise ValueError("axis range must contain 2 through 101 integer score points")
     return DimensionScoreMap(
         dimension_id=dimension_id,
         min_score=min_score,

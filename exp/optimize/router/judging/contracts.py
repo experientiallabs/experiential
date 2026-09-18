@@ -35,7 +35,7 @@ class ManualJudgeLabel(ContractModel):
     trace_id: str = Field(min_length=1, max_length=512)
     reference_trace_id: str | None = Field(default=None, min_length=1, max_length=512)
     dimension_id: ArtifactId
-    score: int | None = Field(default=None, ge=0)
+    score: int | None = None
     winner: Literal["winner_a", "winner_b", "tie"] | None = None
 
     @model_validator(mode="after")
@@ -285,7 +285,7 @@ class JudgeAxisProposal(ContractModel):
     """One configured-judge proposal retained before a human decision."""
 
     dimension_id: ArtifactId
-    proposed_score: int = Field(ge=0, le=10)
+    proposed_score: int
     proposed_judgment: str = ""
     cited_trace_evidence: tuple[str, ...] = ()
     cited_reference_trace_evidence: tuple[str, ...] = ()
@@ -330,14 +330,14 @@ class JudgeAxisProposal(ContractModel):
 class HumanJudgeCorrection(ContractModel):
     """A human-authored replacement for one judge score and judgment."""
 
-    corrected_score: int = Field(ge=0, le=10)
+    corrected_score: int
     corrected_judgment: str | None = Field(default=None, min_length=1)
 
 
 class FinalAcceptedJudgeLabel(ContractModel):
     """The label authorized by a human after reviewing a judge proposal."""
 
-    score: int = Field(ge=0, le=10)
+    score: int
     judgment: str = ""
     cited_trace_evidence: tuple[str, ...] = ()
     cited_reference_trace_evidence: tuple[str, ...] = ()

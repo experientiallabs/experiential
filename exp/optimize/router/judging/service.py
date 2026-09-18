@@ -12,6 +12,7 @@ from exp.common.judging import (
     HumanScoreReview,
     JudgeCalibration,
     JudgeCalibrationService,
+    JudgeDefinition,
     JudgeScoreObservation,
     RouterLineageAssignment,
     RouterLineageSplit,
@@ -84,6 +85,7 @@ from exp.optimize.router.judging.template_bind import (
     DEFAULT_JUDGE_TEMPLATE,
     bind_prompt_template,
     default_judge_dimensions,
+    judge_template,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -141,6 +143,7 @@ def prepare_manual_judge_setup(
     catalog: ModelCatalog,
     *,
     judge_alias: str | None = None,
+    definition: JudgeDefinition | None = None,
     dimensions: Sequence[RubricDimension] | None = None,
     prompt_template: JudgePromptTemplate = DEFAULT_JUDGE_TEMPLATE,
     preview_count: int = 3,
@@ -153,6 +156,7 @@ def prepare_manual_judge_setup(
         store: Existing project with completed deterministic build evidence.
         catalog: Local secret-free model catalog.
         judge_alias: Optional explicit alias, otherwise the configured judge role.
+        definition: Reusable named syllabus and axes, mutually exclusive with custom raw fields.
         dimensions: Optional complete rubric replacement.
         prompt_template: Versioned prompt, variable mapping, and response schema.
         preview_count: Maximum number of distinct fit-lineage traces to render.
@@ -167,6 +171,11 @@ def prepare_manual_judge_setup(
     """
     if preview_count < 1:
         raise ManualJudgeError("judge setup preview count must be positive")
+    if definition is not None:
+        if dimensions is not None or prompt_template != DEFAULT_JUDGE_TEMPLATE:
+            raise ManualJudgeError("supply a judge definition or raw dimensions/template, not both")
+        dimensions = definition.dimensions
+        prompt_template = judge_template(definition)
     project = store.load_project()
     build = _load_build_review(store)
     if build.project_config != project.model_copy(update={"build": None}):

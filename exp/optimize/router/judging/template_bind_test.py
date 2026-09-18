@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from exp.common.judging import PromptDefinition, default_task_success_axis
+from exp.common.judging import (
+    JudgeDefinition,
+    PromptDefinition,
+    default_task_success_axis,
+    scored_axis,
+)
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
     JudgeScoreProjection,
@@ -14,6 +19,7 @@ from exp.optimize.router.judging.template_bind import (
     DEFAULT_JUDGE_PROMPT,
     bind_prompt_template,
     default_judge_template,
+    judge_template,
 )
 
 
@@ -51,3 +57,20 @@ def test_bind_prompt_template_keeps_custom_scalar_with_builtin_prompt_id() -> No
         bound.response_schema
         == default_judge_template((default_task_success_axis(),)).response_schema
     )
+
+
+def test_judge_template_pins_syllabus_and_independent_ranges() -> None:
+    """A stored reusable definition has an executable schema and exact prompt provenance."""
+    definition = JudgeDefinition(
+        name="Support",
+        syllabus="Penalize unsupported claims.",
+        dimensions=(
+            default_task_success_axis(),
+            scored_axis("quality", "Quality", "Helpfulness.", min_score=-2, max_score=2),
+        ),
+    )
+    template = judge_template(definition)
+    assert definition.syllabus in template.prompt.text
+    assert definition.revision in template.prompt.prompt_id
+    assert template.response_schema == judge_feedback_schema("scalar", min_score=-2, max_score=2)
+    assert JudgePromptTemplate.model_validate_json(template.model_dump_json()) == template

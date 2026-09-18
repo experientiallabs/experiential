@@ -29,6 +29,8 @@ from exp.common.judging import (
     Rubric,
     RubricDimension,
     ScoreAnchor,
+    default_task_success_axis,
+    scored_axis,
     verify_persisted_calibration,
     write_router_lineage_split,
 )
@@ -80,8 +82,8 @@ class _Entry:
     rollout_id: str
     lineage_id: str
     dimension_id: str
-    raw_score: Score
-    human_score: Score
+    raw_score: int
+    human_score: int
     judge_model: ModelSnapshot | None = None
     prompt: PromptDefinition | None = None
     label_lineage_id: str | None = None
@@ -156,6 +158,7 @@ def _write_graph(
     entries: tuple[_Entry, ...],
     *,
     dimension_ids: tuple[str, ...] = ("task-success",),
+    axes: tuple[RubricDimension, ...] | None = None,
 ) -> _Graph:
     store = _store(tmp_path)
     task_set_input = _write_task_set(store)
@@ -165,7 +168,7 @@ def _write_graph(
         inputs=(task_set_input,),
         code_revision="w6-test",
         rubric_id="rubric-1",
-        dimensions=tuple(_dimension(dimension_id) for dimension_id in dimension_ids),
+        dimensions=axes or tuple(_dimension(dimension_id) for dimension_id in dimension_ids),
         source_task_set_id="task-set-1",
         status="human_approved",
         approved_at=_TIME,
@@ -952,3 +955,37 @@ def test_human_labels_after_provisional_judgments_build_and_approve_grouped_oof(
     assert metric.mae is not None
     service.write_report(graph.store, report)
     assert service.approve(graph.store, report, approved_at=_TIME).status == "human_calibrated"
+
+
+def test_signed_mixed_axes_survive_judging_calibration_and_persisted_verification(
+    tmp_path: Path,
+) -> None:
+    """Independent ranges remain intact through real artifact writes and grouped calibration."""
+    axes = (
+        default_task_success_axis(),
+        scored_axis("quality", "Quality", "Effect on the user.", min_score=-2, max_score=2),
+    )
+    entries = tuple(
+        _Entry(
+            rollout_id=f"rollout-{index}",
+            lineage_id=f"lineage-{index}",
+            dimension_id=axis.dimension_id,
+            raw_score=axis.min_score + index % (axis.max_score - axis.min_score + 1),
+            human_score=axis.min_score + index % (axis.max_score - axis.min_score + 1),
+        )
+        for index in range(10)
+        for axis in axes
+    )
+    graph = _write_graph(
+        tmp_path, entries, dimension_ids=tuple(axis.dimension_id for axis in axes), axes=axes
+    )
+    service = JudgeCalibrationService()
+    report = _build(graph)
+    assert any(prediction.raw_score < 0 for prediction in report.out_of_fold_predictions)
+    assert {(item.min_score, item.max_score) for item in report.score_maps} == {(0, 1), (-2, 2)}
+    service.write_report(graph.store, report)
+    approved = service.approve(graph.store, report, approved_at=_TIME)
+    assert approved.status == "human_calibrated"
+    service.write_calibration(graph.store, report=report, calibration=approved)
+    verified, _ = verify_persisted_calibration(graph.store, approved.calibration_id)
+    assert verified == approved

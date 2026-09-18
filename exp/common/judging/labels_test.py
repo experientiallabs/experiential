@@ -119,6 +119,7 @@ def test_human_score_review_persists_history_without_overwriting_other_review_st
     """Human score writes retain existing review namespaces and resume after restart."""
     store = _store(tmp_path)
     store.write_review({"other_review": {"status": "draft"}})
+    _write_rubric(store)
     review = HumanScoreReview.open(store)
     review.append(_score("label-1", 1))
     review.correct(_score("label-2", 3, supersedes_label_id="label-1"))
@@ -129,6 +130,25 @@ def test_human_score_review_persists_history_without_overwriting_other_review_st
     saved = store.read_review()
     assert isinstance(saved, dict)
     assert saved["other_review"] == {"status": "draft"}
+
+
+@pytest.mark.parametrize("score", [-1, 6, 10**9])
+@pytest.mark.parametrize("correction", [False, True])
+def test_direct_human_label_writes_validate_axis_before_persistence(
+    tmp_path: Path, score: int, correction: bool
+) -> None:
+    """Both public write paths reject out-of-range labels without changing review state."""
+    store = _store(tmp_path)
+    _write_rubric(store)
+    review = HumanScoreReview.open(store)
+    review.append(_score("label-1", 1))
+    before = store.read_review()
+    label = _score("label-2", 1, supersedes_label_id="label-1" if correction else None).model_copy(
+        update={"score": score}
+    )
+    with pytest.raises(ValueError, match="integers from 0 through 5"):
+        (review.correct if correction else review.append)(label)
+    assert store.read_review() == before
 
 
 def test_human_score_review_upsert_is_idempotent_for_duplicate_delivery(tmp_path: Path) -> None:

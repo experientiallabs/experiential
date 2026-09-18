@@ -29,7 +29,7 @@ class JudgeScoreObservation(ContractModel):
     judgment: ArtifactInput
     source_rollout: ArtifactInput
     dimension_id: ArtifactId
-    raw_score: int = Field(ge=0)
+    raw_score: int
 
 
 class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):

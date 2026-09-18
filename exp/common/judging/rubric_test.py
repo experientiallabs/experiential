@@ -104,21 +104,39 @@ def test_rubric_rejects_empty_axes_duplicate_ids_and_invalid_ranges() -> None:
         )
 
 
-def test_rubric_rejects_axes_that_do_not_share_one_range() -> None:
-    """A shared schema cannot describe mixed inclusive ranges in one rubric."""
-    with pytest.raises(ValidationError, match="same inclusive score range"):
-        Rubric(
-            schema_version=1,
-            created_at=datetime(2026, 8, 11, tzinfo=UTC),
-            inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
-            code_revision="e7aad17",
-            rubric_id="support-rubric-v1",
-            dimensions=(
-                _axis(min_score=0, max_score=1),
-                _axis("quality", min_score=0, max_score=4),
+def test_rubric_preserves_independent_axis_ranges() -> None:
+    """Provider schemas use an envelope; judgments validate each axis's exact range."""
+    rubric = Rubric(
+        schema_version=1,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
+        code_revision="e7aad17",
+        rubric_id="support-rubric-v1",
+        dimensions=(
+            _axis(min_score=0, max_score=1),
+            _axis("quality", min_score=-2, max_score=4),
+        ),
+        source_task_set_id="task-set-v1",
+        status="provisional",
+    )
+    assert score_bounds(rubric.dimensions) == (-2, 4)
+    assert not rubric.dimensions[0].contains_score(2)
+    assert rubric.dimensions[1].contains_score(-1)
+
+
+def test_axis_rejects_unbounded_score_allocation() -> None:
+    """Large ranges fail before allocating a tuple or calibration score map."""
+    with pytest.raises(ValidationError, match="at most 101"):
+        RubricDimension(
+            dimension_id="quality",
+            name="Quality",
+            description="Outcome quality.",
+            min_score=-(10**9),
+            max_score=10**9,
+            anchors=(
+                ScoreAnchor(score=-(10**9), description="Low."),
+                ScoreAnchor(score=10**9, description="High."),
             ),
-            source_task_set_id="task-set-v1",
-            status="provisional",
         )
 
 

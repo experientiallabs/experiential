@@ -18,7 +18,7 @@ class CalibrationDatum(ContractModel):
     """One active human score joined to one verified raw judge observation."""
 
     human_score: HumanScore
-    raw_score: int = Field(ge=0)
+    raw_score: int
 
 
 class OutOfFoldPrediction(ContractModel):
@@ -29,9 +29,9 @@ class OutOfFoldPrediction(ContractModel):
     lineage_id: ArtifactId
     dimension_id: ArtifactId
     fold_index: int = Field(ge=0)
-    raw_score: int = Field(ge=0)
-    human_score: int = Field(ge=0)
-    calibrated_score: float = Field(ge=0)
+    raw_score: int
+    human_score: int
+    calibrated_score: float
     absolute_error: float = Field(ge=0)
     optimistic_error: float = Field(ge=0)
 
