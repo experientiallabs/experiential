@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import time
@@ -25,19 +24,13 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations import (
     EvaluationPlan,
-    EvaluationProtocol,
-    ObservedProductionCell,
     build_evaluation_plan,
-)
-from exp.common.evaluations.evidence import (
-    read_rollout,
 )
 from exp.common.judging import Judge, verify_persisted_calibration
 from exp.common.models import (
     ModelCatalog,
     ProviderConnection,
     ProviderModelSelection,
-    RoutedCandidateSnapshot,
     RouterCandidateSelection,
 )
 from exp.common.observability.telemetry import capture_completion_once
@@ -46,11 +39,10 @@ from exp.common.project import (
     ProjectStore,
     artifact_input,
 )
-from exp.common.rollouts import (
-    SimulationArtifactSet,
-)
 from exp.common.routing import KnnGuard, KnnRouterPolicy
 from exp.common.routing.bank import KnnBankManifest
+from exp.optimize.evaluation.contracts import EvaluationSetup
+from exp.optimize.evaluation.simulation import SimulatorFactory, run_or_load_simulation
 from exp.optimize.router.activation import load_project_router
 from exp.optimize.router.errors import RouterCompositionError
 from exp.optimize.router.evaluation.build import (
@@ -74,13 +66,8 @@ from exp.optimize.router.judgment_budget import complete_cell_evidence
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.router import RouterRuntime
 from exp.simulation.build import ProjectBuild
-from exp.simulation.engines.text.resume import (
-    MAXIMUM_CELL_ATTEMPTS,
-    reexecutable_dispatch_failure,
-)
 from exp.simulation.ingest.otlp import TraceNormalizationResult
-from exp.simulation.orchestration import Simulator
-from exp.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
+from exp.simulation.specs import SimulationSpec
 
 logger = logging.getLogger(__name__)
 
@@ -162,25 +149,12 @@ RouterReviewProvenance = Annotated[
 ]
 
 
-class RouterEvaluationSetup(ContractModel):
+class RouterEvaluationSetup(EvaluationSetup):
     """Reviewed completed inputs and bounded simulation controls for router evaluation."""
 
-    candidates: tuple[RoutedCandidateSnapshot, ...]
-    observed_cells: tuple[ObservedProductionCell, ...]
-    production_protocol: EvaluationProtocol
-    simulation_protocol: EvaluationProtocol
     embedding_set_id: ArtifactId
-    fit_rag_input: ArtifactInput
-    pricing_snapshot_id: ArtifactId
     guard: KnnGuard
     incumbent_alias: ArtifactId | None = None
-    judgment_status: Literal["provisional", "human_calibrated"]
-    world_model_settings: WorldModelSettings
-    simulation_completion_input: ArtifactInput | None = None
-    agent_id: str = Field(min_length=1, max_length=256)
-    seed: int
-    maximum_steps: int = Field(gt=0)
-    maximum_concurrency: int = Field(gt=0)
 
 
 class ReviewSupplier(Protocol):
@@ -206,13 +180,6 @@ class EvaluationSetupSupplier(Protocol):
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Return explicit immutable planning inputs and finite simulation controls."""
-
-
-class SimulatorFactory(Protocol):
-    """Binds an injected simulator only after EXP has frozen its evaluation plan."""
-
-    def __call__(self, project: ProjectStore, plan: EvaluationPlan) -> Simulator:
-        """Return a simulator bound to the exact persisted plan."""
 
 
 class RouterPolicyLock(ArtifactEnvelope):
@@ -346,7 +313,7 @@ def compose_router(
         phase="fit",
         stop_on_overspend=budget.stop_on_overspend,
     )
-    fit_set = _run_or_load_simulation(
+    fit_set = run_or_load_simulation(
         project,
         plan,
         spec,
@@ -430,7 +397,7 @@ def compose_router(
         phase="heldout",
         stop_on_overspend=budget.stop_on_overspend,
     )
-    held_set = _run_or_load_simulation(
+    held_set = run_or_load_simulation(
         project,
         plan,
         held_spec,
@@ -510,127 +477,6 @@ def compose_router(
         total_simulation_spend_usd=total_spend,
         optimization=optimized,
         runtime=runtime,
-    )
-
-
-def _run_or_load_simulation(
-    project: ProjectStore,
-    plan: EvaluationPlan,
-    spec: SimulationSpec,
-    simulator_factory: SimulatorFactory,
-    *,
-    progress: ProgressHook | None = None,
-    progress_detail: str | None = None,
-) -> SimulationArtifactSet:
-    """Load an exactly completed simulation set or run the simulator to a final one.
-
-    A completed prior run replays without invoking its simulator, so no new provider calls
-    are dispatched. When the simulator must run, a produced set that still contains a
-    retryable dispatch failure below the attempt cap is superseded evidence, not a final
-    result: the simulator is re-invoked so resume re-executes only those cells as fresh
-    attempts under whatever ceiling remains. The loop is bounded by
-    ``MAXIMUM_CELL_ATTEMPTS``; a cell that exhausts its generations keeps its terminal
-    failure rollout and the set becomes final.
-
-    Args:
-        project: Project store holding completed simulation artifacts.
-        plan: Frozen evaluation plan bound to the injected simulator.
-        spec: Phase-scoped simulation specification to load or run.
-        simulator_factory: Injected constructor invoked only when no final set exists.
-        progress: Optional observer of exact replayed evaluation-cell counts.
-        progress_detail: Phase qualifier attached to replayed evaluation-cell counts.
-
-    Returns:
-        Immutable index of one final rollout artifact for every selected cell.
-
-    Raises:
-        RouterCompositionError: A stored artifact set is ambiguous, drifted, or mismatched,
-            or retries did not converge within the attempt cap.
-    """
-    matches = []
-    for artifact_id in project.artifacts.list_ids():
-        stored = project.artifacts.read(artifact_id)
-        if stored.manifest.artifact_type != "simulation-artifact-set":
-            continue
-        artifact_set = SimulationArtifactSet.model_validate_json(
-            project.artifacts.read_bytes(artifact_id, "artifact-set.json")
-        )
-        if artifact_set.simulation_id != spec.simulation_id:
-            continue
-        index_payload = project.artifacts.read_bytes(artifact_id, artifact_set.artifacts_path)
-        if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
-            raise RouterCompositionError("simulation artifact-set index digest has drifted")
-        rollouts = tuple(
-            read_rollout(project.artifacts, rollout_id)[0]
-            for rollout_id in artifact_set.artifact_ids
-        )
-        expected_digest = simulation_spec_digest(spec)
-        rollout_cell_ids = tuple(rollout.cell_id for rollout in rollouts)
-        if (
-            artifact_set.artifact_set_id != artifact_id
-            or any(cell_id is None for cell_id in rollout_cell_ids)
-            or tuple(sorted(cell_id for cell_id in rollout_cell_ids if cell_id is not None))
-            != spec.cell_ids
-            or any(
-                rollout.source_run_id != spec.simulation_id
-                or rollout.simulation_id != spec.simulation_id
-                or rollout.simulation_spec_sha256 != expected_digest
-                for rollout in rollouts
-            )
-        ):
-            raise RouterCompositionError(
-                "completed simulation artifact set differs from phase spec"
-            )
-        if any(reexecutable_dispatch_failure(rollout) for rollout in rollouts):
-            continue
-        matches.append(artifact_set)
-    if len(matches) > 1:
-        raise RouterCompositionError("multiple completed artifact sets name one simulation phase")
-    if matches:
-        cell_count = len(matches[0].artifact_ids)
-        report(
-            progress,
-            "evaluation cells",
-            completed=cell_count,
-            total=cell_count,
-            detail=progress_detail,
-        )
-        return matches[0]
-    artifact_set = simulator_factory(project, plan).run(spec)
-    for _ in range(MAXIMUM_CELL_ATTEMPTS - 1):
-        superseded = _reexecutable_cell_count(project, artifact_set)
-        if superseded == 0:
-            return artifact_set
-        logger.warning(
-            "%d simulated cell(s) failed with a retryable dispatch failure; "
-            "re-executing only those cells as fresh attempts",
-            superseded,
-        )
-        artifact_set = simulator_factory(project, plan).run(spec)
-    if _reexecutable_cell_count(project, artifact_set) > 0:
-        raise RouterCompositionError(
-            "simulation retries did not converge to final evidence within the attempt cap"
-        )
-    return artifact_set
-
-
-def _reexecutable_cell_count(
-    project: ProjectStore,
-    artifact_set: SimulationArtifactSet,
-) -> int:
-    """Count rollouts in one set that resume would supersede with another attempt.
-
-    Args:
-        project: Project store holding the set's immutable rollout artifacts.
-        artifact_set: Simulation artifact set produced for one phase.
-
-    Returns:
-        Number of retryable dispatch failures still below the attempt cap.
-    """
-    return sum(
-        1
-        for rollout_id in artifact_set.artifact_ids
-        if reexecutable_dispatch_failure(read_rollout(project.artifacts, rollout_id)[0])
     )
 
 

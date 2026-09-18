@@ -80,6 +80,11 @@ class ReservedJudgeClient:
         self._counter = Utf8UpperBoundTokenCounter()
 
     @property
+    def model(self) -> ModelSnapshot:
+        """Return the provider identity verified against the frozen reservation at construction."""
+        return self._reservation.model
+
+    @property
     def calls(self) -> int:
         """Return provider requests made through this reservation boundary."""
         return self._calls
@@ -168,6 +173,19 @@ class AutomaticRouterJudge:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+
+    @property
+    def model(self) -> ModelSnapshot:
+        """Expose the actual reserved provider identity for pre-dispatch evaluation checks.
+
+        Raises:
+            ManualJudgeError: The client is unbound or differs from the persisted judge setup.
+        """
+        if not isinstance(self._client, ReservedJudgeClient):
+            raise ManualJudgeError("evaluation requires a reservation-bound judge client")
+        if self._client.model != self._setup.judge_model:
+            raise ManualJudgeError("reserved judge model differs from the finalized judge setup")
+        return self._client.model
 
     @property
     def provider_economics(self) -> tuple[OperationEconomics, ...]:

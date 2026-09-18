@@ -1,5 +1,59 @@
 # CLI usage
 
+## Standalone model evaluation in Python
+
+For a completed grounded project, `exp.prepare_model_evaluation` freezes a worker matrix and
+prices its simulation, retrieval and judge requests without calling providers. The default judge
+is binary task success with explicitly provisional provenance. Pass both `judge_setup` and
+`calibration_id` to use a saved authored or calibrated judge instead. No router is fitted or
+activated.
+
+```python
+from datetime import UTC, datetime
+
+from exp import (
+    EvaluationBudget,
+    ModelEvaluationOptions,
+    prepare_model_evaluation,
+    run_prepared_model_evaluation,
+)
+
+# project is a completed ProjectStore; catalog is its secret-free ModelCatalog.
+prepared = prepare_model_evaluation(
+    project,
+    catalog,
+    ("worker-a", "worker-b"),
+    embedder_alias="embedder",
+    options=ModelEvaluationOptions(maximum_steps=8),
+    created_at=datetime.now(UTC),
+    code_revision=engine_revision,
+)
+
+# Display prepared.cost. A host reserves sufficient credits atomically and obtains
+# consent before constructing its credential-backed runtime_catalog and executing.
+result = run_prepared_model_evaluation(
+    project,
+    prepared,
+    runtime_catalog,
+    budget=EvaluationBudget(
+        maximum_cost_usd=prepared.cost.maximum_cost_usd,
+        maximum_judgments=prepared.cost.judgment_count,
+    ),
+    provider_spend_consented=consent_after_credit_reservation,
+    created_at=run_started_at,
+    code_revision=engine_revision,
+)
+```
+
+`result.report` contains the common-cohort model metrics, explicit exclusions and cost-quality
+frontier. The chart's cost is worker operating cost, not the cost of generating the report.
+`result.cost_usd` reconciles simulation and judging charges. Exact replay dispatches no new model
+calls. The quote and result exclude earlier trace mining and grounding costs; a host must include
+those separately before offering a complete trace-to-report price. Credit conversion, promotions,
+identity authorization and job persistence remain hosting responsibilities.
+
+## Commands
+
 The root surface is deliberately small:
 
 | Command | Purpose | Local result |
