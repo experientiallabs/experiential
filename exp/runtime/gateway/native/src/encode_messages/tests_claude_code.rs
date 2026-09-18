@@ -51,6 +51,7 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
         output_tokens: Some(25),
         cached_input_tokens: Some(2000),
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     }));
     let frames = encoder.start().expect("starts");
@@ -183,6 +184,7 @@ fn upstream_start_usage_outranks_the_pre_dispatch_estimate() {
         output_tokens: Some(1),
         cached_input_tokens: Some(10),
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     }));
     let frames = encoder.start().expect("starts");

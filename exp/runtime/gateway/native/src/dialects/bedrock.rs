@@ -126,6 +126,7 @@ impl Normalizer {
         self.tools
             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
         Ok(vec![Event::ToolCallStarted {
+            custom: false,
             index,
             call_id,
             name,

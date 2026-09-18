@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 MAX_HAND_AUTHORED_LINES = 999
@@ -159,9 +162,6 @@ def test_native_crate_versions_stay_in_lockstep() -> None:
     can pair new python code with a stale compiled engine (or fail to publish
     at all, since PyPI rejects re-uploads of an existing version's files).
     """
-    import re
-    import tomllib
-
     crate_dir = REPO_ROOT / "exp" / "runtime" / "gateway" / "native"
     cargo_version = re.search(
         r'^version = "([^"]+)"',
@@ -171,13 +171,76 @@ def test_native_crate_versions_stay_in_lockstep() -> None:
     assert cargo_version is not None
     with (crate_dir / "pyproject.toml").open("rb") as handle:
         wheel_version = tomllib.load(handle)["project"]["version"]
-    assert cargo_version.group(1) == wheel_version
-
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         dependencies = tomllib.load(handle)["project"]["dependencies"]
     floor = next(
         requirement for requirement in dependencies if requirement.startswith("exp-gateway-native")
     )
-    major, minor, _patch = wheel_version.split(".")
-    ceiling = f"{major}.{int(minor) + 1}"
-    assert floor == f"exp-gateway-native>={wheel_version},<{ceiling}"
+    _assert_native_version_contract(cargo_version.group(1), wheel_version, floor)
+
+
+def _assert_native_version_contract(
+    cargo_version: str, wheel_version: str, requirement: str
+) -> None:
+    """Require equivalent package versions and the release's intended native pin.
+
+    Args:
+        cargo_version: SemVer version declared by the compiled crate.
+        wheel_version: PEP 440 version declared by the Python distribution.
+        requirement: Flagship dependency requirement for the native distribution.
+
+    Raises:
+        AssertionError: Manifest versions or the native dependency pin disagree.
+    """
+    version = Version(wheel_version)
+    assert Version(cargo_version) == version, "native manifest versions differ"
+    if version.is_prerelease:
+        expected = f"exp-gateway-native=={version}"
+    else:
+        ceiling = f"{version.major}.{version.minor + 1}"
+        expected = f"exp-gateway-native>={version},<{ceiling}"
+    assert requirement == expected, "native dependency does not match the release version"
+
+
+@pytest.mark.parametrize(
+    ("cargo_version", "wheel_version", "requirement"),
+    (
+        ("0.3.82", "0.3.82", "exp-gateway-native>=0.3.82,<0.4"),
+        ("0.3.82-rc.1", "0.3.82rc1", "exp-gateway-native==0.3.82rc1"),
+    ),
+)
+def test_native_version_contract_accepts_stable_and_pinned_prerelease(
+    cargo_version: str, wheel_version: str, requirement: str
+) -> None:
+    """Stable floors and equivalent pinned prerelease versions satisfy the guard.
+
+    Args:
+        cargo_version: Crate version under test.
+        wheel_version: Distribution version under test.
+        requirement: Native dependency requirement under test.
+    """
+    _assert_native_version_contract(cargo_version, wheel_version, requirement)
+
+
+@pytest.mark.parametrize(
+    ("cargo_version", "wheel_version", "requirement"),
+    (
+        ("0.3.81", "0.3.82", "exp-gateway-native>=0.3.82,<0.4"),
+        ("0.3.82", "0.3.82", "exp-gateway-native>=0.3.81,<0.4"),
+        ("0.3.82-rc.1", "0.3.82rc2", "exp-gateway-native==0.3.82rc2"),
+        ("0.3.82-rc.1", "0.3.82rc1", "exp-gateway-native>=0.3.82rc1,<0.4"),
+        ("0.3.82-rc.1", "0.3.82rc1", "exp-gateway-native==0.3.82"),
+    ),
+)
+def test_native_version_contract_rejects_drift_and_unpinned_prerelease(
+    cargo_version: str, wheel_version: str, requirement: str
+) -> None:
+    """Manifest drift and a prerelease's floating native dependency fail closed.
+
+    Args:
+        cargo_version: Crate version under test.
+        wheel_version: Distribution version under test.
+        requirement: Native dependency requirement under test.
+    """
+    with pytest.raises(AssertionError):
+        _assert_native_version_contract(cargo_version, wheel_version, requirement)

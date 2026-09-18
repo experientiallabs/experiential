@@ -103,6 +103,7 @@ fn settle_argument(
             "output_tokens": usage.output_tokens,
             "cached_input_tokens": usage.cached_input_tokens,
             "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
         })),
         "tool_names": tool_names,
@@ -592,12 +593,20 @@ mod tests {
     }
 
     #[test]
-    fn settle_argument_carries_the_upstream_provider_only_when_the_stream_named_one() {
+    fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
+        let usage = Usage {
+            input_tokens: Some(1_000),
+            output_tokens: Some(10),
+            cached_input_tokens: Some(100),
+            cache_creation_input_tokens: Some(600),
+            cache_creation_1h_input_tokens: Some(200),
+            reasoning_tokens: None,
+        };
         let named = settle_argument(
             "req",
             "att",
             "completed",
-            None,
+            Some(&usage),
             &[],
             None,
             true,
@@ -612,6 +621,9 @@ mod tests {
             parsed["upstream_provider"],
             Value::String("Azure".to_string())
         );
+        assert_eq!(parsed["usage"]["input_tokens"], 1_000);
+        assert_eq!(parsed["usage"]["cache_creation_input_tokens"], 600);
+        assert_eq!(parsed["usage"]["cache_creation_1h_input_tokens"], 200);
         let unnamed = settle_argument(
             "req",
             "att",

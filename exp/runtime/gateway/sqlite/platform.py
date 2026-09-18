@@ -14,7 +14,7 @@ from exp.runtime.gateway.budgets import (
     BudgetScopeKind,
     SQLiteBudgetStore,
 )
-from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage, ProjectTarget
+from exp.runtime.gateway.contracts import GatewayFailureClass, ProjectTarget
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import require_gateway_servable_provider
 from exp.runtime.gateway.platform import (
@@ -85,6 +85,9 @@ from exp.runtime.gateway.sqlite.platform_records import (
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     reservation_record as _reservation_record,
+)
+from exp.runtime.gateway.sqlite.platform_records import (
+    usage_record as _usage_record,
 )
 from exp.runtime.gateway.sqlite.provider_commands import sqlite_connection_config
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
@@ -575,7 +578,17 @@ class SQLiteGatewayPlatform:
         self,
         request: AttemptSettlementRequest,
     ) -> AttemptSettlementRecord:
-        """Settle only an attempt proven to belong to the requested tenant."""
+        """Settle a tenant's attempt and verify exact replay against durable evidence.
+
+        Args:
+            request: Tenant-scoped terminal outcome and provider usage.
+
+        Returns:
+            The persisted outcome with all frozen rates and observed token subsets.
+
+        Raises:
+            ValueError: Tenant ownership or replay evidence differs from the row.
+        """
         self._reservation(
             organization_id=request.organization_id,
             attempt_id=request.attempt_id,
@@ -595,20 +608,7 @@ class SQLiteGatewayPlatform:
             raise ValueError(
                 "attempt settlement replay cannot finalize its non-terminal parent request"
             )
-        usage = (
-            None
-            if row["input_tokens"] is None or row["output_tokens"] is None
-            else GatewayUsage(
-                input_tokens=int(row["input_tokens"]),
-                cached_input_tokens=(
-                    None if row["cached_input_tokens"] is None else int(row["cached_input_tokens"])
-                ),
-                output_tokens=int(row["output_tokens"]),
-                reasoning_tokens=(
-                    None if row["reasoning_tokens"] is None else int(row["reasoning_tokens"])
-                ),
-            )
-        )
+        usage = _usage_record(row)
         settlement = AttemptSettlementRecord(
             reservation=_reservation_record(row, organization_id=request.organization_id),
             state=AttemptTerminalState(str(row["state"])),

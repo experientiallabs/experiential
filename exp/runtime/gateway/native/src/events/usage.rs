@@ -145,6 +145,7 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
         output_tokens: Some(output_tokens),
         cached_input_tokens,
         cache_creation_input_tokens,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens,
     }))
 }
@@ -180,6 +181,7 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
         output_tokens: Some(output_tokens),
         cached_input_tokens,
         cache_creation_input_tokens,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens,
     })
 }
@@ -248,6 +250,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
             "Gemini cachedContentTokenCount",
         )?),
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens,
     })
 }
@@ -288,6 +291,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "cacheWriteInputTokens",
             "Bedrock usage",
         )?,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     })
 }

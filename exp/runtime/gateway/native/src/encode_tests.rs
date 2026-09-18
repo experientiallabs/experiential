@@ -9,6 +9,7 @@ fn fireworks_tool_events() -> Vec<Event> {
             delta: "hidden provider reasoning".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -97,6 +98,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
             delta: "hidden".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 1,
@@ -104,6 +106,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
             name: "first".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,

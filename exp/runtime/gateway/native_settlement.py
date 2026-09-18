@@ -410,12 +410,19 @@ def _usage_from_payload(
     *,
     web_search_requests: int = 0,
 ) -> GatewayUsage | None:
-    """Build normalized usage from settlement scalars, tool names, and the search count.
+    """Build normalized usage without inventing absent token or TTL evidence.
 
-    ``web_search_requests`` rides on whichever usage shape the payload yields.
-    With neither token totals nor tool names there is no usage to carry it on
-    (the contract's validator keeps a bare count from being usage), so such a
-    count is dropped here and the attempt settles without one.
+    Args:
+        payload: Native settlement usage object, or None.
+        tool_names: Observed tool names in invocation order.
+        web_search_requests: Gateway-executed searches billed to this attempt; rides on
+            whichever usage shape the payload yields (a bare count is not usage and is dropped).
+
+    Returns:
+        Typed token or tool-only usage, or None when neither was observed.
+
+    Raises:
+        ValueError: The observed token totals or subsets are contradictory.
     """
     names = tuple(str(name) for name in tool_names)
     if payload is None or payload.get("input_tokens") is None:
@@ -427,6 +434,9 @@ def _usage_from_payload(
         output_tokens=_optional_count(payload.get("output_tokens")),
         cached_input_tokens=_optional_count(payload.get("cached_input_tokens")),
         cache_creation_input_tokens=_optional_count(payload.get("cache_creation_input_tokens")),
+        cache_creation_1h_input_tokens=_optional_count(
+            payload.get("cache_creation_1h_input_tokens")
+        ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         tool_names=names,
         web_search_requests=web_search_requests,

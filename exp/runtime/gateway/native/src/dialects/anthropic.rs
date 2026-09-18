@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 
+mod cache_write;
+
 use super::{
     finish_open_tools, finish_open_tools_truncated, malformed, optional_text, parse_object,
     refusal_failure, Normalizer,
@@ -57,6 +59,7 @@ impl Normalizer {
                     "Anthropic cache_creation_input_tokens",
                 )
                 .map_err(|message| malformed(&message))?;
+                self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
                 self.output_tokens =
                     count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
                         .map_err(|message| malformed(&message))?;
@@ -76,6 +79,9 @@ impl Normalizer {
                     output_tokens: Some(self.output_tokens),
                     cached_input_tokens: Some(self.cache_read),
                     cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    cache_creation_1h_input_tokens: self
+                        .cache_write_1h
+                        .filter(|_| self.cache_write > 0),
                     reasoning_tokens: None,
                 }));
             }
@@ -99,6 +105,7 @@ impl Normalizer {
                         self.tools
                             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
                         events.push(Event::ToolCallStarted {
+                            custom: false,
                             index,
                             call_id,
                             name,
@@ -291,6 +298,11 @@ impl Normalizer {
                         *slot = value;
                     }
                 }
+                if usage.contains_key("cache_creation_input_tokens")
+                    || usage.contains_key("cache_creation")
+                {
+                    self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
+                }
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;
                     events.push(Event::RefusalDelta(String::new()));
@@ -316,6 +328,9 @@ impl Normalizer {
                     // Present only when nonzero so cache-less streams keep
                     // their exact pre-field usage shape.
                     cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    cache_creation_1h_input_tokens: self
+                        .cache_write_1h
+                        .filter(|_| self.cache_write > 0),
                     // Anthropic reports thinking inside output_tokens and
                     // publishes no separate count, so the reasoning subset
                     // stays unknown instead of being invented.

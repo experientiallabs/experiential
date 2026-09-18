@@ -1,4 +1,4 @@
-"""Hosted write pricing must match the requested cache duration."""
+"""Provider payloads preserve cache durations for gateway price reservation."""
 
 import pytest
 
@@ -8,11 +8,9 @@ from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import (
     multimodal_text_cache_blocks,
-    require_priceable_cache_duration,
     retain_multimodal_cache_boundaries,
 )
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
-from exp.runtime.models.providers.errors import ProviderParameterError
 
 
 def test_empty_markers_preserve_complete_boundary_without_mutating_input() -> None:
@@ -55,8 +53,8 @@ def test_colocated_marker_comparison_uses_documented_default_ttl(reverse: bool) 
 
 
 @pytest.mark.parametrize("customer_managed", [True, False])
-def test_one_hour_cache_requires_direct_provider_billing(customer_managed: bool) -> None:
-    """One-hour writes cannot silently use a hosted five-minute rate."""
+def test_one_hour_cache_reaches_provider_for_both_billing_modes(customer_managed: bool) -> None:
+    """Gateway reservation prices the TTL; serialization preserves it."""
     request = decode_messages(
         {
             "model": "coding",
@@ -70,19 +68,16 @@ def test_one_hour_cache_requires_direct_provider_billing(customer_managed: bool)
         url="https://example.invalid",
         billing_customer_managed=customer_managed,
     )
-    if customer_managed:
-        require_priceable_cache_duration(profile, request)
-    else:
-        with pytest.raises(ProviderParameterError, match="5-minute"):
-            require_priceable_cache_duration(profile, request)
+    payload = dialect_stream_payload(profile, request)
+    assert payload["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 @pytest.mark.parametrize("customer_managed", [True, False])
 @pytest.mark.parametrize("ttl", ["5m", "1h"])
-def test_server_tool_cache_duration_is_checked_before_dispatch(
+def test_server_tool_cache_duration_is_preserved_for_settlement(
     customer_managed: bool, ttl: str
 ) -> None:
-    """Verbatim server-tool declarations cannot bypass hosted write pricing."""
+    """Server-tool TTL survives serialization for both billing modes."""
     marker = {"type": "ephemeral", "ttl": ttl}
     request = decode_messages(
         {
@@ -103,15 +98,11 @@ def test_server_tool_cache_duration_is_checked_before_dispatch(
         url="https://example.invalid",
         billing_customer_managed=customer_managed,
     )
-    if ttl == "1h" and not customer_managed:
-        with pytest.raises(ProviderParameterError, match="5-minute"):
-            dialect_stream_payload(profile, request)
-    else:
-        payload = dialect_stream_payload(profile, request)
-        assert payload["tools"] == [
-            {
-                "type": "web_search_20250305",
-                "name": "web_search",
-                "cache_control": marker,
-            }
-        ]
+    payload = dialect_stream_payload(profile, request)
+    assert payload["tools"] == [
+        {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "cache_control": marker,
+        }
+    ]

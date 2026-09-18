@@ -15,6 +15,7 @@ from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import (
     MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
     GatewayDeploymentMetadata,
+    GatewayLongContextTier,
     GatewayTokenPrices,
 )
 from exp.common.models.gateway_catalog import (
@@ -1120,7 +1121,6 @@ def test_reservation_prices_the_long_context_tier_conservatively() -> None:
     reservation, below it base rates reserve, and a reachable tier missing a
     required rate unprices the route entirely.
     """
-    from exp.common.models.catalog import GatewayLongContextTier
 
     def tiered(tier: GatewayLongContextTier | None) -> ExactModelDeployment:
         base = _deployment()
@@ -1273,3 +1273,142 @@ def test_worst_case_attempt_tokens_matches_over_the_serving_request_union() -> N
     img_in, img_out = worst_case_attempt_tokens(images, deployment)
     assert img_in == worst_case_input_tokens(images) and img_in > 0
     assert img_out == 0
+
+
+def test_cache_write_surcharge_raises_reservation_ceiling() -> None:
+    """A cache-write surcharge raises the conservative reservation ceiling."""
+    base = _deployment()
+    surcharged = base.model_copy(
+        update={
+            "gateway": base.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=5_000_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                    ),
+                    "capabilities": base.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    ),
+                }
+            )
+        }
+    )
+    request = _request("cache-write-ceiling")
+    surcharged_cost = maximum_attempt_cost_nano_usd(request, surcharged)
+    base_cost = maximum_attempt_cost_nano_usd(request, base)
+    assert surcharged_cost is not None
+    assert base_cost is not None
+    assert surcharged_cost > base_cost
+
+
+def test_cache_write_capability_requires_its_rate() -> None:
+    """A deployment reporting cache creation without a rate fails closed."""
+    missing = _deployment().model_copy(
+        update={
+            "gateway": _deployment()
+            .gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                    )
+                }
+            )
+            .model_copy(
+                update={
+                    "capabilities": _deployment().gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    )
+                }
+            )
+        }
+    )
+    assert maximum_attempt_cost_nano_usd(_request("needs-cache-write-rate"), missing) is None
+
+
+@pytest.mark.parametrize(
+    "ttl, hour_rate, reports, expected_rate",
+    [
+        ("5m", None, True, 3_750_000_000),
+        ("1h", None, True, None),
+        ("1h", 6_000_000_000, True, 6_000_000_000),
+        ("1h", 6_000_000_000, False, 3_000_000_000),
+    ],
+)
+def test_cache_write_reservation_requires_only_applicable_ttl_rates(
+    ttl: str, hour_rate: int | None, reports: bool, expected_rate: int | None
+) -> None:
+    """One-hour requests reserve the higher observed-capability rate or fail unpriced."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        maximum_output_tokens=16,
+        provider_cache_control={"type": "ephemeral", "ttl": ttl},
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={
+                    "capabilities": deployment.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": reports}
+                    ),
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000_000,
+                        output_nano_usd_per_million_tokens=15_000_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_750_000_000,
+                        cache_creation_1h_input_nano_usd_per_million_tokens=hour_rate,
+                    ),
+                }
+            )
+        }
+    )
+    cost = maximum_attempt_cost_nano_usd(request, deployment)
+    assert cost == (
+        None
+        if expected_rate is None
+        else (worst_case_input_tokens(request) * expected_rate + 16 * 15_000_000_000 + 999_999)
+        // 1_000_000
+    )
+
+
+def test_long_context_cache_write_surcharge_governs_above_threshold() -> None:
+    """Above threshold the worst-case rate includes the tier cache-write surcharge."""
+    tier = GatewayLongContextTier(
+        input_threshold_tokens=10,
+        input_nano_usd_per_million_tokens=1_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=9_000_000,
+        output_nano_usd_per_million_tokens=2_000_000,
+    )
+    base = _deployment().model_copy(
+        update={
+            "gateway": _deployment()
+            .gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=1_500_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                        long_context=tier,
+                    )
+                }
+            )
+            .model_copy(
+                update={
+                    "capabilities": _deployment().gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    )
+                }
+            )
+        }
+    )
+    # Short input stays below threshold: base surcharge governs.
+    short = _request("x")
+    # Long input crosses the threshold: tier surcharge governs the worst case.
+    long = _request("x" * 2_048)
+    short_cost = maximum_attempt_cost_nano_usd(short, base)
+    long_cost = maximum_attempt_cost_nano_usd(long, base)
+    assert short_cost is not None
+    assert long_cost is not None
+    assert long_cost > short_cost

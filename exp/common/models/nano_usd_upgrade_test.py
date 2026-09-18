@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 
 from exp.common.models import (
-    SNAPSHOT_SCHEMA_VERSION,
     CatalogSnapshotUnitError,
     ConnectionConfig,
     ModelCatalog,
@@ -26,6 +25,7 @@ from exp.common.models.catalog import (
     ModelRecord,
 )
 from exp.common.models.gateway_catalog import (
+    FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
@@ -116,11 +116,15 @@ def _micro_authored_document(schema_version: int = 2) -> dict[str, Any]:
 
 
 def test_constants_pin_the_one_upgradable_schema_of_each_document() -> None:
+    """The historical micro-USD schema upgrades only its four original rates."""
     assert NANO_USD_PER_MICRO_USD == 1_000
-    assert LAST_MICRO_USD_SNAPSHOT_SCHEMA_VERSION == 3 == SNAPSHOT_SCHEMA_VERSION - 1
+    assert LAST_MICRO_USD_SNAPSHOT_SCHEMA_VERSION == 3 == FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION - 1
     assert LAST_MICRO_USD_MODEL_CATALOG_SCHEMA_VERSION == 2 == MODEL_CATALOG_SCHEMA_VERSION - 1
     assert set(MICRO_TO_NANO_PRICE_KEYS.values()) == {
-        name for name in GatewayTokenPrices.model_fields if name.endswith("_per_million_tokens")
+        "input_nano_usd_per_million_tokens",
+        "cached_input_nano_usd_per_million_tokens",
+        "output_nano_usd_per_million_tokens",
+        "reasoning_nano_usd_per_million_tokens",
     }
 
 

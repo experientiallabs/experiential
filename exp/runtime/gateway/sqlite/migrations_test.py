@@ -1091,7 +1091,7 @@ def test_v14_migration_widens_api_surface_to_embeddings_and_preserves_rows(
 
 @pytest.mark.parametrize(
     ("source_version", "prior_surface", "added_surface"),
-    [(14, "embeddings", "images"), (20, "images", "decisions")],
+    [(14, "embeddings", "images"), (20, "images", "decisions"), (21, "decisions", "messages")],
 )
 def test_surface_migration_preserves_requests_attempts_and_constraints(
     tmp_path: Path,
@@ -1144,6 +1144,11 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
         for statement in seed_statements.split(";"):
             if statement.strip():
                 connection.execute(statement)
+        if source_version >= 20:
+            connection.execute(
+                "UPDATE gateway_attempts SET input_rate = 3750000000, "
+                "cached_input_rate = 300000000, preferred_input_rate = 4000000000"
+            )
         connection.execute("COMMIT")
         before_request = tuple(connection.execute("SELECT * FROM gateway_requests").fetchone())
         before_attempt = tuple(connection.execute("SELECT * FROM gateway_attempts").fetchone())
@@ -1153,9 +1158,9 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
     backup = initialize_database(path)
 
     assert backup is not None and backup.exists()
-    if source_version == 20:
+    if source_version >= 20:
         with sqlite3.connect(backup) as original:
-            assert original.execute("PRAGMA user_version").fetchone() == (20,)
+            assert original.execute("PRAGMA user_version").fetchone() == (source_version,)
             assert original.execute("SELECT * FROM gateway_requests").fetchone() == before_request
             assert original.execute("SELECT * FROM gateway_attempts").fetchone() == before_attempt
     migrated = connect_database(path)
@@ -1163,16 +1168,14 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
-        if source_version == 20:
+        if source_version >= 20:
             assert (
                 tuple(migrated.execute("SELECT * FROM gateway_requests").fetchone())
                 == before_request
             )
-            # v22 appends the nullable upstream_provider column; every value
-            # the v20 row carried survives in place.
             assert tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone()) == (
                 *before_attempt,
-                None,
+                *(None for _ in range(9)),
             )
         surviving = migrated.execute(
             "SELECT api_surface FROM gateway_requests WHERE request_id = 'req-1'"

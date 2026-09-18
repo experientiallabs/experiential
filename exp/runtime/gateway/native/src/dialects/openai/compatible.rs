@@ -284,6 +284,7 @@ impl Normalizer {
                                 tool.name = repeated_name;
                                 tool.started = true;
                                 events.push(Event::ToolCallStarted {
+                                    custom: false,
                                     index,
                                     call_id: tool.call_id.clone(),
                                     name: tool.name.clone(),
@@ -322,6 +323,7 @@ impl Normalizer {
                         tool.started = !name.is_empty();
                         if tool.started {
                             events.push(Event::ToolCallStarted {
+                                custom: false,
                                 index,
                                 call_id,
                                 name,

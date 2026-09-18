@@ -26,9 +26,11 @@ ExactModelPoolId = ArtifactId
 GATEWAY_EXCLUDED_PROVIDERS = frozenset({"tinker"})
 """Runtime-resolvable providers whose records never become gateway deployments."""
 
-SNAPSHOT_SCHEMA_VERSION = 4
+SNAPSHOT_SCHEMA_VERSION = 5
 """Normalized-catalog schema version this engine build reads and writes.
 
+Version 5 identifies populated cache-write capability and 5-minute/1-hour
+pricing fields, allowing workers with older pricing contracts to detect skew.
 Version 4 moved every catalog price from integer micro-USD to integer nano-USD
 (``*_nano_usd_per_million_tokens``); see ``FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION``
 for why documents below it are refused rather than served tolerantly.

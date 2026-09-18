@@ -24,7 +24,7 @@
 //! empty on every native-Responses route, so that path is byte-for-byte
 //! unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -66,11 +66,15 @@ pub fn invert_tool_event(event: &mut Event, translation: &NativeToolTranslation)
     }
     match event {
         Event::ToolCallStarted {
-            name, namespace, ..
+            name,
+            namespace,
+            custom,
+            ..
         } => {
-            if let Some((origin_name, origin_namespace, _is_custom)) = translation.get(name) {
+            if let Some((origin_name, origin_namespace, is_custom)) = translation.get(name) {
                 *name = origin_name.clone();
                 *namespace = origin_namespace.clone();
+                *custom = *is_custom;
             }
         }
         Event::ToolCallCompleted { call, .. } => {
@@ -84,6 +88,44 @@ pub fn invert_tool_event(event: &mut Event, translation: &NativeToolTranslation)
             }
         }
         _ => {}
+    }
+}
+
+/// Per-response translation state. Wrapped custom arguments cannot be emitted
+/// before the JSON string is complete, including escape sequences. The normalizer
+/// already retains the full call; hold only its index here, then emit the unwrapped
+/// bytes once before completion. Ordinary tools retain their incremental deltas.
+#[derive(Default)]
+pub struct NativeToolInverter {
+    pub translation: NativeToolTranslation,
+    custom_calls: HashSet<u32>,
+}
+
+impl NativeToolInverter {
+    pub fn filter(&mut self, mut event: Event) -> Vec<Event> {
+        if let Event::ToolCallStarted { index, name, .. } = &event {
+            if self.translation.get(name).is_some_and(|entry| entry.2) {
+                self.custom_calls.insert(*index);
+            }
+        }
+        if let Event::ToolArgumentsDelta { index, .. } = &event {
+            if self.custom_calls.contains(index) {
+                return Vec::new();
+            }
+        }
+        invert_tool_event(&mut event, &self.translation);
+        if let Event::ToolCallCompleted { index, call } = &event {
+            if self.custom_calls.remove(index) {
+                return vec![
+                    Event::ToolArgumentsDelta {
+                        index: *index,
+                        delta: call.raw_arguments.clone(),
+                    },
+                    event,
+                ];
+            }
+        }
+        vec![event]
     }
 }
 
@@ -131,6 +173,7 @@ mod tests {
     fn namespaced_started_regains_its_namespace_and_name() {
         let map = translation();
         let mut event = Event::ToolCallStarted {
+            custom: false,
             index: 0,
             call_id: "call-1".to_string(),
             name: "multi_agent_v1__close_agent".to_string(),

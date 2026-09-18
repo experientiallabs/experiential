@@ -8,9 +8,9 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.runtime.gateway.cache_write import requests_hour_cache
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
-from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import decode_chat
@@ -269,11 +269,16 @@ def test_chat_message_marker_cannot_overwrite_empty_checkpoint(same: bool, media
             decode_chat(body)
     else:
         request = decode_chat(body).request
-        with pytest.raises(ProviderParameterError, match="5-minute"):
-            dialect_stream_payload(
-                GatewayWireProfile(dialect="anthropic_messages", url="https://example.invalid"),
-                request,
-            )
+        assert requests_hour_cache(request)
+        payload = dialect_stream_payload(
+            GatewayWireProfile(dialect="anthropic_messages", url="https://example.invalid"),
+            request,
+        )
+        messages = payload["messages"]
+        assert isinstance(messages, list) and isinstance(messages[0], dict)
+        blocks = messages[0]["content"]
+        assert isinstance(blocks, list) and isinstance(blocks[-1], dict)
+        assert blocks[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 @pytest.mark.parametrize("wire", ["anthropic_messages", "bedrock_converse_stream", "openrouter"])
@@ -339,10 +344,10 @@ def test_leading_empty_text_checkpoint_is_not_widened_to_text(surface: str, ttl:
 @pytest.mark.parametrize("surface", ["chat", "messages"])
 @pytest.mark.parametrize("ttl", ["5m", "1h"])
 @pytest.mark.parametrize("customer_managed", [False, True])
-def test_relocated_multimodal_checkpoint_still_enforces_hosted_ttl(
+def test_relocated_multimodal_checkpoint_retains_reservation_ttl(
     surface: str, ttl: str, customer_managed: bool
 ) -> None:
-    """Moving an empty checkpoint onto its image cannot bypass hosted write pricing."""
+    """Moving a checkpoint onto its image preserves the TTL used for reservation."""
     image: JsonObject = (
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
         if surface == "chat"
@@ -374,16 +379,13 @@ def test_relocated_multimodal_checkpoint_still_enforces_hosted_ttl(
         url="https://example.invalid",
         billing_customer_managed=customer_managed,
     )
-    if ttl == "1h" and not customer_managed:
-        with pytest.raises(ProviderParameterError, match="5-minute"):
-            dialect_stream_payload(profile, request)
-    else:
-        payload = dialect_stream_payload(profile, request)
-        messages = payload["messages"]
-        assert isinstance(messages, list) and isinstance(messages[0], dict)
-        blocks = messages[0]["content"]
-        assert isinstance(blocks, list)
-        assert blocks[-1] == {"cachePoint": {"type": "default", "ttl": ttl}}
+    assert requests_hour_cache(request) == (ttl == "1h")
+    payload = dialect_stream_payload(profile, request)
+    messages = payload["messages"]
+    assert isinstance(messages, list) and isinstance(messages[0], dict)
+    blocks = messages[0]["content"]
+    assert isinstance(blocks, list)
+    assert blocks[-1] == {"cachePoint": {"type": "default", "ttl": ttl}}
 
 
 @pytest.mark.parametrize("leading", [False, True])

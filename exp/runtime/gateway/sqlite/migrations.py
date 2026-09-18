@@ -11,12 +11,13 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from exp.runtime.gateway.sqlite.cache_write_migration import migrate_cache_write
 from exp.runtime.gateway.sqlite.nano_usd_migration import (
     NanoUsdMigrationError,
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 
 class GatewaySchemaError(RuntimeError):
@@ -27,7 +28,6 @@ MigrationStep = str | Callable[[sqlite3.Connection], None]
 """One forward-migration step: a plain SQL statement, or a callable for a step
 that must read before it writes (the v20 money-unit move guards every amount
 before scaling it)."""
-
 
 _MIGRATION_1 = (
     """
@@ -611,10 +611,9 @@ _MIGRATION_12 = (
     """,
 )
 
-# Long-context tier rates freeze on the attempt exactly like the base
-# rates, so settlement prices with the schedule that was live at dispatch.
-# The threshold column selects the schedule once provider-reported input
-# tokens reach it; NULL means the deployment had no tier.
+# Long-context rates freeze on the attempt like base rates. Settlement selects
+# the frozen tier once reported input tokens reach its threshold; NULL means
+# the deployment had no tier.
 _MIGRATION_13 = (
     """
     ALTER TABLE gateway_attempts
@@ -750,6 +749,7 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "DROP TABLE gateway_schema_refresh_v21",
     ),
     22: ("ALTER TABLE gateway_attempts ADD COLUMN upstream_provider TEXT",),  # aggregator label
+    23: (migrate_cache_write,),
 }
 
 

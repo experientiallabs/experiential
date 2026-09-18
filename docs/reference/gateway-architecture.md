@@ -558,8 +558,9 @@ forwards them on its Chat wire. Generic Chat adapters disclose marker omission i
 `x-experiential-ignored-parameters`; a provider label or cached price does not prove support.
 `maximize_cache` prefers marker-preserving adapters but may fall back to another provider or
 an adapter that drops markers; it is not a cache-capability requirement or hit guarantee.
-Hosted routes accept five-minute writes and refuse one-hour markers before dispatch because
-settlement has no TTL-specific write split. BYOK retains the requested TTL.
+Cache markers retain their requested TTL. Gateway reservations require the corresponding
+five-minute or one-hour price; settlement uses provider-observed TTL counts, never the request
+marker. Missing rates or incomplete TTL evidence remain unknown rather than using another rate.
 Responses expose observed cache reads and writes; absent write counts remain unknown.
 The decoder also
 carries the provider-native tool annotations (`strict`,
@@ -911,8 +912,8 @@ On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure a
 folded total the ledger bills: an Anthropic rung's own `cache_read_input_tokens` /
 `cache_creation_input_tokens`, an OpenAI-wire rung's `prompt_tokens_details.cached_tokens`
 (Chat) or `input_tokens_details.cached_tokens` (Responses), Gemini's `cachedContentTokenCount`,
-Bedrock's `cacheReadInputTokens`; only the Anthropic wire reports cache writes, every other
-rung carries `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
+Bedrock's `cacheReadInputTokens`; Anthropic and Bedrock report cache writes. Other rungs
+carry `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
 reported before content — an Anthropic upstream's own start-frame input and cache meters,
 mirrored — and otherwise the control plane's pre-dispatch count of the prompt (the reservation
 estimator without its headroom, carried on the admission as `input_token_estimate`, the same

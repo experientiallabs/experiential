@@ -19,7 +19,7 @@ use crate::events::Usage;
 /// | Anthropic field                | source                                              |
 /// |--------------------------------|-----------------------------------------------------|
 /// | `input_tokens`                 | `input_tokens - cached_input_tokens - cache_creation_input_tokens` (uncached input, saturating) |
-/// | `cache_creation_input_tokens`  | `cache_creation_input_tokens`, else `0` (Anthropic-wire rungs only) |
+/// | `cache_creation_input_tokens`  | `cache_creation_input_tokens`, else `0` (Anthropic or Bedrock rungs) |
 /// | `cache_read_input_tokens`      | `cached_input_tokens`, else `0` (Anthropic `cache_read_input_tokens`, OpenAI-wire `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`, Gemini `cachedContentTokenCount`, Bedrock `cacheReadInputTokens`) |
 /// | `output_tokens`                | `output_tokens` (reasoning folded in where the provider bills it additively) |
 ///

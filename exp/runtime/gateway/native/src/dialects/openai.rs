@@ -340,6 +340,7 @@ impl Normalizer {
                         phase: None,
                     });
                     events.push(Event::ToolCallStarted {
+                        custom: false,
                         index,
                         call_id,
                         name,
@@ -405,6 +406,7 @@ impl Normalizer {
                         phase: None,
                     });
                     events.push(Event::ToolCallStarted {
+                        custom: false,
                         index,
                         call_id,
                         name,

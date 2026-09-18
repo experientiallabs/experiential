@@ -14,7 +14,6 @@ from urllib.parse import urlsplit
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.base import SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS
-from exp.runtime.models.providers.cache_policy import require_priceable_cache_duration
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.fireworks import (
     require_responses_continuation_channel,
@@ -128,7 +127,6 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
-    require_priceable_cache_duration(profile, provider_request)
     if fireworks_continuation_required(profile, provider_request):
         require_responses_continuation_channel(provider_request)
     if provider_request.service_tier is not None and profile.dialect not in SERVICE_TIER_DIALECTS:

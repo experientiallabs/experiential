@@ -21,6 +21,7 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
     .is_output_token());
     // A tool-only turn's first token is the tool call itself.
     assert!(Event::ToolCallStarted {
+        custom: false,
         namespace: None,
         caller: None,
         index: 0,
@@ -117,6 +118,7 @@ fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
     assert_eq!(usage.input_tokens, Some(12));
     assert_eq!(usage.cached_input_tokens, Some(2));
     assert_eq!(usage.cache_creation_input_tokens, Some(1));
+    assert_eq!(usage.cache_creation_1h_input_tokens, None);
     // A leg beyond the persistable ledger range fails at the parser.
     assert!(bedrock_usage(Some(&json!({
         "inputTokens": MAXIMUM_LEDGER_COUNT + 1,

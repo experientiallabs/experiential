@@ -14,6 +14,7 @@ fn usage_reports_cached_reads_out_of_the_input_total() {
         output_tokens: Some(4),
         cached_input_tokens: Some(3),
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     };
     assert_eq!(
@@ -47,6 +48,7 @@ fn usage_carries_both_cache_legs_as_zero_when_the_provider_reports_none() {
         output_tokens: Some(12),
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     };
     assert_eq!(
@@ -71,6 +73,7 @@ fn usage_reports_openai_wire_cached_tokens_as_cache_reads() {
         output_tokens: Some(12),
         cached_input_tokens: Some(256),
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     };
     assert_eq!(
@@ -94,6 +97,7 @@ fn usage_reports_both_cache_legs_out_of_the_folded_input_total() {
         output_tokens: Some(9),
         cached_input_tokens: Some(0),
         cache_creation_input_tokens: Some(45_338),
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     };
     assert_eq!(

@@ -182,6 +182,7 @@ impl Normalizer {
         let completed = tool.complete().map_err(|message| malformed(&message))?;
         Ok(vec![
             Event::ToolCallStarted {
+                custom: false,
                 index,
                 call_id,
                 name,

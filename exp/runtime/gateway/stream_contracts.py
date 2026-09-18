@@ -17,9 +17,12 @@ from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
 class GatewayUsage(ContractModel):
     """Normalized token counts and invoked tool names from one provider attempt.
 
-    Cached-input and reasoning counts are subsets of the total input and output counts when
-    present. They identify differently priced portions of those totals and must not be added a
-    second time by callers.
+    Cached-input, cache-write, and reasoning counts are disjoint subsets of
+    the total input and output counts when present. They identify differently
+    priced portions of those totals and must not be added a second time by
+    callers. ``cache_creation_input_tokens`` is the provider cache-write
+    surcharge leg; it is disjoint from ``cached_input_tokens`` inside
+    ``input_tokens``, so ``fresh = input - cached - cache_creation``.
 
     A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
     case both token totals remain unknown instead of being represented as zero.
@@ -32,9 +35,12 @@ class GatewayUsage(ContractModel):
     output_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    """Cache-write tokens inside the input total (Anthropic-only today),
-    present only when the provider reported a nonzero count; billing keeps
-    using the folded input total."""
+    """Cache-write tokens inside the input total (Anthropic and Bedrock),
+    disjoint from the cache-read leg; present only when the provider reported
+    a nonzero count."""
+    cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
+    """Observed 1-hour subset of cache writes; zero proves all writes use 5m.
+    None means no complete TTL breakdown was reported, so write cost is unknown."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
@@ -45,7 +51,14 @@ class GatewayUsage(ContractModel):
 
     @model_validator(mode="after")
     def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:
-        """Require complete token totals unless this is tool-only terminal metadata."""
+        """Require complete totals and a covering cache-write total for the TTL subset.
+
+        Returns:
+            This validated token or tool-only usage record.
+
+        Raises:
+            ValueError: Totals are incomplete or a TTL subset lacks a covering total.
+        """
         totals = (self.input_tokens, self.output_tokens)
         if (totals[0] is None) != (totals[1] is None):
             raise ValueError("input and output token counts must be reported together")
@@ -53,11 +66,17 @@ class GatewayUsage(ContractModel):
             if (
                 self.cached_input_tokens is not None
                 or self.cache_creation_input_tokens is not None
+                or self.cache_creation_1h_input_tokens is not None
                 or self.reasoning_tokens is not None
             ):
                 raise ValueError("token detail counts require input and output totals")
             if not self.tool_names:
                 raise ValueError("usage requires token totals or invoked tool names")
+        if self.cache_creation_1h_input_tokens is not None and (
+            self.cache_creation_input_tokens is None
+            or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens
+        ):
+            raise ValueError("1-hour cache writes require a covering cache-creation total")
         return self
 
     @property

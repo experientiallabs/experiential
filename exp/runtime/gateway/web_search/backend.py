@@ -299,5 +299,5 @@ def default_web_search_backend(
     url = mapping.get(EXA_SEARCH_URL_ENV) or EXA_SEARCH_URL
     if not url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
         raise ValueError(f"{EXA_SEARCH_URL_ENV} must be an https URL (or a loopback fixture)")
-    _logger.info("gateway web search backend: exa (%s)", EXA_API_KEY_ENV)
+    _logger.info("gateway web search backend: exa")
     return ExaWebSearchBackend(url=url, environ=environ)

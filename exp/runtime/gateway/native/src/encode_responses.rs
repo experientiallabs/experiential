@@ -209,12 +209,20 @@ impl ResponsesSseEncoder {
                 encrypted_content,
             } => self.encrypted_reasoning(*output_index, item_id, encrypted_content),
             Event::ToolCallStarted {
+                custom,
                 index,
                 call_id,
                 name,
                 namespace,
                 caller,
-            } => self.tool_started(*index, call_id, name, namespace.as_deref(), caller.as_ref()),
+            } => self.tool_started(
+                *index,
+                call_id,
+                name,
+                namespace.as_deref(),
+                caller.as_ref(),
+                *custom,
+            ),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments(*index, delta),
             Event::ToolCallCompleted { index, call } => self.tool_completed(*index, call),
             // Anthropic text-block boundaries and citation metadata have no
@@ -507,6 +515,7 @@ impl ResponsesSseEncoder {
         name: &str,
         namespace: Option<&str>,
         caller: Option<&Value>,
+        custom: bool,
     ) -> Result<Vec<String>, PublicError> {
         if self.tools.contains_key(&index) {
             return Err(invalid_provider_stream(
@@ -541,10 +550,11 @@ impl ResponsesSseEncoder {
                 false,
             ),
         };
-        let custom = self
-            .provider_output_starts
-            .get(&index)
-            .is_some_and(|start| start.kind == ProviderOutputItemKind::CustomToolCall);
+        let custom = custom
+            || self
+                .provider_output_starts
+                .get(&index)
+                .is_some_and(|start| start.kind == ProviderOutputItemKind::CustomToolCall);
         let state = ToolState {
             item_id,
             output_index,
@@ -609,6 +619,7 @@ impl ResponsesSseEncoder {
             || state.name != call.name
             || state.namespace != call.namespace
             || state.caller != call.caller
+            || state.custom != call.custom
             || state.arguments != call.raw_arguments
             || (provider_owned_identity && call.provider_item_id != state.item_id)
         {

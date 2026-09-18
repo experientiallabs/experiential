@@ -65,6 +65,7 @@ fn fireworks_tool_events() -> Vec<Event> {
             delta: "hidden provider reasoning".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -152,6 +153,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
             delta: "hidden".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 1,
@@ -159,6 +161,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
             name: "first".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -368,6 +371,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
             phase: None,
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 1,
@@ -484,6 +488,7 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
             phase: None,
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 2,
@@ -579,6 +584,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
     // rejects the next turn ("Missing namespace for function_call ...").
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
             index: 0,
             call_id: "call-ns".to_string(),
             name: "spawn_agent".to_string(),
@@ -647,6 +653,7 @@ fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
         ResponsesEnvelope::default(),
         &[
             Event::ToolCallStarted {
+                custom: false,
                 index: 0,
                 call_id: "call-plain".to_string(),
                 name: "lookup".to_string(),
@@ -892,6 +899,7 @@ fn caller_attributed_tool_call_items_re_emit_caller_to_the_caller() {
     let caller = json!({"type": "program", "id": "prog_1"});
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
             index: 0,
             call_id: "call-caller".to_string(),
             name: "lookup".to_string(),

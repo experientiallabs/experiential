@@ -57,6 +57,7 @@ fn completed_body_orders_text_before_tool_use_blocks() {
     let events = vec![
         Event::TextDelta("hi".to_string()),
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -98,6 +99,7 @@ fn completed_body_orders_text_before_tool_use_blocks() {
 fn completed_body_preserves_interleaved_block_order() {
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -135,6 +137,7 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
     // text may arrive between the tool's arguments and its completion.
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -185,6 +188,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
     // buffers and flushes as one delta after A's block closes.
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -196,6 +200,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
             delta: "{\"a\": ".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 1,
@@ -396,6 +401,7 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
             signature: "sig-a".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,
@@ -693,6 +699,7 @@ pub(super) fn tool_turn_reasoning_events() -> Vec<Event> {
             delta: "think privately".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
             namespace: None,
             caller: None,
             index: 0,

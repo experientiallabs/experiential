@@ -7,7 +7,12 @@ from datetime import datetime
 
 from exp.common.models import BillingSource
 from exp.runtime.gateway.auth import utc_text
-from exp.runtime.gateway.contracts import DirectTarget, GatewayFailureClass, ProjectTarget
+from exp.runtime.gateway.contracts import (
+    DirectTarget,
+    GatewayFailureClass,
+    GatewayUsage,
+    ProjectTarget,
+)
 from exp.runtime.gateway.platform import (
     AliasRevisionRecord,
     AttemptReservationRecord,
@@ -115,7 +120,15 @@ def reservation_record(
     *,
     organization_id: str,
 ) -> AttemptReservationRecord:
-    """Decode one reservation from the existing atomic attempt row."""
+    """Decode one reservation and every frozen pricing dimension.
+
+    Args:
+        row: Durable attempt joined to its accepted request.
+        organization_id: Tenant already checked against the row.
+
+    Returns:
+        The exact persisted reservation, including unknown prices as None.
+    """
     return AttemptReservationRecord(
         organization_id=organization_id,
         attempt_id=str(row["attempt_id"]),
@@ -131,11 +144,19 @@ def reservation_record(
         billing_source=BillingSource(str(row["billing_source"])),
         input_rate=optional_int(row["input_rate"]),
         cached_input_rate=optional_int(row["cached_input_rate"]),
+        cache_creation_input_rate=optional_int(row["cache_creation_input_rate"]),
+        cache_creation_1h_input_rate=optional_int(row["cache_creation_1h_input_rate"]),
         output_rate=optional_int(row["output_rate"]),
         reasoning_rate=optional_int(row["reasoning_rate"]),
         long_context_threshold_tokens=optional_int(row["long_context_threshold_tokens"]),
         long_context_input_rate=optional_int(row["long_context_input_rate"]),
         long_context_cached_input_rate=optional_int(row["long_context_cached_input_rate"]),
+        long_context_cache_creation_input_rate=optional_int(
+            row["long_context_cache_creation_input_rate"]
+        ),
+        long_context_cache_creation_1h_input_rate=optional_int(
+            row["long_context_cache_creation_1h_input_rate"]
+        ),
         long_context_output_rate=optional_int(row["long_context_output_rate"]),
         long_context_reasoning_rate=optional_int(row["long_context_reasoning_rate"]),
         attempt_ordinal=int(row["attempt_ordinal"]),
@@ -151,7 +172,18 @@ def require_reservation_replay(
     *,
     request: AttemptReservationRequest,
 ) -> AttemptReservationRecord:
-    """Return an exact natural-key replay or reject changed accounting input."""
+    """Return an exact natural-key replay or reject changed accounting input.
+
+    Args:
+        row: Existing durable attempt joined to its accepted request.
+        request: Requested reservation to compare with frozen evidence.
+
+    Returns:
+        The original reservation when every accounting input matches.
+
+    Raises:
+        ValueError: Any identity, pricing, or reservation input differs.
+    """
     record = reservation_record(row, organization_id=request.organization_id)
     authorization = request.snapshot.authorization
     prices = request.deployment.gateway.prices
@@ -177,6 +209,8 @@ def require_reservation_replay(
         ),
         prices.input_nano_usd_per_million_tokens,
         prices.cached_input_nano_usd_per_million_tokens,
+        prices.cache_creation_input_nano_usd_per_million_tokens,
+        prices.cache_creation_1h_input_nano_usd_per_million_tokens,
         prices.output_nano_usd_per_million_tokens,
         prices.reasoning_nano_usd_per_million_tokens,
         (None if prices.long_context is None else prices.long_context.input_threshold_tokens),
@@ -189,6 +223,16 @@ def require_reservation_replay(
             None
             if prices.long_context is None
             else prices.long_context.cached_input_nano_usd_per_million_tokens
+        ),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.cache_creation_input_nano_usd_per_million_tokens
+        ),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.cache_creation_1h_input_nano_usd_per_million_tokens
         ),
         (
             None
@@ -222,11 +266,15 @@ def require_reservation_replay(
         (None if row["pricing_effective_at"] is None else str(row["pricing_effective_at"])),
         record.input_rate,
         record.cached_input_rate,
+        record.cache_creation_input_rate,
+        record.cache_creation_1h_input_rate,
         record.output_rate,
         record.reasoning_rate,
         record.long_context_threshold_tokens,
         record.long_context_input_rate,
         record.long_context_cached_input_rate,
+        record.long_context_cache_creation_input_rate,
+        record.long_context_cache_creation_1h_input_rate,
         record.long_context_output_rate,
         record.long_context_reasoning_rate,
         record.attempt_ordinal,
@@ -253,3 +301,24 @@ def optional_datetime(value: object) -> datetime | None:
 def optional_int(value: object) -> int | None:
     """Decode one optional SQLite integer."""
     return None if value is None else int(str(value))
+
+
+def usage_record(row: sqlite3.Row) -> GatewayUsage | None:
+    """Recover every observed usage leg for idempotent settlement comparison.
+
+    Args:
+        row: Durable attempt row including the cache-write total and TTL subset.
+
+    Returns:
+        Complete observed usage, or None when provider totals remain unknown.
+    """
+    if row["input_tokens"] is None or row["output_tokens"] is None:
+        return None
+    return GatewayUsage(
+        input_tokens=int(row["input_tokens"]),
+        output_tokens=int(row["output_tokens"]),
+        cached_input_tokens=optional_int(row["cached_input_tokens"]),
+        cache_creation_input_tokens=optional_int(row["cache_creation_input_tokens"]),
+        cache_creation_1h_input_tokens=optional_int(row["cache_creation_1h_input_tokens"]),
+        reasoning_tokens=optional_int(row["reasoning_tokens"]),
+    )

@@ -416,6 +416,7 @@ pub struct Normalizer {
     output_tokens: u64,
     cache_read: u64,
     cache_write: u64,
+    cache_write_1h: Option<u64>,
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
     usage: Option<Usage>,
@@ -472,6 +473,7 @@ impl Normalizer {
             output_tokens: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: None,
             stop_reason: None,
             usage: None,
             finish_reason: None,

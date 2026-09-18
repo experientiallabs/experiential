@@ -65,6 +65,106 @@ def test_malformed_subset_counts_clamp_to_their_totals() -> None:
     assert cost == 40
 
 
+def test_cache_write_prices_at_its_surcharge_rate() -> None:
+    """Cache-write tokens bill at their own rate, disjoint from cache-read."""
+    fresh = GatewayUsage(input_tokens=1_000, output_tokens=10)
+    written = GatewayUsage(
+        input_tokens=1_000,
+        cache_creation_input_tokens=1_000,
+        cache_creation_1h_input_tokens=0,
+        output_tokens=10,
+    )
+    # Synthetic nano-USD rates: the fresh request costs 3_150, cache writes cost 3_900.
+    assert (
+        estimated_cost_nano_usd(
+            fresh,
+            input_rate=3_000_000,
+            cached_input_rate=300_000,
+            cache_creation_input_rate=3_750_000,
+            output_rate=15_000_000,
+            reasoning_rate=15_000_000,
+        )
+        == 3_150
+    )
+    assert (
+        estimated_cost_nano_usd(
+            written,
+            input_rate=3_000_000,
+            cached_input_rate=300_000,
+            cache_creation_input_rate=3_750_000,
+            output_rate=15_000_000,
+            reasoning_rate=15_000_000,
+        )
+        == 3_900
+    )
+    # Mixed: 400 cached read + 300 cache write + 300 fresh.
+    mixed = GatewayUsage(
+        input_tokens=1_000,
+        cached_input_tokens=400,
+        cache_creation_input_tokens=300,
+        cache_creation_1h_input_tokens=0,
+        output_tokens=10,
+    )
+    assert (
+        estimated_cost_nano_usd(
+            mixed,
+            input_rate=3_000_000,
+            cached_input_rate=300_000,
+            cache_creation_input_rate=3_750_000,
+            output_rate=15_000_000,
+            reasoning_rate=15_000_000,
+        )
+        == 300 * 3_000_000 // 1_000_000
+        + 400 * 300_000 // 1_000_000
+        + 300 * 3_750_000 // 1_000_000
+        + 10 * 15_000_000 // 1_000_000
+    )
+
+
+def test_missing_cache_write_rate_preserves_unknown_pricing() -> None:
+    """A cache-write without its rate stays unknown even when base rate is known."""
+    usage = GatewayUsage(
+        input_tokens=100,
+        cache_creation_input_tokens=10,
+        cache_creation_1h_input_tokens=0,
+        output_tokens=5,
+    )
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=1_000_000,
+            cached_input_rate=1_000_000,
+            cache_creation_input_rate=None,
+            output_rate=1_000_000,
+            reasoning_rate=None,
+        )
+        is None
+    )
+
+
+def test_malformed_cache_write_clamps_to_remaining_input() -> None:
+    """Cache-write exceeding the remaining input clamps to input - cached."""
+    usage = GatewayUsage(
+        input_tokens=100,
+        cached_input_tokens=60,
+        cache_creation_input_tokens=90,
+        cache_creation_1h_input_tokens=0,
+        output_tokens=5,
+    )
+    # cached=60, creation clamps to 40, fresh=0.
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=1_000_000,
+            cached_input_rate=2_000_000,
+            cache_creation_input_rate=3_000_000,
+            output_rate=1_000_000,
+            reasoning_rate=None,
+        )
+        == 60 * 2_000_000 // 1_000_000 + 40 * 3_000_000 // 1_000_000 + 5
+    )
+
+
 def test_absent_usage_or_counts_preserve_unknown_cost() -> None:
     """No usage, or usage without token counts, yields no estimate."""
     assert (
@@ -169,3 +269,84 @@ def test_max_authored_rate_and_million_token_context_fit_the_int8_column() -> No
     )
     assert cost == numerator // 1_000_000
     assert cost < MAXIMUM_NANO_USD // 1_000
+
+
+@pytest.mark.parametrize("hour", [0, 200, 600])
+def test_mixed_ttl_writes_are_priced_once(hour: int) -> None:
+    """Provider TTL evidence partitions writes without changing the input total."""
+    usage = GatewayUsage(
+        input_tokens=1000,
+        output_tokens=10,
+        cached_input_tokens=100,
+        cache_creation_input_tokens=600,
+        cache_creation_1h_input_tokens=hour,
+    )
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=3_000_000_000,
+            cached_input_rate=300_000_000,
+            cache_creation_input_rate=3_750_000_000,
+            cache_creation_1h_input_rate=6_000_000_000,
+            output_rate=15_000_000_000,
+            reasoning_rate=None,
+        )
+        == 300 * 3000 + 100 * 300 + (600 - hour) * 3750 + hour * 6000 + 10 * 15000
+    )
+
+
+@pytest.mark.parametrize("hour, hour_rate", [(None, 6_000_000_000), (200, None)])
+def test_unobserved_ttl_or_missing_hour_rate_preserves_unknown_cost(
+    hour: int | None, hour_rate: int | None
+) -> None:
+    """A request or default price must never invent a missing observed TTL split."""
+    usage = GatewayUsage(
+        input_tokens=1000,
+        output_tokens=10,
+        cache_creation_input_tokens=600,
+        cache_creation_1h_input_tokens=hour,
+    )
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=3_000_000_000,
+            cached_input_rate=300_000_000,
+            cache_creation_input_rate=3_750_000_000,
+            cache_creation_1h_input_rate=hour_rate,
+            output_rate=15_000_000_000,
+            reasoning_rate=None,
+        )
+        is None
+    )
+
+
+def test_cache_write_nano_usd_rounding_and_overflow_are_bounded() -> None:
+    """Write dimensions use the shared single rounding and signed-ledger limit."""
+    usage = GatewayUsage(
+        input_tokens=2,
+        output_tokens=0,
+        cache_creation_input_tokens=2,
+        cache_creation_1h_input_tokens=1,
+    )
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=None,
+            cached_input_rate=None,
+            cache_creation_input_rate=250_000,
+            cache_creation_1h_input_rate=250_000,
+            output_rate=None,
+            reasoning_rate=None,
+        )
+        == 1
+    )
+    with pytest.raises(NanoUsdOverflowError):
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=None,
+            cached_input_rate=None,
+            cache_creation_input_rate=10**30,
+            cache_creation_1h_input_rate=10**30,
+            output_rate=None,
+            reasoning_rate=None,
+        )
