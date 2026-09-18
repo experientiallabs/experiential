@@ -89,6 +89,11 @@ relay that already declared its finish settles by that finish, and every other w
 `incomplete` with open items closed and any mid-fragment call dropped (operator log
 `stream_ended_without_terminal_after_output`).
 
+## Attribution and billing
+
+[Gateway attribution and settled billing](gateway-attribution-billing.md) defines
+`X-Explabs-Tags`, the host snapshot contract, and terminal billing extensions.
+
 ## The data plane
 
 The gateway has one data plane: the native Rust HTTP server in the PyO3 extension

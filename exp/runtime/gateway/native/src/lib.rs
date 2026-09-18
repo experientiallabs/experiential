@@ -6,6 +6,7 @@
 //! failure taxonomy for byte-level parity tests against the Python engine.
 
 mod admission;
+mod billing;
 mod bridge;
 mod codex_native_inversion;
 mod dialects;
@@ -25,6 +26,7 @@ mod rejection_shapes;
 mod relay;
 mod replay;
 mod replay_repair;
+mod request_tags;
 mod respond;
 mod responses_retention;
 mod route_batches;

@@ -18,7 +18,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 use pyo3::prelude::*;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::PublicError;
 
@@ -28,6 +28,10 @@ struct Job {
     method: &'static str,
     argument: String,
     responder: oneshot::Sender<Result<String, PublicError>>,
+    // Optional callers may stop waiting while Python still runs. Keep their
+    // slot occupied until the callback finishes, not just until its timeout.
+    _permit: Option<OwnedSemaphorePermit>,
+    _optional_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Bounded bridge to one Python `NativeControlPlane` instance.
@@ -39,6 +43,7 @@ pub struct Bridge {
     queue: Mutex<Option<mpsc::Sender<Job>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     permits: Arc<Semaphore>,
+    optional_permits: Arc<Semaphore>,
 }
 
 impl Bridge {
@@ -65,6 +70,9 @@ impl Bridge {
             queue: Mutex::new(Some(sender)),
             workers: Mutex::new(workers),
             permits: Arc::new(Semaphore::new(worker_count)),
+            // Optional enrichment may hold one worker, never the whole pool.
+            // A one-worker host reserves its only slot for mandatory work.
+            optional_permits: Arc::new(Semaphore::new(usize::from(worker_count > 1))),
         })
     }
 
@@ -90,6 +98,8 @@ impl Bridge {
                         method,
                         argument,
                         responder,
+                        _permit: None,
+                        _optional_permit: None,
                     })
                     .is_ok(),
                 None => false,
@@ -107,6 +117,42 @@ impl Bridge {
             Ok(result) => result,
             Err(_) => Err(PublicError::internal()),
         }
+    }
+
+    /// Attempt optional work without queueing for capacity or exceeding its budget.
+    ///
+    /// A timeout abandons only the result: the queued job owns its permit until
+    /// Python returns, so slow optional callbacks cannot overfill the pool.
+    pub async fn call_optional(
+        &self,
+        method: &'static str,
+        argument: String,
+        budget: std::time::Duration,
+    ) -> Option<String> {
+        if budget.is_zero() {
+            return None;
+        }
+        let expires = tokio::time::Instant::now() + budget;
+        let optional_permit = self.optional_permits.clone().try_acquire_owned().ok()?;
+        let permit = self.permits.clone().try_acquire_owned().ok()?;
+        let (responder, outcome) = oneshot::channel();
+        self.queue
+            .try_lock()
+            .ok()?
+            .as_ref()?
+            .send(Job {
+                method,
+                argument,
+                responder,
+                _permit: Some(permit),
+                _optional_permit: Some(optional_permit),
+            })
+            .ok()?;
+        tokio::time::timeout_at(expires, outcome)
+            .await
+            .ok()?
+            .ok()?
+            .ok()
     }
 }
 
@@ -153,10 +199,19 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
             // A panic maps to the shared internal error and never poisons
             // the receive lock, so one poisoned call cannot take down the
             // pool.
+            let call_started = std::time::Instant::now();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 control_plane_call(py, object, job.method, job.argument)
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
+            if job._optional_permit.is_some() {
+                // Measure actual execution even after the caller stopped waiting.
+                crate::metrics::METRICS
+                    .bridge_call_ms
+                    .record(call_started.elapsed());
+            }
+            drop(job._permit);
+            drop(job._optional_permit);
             let _ = job.responder.send(outcome);
         }
         // The control plane caches one SQLite connection per worker thread;
@@ -222,6 +277,12 @@ class Plane:
         self.call_threads = set()
         self.closed_threads = []
         self.barrier = threading.Barrier(2, timeout=10.0)
+        self.release = threading.Event()
+
+    def blocked(self, argument):
+        if not self.release.wait(timeout=5.0):
+            raise RuntimeError("test callback was not released")
+        return argument
 
     def echo(self, argument):
         with self.lock:
@@ -324,6 +385,132 @@ class Plane:
         // Drop joins the workers, so every one of them has already run its
         // `close_thread_resources` cleanup, including idle workers.
         assert_eq!(attribute_length(&observer, "closed_threads"), 3);
+    }
+
+    #[test]
+    fn optional_timeout_retains_capacity_until_the_callback_finishes() {
+        let object = plane();
+        let observer = Python::attach(|py| object.clone_ref(py));
+        let bridge = Bridge::new(object, 4).expect("bridge starts");
+        block_on(async {
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                bridge.call_optional(
+                    "blocked",
+                    "{}".to_string(),
+                    std::time::Duration::from_millis(20),
+                ),
+            )
+            .await
+            .expect("optional wait returns while the callback is blocked");
+            assert!(outcome.is_none());
+            assert_eq!(bridge.permits.available_permits(), 3);
+            assert_eq!(bridge.optional_permits.available_permits(), 0);
+            assert!(bridge
+                .call_optional(
+                    "echo",
+                    "skipped".to_string(),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .is_none());
+            assert_eq!(attribute_length(&observer, "call_threads"), 0);
+            let answer = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                bridge.call("echo", "while-optional-blocked".to_string()),
+            )
+            .await
+            .expect("mandatory work keeps capacity while optional Python still runs")
+            .expect("ordinary call succeeds");
+            assert_eq!(answer, "while-optional-blocked");
+            Python::attach(|py| {
+                observer
+                    .bind(py)
+                    .getattr("release")
+                    .expect("release event exists")
+                    .call_method0("set")
+                    .expect("callback releases");
+            });
+            let answer = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                bridge.call("echo", "after".to_string()),
+            )
+            .await
+            .expect("capacity returns after the callback finishes")
+            .expect("ordinary call succeeds");
+            assert_eq!(answer, "after");
+            let optional = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                bridge.optional_permits.acquire(),
+            )
+            .await
+            .expect("timed-out callback returns its optional permit")
+            .expect("optional pool stays open");
+            assert_eq!(bridge.permits.available_permits(), 4);
+            drop(optional);
+        });
+    }
+
+    #[test]
+    fn optional_calls_skip_saturated_workers_without_running_a_callback() {
+        let object = plane();
+        let observer = Python::attach(|py| object.clone_ref(py));
+        let bridge = Bridge::new(object, 2).expect("bridge starts");
+        block_on(async {
+            let permit = bridge
+                .permits
+                .acquire_many(2)
+                .await
+                .expect("capacity exists");
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                bridge.call_optional(
+                    "echo",
+                    "skipped".to_string(),
+                    std::time::Duration::from_secs(5),
+                ),
+            )
+            .await
+            .expect("saturated calls do not wait for a permit or the budget");
+            assert!(outcome.is_none());
+            assert_eq!(attribute_length(&observer, "call_threads"), 0);
+            drop(permit);
+            assert_eq!(
+                bridge
+                    .call_optional(
+                        "echo",
+                        "ready".to_string(),
+                        std::time::Duration::from_secs(2),
+                    )
+                    .await
+                    .as_deref(),
+                Some("ready"),
+            );
+            assert_eq!(bridge.permits.available_permits(), 2);
+            assert!(bridge
+                .call_optional("boom", "{}".to_string(), std::time::Duration::from_secs(2),)
+                .await
+                .is_none());
+            assert_eq!(bridge.permits.available_permits(), 2);
+        });
+    }
+
+    #[test]
+    fn a_single_worker_is_reserved_for_mandatory_calls() {
+        let object = plane();
+        let observer = Python::attach(|py| object.clone_ref(py));
+        let bridge = Bridge::new(object, 1).expect("bridge starts");
+        block_on(async {
+            assert!(bridge
+                .call_optional("echo", "skip".into(), std::time::Duration::from_secs(1))
+                .await
+                .is_none());
+            assert_eq!(attribute_length(&observer, "call_threads"), 0);
+            assert_eq!(
+                bridge.call("echo", "required".into()).await.unwrap(),
+                "required"
+            );
+        });
     }
 
     #[test]

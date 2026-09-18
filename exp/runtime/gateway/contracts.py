@@ -46,6 +46,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import (
     ThinkingBlock as ThinkingBlock,
 )
+from exp.runtime.gateway.request_tags import RequestTags
 from exp.runtime.gateway.stream_contracts import (
     GatewayEvent as GatewayEvent,
 )
@@ -496,20 +497,17 @@ class GatewayRequest(ContractModel):
     """Lossless canonical request shared by protocol and provider implementations."""
 
     surface: GatewayApiSurface
+    request_tags: RequestTags = Field(default_factory=dict, exclude=True)
+    """Attribution excluded from providers/token counts, included by canonical_request_sha256."""
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
     tools: tuple[GatewayToolDefinition, ...] = ()
     tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
     json_object_output: bool = Field(default=False, exclude=True)
-    """Caller ``response_format: {"type": "json_object"}`` from the Chat surface.
-
-    A schema-free "answer with one JSON object" mode, distinct from
-    ``structured_text``: no schema exists to enforce, so each wire dialect
-    honors it its own way (a native JSON mode where the provider has one, a
-    system instruction otherwise). Mutually exclusive with ``structured_text``.
-    Serialized only in replay identity when enabled.
-    """
+    """Chat ``response_format: {"type": "json_object"}`` requests schema-free JSON.
+    Uses native JSON mode where supported, a system instruction otherwise.
+    Mutually exclusive with ``structured_text``; joins replay identity only when enabled."""
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens_parameter: (
         Literal["max_tokens", "max_completion_tokens", "max_output_tokens"] | None
@@ -944,6 +942,8 @@ class AuthorizationSnapshot(ContractModel):
     surface: GatewayApiSurface
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
+    request_tags: RequestTags = Field(default_factory=dict)
+    """Validated caller attribution for the host ledger, never authorization policy."""
     caller_operation_sha256: Sha256 | None = None
     refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)

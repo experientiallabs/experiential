@@ -35,6 +35,19 @@ def test_invalid_json_is_a_native_decode_error() -> None:
     assert raised.value.error.detail.code == "invalid_json"
 
 
+def test_invalid_message_content_is_not_misattributed_to_absent_tags() -> None:
+    """Canonical body validation cannot blame an unrelated optional header."""
+    with pytest.raises(NativeDecodeError) as raised:
+        decode_native_body(
+            '{"model":"coding","messages":[{"role":"assistant","content":null,'
+            '"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque"}]}]}'
+        )
+    assert raised.value.error.status_code == 400
+    assert raised.value.error.detail.param == "messages"
+    assert "X-Explabs-Tags" not in raised.value.error.detail.message
+    assert "opaque" not in raised.value.error.detail.message
+
+
 def test_messages_surface_threads_the_caller_beta_header() -> None:
     """The Messages decode receives the caller anthropic-beta header so
     allowlisted tokens (the 1M context window) survive to dispatch."""
