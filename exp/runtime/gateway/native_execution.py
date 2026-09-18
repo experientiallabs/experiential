@@ -818,6 +818,7 @@ def deployment_wire_entry(
     serialize_tool_calls: bool = False,
     throttle_redial_budget: int = 0,
     zdr_constrained: bool = False,
+    native_tool_translation: Mapping[str, tuple[str, str | None, bool]] | None = None,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -878,6 +879,13 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # Codex native tools translated to function tools on a foreign wire;
+        # the data plane inverts the tool-call responses back to the native
+        # (namespaced / custom) shape the caller declared. Empty on native
+        # Responses routes and every non-Codex request.
+        "native_tool_translation": {
+            mangled: list(origin) for mangled, origin in (native_tool_translation or {}).items()
+        },
         # An image-emitting lane (the platform projects `emits_images` from the
         # model's output modalities): the data plane answers an empty
         # completion there at once instead of redialing a second whole image.

@@ -3338,10 +3338,10 @@ def test_output_config_discloses_on_routes_that_cannot_honor_it() -> None:
     assert provider.provider_output_config is None
 
 
-def test_native_items_require_a_homogeneous_responses_route_and_reemit_verbatim() -> None:
+def test_native_items_reemit_verbatim_natively_and_translate_on_a_foreign_route() -> None:
     """Codex-native input items forward byte-for-byte on native Responses
-    rungs at their exact position; any other rung in the route is a named
-    rejection (dropping tool definitions would silently degrade the agent)."""
+    rungs at their exact position; on any foreign rung they are translated to
+    ordinary tool-call messages so the turn serves instead of being rejected."""
     native_item: JsonObject = {
         "type": "custom_tool_call",
         "id": "ctc_1",
@@ -3365,9 +3365,13 @@ def test_native_items_require_a_homogeneous_responses_route_and_reemit_verbatim(
     chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
     public, _provider = route_generation_parameter_requests((responses,), request)
     assert public.ignored_parameters == ()
-    with pytest.raises(ProviderParameterError) as mixed:
-        route_generation_parameter_requests((responses, chat), request)
-    assert mixed.value.param == "input"
+    # A foreign rung translates the custom_tool_call history to a function
+    # tool-call message instead of rejecting the turn.
+    _public, provider = route_generation_parameter_requests((responses, chat), request)
+    converted = provider.messages[-1]
+    assert converted.provider_native_item is None
+    assert converted.tool_calls[0].name == "exec"
+    assert converted.tool_calls[0].arguments == {"input": "const r = 1;"}
 
 
 def test_client_metadata_and_verbosity_forward_native_and_disclose_elsewhere() -> None:
@@ -3973,11 +3977,12 @@ def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:
     }
 
 
-def test_native_tool_declarations_require_a_homogeneous_responses_route() -> None:
+def test_native_tool_declarations_reemit_natively_and_translate_on_a_foreign_route() -> None:
     """Non-function tool declarations (custom, namespace, web_search,
     tool_search) forward byte-for-byte at their caller positions on native
-    Responses rungs; any other rung in the route is a named rejection
-    (dropping an agent's tool definitions would silently degrade it)."""
+    Responses rungs; on a foreign rung they are translated into ordinary
+    function tools (custom -> single-input function) with hosted tools dropped,
+    so the turn serves instead of being rejected."""
     custom_tool: JsonObject = {
         "type": "custom",
         "name": "apply_patch",
@@ -4015,9 +4020,20 @@ def test_native_tool_declarations_require_a_homogeneous_responses_route() -> Non
     chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
     public, _provider = route_generation_parameter_requests((responses,), request)
     assert public.ignored_parameters == ()
-    with pytest.raises(ProviderParameterError) as mixed:
-        route_generation_parameter_requests((responses, chat), request)
-    assert mixed.value.param == "tools"
+    # A foreign rung translates the declarations: the custom apply_patch becomes
+    # a single-``input`` function tool, web_search drops with disclosure, and the
+    # inverse mapping rides on the provider request.
+    public, provider = route_generation_parameter_requests((responses, chat), request)
+    assert [tool.name for tool in provider.tools] == [
+        "exec_command",
+        "view_image",
+        "apply_patch",
+    ]
+    assert provider.provider_native_tools == ()
+    apply_patch = next(tool for tool in provider.tools if tool.name == "apply_patch")
+    assert apply_patch.parameters["required"] == ["input"]
+    assert "tools.web_search->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert provider.native_tool_translation == {"apply_patch": ("apply_patch", None, True)}
 
 
 def test_native_tool_declarations_count_as_tools_for_capability_preflight() -> None:
@@ -4970,12 +4986,12 @@ def test_plaintext_reasoning_prefers_the_exposing_rung_on_a_mixed_waterfall() ->
     assert compatible_generation_parameter_profile_indexes(profiles, plain) == (0, 1)
 
 
-def test_hosted_tool_echoes_require_a_homogeneous_responses_route_and_reemit_verbatim() -> None:
+def test_hosted_tool_echoes_reemit_natively_and_drop_with_disclosure_on_a_foreign_route() -> None:
     """Echoed hosted-tool items (web_search_call, mcp_call, their outputs)
     forward byte-for-byte on native Responses rungs at their exact position;
-    any other rung in the route is a named rejection, mirroring the Anthropic
-    server-tool rule: silently dropping provider-executed history would wedge
-    the session."""
+    on a foreign rung they have no representation and drop with disclosure so
+    the turn still serves (the provider-executed result is already in the
+    transcript text)."""
     hosted_item: JsonObject = {
         "type": "web_search_call",
         "id": "ws_1",
@@ -5003,10 +5019,13 @@ def test_hosted_tool_echoes_require_a_homogeneous_responses_route_and_reemit_ver
     chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
     public, _provider = route_generation_parameter_requests((responses,), request)
     assert public.ignored_parameters == ()
-    with pytest.raises(ProviderParameterError) as mixed:
-        route_generation_parameter_requests((responses, chat), request)
-    assert mixed.value.param == "input"
-    assert "hosted tool items" in str(mixed.value)
+    # A foreign rung drops the hosted-tool echo with disclosure and serves.
+    public_mixed, provider = route_generation_parameter_requests((responses, chat), request)
+    assert [message.role for message in provider.messages] == ["user", "user"]
+    assert all(message.provider_native_item is None for message in provider.messages)
+    assert (
+        "input.web_search_call->dropped(unsupported_by_provider)" in public_mixed.ignored_parameters
+    )
 
 
 def test_route_rejects_max_output_tokens_below_the_responses_minimum() -> None:

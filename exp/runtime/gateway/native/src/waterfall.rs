@@ -694,6 +694,7 @@ async fn run_attempt(
         relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
+        relay.set_native_tool_translation(wire.native_tool_translation.clone());
         if !wire.model_id.is_empty() {
             relay.set_request_words([wire.model_id.clone()]);
         }

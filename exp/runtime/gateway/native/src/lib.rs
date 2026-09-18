@@ -7,6 +7,7 @@
 
 mod admission;
 mod bridge;
+mod codex_native_inversion;
 mod dialects;
 mod encode;
 mod encode_messages;

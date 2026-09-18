@@ -11,6 +11,11 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.models.providers.codex_tools import (
+    NativeToolMapping,
+    convert_native_history,
+    translate_native_tools,
+)
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
@@ -779,19 +784,6 @@ def route_generation_parameter_requests(
         provider_updates["provider_server_tools"] = ()
         if clear_tool_choice:
             provider_updates["tool_choice"] = None
-    if any(message.provider_native_item is not None for message in request.messages) and not all(
-        profile.dialect == "openai_responses" for profile in profiles
-    ):
-        raise ProviderParameterError(
-            message=(
-                "The request carries native Responses input items (tool namespaces, "
-                "custom tool calls, or hosted tool items such as web_search_call and "
-                "mcp_call echoes) that only a native OpenAI Responses route can serve. "
-                "Choose a different model alias."
-            ),
-            param="input",
-            code="unsupported_parameter",
-        )
     outbound_maximum_output_tokens = provider_updates.get(
         "maximum_output_tokens", request.maximum_output_tokens
     )
@@ -816,19 +808,48 @@ def route_generation_parameter_requests(
             param=parameter,
             code="invalid_parameter",
         )
-    if request.provider_native_tools and not all(
+    # Codex CLI native Responses tool declarations and history items only serve
+    # verbatim on a native OpenAI Responses rung. On a foreign wire, translate
+    # them into ordinary function tools (hoisting namespaced functions,
+    # converting freeform custom tools to a single-``input`` function) and drop
+    # the hosted web_search/tool_search with disclosure, instead of rejecting.
+    # The inverse mapping rides on the provider request so the response path
+    # re-shapes tool calls into the native items the caller declared.
+    native_history_present = any(
+        message.provider_native_item is not None for message in request.messages
+    )
+    if (request.provider_native_tools or native_history_present) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
-        raise ProviderParameterError(
-            message=(
-                "The request carries native Responses tool declarations (custom, "
-                "namespace, web_search, or tool_search entries) that only a native "
-                "OpenAI Responses route can serve. Remove those tools or choose a "
-                "different model alias."
-            ),
-            param="tools",
-            code="unsupported_parameter",
-        )
+        native_mapping = NativeToolMapping()
+        if request.provider_native_tools:
+            translation = translate_native_tools(request)
+            native_mapping = translation.mapping
+            provider_updates["tools"] = translation.tools
+            provider_updates["provider_native_tools"] = ()
+            for disclosure in translation.disclosures:
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+            if not translation.tools and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, GatewayNamedToolChoice)
+            ):
+                provider_updates["tool_choice"] = None
+                if "tool_choice->cleared(no_serviceable_tool)" not in ignored:
+                    ignored.append("tool_choice->cleared(no_serviceable_tool)")
+        if native_history_present:
+            current_messages = cast(
+                "Sequence[GatewayMessage]", provider_updates.get("messages", request.messages)
+            )
+            converted, history_disclosures = convert_native_history(
+                current_messages, native_mapping
+            )
+            provider_updates["messages"] = converted
+            for disclosure in history_disclosures:
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+        if native_mapping:
+            provider_updates["native_tool_translation"] = native_mapping.as_dict()
 
     if any(profile.dialect == "anthropic_messages" for profile in profiles) and any(
         message.role == "user"

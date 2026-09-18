@@ -121,6 +121,7 @@ def build_rung_dispatch(
         stop_sequences=emulated_stop_sequences(profile.dialect, rung_request),
         serialize_tool_calls=rung_request.serialize_tool_calls,
         throttle_redial_budget=throttle_redial_budget,
+        native_tool_translation=rung_request.native_tool_translation,
         zdr_constrained=zdr_constrained,
     )
     binding = (

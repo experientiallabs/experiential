@@ -660,13 +660,14 @@ class GatewayRequest(ContractModel):
     present value joins replay identity through :func:`canonical_request_sha256`.
     """
     provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
-    """Verbatim non-function OpenAI Responses tool declarations.
-
-    See :class:`GatewayProviderNativeTool`. Non-Responses rungs cannot serve
-    these, so admission rejects by name. Excluded from serialization like the
-    other carriers; present entries join replay identity through
-    :func:`canonical_request_sha256`.
+    """Verbatim non-function OpenAI Responses tool declarations (see
+    :class:`GatewayProviderNativeTool`); excluded from serialization, present
+    entries join replay identity via ``canonical_request_sha256``.
     """
+    native_tool_translation: dict[str, tuple[str, str | None, bool]] | None = Field(
+        default=None, exclude=True
+    )
+    """Provider-only reverse map for translated Codex native tools; not in replay identity."""
     provider_server_tools: tuple[JsonObject, ...] = Field(default=(), exclude=True)
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 

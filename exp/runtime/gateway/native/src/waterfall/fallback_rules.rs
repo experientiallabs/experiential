@@ -155,6 +155,7 @@ mod tests {
 
     fn rung(tokens: Option<&[&str]>) -> DeploymentWire {
         DeploymentWire {
+            native_tool_translation: Default::default(),
             provider: "openai".to_string(),
             deployment_id: "d".to_string(),
             dialect: "openai_compatible".to_string(),

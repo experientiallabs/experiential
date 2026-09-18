@@ -66,6 +66,12 @@ pub struct DeploymentWire {
     /// no such control: the relay serializes the turn to one tool call.
     #[serde(default)]
     pub serialize_tool_calls: bool,
+    /// Codex native-tool inversion map for this request (provider-facing
+    /// mangled name -> origin name, namespace, is-custom). Empty unless the
+    /// request carried translated Codex native tools; see
+    /// `codex_native_inversion`.
+    #[serde(default)]
+    pub native_tool_translation: std::collections::HashMap<String, (String, Option<String>, bool)>,
     /// The served model emits images (`emits_images` on the lane -- never the
     /// Images-API claim `supports_image_generation`, whose reuse admitted
     /// image generations onto OpenRouter chat lanes on 2026-09-15) that the

@@ -160,6 +160,7 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
         let rung_b = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
         let route = [
             DeploymentWire {
+                native_tool_translation: Default::default(),
                 throttle_redial_budget: 2,
                 ..responses_wire("a", &rung_a.url, &["rsn_a_remembered_repair_is_redialed_without_earning_the_refusal_again_hA=="])
             },

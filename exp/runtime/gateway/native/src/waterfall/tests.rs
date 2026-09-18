@@ -4,6 +4,7 @@ use super::*;
 
 fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
     DeploymentWire {
+        native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: "d".to_string(),
         dialect: "openai_compatible".to_string(),

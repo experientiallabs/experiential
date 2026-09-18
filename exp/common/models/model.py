@@ -242,6 +242,14 @@ class ToolCall(ContractModel):
     identity explicitly.
     """
     provider_caller: JsonObject | None = Field(default=None, exclude=True)
+    custom: bool = Field(default=False, exclude=True)
+    """Whether this call targets a freeform OpenAI Responses ``custom`` tool.
+
+    Set when a Codex ``custom`` tool declaration was translated to a function
+    tool for a foreign wire; the Responses response inverts it back to a
+    ``custom_tool_call`` whose ``input`` is the freeform text. Excluded from
+    serialization like the other replay carriers; it rides on the live
+    response only and never on an immutable artifact."""
     """Opaque SDK 3.0 ``caller`` attribution on a Responses tool-call item.
 
     Programmatic tool calling attributes a ``function_call`` or
