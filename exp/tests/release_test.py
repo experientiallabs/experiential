@@ -1450,7 +1450,7 @@ def _installed_release_driver() -> None:
         raise AssertionError(f"exp gateway did not listen on port {port}")
 
     def start_gateway(root: Path) -> tuple[subprocess.Popen[str], int, str]:
-        """Start one installed gateway subprocess on an unused loopback port.
+        """Start the accounting-only privacy canary with explicit content opt-out.
 
         Args:
             root: Configured gateway root.
@@ -1462,6 +1462,7 @@ def _installed_release_driver() -> None:
         process = subprocess.Popen(
             [
                 str(executable),
+                "--ghost",
                 "--root",
                 str(root),
                 "--port",

@@ -969,9 +969,9 @@ or eviction returns an explicit unavailable error and never reconstructs content
 
 ## Content-free observability and lifecycle
 
-SQLite stores hashes, frozen authority, route identity, state transitions, token counts, latency,
-and estimated cost. It never stores prompts, responses, raw tool arguments, raw virtual keys, or
-provider secrets. `GET /usage` and `GET /usage.json` are two renderings of the same schema-v2 report
+The accounting SQLite stores hashes, frozen authority, route identity, state transitions, tokens,
+latency and estimated cost, never content or keys. Separate [local capture](local_gateway_traffic.md)
+is default-on (`--ghost` disables it). `GET /usage` and `GET /usage.json` render the same schema-v2 report
 and expose only aggregate, per-identity, and physical-attempt `by_billing_source` accounting.
 An anonymous request reads the organization-wide report; a request carrying a virtual key as
 `Authorization: Bearer <key>` reads the report scoped to that key's identity, and an invalid

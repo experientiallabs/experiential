@@ -610,7 +610,9 @@ async def _exercise_async_sdk(base_url: str, raw_key: str, prompt: str) -> None:
     assert events[-1].type == "response.completed"
 
 
-def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement, str]:
+def _configure_gateway(
+    root: Path, *, base_url: str, supports_tools: bool = False
+) -> tuple[GatewayManagement, str]:
     """Create explicit launch state against one real loopback provider."""
     manager = GatewayManagement(root)
     manager.initialize()
@@ -631,8 +633,10 @@ def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement,
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        capabilities=ModelCapabilities(supports_tools=supports_tools),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_streaming_tool_arguments=supports_tools
+        ),
         prices=GatewayTokenPrices(
             input_nano_usd_per_million_tokens=1_000_000,
             output_nano_usd_per_million_tokens=2_000_000,

@@ -14,11 +14,13 @@ not have to know which vendor errors exist.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Protocol
 
 from exp.simulation.ingest.braintrust import BRAINTRUST_SOURCE
 from exp.simulation.ingest.chat_json import CHAT_JSON_SOURCE
+from exp.simulation.ingest.gateway import load_gateway_capture
 from exp.simulation.ingest.langfuse import LANGFUSE_SOURCE
 from exp.simulation.ingest.langsmith import LANGSMITH_SOURCE
 from exp.simulation.ingest.mastra import MASTRA_SOURCE
@@ -61,7 +63,7 @@ _LOADERS: dict[str, _TraceFileLoader] = {
     "phoenix": PHOENIX_SOURCE.load,
     "posthog": load_posthog_file,
 }
-CANONICAL_TRACE_SOURCES: tuple[str, ...] = tuple(sorted(_LOADERS))
+CANONICAL_TRACE_SOURCES: tuple[str, ...] = tuple(sorted((*_LOADERS, "gateway")))
 
 
 def load_trace_source(
@@ -69,6 +71,7 @@ def load_trace_source(
     path: Path,
     *,
     source_id: str | None = None,
+    identity_id: str | None = None,
 ) -> TraceNormalizationResult:
     """Normalize one local corpus through the loader of its declared source.
 
@@ -76,6 +79,7 @@ def load_trace_source(
         source: Declared source name, matched case-insensitively after trimming.
         path: Local trace export.
         source_id: Optional durable label that replaces the worker-local path in provenance.
+        identity_id: Required authenticated local identity for the gateway source only.
 
     Returns:
         Canonical traces and every retained validation exclusion.
@@ -83,7 +87,20 @@ def load_trace_source(
     Raises:
         TraceSourceError: The source is unsupported or its corpus cannot be normalized.
     """
-    loader = _LOADERS.get(source.strip().casefold())
+    source = source.strip().casefold()
+    if source == "gateway":
+        if identity_id is None:
+            raise TraceSourceError("gateway traffic requires an explicit --identity ID")
+        try:
+            return load_gateway_capture(path, identity_id=identity_id, source_id=source_id)
+        except (sqlite3.Error, ValueError) as exc:
+            raise TraceSourceError(
+                "Cannot read this identity's gateway capture. Collect fresh traffic "
+                "with capture enabled and select its traffic.db file."
+            ) from exc
+    if identity_id is not None:
+        raise TraceSourceError("--identity is supported only with --source gateway")
+    loader = _LOADERS.get(source)
     if loader is None:
         choices = ", ".join(CANONICAL_TRACE_SOURCES)
         raise TraceSourceError(f"unsupported trace source {source!r}; choose one of: {choices}")

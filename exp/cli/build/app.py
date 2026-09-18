@@ -43,6 +43,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.release_revision import installed_release_revision
+from exp.runtime.gateway.local_capture import local_capture_path
 from exp.runtime.models import (
     CapabilityRequirement,
     ModelCapabilityError,
@@ -111,6 +112,9 @@ def build(
         help=f"Trace source format: {', '.join(CANONICAL_TRACE_SOURCES)}.",
     ),
     root: Path = ROOT_OPTION,
+    identity: str | None = typer.Option(
+        None, "--identity", help="Identity whose local gateway traffic supplies the build."
+    ),
     world_model: str | None = typer.Option(None, "--world-model", help="World-model alias."),
     judge: str | None = typer.Option(None, "--judge", help="Judge alias."),
     embedder: str | None = typer.Option(None, "--embedder", help="Embedding-capable alias."),
@@ -162,6 +166,7 @@ def build(
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
         source: Declared local-export format.
         root: Local ``.exp`` artifact root.
+        identity: Required local identity when using ``--source gateway``.
         world_model: Optional configured alias override for this project.
         judge: Optional configured alias override for this project.
         embedder: Optional configured alias override for this project.
@@ -180,6 +185,12 @@ def build(
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
         trace_file = legacy_trace_file
+    if source.strip().casefold() == "gateway":
+        if identity is None:
+            raise typer.BadParameter("--source gateway requires --identity ID")
+        trace_file = trace_file or local_capture_path(root)
+    elif identity is not None:
+        raise typer.BadParameter("--identity requires --source gateway")
     if trace_file is None:
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
@@ -250,7 +261,11 @@ def build(
         path = _resolve_trace_file(trace_file)
         with progress_display(_console) as progress:
             report(progress, "normalization")
-            normalized = _load_canonical_traces(path, source)
+            normalized = (
+                load_trace_source(source, path, identity_id=identity)
+                if identity is not None
+                else _load_canonical_traces(path, source)
+            )
             if not normalized.traces:
                 raise ValueError(
                     "no valid canonical traces were produced; inspect the input and provide at "

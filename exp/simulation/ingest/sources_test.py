@@ -147,6 +147,7 @@ def test_declared_sources_are_the_supported_set() -> None:
     assert CANONICAL_TRACE_SOURCES == (
         "braintrust",
         "chat-json",
+        "gateway",
         "langfuse",
         "langsmith",
         "mastra",

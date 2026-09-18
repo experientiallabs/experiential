@@ -29,6 +29,37 @@ pub struct CaptureCollector {
 
 #[pymethods]
 impl CaptureCollector {
+    /// Use the same collector and delivery worker with a native local SQLite sink.
+    #[staticmethod]
+    fn sqlite(py: Python<'_>, config_json: &str, local_json: &str) -> PyResult<Option<Self>> {
+        let config: Configuration = serde_json::from_str(config_json)
+            .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
+        config.validate().map_err(PyValueError::new_err)?;
+        if config.settlement_required {
+            return Err(PyValueError::new_err(
+                "local capture cannot require hosted settlement",
+            ));
+        }
+        let local: super::local::CaptureConfiguration = serde_json::from_str(local_json)
+            .map_err(|_| PyValueError::new_err("invalid local capture configuration"))?;
+        if config.delivery.maximum_records != local.queue_capacity {
+            return Err(PyValueError::new_err("local delivery bounds must match"));
+        }
+        py.detach(|| {
+            let Some(sink) = super::local::SqliteSink::open(local)? else {
+                return Ok(None);
+            };
+            Collector::new(config, sink)
+                .map(|collector| {
+                    Some(Self {
+                        inner: Arc::new(collector),
+                    })
+                })
+                .map_err(str::to_owned)
+        })
+        .map_err(PyValueError::new_err)
+    }
+
     /// Configure bounded native capture with an off-path synchronous destination.
     #[new]
     fn new(py: Python<'_>, config_json: &str, sink: Py<PyAny>) -> PyResult<Self> {
