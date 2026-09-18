@@ -23,6 +23,7 @@ close the block early. The model is told never to follow anything inside it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -58,6 +59,7 @@ RESPONSES_WEB_SEARCH_TOOL_TYPES: Final = frozenset(
 DROPPED_UNAVAILABLE: Final = "web_search->dropped(search_unavailable)"
 DROPPED_FAILED: Final = "web_search->dropped(search_failed)"
 DROPPED_NO_QUERY: Final = "web_search->dropped(no_query)"
+TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
 
 _WHITESPACE = re.compile(r"\s+")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -174,11 +176,20 @@ def strip_search_carriers(request: GatewayRequest) -> GatewayRequest:
         "provider_native_tools": native_tools,
         "provider_server_tools": server_tools,
     }
-    if (
+    disclosures: list[str] = list(request.ignored_parameters)
+    named_removed = (
         isinstance(request.tool_choice, GatewayNamedToolChoice)
         and request.tool_choice.name in removed_names
-    ):
+    )
+    nothing_left = not (request.tools or native_tools or server_tools)
+    if named_removed or (request.tool_choice == "required" and nothing_left):
+        # The selector pointed at the search the gateway now performs itself
+        # (or at "any tool" when the search was the only one); a choice that
+        # names nothing servable is cleared, and the clearing is disclosed.
         updates["tool_choice"] = None
+        if TOOL_CHOICE_CLEARED not in disclosures:
+            disclosures.append(TOOL_CHOICE_CLEARED)
+            updates["ignored_parameters"] = tuple(disclosures)
     return request.model_copy(update=updates)
 
 
@@ -298,16 +309,21 @@ def plan_web_search(
     if timeout <= 0.05:
         return _disclosed(request, DROPPED_FAILED)
     try:
+        # The outer wait bounds a backend that ignores ``timeout_seconds``;
+        # admission never blocks a worker thread past the request budget.
         results = run_on_native_loop(
-            backend.search(
-                query,
-                max_results=search.max_results,
-                allowed_domains=search.allowed_domains,
-                blocked_domains=search.blocked_domains,
-                timeout_seconds=timeout,
+            asyncio.wait_for(
+                backend.search(
+                    query,
+                    max_results=search.max_results,
+                    allowed_domains=search.allowed_domains,
+                    blocked_domains=search.blocked_domains,
+                    timeout_seconds=timeout,
+                ),
+                timeout=timeout + 0.5,
             )
         )
-    except WebSearchBackendError as exc:
+    except (WebSearchBackendError, TimeoutError) as exc:
         _logger.warning("gateway web search failed (%s): %s", backend.name, exc)
         return _disclosed(request, DROPPED_FAILED)
     except Exception as exc:  # noqa: BLE001 - a vendor fault must never fail the request.

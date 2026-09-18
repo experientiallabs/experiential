@@ -12,7 +12,8 @@ search untouched; otherwise the control plane runs ONE search against the config
 (`exp/runtime/gateway/web_search/backend.py`; Exa when `EXA_API_KEY` is set, or a host-supplied
 backend on `NativeControlPlane(web_search=...)`), bounded by eight seconds and the request
 deadline, for the latest user turn's text. The ranked results are injected as one instruction
-turn placed after the leading instructions (a `developer` turn on Responses, `system` elsewhere),
+`system` turn placed after the leading instructions (never `developer`: a compatible rung may lack
+that capability),
 so token reservations already count them and every wire dialect carries them; the
 provider-native search carriers are stripped so a mixed route answers from the same evidence.
 Admission then tells the data plane `{"web_search": {"query", "requests", "results": [{"url",
@@ -62,8 +63,11 @@ exclusive (the provider's rule) and are forwarded to the vendor as include/exclu
 only https or loopback origins are accepted). A host may pass any `WebSearchBackend` to
 `NativeControlPlane(web_search=...)`. Without a backend the ask is dropped with
 `web_search->dropped(search_unavailable)`; a vendor failure or timeout (8 s, bounded by the request
-deadline) yields `web_search->dropped(search_failed)`; a request with no user text yields
-`web_search->dropped(no_query)`. In every case the turn still serves and no search is billed.
+deadline, enforced by the gateway even for a backend that ignores it) yields
+`web_search->dropped(search_failed)`; a request with no user text yields
+`web_search->dropped(no_query)`. A `tool_choice` that named the replaced search tool (or demanded
+"any tool" when the search was the only one) is cleared with
+`tool_choice->cleared(no_serviceable_tool)`. In every case the turn still serves and no search is billed.
 
 ## Settlement
 
