@@ -26,6 +26,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         shutdown: object,
         on_listening: object,
         guardrail_detectors: object,
+        capture: object,
     ) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
@@ -33,6 +34,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         captured["shutdown"] = shutdown
         captured["on_listening"] = on_listening
         captured["guardrail_detectors"] = guardrail_detectors
+        captured["capture"] = capture
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
@@ -61,6 +63,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
     assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
     assert captured["guardrail_detectors"] == {}
+    assert captured["capture"] is None
 
 
 def test_host_forwards_an_embedder_owned_shutdown_handle(
@@ -75,9 +78,10 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
         shutdown: object,
         on_listening: object,
         guardrail_detectors: object,
+        capture: object,
     ) -> None:
         """Capture the extension boundary call."""
-        del control_plane, config_json, on_listening, guardrail_detectors
+        del control_plane, config_json, on_listening, guardrail_detectors, capture
         captured["shutdown"] = shutdown
 
     native = SimpleNamespace(serve=serve)

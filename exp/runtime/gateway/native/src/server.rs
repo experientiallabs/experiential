@@ -120,6 +120,7 @@ pub(crate) struct AppState {
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
+    pub(crate) capture: Option<Arc<crate::capture::collector::Collector>>,
     /// Deterministic guardrail rules compiled once by the control plane,
     /// keyed by policy `adapter_id`. An admission whose output chain names
     /// only these adapters is enforced here instead of in python.
@@ -136,6 +137,7 @@ pub async fn run(
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Arc<DetectorMap>,
+    capture: Option<Arc<crate::capture::collector::Collector>>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
     let http = crate::upstream::build_client(connect_timeout)?;
@@ -154,6 +156,7 @@ pub async fn run(
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
+        capture: capture.clone(),
         guardrail_detectors,
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
@@ -220,6 +223,11 @@ pub async fn run(
     let drain_deadline = Instant::now() + graceful;
     while pending_settlements.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if let Some(capture) = capture {
+        if !capture.close_until(drain_deadline) {
+            eprintln!("capture delivery exceeded the graceful shutdown deadline");
+        }
     }
     outcome
 }

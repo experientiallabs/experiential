@@ -220,7 +220,9 @@ pub(crate) async fn messages(
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
-    match won {
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
+    let response = match won {
         Won::Failed(error) => messages_error_response(&error),
         Won::Settled(settled) => settled_messages_response(&admission, settled).await,
         Won::Committed(committed) => {
@@ -234,7 +236,8 @@ pub(crate) async fn messages(
                 completed_messages(admission, guard, committed, deadline, permit).await
             }
         }
-    }
+    };
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Abandon a durably accepted request whose admission reply failed to parse,

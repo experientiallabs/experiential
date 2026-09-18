@@ -224,7 +224,9 @@ pub(crate) async fn chat(
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    match won {
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
+    let response = match won {
         Won::Failed(error) => {
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
@@ -277,7 +279,8 @@ pub(crate) async fn chat(
                 .await
             }
         }
-    }
+    };
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Answer one attempt that the waterfall already settled: a successful

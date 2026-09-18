@@ -7,6 +7,7 @@
 
 mod admission;
 mod bridge;
+mod capture;
 mod dialects;
 mod encode;
 mod encode_messages;
@@ -183,7 +184,7 @@ fn shutdown_handle() -> ShutdownHandle {
 /// `RegexDetector`, so an admission whose output chain is deterministic runs
 /// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None))]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
@@ -191,6 +192,7 @@ fn serve(
     shutdown: Option<&ShutdownHandle>,
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Option<&Bound<'_, PyDict>>,
+    capture: Option<&capture::python::CaptureCollector>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
@@ -199,12 +201,20 @@ fn serve(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
     );
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
+    let capture = capture.map(|collector| collector.inner.clone());
     let outcome = py.detach(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("tokio runtime construction failed: {error}"))?;
-        runtime.block_on(server::run(bridge, config, stop, on_listening, detectors))
+        runtime.block_on(server::run(
+            bridge,
+            config,
+            stop,
+            on_listening,
+            detectors,
+            capture,
+        ))
     });
     outcome.map_err(PyRuntimeError::new_err)
 }
@@ -761,6 +771,7 @@ fn error_payload(error: &errors::PublicError) -> String {
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
     module.add_class::<RegexDetector>()?;
+    module.add_class::<capture::python::CaptureCollector>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;

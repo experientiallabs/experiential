@@ -1,5 +1,8 @@
 # CLI usage
 
+Gateway embedders can use the [capture hosting interface](reference/gateway_capture.md)
+with their own consent policy and storage destination.
+
 The root surface is deliberately small:
 
 | Command | Purpose | Local result |
