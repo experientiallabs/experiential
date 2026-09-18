@@ -64,6 +64,7 @@ from exp.runtime.gateway.stream_contracts import (
 from exp.runtime.gateway.stream_contracts import (
     GatewayUsage as GatewayUsage,
 )
+from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -661,9 +662,7 @@ class GatewayRequest(ContractModel):
     """
     provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
     """Verbatim non-function OpenAI Responses tool declarations (see
-    :class:`GatewayProviderNativeTool`); excluded from serialization, present
-    entries join replay identity via ``canonical_request_sha256``.
-    """
+    :class:`GatewayProviderNativeTool`); excluded, join replay identity when present."""
     native_tool_translation: dict[str, tuple[str, str | None, bool]] | None = Field(
         default=None, exclude=True
     )
@@ -672,12 +671,13 @@ class GatewayRequest(ContractModel):
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 
     Typed entries with no ``input_schema`` execute at the provider; validated
-    shallowly at decode and re-emitted byte-for-byte AFTER the converted custom
-    tools on native Anthropic rungs only. Other rungs cannot execute them, so
-    admission rejects by name. Excluded from serialization like the other
-    carriers; present entries join replay identity through
-    :func:`canonical_request_sha256`.
+    shallowly at decode, re-emitted byte-for-byte AFTER the converted custom tools
+    on native Anthropic rungs only (other rungs reject by name). Excluded from
+    serialization; present entries join replay identity (``canonical_request_sha256``).
     """
+    web_search: GatewayWebSearch | None = Field(default=None, exclude=True)
+    """The caller's normalized pre-answer web-search request (any spelling); excluded
+    from serialization, joins replay identity when present. See ``web_search.plan``."""
     # `provider: {"zdr": true}`: the caller demanded ZDR routing. Tightening
     # only: the host applies its require_zdr posture filter to this request and
     # refuses with the same 403 when no rung qualifies. Part of identity.

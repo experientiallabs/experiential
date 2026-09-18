@@ -108,6 +108,16 @@ CHAT_MANIFEST = CompatibilityManifest(
         # Both API surfaces share the native Responses output-length hint;
         # other routes omit it with disclosure. Values remain validated.
         _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
+        # Pre-answer web search. OpenAI's ``web_search_options`` and the
+        # OpenRouter ``plugins: [{"id": "web"}]`` extension (and the ``:online``
+        # model suffix) normalize to one gateway search: a route with no
+        # provider-native search gets the gateway's own (results injected, sources
+        # cited, one search counted); without a configured backend the request
+        # still serves and the drop is disclosed.
+        _field(
+            "web_search_options", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"
+        ),
+        _field("plugins", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"),
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
@@ -124,7 +134,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "web_search_options",
             )
         ),
     ),

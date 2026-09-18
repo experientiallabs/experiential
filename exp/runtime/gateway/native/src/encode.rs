@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
+use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
 /// Derive one replay-stable public object ID, mirroring `stable_public_id`.
 pub fn stable_public_id(prefix: &str, request_id: &str) -> String {
@@ -181,6 +182,7 @@ pub struct ChatSseEncoder {
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
     reasoning_output_exposed: bool,
+    web_search: Option<ChatWebSearch>,
 }
 
 impl ChatSseEncoder {
@@ -206,12 +208,19 @@ impl ChatSseEncoder {
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
             reasoning_output_exposed: false,
+            web_search: None,
         }
     }
 
     /// Attach an authenticated carrier before the terminal is encoded.
     pub fn set_reasoning_content_carrier(&mut self, carrier: String) {
         self.reasoning_content_carrier = Some(carrier);
+    }
+
+    /// Cite the gateway-executed web search at the terminal: `None` (no
+    /// search) leaves every frame byte-identical.
+    pub fn set_web_search(&mut self, web_search: Option<WebSearchAdmission>) {
+        self.web_search = web_search.map(ChatWebSearch::new);
     }
 
     /// Expose the model's plaintext reasoning to the caller on output.
@@ -256,6 +265,9 @@ impl ChatSseEncoder {
             ));
         }
         self.reasoning.observe(event)?;
+        if let Some(web_search) = self.web_search.as_mut() {
+            web_search.observe(event);
+        }
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
@@ -403,6 +415,12 @@ impl ChatSseEncoder {
                     })?;
                     frames.push(self.chunk(json!({"reasoning_content": carrier}), None));
                 }
+                // Search citations ride one annotations delta immediately
+                // before the finish chunk, and only when a result URL appears.
+                let annotations = self.web_search.as_ref().map(ChatWebSearch::annotations);
+                if let Some(annotations) = annotations.filter(|found| !found.is_empty()) {
+                    frames.push(self.chunk(json!({"annotations": annotations}), None));
+                }
                 frames.push(self.chunk(json!({}), Some(finish_reason)));
                 if self.include_usage {
                     if let Some(usage) = &self.usage {
@@ -454,13 +472,18 @@ impl ChatSseEncoder {
     }
 
     fn usage_chunk(&self, usage: &Usage) -> String {
+        let mut usage = streaming_chat_usage(usage);
+        annotate_usage_details(
+            &mut usage,
+            self.web_search.as_ref().map(ChatWebSearch::admission),
+        );
         let payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",
             "created": self.created_at,
             "model": self.model,
             "choices": [],
-            "usage": streaming_chat_usage(usage),
+            "usage": usage,
         });
         chat_data(&payload)
     }

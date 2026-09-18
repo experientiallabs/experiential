@@ -127,6 +127,7 @@ class _RecordingLedger:
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
         self.upstream_providers: list[str | None] = []
+        self.web_search_requests: list[int | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
@@ -190,10 +191,16 @@ class _RecordingLedger:
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
+        web_search_requests: int | None = None,
     ) -> None:
-        """Record one settled attempt, tracking harvested rate-limit values apart."""
+        """Record one settled attempt, tracking harvested rate-limit values apart.
+
+        ``web_search_requests`` defaults to ``None`` here (the protocol says
+        ``0``) so a recorded ``None`` proves the registry withheld the keyword.
+        """
         del first_token_at
         self.upstream_providers.append(upstream_provider)
+        self.web_search_requests.append(web_search_requests)
         self.terminal_events.append(terminal_event)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1
@@ -2381,3 +2388,89 @@ def test_settle_hands_the_upstream_provider_only_to_a_ledger_that_accepts_it() -
     started = _start(registry, ordinal=0, request_id="request-2")
     _settle_naming_upstream(registry, attempt_id=str(started["attempt_id"]), request_id="request-2")
     assert current.upstream_providers == ["Azure"]
+
+
+def _settle_billing_searches(
+    registry: NativeAttemptAccounting,
+    *,
+    attempt_id: str,
+    request_id: str,
+    web_search_requests: int | None,
+) -> str:
+    """One completed, token-bearing settle that bills ``web_search_requests`` gateway searches.
+
+    ``None`` omits the key exactly as an engine predating the field does.
+    """
+    payload: JsonObject = {
+        "request_id": request_id,
+        "attempt_id": attempt_id,
+        "outcome": "completed",
+        "usage": {"input_tokens": 12, "output_tokens": 4},
+        "tool_names": [],
+        "failure": None,
+        "finalize": True,
+        "opened": True,
+    }
+    if web_search_requests is not None:
+        payload["web_search_requests"] = web_search_requests
+    return registry.settle(json.dumps(payload))
+
+
+def test_settle_hands_web_search_requests_only_to_a_ledger_that_accepts_it() -> None:
+    """The hosted-ledger seam for the search meter mirrors ``upstream_provider``.
+
+    A ledger predating the keyword settles cleanly with it withheld; a current
+    ledger receives the settled count; zero or an absent count is withheld from
+    every ledger so an attempt that never searched settles as before the field.
+    """
+    legacy = _LegacySignatureLedger()
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", legacy))
+    deployments = _bounded_pair(1)
+    _admit(registry, deployments, request_id="request-1")
+    started = _start(registry, ordinal=0, request_id="request-1")
+    _settle_billing_searches(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        request_id="request-1",
+        web_search_requests=3,
+    )
+    assert legacy.finished[-1]["finalize"] is True
+    assert legacy.web_search_requests == []
+
+    current = _RecordingLedger()
+    registry = NativeAttemptAccounting(current)
+    for ordinal, (request_id, count) in enumerate(
+        (("request-2", 3), ("request-3", 0), ("request-4", None))
+    ):
+        _admit(registry, deployments, request_id=request_id)
+        started = _start(registry, ordinal=0, request_id=request_id)
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id=request_id,
+            web_search_requests=count,
+        )
+        assert len(current.finished) == ordinal + 1
+    terminal = current.terminal_events[0]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.web_search_requests == 3
+    assert current.web_search_requests == [3, None, None]
+
+
+def test_swept_retained_settlement_still_bills_its_web_searches() -> None:
+    """A settlement the sweep recovers hands the ledger the same search count as a direct one."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id="request-one",
+            web_search_requests=2,
+        )
+    assert entry.pending_settlement is not None
+    registry.sweep_expired()
+    assert entry.pending_settlement is None
+    assert len(ledger.finished) == 1
+    assert ledger.web_search_requests == [2, 2]

@@ -73,6 +73,11 @@ from exp.runtime.openai_protocol.structured_text import (
     responses_structured_text,
 )
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
+from exp.runtime.openai_protocol.web_search import (
+    chat_web_search,
+    responses_web_search,
+    split_online_suffix,
+)
 from exp.runtime.openai_protocol.wire_models import (
     HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
@@ -228,9 +233,10 @@ def decode_chat(
     _validate_official(
         _CHAT_OFFICIAL,
         _without_chat_message_extensions(payload),
-        extension_fields={"top_k", "reasoning_effort", "enable_thinking", "provider"},
+        extension_fields={"top_k", "reasoning_effort", "enable_thinking", "provider", "plugins"},
     )
     request = _validate_wire(_ChatRequest, payload)
+    alias, online_suffix = split_online_suffix(request.model)
     idempotency_key, client_request_id = _validated_operation_headers(
         idempotency_key, client_request_id
     )
@@ -263,6 +269,11 @@ def decode_chat(
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
+            web_search=chat_web_search(
+                options=request.web_search_options,
+                plugins=request.plugins,
+                online_suffix=online_suffix,
+            ),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -296,7 +307,7 @@ def decode_chat(
         )
     except ValidationError as exc:
         raise validation_protocol_error(exc) from exc
-    return DecodedGatewayRequest(alias=request.model, request=canonical)
+    return DecodedGatewayRequest(alias=alias, request=canonical)
 
 
 def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
@@ -355,6 +366,7 @@ def decode_responses(
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
+    alias, online_suffix = split_online_suffix(request.model)
     require_responses_input(request)
     if not isinstance(request.input, str):
         for item_index, item in enumerate(request.input):
@@ -409,6 +421,7 @@ def decode_responses(
             messages=tuple(messages),
             tools=tuple(function_tools),
             provider_native_tools=tuple(native_tools),
+            web_search=responses_web_search(native_tools, online_suffix=online_suffix),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
@@ -493,7 +506,7 @@ def decode_responses(
         if developer_index is not None:
             developer_messages_param = f"input.{developer_index}.role"
     return DecodedGatewayRequest(
-        alias=request.model,
+        alias=alias,
         request=canonical,
         developer_messages_param=developer_messages_param,
     )

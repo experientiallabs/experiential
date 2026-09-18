@@ -466,6 +466,7 @@ class SQLiteAttemptLedger:
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
+        web_search_requests: int = 0,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -483,6 +484,10 @@ class SQLiteAttemptLedger:
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
             upstream_provider: The upstream an aggregator rung (OpenRouter)
                 named as having served the attempt, when its response said.
+            web_search_requests: Gateway-executed web searches billed to the
+                attempt. The hosted ledger prices these per attempt; the local
+                SQLite ledger accepts and does not yet persist or price them
+                (a follow-up), so its schema is unchanged.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -498,6 +503,7 @@ class SQLiteAttemptLedger:
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
                 upstream_provider=upstream_provider,
+                web_search_requests=web_search_requests,
             )
 
     def apply_finish_attempt(
@@ -515,6 +521,7 @@ class SQLiteAttemptLedger:
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
+        web_search_requests: int = 0,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -533,7 +540,11 @@ class SQLiteAttemptLedger:
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
             upstream_provider: The upstream an aggregator rung (OpenRouter)
                 named as having served the attempt, when its response said.
+            web_search_requests: Gateway-executed web searches billed to the
+                attempt; accepted for the shared settle signature and not
+                persisted or priced locally yet (see ``finish_attempt``).
         """
+        del web_search_requests  # Priced by the hosted ledger; local pricing is a follow-up.
         state, normalized_failure, failure_message, usage = _terminal_values(
             terminal_event, failure
         )

@@ -23,6 +23,9 @@ class GatewayUsage(ContractModel):
 
     A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
     case both token totals remain unknown instead of being represented as zero.
+
+    ``web_search_requests`` rides along with either shape but never makes usage on its own: a
+    count with neither token totals nor tool names is still rejected.
     """
 
     input_tokens: int | None = Field(default=None, ge=0)
@@ -35,6 +38,10 @@ class GatewayUsage(ContractModel):
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
+    web_search_requests: int = Field(default=0, ge=0)
+    """Gateway-executed web searches billed to this attempt; never a provider
+    meter and not a subset of any token total. Zero on every attempt that ran
+    no search, including every attempt settled by an engine predating it."""
 
     @model_validator(mode="after")
     def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:

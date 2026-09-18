@@ -20,9 +20,7 @@ use crate::admission::{
     Admission,
 };
 use crate::encode::{compact_json, reasoning_carrier_candidate};
-use crate::encode_responses::{
-    completed_responses_body, completed_responses_body_with_carrier, ResponsesSseEncoder,
-};
+use crate::encode_responses::{completed_responses_body_with_web_search, ResponsesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::guardrails::{released_events, StreamRedactor};
@@ -163,6 +161,7 @@ pub(crate) async fn responses(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    guard.record_web_search_requests(admission.web_search_requests());
     // The replay key was authorized independently of admission; a revision
     // swap between the two fails closed exactly like the chat surface.
     if lease
@@ -340,12 +339,14 @@ async fn settled_responses_response(
         return sse_body_response(&headers, body);
     }
     let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body(
+    let aggregated = match completed_responses_body_with_web_search(
         &admission.request_id,
         &admission.alias,
         created_at,
         envelope,
         &events,
+        None,
+        admission.web_search.as_ref(),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => return error_response(&error),
@@ -406,13 +407,14 @@ async fn respond_from_responses_events(
             }
         };
     let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body_with_carrier(
+    let aggregated = match completed_responses_body_with_web_search(
         &admission.request_id,
         &admission.alias,
         created_at,
         envelope,
         &events,
         reasoning_content_carrier.as_deref(),
+        admission.web_search.as_ref(),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
@@ -620,6 +622,7 @@ fn encode_responses_sse(
         created_at,
         envelope,
     );
+    encoder.set_web_search(admission.web_search.clone());
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string())?;
     }
@@ -745,6 +748,7 @@ async fn stream_responses(
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
+        encoder.set_web_search(admission.web_search.clone());
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;

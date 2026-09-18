@@ -6,10 +6,12 @@ from datetime import UTC, datetime
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailureClass,
     GatewayRefusalReason,
+    GatewayUsage,
 )
 from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
@@ -19,6 +21,9 @@ from exp.runtime.gateway.native_settlement import (
     terminal_from_settlement,
     upstream_provider_from_settlement,
     upstream_provider_kwarg,
+    web_search_requests_from_settlement,
+    web_search_requests_from_terminal,
+    web_search_requests_kwarg,
 )
 
 
@@ -388,3 +393,74 @@ def test_cache_write_count_crosses_the_settlement_boundary(writes: int | None) -
     )
     assert usage is not None
     assert usage.cache_creation_input_tokens == writes
+
+
+def test_web_search_requests_parses_the_top_level_count_and_nothing_else() -> None:
+    """The count sits beside ``usage`` in the settle argument; anything unusable reads as zero."""
+    assert web_search_requests_from_settlement({"web_search_requests": 2}) == 2
+    assert web_search_requests_from_settlement({}) == 0
+    assert web_search_requests_from_settlement(None) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": None}) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": "2"}) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": True}) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": -1}) == 0
+    # Inside "usage" is the wrong place: the engine never puts it there.
+    assert web_search_requests_from_settlement({"usage": {"web_search_requests": 2}}) == 0
+
+
+def test_web_search_requests_ride_on_the_settled_usage() -> None:
+    """Token-bearing and tool-only usage both carry the count; no usage means no carrier."""
+    tokens: JsonObject = {"input_tokens": 8, "output_tokens": 3}
+    terminal, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": [], "web_search_requests": 2}
+    )
+    assert terminal.usage is not None and terminal.usage.web_search_requests == 2
+    assert web_search_requests_from_terminal(terminal) == 2
+
+    tools_only, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": None,
+            "tool_names": ["web_search"],
+            "web_search_requests": 1,
+        }
+    )
+    assert tools_only.usage is not None and tools_only.usage.web_search_requests == 1
+    assert not tools_only.usage.has_token_counts
+
+    # A count with neither tokens nor tool names has nothing to ride on: the
+    # contract's validator keeps a bare count from being usage, so it is dropped.
+    bare, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": None, "tool_names": [], "web_search_requests": 3}
+    )
+    assert bare.usage is None
+    assert web_search_requests_from_terminal(bare) == 0
+    assert web_search_requests_from_terminal(None) == 0
+
+    # Absent stays byte-identical to the pre-field engine: zero on the usage.
+    absent, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": []}
+    )
+    assert absent.usage is not None and absent.usage.web_search_requests == 0
+    assert _usage_from_payload(tokens, [], web_search_requests=4) == GatewayUsage(
+        input_tokens=8, output_tokens=3, web_search_requests=4
+    )
+
+
+def test_web_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger() -> None:
+    """Same seam as ``upstream_provider_kwarg``, plus: a zero count sends nothing at all."""
+
+    def named(*, web_search_requests: int = 0) -> None:
+        del web_search_requests
+
+    def variadic(**kwargs: object) -> None:
+        del kwargs
+
+    def absent(*, upstream_provider: str | None = None) -> None:
+        del upstream_provider
+
+    assert web_search_requests_kwarg(named, 2) == {"web_search_requests": 2}
+    assert web_search_requests_kwarg(variadic, 1) == {"web_search_requests": 1}
+    assert web_search_requests_kwarg(absent, 2) == {}
+    assert web_search_requests_kwarg(named, 0) == {}
+    assert web_search_requests_kwarg(variadic, 0) == {}

@@ -62,6 +62,7 @@ from exp.runtime.gateway.native_admission import (
     record_dead_admission_rungs,
     resolve_admission_route,
 )
+from exp.runtime.gateway.native_authentication import NativeAuthenticationMixin
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
@@ -127,6 +128,8 @@ from exp.runtime.gateway.reasoning_carrier import (
 )
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.web_search.backend import WebSearchBackend, default_web_search_backend
+from exp.runtime.gateway.web_search.plan import plan_web_search
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -153,6 +156,7 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 class NativeControlPlane(
+    NativeAuthenticationMixin,
     NativeBatchRelayMixin,
     NativeCountTokensMixin,
     NativeDecisionsMixin,
@@ -180,6 +184,7 @@ class NativeControlPlane(
         cache_sample_gate: Callable[[str], bool] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
+        web_search: WebSearchBackend | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -201,6 +206,7 @@ class NativeControlPlane(
                 admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
+            web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -224,6 +230,7 @@ class NativeControlPlane(
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
+        self._web_search = web_search if web_search is not None else default_web_search_backend()
         # Deterministic rules compile once here, never per request.
         self._guardrail_detectors = deterministic.compile_native_detectors(
             {} if guardrails is None else guardrails.deterministic_specifications
@@ -259,25 +266,6 @@ class NativeControlPlane(
     def reconciled_unknown_attempts(self) -> int:
         """Return crashed attempts reconciled at startup."""
         return self._components.reconciled_unknown_attempts
-
-    def authenticate(self, argument: str) -> str:
-        """Authenticate one virtual key before the data plane reads the body.
-
-        Args:
-            argument: JSON object with ``raw_key``.
-
-        Returns:
-            An empty JSON object on success.
-
-        Raises:
-            NativeBridgeError: The key is invalid, expired, or revoked.
-        """
-        data = json.loads(argument)
-        try:
-            self._components.store.authenticate_key(raw_key=data["raw_key"])
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise _authority_error(exc) from exc
-        return "{}"
 
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.
@@ -424,6 +412,7 @@ class NativeControlPlane(
         # accounted content-free and never billed. Routing failures found by
         # the probe are raised against the accepted request below.
         probe_failure: Exception | None = None
+        web_search_admission: JsonObject | None = None
         route: GatewayRoute | None = None
         resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
         try:
@@ -463,6 +452,14 @@ class NativeControlPlane(
                 )
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
+            # Caller-requested web search against the admitted route (see web_search.plan).
+            searched = plan_web_search(
+                request,
+                [profile.dialect for profile, _client in resolved_wires],
+                self._web_search,
+                deadline_monotonic=deadline,
+            )
+            request, web_search_admission = searched.request, searched.admission
             _require_bound_wire_authority(
                 None
                 if continuation_context is None
@@ -687,6 +684,9 @@ class NativeControlPlane(
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
         if plan is not None:
             response["guardrail_output_plan"] = plan
+        if web_search_admission is not None:
+            # The gateway searched: the data plane cites the sources and counts it.
+            response["web_search"] = web_search_admission
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
             # upstream reports nothing before its final chunk. The ledger

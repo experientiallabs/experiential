@@ -299,3 +299,124 @@ fn chat_message_with_tool_calls_carries_the_array() {
         json!("tool_calls")
     );
 }
+
+fn web_search_admission() -> crate::web_search::WebSearchAdmission {
+    crate::web_search::WebSearchAdmission {
+        query: "current stable Python".to_string(),
+        requests: 1,
+        results: vec![crate::web_search::WebSearchSource {
+            url: "https://python.org/".to_string(),
+            title: "Python".to_string(),
+        }],
+    }
+}
+
+fn web_search_chat_events(text: &str) -> Vec<Event> {
+    vec![
+        Event::TextDelta(text.to_string()),
+        Event::Usage(Usage {
+            input_tokens: Some(12),
+            output_tokens: Some(7),
+            ..Usage::default()
+        }),
+        Event::Completed,
+    ]
+}
+
+fn chat_frames(
+    web_search: Option<crate::web_search::WebSearchAdmission>,
+    text: &str,
+) -> Vec<String> {
+    let mut encoder =
+        ChatSseEncoder::new_with_ignored("request-1", "coding", 1_700_000_000, true, Vec::new());
+    encoder.set_web_search(web_search);
+    let mut frames = encoder.start().expect("starts");
+    for event in &web_search_chat_events(text) {
+        frames.extend(encoder.feed(event).expect("encodes"));
+    }
+    frames
+}
+
+fn chat_payload(frame: &str) -> Value {
+    serde_json::from_str(frame.trim_start_matches("data: ").trim_end()).expect("chunk JSON")
+}
+
+#[test]
+fn chat_stream_cites_the_search_right_before_the_finish_chunk_and_meters_usage() {
+    let frames = chat_frames(
+        Some(web_search_admission()),
+        "See https://python.org/ today",
+    );
+    // role, content, annotations, finish, usage, [DONE]
+    assert_eq!(frames.len(), 6);
+    let annotations = chat_payload(&frames[2]);
+    assert_eq!(
+        annotations["choices"][0]["delta"],
+        json!({"annotations": [{
+            "type": "url_citation",
+            "url_citation": {
+                "url": "https://python.org/",
+                "title": "Python",
+                "start_index": 4,
+                "end_index": 23,
+            },
+        }]})
+    );
+    assert_eq!(annotations["choices"][0]["finish_reason"], Value::Null);
+    let finish = chat_payload(&frames[3]);
+    assert_eq!(finish["choices"][0]["finish_reason"], json!("stop"));
+    let usage = chat_payload(&frames[4]);
+    assert_eq!(
+        usage["usage"]["server_tool_use_details"],
+        json!({"web_search_requests": 1})
+    );
+    assert_eq!(usage["usage"]["prompt_tokens"], json!(12));
+    assert_eq!(frames[5], "data: [DONE]\n\n");
+}
+
+#[test]
+fn chat_stream_skips_the_annotations_chunk_when_no_result_is_cited() {
+    let frames = chat_frames(Some(web_search_admission()), "no links");
+    // role, content, finish, usage, [DONE]
+    assert_eq!(frames.len(), 5);
+    assert!(!frames.join("").contains("annotations"));
+    assert_eq!(
+        chat_payload(&frames[3])["usage"]["server_tool_use_details"],
+        json!({"web_search_requests": 1})
+    );
+}
+
+#[test]
+fn chat_stream_without_a_search_is_byte_identical() {
+    let mut untouched =
+        ChatSseEncoder::new_with_ignored("request-1", "coding", 1_700_000_000, true, Vec::new());
+    let mut frames = untouched.start().expect("starts");
+    for event in &web_search_chat_events("See https://python.org/ today") {
+        frames.extend(untouched.feed(event).expect("encodes"));
+    }
+    assert_eq!(frames, chat_frames(None, "See https://python.org/ today"));
+    let joined = frames.join("");
+    assert!(!joined.contains("annotations"));
+    assert!(!joined.contains("server_tool_use_details"));
+}
+
+#[test]
+fn chat_aggregate_gains_annotations_and_the_usage_meter_only_when_searched() {
+    let events = web_search_chat_events("See https://python.org/ today");
+    let mut cited =
+        completed_chat_body_with_ignored("request-1", "coding", 1_700_000_000, &events, &[], false)
+            .expect("aggregates");
+    let plain = compact_json(&cited.body);
+    crate::web_search::annotate_chat_completion(&mut cited.body, &web_search_admission());
+    let message = &cited.body["choices"][0]["message"];
+    assert_eq!(
+        message["annotations"][0]["url_citation"]["start_index"],
+        json!(4)
+    );
+    assert_eq!(
+        cited.body["usage"]["server_tool_use_details"],
+        json!({"web_search_requests": 1})
+    );
+    assert!(!plain.contains("annotations"));
+    assert!(!plain.contains("server_tool_use_details"));
+}

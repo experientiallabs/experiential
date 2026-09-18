@@ -2,6 +2,7 @@
 //! implementation stays within the repository line budget.
 
 use super::*;
+use crate::errors::FailureClass;
 use crate::events::CompletedToolCall;
 
 #[test]

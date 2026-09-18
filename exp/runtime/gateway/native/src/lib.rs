@@ -44,6 +44,7 @@ mod throttle_backoff;
 mod tool_serialization;
 mod upstream;
 mod waterfall;
+mod web_search;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

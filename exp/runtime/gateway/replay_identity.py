@@ -119,6 +119,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and not request.provider_server_tools
         and not request.provider_native_tools
         and request.provider_preferences is None
+        and request.web_search is None
     ):
         return None
     envelope: JsonObject = {
@@ -147,6 +148,10 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     if request.json_object_output:
         # Schema-free JSON mode changes the answer shape for the same body.
         envelope["json_object_output"] = True
+    if request.web_search is not None:
+        # A pre-answer web search changes the answer for the same body; the
+        # fetched results are derived at admission and never join identity.
+        envelope["web_search"] = request.web_search.model_dump(mode="json")
     if retained_tools:
         envelope["tools"] = retained_tools
     if request.provider_beta_tokens:

@@ -11,13 +11,21 @@ use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus, Usage,
 };
+use crate::web_search::{url_citations, CitationShape, WebSearchAdmission};
 
 mod aggregate;
 mod envelope;
 mod output;
 mod provider;
 
-pub use aggregate::{completed_responses_body, completed_responses_body_with_carrier};
+// `completed_responses_body_with_carrier` stays on the public seam for the
+// unit tests and any host that never runs a search; the routes now call the
+// web-search-aware variant.
+#[allow(unused_imports)]
+pub use aggregate::{
+    completed_responses_body, completed_responses_body_with_carrier,
+    completed_responses_body_with_web_search,
+};
 pub use envelope::ResponsesEnvelope;
 
 fn invalid_provider_stream(message: &str) -> PublicError {
@@ -54,6 +62,7 @@ pub struct ResponsesSseEncoder {
     messages: HashMap<MessageKey, MessageState>,
     provider_output_starts: HashMap<u32, ProviderOutputStart>,
     usage: Option<Usage>,
+    web_search: Option<WebSearchAdmission>,
 }
 
 impl ResponsesSseEncoder {
@@ -82,7 +91,14 @@ impl ResponsesSseEncoder {
             messages: HashMap::new(),
             provider_output_starts: HashMap::new(),
             usage: None,
+            web_search: None,
         }
+    }
+
+    /// Cite the gateway-executed web search on the synthetic message and
+    /// meter it on usage: `None` (no search) leaves every frame untouched.
+    pub fn set_web_search(&mut self, web_search: Option<WebSearchAdmission>) {
+        self.web_search = web_search;
     }
 
     /// Emit required created and in-progress lifecycle events once.
@@ -842,6 +858,7 @@ impl ResponsesSseEncoder {
             text,
             refusal,
             annotations,
+            first_search_citation,
             text_started,
             refusal_started,
             item,
@@ -860,12 +877,24 @@ impl ResponsesSseEncoder {
             ) {
                 state.status = Some(fallback_status);
             }
+            // The gateway's own search cites the synthetic (foreign-rung)
+            // message it answered from; provider-keyed messages carry only
+            // the provider's own annotations.
+            let first_search_citation = state.annotations.len();
+            if let (MessageKey::Synthetic, Some(web_search)) = (key, self.web_search.as_ref()) {
+                state.annotations.extend(url_citations(
+                    &state.text,
+                    &web_search.results,
+                    CitationShape::Responses,
+                ));
+            }
             (
                 state.item_id.clone(),
                 state.output_index,
                 state.text.clone(),
                 state.refusal.clone(),
                 state.annotations.clone(),
+                first_search_citation,
                 state.text_started,
                 state.refusal_started,
                 state.item(true, fallback_status),
@@ -874,6 +903,18 @@ impl ResponsesSseEncoder {
         let mut frames: Vec<String> = Vec::new();
         let mut content_index = 0;
         if text_started {
+            for (offset, annotation) in annotations[first_search_citation..].iter().enumerate() {
+                frames.push(self.event(
+                    "response.output_text.annotation.added",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "annotation_index": first_search_citation + offset,
+                        "annotation": annotation,
+                    }),
+                ));
+            }
             frames.push(self.event(
                 "response.output_text.done",
                 json!({

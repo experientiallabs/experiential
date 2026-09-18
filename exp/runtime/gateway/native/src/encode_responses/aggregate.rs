@@ -53,6 +53,29 @@ pub fn completed_responses_body_with_carrier(
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
 ) -> Result<AggregatedResponses, PublicError> {
+    completed_responses_body_with_web_search(
+        request_id,
+        model,
+        created_at,
+        envelope,
+        events,
+        reasoning_content_carrier,
+        None,
+    )
+}
+
+/// Build one non-streaming result that also cites and meters the
+/// gateway-executed web search; `None` renders exactly like the variants
+/// above.
+pub fn completed_responses_body_with_web_search(
+    request_id: &str,
+    model: &str,
+    created_at: i64,
+    envelope: ResponsesEnvelope,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+    web_search: Option<&WebSearchAdmission>,
+) -> Result<AggregatedResponses, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
         Some(event) => event,
@@ -105,6 +128,7 @@ pub fn completed_responses_body_with_carrier(
         });
     }
     let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
+    encoder.set_web_search(web_search.cloned());
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string())?;
     }

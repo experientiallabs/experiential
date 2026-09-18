@@ -92,8 +92,9 @@ fn settle_argument(
     first_token_at: Option<SystemTime>,
     rate_limit_headers: Option<&serde_json::Map<String, Value>>,
     upstream_provider: Option<&str>,
+    web_search_requests: u32,
 ) -> String {
-    compact_json(&json!({
+    let mut argument = json!({
         "request_id": request_id,
         "attempt_id": attempt_id,
         "outcome": outcome,
@@ -141,7 +142,16 @@ fn settle_argument(
         // per attempt so a zero-data-retention dispatch shows WHICH
         // retention-free upstream answered.
         "upstream_provider": upstream_provider,
-    }))
+    });
+    // The gateway's own pre-dispatch web searches, a request-level cost the
+    // control plane bills once: only the settlement that closes the request
+    // carries the count, so a failed rung's non-finalizing settlement can
+    // never bill it a second time. Absent at zero, so unsearched requests
+    // settle with exactly the bytes they always did.
+    if finalize && web_search_requests > 0 {
+        argument["web_search_requests"] = json!(web_search_requests);
+    }
+    compact_json(&argument)
 }
 
 /// Deliver one control-plane write with bounded backoff; the control plane
@@ -214,6 +224,10 @@ pub struct AttemptGuard {
     /// The upstream an aggregator named as serving the active attempt's
     /// committed stream, recorded at commit and settled alongside the outcome.
     upstream_provider: Option<String>,
+    /// How many web searches the control plane executed for this request
+    /// before dispatch (from the admission); a request-level fact that
+    /// survives `rebind` and rides only the finalizing settlement.
+    web_search_requests: u32,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -261,7 +275,14 @@ impl AttemptGuard {
             first_token_at: None,
             rate_limit_headers: None,
             upstream_provider: None,
+            web_search_requests: 0,
         }
+    }
+
+    /// Record the admission's count of gateway-executed web searches, so the
+    /// finalizing settlement bills them.
+    pub fn record_web_search_requests(&mut self, requests: u32) {
+        self.web_search_requests = requests;
     }
 
     /// Bind one freshly reserved attempt as the active settlement target.
@@ -353,6 +374,7 @@ impl AttemptGuard {
             self.first_token_at,
             rate_limit_headers,
             self.upstream_provider.as_deref(),
+            self.web_search_requests,
         );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
@@ -462,6 +484,7 @@ impl Drop for AttemptGuard {
                             self.first_token_at,
                             self.rate_limit_headers.as_ref(),
                             self.upstream_provider.as_deref(),
+                            self.web_search_requests,
                         ),
                     )
                 }
@@ -535,10 +558,37 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             );
             let parsed: Value = serde_json::from_str(&argument).expect("valid json");
             assert_eq!(parsed["usage"]["cache_creation_input_tokens"], json!(count));
         }
+    }
+
+    #[test]
+    fn settle_argument_bills_web_searches_only_on_the_finalizing_settlement() {
+        let settle = |finalize: bool, requests: u32| -> Value {
+            let argument = settle_argument(
+                "req",
+                "att",
+                "completed",
+                None,
+                &[],
+                None,
+                finalize,
+                true,
+                None,
+                None,
+                None,
+                requests,
+            );
+            serde_json::from_str(&argument).expect("valid json")
+        };
+        assert_eq!(settle(true, 1)["web_search_requests"], json!(1));
+        // A failed rung's non-finalizing settlement never bills the search a
+        // second time, and an unsearched request omits the key entirely.
+        assert!(settle(false, 1).get("web_search_requests").is_none());
+        assert!(settle(true, 0).get("web_search_requests").is_none());
     }
 
     #[test]
@@ -555,6 +605,7 @@ mod tests {
             None,
             None,
             Some("Azure"),
+            0,
         );
         let parsed: Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(
@@ -573,6 +624,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&unnamed).expect("valid json");
         assert_eq!(parsed["upstream_provider"], Value::Null);
@@ -593,6 +645,7 @@ mod tests {
             Some(observed),
             None,
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&with_token).expect("valid json");
         assert_eq!(
@@ -613,6 +666,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&without).expect("valid json");
         assert_eq!(parsed["first_token_at"], Value::Null);
@@ -636,6 +690,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&argument).expect("valid json");
         assert_eq!(parsed["failure"]["failure_class"], "invalid_request");
@@ -660,6 +715,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&owned_argument).expect("valid json");
         assert_eq!(
@@ -682,6 +738,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&bare_argument).expect("valid json");
         assert_eq!(parsed["failure"]["provider_detail"], Value::Null);
@@ -711,6 +768,7 @@ mod tests {
             None,
             throttled.rate_limit_headers.as_deref(),
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&argument).expect("valid json");
         assert_eq!(parsed["failure"]["retry_after_seconds"], 3_600);
@@ -733,6 +791,7 @@ mod tests {
             None,
             Some(&headers),
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&success).expect("valid json");
         assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
@@ -748,6 +807,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         let parsed: Value = serde_json::from_str(&bare).expect("valid json");
         assert_eq!(parsed["rate_limit_headers"], Value::Null);

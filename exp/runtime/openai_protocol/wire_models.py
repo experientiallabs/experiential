@@ -25,7 +25,9 @@ from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEf
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
+from exp.runtime.openai_protocol.native_tools import NativeResponseTool
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
+from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
 
 
 class _WireModel(BaseModel):
@@ -313,7 +315,7 @@ class _Message(_WireModel):
     elsewhere. Other roles keep the named rejection.
     """
     refusal: None = None
-    annotations: tuple[()] | None = None
+    annotations: tuple[JsonObject, ...] | None = None
     audio: None = None
     function_call: None = None
     provider_specific_fields: JsonObject | None = None
@@ -593,6 +595,8 @@ class _ChatRequest(_WireModel):
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     provider: ProviderRoutingPreferences | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""
+    web_search_options: WebSearchOptions | None = None
+    plugins: tuple[ChatPlugin, ...] = ()
     verbosity: Literal["low", "medium", "high"] | None = None
     """Output-length hint (GPT-5 family), the Chat spelling of Responses ``text.verbosity``.
 
@@ -618,31 +622,6 @@ class _ResponseTool(_WireModel):
     description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
-
-
-class _NativeResponseTool(BaseModel):
-    """One non-function Responses tool declaration carried opaquely.
-
-    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool
-    tree), ``web_search``, and ``tool_search`` declarations whose shapes
-    exist on no other wire. Like ``_AdditionalToolsItem``, validation is
-    deliberately shallow and the raw declaration forwards byte-for-byte on
-    native Responses rungs only (each type captured live from Codex 0.151.0
-    and accepted by the provider with a plain API key, 2026-09-01); the
-    provider stays the authority on each declaration's internal shape.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: str = Field(min_length=1, max_length=64)
-
-    @field_validator("type")
-    @classmethod
-    def _require_non_function(cls, value: str) -> str:
-        """Keep typed function declarations on the strict model."""
-        if value == "function":
-            raise ValueError("function tool declarations use the typed profile")
-        return value
 
 
 class _ResponseFunctionCall(_WireModel):
@@ -955,7 +934,7 @@ class _ResponsesRequest(_WireModel):
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     store: bool | None = None
     include: tuple[str, ...] | None = None
-    tools: tuple[_ResponseTool | _NativeResponseTool, ...] = ()
+    tools: tuple[_ResponseTool | NativeResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)

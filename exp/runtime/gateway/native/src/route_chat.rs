@@ -36,6 +36,7 @@ use crate::respond::{
 use crate::server::AppState;
 use crate::settlement::{settle_guarded_failure, AttemptGuard};
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
+use crate::web_search::annotate_chat_completion;
 
 pub(crate) async fn chat(
     State(state): State<AppState>,
@@ -160,6 +161,7 @@ pub(crate) async fn chat(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    guard.record_web_search_requests(admission.web_search_requests());
     // The replay key was authorized independently of admission. If an alias
     // activation landed between the two, the admitted work belongs to a newer
     // revision than the claimed replay scope, so the request fails closed:
@@ -338,7 +340,7 @@ async fn settled_chat_response(
         }
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_chat_body_with_ignored(
+    let mut aggregated = match completed_chat_body_with_ignored(
         &admission.request_id,
         &admission.alias,
         created_at,
@@ -349,6 +351,9 @@ async fn settled_chat_response(
         Ok(aggregated) => aggregated,
         Err(error) => return error_response(&error),
     };
+    if let Some(web_search) = admission.web_search.as_ref() {
+        annotate_chat_completion(&mut aggregated.body, web_search);
+    }
     if let Some(failure) = &aggregated.failure {
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
@@ -386,6 +391,7 @@ fn encode_chat_sse(
         admission.include_usage,
         admission.ignored_parameters.clone(),
     );
+    encoder.set_web_search(admission.web_search.clone());
     encoder.set_reasoning_output_exposed(reasoning_output_exposed);
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string());
@@ -506,7 +512,7 @@ async fn respond_from_chat_events(
             }
         }
     };
-    let aggregated = match completed_chat_body_with_carrier(
+    let mut aggregated = match completed_chat_body_with_carrier(
         &admission.request_id,
         &admission.alias,
         created_at,
@@ -538,6 +544,9 @@ async fn respond_from_chat_events(
             return error_response(&error);
         }
     };
+    if let Some(web_search) = admission.web_search.as_ref() {
+        annotate_chat_completion(&mut aggregated.body, web_search);
+    }
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
@@ -776,6 +785,7 @@ async fn stream_response(
             include_usage,
             admission.ignored_parameters.clone(),
         );
+        encoder.set_web_search(admission.web_search.clone());
         encoder.set_reasoning_output_exposed(admission.reasoning_exposed_at(committed.depth));
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);

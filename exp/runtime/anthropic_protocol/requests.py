@@ -43,7 +43,6 @@ from exp.runtime.anthropic_protocol.gateway_reasoning import (
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
-    MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
 )
 from exp.runtime.anthropic_protocol.media_blocks import (
     AnthropicWireModel,
@@ -56,6 +55,11 @@ from exp.runtime.anthropic_protocol.media_blocks import (
 from exp.runtime.anthropic_protocol.reasoning_channels import (
     ReasoningConfig,
     resolve_reasoning_channels,
+)
+from exp.runtime.anthropic_protocol.server_tools import (
+    ServerTool,
+    messages_web_search,
+    require_served_server_tool_types,
 )
 from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
 from exp.runtime.gateway.compatibility import CompatibilityDisposition
@@ -139,7 +143,7 @@ class _ToolResultBlock(AnthropicWireModel):
     cache_control: CacheControl | None = None
 
 
-class _ServerToolUseBlock(BaseModel):
+class ServerToolUseBlock(BaseModel):
     """One server-tool invocation echoed in history, carried shallowly.
 
     Server-tool block shapes are an evolving provider surface; a closed model
@@ -168,7 +172,7 @@ _ContentBlock = (
     | _RedactedThinkingBlock
     | _ToolUseBlock
     | _ToolResultBlock
-    | _ServerToolUseBlock
+    | ServerToolUseBlock
     | _WebSearchToolResultBlock
 )
 
@@ -211,28 +215,6 @@ class _Tool(AnthropicWireModel):
     defer_loading: bool | None = None
     allowed_callers: tuple[str, ...] | None = None
     input_examples: tuple[JsonObject, ...] | None = None
-
-
-class _ServerTool(BaseModel):
-    """One Anthropic server tool, validated shallowly and carried verbatim.
-
-    Server tools (``web_search_20250305``-style) execute at the provider and carry
-    no ``input_schema``; their per-type configuration is an evolving provider
-    surface, so only the discriminator pair is validated and the raw entry
-    forwards byte-for-byte on native Anthropic rungs.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
-    name: str = Field(min_length=1, max_length=256)
-
-    @model_validator(mode="after")
-    def _require_server_type(self) -> _ServerTool:
-        """Reject the custom discriminator: custom tools take the strict model."""
-        if self.type == "custom":
-            raise ValueError("custom tools must declare an input_schema")
-        return self
 
 
 class _ToolChoice(AnthropicWireModel):
@@ -287,7 +269,7 @@ class _MessagesRequest(AnthropicWireModel):
     top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
-    tools: tuple[_Tool | _ServerTool, ...] = ()
+    tools: tuple[_Tool | ServerTool, ...] = ()
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
@@ -391,7 +373,7 @@ def _decode(
     """Validate ``payload`` against ``wire`` and build the canonical request."""
     _validate_manifest(payload)
     request = validate_wire(payload, wire)
-    _require_served_server_tool_types(request.tools)
+    require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
@@ -443,8 +425,9 @@ def _decode(
             provider_server_tools=tuple(
                 cast(JsonObject, cast(list, payload["tools"])[tool_index])
                 for tool_index, tool in enumerate(request.tools)
-                if isinstance(tool, _ServerTool)
+                if isinstance(tool, ServerTool)
             ),
+            web_search=messages_web_search(payload, request.tools),
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
@@ -483,28 +466,6 @@ def _decode(
     except ValidationError as exc:
         raise validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
-
-
-def _require_served_server_tool_types(tools: tuple[_Tool | _ServerTool, ...]) -> None:
-    """Reject any server tool type the gateway cannot serve truthfully.
-
-    Acceptance means the data plane carries every block the tool makes the
-    provider stream (see the decision tables in ``manifest.py``); an
-    unclassified type stays rejected until the SDK drift gate forces its
-    decision, so a new provider tool never half-works silently.
-
-    Raises:
-        OpenAIProtocolError: A tool entry names an unserved server tool type.
-    """
-    for tool_index, tool in enumerate(tools):
-        if isinstance(tool, _ServerTool) and tool.type not in MESSAGES_SERVER_TOOL_TYPES_ACCEPTED:
-            supported = ", ".join(sorted(MESSAGES_SERVER_TOOL_TYPES_ACCEPTED))
-            raise invalid_field(
-                f"tools.{tool_index}.type",
-                f"the server tool type '{tool.type}' is not supported by this gateway. "
-                f"Supported server tool types: {supported}. Remove the tool or use a "
-                "supported type.",
-            )
 
 
 def _context_management(payload: JsonObject) -> JsonObject | None:
@@ -901,7 +862,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 )
             )
             ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
-        elif isinstance(block, (_ServerToolUseBlock, _WebSearchToolResultBlock)):
+        elif isinstance(block, (ServerToolUseBlock, _WebSearchToolResultBlock)):
             if message.role != "assistant":
                 raise invalid_field(
                     f"{param}.content.{block_index}",

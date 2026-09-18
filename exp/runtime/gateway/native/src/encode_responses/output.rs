@@ -6,6 +6,7 @@ use super::{aggregate, OutputSlot, ResponsesSseEncoder};
 use crate::encode::compact_json;
 use crate::errors::Failure;
 use crate::events::ProviderOutputItemStatus;
+use crate::web_search::annotate_usage_details;
 
 impl ResponsesSseEncoder {
     /// Build one SDK-readable Responses envelope for the current lifecycle state.
@@ -77,7 +78,9 @@ impl ResponsesSseEncoder {
             "max_output_tokens": self.envelope.max_output_tokens,
             "previous_response_id": self.envelope.previous_response_id,
             "usage": if include_content {
-                aggregate::responses_usage(self.usage.as_ref())
+                let mut usage = aggregate::responses_usage(self.usage.as_ref());
+                annotate_usage_details(&mut usage, self.web_search.as_ref());
+                usage
             } else {
                 Value::Null
             },

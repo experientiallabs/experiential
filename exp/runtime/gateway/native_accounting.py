@@ -21,7 +21,6 @@ from collections.abc import Callable
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
-from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
@@ -36,6 +35,11 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.native_accounting_errors import (
+    NativeBridgeError,
+    authority_error,
+    internal_protocol_error,
+)
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -67,63 +71,17 @@ from exp.runtime.gateway.native_settlement import (
     terminal_from_settlement,
     upstream_provider_from_settlement,
     upstream_provider_kwarg,
+    web_search_requests_from_terminal,
+    web_search_requests_kwarg,
 )
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
-from exp.runtime.openai_protocol.errors import (
-    OpenAIProtocolError,
-    public_failure_error,
-)
+from exp.runtime.openai_protocol.errors import public_failure_error
 
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
 _logger = logging.getLogger(__name__)
-
-
-class NativeBridgeError(Exception):
-    """One sanitized boundary failure delivered to the native data plane."""
-
-    def __init__(self, error: OpenAIProtocolError) -> None:
-        """Retain the public error as the JSON payload the data plane returns.
-
-        Args:
-            error: Sanitized protocol error carrying its HTTP representation.
-        """
-        super().__init__(error.detail.message)
-        self.public_error_json = json.dumps(
-            {
-                "status_code": error.status_code,
-                "code": error.detail.code,
-                "message": error.detail.message,
-                "error_type": error.detail.type,
-                "param": error.detail.param,
-                "retry_after_seconds": error.retry_after_seconds,
-            },
-            separators=(",", ":"),
-        )
-
-
-def authority_error(exception: Exception) -> NativeBridgeError:
-    """Map boundary failures through the shared service-layer mapper.
-
-    Args:
-        exception: Store, grant, routing, or execution failure.
-
-    Returns:
-        A boundary error carrying the matching public OpenAI error.
-    """
-    return NativeBridgeError(boundary_protocol_error(exception))
-
-
-def internal_protocol_error() -> OpenAIProtocolError:
-    """Return the public internal error for a broken data-plane wire contract."""
-    return OpenAIProtocolError(
-        status_code=500,
-        code="internal_error",
-        message="The gateway request failed.",
-        error_type="api_error",
-    )
 
 
 class NativeAttemptAccounting:
@@ -682,6 +640,9 @@ class NativeAttemptAccounting:
                 ratelimit_limit_tokens=rate_limit.limit_tokens,
                 ratelimit_remaining_tokens=rate_limit.remaining_tokens,
                 **upstream_provider_kwarg(self._finish_attempt, upstream),
+                **web_search_requests_kwarg(
+                    self._finish_attempt, web_search_requests_from_terminal(terminal)
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -981,6 +942,9 @@ class NativeAttemptAccounting:
                 ratelimit_limit_tokens=observation.limit_tokens,
                 ratelimit_remaining_tokens=observation.remaining_tokens,
                 **upstream_provider_kwarg(self._finish_attempt, upstream),
+                **web_search_requests_kwarg(
+                    self._finish_attempt, web_search_requests_from_terminal(terminal)
+                ),
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False

@@ -20,10 +20,7 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, new_guard, served_headers, Admission,
 };
 use crate::encode::compact_json;
-use crate::encode_messages::{
-    anthropic_error_body, completed_messages_body_with_reasoning, AggregatedMessage,
-    MessagesSseEncoder,
-};
+use crate::encode_messages::{anthropic_error_body, AggregatedMessage, MessagesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::guardrails::{released_events, StreamRedactor};
@@ -41,6 +38,7 @@ use crate::waterfall::{
     acquire_attempt, billed_empty_completion, unreported_empty_completion, CommittedAttempt,
     Served, SettledAttempt, WaterfallContext, Won,
 };
+use crate::web_search::{completed_messages_body_with_web_search, configure_messages_encoder};
 
 /// Anthropic-enveloped variant of `error_response` for the Messages surface,
 /// mirroring `anthropic_error_response` in the python engine.
@@ -193,6 +191,7 @@ pub(crate) async fn messages(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    guard.record_web_search_requests(admission.web_search_requests());
 
     let permit = match acquire_permit(&state, &mut guard, deadline).await {
         Ok(permit) => permit,
@@ -296,13 +295,14 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
         };
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_messages_body_with_reasoning(
+    let aggregated = match completed_messages_body_with_web_search(
         &admission.request_id,
         &admission.alias,
         &events,
         &admission.ignored_parameters,
         None,
         exposed,
+        admission.web_search.as_ref(),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => return messages_error_response(&error),
@@ -344,13 +344,14 @@ async fn respond_from_messages_events(
         }
     };
     let exposed = admission.reasoning_exposed_at(depth);
-    let aggregated = match completed_messages_body_with_reasoning(
+    let aggregated = match completed_messages_body_with_web_search(
         &admission.request_id,
         &admission.alias,
         &events,
         &admission.ignored_parameters,
         carrier.as_deref(),
         exposed,
+        admission.web_search.as_ref(),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
@@ -487,6 +488,11 @@ fn encode_messages_sse(
         &admission.request_id,
         &admission.alias,
         admission.ignored_parameters.clone(),
+    );
+    configure_messages_encoder(
+        &mut encoder,
+        admission.web_search.as_ref(),
+        &admission.request_id,
     );
     encoder.set_reasoning_output_exposed(reasoning_output_exposed);
     encoder.set_pre_dispatch_input_estimate(admission.input_token_estimate);
@@ -628,6 +634,7 @@ async fn stream_messages(
         let mut committed = committed;
         let mut encoder =
             MessagesSseEncoder::new_with_ignored(&request_id, &alias, ignored_parameters);
+        configure_messages_encoder(&mut encoder, admission.web_search.as_ref(), &request_id);
         encoder.set_reasoning_output_exposed(admission.reasoning_exposed_at(committed.depth));
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);

@@ -2182,3 +2182,43 @@ def test_provider_zdr_demand_decodes_on_the_messages_surface() -> None:
     plain = decode_messages(_body())
     assert plain.request.zdr_requested is False
     assert plain.request.provider_preferences is None
+
+
+def test_web_search_server_tool_also_normalizes_into_a_gateway_search() -> None:
+    """The verbatim carrier stays for Anthropic rungs; other routes get the gateway search."""
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 3,
+                    "blocked_domains": ["spam.example"],
+                    "user_location": {"type": "approximate", "city": "Bern"},
+                }
+            ]
+        )
+    )
+    search = decoded.request.web_search
+    assert search is not None
+    assert search.declared_as == "messages_server_tool"
+    assert search.max_uses == 3
+    assert search.blocked_domains == ("spam.example",)
+    assert search.user_location == {"type": "approximate", "city": "Bern"}
+    assert decoded.request.provider_server_tools[0]["type"] == "web_search_20250305"
+    plain = decode_messages(_body())
+    assert plain.request.web_search is None
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_messages(
+            _body(
+                tools=[
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "allowed_domains": ["a.com"],
+                        "blocked_domains": ["b.com"],
+                    }
+                ]
+            )
+        )
+    assert error.value.detail.param == "tools.0"
