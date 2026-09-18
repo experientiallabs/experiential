@@ -16,6 +16,7 @@ import os
 import threading
 from collections.abc import Mapping, Sequence
 from typing import Final, Protocol
+from urllib.parse import urlparse
 from weakref import WeakKeyDictionary
 
 import httpx
@@ -282,6 +283,35 @@ def _parse_exa(raw: bytes, max_results: int) -> tuple[GatewayWebSearchResult, ..
     return tuple(hits)
 
 
+_LOOPBACK_HOSTS: Final = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def validate_search_url(url: str) -> str:
+    """Accept an https search endpoint, or plain http only to an exact loopback host.
+
+    The credential rides every search request, so the endpoint must not be
+    steerable to an attacker host: the URL is parsed and the host compared
+    exactly (a prefix test would admit ``127.0.0.1.evil.example``).
+
+    Args:
+        url: Candidate endpoint.
+
+    Returns:
+        The validated URL.
+
+    Raises:
+        ValueError: The scheme, host, credentials, or fragment are unacceptable.
+    """
+    parsed = urlparse(url)
+    if parsed.username or parsed.password or parsed.fragment or not parsed.hostname:
+        raise ValueError(f"{EXA_SEARCH_URL_ENV} must be a bare https URL")
+    if parsed.scheme == "https":
+        return url
+    if parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS:
+        return url
+    raise ValueError(f"{EXA_SEARCH_URL_ENV} must be an https URL (or an exact loopback fixture)")
+
+
 def default_web_search_backend(
     environ: Mapping[str, str] | None = None,
 ) -> WebSearchBackend | None:
@@ -296,8 +326,6 @@ def default_web_search_backend(
     mapping = os.environ if environ is None else environ
     if not mapping.get(EXA_API_KEY_ENV):
         return None
-    url = mapping.get(EXA_SEARCH_URL_ENV) or EXA_SEARCH_URL
-    if not url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
-        raise ValueError(f"{EXA_SEARCH_URL_ENV} must be an https URL (or a loopback fixture)")
+    url = validate_search_url(mapping.get(EXA_SEARCH_URL_ENV) or EXA_SEARCH_URL)
     _logger.info("gateway web search backend: exa")
     return ExaWebSearchBackend(url=url, environ=environ)

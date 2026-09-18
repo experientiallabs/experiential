@@ -14,6 +14,7 @@ from exp.runtime.gateway.web_search.backend import (
     WebSearchBackendError,
     _parse_exa,
     default_web_search_backend,
+    validate_search_url,
 )
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 
@@ -140,5 +141,15 @@ def test_default_backend_honors_a_loopback_or_https_url_override() -> None:
     )
     assert isinstance(backend, ExaWebSearchBackend)
     assert backend._url == "http://127.0.0.1:9/search"
-    with pytest.raises(ValueError, match="https"):
-        default_web_search_backend({EXA_API_KEY_ENV: "k", "EXA_SEARCH_URL": "http://evil.example/"})
+    for hostile in (
+        "http://evil.example/",
+        "http://127.0.0.1.evil.example/search",
+        "http://localhost.evil.example/",
+        "http://user:pw@127.0.0.1/search",
+        "https://api.exa.ai/search#frag",
+        "ftp://127.0.0.1/",
+    ):
+        with pytest.raises(ValueError, match="https"):
+            default_web_search_backend({EXA_API_KEY_ENV: "k", "EXA_SEARCH_URL": hostile})
+    assert validate_search_url("http://[::1]:8080/search") == "http://[::1]:8080/search"
+    assert validate_search_url("https://proxy.example/exa") == "https://proxy.example/exa"
