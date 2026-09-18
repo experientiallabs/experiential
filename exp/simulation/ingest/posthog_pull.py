@@ -12,7 +12,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import JsonValue, TypeAdapter
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from exp.common.core.artifacts import JsonObject, SourceIdentity, canonical_json_bytes
 from exp.simulation.ingest.otlp import GENAI_SEMANTIC_CONVENTION_VERSION, TraceNormalizationResult
@@ -129,14 +129,41 @@ def _query_payload(
     body: JsonObject,
 ) -> JsonValue:
     """Issue one bounded injected or owned HTTP request and validate its JSON result."""
-    if client is not None:
-        response = client.post(endpoint, headers=headers, json=body, timeout=60.0)
-        response.raise_for_status()
-        return response.json()
-    with httpx.Client() as owned_client:
-        response = owned_client.post(endpoint, headers=headers, json=body, timeout=60.0)
-        response.raise_for_status()
-        return _JSON_VALUE_ADAPTER.validate_python(response.json())
+    try:
+        if client is not None:
+            response = client.post(endpoint, headers=headers, json=body, timeout=60.0)
+            return _response_payload(response)
+        with httpx.Client() as owned_client:
+            response = owned_client.post(endpoint, headers=headers, json=body, timeout=60.0)
+            return _response_payload(response)
+    except httpx.HTTPStatusError as exc:
+        raise PostHogPullError(_status_error_message(exc.response.status_code)) from exc
+    except httpx.RequestError as exc:
+        raise PostHogPullError(
+            "PostHog pull could not reach PostHog; verify POSTHOG_HOST and network connectivity"
+        ) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError) as exc:
+        raise PostHogPullError(
+            "PostHog returned invalid JSON; verify the host targets a PostHog API"
+        ) from exc
+
+
+def _response_payload(response: PostHogResponse | httpx.Response) -> JsonValue:
+    """Validate one successful PostHog response as JSON without exposing its content."""
+    response.raise_for_status()
+    return _JSON_VALUE_ADAPTER.validate_python(response.json())
+
+
+def _status_error_message(status_code: int) -> str:
+    """Return content-safe remediation for one PostHog HTTP failure."""
+    if status_code in {401, 403}:
+        return "PostHog rejected the API key or project access; verify both values"
+    if status_code == 429:
+        return "PostHog rate limit exceeded; retry the pull later"
+    return (
+        f"PostHog query failed with HTTP status {status_code}; "
+        "verify the project and PostHog service status"
+    )
 
 
 def _posthog_host(value: str) -> str:
