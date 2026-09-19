@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -552,6 +553,7 @@ def _emit_gateway_ready(
             markup=False,
         )
         _console.print(
-            f"export EXP_GATEWAY_KEY=\"$(tr -d '\\n' < {compatibility.key_file})\"",
+            "export EXP_GATEWAY_KEY=\"$(tr -d '\\n' < "
+            f'{shlex.quote(str(compatibility.key_file))})"',
             markup=False,
         )
