@@ -189,6 +189,7 @@ class NativeControlPlane(
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
         web_search: WebSearchBackend | None = None,
+        default_lane_bound: int | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -211,6 +212,10 @@ class NativeControlPlane(
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
             web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
+            default_lane_bound: Per-worker in-flight cap for rungs that author
+                no ``concurrency_bound`` (``lane_saturation.default_lane_bound``
+                of the data plane's ``max_active_requests``); ``None`` leaves
+                unauthored rungs unbounded, the historical behavior.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -245,6 +250,7 @@ class NativeControlPlane(
             self._write_ledger,
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
+            default_lane_bound=default_lane_bound,
         )
         # Every reservation tokenizes its prompt; build the packaged BPE now so
         # a fresh process pays that once at bind time, never on its first

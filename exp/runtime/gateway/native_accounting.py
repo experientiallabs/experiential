@@ -36,6 +36,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
 from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
     authority_error,
@@ -107,6 +108,7 @@ class NativeAttemptAccounting:
         *,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         cache_sample_gate: Callable[[str], bool] | None = None,
+        default_lane_bound: int | None = None,
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -114,6 +116,7 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation.
+            default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
             cache_sample_gate: Optional hosted predicate deciding whether one
                 settled attempt (by attempt id) may feed the cache-priority
                 EWMA. The hosted store knows which attempts are promo-funded;
@@ -129,7 +132,7 @@ class NativeAttemptAccounting:
         self._cache_sample_gate = cache_sample_gate
         # Revision-scoped deployment health; physical-lane load survives catalog rolls.
         self._health = DeploymentHealthRegistry()
-        self._loads = RungLoadRegistry()
+        self._loads = RungLoadRegistry(default_bound=default_lane_bound)
         # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
@@ -149,6 +152,7 @@ class NativeAttemptAccounting:
         # could serve. The per-reason counters split the aggregate.
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
+        self._rung_saturation_refusals = 0
         self._rung_rate_limit_sheds = 0
         self._rung_fresh_session_spills = 0
         # Cache-stakes throttle dispositions on pools authoring a
@@ -228,10 +232,11 @@ class NativeAttemptAccounting:
                     self._rung_fresh_session_spills += 1
         return result
 
-    def rung_admission_counters(self) -> tuple[int, int]:
-        """Return ``(sheds, saturated_overflows)`` for the metrics snapshot."""
+    def rung_admission_counters(self) -> tuple[int, int, int]:
+        """Return ``(sheds, saturated_overflows, saturation_refusals)`` for metrics."""
         with self._lock:
-            return (self._rung_admission_sheds, self._rung_saturated_overflows)
+            sheds, overflows = self._rung_admission_sheds, self._rung_saturated_overflows
+            return (sheds, overflows, self._rung_saturation_refusals)
 
     def rung_rate_counters(self) -> tuple[int, int]:
         """Return ``(rate_limit_sheds, fresh_session_spills)`` for metrics."""
@@ -405,14 +410,20 @@ class NativeAttemptAccounting:
             )
             last_failure = None
         forced_overflow = False
+        shed_records: dict[int, RungShed] = {}
         # The input half of the reservation tokenizes the whole prompt, so it
         # is computed once per ladder walk and shared with every candidate.
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             if candidate is None:
                 if policy_sheds and last_failure is None and not forced_overflow:
-                    forced_overflow = True
-                    candidate = policy_sheds[0][0]
+                    candidate = overflow_target(route, policy_sheds, shed_records)
+                    forced_overflow = candidate is not None
+                    if candidate is None:
+                        last_failure = lane_saturated_failure()
+                        with self._lock:
+                            self._rung_saturation_refusals += 1
+                        break
                 else:
                     break
             deployment = deployment_priced_for_service_tier(
@@ -437,6 +448,7 @@ class NativeAttemptAccounting:
             )
             if isinstance(ticket, RungShed):
                 policy_sheds.append((candidate, ticket.reason))
+                shed_records.setdefault(candidate, ticket)
                 self._health.release_probe(keys[candidate])
                 forced_overflow = shed_keeps_rung(
                     route, candidate, redial_depth, last_failure, ticket.reason

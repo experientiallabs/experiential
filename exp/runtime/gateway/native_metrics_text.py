@@ -76,6 +76,10 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Dispatches forced past a saturated rung bound.",
     ),
     (
+        "rung_saturation_refusals",
+        "Requests refused with every rung at its bound.",
+    ),
+    (
         "rung_rate_limit_sheds",
         "Dispatches shed by a rung's rate window.",
     ),

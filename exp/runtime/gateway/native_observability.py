@@ -141,7 +141,7 @@ class NativeObservabilityMixin:
             data_plane = json.loads(self._data_plane_metrics())
         retained_replayed, abandoned_cancelled, inflight = self._accounting.counters()
         lead_rungs_skipped, dead_rungs_skipped = self._accounting.admission_rung_skips()
-        rung_sheds, rung_overflows = self._accounting.rung_admission_counters()
+        rung_sheds, rung_overflows, rung_refusals = self._accounting.rung_admission_counters()
         rate_limit_sheds, fresh_session_spills = self._accounting.rung_rate_counters()
         throttles_surfaced, throttles_failed_over, throttle_backoffs, throttle_backoffs_forced = (
             self._accounting.throttle_cache_counters()
@@ -154,6 +154,7 @@ class NativeObservabilityMixin:
             "admission_parameter_coercions": self._accounting.admission_parameter_coercions(),
             "rung_admission_sheds": rung_sheds,
             "rung_saturated_overflows": rung_overflows,
+            "rung_saturation_refusals": rung_refusals,
             "rung_rate_limit_sheds": rate_limit_sheds,
             "rung_fresh_session_spills": fresh_session_spills,
             # Cache-stakes throttle dispositions on pools authoring a

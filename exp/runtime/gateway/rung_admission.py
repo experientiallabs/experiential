@@ -138,6 +138,15 @@ class RungShed:
     it; the durable disclosure column stays the bare reason code. A float
     because the ceiling can sit below one request per minute per worker.
     """
+    default_bound: bool = False
+    """Whether the bound that shed was the worker's default lane share.
+
+    A ``queue_bound`` shed by a bound the rung never authored (the worker's
+    default in-flight share, ``exp.runtime.gateway.lane_saturation``) is never
+    force-admitted when the ladder is exhausted: the default exists to keep
+    one lane from holding every admission permit, so overflowing it would
+    protect nothing. An authored bound keeps its authored ``saturation``.
+    """
 
 
 @dataclass
@@ -194,18 +203,25 @@ class RungLoadRegistry:
         *,
         activity_window_seconds: float = ACTIVITY_WINDOW_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        default_bound: int | None = None,
     ) -> None:
         """Initialize empty counters with an injectable clock for tests.
 
         Args:
             activity_window_seconds: Recency horizon for share reservations.
             clock: Monotonic clock.
+            default_bound: The per-worker in-flight cap applied to every rung
+                that authors no ``concurrency_bound`` (the worker's default
+                lane share); ``None`` leaves unauthored rungs unbounded.
 
         Raises:
             ValueError: The activity window is not positive.
         """
         if activity_window_seconds <= 0:
             raise ValueError("activity window must be positive")
+        if default_bound is not None and default_bound < 1:
+            raise ValueError("default_bound must be at least one")
+        self.default_bound = default_bound
         self._window = activity_window_seconds
         self._clock = clock
         self._rungs: dict[RungLoadKey, _RungLoad] = {}

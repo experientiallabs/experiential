@@ -1125,7 +1125,7 @@ def test_pinned_continuation_rate_shed_keeps_the_issuing_rung_then_fails_over(
     request_id = _admitted_request_id(continued)
     assert _attempt_dispatch_reasons(control, request_id) == ["saturated_overflow"]
     assert _attempt_route_reasons(control, request_id) == [(0, "reasoning_continuation")]
-    assert control._accounting.rung_admission_counters() == (1, 1)  # noqa: SLF001
+    assert control._accounting.rung_admission_counters() == (1, 1, 0)  # noqa: SLF001
 
     throttled = {
         "failure_class": "throttled",
