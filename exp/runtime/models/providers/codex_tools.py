@@ -317,7 +317,10 @@ def invert_tool_call(
 
 
 def convert_native_history(
-    messages: Sequence[GatewayMessage], mapping: NativeToolMapping
+    messages: Sequence[GatewayMessage],
+    mapping: NativeToolMapping,
+    *,
+    tool_search_name: str = GATEWAY_TOOL_SEARCH_NAME,
 ) -> tuple[tuple[GatewayMessage, ...], list[str]]:
     """Convert native Responses history items to foreign-wire messages.
 
@@ -343,7 +346,7 @@ def convert_native_history(
         if item is None:
             converted.append(message)
             continue
-        replacement, disclosure = _convert_history_item(item, mapping)
+        replacement, disclosure = _convert_history_item(item, mapping, tool_search_name)
         if replacement is not None:
             converted.append(replacement)
         if disclosure is not None and disclosure not in disclosures:
@@ -352,7 +355,7 @@ def convert_native_history(
 
 
 def _convert_history_item(
-    item: JsonObject, mapping: NativeToolMapping
+    item: JsonObject, mapping: NativeToolMapping, tool_search_name: str
 ) -> tuple[GatewayMessage | None, str | None]:
     item_type = item.get("type")
     if item_type == "additional_tools":
@@ -432,7 +435,7 @@ def _convert_history_item(
             arguments = {"query": arguments["goal"]}
         call = ToolCall(
             call_id=call_id,
-            name=GATEWAY_TOOL_SEARCH_NAME,
+            name=tool_search_name,
             arguments=arguments,
             raw_arguments=json.dumps(arguments, separators=(",", ":")),
         )

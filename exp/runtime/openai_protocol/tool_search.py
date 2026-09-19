@@ -50,7 +50,14 @@ def chat_tool_search(
     """
     for entry in native_tools:
         if entry.tool.get("type") == OPENROUTER_TOOL_SEARCH_TYPE:
+            raw_limit = entry.tool.get("max_results")
+            limit = (
+                raw_limit if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) else 5
+            )
             return GatewayToolSearch(
-                declared_as="openrouter_tool", mode="any", tool_type=OPENROUTER_TOOL_SEARCH_TYPE
+                declared_as="openrouter_tool",
+                mode="any",
+                tool_type=OPENROUTER_TOOL_SEARCH_TYPE,
+                default_limit=max(1, min(10, limit)),
             )
     return None

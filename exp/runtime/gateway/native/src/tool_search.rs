@@ -86,6 +86,10 @@ pub struct ToolSearchRound {
     /// over names alone.
     #[serde(default)]
     pub matched_tools: Vec<Value>,
+    /// The caller's own declaration name (a versioned Anthropic type keeps
+    /// its version), rendered as the Messages `server_tool_use.name`.
+    #[serde(default)]
+    pub declared_name: Option<String>,
 }
 
 impl ToolSearchRound {
@@ -95,11 +99,11 @@ impl ToolSearchRound {
     }
 
     /// The Anthropic server tool name this round renders as.
-    pub fn anthropic_tool_name(&self) -> &'static str {
-        if self.is_regex() {
-            TOOL_SEARCH_REGEX_TOOL_NAME
-        } else {
-            TOOL_SEARCH_BM25_TOOL_NAME
+    pub fn anthropic_tool_name(&self) -> &str {
+        match self.declared_name.as_deref() {
+            Some(name) if !name.is_empty() && name.starts_with("tool_search") => name,
+            _ if self.is_regex() => TOOL_SEARCH_REGEX_TOOL_NAME,
+            _ => TOOL_SEARCH_BM25_TOOL_NAME,
         }
     }
 

@@ -72,17 +72,18 @@ def tool_document(tool: GatewayToolDefinition) -> str:
     return " ".join(parts)[:_MAXIMUM_DOCUMENT_CHARACTERS]
 
 
-def clamp_limit(limit: object) -> int:
-    """Bound a caller-supplied result limit.
+def clamp_limit(limit: object, *, default: int = DEFAULT_TOOL_SEARCH_LIMIT) -> int:
+    """Bound a model-supplied result limit.
 
     Args:
         limit: The raw ``limit`` argument the model sent.
+        default: The declaration's default (OpenRouter ``max_results``) when absent.
 
     Returns:
-        An integer between 1 and the ceiling; the default when absent or invalid.
+        An integer between 1 and the ceiling; ``default`` when absent or invalid.
     """
     if isinstance(limit, bool) or not isinstance(limit, int):
-        return DEFAULT_TOOL_SEARCH_LIMIT
+        return max(1, min(MAXIMUM_TOOL_SEARCH_LIMIT, default))
     return max(1, min(MAXIMUM_TOOL_SEARCH_LIMIT, limit))
 
 
@@ -111,14 +112,19 @@ def bm25_search(
     average = max(1.0, sum(lengths) / len(lengths))
     frequencies = [Counter(document) for document in documents]
     document_count = len(documents)
+    unique_terms = set(terms)
+    # Document frequency once per query term, so scoring stays linear in the corpus.
+    containing_by_term = {
+        term: sum(1 for counts in frequencies if term in counts) for term in unique_terms
+    }
     scored: list[tuple[float, int]] = []
     for index, counts in enumerate(frequencies):
         score = 0.0
-        for term in set(terms):
+        for term in unique_terms:
             frequency = counts.get(term, 0)
             if frequency == 0:
                 continue
-            containing = sum(1 for other in frequencies if term in other)
+            containing = containing_by_term[term]
             idf = math.log(1.0 + (document_count - containing + 0.5) / (containing + 0.5))
             normalized = frequency * (_BM25_K1 + 1.0)
             denominator = frequency + _BM25_K1 * (

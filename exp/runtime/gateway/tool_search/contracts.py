@@ -10,6 +10,7 @@ whether the provider runs the search natively or the gateway does.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Literal
 
 from pydantic import Field
@@ -80,6 +81,10 @@ class GatewayToolSearch(ContractModel):
     tool_name: str | None = Field(default=None, max_length=256)
     """The caller's ``name`` for the declaration when the surface carries one."""
     max_rounds: int = Field(default=DEFAULT_TOOL_SEARCH_ROUNDS, ge=1, le=8)
+    default_limit: int = Field(
+        default=DEFAULT_TOOL_SEARCH_LIMIT, ge=1, le=MAXIMUM_TOOL_SEARCH_LIMIT
+    )
+    """Results per search when the model names no ``limit`` (OpenRouter ``max_results``)."""
 
 
 def gateway_tool_search_definition(name: str, mode: ToolSearchMode) -> JsonObject:
@@ -123,3 +128,27 @@ def gateway_tool_search_definition(name: str, mode: ToolSearchMode) -> JsonObjec
             "additionalProperties": False,
         },
     }
+
+
+def gateway_tool_search_name(taken: Iterable[str]) -> str:
+    """Pick the gateway's search-tool name so it never collides with a caller tool.
+
+    ``tool_search`` when free, else ``gateway_tool_search``, else a numbered
+    variant; the same rule runs at admission and when the caller replays a
+    prior turn's ``tool_search_call`` item, so both name the same tool.
+
+    Args:
+        taken: The caller's tool names.
+
+    Returns:
+        A free name.
+    """
+    names = set(taken)
+    if GATEWAY_TOOL_SEARCH_NAME not in names:
+        return GATEWAY_TOOL_SEARCH_NAME
+    candidate = GATEWAY_TOOL_SEARCH_FALLBACK_NAME
+    suffix = 2
+    while candidate in names:
+        candidate = f"{GATEWAY_TOOL_SEARCH_FALLBACK_NAME}_{suffix}"
+        suffix += 1
+    return candidate

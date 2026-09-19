@@ -492,15 +492,18 @@ fn a_failed_round_callback_fails_the_request_closed_with_the_gateways_error() {
         assert_eq!(error.status_code, 500);
         assert_eq!(error.code, "internal_error");
         let story = harness.story().await;
-        // The search-call attempt settled (billed) before the round was
-        // asked for; the request itself was then abandoned as internal.
+        // The round was asked for while the search-call attempt was still
+        // open, so the failure settles THAT attempt as the request's
+        // finalizing failure and the metered searches ride along; no
+        // attempt-less abandon ever happens.
         let settles = story["settles"].as_array().expect("settles");
         assert_eq!(settles.len(), 1);
-        assert_eq!(settles[0]["outcome"], "completed");
-        assert_eq!(settles[0]["finalize"], false);
+        assert_eq!(settles[0]["outcome"], "failed");
+        assert_eq!(settles[0]["finalize"], true);
+        assert_eq!(settles[0]["failure"]["failure_class"], "internal");
+        assert!(settles[0].get("tool_search_requests").is_none());
         let abandons = story["abandons"].as_array().expect("abandons");
-        assert_eq!(abandons.len(), 1);
-        assert_eq!(abandons[0]["failure"]["failure_class"], "internal");
+        assert_eq!(abandons.len(), 0);
         assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
         assert_eq!(rung.bodies.lock().expect("lock").len(), 1);
     });

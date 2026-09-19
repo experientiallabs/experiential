@@ -29,13 +29,12 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.gateway.tool_search.contracts import (
-    GATEWAY_TOOL_SEARCH_FALLBACK_NAME,
-    GATEWAY_TOOL_SEARCH_NAME,
     MESSAGES_TOOL_SEARCH_TYPES,
     OPENROUTER_TOOL_SEARCH_TYPE,
     RESPONSES_TOOL_SEARCH_TYPES,
     GatewayToolSearch,
     gateway_tool_search_definition,
+    gateway_tool_search_name,
 )
 
 DROPPED_NO_DEFERRED: Final = "tool_search->dropped(no_deferred_tools)"
@@ -190,12 +189,7 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
             None,
             None,
         )
-    taken = {tool.name for tool in request.tools}
-    tool_name = (
-        GATEWAY_TOOL_SEARCH_NAME
-        if GATEWAY_TOOL_SEARCH_NAME not in taken
-        else GATEWAY_TOOL_SEARCH_FALLBACK_NAME
-    )
+    tool_name = gateway_tool_search_name(tool.name for tool in request.tools)
     state = ToolSearchState(search=search, tool_name=tool_name, loaded=loaded, deferred=deferred)
     stripped = strip_search_carriers(request)
     dispatch = stripped.model_copy(update={"tools": state.dispatch_tools()})
@@ -204,5 +198,9 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
         "max_rounds": search.max_rounds,
         "deferred": len(deferred),
         "surface_shape": surface_shape(search),
+        # The caller's own declaration, so the rendered round trip names it
+        # exactly (a versioned Anthropic type keeps its version and name).
+        "declared_type": search.tool_type,
+        "declared_name": search.tool_name or search.tool_type,
     }
     return ToolSearchPlan(dispatch, state, admission)

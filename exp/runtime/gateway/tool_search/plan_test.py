@@ -84,6 +84,8 @@ def test_gateway_search_partitions_tools_and_offers_the_search_tool() -> None:
         "max_rounds": 3,
         "deferred": 2,
         "surface_shape": "messages_bm25",
+        "declared_type": "tool_search_tool_bm25",
+        "declared_name": "ts",
     }
     assert [tool.name for tool in plan.state.deferred] == ["deferred_a", "deferred_b"]
     properties = cast("dict[str, object]", plan.request.tools[1].parameters["properties"])
@@ -136,3 +138,13 @@ def test_strip_carriers_leaves_unrelated_tools() -> None:
     )
     stripped = strip_search_carriers(request)
     assert [entry.tool["type"] for entry in stripped.provider_native_tools] == ["custom"]
+
+
+def test_gateway_tool_name_skips_every_taken_variant() -> None:
+    from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
+
+    assert gateway_tool_search_name([]) == "tool_search"
+    assert gateway_tool_search_name(["tool_search"]) == "gateway_tool_search"
+    assert (
+        gateway_tool_search_name(["tool_search", "gateway_tool_search"]) == "gateway_tool_search_2"
+    )

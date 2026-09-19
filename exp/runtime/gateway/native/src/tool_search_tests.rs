@@ -21,6 +21,7 @@ fn round(
         pattern: pattern.map(str::to_string),
         matched: matched.iter().map(|name| name.to_string()).collect(),
         matched_tools: Vec::new(),
+        declared_name: None,
     }
 }
 

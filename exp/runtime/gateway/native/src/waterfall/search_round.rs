@@ -39,6 +39,24 @@ pub(super) async fn negotiate(
     tool_names: &[String],
     rounds: &mut Vec<ToolSearchRound>,
 ) -> Result<ToolSearchRoundReply, Won> {
+    // Ask the control plane first, while the search-call attempt is still
+    // open: a round that cannot be answered settles THIS attempt as the
+    // request's finalizing failure, carrying every round metered so far, so
+    // the searches are never lost to an attempt-less abandon.
+    let argument = round_argument(ctx.request_id, depth, round, calls, usage);
+    let reply: Option<ToolSearchRoundReply> =
+        match ctx.bridge.call("tool_search_round", argument).await {
+            Ok(text) => serde_json::from_str(&text).ok(),
+            Err(_) => None,
+        };
+    let Some(reply) = reply else {
+        guard.record_tool_search_requests(rounds.len() as u32);
+        return Err(
+            fail_closed(guard, usage, tool_names, "gateway tool search round failed").await,
+        );
+    };
+    rounds.extend(reply.rounds.iter().cloned());
+    guard.record_tool_search_requests(rounds.len() as u32);
     // The search-call turn was answered and billed; it closes as completed
     // without finalizing the request, exactly like a throttled rung's
     // non-finalizing settlement leaves the request open for its redial.
@@ -48,27 +66,21 @@ pub(super) async fn negotiate(
     {
         return Err(Won::Failed(PublicError::internal()));
     }
-    let argument = round_argument(ctx.request_id, depth, round, calls, usage);
-    let text = match ctx.bridge.call("tool_search_round", argument).await {
-        Ok(text) => text,
-        Err(_) => return Err(fail_closed(guard, "gateway tool search round failed").await),
-    };
-    let reply: ToolSearchRoundReply = match serde_json::from_str(&text) {
-        Ok(reply) => reply,
-        Err(_) => {
-            return Err(fail_closed(guard, "gateway tool search round wire contract failed").await)
-        }
-    };
-    rounds.extend(reply.rounds.iter().cloned());
-    guard.record_tool_search_requests(rounds.len() as u32);
     Ok(reply)
 }
 
-/// Terminalize the request (no attempt is active: the search-call attempt
-/// settled above) with the gateway's own internal error.
-async fn fail_closed(guard: &mut AttemptGuard, message: &str) -> Won {
+/// Terminalize the request on the still-open search-call attempt with the
+/// gateway's own internal error (a finalizing settlement, so the metered
+/// rounds ride along).
+async fn fail_closed(
+    guard: &mut AttemptGuard,
+    usage: Option<&Usage>,
+    tool_names: &[String],
+    message: &str,
+) -> Won {
+    let failure = Failure::new(FailureClass::Internal, message);
     guard
-        .abandon(&Failure::new(FailureClass::Internal, message))
+        .settle("failed", usage, tool_names, Some(&failure), true)
         .await;
     Won::Failed(PublicError::internal())
 }

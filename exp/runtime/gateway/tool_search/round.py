@@ -94,7 +94,7 @@ def search_once(
     Returns:
         ``(matched, query, pattern, error)``; ``error`` names an unusable request.
     """
-    limit = clamp_limit(arguments.get("limit"))
+    limit = clamp_limit(arguments.get("limit"), default=state.search.default_limit)
     query = arguments.get("query")
     pattern = arguments.get("pattern")
     query = query[:MAXIMUM_TOOL_SEARCH_QUERY_CHARACTERS] if isinstance(query, str) else None
@@ -178,6 +178,7 @@ def perform_round(
                 "call_id": call.call_id,
                 "query": query,
                 "pattern": pattern,
+                "declared_name": state.search.tool_name or state.search.tool_type,
                 "matched": [tool.name for tool in matched],
                 "matched_tools": [
                     {
