@@ -8,17 +8,27 @@ upstreams, ledger reader) is the waterfall module's.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 
 import httpx
+import pytest
 
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _attempt_rows,
     _chat_payload,
     _ServingEngine,
+    serve_waterfall_engine,
 )
-from exp.runtime.gateway.tests.native_waterfall_test import _engine as _engine
 
-__all__ = ["_engine"]
+
+@pytest.fixture(scope="module", name="engine")
+def _stall_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+    """The shared harness with a one-second first-token allowance.
+
+    Its own engine so the short bound never leaks into the waterfall or soak
+    modules, whose slow-box scenarios rely on the engine's default allowance.
+    """
+    yield from serve_waterfall_engine(tmp_path_factory, time_to_first_byte_seconds=1.0)
 
 
 def test_first_token_stall_behind_keepalives_fails_over_to_the_second_deployment(

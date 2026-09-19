@@ -85,11 +85,15 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
                             "graceful_timeout_seconds": 2.0,
-                            # Short first-token bound so the stall scenario fails
-                            # over in about a second; every other upstream here
-                            # answers immediately, so it never fires for them.
-                            "time_to_first_byte_seconds": 1.0,
-                            "time_to_first_byte_seconds_per_million_input_tokens": 0.0,
+                            # The first-token allowance: the engine's defaults
+                            # unless the scenario names its own (the stall
+                            # module shortens it to about a second).
+                            "time_to_first_byte_seconds": config.get(
+                                "time_to_first_byte_seconds", 15.0
+                            ),
+                            "time_to_first_byte_seconds_per_million_input_tokens": config.get(
+                                "time_to_first_byte_seconds_per_million_input_tokens", 240.0
+                            ),
                         }
                     ),
                 )
@@ -380,6 +384,25 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
+    yield from serve_waterfall_engine(tmp_path_factory)
+
+
+def serve_waterfall_engine(
+    tmp_path_factory: pytest.TempPathFactory,
+    *,
+    time_to_first_byte_seconds: float | None = None,
+) -> Iterator[_ServingEngine]:
+    """Serve the primary/secondary harness engine; other modules build their own.
+
+    Args:
+        tmp_path_factory: Pytest's per-session temporary path factory.
+        time_to_first_byte_seconds: The engine's first-token allowance for
+            this engine (input scaling disabled alongside it), or ``None``
+            for the engine's defaults.
+
+    Yields:
+        The live serving facts as a :class:`_ServingEngine`.
+    """
     root = tmp_path_factory.mktemp("native-waterfall-root")
     primary = ThreadingHTTPServer((_HOST, 0), _PrimaryUpstream)
     secondary = ThreadingHTTPServer((_HOST, 0), _SecondaryUpstream)
@@ -399,12 +422,14 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     )
     driver = root / "native_waterfall_driver.py"
     driver.write_text(_DRIVER_SOURCE + "\n")
-    config = json.dumps(
-        {
-            "root": str(root),
-            "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-        }
-    )
+    config_values: dict[str, object] = {
+        "root": str(root),
+        "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+    }
+    if time_to_first_byte_seconds is not None:
+        config_values["time_to_first_byte_seconds"] = time_to_first_byte_seconds
+        config_values["time_to_first_byte_seconds_per_million_input_tokens"] = 0.0
+    config = json.dumps(config_values)
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
     environment["TEST_PROVIDER_KEY"] = "provider-secret-canary"
