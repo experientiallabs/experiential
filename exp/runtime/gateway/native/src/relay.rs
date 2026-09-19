@@ -296,6 +296,11 @@ impl UpstreamRelay {
     }
 
     /// Hand over the withheld tool-search calls, leaving none behind.
+    /// Whether the dial's search calls exceeded the withholder's bounds.
+    pub fn withheld_search_overflowed(&self) -> bool {
+        self.tool_search.overflowed()
+    }
+
     pub fn take_withheld_search_calls(&mut self) -> Vec<WithheldSearchCall> {
         self.tool_search.take_withheld()
     }

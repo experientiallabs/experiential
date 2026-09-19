@@ -819,3 +819,43 @@ fn adopt_outcome_moves_a_settled_attempts_rounds_onto_the_admission() {
         json!(1)
     );
 }
+
+#[test]
+fn withholder_bounds_the_calls_it_will_carry_into_a_round() {
+    use crate::events::CompletedToolCall;
+    let mut withholder = ToolSearchWithholder::default();
+    withholder.set_tool_name(Some("tool_search".to_string()));
+    let completed = |index: u32, arguments: &str| Event::ToolCallCompleted {
+        index,
+        call: CompletedToolCall {
+            call_id: format!("call_{index}"),
+            name: "tool_search".to_string(),
+            namespace: None,
+            caller: None,
+            provider_item_id: None,
+            provider_status: None,
+            raw_arguments: arguments.to_string(),
+            custom: false,
+        },
+    };
+    for index in 0..(MAXIMUM_WITHHELD_SEARCH_CALLS as u32) {
+        assert!(withholder.filter(completed(index, "{}")).is_none());
+    }
+    assert_eq!(withholder.withheld_count(), MAXIMUM_WITHHELD_SEARCH_CALLS);
+    assert!(!withholder.overflowed());
+    // The ninth call is still swallowed but tips the dial into overflow.
+    assert!(withholder.filter(completed(99, "{}")).is_none());
+    assert!(withholder.overflowed());
+    assert_eq!(withholder.withheld_count(), MAXIMUM_WITHHELD_SEARCH_CALLS);
+
+    let mut by_bytes = ToolSearchWithholder::default();
+    by_bytes.set_tool_name(Some("tool_search".to_string()));
+    let huge = "x".repeat(MAXIMUM_WITHHELD_SEARCH_BYTES + 1);
+    assert!(by_bytes.filter(completed(0, &huge)).is_none());
+    assert!(by_bytes.overflowed());
+    assert_eq!(by_bytes.withheld_count(), 0);
+    assert_eq!(
+        withheld_overflow_failure().failure_class,
+        FailureClass::Internal
+    );
+}

@@ -42,7 +42,7 @@ use crate::relay::{
 use crate::replay_repair::AttemptRepair;
 use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::{track_retry_after, with_largest_retry_after};
-use crate::tool_search::{ToolSearchRound, WithheldSearchCall};
+use crate::tool_search::{withheld_overflow_failure, ToolSearchRound, WithheldSearchCall};
 use crate::upstream::open_stream;
 
 /// Byte bound for withheld refusal deltas, matching the python executor's
@@ -834,6 +834,22 @@ async fn run_attempt(
                                 "provider refused the request",
                             ),
                             refusal_eligible: ctx.policy.refusal_failover,
+                            exhaustion_flush: Vec::new(),
+                            usage,
+                            tool_names,
+                            opened: true,
+                            encrypted_reasoning_stripped,
+                        };
+                    }
+                    if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
+                        && relay.withheld_search_overflowed()
+                    {
+                        // The model flooded the gateway's search tool past the
+                        // per-dial bound: the gateway's own limit, so the dial
+                        // fails closed instead of running an oversized round.
+                        return AttemptEnd::Ladder {
+                            failure: withheld_overflow_failure(),
+                            refusal_eligible: false,
                             exhaustion_flush: Vec::new(),
                             usage,
                             tool_names,

@@ -32,7 +32,7 @@ use crate::encode_messages::{AggregatedMessage, MessagesSseEncoder};
 use crate::encode_responses::{
     completed_responses_body_with_gateway_tools, AggregatedResponses, ResponsesSseEncoder,
 };
-use crate::errors::PublicError;
+use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{CompletedToolCall, Event, Usage};
 use crate::waterfall::{CommittedAttempt, DeploymentWire, Won};
 use crate::web_search::{
@@ -155,7 +155,18 @@ pub struct ToolSearchWithholder {
     /// Started-but-unfinished search calls by provider tool index.
     open: HashSet<u32>,
     completed: Vec<WithheldSearchCall>,
+    /// Bytes of raw arguments across the withheld calls.
+    withheld_bytes: usize,
+    /// The model exceeded the bounds; the round is refused, never trimmed.
+    overflowed: bool,
 }
+
+/// Most search calls one dial may withhold; more is a runaway model, not a search.
+pub const MAXIMUM_WITHHELD_SEARCH_CALLS: usize = 8;
+
+/// Most raw-argument bytes the withheld calls may hold together; the same
+/// order as the withheld-refusal buffer, and what bounds the bridge payload.
+pub const MAXIMUM_WITHHELD_SEARCH_BYTES: usize = 65_536;
 
 impl ToolSearchWithholder {
     /// Name the gateway's search tool; `None` (or empty) disables withholding.
@@ -179,6 +190,15 @@ impl ToolSearchWithholder {
                 if self.open.contains(index) || call.name == tool_name =>
             {
                 self.open.remove(index);
+                self.withheld_bytes = self.withheld_bytes.saturating_add(call.raw_arguments.len());
+                if self.completed.len() >= MAXIMUM_WITHHELD_SEARCH_CALLS
+                    || self.withheld_bytes > MAXIMUM_WITHHELD_SEARCH_BYTES
+                {
+                    // Still swallowed (the caller never sees the gateway tool),
+                    // but the dial fails closed instead of running the round.
+                    self.overflowed = true;
+                    return None;
+                }
                 self.completed.push(WithheldSearchCall {
                     index: *index,
                     call_id: call.call_id.clone(),
@@ -203,10 +223,24 @@ impl ToolSearchWithholder {
         !self.open.is_empty() || !self.completed.is_empty()
     }
 
+    /// Whether the model exceeded the withheld-call bounds on this dial.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     /// Hand over the withheld completed calls, leaving none behind.
     pub fn take_withheld(&mut self) -> Vec<WithheldSearchCall> {
         std::mem::take(&mut self.completed)
     }
+}
+
+/// The failure a dial ends with when the model flooded the gateway's search
+/// tool: the gateway's own bound, so neither retryable nor failover-eligible.
+pub fn withheld_overflow_failure() -> Failure {
+    Failure::new(
+        FailureClass::Internal,
+        "gateway tool search calls exceeded the per-dial bound",
+    )
 }
 
 /// The settle-shaped usage object (`null` without a provider report).
