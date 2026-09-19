@@ -17,7 +17,7 @@ from exp.cli.providers.experiential_cloud import (
     read_hosted_key_fallback,
 )
 from exp.cli.providers.sync import sync_account_models
-from exp.cli.shared.options import ROOT_OPTION
+from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.auth import ProviderAuthStore
 from exp.common.config import ARTIFACT_DIR
@@ -117,4 +117,5 @@ def run_login(
 
 def login(root: Path = ROOT_OPTION) -> None:
     """Open Platform login, save the credential, and synchronize account models."""
-    run_login(console=Console(theme=EXP_THEME), environment=os.environ, root=root)
+    with usage_error(ValueError):
+        run_login(console=Console(theme=EXP_THEME), environment=os.environ, root=root)
