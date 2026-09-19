@@ -9,6 +9,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: "d".to_string(),
+        exact_model_id: "exact-d".to_string(),
         dialect: "openai_compatible".to_string(),
         url: "https://provider.test".to_string(),
         headers: HashMap::new(),
@@ -27,6 +28,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         time_to_first_byte_base_seconds: base,
         time_to_first_byte_seconds_per_million_input_tokens: slope,
         throttle_redial_budget: 0,
+        throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
     }

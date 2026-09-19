@@ -10,6 +10,7 @@ results, and plans do not live here.
 | `usage.md` | Locked CLI map for build, bounded optimize model, optimize router, run, and config. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
+| `reference/model-chains.md` | Explicit cross-model stage configuration, bounded traversal, per-stage policy, accounting, and recovery contracts. |
 | `reference/gateway-failover-rules.md` | Per-rung conditional failover (`failover_only_on`): the token vocabulary, first-dial and successor rules, the ledger `fallback_reason`, and the fail-closed cases. |
 | `reference/gateway-guardrails.md` | Identity-scoped gateway guardrails: data flow, latency, privacy, standard pack, http_json adapters, and inappropriate-content use. |
 | `reference/gateway-latency.md` | Routine CI gateway-latency report against a local mock: schedule, artifact schema, and numeric latency badge. |

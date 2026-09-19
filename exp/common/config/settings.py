@@ -54,11 +54,21 @@ class CommandBudgetSettings(BaseModel):
         return value
 
 
+class GatewayResourceSettings(BaseModel):
+    """Operator-owned resource budgets for local gateway configuration commands."""
+
+    budget_snapshot_max_bytes: int = Field(
+        default=64 * 1024 * 1024, strict=True, ge=1, le=2**63 - 1
+    )
+    """Maximum snapshot bytes parsed while authoring pool or deployment budgets."""
+
+
 class ProjectSettings(BaseModel):
     """Local telemetry preference and optional shared command-budget ceiling."""
 
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     commands: CommandBudgetSettings = Field(default_factory=CommandBudgetSettings)
+    gateway: GatewayResourceSettings = Field(default_factory=GatewayResourceSettings)
 
 
 def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:

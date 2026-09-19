@@ -795,11 +795,17 @@ async fn stream_responses(
             let event = if let Some(event) = prefix.pop_front() {
                 event
             } else {
-                match committed
-                    .relay
-                    .next_event(deadline, phase_timeout, guard.started)
-                    .await
-                {
+                // Translated custom input may defer every argument delta until
+                // completion. Observe disconnect even while that read is pending.
+                let next = tokio::select! {
+                    biased;
+                    result = committed.relay.next_event(deadline, phase_timeout, guard.started) => result,
+                    _ = sender.closed() => {
+                        guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+                        return;
+                    }
+                };
+                match next {
                     Ok(Some(event)) => event,
                     Ok(None) => {
                         fail_stream!(Failure::new(

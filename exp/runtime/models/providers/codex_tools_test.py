@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -11,12 +13,17 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.codex_tools import (
     NativeToolMapping,
     convert_native_history,
     invert_tool_call,
     translate_native_tools,
 )
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.openai_protocol import decode_responses
 
 _FUNCTION = {
     "type": "function",
@@ -230,3 +237,205 @@ def test_convert_history_replays_a_gateway_tool_search_round_as_a_function_pair(
     assert messages[1].role == "tool"
     assert messages[1].tool_call_id == "call_ts"
     assert '"get_weather"' in (messages[1].content or "")
+
+
+def test_custom_history_reuses_allocated_name_without_overwriting_plain_function() -> None:
+    """Custom history follows its declaration even when a plain name is identical."""
+
+    for tools in [
+        [{"type": "function", "name": "apply_patch", "parameters": {"type": "object"}}, _CUSTOM],
+        [_CUSTOM, {"type": "function", "name": "apply_patch", "parameters": {"type": "object"}}],
+    ]:
+        request = decode_responses(
+            {
+                "model": "coding",
+                "tools": tools,
+                "input": [
+                    {
+                        "type": "custom_tool_call",
+                        "name": "apply_patch",
+                        "call_id": "c",
+                        "input": "patch",
+                    },
+                    {"type": "custom_tool_call_output", "call_id": "c", "output": "done"},
+                    {
+                        "type": "function_call",
+                        "name": "apply_patch",
+                        "call_id": "f",
+                        "arguments": "{}",
+                    },
+                    {"type": "function_call_output", "call_id": "f", "output": "done"},
+                ],
+            }
+        ).request
+        translated = translate_native_tools(request)
+        messages, _ = convert_native_history(request.messages, translated.mapping)
+        calls = [call for message in messages for call in message.tool_calls]
+        assert [(call.call_id, call.name) for call in calls] == [
+            ("c", "apply_patch_2"),
+            ("f", "apply_patch"),
+        ]
+        assert translated.mapping.as_dict() == {"apply_patch_2": ("apply_patch", None, True)}
+        assert [message.tool_call_id for message in messages if message.role == "tool"] == [
+            "c",
+            "f",
+        ]
+
+
+def test_namespaced_history_uses_full_origin_and_reserves_plain_history_suffixes() -> None:
+    """Flattened collisions retain exact origins and reserve genuine plain history names."""
+
+    request = decode_responses(
+        {
+            "model": "coding",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "a__b",
+                    "tools": [{"type": "function", "name": "c", "parameters": {"type": "object"}}],
+                },
+                {
+                    "type": "namespace",
+                    "name": "a",
+                    "tools": [
+                        {"type": "function", "name": "b__c", "parameters": {"type": "object"}}
+                    ],
+                },
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "c",
+                    "namespace": "a__b",
+                    "call_id": "one",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call",
+                    "name": "b__c",
+                    "namespace": "a",
+                    "call_id": "two",
+                    "arguments": "{}",
+                },
+                {"type": "function_call", "name": "a__b__c", "call_id": "plain", "arguments": "{}"},
+                {
+                    "type": "function_call",
+                    "name": "a__b__c_2",
+                    "call_id": "suffix",
+                    "arguments": "{}",
+                },
+            ],
+        }
+    ).request
+    translated = translate_native_tools(request)
+    messages, _ = convert_native_history(request.messages, translated.mapping)
+    assert [tool.name for tool in translated.tools] == ["a__b__c_3", "a__b__c_4"]
+    assert [(call.call_id, call.name) for message in messages for call in message.tool_calls] == [
+        ("one", "a__b__c_3"),
+        ("two", "a__b__c_4"),
+        ("plain", "a__b__c"),
+        ("suffix", "a__b__c_2"),
+    ]
+    assert translated.mapping.resolve("a__b__c_3") == ("c", "a__b", False)
+    assert translated.mapping.resolve("a__b__c_4") == ("b__c", "a", False)
+
+
+def test_history_only_native_names_do_not_claim_ordinary_declarations() -> None:
+    """Historical tools keep unique replay names without inventing current declarations."""
+
+    request = decode_responses(
+        {
+            "model": "coding",
+            "tools": [
+                {"type": "function", "name": "apply_patch", "parameters": {"type": "object"}},
+            ],
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "call_id": "old",
+                    "input": "patch",
+                },
+                {"type": "custom_tool_call_output", "call_id": "old", "output": "done"},
+            ],
+        }
+    ).request
+    translated = translate_native_tools(request)
+    messages, _ = convert_native_history(request.messages, translated.mapping)
+    assert [tool.name for tool in translated.tools] == ["apply_patch"]
+    assert messages[0].tool_calls[0].name == "apply_patch_2"
+    assert translated.mapping.resolve("apply_patch") is None
+    assert translated.mapping.resolve("apply_patch_2") == ("apply_patch", None, True)
+
+
+def test_collision_shaping_preserves_public_identity_and_is_idempotent() -> None:
+    """Repeated provider shaping preserves its map and never mutates public replay identity."""
+
+    request = decode_responses(
+        {
+            "model": "coding",
+            "tools": [
+                {"type": "function", "name": "apply_patch", "parameters": {"type": "object"}},
+                _CUSTOM,
+            ],
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "call_id": "c",
+                    "input": "patch",
+                },
+                {"type": "custom_tool_call_output", "call_id": "c", "output": "done"},
+            ],
+        }
+    ).request
+    digest = canonical_request_sha256(request)
+    chat = GatewayWireProfile(
+        dialect="openai_compatible", url="http://127.0.0.1:9/v1", model_id="model"
+    )
+    native = GatewayWireProfile(
+        dialect="openai_responses", url="http://127.0.0.1:10/v1", model_id="model"
+    )
+    for profiles in [(chat,), (native, chat)]:
+        public, shaped = route_generation_parameter_requests(profiles, request)
+        _, reshaped = route_generation_parameter_requests(profiles, shaped)
+        assert canonical_request_sha256(public) == digest
+        assert canonical_request_sha256(request) == digest
+        assert (
+            shaped.native_tool_translation
+            == reshaped.native_tool_translation
+            == {"apply_patch_2": ("apply_patch", None, True)}
+        )
+        assert shaped.tools == reshaped.tools
+        assert shaped.messages == reshaped.messages
+        translated = translate_native_tools(shaped)
+        assert translated.mapping.as_dict() == shaped.native_tool_translation
+    _, unchanged = route_generation_parameter_requests((native,), request)
+    assert unchanged.native_tool_translation is None
+    assert unchanged.provider_native_tools == request.provider_native_tools
+    assert unchanged.messages == request.messages
+
+
+def test_duplicate_native_origin_fails_typed_before_dispatch() -> None:
+    """Ambiguous duplicate declarations fail before any provider dispatch."""
+
+    request = _request(
+        provider_native_tools=(
+            GatewayProviderNativeTool(index=0, tool=_CUSTOM),
+            GatewayProviderNativeTool(
+                index=1, tool={**_CUSTOM, "description": "Different declaration"}
+            ),
+        )
+    )
+    with pytest.raises(ProviderParameterError) as rejected:
+        translate_native_tools(request)
+    assert rejected.value.param == "tools" and rejected.value.code == "invalid_parameter"
+
+
+def test_inverse_mapping_never_overwrites_a_different_origin() -> None:
+    """An occupied wire identity cannot be rebound to another caller tool."""
+
+    mapping = NativeToolMapping({"wire": ("a", "namespace", False)})
+    with pytest.raises(ProviderParameterError):
+        mapping.record("wire", "b", None, True)
+    assert mapping.as_dict() == {"wire": ("a", "namespace", False)}

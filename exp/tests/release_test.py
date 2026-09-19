@@ -14,6 +14,7 @@ import sys
 import tarfile
 import termios
 import time
+import tomllib
 import zipfile
 from email.parser import Parser
 from pathlib import Path, PurePosixPath
@@ -27,6 +28,9 @@ if sys.platform != "win32":
 
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
+    from packaging.markers import Marker
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENTS = frozenset(
@@ -42,6 +46,7 @@ FORBIDDEN_REQUIREMENTS = frozenset(
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
+        "anyio",
         "boto3",
         "botocore",
         "click",
@@ -227,6 +232,43 @@ def _assert_allowed_requirements(metadata: str) -> None:
         )
 
 
+def _validated_release_core_names(metadata: str) -> frozenset[str]:
+    """Parse unconditional requirements and reject unsanctioned optional contracts.
+
+    The release has unconditional core requirements and exact dev/sft markers.
+    Compound or platform markers require an explicit contract change, rather
+    than being evaluated on this host and hiding another platform's dependency.
+    """
+    optional = {
+        "dev": {
+            "anthropic",
+            "maturin",
+            "pytest",
+            "pytest-xdist",
+            "ruff",
+            "tinker",
+            "tinker-cookbook",
+            "ty",
+            "websockets",
+        },
+        "sft": {"tinker", "tinker-cookbook"},
+    }
+    names: set[str] = set()
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for value in headers.get_all("Requires-Dist", []):
+        requirement = Requirement(value)
+        name = canonicalize_name(requirement.name)
+        if requirement.marker is None:
+            names.add(name)
+            continue
+        matches = [
+            extra for extra in optional if requirement.marker == Marker(f'extra == "{extra}"')
+        ]
+        assert len(matches) == 1, f"unsupported release dependency marker: {requirement}"
+        assert name in optional[matches[0]], f"unexpected optional dependency: {requirement}"
+    return frozenset(names)
+
+
 def _core_requirement_names(metadata: str) -> frozenset[str]:
     """Return dependencies unless gated solely by one named extra equality.
 
@@ -241,6 +283,143 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
         for name, marker in _metadata_requirements(metadata)
         if not re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker)
     )
+
+
+def _assert_release_archive_metadata(metadata: str) -> None:
+    """Require current source identity and the independent dependency contract."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    project = tomllib.loads((repository / "pyproject.toml").read_text())["project"]
+    headers = Parser().parsestr(metadata, headersonly=True)
+    assert headers["Name"] == project["name"]
+    assert headers["Version"] == project["version"]
+    native_project = tomllib.loads(
+        (repository / "exp/runtime/gateway/native/pyproject.toml").read_text()
+    )["project"]
+    _assert_exact_native_requirement(metadata, native_project["version"])
+    _assert_release_requirements(metadata)
+
+
+def _assert_exact_native_requirement(metadata: str, native_version: str) -> None:
+    """Require exactly one unconditional registry pin to the reviewed native companion."""
+    requirements = [
+        Requirement(value)
+        for value in Parser().parsestr(metadata, headersonly=True).get_all("Requires-Dist", [])
+    ]
+    native = [item for item in requirements if canonicalize_name(item.name) == "exp-gateway-native"]
+    assert len(native) == 1, "release must name exactly one native companion"
+    requirement = native[0]
+    assert requirement.marker is None and requirement.url is None and not requirement.extras
+    assert str(requirement.specifier) == f"=={native_version}", (
+        "release must pin the exact reviewed native companion"
+    )
+
+
+def test_native_companion_dependency_is_exact_in_source() -> None:
+    """The local path lock cannot substitute for a published exact dependency."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    project = tomllib.loads((repository / "pyproject.toml").read_text())["project"]
+    native = tomllib.loads((repository / "exp/runtime/gateway/native/pyproject.toml").read_text())[
+        "project"
+    ]
+    cargo = tomllib.loads((repository / "exp/runtime/gateway/native/Cargo.toml").read_text())
+    lock = tomllib.loads((repository / "uv.lock").read_text())
+    locked = [package for package in lock["package"] if package["name"] == "exp-gateway-native"]
+    assert len(locked) == 1 and locked[0]["version"] == native["version"]
+    assert cargo["package"]["version"].replace("-rc.", "rc") == native["version"]
+    metadata = "\n".join(f"Requires-Dist: {value}" for value in project["dependencies"])
+    _assert_exact_native_requirement(metadata, native["version"])
+
+
+def test_native_companion_metadata_rejects_unreviewed_resolution() -> None:
+    """A version range, wrong release, marker or direct URL cannot bypass exact pairing."""
+    _assert_exact_native_requirement("Requires-Dist: exp-gateway-native==0.3.88\n", "0.3.88")
+    for requirement in (
+        "exp-gateway-native>=0.3.88,<0.4",
+        "exp-gateway-native==0.3.*",
+        "exp-gateway-native~=0.3.88",
+        "exp-gateway-native==0.3.89",
+        'exp-gateway-native==0.3.88; sys_platform == "linux"',
+        "exp-gateway-native @ https://example.test/native.whl",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_exact_native_requirement(f"Requires-Dist: {requirement}\n", "0.3.88")
+
+
+def _assert_anyio_security_requirement(metadata: str) -> None:
+    """Require the unconditional registry security floor for the async HTTP transport."""
+    requirements = [
+        Requirement(value)
+        for value in Parser().parsestr(metadata, headersonly=True).get_all("Requires-Dist", [])
+    ]
+    anyio = [item for item in requirements if canonicalize_name(item.name) == "anyio"]
+    assert len(anyio) == 1, "release must name exactly one AnyIO security requirement"
+    requirement = anyio[0]
+    assert requirement.marker is None and requirement.url is None and not requirement.extras
+    assert str(requirement.specifier) == ">=4.14.2", (
+        "release must preserve the AnyIO security floor"
+    )
+
+
+def test_anyio_security_requirement_is_mandatory_in_source() -> None:
+    """The security floor must ship in all runtime installs, not only an optional extra."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    project = tomllib.loads((repository / "pyproject.toml").read_text())["project"]
+    metadata = "\n".join(f"Requires-Dist: {value}" for value in project["dependencies"])
+    _assert_anyio_security_requirement(metadata)
+
+
+def test_anyio_security_requirement_rejects_missing_or_conditional_floor() -> None:
+    """A package name, optional marker or weaker specifier cannot claim the security contract."""
+    for requirement in (
+        "",
+        "anyio",
+        "anyio>=4.14.1",
+        "anyio==4.14.*",
+        "anyio~=4.14.2",
+        'anyio>=4.14.2; extra == "dev"',
+        'anyio>=4.14.2; sys_platform == "linux"',
+        'anyio>=4.14.2; extra == "dev" or python_version >= "3.12"',
+        "anyio[trio]>=4.14.2",
+        "anyio @ https://example.test/anyio.whl",
+        "anyio>=4.14.2\nRequires-Dist: anyio>=4.14.2",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_anyio_security_requirement(
+                "" if not requirement else f"Requires-Dist: {requirement}\n"
+            )
+
+
+def _assert_release_requirements(metadata: str) -> None:
+    """Require the independently declared core dependency contract."""
+    _assert_allowed_requirements(metadata)
+    core = _validated_release_core_names(metadata)
+    assert core == _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+    _assert_anyio_security_requirement(metadata)
+
+
+def test_release_requirement_contract_distinguishes_sanctioned_dev_extra() -> None:
+    """Allow the SDK drift-check extra without allowing it into runtime installs."""
+    core = "\n".join(
+        f"Requires-Dist: {name}{'>=4.14.2' if name == 'anyio' else ''}"
+        for name in REQUIRED_CORE_REQUIREMENTS
+    )
+    _assert_release_requirements(core + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    _assert_release_requirements(core + "\nRequires-Dist: anthropic>=1.2; extra == 'dev'")
+    for requirement in (
+        "anthropic>=1.2",
+        'anthropic>=1.2; extra == "sft"',
+        'anthropic>=1.2; extra == "unknown"',
+        'anthropic>=1.2; extra == "dev" or sys_platform == "win32"',
+        'anthropic>=1.2; extra == "dev" and python_version >= "3.12"',
+        'anthropic>=1.2; sys_platform == "win32"',
+        'transformers>=4; extra == "dev"',
+        'httpx>=0.27; extra == "dev"',
+        'unknown-library; extra == "dev"',
+    ):
+        with pytest.raises(AssertionError):
+            _assert_release_requirements(core + f"\nRequires-Dist: {requirement}")
+    with pytest.raises(AssertionError):
+        _assert_release_requirements(core.replace("Requires-Dist: google-re2", ""))
 
 
 def _assert_current_archive_members(
@@ -3144,6 +3323,25 @@ def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     assert 'dist/*.whl "openai==3.0.0"' in workflow
 
 
+def test_gate_excludes_only_named_provider_calls_not_live_substrings() -> None:
+    """Ordinary live-state and delivery tests must remain in the non-provider gate."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "gate.yml").read_text(encoding="utf-8")
+    assert '-k "not live"' not in workflow
+    expected = (
+        "exp/cli/tests/terminal_tasks_live_pipeline_test.py::test_live_openai_pipeline_covers_every_locked_cli_path",
+        "exp/runtime/gateway/batch/tests/live_test.py::test_live_anthropic_messages_batch",
+        "exp/runtime/gateway/batch/tests/live_test.py::test_live_openai_chat_batch",
+        "exp/runtime/gateway/batch/tests/live_test.py::test_live_openrouter_chat_batch",
+        "exp/runtime/models/providers/openai_compatible_test.py::test_embed_raw_against_live_openai",
+    )
+    for node_id in expected:
+        assert f"--deselect={node_id}" in workflow
+        file_name, test_name = node_id.split("::")
+        assert f"def {test_name}(" in (repository / file_name).read_text(encoding="utf-8")
+    assert "--deselect=exp/runtime/gateway/native_stage_admission_test.py" not in workflow
+
+
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 
@@ -3196,6 +3394,16 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             str(installed_python),
             *(str(wheel) for wheel in wheels),
             "openai==3.0.0",
+        ],
+        cwd=execution,
+        environment=environment,
+    )
+    _run_checked(
+        [
+            str(installed_python),
+            "-I",
+            "-c",
+            "import importlib.util; assert importlib.util.find_spec('pytest') is None",
         ],
         cwd=execution,
         environment=environment,
@@ -3311,8 +3519,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        _assert_allowed_requirements(metadata)
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_release_archive_metadata(metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         names = tuple(
@@ -3323,8 +3530,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        _assert_allowed_requirements(metadata)
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_release_archive_metadata(metadata)
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:

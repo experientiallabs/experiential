@@ -13,22 +13,23 @@
 //! connection prewarm: it is answered with an empty completed response
 //! envelope and never touches admission or the ledger.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Method};
 use axum::response::Response;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 
 use crate::encode::compact_json;
 use crate::encode_responses::{ResponsesEnvelope, ResponsesSseEncoder};
 use crate::errors::PublicError;
 use crate::events::Event;
-use crate::respond::{bearer_key, error_response};
+use crate::respond::{bearer_key, error_response, MAXIMUM_REQUEST_BODY_BYTES};
 use crate::route_responses::responses;
 use crate::server::AppState;
 use crate::sse::SseDecoder;
@@ -36,6 +37,19 @@ use crate::sse::SseDecoder;
 /// Bound on a buffered non-streaming (error) response body read back from
 /// the HTTP handler; its bodies are single compact JSON envelopes.
 const MAXIMUM_ADAPTED_BODY_BYTES: usize = 1_000_000;
+
+/// Bound pipelined requests while the connection finishes its current response.
+const MAXIMUM_PENDING_FRAMES: usize = 8;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Payload bytes retained by a queued application frame (control frames never queue).
+fn pending_frame_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
 
 /// Byte-compatible rejection for `"stream": false`, which the WebSocket
 /// transport cannot honor (api.openai.com answers this exact message).
@@ -112,20 +126,27 @@ fn request_headers(headers: &HeaderMap) -> HeaderMap {
     carried
 }
 
-/// Serve one accepted connection: sequential request frames, each answered
-/// with its full event stream before the next frame is read.
+/// Serve requests sequentially, retaining bounded pipelined frames while the
+/// active response polls control frames and disconnects.
 async fn serve_socket(state: AppState, headers: HeaderMap, mut socket: WebSocket) {
-    while let Some(message) = socket.recv().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(_) => return,
+    let mut pending = VecDeque::new();
+    loop {
+        let message = match pending.pop_front() {
+            Some(message) => message,
+            None => match socket.recv().await {
+                Some(Ok(message)) => message,
+                _ => return,
+            },
         };
         match message {
             Message::Text(text) => {
-                if handle_frame(&state, &headers, &mut socket, text.as_str())
+                if handle_frame(&state, &headers, &mut socket, &mut pending, text.as_str())
                     .await
                     .is_err()
                 {
+                    // Axum queues the close reply; flush only after the HTTP
+                    // body has dropped and cancellation can release admission.
+                    let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.flush()).await;
                     return;
                 }
             }
@@ -156,6 +177,7 @@ async fn handle_frame(
     state: &AppState,
     headers: &HeaderMap,
     socket: &mut WebSocket,
+    pending: &mut VecDeque<Message>,
     text: &str,
 ) -> Result<(), ()> {
     let mut value: Value = match serde_json::from_str(text) {
@@ -207,13 +229,17 @@ async fn handle_frame(
         .expect("static request line is valid");
     *request.headers_mut() = headers.clone();
     let response = responses(State(state.clone()), request).await;
-    relay_response(socket, response).await
+    relay_response(socket, pending, response).await
 }
 
 /// Re-frame one HTTP handler response onto the socket: an event-stream body
 /// becomes one text frame per SSE event; anything else becomes one wrapped
 /// in-band error frame.
-async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<(), ()> {
+async fn relay_response(
+    socket: &mut WebSocket,
+    pending: &mut VecDeque<Message>,
+    response: Response,
+) -> Result<(), ()> {
     let status = response.status();
     let is_event_stream = response
         .headers()
@@ -226,7 +252,48 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
         // Dropping the body mid-stream cancels the in-flight attempt through
         // the same disconnect guards an HTTP client disconnect triggers.
         let mut body = response.into_body().into_data_stream();
-        while let Some(chunk) = body.next().await {
+        let mut pending_bytes = pending.iter().map(pending_frame_bytes).sum::<usize>();
+        loop {
+            // Both reads are cancellation-safe StreamExt::next operations;
+            // axum recv delegates to next and owns partial frames on the socket.
+            // Drain ready HTTP usage/terminal output before observing close.
+            let chunk = tokio::select! {
+                biased;
+                chunk = body.next() => match chunk {
+                    Some(chunk) => chunk,
+                    None => break,
+                },
+                message = socket.recv() => {
+                    match message {
+                        Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) => {
+                            if pending.len() >= MAXIMUM_PENDING_FRAMES
+                                || pending_frame_bytes(&message) > MAXIMUM_REQUEST_BODY_BYTES.saturating_sub(pending_bytes)
+                            {
+                                // Release the admitted request before any bounded close write.
+                                drop(body);
+                                let close = Message::Close(Some(CloseFrame {
+                                    code: close_code::SIZE,
+                                    reason: "Pending request limit exceeded".into(),
+                                }));
+                                let _ = tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.send(close)).await;
+                                return Err(());
+                            }
+                            pending_bytes += pending_frame_bytes(&message);
+                            pending.push_back(message);
+                        }
+                        // Axum queues the automatic pong; flush it while no
+                        // output is arriving, with the same bounded write wait.
+                        Some(Ok(Message::Ping(_))) => {
+                            if !matches!(tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.flush()).await, Ok(Ok(()))) {
+                                return Err(());
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        _ => return Err(()),
+                    }
+                    continue;
+                }
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(_) => {
@@ -243,7 +310,14 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
             };
             for event in events {
                 saw_terminal = saw_terminal || is_terminal_event(event.event.as_deref());
-                if socket.send(Message::Text(event.data.into())).await.is_err() {
+                if !matches!(
+                    tokio::time::timeout(
+                        SOCKET_SEND_TIMEOUT,
+                        socket.send(Message::Text(event.data.into())),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) {
                     return Err(());
                 }
             }

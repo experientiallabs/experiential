@@ -8,7 +8,7 @@ import math
 import time
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 from uuid import uuid4
 
 from exp.common.core.artifacts import JsonObject
@@ -19,6 +19,7 @@ from exp.common.models import (
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     RequestDeadline,
@@ -38,6 +39,9 @@ from exp.runtime.models.providers.transport import (
     RetryPolicy,
     classify_retry,
 )
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_RETRY_POLICY = RetryPolicy()
@@ -107,6 +111,15 @@ class GatewayWireProfile:
 
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     """Authenticated request headers for every dispatch, excluded from diagnostics."""
+
+    credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
+    """Worker-private receipt for static auth; never serialized onto the native wire."""
+
+    recovery_binding: FrozenRecoveryBinding | None = field(default=None, repr=False)
+    """Private scope frozen from this exact profile before recovery selection."""
+
+    operational_region: str | None = None
+    """Verified region or named global service scope of this exact wire endpoint."""
 
     model_id: str = ""
     """Exact provider model identifier."""

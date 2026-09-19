@@ -210,7 +210,7 @@ impl UpstreamRelay {
     }
 
     #[cfg(test)]
-    fn from_stream(
+    pub(crate) fn from_stream(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
         first_byte_deadline: Instant,
@@ -336,9 +336,9 @@ impl UpstreamRelay {
 
     /// Move one normalized event through the stop-sequence guard (if any)
     /// onto the ready queue.
-    fn guard_next_pending(&mut self) -> bool {
+    fn guard_next_pending(&mut self) -> Result<bool, Failure> {
         let Some(mut event) = self.pending.pop_front() else {
-            return false;
+            return Ok(false);
         };
         if let (Some(provider), Event::Failed(failure)) =
             (self.customer_managed_provider.as_deref(), &event)
@@ -352,21 +352,21 @@ impl UpstreamRelay {
         // the caller's tools, so it never counts toward one-call-per-turn
         // serialization and never reaches the Codex inversion or the caller.
         let Some(mut event) = self.tool_search.filter(event) else {
-            return true;
+            return Ok(true);
         };
         if let Some(serializer) = self.tool_serializer.as_mut() {
             let Some(kept) = serializer.filter(event) else {
-                return true;
+                return Ok(true);
             };
             event = kept;
         }
-        for event in self.native_tool_inverter.filter(event) {
+        for event in self.native_tool_inverter.filter(event)? {
             match self.stop_guard.as_mut() {
                 Some(guard) => self.ready.extend(guard.filter(event)),
                 None => self.ready.push_back(event),
             }
         }
-        true
+        Ok(true)
     }
 
     /// Route an abnormal stream termination through the normalizer's recovery.
@@ -411,7 +411,7 @@ impl UpstreamRelay {
                 }
                 return Ok(Some(event));
             }
-            if self.guard_next_pending() {
+            if self.guard_next_pending()? {
                 continue;
             }
             if self.eof {

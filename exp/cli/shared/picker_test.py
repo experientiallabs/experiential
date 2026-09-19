@@ -9,6 +9,7 @@ from collections.abc import Callable
 import pytest
 from rich.console import Console
 
+from exp.cli.shared import picker
 from exp.cli.shared.picker import (
     PickerAction,
     PickerEvent,
@@ -26,6 +27,18 @@ _DOWN = "\x1b[B"
 _UP = "\x1b[A"
 _ENTER = "\r"
 _SPACE = " "
+
+
+def test_raw_picker_input_reports_unsupported_windows_but_retains_scripted_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard only raw terminal access, not deterministic input or module import."""
+    monkeypatch.setattr(picker.sys, "platform", "win32")
+    with pytest.raises(RuntimeError, match="POSIX terminal"):
+        with picker._terminal_key_reader(None):
+            pass
+    with picker._terminal_key_reader(lambda: PickerKey.ENTER) as reader:
+        assert reader() == PickerKey.ENTER
 
 
 class ScriptedConsole(Console):

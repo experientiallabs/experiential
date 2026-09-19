@@ -8,6 +8,32 @@ from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, unsupported_field
 
+
+def internal_protocol_error() -> OpenAIProtocolError:
+    """Return the public internal error for a broken data-plane wire contract."""
+    return OpenAIProtocolError(
+        status_code=500,
+        code="internal_error",
+        message="The gateway request failed.",
+        error_type="api_error",
+    )
+
+
+def encoded_public_error(error: OpenAIProtocolError) -> str:
+    """Serialize only the public protocol fields allowed across the native error boundary."""
+    return json.dumps(
+        {
+            "status_code": error.status_code,
+            "code": error.detail.code,
+            "message": error.detail.message,
+            "error_type": error.detail.type,
+            "param": error.detail.param,
+            "retry_after_seconds": error.retry_after_seconds,
+        },
+        separators=(",", ":"),
+    )
+
+
 _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
     GatewayApiSurface.CHAT_COMPLETIONS: {
         "developer_messages": "messages",

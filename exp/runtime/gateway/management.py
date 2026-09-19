@@ -17,6 +17,7 @@ from exp.common.models import (
 )
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, ProjectTarget
+from exp.runtime.gateway.model_chain_authority import refuse_local_chain_snapshot
 from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.provider_authority import (
@@ -839,6 +840,7 @@ class GatewayManagement:
         refusal_failover: bool,
     ) -> tuple[bool, bool]:
         """Return activation and snapshot change status after read-only validation."""
+        refuse_local_chain_snapshot(self.state_dir, snapshot_ref)
         self.require_initialized()
         connection = connect_database(self.database_path)
         try:

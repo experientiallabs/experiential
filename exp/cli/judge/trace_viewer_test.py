@@ -11,6 +11,15 @@ from exp.cli.judge import trace_viewer
 from exp.cli.judge.review_test import _proposal, _trace
 
 
+def test_raw_viewer_input_reports_unsupported_windows_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep import and rendering available without claiming Windows raw-input support."""
+    monkeypatch.setattr(trace_viewer.sys, "platform", "win32")
+    with pytest.raises(RuntimeError, match="POSIX terminal"):
+        trace_viewer._read_key()
+
+
 def _plain(renderable: object) -> str:
     """Render one Rich renderable to plain text.
 

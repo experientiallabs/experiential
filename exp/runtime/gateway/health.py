@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 
@@ -34,6 +35,29 @@ _OPERATIONAL_FAILURES = {
 # skips it for the whole window.
 RETRY_AFTER_WINDOW_MINIMUM_SECONDS = 5.0
 RETRY_AFTER_WINDOW_MAXIMUM_SECONDS = 6.0 * 3_600.0
+
+
+def health_failure_cause(
+    failure_class: GatewayFailureClass,
+) -> Literal["transport", "credential", "throttle"] | None:
+    """Classify deployment-affecting failures for circuits and scoped recovery.
+
+    Args:
+        failure_class: Normalized provider or gateway failure category.
+
+    Returns:
+        Transport for operational failures, credential for operator-actionable
+        account failures, throttle for explicit backoff, or None when the outcome
+        says nothing about deployment health. Customer ownership does not change
+        the provider failure's health effect.
+    """
+    if failure_class == GatewayFailureClass.THROTTLED:
+        return "throttle"
+    if failure_class in _HARD_FAILURES:
+        return "credential"
+    if failure_class in _OPERATIONAL_FAILURES:
+        return "transport"
+    return None
 
 
 @dataclass
@@ -210,11 +234,12 @@ class DeploymentHealthRegistry:
             failure: Sanitized provider failure classification.
         """
         now = self._clock()
+        cause = health_failure_cause(failure.failure_class)
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
             state.half_open_probe = False
             state.last_resort_probe = False
-            if failure.failure_class == GatewayFailureClass.THROTTLED:
+            if cause == "throttle":
                 state.throttle_until = max(
                     state.throttle_until,
                     now + self._throttle_window_seconds(failure),
@@ -223,17 +248,11 @@ class DeploymentHealthRegistry:
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1
                 return
-            if failure.failure_class == GatewayFailureClass.EMPTY_COMPLETION:
-                # The model answered the content with nothing: the caller's
-                # conversation, not rung deadness. One stuck Claude Code
-                # session re-sending the same prompt every minute must not
-                # open the rung for everyone else (2026-09-15, gpt-5.6-luna).
-                return
-            if failure.failure_class in _HARD_FAILURES:
+            if cause == "credential":
                 state.consecutive_failures = self._failure_threshold
                 state.open_until = now + self._open_seconds
                 return
-            if failure.failure_class in _OPERATIONAL_FAILURES:
+            if cause == "transport":
                 state.consecutive_failures += 1
                 if state.consecutive_failures >= self._failure_threshold:
                     state.open_until = now + self._open_seconds

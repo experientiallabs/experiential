@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
-from typing import cast
+from datetime import UTC, datetime
+from typing import Literal, cast
 
 import pytest
 
@@ -29,13 +29,16 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
 )
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
+from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
+from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
@@ -118,6 +121,31 @@ def _route(
     )
 
 
+def test_typed_preflight_rejection_survives_public_and_ledger_terminal() -> None:
+    """Expected unavailable root preflight never becomes an internal-error settlement."""
+    ledger = _RecordingLedger()
+    ledger.typed_rejection = GatewayFailure(
+        failure_class=GatewayFailureClass.UNAVAILABLE,
+        safe_message="root funding preflight is unavailable",
+    )
+    accounting = NativeAttemptAccounting(ledger)
+    route = _route((_deployment("first", connection_sha256="b" * 64),))
+    entry = InflightRequest(
+        authorization=route.snapshot.authorization,
+        route=route,
+        request=_request(),
+        deadline_monotonic=time.monotonic() + 10,
+    )
+    accounting.register(entry)
+    with pytest.raises(NativeBridgeError) as raised:
+        accounting.start_attempt(
+            json.dumps({"request_id": entry.authorization.request_id, "attempt_ordinal": 0})
+        )
+    assert json.loads(raised.value.public_error_json)["status_code"] == 503
+    assert ledger.finished_requests == [ledger.typed_rejection]
+    assert not ledger.started
+
+
 class _RecordingLedger:
     """Blocking write-ledger fake recording every waterfall write."""
 
@@ -127,12 +155,14 @@ class _RecordingLedger:
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
         self.upstream_providers: list[str | None] = []
+        self.first_token_times: list[datetime | None] = []
         self.web_search_requests: list[int | None] = []
         self.tool_search_requests: list[int | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
         self.fail_finishes = 0
+        self.typed_rejection: GatewayFailure | None = None
         self._counter = 0
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
@@ -156,6 +186,8 @@ class _RecordingLedger:
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
         del snapshot, maximum_cost_nano_usd, fallback_reason
+        if self.typed_rejection is not None:
+            raise AttemptRejectedError("root preflight required", failure=self.typed_rejection)
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
@@ -201,7 +233,7 @@ class _RecordingLedger:
         here (the protocol says ``0``) so a recorded ``None`` proves the
         registry withheld the keyword.
         """
-        del first_token_at
+        self.first_token_times.append(first_token_at)
         self.upstream_providers.append(upstream_provider)
         self.web_search_requests.append(web_search_requests)
         self.tool_search_requests.append(tool_search_requests)
@@ -560,6 +592,102 @@ def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
         }
     ]
     assert registry.entry("request-one") is None
+    assert registry.counters()[1] == 1
+
+
+@pytest.mark.parametrize("writes", [None, 0, 25])
+@pytest.mark.parametrize("fault", ["raise", "provider", "exact_model_id", "organization_id"])
+@pytest.mark.parametrize("delivery", ["direct", "retry", "sweep"])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
+    writes: int | None,
+    fault: Literal["raise", "provider", "exact_model_id", "organization_id"],
+    delivery: Literal["direct", "retry", "sweep"],
+    finalize: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both settlement paths release load and finalize despite unusable host scope."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger, recovery_host=RecoveryHostFake(fault))
+    deployments = _bounded_pair(1)
+    entry = _admit(registry, deployments, request_id="recovery-fault")
+    entry.request = _request().model_copy(
+        update={"provider_prompt_cache_key": "xpl-test-session", "prompt_cache_key": "session"}
+    )
+    deployment = entry.route.deployment
+    invalid_scope = (
+        RecoveryHostFake()
+        .scope_for(deployment, entry.authorization.organization_id)
+        .model_copy(update={"provider" if fault == "raise" else fault: "synthetic-private-detail"})
+    )
+    entry.recovery_bindings[deployment.deployment_id] = FrozenRecoveryBinding(
+        deployment.deployment_id,
+        deployment.connection_sha256,
+        "https://test.invalid",
+        deployment.provider_model,
+        invalid_scope,
+    )
+    frozen_bindings = dict(entry.recovery_bindings)
+    started = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
+    settlement = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "completed",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cached_input_tokens": 50,
+                "cache_creation_input_tokens": writes,
+            },
+            "first_token_at": "2026-09-18T01:02:03+00:00",
+            "upstream_provider": "Azure",
+            "finalize": finalize,
+        }
+    )
+    if delivery != "direct":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(settlement)
+        assert entry.pending_settlement == json.loads(settlement)
+        if delivery == "sweep":
+            registry.sweep_expired()
+            assert entry.pending_settlement is None
+            assert registry.counters()[0] == 1
+        else:
+            assert registry.settle(settlement) == "{}"
+    else:
+        assert registry.settle(settlement) == "{}"
+    assert len(ledger.finished) == 1 and ledger.finished[0]["finalize"] is finalize
+    observed = datetime.fromisoformat("2026-09-18T01:02:03+00:00")
+    calls = 1 if delivery == "direct" else 2
+    assert ledger.first_token_times == [observed] * calls
+    assert ledger.upstream_providers == ["Azure"] * calls
+    assert len(ledger.terminal_events) == calls
+    for event in ledger.terminal_events:
+        assert event is not None and event.usage is not None
+        assert event.usage.cache_creation_input_tokens == writes
+        assert event.usage.input_tokens == 100
+        assert event.usage.cached_input_tokens == 50
+    assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
+    assert registry.accounting_healthy
+    assert entry.recovery_bindings == frozen_bindings
+    assert not entry.recovery_recorded_attempts
+    assert not registry.recovery._sessions  # noqa: SLF001 - scope faults must write no evidence.
+    assert "synthetic-private-detail" not in caplog.text
+    assert caplog.records and all(record.exc_info is None for record in caplog.records)
+    if finalize:
+        assert registry.entry(entry.authorization.request_id) is None
+    else:
+        assert registry.entry(entry.authorization.request_id) is entry
+        assert entry.active_attempt_id is None
+        registry.abandon(json.dumps({"request_id": entry.authorization.request_id}))
+    # Another expired request still settles on the next sweep after the host fault.
+    other = _admit(registry, deployments, request_id="after-recovery-fault")
+    _start(registry, ordinal=0, request_id=other.authorization.request_id)
+    other.deadline_monotonic = time.monotonic() - 60
+    registry.sweep_expired()
+    assert registry.entry(other.authorization.request_id) is None
     assert registry.counters()[1] == 1
 
 
@@ -1781,6 +1909,66 @@ def _settle_with_usage(
     )
 
 
+@pytest.mark.parametrize("mode", ["maximize_availability", "maximize_cache_affinity"])
+def test_recovery_placement_reason_does_not_replace_throttle_redial_reason(
+    mode: FailoverMode,
+) -> None:
+    """Initial recovery placement and a later physical backoff remain distinguishable."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    deployments = (_deployment("deployment-a", connection_sha256="b" * 64),)
+    entry = _admit(
+        registry,
+        deployments,
+        request_id="request-1",
+        failover_mode=mode,
+        throttle_redial=GatewayThrottleRedialPolicy(
+            max_attempts=1, base_delay_ms=100, max_delay_ms=100
+        ),
+    )
+    entry.recovery_reason = "retained_warm_fallback"
+    first = _start(registry, ordinal=0, request_id="request-1")
+    assert ledger.started[0]["dispatch_reason"] == "retained_warm_fallback"
+    _settle(
+        registry,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=_THROTTLE,
+        request_id="request-1",
+    )
+    redial = _start(
+        registry,
+        ordinal=1,
+        current_depth=0,
+        failure=_THROTTLE,
+        throttle_backoff=True,
+        request_id="request-1",
+    )
+    assert redial["route_depth"] == 0
+    assert ledger.started[1]["dispatch_reason"] == "throttle_backoff"
+    assert ledger.started[1]["preferred_deployment_id"] is None
+    registry.abandon(json.dumps({"request_id": "request-1"}))
+
+
+def test_recovery_placement_reason_does_not_replace_forced_overflow() -> None:
+    """A retained route forced past its capacity reports the real admission override."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    deployments = (_bounded_pair(1)[0],)
+    _admit(registry, deployments, request_id="holder")
+    _start(registry, ordinal=0, request_id="holder")
+    entry = _admit(
+        registry, deployments, request_id="overflow", failover_mode="maximize_cache_affinity"
+    )
+    entry.recovery_reason = "retained_warm_fallback"
+    assert _start(registry, ordinal=0, request_id="overflow")["route_depth"] == 0
+    assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
+    assert registry.rung_admission_counters() == (1, 1)
+    for request_id in ("holder", "overflow"):
+        registry.abandon(json.dumps({"request_id": request_id}))
+
+
 class TestThrottleCacheThreshold:
     """The per-request cache-stakes throttle decision and its disclosures."""
 
@@ -2341,12 +2529,52 @@ class _LegacySignatureLedger(_RecordingLedger):
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Record the settle exactly as the previous engine handed it over."""
-        del first_token_at, retry_after_seconds, ratelimit_limit_requests
+        del retry_after_seconds, ratelimit_limit_requests
         del ratelimit_remaining_requests, ratelimit_limit_tokens, ratelimit_remaining_tokens
+        self.first_token_times.append(first_token_at)
         self.terminal_events.append(terminal_event)
         self.finished.append(
             {"attempt_id": attempt_id, "finalize": finalize_request, "failed": failure is not None}
         )
+
+
+@pytest.mark.parametrize("writes", [None, 0, 25])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_cache_write_usage_keeps_legacy_and_current_host_signatures(
+    writes: int | None, legacy: bool
+) -> None:
+    """Cache writes ride typed usage, never a new keyword an older host must accept."""
+    ledger = _LegacySignatureLedger() if legacy else _RecordingLedger()
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", ledger))
+    _admit(registry, _bounded_pair(1), request_id="cache-write-host")
+    started = _start(registry, ordinal=0, request_id="cache-write-host")
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": "cache-write-host",
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 5,
+                    "cached_input_tokens": 50,
+                    "cache_creation_input_tokens": writes,
+                },
+                "first_token_at": observed.isoformat(),
+                "upstream_provider": "Azure",
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    (event,) = ledger.terminal_events
+    assert event is not None and event.usage is not None
+    assert event.usage.cache_creation_input_tokens == writes
+    assert ledger.first_token_times == [observed]
+    assert ledger.upstream_providers == ([] if legacy else ["Azure"])
+    assert len(ledger.finished) == 1
+    assert registry.entry("cache-write-host") is None
 
 
 def _settle_naming_upstream(

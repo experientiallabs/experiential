@@ -61,6 +61,13 @@ class AffinityPlacement:
     fingerprint: bytes | None = None
     sticky_preferred: bool = False
     sticky_deployment_id: str | None = None
+    recovery_reason: str | None = None
+    # Scoped recovery verifies the exact tenant, session prefix and credential at
+    # admission. Its selected warm rung travels only with this request, never
+    # through the conversation-only sticky registry.
+    verified_warm_deployment_id: str | None = None
+    verified_warm_until_monotonic: float = 0
+    recovery_scoped: bool = False
 
 
 def sticky_first_order(

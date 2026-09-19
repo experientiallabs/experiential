@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import json
 import sys
-import termios
-import tty
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,6 +30,10 @@ from exp.cli.judge.transcript import (
 )
 from exp.common.traces import Trace, TraceSpan
 from exp.optimize.router.judging.review import ManualJudgeTraceProposal
+
+if sys.platform != "win32":
+    import termios
+    import tty
 
 _HELP = "j/k scroll  space/b page  d/u half  n/p step  g/G top/end  q continue"
 
@@ -558,6 +560,8 @@ def _read_key() -> str:
     Returns:
         Single character, or a normalized name such as ``up`` or ``pgdn``.
     """
+    if sys.platform == "win32":
+        raise RuntimeError("Raw trace-viewer input requires a POSIX terminal")
     descriptor = sys.stdin.fileno()
     saved = termios.tcgetattr(descriptor)
     try:

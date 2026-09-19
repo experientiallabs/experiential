@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 from exp.common.models import ToolCall
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayToolDefinition
 from exp.runtime.gateway.tool_search.contracts import GATEWAY_TOOL_SEARCH_NAME
+from exp.runtime.models.providers.errors import ProviderParameterError
 
 if TYPE_CHECKING:
     from exp.common.core.artifacts import JsonObject
@@ -74,17 +75,52 @@ class NativeToolMapping:
     Responses item the Codex caller declared.
     """
 
-    __slots__ = ("_by_mangled",)
+    __slots__ = ("_by_mangled", "_by_origin", "_used")
 
     def __init__(self, entries: dict[str, tuple[str, str | None, bool]] | None = None) -> None:
-        # mangled provider name -> (origin_name, origin_namespace, is_custom)
-        self._by_mangled: dict[str, tuple[str, str | None, bool]] = dict(entries or {})
+        """Restore a provider-only map without allowing ambiguous inverse identities."""
+        self._by_mangled: dict[str, tuple[str, str | None, bool]] = {}
+        self._by_origin: dict[tuple[str, str | None, bool], str] = {}
+        self._used: set[str] = set()
+        for wire_name, origin in (entries or {}).items():
+            self.record(wire_name, *origin)
+
+    def reserve_plain(self, name: str) -> None:
+        """Keep ordinary declarations/history unchanged, including already-shaped names."""
+        if name not in self._by_mangled:
+            self._used.add(name)
+            self._by_origin[(name, None, False)] = name
+
+    def reserved_names(self) -> set[str]:
+        """Return a copy of every occupied name for declaration allocation."""
+        return set(self._used)
+
+    def allocate(self, name: str, namespace: str | None, is_custom: bool) -> str:
+        """Reuse the declaration's exact name, or allocate one for historical-only input."""
+        origin = (name, namespace, is_custom)
+        if origin in self._by_origin:
+            return self._by_origin[origin]
+        wire_name = _unique(mangle(namespace, name), set(self._used))
+        self.record(wire_name, *origin)
+        return wire_name
 
     def record(
         self, mangled: str, origin_name: str, namespace: str | None, is_custom: bool
     ) -> None:
-        """Record the origin of one provider-facing (mangled) tool name."""
-        self._by_mangled[mangled] = (origin_name, namespace, is_custom)
+        """Bind a bijective native identity; never overwrite a reserved ordinary name."""
+        origin = (origin_name, namespace, is_custom)
+        existing = self._by_mangled.get(mangled)
+        if (mangled in self._used and existing != origin) or (
+            origin in self._by_origin and self._by_origin[origin] != mangled
+        ):
+            raise ProviderParameterError(
+                message="Tool declarations must have distinct native identities.",
+                param="tools",
+                code="invalid_parameter",
+            )
+        self._by_mangled[mangled] = origin
+        self._by_origin[origin] = mangled
+        self._used.add(mangled)
 
     def resolve(self, mangled: str) -> tuple[str, str | None, bool] | None:
         """Return ``(origin_name, namespace, is_custom)`` for a provider name."""
@@ -264,10 +300,13 @@ def translate_native_tools(request: GatewayRequest) -> NativeToolTranslation:
     Returns:
         The translated tool list, drop disclosures, and the inverse mapping.
     """
-    used: set[str] = {tool.name for tool in request.tools}
     tools: list[GatewayToolDefinition] = list(request.tools)
     disclosures: list[str] = []
-    mapping = NativeToolMapping()
+    mapping = NativeToolMapping(request.native_tool_translation)
+    for tool in request.tools:
+        mapping.reserve_plain(tool.name)
+    _reserve_plain_history(request.messages, mapping)
+    used = mapping.reserved_names()
     for entry in request.provider_native_tools:
         translated, disclosure = _translate_declaration(entry.tool, used=used)
         if disclosure is not None and disclosure not in disclosures:
@@ -316,6 +355,19 @@ def invert_tool_call(
     return origin_name, namespace, True, custom_input
 
 
+def _reserve_plain_history(messages: Sequence[GatewayMessage], mapping: NativeToolMapping) -> None:
+    """Reserve all genuine plain history names before allocating native aliases."""
+    for message in messages:
+        for call in message.tool_calls:
+            if call.provider_namespace is None:
+                mapping.reserve_plain(call.name)
+        item = message.provider_native_item
+        if item is not None and item.get("type") == "function_call" and not item.get("namespace"):
+            name = _string(item.get("name"))
+            if name is not None:
+                mapping.reserve_plain(name)
+
+
 def convert_native_history(
     messages: Sequence[GatewayMessage],
     mapping: NativeToolMapping,
@@ -339,12 +391,28 @@ def convert_native_history(
     Returns:
         The converted message tuple and any drop disclosures.
     """
+    _reserve_plain_history(messages, mapping)
     converted: list[GatewayMessage] = []
     disclosures: list[str] = []
     for message in messages:
         item = message.provider_native_item
         if item is None:
-            converted.append(message)
+            calls = tuple(
+                call.model_copy(
+                    update={
+                        "name": mapping.allocate(call.name, call.provider_namespace, False),
+                        "provider_namespace": None,
+                    }
+                )
+                if call.provider_namespace is not None
+                else call
+                for call in message.tool_calls
+            )
+            converted.append(
+                message.model_copy(update={"tool_calls": calls})
+                if calls != message.tool_calls
+                else message
+            )
             continue
         replacement, disclosure = _convert_history_item(item, mapping, tool_search_name)
         if replacement is not None:
@@ -367,8 +435,7 @@ def _convert_history_item(
         text = item.get("input")
         if call_id is None or name is None:
             return None, "input.custom_tool_call->dropped(malformed)"
-        mangled = mangle(namespace, name)
-        mapping.record(mangled, name, namespace, True)
+        mangled = mapping.allocate(name, namespace, True)
         arguments: JsonObject = {_CUSTOM_INPUT_PROPERTY: text if isinstance(text, str) else ""}
         call = ToolCall(
             call_id=call_id,
@@ -397,9 +464,7 @@ def _convert_history_item(
         raw_arguments = item.get("arguments")
         if call_id is None or name is None or not isinstance(raw_arguments, str):
             return None, "input.function_call->dropped(malformed)"
-        mangled = mangle(namespace, name)
-        if namespace is not None:
-            mapping.record(mangled, name, namespace, False)
+        mangled = mapping.allocate(name, namespace, False) if namespace is not None else name
         try:
             arguments = json.loads(raw_arguments)
         except json.JSONDecodeError:

@@ -275,14 +275,20 @@ class AttemptReservationRequest(ContractModel):
     maximum_cost_nano_usd: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
-    def _require_matching_organization(self) -> AttemptReservationRequest:
-        """Reject tenant, deployment-list, or exact-model drift."""
+    def _require_matching_route(self) -> AttemptReservationRequest:
+        """Reject tenant, stage-cursor, or destination exact-model drift."""
         if self.organization_id != self.snapshot.authorization.organization_id:
             raise ValueError("attempt reservation organization differs from its snapshot")
         if self.deployment.deployment_id not in self.snapshot.deployment_ids:
             raise ValueError("attempt deployment is absent from its execution snapshot")
-        if self.deployment.exact_model_id != self.snapshot.exact_model_id:
-            raise ValueError("attempt deployment changes the selected exact model")
+        stage = self.snapshot.stage_for_depth(self.route_depth)
+        if (
+            self.deployment.deployment_id != self.snapshot.deployment_ids[self.route_depth]
+            or self.deployment.deployment_id not in stage.deployment_ids
+        ):
+            raise ValueError("attempt deployment differs from its authorized stage cursor")
+        if self.deployment.exact_model_id != stage.exact_model_id:
+            raise ValueError("attempt deployment changes the selected stage exact model")
         return self
 
 

@@ -696,7 +696,7 @@ def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     twice (its bounded cap) before failover; the terminal attempt completes
     on route depth one and the response carries the winning deployment's
     output and route headers. The two operational failures open the primary's
-    health circuit, which the streaming scenario below observes.
+    health circuit; other tests must establish their own circuit preconditions.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -711,36 +711,27 @@ def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     assert rows == [(0, 0, "failed"), (1, 0, "failed"), (2, 1, "completed")]
 
 
-def _open_primary_circuit(engine: _ServingEngine) -> None:
-    """Make sure the primary's circuit is open before a scenario that relies on it.
-
-    The failover scenario opens it with two operational failures, but under
-    ``pytest -n --dist worksteal`` a module's tail can land on a worker whose
-    engine never ran that scenario. One ``always-500`` request either opens a
-    cold circuit (two primary failures, then the fallback) or, on an already
-    open one, dispatches straight to the fallback; both leave it open.
-    """
-    response = httpx.post(
-        f"{engine.base}/v1/chat/completions",
-        headers={"authorization": f"Bearer {engine.raw_key}"},
-        json=_chat_payload("always-500"),
-        timeout=30.0,
-    )
-    assert response.status_code == 200
-    assert response.headers["x-gateway-route-depth"] == "1"
-
-
 def test_streaming_request_skips_the_open_primary_circuit(
     engine: _ServingEngine,
 ) -> None:
     """An open primary circuit routes a streamed request straight to depth one.
 
-    With the primary's circuit open (the failover scenario's two operational
-    failures, re-established here so the scenario holds on any worker), this
-    streamed request dispatches once on the fallback and its committed headers
-    name the winning deployment position before the first byte flows.
+    This test opens the circuit itself rather than relying on another test
+    running first on the same worker. An already-open circuit needs no extra
+    primary call; otherwise the setup records the two failures that open it.
     """
-    _open_primary_circuit(engine)
+    setup = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("always-500"),
+        timeout=30.0,
+    )
+    assert setup.status_code == 200
+    setup_rows = _attempt_rows(engine, setup.headers["x-request-id"])
+    assert setup_rows in (
+        [(0, 1, "completed")],
+        [(0, 0, "failed"), (1, 0, "failed"), (2, 1, "completed")],
+    )
     collected = b""
     with httpx.stream(
         "POST",
@@ -763,12 +754,12 @@ def test_streaming_request_skips_the_open_primary_circuit(
 def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None:
     """Every accepted request settles: no open attempts, matched totals.
 
-    Conservation is asserted against the ledger itself, whatever traffic this
-    worker's engine has seen (under ``pytest -n --dist worksteal`` a module's
-    tail may run on a worker that ran only some scenarios): the usage report's
-    request total equals the accepted request rows, every attempt row is
-    terminal, and the report's terminal attempt counts equal the attempt rows.
+    Establish its own baseline because parallel workers may run any subset
+    of the module. The successful probe adds exactly one request and attempt;
+    aggregate terminal attempts must equal the durable closed attempt count.
     """
+    before = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
+    before_attempts = sum(int(count["attempts"]) for count in before["totals"]["terminal_counts"])
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
         headers={"authorization": f"Bearer {engine.raw_key}"},
@@ -777,6 +768,9 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
+    rows = _attempt_rows(engine, response.headers["x-request-id"])
+    assert rows in ([(0, 0, "completed")], [(0, 1, "completed")])
+    assert report["totals"]["requests"] == before["totals"]["requests"] + 1
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
         (total_requests,) = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()
@@ -788,4 +782,4 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     assert total_requests >= 1
     assert report["totals"]["requests"] == total_requests
     assert open_attempts == 0
-    assert terminal_attempts == total_attempts >= total_requests
+    assert terminal_attempts == total_attempts == before_attempts + 1

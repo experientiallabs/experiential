@@ -16,7 +16,6 @@ import os
 import secrets
 import select
 import sys
-import termios
 import threading
 import webbrowser
 from collections.abc import Callable, Mapping
@@ -28,6 +27,9 @@ from rich.console import Console
 
 from exp.common.auth import StoredCredentialBinding
 from exp.common.models import ProviderConnection
+
+if sys.platform != "win32":
+    import termios
 
 SETUP_PICKER_NAME = "experiential-cloud"
 SETUP_PICKER_LABEL = "Experiential Cloud"
@@ -335,6 +337,8 @@ def read_masked_key_with_callback(
         OSError: The terminal cannot be opened or read.
         termios.error: Terminal echo settings cannot be changed.
     """
+    if sys.platform == "win32":
+        raise RuntimeError("Callback-aware hidden terminal input requires a POSIX terminal")
     try:
         fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
         owns_fd = True

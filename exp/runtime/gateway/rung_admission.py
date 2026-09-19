@@ -294,6 +294,51 @@ class RungLoadRegistry:
             self._tickets[ticket] = (key, organization_id)
             return ticket
 
+    def can_admit(
+        self,
+        key: RungLoadKey,
+        *,
+        organization_id: str,
+        weight: int,
+        bound: int | None,
+        fair_share: bool,
+        requests_per_minute: int | None,
+        tokens_per_minute: int | None,
+        cache_priority_alpha: float | None,
+        reserved_tokens: int,
+    ) -> bool:
+        """Check current local headroom without reserving or consuming a rate-window slot.
+
+        This is an elective recovery hint only. Dispatch still performs the atomic
+        reservation and may shed if competing traffic consumed the headroom meanwhile.
+        """
+        now = self._clock()
+        with self._lock:
+            rung = self._rungs.get(key)
+            if rung is None:
+                return True
+            organization = rung.organizations.setdefault(organization_id, _OrganizationLoad())
+            organization.last_seen = now
+            organization.weight = weight
+            self._prune(key, rung, now)
+            self._prune_window(rung, now)
+            return (
+                self._shed_reason(
+                    rung,
+                    organization,
+                    now=now,
+                    bound=bound,
+                    fair_share=fair_share,
+                    requests_per_minute=requests_per_minute,
+                    tokens_per_minute=tokens_per_minute,
+                    cache_priority_alpha=cache_priority_alpha,
+                    reserved_tokens=reserved_tokens,
+                    warm_session=True,
+                    fresh_spill_fraction=None,
+                )
+                is None
+            )
+
     def _shed_reason(
         self,
         rung: _RungLoad,

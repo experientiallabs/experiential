@@ -9,13 +9,27 @@ import pytest
 
 from exp.common.config.settings import (
     DEFAULT_COMMAND_BUDGET_USD,
+    GatewayResourceSettings,
     ensure_telemetry_anonymous_id,
     load_settings,
     resolve_command_budget_usd,
+    save_settings,
     set_maximum_command_cost_usd,
     set_telemetry_enabled,
     settings_path,
 )
+
+
+def test_gateway_resource_setting_survives_other_settings_updates(tmp_path: Path) -> None:
+    """The single settings file preserves existing fields and the explicit resource budget."""
+    settings = load_settings(tmp_path)
+    settings.gateway = GatewayResourceSettings(budget_snapshot_max_bytes=128 * 1024 * 1024)
+    save_settings(settings, tmp_path)
+    set_telemetry_enabled(False, tmp_path)
+    set_maximum_command_cost_usd(2.5, tmp_path)
+    loaded = load_settings(tmp_path)
+    assert loaded.gateway.budget_snapshot_max_bytes == 128 * 1024 * 1024
+    assert not loaded.telemetry.enabled and loaded.commands.maximum_cost_usd == 2.5
 
 
 def test_missing_settings_defaults_to_telemetry_enabled(tmp_path: Path) -> None:

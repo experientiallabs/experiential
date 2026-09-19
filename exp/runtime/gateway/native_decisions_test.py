@@ -19,6 +19,13 @@ from exp.common.models import (
     GatewayEquivalenceCertification,
     GatewayTokenPrices,
     ModelCapabilities,
+    load_model_catalog,
+    write_model_catalog,
+)
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.catalog_authority import (
     upsert_certified_pool,
@@ -145,6 +152,56 @@ def _admit(control: NativeControlPlane, raw_key: str, body: JsonObject | None = 
             json.dumps({"raw_key": raw_key, "body": json.dumps(_body() if body is None else body)})
         )
     )
+
+
+def test_decisions_never_enter_authored_model_reference_stages(tmp_path: Path) -> None:
+    """A decision alias remains exact-model even when its catalog also authors a child chain."""
+    _control, key = _control_plane(tmp_path)
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    root = catalog.models["decision-0"]
+    assert root.gateway is not None
+    child = root.model_copy(
+        update={"gateway": root.gateway.model_copy(update={"exact_model_id": "other-decision"})}
+    )
+    chain = GatewayModelChain(
+        model_id="systemone-exact",
+        pool_id="decision-0",
+        revision="chain-test",
+        rungs=(
+            GatewayDeploymentRung(deployment_id="decision-0"),
+            GatewayModelReferenceRung(model_id="other-decision"),
+        ),
+    )
+    write_model_catalog(
+        tmp_path / "models.toml",
+        catalog.model_copy(
+            update={
+                "models": {**catalog.models, "decision-child": child},
+                "gateway_model_chains": {"systemone-exact": chain},
+            }
+        ),
+    )
+    from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+        chain_components,
+        publish_authored_chain_fixture,
+    )
+
+    publish_authored_chain_fixture(
+        tmp_path, alias_id="decisions", revision_id="revision-chain", pool_id="decision-0"
+    )
+    control = NativeControlPlane(
+        chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"})
+    )
+    admitted = _admit(control, key)
+    wires = admitted["route"]
+    assert isinstance(wires, list)
+    assert [wire["deployment_id"] for wire in wires] == ["decision-0"]
+    entry = control._accounting.entry(str(admitted["request_id"]))
+    assert entry is not None
+    assert entry.route.snapshot.model_stages == ()
+    assert entry.route.snapshot.exact_model_id == "systemone-exact"
+    assert entry.route.snapshot.deployment_ids == ("decision-0",)
+    control.abandon(json.dumps({"request_id": admitted["request_id"]}))
 
 
 def _rows(control: NativeControlPlane) -> list[tuple[str, str | None]]:

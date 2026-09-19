@@ -38,7 +38,21 @@ from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.lifecycle_fields import (
+    GatewayLifecycleError as GatewayLifecycleError,
+)
+from exp.runtime.gateway.lifecycle_fields import (
+    required as _required,
+)
+from exp.runtime.gateway.lifecycle_fields import (
+    required_revision as _required_revision,
+)
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
+from exp.runtime.gateway.model_chain_authority import (
+    ModelChainAuthorityError,
+    refuse_local_chain_snapshot,
+    refuse_unenforced_model_chains,
+)
 from exp.runtime.gateway.project_activation import (
     ProjectActivationError,
     ProjectActivationRepository,
@@ -58,10 +72,6 @@ from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntim
 _RETIRED_REVISION_RETENTION_SECONDS = 600.0
 
 _logger = logging.getLogger(__name__)
-
-
-class GatewayLifecycleError(ValueError):
-    """Local gateway configuration cannot form one ready execution snapshot."""
 
 
 @dataclass(frozen=True)
@@ -600,7 +610,15 @@ def _load_alias_state(
         try:
             try:
                 revision_id, catalog_sha256 = _required_revision(alias)
+                if alias.snapshot_ref is not None:
+                    refuse_local_chain_snapshot(manager.state_dir, alias.snapshot_ref)
                 catalog, normalized = _load_snapshot(manager, alias)
+                refuse_unenforced_model_chains(normalized)
+                refuse_unenforced_model_chains(catalog)
+            except ModelChainAuthorityError as exc:
+                # Feature policy cannot fall back to a prior, weaker alias revision.
+                unavailable_aliases.append((alias.alias_name, str(exc)))
+                continue
             except GatewayLifecycleError as exc:
                 # The alias's active revision pins an unservable snapshot (parse
                 # failure or a same-version self-inconsistent digest). Serve the
@@ -977,18 +995,3 @@ def _readiness_authorization(
         refusal_failover=alias.refusal_failover,
         deadline_monotonic=time.monotonic() + 30,
     )
-
-
-def _required_revision(alias: GatewayAliasView) -> tuple[str, str]:
-    """Return required alias revision and catalog digest values."""
-    return (
-        _required(alias.revision_id, "revision ID", alias),
-        _required(alias.catalog_sha256, "catalog digest", alias),
-    )
-
-
-def _required(value: str | None, name: str, alias: GatewayAliasView) -> str:
-    """Return one required active-alias field or fail with safe context."""
-    if value is None:
-        raise GatewayLifecycleError(f"alias {alias.alias_name!r} is missing {name}")
-    return value

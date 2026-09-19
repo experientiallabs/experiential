@@ -34,6 +34,10 @@ from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.model_chain_authority import (
+    refuse_sqlite_chain_authorization,
+    refuse_sqlite_chain_snapshot,
+)
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.alias_activation import (
@@ -446,6 +450,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             catalog_sha256: Normalized secret-free catalog digest.
         """
         with self._transaction() as connection:
+            refuse_sqlite_chain_snapshot(connection, snapshot_ref)
             connection.execute(
                 """
                 INSERT INTO catalog_snapshot_refs (
@@ -672,6 +677,10 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             ).fetchone()
         if row is None:
             raise AliasNotGrantedError("requested model alias is not granted")
+        with self._transaction() as connection:
+            refuse_sqlite_chain_authorization(
+                connection, organization_id, str(row["active_revision_id"])
+            )
         target: GatewayTarget
         if str(row["target_kind"]) == "direct":
             target = DirectTarget(pool_id=str(row["pool_id"]))

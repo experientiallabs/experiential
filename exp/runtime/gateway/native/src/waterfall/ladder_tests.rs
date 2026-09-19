@@ -258,6 +258,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
+        exact_model_id: "exact-model".to_string(),
         dialect: "openai_compatible".to_string(),
         url: url.to_string(),
         headers: HashMap::new(),
@@ -280,6 +281,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
         throttle_redial_budget,
+        throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
     }
@@ -473,6 +475,27 @@ pub(super) async fn finish(mut guard: AttemptGuard, won: Won) -> Won {
         guard.settle("completed", None, &[], None, true).await;
     }
     won
+}
+
+#[test]
+fn stage_local_redial_schedule_is_consumed_without_a_root_schedule() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![Answer::Throttle(None), Answer::Stream(&[TEXT_FRAME])]).await;
+        let mut stage = wire("child", &rung.url, 1);
+        stage.exact_model_id = "child-model".to_string();
+        stage.throttle_redial = Some(SCHEDULE);
+        let (won, guard) = harness.run(&[stage], None, Duration::from_secs(10)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("stage-local redial must serve without a root schedule");
+        };
+        assert_eq!(committed.depth, 0);
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["throttle_backoff"], true);
+        assert_eq!(gaps(&rung).len(), 1);
+    });
 }
 
 #[test]

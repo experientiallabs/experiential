@@ -13,7 +13,7 @@ import inspect
 import math
 from collections.abc import Callable
 from datetime import datetime
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -360,6 +360,36 @@ def tool_search_requests_from_terminal(terminal: GatewayEvent | None) -> int:
 
 
 """Longest upstream label the settlement carries; anything longer is not a name."""
+
+
+class SettlementMetadata(TypedDict):
+    """Content-free observation fields forwarded identically on direct and swept writes."""
+
+    first_token_at: datetime | None
+    retry_after_seconds: int | None
+    ratelimit_limit_requests: int | None
+    ratelimit_remaining_requests: int | None
+    ratelimit_limit_tokens: int | None
+    ratelimit_remaining_tokens: int | None
+    upstream_provider: NotRequired[str | None]
+
+
+def settlement_metadata(
+    data: JsonObject | None, settle: Callable[..., object]
+) -> SettlementMetadata:
+    """Project original observations while withholding unsupported host keywords."""
+    observed = settlement_rate_limit(data)
+    fields: SettlementMetadata = {
+        "first_token_at": None if data is None else first_token_at_from_settlement(data),
+        "retry_after_seconds": observed.retry_after_seconds,
+        "ratelimit_limit_requests": observed.limit_requests,
+        "ratelimit_remaining_requests": observed.remaining_requests,
+        "ratelimit_limit_tokens": observed.limit_tokens,
+        "ratelimit_remaining_tokens": observed.remaining_tokens,
+    }
+    if accepts_keyword(settle, "upstream_provider"):
+        fields["upstream_provider"] = upstream_provider_from_settlement(data)
+    return fields
 
 
 def upstream_provider_from_settlement(data: JsonObject | None) -> str | None:

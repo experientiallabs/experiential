@@ -53,7 +53,7 @@ pub(super) fn throttle_backoff_delay(
     throttle_redials_at_depth: u32,
     total_attempts: u32,
 ) -> Option<Duration> {
-    let schedule = ctx.policy.throttle_redial?;
+    let schedule = wire.throttle_redial.or(ctx.policy.throttle_redial)?;
     if wire.throttle_redial_budget == 0
         || failure.failure_class != FailureClass::Throttled
         || total_attempts >= ctx.policy.maximum_total_attempts

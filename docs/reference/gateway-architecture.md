@@ -188,8 +188,8 @@ An alias targets either:
 A singleton alias creates a one-deployment pool. `exp config gateway pool certify` can replace that
 with an ordered pool only when every member has the same exact logical model identity and an
 operator-supplied equivalence certification. The certification records an ID, provenance, evidence
-digest, time, and exact deployment order. Project policy selection still chooses one exact logical
-model; operational fallback can only move among certified deployments for that model.
+digest, time, and exact deployment order. Project selection remains exact-model; direct conversational
+aliases may enter explicit [model chains](model-chains.md), with separate exact certification per stage.
 
 ## Request, route, and provider attempts
 
@@ -327,13 +327,13 @@ provider serves 200K); non-allowlisted tokens drop with a per-token
 and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
 same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a
 `verbosity` disclosure on other routes. Invalid values remain named parameter errors.
-Codex-native input items (`additional_tools` tool namespaces,
-`custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
-declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
-`tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
-Responses route; echoed message items accept `id`/`phase` with `status`
-optional (non-assistant identity drops); and freeform custom tool calls stream end to end with
-their native event names, including continuation retention. The item-level `namespace` on
+Native Responses declarations and history keep their caller positions and wire shapes on
+homogeneous native routes. Foreign or mixed routes translate custom and namespaced tools to
+functions; unsupported hosted tools/history drop with explicit disclosure. The selected
+attempt restores original identities. Translated custom input emits one decoded delta after
+the bounded wrapper completes; invalid wrappers fail. Ordinary/namespaced function arguments
+and native custom input remain incremental. Echoed message items accept
+`id`/`phase` with `status` optional (non-assistant identity drops). The item-level `namespace` on
 `function_call` (plus the `name`/`namespace` pair on `function_call_output` and the
 `custom_tool_call` namespace) round-trips verbatim through decode, the client stream, and
 continuation retention: the provider rejects a namespaced call replayed without it, so the

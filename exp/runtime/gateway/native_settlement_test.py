@@ -17,6 +17,7 @@ from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
     first_token_at_from_settlement,
+    settlement_metadata,
     settlement_rate_limit,
     terminal_from_settlement,
     tool_search_requests_from_settlement,
@@ -28,6 +29,40 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
 )
+
+
+def test_settlement_metadata_is_exact_content_free_and_host_capability_bound() -> None:
+    """Shared projection retains observed time without forwarding unrelated payload contents."""
+
+    def current(*, upstream_provider: str | None = None) -> None:
+        """A host accepting the new optional observation."""
+        del upstream_provider
+
+    def legacy() -> None:
+        """A host whose signature predates the optional observation."""
+
+    fields = settlement_metadata(
+        {
+            "first_token_at": "2026-09-18T01:02:03+00:00",
+            "upstream_provider": "Azure",
+            "rate_limit_headers": {"retry-after": "12"},
+            "content": "private prompt",
+            "authorization": "secret",
+        },
+        current,
+    )
+    assert fields == {
+        "first_token_at": datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC),
+        "retry_after_seconds": 12,
+        "ratelimit_limit_requests": None,
+        "ratelimit_remaining_requests": None,
+        "ratelimit_limit_tokens": None,
+        "ratelimit_remaining_tokens": None,
+        "upstream_provider": "Azure",
+    }
+    assert "upstream_provider" not in settlement_metadata({"upstream_provider": "Azure"}, legacy)
+    assert settlement_metadata(None, current)["first_token_at"] is None
+    assert settlement_metadata({}, current)["first_token_at"] is None
 
 
 def test_first_token_at_parses_the_native_plane_rfc3339_wire_format() -> None:

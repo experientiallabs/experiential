@@ -1,14 +1,4 @@
-"""Durable attempt accounting for the native data plane's waterfall.
-
-One registry owns every admitted request from acceptance to its terminal
-settlement: it reserves each physical dispatch (``start_attempt``), lands each
-attempt's durable terminal (``settle``), terminalizes requests with no
-settleable outcome (``abandon``), and sweeps retained settlements and
-abandoned reservations on a timer. Candidate selection enforces the frozen
-waterfall policy, including deployment-health circuits and per-deployment
-budget skipping. Every method takes and returns one JSON
-string, matching the bridge boundary.
-"""
+"""Durable native attempt reservations, scoped recovery, settlement and deadline cleanup."""
 
 from __future__ import annotations
 
@@ -22,6 +12,7 @@ from typing import Final
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
@@ -36,6 +27,8 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.ledger import AttemptRejectedError
+from exp.runtime.gateway.model_chain_authority import require_bound_model_chain_authority
 from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
     authority_error,
@@ -55,6 +48,11 @@ from exp.runtime.gateway.native_execution import (
     rung_load_key,
 )
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
+from exp.runtime.gateway.native_recovery import (
+    observe_reserved_attempt,
+    record_departure,
+    record_session_outcome,
+)
 from exp.runtime.gateway.native_rung_policy import (
     failed_dispatch_candidate,
     reserve_rung_slot,
@@ -66,17 +64,15 @@ from exp.runtime.gateway.native_settlement import (
     budget_quota_failure,
     budget_quota_protocol_error,
     failure_from_boundary_payload,
-    first_token_at_from_settlement,
     ledger_failure,
-    settlement_rate_limit,
+    settlement_metadata,
     terminal_from_settlement,
     tool_search_requests_from_terminal,
     tool_search_requests_kwarg,
-    upstream_provider_from_settlement,
-    upstream_provider_kwarg,
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
 )
+from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
@@ -107,6 +103,7 @@ class NativeAttemptAccounting:
         *,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         cache_sample_gate: Callable[[str], bool] | None = None,
+        recovery_host: RecoveryHost | None = None,
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -127,8 +124,10 @@ class NativeAttemptAccounting:
         self._finish_attempt: Callable[..., None] = write_ledger.finish_attempt
         self._budget_error_factory = budget_error_factory
         self._cache_sample_gate = cache_sample_gate
-        # Revision-scoped deployment health; physical-lane load survives catalog rolls.
+        self.recovery_host = recovery_host
+        self.recovery = SessionRecoveryRegistry()
         self._health = DeploymentHealthRegistry()
+        # Physical-lane admission counters survive catalog rolls.
         self._loads = RungLoadRegistry()
         # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
@@ -160,8 +159,7 @@ class NativeAttemptAccounting:
         self._throttles_failed_over = 0
         self._throttle_backoff_redials = 0
         self._throttle_backoff_forced = 0
-        # The sweep also runs on a timer so retained settlements and abandoned
-        # attempts are recovered even when no further requests arrive.
+        # Reconcile retained writes and abandoned requests even without new traffic.
         self._sweeper = threading.Thread(
             target=self._sweep_loop,
             name="exp-native-settlement-sweep",
@@ -347,6 +345,10 @@ class NativeAttemptAccounting:
         if entry is None or int(data["attempt_ordinal"]) != entry.total_attempts:
             raise NativeBridgeError(internal_protocol_error())
         route = entry.route
+        if entry.authorization.model_chain_authority is not None:
+            # The host refreshes an expired receipt inside reservation before
+            # binding it to the durable attempt; identity and mode cannot drift.
+            require_bound_model_chain_authority(entry.authorization, require_current=False)
         keys = tuple(
             deployment_health_key(entry.authorization, deployment)
             for deployment in route.deployments
@@ -410,11 +412,21 @@ class NativeAttemptAccounting:
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             if candidate is None:
-                if policy_sheds and last_failure is None and not forced_overflow:
+                if (
+                    policy_sheds
+                    and last_failure is None
+                    and not forced_overflow
+                    and not entry.overflow_used
+                ):
                     forced_overflow = True
+                    entry.overflow_used = True
                     candidate = policy_sheds[0][0]
                 else:
                     break
+            if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
+                self._health.release_probe(keys[candidate])
+                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                continue
             deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
@@ -436,6 +448,9 @@ class NativeAttemptAccounting:
                 force=forced_overflow,
             )
             if isinstance(ticket, RungShed):
+                record_departure(
+                    self.recovery, self.recovery_host, entry, deployment, "local_capacity"
+                )
                 policy_sheds.append((candidate, ticket.reason))
                 self._health.release_probe(keys[candidate])
                 forced_overflow = shed_keeps_rung(
@@ -468,13 +483,25 @@ class NativeAttemptAccounting:
                     reserved_output_tokens=reserved_output_tokens,
                     route_reason=route.attempt_route_reason(route.deployments[candidate]),
                     fallback_reason=rule_fallback_reason(route, candidate, current_depth, failure),
-                    dispatch_reason=dispatch_reason,
+                    dispatch_reason=entry.recovery_reason
+                    if candidate == 0
+                    and entry.total_attempts == 0
+                    and entry.recovery_reason is not None
+                    and dispatch_reason in (None, "affinity", "affinity_sticky")
+                    else dispatch_reason,
                     preferred_deployment=preferred_deployment,
                 )
             except BudgetReservationRejected as exc:
                 if ticket is not None:
                     self._loads.release_ticket(ticket)
                 self._health.release_probe(keys[candidate])
+                denied_pool = denied_destination_pool(exc, route.snapshot, candidate)
+                if denied_pool is not None:
+                    entry.denied_destination_pools.add(denied_pool)
+                    last_failure = budget_quota_failure()
+                    forced_overflow = False
+                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                    continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
                         NativeBridgeError(budget_quota_protocol_error())
@@ -507,11 +534,11 @@ class NativeAttemptAccounting:
                 error = authority_error(exc)
                 self.finish_request_quietly(
                     entry.authorization,
-                    GatewayFailure(
+                    exc.failure
+                    if isinstance(exc, AttemptRejectedError)
+                    else GatewayFailure(
                         failure_class=GatewayFailureClass.INTERNAL,
-                        safe_message=(
-                            "gateway could not reserve attempt accounting before dispatch"
-                        ),
+                        safe_message="gateway could not reserve attempt accounting before dispatch",
                     ),
                 )
                 with self._lock:
@@ -525,6 +552,7 @@ class NativeAttemptAccounting:
             elif throttle_backoff:
                 self._count_throttle_disposition(THROTTLE_BACKOFF)
             self._bind_sticky_dispatch(entry, deployment)
+            observe_reserved_attempt(self.recovery_host, entry, attempt_id, deployment)
             with self._lock:
                 if forced_overflow and not throttle_backoff:
                     self._rung_saturated_overflows += 1
@@ -582,20 +610,13 @@ class NativeAttemptAccounting:
         entry: InflightRequest,
         deployment: ExactModelDeployment,
     ) -> None:
-        """Record or refresh the conversation's binding to its serving rung.
+        """Refresh placement only on direct affinity routes without scoped recovery.
 
-        Every dispatch on a ``maximize_cache_affinity`` pool records where the
-        conversation's provider cache is being built, with the serving rung's
-        authored ``sticky_spill_seconds`` as the lifetime: a spilled
-        conversation thereby stays on its spill target instead of bouncing
-        back to the higher-ranked rung the moment it stops shedding, and a
-        conversation on its preferred rung simply refreshes a no-op binding.
-        A rung authoring no lifetime records nothing.
-
-        Args:
-            entry: The owning in-flight request.
-            deployment: The rung about to receive the dispatch.
+        Placement is not proof of successful cache use. Scoped recovery and model
+        plans record their cache evidence at successful settlement instead.
         """
+        if self.recovery_host is not None or entry.route.snapshot.model_stages:
+            return
         if entry.affinity_fingerprint is None:
             return
         if entry.route.snapshot.failover_mode != "maximize_cache_affinity":
@@ -642,22 +663,13 @@ class NativeAttemptAccounting:
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
         terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
-        first_token_at = first_token_at_from_settlement(data)
-        rate_limit = settlement_rate_limit(data)
-        upstream = upstream_provider_from_settlement(data)
         try:
             self._finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                first_token_at=first_token_at,
-                retry_after_seconds=rate_limit.retry_after_seconds,
-                ratelimit_limit_requests=rate_limit.limit_requests,
-                ratelimit_remaining_requests=rate_limit.remaining_requests,
-                ratelimit_limit_tokens=rate_limit.limit_tokens,
-                ratelimit_remaining_tokens=rate_limit.remaining_tokens,
-                **upstream_provider_kwarg(self._finish_attempt, upstream),
+                **settlement_metadata(data, self._finish_attempt),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -674,6 +686,9 @@ class NativeAttemptAccounting:
             raise authority_error(exc) from exc
         self._record_health(entry, attempt_id, opened=opened, failure=failure)
         self._record_cache_fraction(entry, attempt_id, terminal.usage)
+        record_session_outcome(
+            self.recovery, self.recovery_host, entry, attempt_id, terminal.usage, failure
+        )
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)
@@ -850,7 +865,7 @@ class NativeAttemptAccounting:
         )
 
     def _sweep_loop(self) -> None:
-        """Run the settlement sweep on a timer for the process lifetime."""
+        """Periodically reconcile retained or expired attempts for the process lifetime."""
         while True:
             time.sleep(_SWEEP_INTERVAL_SECONDS)
             self.sweep_expired()
@@ -949,20 +964,13 @@ class NativeAttemptAccounting:
         Returns:
             Whether the swept terminal write reached the ledger.
         """
-        observation = settlement_rate_limit(settlement)
-        upstream = upstream_provider_from_settlement(settlement)
         try:
             self._finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                retry_after_seconds=observation.retry_after_seconds,
-                ratelimit_limit_requests=observation.limit_requests,
-                ratelimit_remaining_requests=observation.remaining_requests,
-                ratelimit_limit_tokens=observation.limit_tokens,
-                ratelimit_remaining_tokens=observation.remaining_tokens,
-                **upstream_provider_kwarg(self._finish_attempt, upstream),
+                **settlement_metadata(settlement, self._finish_attempt),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -978,6 +986,9 @@ class NativeAttemptAccounting:
         # the same observed usage as the direct path, so the cache-priority
         # EWMA must not depend on WHICH recovery path succeeded.
         self._record_cache_fraction(entry, attempt_id, terminal.usage)
+        record_session_outcome(
+            self.recovery, self.recovery_host, entry, attempt_id, terminal.usage, failure
+        )
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)

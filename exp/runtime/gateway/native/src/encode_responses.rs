@@ -768,7 +768,9 @@ impl ResponsesSseEncoder {
                     frames.extend(self.close_message(key, item_status));
                 }
                 OutputSlot::Tool(index) if !self.tools[&index].done => {
-                    let item_status = if self.provider_output_starts.contains_key(&index) {
+                    let item_status = if self.provider_output_starts.contains_key(&index)
+                        || self.tools[&index].custom
+                    {
                         fallback_status
                     } else {
                         ProviderOutputItemStatus::Completed
