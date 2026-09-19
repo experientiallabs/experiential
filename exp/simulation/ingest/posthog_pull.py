@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import JsonValue, TypeAdapter
@@ -107,7 +107,10 @@ def pull_posthog_traces(
         raise PostHogPullError("PostHog pull needs an API key or POSTHOG_API_KEY")
     host = _posthog_host(request.host or os.environ.get("POSTHOG_HOST", "https://us.posthog.com"))
     body = _hogql_body(request)
-    endpoint = f"{host}/api/projects/{request.project_id}/query/"
+    project_segment = quote(request.project_id, safe="")
+    if project_segment in {".", ".."}:
+        project_segment = project_segment.replace(".", "%2E")
+    endpoint = f"{host}/api/projects/{project_segment}/query/"
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = _query_payload(client, endpoint, headers, body)
     source = SourceIdentity(
