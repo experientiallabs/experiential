@@ -115,6 +115,11 @@ class SimulationSpec(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_selected_mode_settings(self) -> Self:
+        """Require settings for the selected mode and reject inactive mode settings.
+
+        Raises:
+            ValueError: The selected mode lacks settings or another mode has settings.
+        """
         selected = {
             SimulationMode.WORLD_MODEL: self.world_model,
             SimulationMode.SANDBOX: self.sandbox,

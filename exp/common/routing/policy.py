@@ -100,6 +100,11 @@ class KnnRouterPolicy(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_baseline_candidate(self) -> KnnRouterPolicy:
+        """Validate candidate uniqueness and baseline coverage in the frozen policy.
+
+        Raises:
+            ValueError: Candidates are empty or duplicated, or baseline coverage is invalid.
+        """
         aliases = tuple(candidate.alias for candidate in self.candidates)
         if not aliases:
             raise ValueError("a router policy needs at least one candidate")

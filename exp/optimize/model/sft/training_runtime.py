@@ -39,6 +39,7 @@ class _ExpectedBatch:
 def _build_schedule(
     datums: tuple[TrainerDatum, ...], spec: TinkerSFTSpec
 ) -> tuple[_ScheduledBatch, ...]:
+    """Build the deterministic shuffled batch schedule for provider training."""
     schedule_items: list[_ScheduledBatch] = []
     for epoch in range(1, spec.epochs + 1):
         shuffled = tuple(
@@ -68,6 +69,7 @@ def _build_schedule(
 def _expected_schedule(
     examples: Sequence[SFTExample], spec: TinkerSFTSpec
 ) -> tuple[_ExpectedBatch, ...]:
+    """Build the schedule identity expected from persisted training examples."""
     schedule: list[_ExpectedBatch] = []
     for epoch in range(1, spec.epochs + 1):
         shuffled_ids = tuple(
@@ -97,6 +99,7 @@ def _expected_schedule(
 def _validate_event_schedule(
     events: Sequence[TinkerSFTEvent], expected_schedule: Sequence[_ExpectedBatch]
 ) -> None:
+    """Verify each persisted metric and checkpoint matches the frozen schedule."""
     for event in events:
         if isinstance(event, TinkerSFTMetric):
             if event.step > len(expected_schedule):
@@ -150,6 +153,7 @@ def _add_cost(
     *,
     has_prior_metrics: bool,
 ) -> NumericMeasurement | None:
+    """Combine exact or estimated costs while preserving their provenance."""
     if added is None:
         return None
     if current is None:
@@ -180,6 +184,7 @@ def _require_budget_can_continue(
     metrics: Sequence[TinkerSFTMetric],
     cost: NumericMeasurement | None,
 ) -> None:
+    """Reject a resumed run that has exhausted or cannot prove its budget."""
     if spec.maximum_cost_usd is None:
         return
     if metrics and cost is None:
@@ -200,6 +205,11 @@ def _require_step_budget(
     batch_example_count: int,
     current_cost: NumericMeasurement | None,
 ) -> NumericMeasurement | None:
+    """Require a conservative next-step cost bound to fit the remaining budget.
+
+    Raises:
+        TinkerSFTBudgetExceeded: The backend cannot bound the step or the budget is insufficient.
+    """
     upper_bound = backend.conservative_step_cost(
         spec,
         batch_example_count=batch_example_count,

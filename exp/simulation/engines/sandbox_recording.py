@@ -276,6 +276,7 @@ class _RecordingCandidateClient:
         monotonic: Callable[[], float],
         record_dispatch_intent: Callable[[], None],
     ) -> None:
+        """Bind a model client and evidence limits for one sandbox episode."""
         self._client = client
         self._snapshot = snapshot
         self._maximum_steps = maximum_steps
@@ -416,6 +417,7 @@ class _RecordingEnvironmentRuntime:
         monotonic: Callable[[], float],
         record_dispatch_intent: Callable[[], None],
     ) -> None:
+        """Bind an environment runtime and evidence limits for one sandbox episode."""
         self._runtime = runtime
         self._deadline = deadline
         self._clock = clock

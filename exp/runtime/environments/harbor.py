@@ -374,6 +374,7 @@ class _HarborEnvironmentSession:
         maximum_observation_characters: int,
         workspace_root: str,
     ) -> None:
+        """Bind a Harbor session and limits for one environment episode."""
         self._session = session
         self._command_timeout_seconds = command_timeout_seconds
         self._retry_delays_seconds = retry_delays_seconds

@@ -167,7 +167,6 @@ def build_coverage_report(
             partition=name,
             candidates=candidates_by_partition[name],
             selection=selection_by_partition[name],
-            task_ids_by_representative=task_ids_by_representative,
             similarity_threshold=similarity_threshold,
         )
         for name in _PARTITIONS
@@ -222,7 +221,6 @@ def _partition_coverage(
     partition: PartitionName,
     candidates: Sequence[DeduplicatedTrace],
     selection: PartitionSelection,
-    task_ids_by_representative: dict[str, str],
     similarity_threshold: float,
 ) -> PartitionCoverage:
     """Create one partition report including all nearest-representative coverage distances."""

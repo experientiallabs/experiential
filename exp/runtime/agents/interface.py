@@ -25,6 +25,11 @@ class AgentEpisode(ContractModel):
 
     @model_validator(mode="after")
     def _require_consistent_terminal_state(self) -> AgentEpisode:
+        """Validate event ordering and failure fields for the terminal agent state.
+
+        Raises:
+            ValueError: Event IDs, ordering, or failure fields violate the episode contract.
+        """
         span_ids = tuple(event.span_id for event in self.events)
         if len(span_ids) != len(set(span_ids)):
             raise ValueError("agent episode event IDs must be unique")

@@ -280,7 +280,6 @@ def collect_trace_reviews(
             rollout_input=rollout_input,
             reference_input=reference_input,
             provisional_input=provisional_input,
-            rubric=rubric,
             judgment=judgment,
             judgment_input=judgment_input,
             probes=adapter.probes,
@@ -361,7 +360,6 @@ def _build_trace_review(
     rollout_input: ArtifactInput,
     reference_input: ArtifactInput | None,
     provisional_input: ArtifactInput,
-    rubric: Rubric,
     judgment: Judgment,
     judgment_input: ArtifactInput,
     probes: tuple[ArtifactInput, ...],
@@ -384,7 +382,6 @@ def _build_trace_review(
         rollout_input: Exact target rollout pointer.
         reference_input: Optional comparison rollout pointer.
         provisional_input: Provisional calibration used for raw judging.
-        rubric: Exact finalized rubric revision.
         judgment: Normalized immutable configured-judge response.
         judgment_input: Exact normalized judgment pointer.
         probes: Original immutable provider-response pointers.

@@ -23,6 +23,14 @@ class HashingRAGEmbedder:
     """Provider-free signed hashing embedder used by default for local RAG builds."""
 
     def __init__(self, dimensions: int = DEFAULT_HASHING_DIMENSIONS) -> None:
+        """Set the width of the deterministic hashing vectors.
+
+        Args:
+            dimensions: Number of components in each generated embedding.
+
+        Raises:
+            ValueError: The requested width is smaller than eight dimensions.
+        """
         if dimensions < 8:
             raise ValueError("the local RAG hashing embedder needs at least 8 dimensions")
         self.dimensions = dimensions

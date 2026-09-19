@@ -430,7 +430,6 @@ def _event_loop(
             anchors,
             top=top,
             width=width,
-            height=height,
             view_height=view_height,
             title=title,
         )
@@ -501,7 +500,6 @@ def _draw(
     *,
     top: int,
     width: int,
-    height: int,
     view_height: int,
     title: str,
 ) -> None:
@@ -513,7 +511,6 @@ def _draw(
         anchors: Ordered navigation targets used for the position label.
         top: First visible line offset.
         width: Terminal column count.
-        height: Terminal row count.
         view_height: Visible content rows.
         title: Header title identifying the current trace.
     """

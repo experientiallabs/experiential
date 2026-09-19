@@ -335,6 +335,11 @@ class ModelMessage(ContractModel):
 
     @model_validator(mode="after")
     def _require_message_payload(self) -> ModelMessage:
+        """Validate message content, role-specific fields, and media flattening.
+
+        Raises:
+            ValueError: Message fields do not satisfy their role and content contract.
+        """
         if self.content is None and self.assistant_action is None:
             raise ValueError("a model message needs text or an assistant action")
         if self.role != "tool" and self.tool_call_id is not None:
@@ -683,6 +688,11 @@ class ModelRequest(ContractModel):
 
     @model_validator(mode="after")
     def _require_coherent_tools_and_messages(self) -> ModelRequest:
+        """Validate tool uniqueness, tool choice references, and message compatibility.
+
+        Raises:
+            ValueError: Tools, tool choice, or messages violate the request contract.
+        """
         tool_names = tuple(tool.name for tool in self.tools)
         if len(set(tool_names)) != len(tool_names):
             raise ValueError("model request tool names must be unique")

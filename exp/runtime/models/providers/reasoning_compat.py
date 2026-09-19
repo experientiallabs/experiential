@@ -310,7 +310,6 @@ def thinking_config_reasoning_effort(config: Mapping[str, object]) -> ReasoningE
 def anthropic_reasoning_effort(model_id: str, effort: str) -> str:
     """Return one exact Anthropic effort or reject it before provider dispatch."""
     return _require_exact_effort(
-        model_id,
         effort,
         _anthropic_supported_efforts(model_id),
     )
@@ -318,7 +317,7 @@ def anthropic_reasoning_effort(model_id: str, effort: str) -> str:
 
 def gemini_thinking_level(model_id: str, effort: str) -> str:
     """Return one exact Gemini thinking level or reject it before dispatch."""
-    return _require_exact_effort(model_id, effort, _gemini_supported_efforts(model_id))
+    return _require_exact_effort(effort, _gemini_supported_efforts(model_id))
 
 
 def _gemini_supported_efforts(model_id: str) -> Collection[str]:
@@ -360,7 +359,7 @@ def openai_reasoning_effort(model_id: str, effort: str) -> str:
     if supported is None:
         # Preserve explicitly configured third-party OpenAI-compatible wires.
         return effort
-    return _require_exact_effort(model_id, effort, supported)
+    return _require_exact_effort(effort, supported)
 
 
 def _openai_supported_efforts(model_id: str) -> Collection[str] | None:
@@ -432,7 +431,6 @@ def _anthropic_supported_efforts(model_id: str) -> Collection[str]:
 
 
 def _require_exact_effort(
-    model_id: str,
     effort: str,
     supported: Collection[str],
 ) -> str:

@@ -69,6 +69,11 @@ class RAGAction(ContractModel):
 
     @model_validator(mode="after")
     def _require_kind_payload(self) -> RAGAction:
+        """Validate message and tool-call payload fields for the selected action kind.
+
+        Raises:
+            ValueError: Payload fields do not match the action kind.
+        """
         if self.kind == "message":
             if not self.content:
                 raise ValueError("message RAG actions need visible content")

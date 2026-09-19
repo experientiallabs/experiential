@@ -149,6 +149,24 @@ def _train_locked(
     created_at: datetime,
     code_revision: str,
 ) -> TinkerSFTResult:
+    """Resume or execute the bounded SFT schedule and persist its terminal artifacts.
+
+    Args:
+        dataset: Frozen training dataset and lineage metadata.
+        dataset_input: Exact persisted dataset pointer.
+        spec: Immutable training and budget configuration.
+        output_dir: Directory holding the run manifest, events, and artifacts.
+        backend: Provider-backed trainer implementation.
+        created_at: Timestamp recorded for newly created artifacts.
+        code_revision: Producer revision recorded in the run manifest.
+
+    Returns:
+        The completed or exactly replayed SFT result.
+
+    Raises:
+        TinkerSFTResumeError: Existing durable state cannot be resumed safely.
+        TinkerSFTBudgetExceeded: The next provider operation exceeds the budget.
+    """
     manifest = load_or_create_manifest(
         dataset=dataset,
         dataset_input=dataset_input,
@@ -287,7 +305,6 @@ def _train_locked(
                 session=session,
                 output_dir=output_dir,
                 manifest=manifest,
-                events=events,
                 attempt_id=attempt_id,
                 step=step,
                 cumulative_cost_usd=current_cost,
@@ -318,6 +335,11 @@ def _train_locked(
 
 
 def _read_events(output_dir: Path, run_id: ArtifactId) -> tuple[TinkerSFTEvent, ...]:
+    """Read, decode, and validate one run's append-only event log.
+
+    Raises:
+        TinkerSFTResumeError: The log is unreadable, malformed, or names another run.
+    """
     path = output_dir / _EVENTS_FILE
     if not path.exists():
         return ()
@@ -350,6 +372,11 @@ def _read_events(output_dir: Path, run_id: ArtifactId) -> tuple[TinkerSFTEvent, 
 
 
 def _validate_event_history(events: tuple[TinkerSFTEvent, ...]) -> None:
+    """Validate checkpoint, resume, and metric uniqueness across the event history.
+
+    Raises:
+        TinkerSFTResumeError: Events reference unknown checkpoints or duplicate work.
+    """
     checkpoints: dict[str, TinkerSFTCheckpoint] = {}
     metric_keys: set[tuple[int, int]] = set()
     seen_attempts: set[int] = set()
@@ -396,6 +423,7 @@ def _assert_no_uncheckpointed_completed_steps(events: Sequence[TinkerSFTEvent]) 
 def _metrics_at_checkpoint(
     events: Sequence[TinkerSFTEvent], checkpoint: TinkerSFTCheckpoint | None
 ) -> tuple[TinkerSFTMetric, ...]:
+    """Collect the complete metric lineage represented by a durable checkpoint."""
     if checkpoint is None:
         return ()
     checkpoints = {
@@ -442,11 +470,11 @@ def _save_checkpoint(
     session: TrainerSession,
     output_dir: Path,
     manifest: TinkerSFTRunManifest,
-    events: Sequence[TinkerSFTEvent],
     attempt_id: int,
     step: int,
     cumulative_cost_usd: NumericMeasurement | None,
 ) -> TinkerSFTCheckpoint:
+    """Persist checkpoint intent, provider state, and the corresponding event."""
     checkpoint_id = stable_id(
         "tinker-sft-checkpoint",
         {"run_id": manifest.run_id, "attempt_id": attempt_id, "step": step},
@@ -489,6 +517,7 @@ def _save_or_load_terminal_model(
     dataset_input: ArtifactInput,
     expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTModelArtifact:
+    """Load a verified terminal model or save and persist one from the final checkpoint."""
     existing_model = _load_model(output_dir, manifest)
     if existing_model is not None:
         _validate_model_lineage(
@@ -564,6 +593,7 @@ def _write_terminal_result(
     dataset_input: ArtifactInput,
     expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTResult:
+    """Validate terminal lineage and persist the completed SFT result artifact."""
     existing = _load_completed_result(
         output_dir,
         manifest,
@@ -625,6 +655,7 @@ def _load_completed_result(
     dataset_input: ArtifactInput,
     expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTResult | None:
+    """Load a completed result and verify every referenced durable artifact."""
     path = output_dir / _RESULT_FILE
     if not path.exists():
         return None
@@ -679,6 +710,7 @@ def _load_completed_result(
 
 
 def _load_model(output_dir: Path, manifest: TinkerSFTRunManifest) -> TinkerSFTModelArtifact | None:
+    """Load and validate the terminal model artifact for one run, if present."""
     path = output_dir / _MODEL_FILE
     if not path.exists():
         return None
@@ -708,6 +740,7 @@ def _validate_dataset_lineage(
     dataset: SFTDatasetArtifact,
     dataset_input: ArtifactInput,
 ) -> None:
+    """Require an artifact's dataset identity and input pointer to match the run."""
     if dataset_id != dataset.dataset.dataset_id or dataset_id != manifest.dataset_id:
         raise TinkerSFTResumeError(f"Tinker SFT {label} has a different canonical dataset ID")
     if (
@@ -739,6 +772,7 @@ def _validate_model_lineage(
     dataset_input: ArtifactInput,
     expected_schedule: Sequence[_ExpectedBatch],
 ) -> None:
+    """Require a model artifact to match the durable event chain and frozen schedule."""
     _validate_dataset_lineage(
         label="model",
         dataset_id=model.dataset_id,
@@ -788,6 +822,7 @@ def _events_sha256(output_dir: Path) -> str:
 def _assert_no_ambiguous_checkpoint_intent(
     output_dir: Path, run_id: ArtifactId, events: Sequence[TinkerSFTEvent]
 ) -> None:
+    """Reject checkpoint intents that lack matching durable completion events."""
     checkpoint_ids = {
         event.checkpoint_id for event in events if isinstance(event, TinkerSFTCheckpoint)
     }
@@ -809,6 +844,7 @@ def _assert_no_ambiguous_checkpoint_intent(
 def _assert_no_ambiguous_step_intent(
     output_dir: Path, run_id: ArtifactId, events: Sequence[TinkerSFTEvent]
 ) -> None:
+    """Reject optimizer-step intents whose completion status is unknown."""
     metrics = {
         (event.attempt_id, event.step): event
         for event in events

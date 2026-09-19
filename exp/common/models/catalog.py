@@ -184,6 +184,11 @@ class ConnectionConfig(ContractModel):
     @field_validator("base_url")
     @classmethod
     def _reject_embedded_credentials(cls, value: str | None) -> str | None:
+        """Validate the base URL and reject embedded credentials or query state.
+
+        Raises:
+            ValueError: The URL is not absolute HTTP(S), contains credentials, or has query data.
+        """
         if value is None:
             return value
         parsed = urlsplit(value)
@@ -198,6 +203,11 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        """Validate provider-specific endpoint metadata without accepting secrets.
+
+        Raises:
+            ValueError: Provider fields are incompatible, unsafe, or contain credential data.
+        """
         if self.provider != "azure" and self.azure_api_surface is not None:
             raise ValueError("azure_api_surface is only accepted for provider='azure'")
         if self.provider != "bedrock" and (
@@ -702,6 +712,11 @@ class ModelCatalog(ContractModel):
 
     @model_validator(mode="after")
     def _require_referenced_connections_and_roles(self) -> ModelCatalog:
+        """Validate model connection references, roles, pools, and gateway identities.
+
+        Raises:
+            ValueError: A model, role, pool, or gateway identity references an invalid entry.
+        """
         for alias, record in self.models.items():
             if record.connection not in self.connections:
                 raise ValueError(

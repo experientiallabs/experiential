@@ -133,6 +133,7 @@ class _DescendantTracker:
         root_identity: _ProcessIdentity,
         bindings: _DarwinKqueueBindings,
     ) -> None:
+        """Start descendant tracking and arm fork and exit notifications for the root process."""
         snapshot = _process_snapshot()
         root = snapshot.get(root_identity.pid)
         if root is None or root.identity != root_identity:
@@ -485,6 +486,7 @@ class _LocalProcessContext(AbstractContextManager[EnvironmentSession]):
         environment: Mapping[str, str],
         task: TaskCase,
     ) -> None:
+        """Bind the child command, resource limits, environment, and task."""
         self._command = command
         self._limits = limits
         self._workspace_parent = workspace_parent
@@ -532,6 +534,7 @@ class _LocalProcessSession:
         workspace_parent: Path | None,
         environment: Mapping[str, str],
     ) -> None:
+        """Initialize a bounded JSONL child-process session before it is started."""
         self._command = command
         self._limits = limits
         self._workspace_parent = workspace_parent

@@ -101,6 +101,11 @@ class CalibrationReport(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_coherent_report(self) -> CalibrationReport:
+        """Validate rubric coverage, lineage scope, inputs, and report status.
+
+        Raises:
+            ValueError: The report omits required dimensions, evidence, lineages, or inputs.
+        """
         metric_ids = tuple(item.dimension_id for item in self.dimension_metrics)
         map_ids = tuple(item.dimension_id for item in self.score_maps)
         if not self.rubric_dimension_ids:

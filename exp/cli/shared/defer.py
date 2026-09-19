@@ -34,6 +34,13 @@ class DeferredTyperGroup(TyperGroup):
         known_names: tuple[str, ...],
         **kwargs: object,
     ) -> None:
+        """Initialize a group that loads its real Typer app on demand.
+
+        Args:
+            import_path: Dotted module path containing the deferred Typer app.
+            attr: Module attribute containing the Typer app.
+            known_names: Child command names available without importing the app.
+        """
         # Typer/Click pass a wide kwargs bag; forwarding as typed kwargs is not practical here.
         super().__init__(*args, **kwargs)  # ty: ignore[invalid-argument-type]
         self._import_path = import_path

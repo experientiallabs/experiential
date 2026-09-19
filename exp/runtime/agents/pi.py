@@ -109,6 +109,15 @@ class PiAgentRuntime:
         executable: str = "pi",
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        """Validate and retain the installed Pi command and process timeout.
+
+        Args:
+            executable: Name or path of the externally installed Pi executable.
+            timeout_seconds: Positive upper bound for the installed Pi subprocess.
+
+        Raises:
+            ValueError: The executable is empty or the timeout is not positive and finite.
+        """
         if not executable:
             raise ValueError("Pi executable must be a non-empty command or path")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
@@ -175,6 +184,7 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         model: ModelClient,
         environment: EnvironmentSession,
     ) -> None:
+        """Bind one Pi process to its task, model, and execute-only environment."""
         self._task = task
         self._model = model
         self._environment = environment

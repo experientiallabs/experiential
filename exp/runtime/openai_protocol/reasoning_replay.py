@@ -77,7 +77,17 @@ class ReasoningDetail(BaseModel):
     @field_validator("type")
     @classmethod
     def _require_reasoning_block_type(cls, value: str) -> str:
-        """Require the documented ``reasoning.<kind>`` type spelling."""
+        """Require the documented ``reasoning.<kind>`` type spelling.
+
+        Args:
+            value: Reasoning detail type supplied by the caller.
+
+        Returns:
+            The unchanged validated type.
+
+        Raises:
+            ValueError: The type does not start with ``reasoning.``.
+        """
         if not value.startswith(REASONING_DETAIL_TYPE_PREFIX):
             raise ValueError("reasoning_details block types are spelled 'reasoning.<kind>'")
         return value

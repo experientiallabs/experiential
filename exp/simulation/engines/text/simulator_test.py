@@ -1798,7 +1798,6 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
                     selected[1],
                     world_model,
                     grounded_world_model,
-                    spec_input,
                     resolution,
                     resolution_input,
                     bindings,

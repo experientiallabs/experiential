@@ -96,6 +96,11 @@ class RubricProposal(ContractModel):
 
     @model_validator(mode="after")
     def _require_success_and_failure_evidence(self) -> RubricProposal:
+        """Validate evidence coverage and dimension references for the proposal.
+
+        Raises:
+            ValueError: Required successful, failed, lineage, or citation evidence is invalid.
+        """
         if not self.successful_rollout_ids or not self.failed_rollout_ids:
             raise ValueError("rubric proposals require successful and failed rollout evidence")
         if set(self.successful_rollout_ids).intersection(self.failed_rollout_ids):

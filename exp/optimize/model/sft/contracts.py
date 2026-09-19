@@ -72,6 +72,11 @@ class SFTTranscript(ContractModel):
     def _require_nonempty_linked_events(
         cls, value: tuple[SFTTranscriptEvent, ...]
     ) -> tuple[SFTTranscriptEvent, ...]:
+        """Validate transcript ordering and assistant-to-tool event links.
+
+        Raises:
+            ValueError: The transcript is empty or contains duplicate or mismatched tool links.
+        """
         if not value:
             raise ValueError("SFT transcripts need at least one event")
         tool_names: dict[str, str] = {}
@@ -177,6 +182,11 @@ class ProductionAcceptanceEvidence(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_complete_evidence_branch(self) -> ProductionAcceptanceEvidence:
+        """Validate the trusted-outcome or human-approval evidence branch.
+
+        Raises:
+            ValueError: Branch-specific evidence or its sorted input references are inconsistent.
+        """
         expected_inputs = [self.trace_dataset, self.acceptance_rule]
         if self.decision == "trusted_outcome":
             if self.outcome_sha256 is None:
@@ -229,6 +239,11 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_complete_references(self) -> TeacherAcceptanceEvidence:
+        """Validate that every required teacher evidence reference is persisted.
+
+        Raises:
+            ValueError: Required references are missing or do not match the input tuple.
+        """
         expected_inputs = tuple(
             sorted(
                 (

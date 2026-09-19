@@ -26,6 +26,12 @@ class ProviderTransportError(RuntimeError):
     """A non-success HTTP or transport result that contains no secret-bearing payload."""
 
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        """Create an error with an optional HTTP status for classification.
+
+        Args:
+            message: Secret-free description of the transport failure.
+            status_code: HTTP status returned by the provider, when available.
+        """
         super().__init__(message)
         self.status_code = status_code
 
@@ -170,6 +176,11 @@ class HttpxJsonTransport(JsonHttpTransport):
     """Production JSON transport backed by a caller-owned-or-default httpx client."""
 
     def __init__(self, client: httpx.Client | None = None) -> None:
+        """Use the supplied HTTP client or create a default client.
+
+        Args:
+            client: Optional caller-owned client used for provider requests.
+        """
         self._client = client or httpx.Client()
 
     def get(

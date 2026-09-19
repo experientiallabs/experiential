@@ -39,6 +39,11 @@ class RubricDimension(ContractModel):
 
     @model_validator(mode="after")
     def _require_valid_range_and_anchors(self) -> RubricDimension:
+        """Validate the inclusive score range and ordered endpoint anchors.
+
+        Raises:
+            ValueError: The range or anchor scores are missing, duplicated, unordered, or invalid.
+        """
         if self.min_score >= self.max_score:
             raise ValueError("rubric axis range must be inclusive with min_score below max_score")
         permitted = self.permitted_scores()
@@ -199,6 +204,11 @@ class Rubric(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_approval(self) -> Rubric:
+        """Validate rubric inputs and approval metadata for its current status.
+
+        Raises:
+            ValueError: Inputs, approval timestamps, or status-specific fields are inconsistent.
+        """
         expected_input_ids = tuple(
             sorted((self.source_task_set_id, *self.accepted_proposal_evidence_ids))
         )
@@ -240,6 +250,11 @@ class DimensionScoreMap(ContractModel):
 
     @model_validator(mode="after")
     def _require_monotonic_range_scores(self) -> DimensionScoreMap:
+        """Validate score-map coverage, bounds, and monotonic ordering.
+
+        Raises:
+            ValueError: The map omits scores, leaves its range, or is not monotonic.
+        """
         if self.min_score >= self.max_score:
             raise ValueError("score-map range must be inclusive with min_score below max_score")
         expected_length = self.max_score - self.min_score + 1
@@ -342,6 +357,11 @@ class JudgeCalibration(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_sealed_calibration_lineages(self) -> JudgeCalibration:
+        """Validate calibration status, lineage scope, labels, and score-map sealing.
+
+        Raises:
+            ValueError: Calibration evidence or status-specific approval requirements fail.
+        """
         if set(self.calibration_lineage_ids).intersection(
             self.excluded_router_held_out_lineage_ids
         ):

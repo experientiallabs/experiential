@@ -198,6 +198,11 @@ class FrozenEmbeddingClient(EmbeddingClient):
     """Resolve exact precomputed feature texts without network or environment access."""
 
     def __init__(self, artifact: FrozenEmbeddingSet) -> None:
+        """Bind each precomputed feature vector by its canonical text digest.
+
+        Args:
+            artifact: Frozen embedding artifact containing the feature vectors to resolve.
+        """
         self._vectors = {
             item.text_sha256: Embedding(values=item.values) for item in artifact.embeddings
         }

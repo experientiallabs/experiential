@@ -258,7 +258,6 @@ class WorldModelSimulator:
                 cell,
                 world_model,
                 grounded_world_model,
-                spec_input,
                 resolution,
                 resolution_input,
                 bindings,
@@ -522,7 +521,6 @@ class WorldModelSimulator:
         cell: EvaluationCell,
         world_model: ResolvedModel,
         grounded_world_model: GroundedWorldModel,
-        spec_input: ArtifactInput,
         resolution: SimulationResolution,
         resolution_input: ArtifactInput,
         bindings: Mapping[ArtifactId, SimulationCellBinding],
@@ -534,7 +532,6 @@ class WorldModelSimulator:
             cell: Exact selected evaluation cell.
             world_model: Resolved world model pinned by the specification.
             grounded_world_model: Persisted fit-bound executor for that resolved model.
-            spec_input: Persisted specification pointer used by the durable lease.
             resolution: Immutable resolution owning the cell binding.
             resolution_input: Exact resolution manifest pointer.
             bindings: Complete bindings for every selected cell.

@@ -177,6 +177,11 @@ class FidelityReport(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_fidelity_counts(self) -> FidelityReport:
+        """Validate overlap counts, pair coverage, errors, and failure records.
+
+        Raises:
+            ValueError: The report counts, pairs, errors, or failures are inconsistent.
+        """
         if len(self.overlap_cell_ids) != self.planned_overlap_count:
             raise ValueError("fidelity overlap cells must match the planned overlap count")
         pair_cell_ids = tuple(pair.fidelity_cell_id for pair in self.pairs)
@@ -236,6 +241,11 @@ class EvaluationDatasetManifest(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_dataset_scope(self) -> EvaluationDatasetManifest:
+        """Validate disjoint task scope and complete candidate and protocol identities.
+
+        Raises:
+            ValueError: Manifest IDs repeat, overlap, or omit required entries.
+        """
         fit_task_ids = set(self.fit_task_ids)
         held_out_task_ids = set(self.held_out_task_ids)
         if len(fit_task_ids) != len(self.fit_task_ids):
@@ -269,6 +279,11 @@ class EvaluationDataset(ContractModel):
 
     @model_validator(mode="after")
     def _require_rows_to_match_manifest_scope(self) -> EvaluationDataset:
+        """Validate every materialized row against its manifest scope.
+
+        Raises:
+            ValueError: A row names an unknown task, candidate, protocol, or partition.
+        """
         fit_task_ids = set(self.manifest.fit_task_ids)
         held_out_task_ids = set(self.manifest.held_out_task_ids)
         candidate_aliases = {candidate.alias for candidate in self.manifest.candidate_snapshots}

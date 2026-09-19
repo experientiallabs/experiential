@@ -59,6 +59,11 @@ class ProviderConnection(ContractModel):
 
     @model_validator(mode="after")
     def _require_supported_connection_shape(self) -> ProviderConnection:
+        """Validate provider-specific credential, endpoint, and region requirements.
+
+        Raises:
+            ValueError: The provider shape is unsupported or required metadata is missing.
+        """
         if self.provider != "bedrock" and (
             self.aws_access_key_id_env is not None or self.bedrock_auth_mode is not None
         ):

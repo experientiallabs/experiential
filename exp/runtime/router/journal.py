@@ -753,6 +753,7 @@ class RuntimeInteractionJournal:
             return event
 
     def _read_unlocked(self) -> tuple[RuntimeJournalEvent, ...]:
+        """Read and validate the runtime event journal, tolerating one torn final line."""
         try:
             payload = self.path.read_bytes()
         except FileNotFoundError:
@@ -807,6 +808,7 @@ class RuntimeInteractionJournal:
         return tuple(events)
 
     def _append_unlocked(self, event: RuntimeJournalEvent) -> None:
+        """Append one validated runtime event and durably flush its journal file."""
         if event.event_id != _event_content_id(event):
             raise RuntimeJournalError("runtime event ID differs from its canonical content")
         _prepare_runtime_directory(self.path)

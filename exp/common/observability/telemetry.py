@@ -379,6 +379,7 @@ def _is_nonnegative_finite_number(value: TelemetryValue) -> bool:
 
 
 def _enabled(root: str | Path) -> bool:
+    """Return whether telemetry is enabled after environment and settings checks."""
     if _env_truthy("DO_NOT_TRACK"):
         return False
     env = os.getenv("EXP_TELEMETRY")

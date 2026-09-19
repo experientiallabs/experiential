@@ -44,6 +44,11 @@ class HumanScoreHistory(ContractModel):
 
     @model_validator(mode="after")
     def _require_linear_correction_history(self) -> HumanScoreHistory:
+        """Validate that score corrections form one ordered active history per target.
+
+        Raises:
+            ValueError: A label repeats, cites an unknown predecessor, or changes its target.
+        """
         known: dict[str, HumanScore] = {}
         superseded: set[str] = set()
         active_by_target: dict[tuple[str, str, str, str], str] = {}

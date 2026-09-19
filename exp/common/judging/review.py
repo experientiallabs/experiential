@@ -83,6 +83,11 @@ class RubricReviewDraft(ContractModel):
 
     @model_validator(mode="after")
     def _require_consistent_finalization(self) -> RubricReviewDraft:
+        """Validate proposal lineage and the draft's finalized-artifact state.
+
+        Raises:
+            ValueError: The review status, finalized rubric, or proposal lineage is inconsistent.
+        """
         for proposal in self.proposals:
             if proposal.source_task_set_id != self.source_task_set_id:
                 raise ValueError("rubric proposal must retain the review task-set identity")

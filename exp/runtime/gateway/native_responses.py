@@ -448,6 +448,7 @@ def remember_turn(
     segment_message: GatewayMessage | None = None
 
     def flush_segment() -> None:
+        """Append the accumulated assistant segment and clear its temporary state."""
         nonlocal segment_message
         if segment_message is None and not segment_reasoning and not segment_calls:
             return
