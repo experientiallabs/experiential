@@ -69,6 +69,11 @@ def test_regex_matches_names_and_descriptions_case_insensitively() -> None:
         regex_search("(", _TOOLS, limit=5)
     with pytest.raises(ToolSearchPatternError):
         regex_search("a" * 201, _TOOLS, limit=5)
+    # Backtracking-only constructs are refused by RE2 rather than run.
+    with pytest.raises(ToolSearchPatternError):
+        regex_search(r"(a+)+\1", _TOOLS, limit=5)
+    # A classic catastrophic-backtracking shape completes in linear time.
+    assert regex_search(r"(a+)+$", _TOOLS, limit=5) == []
 
 
 def test_limit_is_clamped() -> None:

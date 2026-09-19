@@ -3,8 +3,9 @@
 Small on purpose: the corpus is one request's tool list (at most a few
 thousand short documents), so a plain in-memory BM25 with a lowercase
 alphanumeric tokenizer is exact enough and needs no dependency. Regular
-expressions are bounded in length and applied with ``re.search`` to
-bounded documents, so a hostile pattern cannot hold a worker thread.
+expressions run on RE2 (linear time, bounded memory, the engine the
+guardrails already use), so a model-supplied pattern cannot backtrack a
+worker thread into a denial of service; length and document bounds apply too.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ import math
 import re
 from collections import Counter
 from collections.abc import Sequence
+
+import re2
 
 from exp.runtime.gateway.contracts import GatewayToolDefinition
 from exp.runtime.gateway.tool_search.contracts import (
@@ -32,6 +35,7 @@ _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _MAXIMUM_DOCUMENT_CHARACTERS = 4000
 _BM25_K1 = 1.2
 _BM25_B = 0.75
+_RE2_MAX_MEMORY = 262_144
 
 
 def tokenize(text: str) -> list[str]:
@@ -145,14 +149,20 @@ def regex_search(
         Matching tools in declaration order.
 
     Raises:
-        ToolSearchPatternError: The pattern is too long or does not compile.
+        ToolSearchPatternError: The pattern is too long or is not valid RE2.
     """
     if not pattern or len(pattern) > MAXIMUM_TOOL_SEARCH_PATTERN_CHARACTERS:
         raise ToolSearchPatternError("pattern must be 1-200 characters")
+    options = re2.Options()
+    options.max_mem = _RE2_MAX_MEMORY
+    options.log_errors = False
+    options.case_sensitive = False
     try:
-        compiled = re.compile(pattern, re.IGNORECASE)
-    except re.error as exc:
-        raise ToolSearchPatternError(f"invalid pattern: {exc}") from exc
+        compiled = re2.compile(pattern, options=options)
+    except re2.error:
+        raise ToolSearchPatternError(
+            "invalid pattern: RE2 syntax only (no backreferences or lookaround)"
+        ) from None
     matched: list[GatewayToolDefinition] = []
     for tool in tools:
         haystack = f"{tool.name}\n{tool.description or ''}"[:_MAXIMUM_DOCUMENT_CHARACTERS]
