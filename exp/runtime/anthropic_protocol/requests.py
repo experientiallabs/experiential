@@ -58,6 +58,7 @@ from exp.runtime.anthropic_protocol.reasoning_channels import (
 )
 from exp.runtime.anthropic_protocol.server_tools import (
     ServerTool,
+    messages_tool_search,
     messages_web_search,
     require_served_server_tool_types,
 )
@@ -161,7 +162,7 @@ class _WebSearchToolResultBlock(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["web_search_tool_result"]
+    type: Literal["web_search_tool_result", "tool_search_tool_result", "tool_reference"]
 
 
 _ContentBlock = (
@@ -428,6 +429,7 @@ def _decode(
                 if isinstance(tool, ServerTool)
             ),
             web_search=messages_web_search(payload, request.tools),
+            tool_search=messages_tool_search(request.tools),
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,

@@ -429,10 +429,27 @@ class _FunctionDefinition(_WireModel):
 
 
 class _ChatTool(_WireModel):
-    """Chat Completions function tool wrapper."""
+    """Chat Completions function tool wrapper.
 
-    type: Literal["function"] = "function"
-    function: _FunctionDefinition
+    OpenRouter's ``openrouter:tool_search`` server tool rides the same array
+    without a ``function`` body; ``defer_loading`` (OpenRouter's spelling of
+    Anthropic's deferred-loading marker) makes a function tool searchable
+    instead of loaded up front.
+    """
+
+    type: Literal["function", "openrouter:tool_search"] = "function"
+    function: _FunctionDefinition | None = None
+    defer_loading: bool | None = None
+    max_results: int | None = Field(default=None, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def _require_function_body(self) -> _ChatTool:
+        """A function tool needs its body; a server tool must not carry one."""
+        if self.type == "function" and self.function is None:
+            raise ValueError("a function tool requires a function object")
+        if self.type != "function" and self.function is not None:
+            raise ValueError("a server tool cannot carry a function object")
+        return self
 
 
 class _StructuredSchema(_WireModel):
@@ -622,6 +639,8 @@ class _ResponseTool(_WireModel):
     description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
+    defer_loading: bool | None = None
+    """OpenAI's deferred-loading marker for a ``tool_search`` request."""
 
 
 class _ResponseFunctionCall(_WireModel):

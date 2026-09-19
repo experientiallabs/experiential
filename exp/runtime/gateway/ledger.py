@@ -491,6 +491,7 @@ class SQLiteAttemptLedger:
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -500,16 +501,15 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
-            retry_after_seconds: Provider-stated wait from the response's
-                ``Retry-After`` header, when one was harvested.
+            retry_after_seconds: Provider-stated ``Retry-After`` wait, when one was harvested.
             ratelimit_limit_requests: Provider-stated request-rate ceiling.
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
-            upstream_provider: The upstream an aggregator rung (OpenRouter)
-                named as having served the attempt, when its response said.
-            web_search_requests: Gateway-executed web searches billed to the attempt;
-                priced by the hosted ledger, not yet persisted or priced locally.
+            upstream_provider: The upstream an aggregator rung (OpenRouter) named as serving.
+            web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
+                Both meters are priced by the hosted ledger; not yet persisted or priced locally.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -526,6 +526,7 @@ class SQLiteAttemptLedger:
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
                 upstream_provider=upstream_provider,
                 web_search_requests=web_search_requests,
+                tool_search_requests=tool_search_requests,
             )
 
     def apply_finish_attempt(
@@ -544,6 +545,7 @@ class SQLiteAttemptLedger:
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -554,18 +556,16 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
-            retry_after_seconds: Provider-stated wait from the response's
-                ``Retry-After`` header, when one was harvested.
+            retry_after_seconds: Provider-stated ``Retry-After`` wait, when one was harvested.
             ratelimit_limit_requests: Provider-stated request-rate ceiling.
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
-            upstream_provider: The upstream an aggregator rung (OpenRouter)
-                named as having served the attempt, when its response said.
-            web_search_requests: Accepted for the shared settle signature; not
-                persisted or priced locally yet (see ``finish_attempt``).
+            upstream_provider: The upstream an aggregator rung (OpenRouter) named as serving.
+            web_search_requests: Accepted for the shared settle signature (see ``finish_attempt``).
+            tool_search_requests: Accepted alongside ``web_search_requests``; same local status.
         """
-        del web_search_requests  # Priced by the hosted ledger; local pricing is a follow-up.
+        del web_search_requests, tool_search_requests  # Hosted ledger prices both meters.
         state, normalized_failure, failure_message, usage = _terminal_values(
             terminal_event, failure
         )

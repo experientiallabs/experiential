@@ -38,6 +38,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_settlement import (
+    tool_search_requests_kwarg,
     upstream_provider_kwarg,
     web_search_requests_kwarg,
 )
@@ -231,6 +232,7 @@ class GroupCommitAttemptLedger:
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -247,6 +249,7 @@ class GroupCommitAttemptLedger:
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
             upstream_provider: The upstream an aggregator rung named as serving.
             web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         """
         # The host's apply hook is the object this facade forwards to, so it is
         # the one probed for the settle keywords; a hook that predates one gets
@@ -267,6 +270,7 @@ class GroupCommitAttemptLedger:
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
                 **upstream_provider_kwarg(apply, upstream_provider),
                 **web_search_requests_kwarg(apply, web_search_requests),
+                **tool_search_requests_kwarg(apply, tool_search_requests),
             )
         )
 
@@ -584,6 +588,7 @@ class SyncGroupCommitLedger:
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -600,6 +605,7 @@ class SyncGroupCommitLedger:
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
             upstream_provider: The upstream an aggregator rung named as serving.
             web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         """
         # Same probe as the async facade: the host hook decides the keywords.
         apply = cast("Callable[..., None]", self._writer.core.apply_finish_attempt)
@@ -618,6 +624,7 @@ class SyncGroupCommitLedger:
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
                 **upstream_provider_kwarg(apply, upstream_provider),
                 **web_search_requests_kwarg(apply, web_search_requests),
+                **tool_search_requests_kwarg(apply, tool_search_requests),
             )
         )
 

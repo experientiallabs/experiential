@@ -90,3 +90,24 @@ def test_web_search_requests_ride_on_usage_but_never_make_usage_alone() -> None:
         GatewayUsage(web_search_requests=2)
     with pytest.raises(ValidationError):
         GatewayUsage(input_tokens=1, output_tokens=1, web_search_requests=-1)
+
+
+def test_tool_search_requests_ride_on_usage_but_never_make_usage_alone() -> None:
+    """The gateway-executed tool-search count mirrors ``web_search_requests`` exactly.
+
+    It defaults to zero, is never negative, rides on token-bearing or tool-only
+    usage, and is rejected on its own because a bare count is not usage.
+    """
+    assert GatewayUsage(input_tokens=1, output_tokens=1).tool_search_requests == 0
+    with_tokens = GatewayUsage(input_tokens=1, output_tokens=1, tool_search_requests=3)
+    assert with_tokens.tool_search_requests == 3
+    tools_only = GatewayUsage(tool_names=("tool_search",), tool_search_requests=2)
+    assert tools_only.tool_search_requests == 2 and not tools_only.has_token_counts
+    both = GatewayUsage(
+        input_tokens=1, output_tokens=1, web_search_requests=1, tool_search_requests=2
+    )
+    assert (both.web_search_requests, both.tool_search_requests) == (1, 2)
+    with pytest.raises(ValidationError, match="token totals or invoked tool names"):
+        GatewayUsage(tool_search_requests=2)
+    with pytest.raises(ValidationError):
+        GatewayUsage(input_tokens=1, output_tokens=1, tool_search_requests=-1)

@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::bridge::Bridge;
 use crate::throttle_backoff::ThrottleRedial;
+use crate::tool_search::ToolSearchAdmission;
 
 /// One deployment's wire configuration inside the admitted ordered route.
 /// Payloads are built python-side per deployment, since model identities and
@@ -171,6 +172,10 @@ pub struct WaterfallContext<'a> {
     /// `Incomplete`; the same shape on an uncapped request is the provider
     /// delivering nothing at all and takes the ladder.
     pub output_token_cap: Option<u64>,
+    /// The gateway-run tool search admitted for this request: the relay
+    /// withholds every call to its tool and the waterfall runs at most
+    /// `max_rounds` search rounds. `None` withholds nothing.
+    pub tool_search: Option<&'a ToolSearchAdmission>,
 }
 
 /// The bound on one dial's open (request/response-header) phase: the

@@ -15,19 +15,21 @@
 //! enables refusal failover, refusal deltas are withheld in a bounded
 //! in-memory buffer so a refusal-only terminal can advance to the next
 //! deployment without exposing the refused route; mixed output or buffer
-//! overflow commits and flushes. Candidate
+//! overflow commits and flushes. A turn whose only output was a call to the
+//! gateway's tool-search tool (withheld inside the relay, see `tool_search`)
+//! does not commit either: the control plane runs the search and rebuilds
+//! the rung's dispatch, and the same depth is dialed again under a bounded
+//! round budget (`search_round`). Candidate
 //! selection policy (health circuits, budgets, attempt counting) stays in
 //! python: the loop only states its position and the classified failure, and
 //! the control plane answers with a reservation, a later depth, or
 //! exhaustion.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::bridge::Bridge;
 use crate::dialects::Dialect;
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -39,9 +41,8 @@ use crate::relay::{
 };
 use crate::replay_repair::AttemptRepair;
 use crate::settlement::AttemptGuard;
-use crate::throttle_backoff::{
-    jitter_unit, track_retry_after, with_largest_retry_after, BackoffQuery, ThrottleRedial,
-};
+use crate::throttle_backoff::{track_retry_after, with_largest_retry_after};
+use crate::tool_search::{ToolSearchRound, WithheldSearchCall};
 use crate::upstream::open_stream;
 
 /// Byte bound for withheld refusal deltas, matching the python executor's
@@ -79,6 +80,13 @@ pub struct CommittedAttempt {
     /// encrypted reasoning items the rung refused (disclosed to the caller
     /// through `crate::replay_repair::REPLAY_REPAIR_HEADER`).
     pub encrypted_reasoning_stripped: bool,
+    /// The gateway-run tool-search rounds that led to this attempt, in
+    /// order; empty on every request the gateway searched nothing for.
+    pub tool_search_rounds: Vec<ToolSearchRound>,
+    /// The model called the gateway's search tool in the same turn as other
+    /// semantic output: the rung committed on that output and the call was
+    /// dropped (disclosed as `tool_search->dropped(after_output)`).
+    pub tool_search_dropped_after_output: bool,
 }
 
 /// One attempt whose terminal was reached and settled before commitment.
@@ -90,6 +98,8 @@ pub struct SettledAttempt {
     /// See [`Served::empty_completion`]: the ladder exhausted on empty turns
     /// and these events are the typed empty answer.
     pub empty_completion: bool,
+    /// See [`CommittedAttempt::tool_search_rounds`].
+    pub tool_search_rounds: Vec<ToolSearchRound>,
 }
 
 /// The facts of the attempt that served, as the response surfaces name them.
@@ -170,77 +180,6 @@ pub(crate) struct StartResponse {
     pub(crate) failure: Option<Failure>,
 }
 
-/// Whether the classified failure leaves any successor dispatch possible
-/// under the rust-side facts (caps, flags, remaining route, deadline). The
-/// control plane re-checks with health and budget state and may still answer
-/// with exhaustion.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn successor_possible(
-    policy: RoutePolicy,
-    route: &[DeploymentWire],
-    deadline: Instant,
-    total_attempts: u32,
-    same_deployment_attempts: u32,
-    depth: usize,
-    failure: &Failure,
-    refusal_eligible: bool,
-) -> bool {
-    if total_attempts >= policy.maximum_total_attempts || remaining(deadline).is_zero() {
-        return false;
-    }
-    let same = failure.retryable_same_deployment
-        && same_deployment_attempts < policy.maximum_same_deployment_attempts;
-    // An unrestricted later rung takes the failure when the route policy
-    // advances it; a failover-only rung takes it when its own set names it,
-    // whatever the policy says (`fallback_rules`).
-    let failover = fallback_rules::successor_available(
-        route,
-        depth,
-        failure,
-        failure.failover_eligible || refusal_eligible,
-    );
-    same || failover
-}
-
-/// The wait before re-dialing a throttled rung, or `None` when the ladder
-/// should advance instead: the pool authors no schedule, the rung's redial
-/// budget on this request is spent (or zero), the failure is not a throttle,
-/// the total cap is reached, or the schedule itself declines (`Retry-After`
-/// beyond the ceiling, or no room under the deadline).
-fn throttle_backoff_delay(
-    ctx: &WaterfallContext<'_>,
-    wire: &DeploymentWire,
-    failure: &Failure,
-    throttle_redials_at_depth: u32,
-    total_attempts: u32,
-) -> Option<Duration> {
-    let schedule = ctx.policy.throttle_redial?;
-    if wire.throttle_redial_budget == 0
-        || failure.failure_class != FailureClass::Throttled
-        || total_attempts >= ctx.policy.maximum_total_attempts
-    {
-        return None;
-    }
-    BackoffQuery {
-        // The rung's per-request budget never exceeds the schedule's cap.
-        schedule: ThrottleRedial {
-            max_attempts: schedule.max_attempts.min(wire.throttle_redial_budget),
-            ..schedule
-        },
-        redials_so_far: throttle_redials_at_depth,
-        retry_after_seconds: failure.retry_after_seconds,
-        remaining_deadline: remaining(ctx.deadline),
-        first_byte_allowance: first_byte_allowance(
-            wire,
-            ctx.time_to_first_byte,
-            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
-            ctx.approximate_input_tokens,
-        ),
-        jitter_unit: jitter_unit(ctx.request_id, total_attempts),
-    }
-    .delay()
-}
-
 /// One pre-commit attempt outcome, private to the waterfall loop.
 enum AttemptEnd {
     Committed(Box<CommittedAttempt>),
@@ -259,6 +198,15 @@ enum AttemptEnd {
         /// Whether the failing dial was the stripped re-dial, so an
         /// exhaustion flush of its withheld output still discloses it.
         encrypted_reasoning_stripped: bool,
+    },
+    /// The dial's only output was one or more calls to the gateway's
+    /// tool-search tool, withheld inside the relay, and it ended
+    /// successfully: nothing committed, and the waterfall runs the search
+    /// and dials the same depth again.
+    ToolSearchRound {
+        calls: Vec<WithheldSearchCall>,
+        usage: Option<Usage>,
+        tool_names: Vec<String>,
     },
     /// Accounting failed mid-attempt; the request is answered internal.
     Accounting,
@@ -292,7 +240,18 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
     // Whether this reservation re-dials the rung that just throttled after
     // the schedule's backoff was waited out; consumed by one `start_attempt`.
     let mut throttle_backoff = false;
+    // Per depth, the wire a tool-search round rebuilt for the rung (the
+    // conversation extended with the search call and its result, the
+    // matched tools loaded); every later dial of that depth sends it.
+    let mut search_wires: Vec<Option<DeploymentWire>> = vec![None; ctx.route.len()];
+    // The rounds completed so far, handed to the winning attempt to render.
+    let mut tool_search_rounds: Vec<ToolSearchRound> = Vec::new();
+    let mut rounds_done: u32 = 0;
+    // Whether this reservation re-dials the same depth after a tool-search
+    // round; consumed by one `start_attempt`.
+    let mut tool_search_round = false;
     loop {
+        let search_redial = std::mem::take(&mut tool_search_round);
         let argument = compact_json(&json!({
             "request_id": ctx.request_id,
             "raw_key": ctx.raw_key,
@@ -302,6 +261,10 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             // claims the same depth through its own throttle window and
             // discloses the attempt as `throttle_backoff`.
             "throttle_backoff": std::mem::take(&mut throttle_backoff),
+            // A same-depth re-dial after a gateway tool-search round: the
+            // control plane reserves the same rung and discloses the attempt
+            // as `tool_search_round`.
+            "tool_search_round": search_redial,
             "failure": last_failure.as_ref().map(|failure| json!({
                 "failure_class": failure.failure_class.as_str(),
                 "safe_message": failure.safe_message,
@@ -393,22 +356,82 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 .await;
             return Won::Failed(PublicError::internal());
         }
-        if current_depth == Some(depth) {
+        if current_depth == Some(depth) && !search_redial {
             METRICS.record_open_retry();
         }
         guard.rebind(attempt_id);
         total_attempts += 1;
         counts[depth] += 1;
-        let end = run_attempt(ctx, guard, wire, depth, &mut repaired[depth]).await;
+        // A rung a tool-search round rebuilt dials its rebuilt wire; the
+        // route's own entry still answers every policy question above.
+        let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
+        let end = run_attempt(ctx, guard, dial_wire, depth, &mut repaired[depth]).await;
         match end {
-            AttemptEnd::Committed(committed) => {
+            AttemptEnd::Committed(mut committed) => {
                 // The committed stream has parsed at least its first
                 // semantic chunk, so an aggregator's upstream label (if any)
                 // is known here; settle it with whatever outcome follows.
                 guard.record_upstream_provider(committed.relay.upstream_provider());
+                committed.tool_search_rounds = std::mem::take(&mut tool_search_rounds);
                 return Won::Committed(committed);
             }
-            AttemptEnd::Settled(settled) => return Won::Settled(settled),
+            AttemptEnd::Settled(mut settled) => {
+                settled.tool_search_rounds = std::mem::take(&mut tool_search_rounds);
+                return Won::Settled(settled);
+            }
+            AttemptEnd::ToolSearchRound {
+                calls,
+                usage,
+                tool_names,
+            } => {
+                // The search-call turn was the rung's own answer, not a
+                // retry of it: the round budget bounds it, not the
+                // same-deployment cap.
+                counts[depth] = counts[depth].saturating_sub(1);
+                let max_rounds = ctx.tool_search.map_or(0, |search| search.max_rounds);
+                if rounds_done >= max_rounds
+                    || total_attempts >= ctx.policy.maximum_total_attempts
+                    || remaining(ctx.deadline).is_zero()
+                {
+                    // The model called the search tool past the budget (or
+                    // after the control plane withdrew the tool): the turn
+                    // has no answer in it, and the request fails closed with
+                    // the gateway's own error rather than a half answer.
+                    let failure = search_round::budget_exhausted();
+                    guard
+                        .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
+                        .await;
+                    return Won::Failed(PublicError::internal());
+                }
+                rounds_done += 1;
+                let reply = match search_round::negotiate(
+                    ctx,
+                    guard,
+                    depth,
+                    rounds_done,
+                    &calls,
+                    usage.as_ref(),
+                    &tool_names,
+                    &mut tool_search_rounds,
+                )
+                .await
+                {
+                    Ok(reply) => reply,
+                    Err(won) => return won,
+                };
+                if reply.exhausted {
+                    rounds_done = max_rounds;
+                }
+                // The rebuilt wire carries the extended conversation; a
+                // payload stripped from the OLD conversation on an earlier
+                // dial of this rung must not be dialed over it.
+                repaired[depth] = None;
+                search_wires[depth] = Some(reply.wire);
+                current_depth = Some(depth);
+                last_failure = None;
+                tool_search_round = true;
+                continue;
+            }
             AttemptEnd::Accounting => return Won::Failed(PublicError::internal()),
             AttemptEnd::Retention(error) => return Won::Failed(error),
             AttemptEnd::Ladder {
@@ -479,6 +502,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         events: exhaustion_flush,
                         encrypted_reasoning_stripped,
                         empty_completion: false,
+                        tool_search_rounds: Vec::new(),
                     });
                 }
                 if failure.failure_class == FailureClass::EmptyCompletion {
@@ -500,55 +524,13 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         events,
                         encrypted_reasoning_stripped,
                         empty_completion: true,
+                        tool_search_rounds: std::mem::take(&mut tool_search_rounds),
                     });
                 }
                 let boundary = with_largest_retry_after(boundary, largest_retry_after);
                 return Won::Failed(collection_public_error(&boundary));
             }
         }
-    }
-}
-
-/// Resolve the dispatch headers for one physical open attempt. Body-signing
-/// dialects (Bedrock SigV4) are signed here, immediately before the provider
-/// POST, so neither queue time nor a spent earlier attempt can age the
-/// signature toward AWS's short clock window. Other dialects use the route
-/// entry's headers unchanged.
-async fn dispatch_headers(
-    bridge: &Bridge,
-    request_id: &str,
-    wire: &DeploymentWire,
-) -> Result<HashMap<String, String>, PublicError> {
-    let mut headers = wire.headers.clone();
-    let Some(body) = wire.upstream_body.as_deref() else {
-        return Ok(headers);
-    };
-    let argument = compact_json(&json!({
-        "request_id": request_id,
-        "url": wire.url,
-        "body": body,
-    }));
-    let text = bridge.call("sign_dispatch", argument).await?;
-    let signed: HashMap<String, String> = serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|value| {
-            serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null)).ok()
-        })
-        .ok_or_else(PublicError::internal)?;
-    headers.extend(signed);
-    Ok(headers)
-}
-
-/// Open and read one physical attempt up to commitment or its terminal.
-/// On a customer-managed rung, a rejected credential or exhausted provider
-/// account at stream OPEN is the customer's to fix (see
-/// `stream_errors::customer_credential_failure`); failures declared on the
-/// open stream take the same path inside the relay. House rungs are unchanged.
-fn customer_owned(failure: Failure, wire: &DeploymentWire) -> Failure {
-    if wire.billing_customer_managed {
-        crate::stream_errors::customer_credential_failure(failure, &wire.provider)
-    } else {
-        failure
     }
 }
 
@@ -695,6 +677,7 @@ async fn run_attempt(
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
         relay.set_native_tool_translation(wire.native_tool_translation.clone());
+        relay.set_tool_search_tool_name(ctx.tool_search.map(|search| search.tool_name.clone()));
         if !wire.model_id.is_empty() {
             relay.set_request_words([wire.model_id.clone()]);
         }
@@ -761,6 +744,7 @@ async fn run_attempt(
                         // Buffer overflow commits and flushes.
                         let mut prefix = std::mem::take(&mut withheld);
                         prefix.push(event);
+                        let tool_search_dropped_after_output = relay.withheld_search_call_seen();
                         return AttemptEnd::Committed(Box::new(CommittedAttempt {
                             depth,
                             prefix,
@@ -769,6 +753,8 @@ async fn run_attempt(
                             tool_names,
                             visible_refusal: true,
                             encrypted_reasoning_stripped,
+                            tool_search_rounds: Vec::new(),
+                            tool_search_dropped_after_output,
                         }));
                     }
                     withheld_bytes += event_bytes;
@@ -786,6 +772,9 @@ async fn run_attempt(
                     );
                 let mut prefix = std::mem::take(&mut withheld);
                 prefix.push(event);
+                // A search call withheld in the same turn is dropped: the
+                // rung is frozen on this output, and the caller is told.
+                let tool_search_dropped_after_output = relay.withheld_search_call_seen();
                 return AttemptEnd::Committed(Box::new(CommittedAttempt {
                     depth,
                     prefix,
@@ -794,6 +783,8 @@ async fn run_attempt(
                     tool_names,
                     visible_refusal,
                     encrypted_reasoning_stripped,
+                    tool_search_rounds: Vec::new(),
+                    tool_search_dropped_after_output,
                 }));
             }
             if !event.is_terminal() {
@@ -848,6 +839,19 @@ async fn run_attempt(
                             tool_names,
                             opened: true,
                             encrypted_reasoning_stripped,
+                        };
+                    }
+                    if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
+                        && relay.withheld_search_call_count() > 0
+                    {
+                        // The turn's only output was the gateway's search
+                        // tool: nothing reached the caller and nothing
+                        // committed, so the waterfall runs the search and
+                        // dials this depth again with the extended context.
+                        return AttemptEnd::ToolSearchRound {
+                            calls: relay.take_withheld_search_calls(),
+                            usage,
+                            tool_names,
                         };
                     }
                     if billed_empty_completion(&event, usage.as_ref()) {
@@ -922,62 +926,25 @@ async fn run_attempt(
     }
 }
 
-/// Settle one output-less terminal (`Completed` or `Incomplete`) reached
-/// before any semantic event: retain the output-less continuation while the
-/// attempt is still in flight, settle, then answer with the tracked usage
-/// ahead of the terminal so the encoders keep the client-visible token
-/// accounting.
-async fn settle_output_less(
-    ctx: &WaterfallContext<'_>,
-    guard: &mut AttemptGuard,
-    terminal: Event,
-    usage: Option<Usage>,
-    tool_names: Vec<String>,
-    depth: usize,
-    encrypted_reasoning_stripped: bool,
-) -> AttemptEnd {
-    let retention_failure = match &ctx.output_less_retention {
-        Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
-        None => None,
-    };
-    let outcome = if matches!(terminal, Event::Incomplete) {
-        "incomplete"
-    } else {
-        "completed"
-    };
-    if !guard
-        .settle(outcome, usage.as_ref(), &tool_names, None, true)
-        .await
-    {
-        return AttemptEnd::Accounting;
-    }
-    if let Some(error) = retention_failure {
-        // The provider outcome settled above, exactly like a committed
-        // attempt's retention failure; only the HTTP result reports it.
-        return AttemptEnd::Retention(error);
-    }
-    let mut events = Vec::with_capacity(2);
-    if let Some(tracked) = usage {
-        events.push(Event::Usage(tracked));
-    }
-    events.push(terminal);
-    AttemptEnd::Settled(SettledAttempt {
-        depth,
-        events,
-        encrypted_reasoning_stripped,
-        empty_completion: false,
-    })
-}
-
 mod fallback_rules;
 mod wire;
 pub(crate) use wire::{first_byte_allowance, open_phase_bound};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 mod empty;
+use empty::settle_output_less;
 pub(crate) use empty::{
     billed_empty_completion, empty_completion_failure, unreported_empty_completion,
 };
+
+mod dispatch;
+use dispatch::{customer_owned, dispatch_headers};
+
+mod successor;
+pub(crate) use successor::successor_possible;
+use successor::throttle_backoff_delay;
+
+mod search_round;
 
 #[cfg(test)]
 mod ladder_tests;
@@ -985,3 +952,5 @@ mod ladder_tests;
 mod repair_ladder_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_search_ladder_tests;

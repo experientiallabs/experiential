@@ -591,8 +591,8 @@ production turns on 2026-09-11). The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
 
-Gateway-executed web search (every public spelling, the injection, citations, and the
-per-search count) is documented in [gateway-web-search.md](gateway-web-search.md).
+Gateway-executed web search is documented in [gateway-web-search.md](gateway-web-search.md);
+gateway-executed tool search in [gateway-tool-search.md](gateway-tool-search.md).
 
 OpenAI-family prefix caches are keyed per cache node behind the provider's load balancer, so
 an identical prompt hits but the same stem with a new tail (every turn of an agent loop) is

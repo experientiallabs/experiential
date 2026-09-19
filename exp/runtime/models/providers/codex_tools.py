@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from exp.common.models import ToolCall
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayToolDefinition
+from exp.runtime.gateway.tool_search.contracts import GATEWAY_TOOL_SEARCH_NAME
 
 if TYPE_CHECKING:
     from exp.common.core.artifacts import JsonObject
@@ -419,5 +420,37 @@ def _convert_history_item(
             ),
             None,
         )
+    if item_type == "tool_search_call":
+        # The gateway's own tool-search round echoed back: replay it as the
+        # function call the model actually made, so the conversation stays whole.
+        call_id = _string(item.get("call_id"))
+        if call_id is None:
+            return None, "input.tool_search_call->dropped(malformed)"
+        raw = item.get("arguments")
+        arguments = raw if isinstance(raw, dict) else {}
+        if "goal" in arguments and "query" not in arguments:
+            arguments = {"query": arguments["goal"]}
+        call = ToolCall(
+            call_id=call_id,
+            name=GATEWAY_TOOL_SEARCH_NAME,
+            arguments=arguments,
+            raw_arguments=json.dumps(arguments, separators=(",", ":")),
+        )
+        return GatewayMessage(role="assistant", tool_calls=(call,)), None
+    if item_type == "tool_search_output":
+        call_id = _string(item.get("call_id"))
+        if call_id is None:
+            return None, "input.tool_search_output->dropped(malformed)"
+        tools = item.get("tools")
+        names = [
+            entry.get("name")
+            for entry in (tools if isinstance(tools, list) else ())
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        ]
+        content = json.dumps(
+            {"matched": [{"name": name} for name in names], "loaded": bool(names)},
+            separators=(",", ":"),
+        )
+        return GatewayMessage(role="tool", tool_call_id=call_id, content=content), None
     # Hosted-tool echoes (web_search_call, mcp_call, ...) have no foreign shape.
     return None, f"input.{item_type}->dropped(unsupported_by_provider)"

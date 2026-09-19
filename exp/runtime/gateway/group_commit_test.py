@@ -831,6 +831,68 @@ def _searching_terminal() -> GatewayEvent:
     )
 
 
+def _pre_tool_search_meter_hook(
+    original: Callable[..., None], recorded: list[dict[str, object]]
+) -> Callable[..., None]:
+    """The host hook shape that learned ``web_search_requests`` but not ``tool_search_requests``.
+
+    Any further keyword would TypeError here, which is the drift under test.
+    """
+
+    def legacy_apply(
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+    ) -> None:
+        """Record the settle and forward it to the engine's own core."""
+        recorded.append(
+            {
+                "attempt_id": attempt_id,
+                "upstream_provider": upstream_provider,
+                "web_search_requests": web_search_requests,
+            }
+        )
+        original(
+            connection,
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+            first_token_at=first_token_at,
+            retry_after_seconds=retry_after_seconds,
+            ratelimit_limit_requests=ratelimit_limit_requests,
+            ratelimit_remaining_requests=ratelimit_remaining_requests,
+            ratelimit_limit_tokens=ratelimit_limit_tokens,
+            ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+            upstream_provider=upstream_provider,
+            web_search_requests=web_search_requests,
+        )
+
+    return legacy_apply
+
+
+def _tool_searching_terminal() -> GatewayEvent:
+    """One completed terminal whose usage bills one web search and two tool-search rounds."""
+    return GatewayEvent(
+        kind=GatewayEventKind.COMPLETED,
+        sequence_number=1,
+        usage=GatewayUsage(
+            input_tokens=10, output_tokens=4, web_search_requests=1, tool_search_requests=2
+        ),
+    )
+
+
 def test_sync_facade_forwards_web_search_requests_only_to_a_host_hook_that_accepts_it(
     tmp_path: Path,
 ) -> None:
@@ -945,6 +1007,133 @@ def test_async_facade_withholds_web_search_requests_from_a_pre_meter_host_hook(
         attempt_id = asyncio.run(lifecycle())
         grouped.close()
     assert recorded == [{"attempt_id": attempt_id, "upstream_provider": "Azure"}]
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == ("completed", "Azure")
+    finally:
+        connection.close()
+
+
+def test_sync_facade_forwards_tool_search_requests_only_to_a_host_hook_that_accepts_it(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the ``web_search_requests`` seam for the tool-search meter, on the blocking facade.
+
+    A host hook predating ``tool_search_requests`` settles cleanly with it
+    withheld while still receiving the upstream label and the web-search count;
+    a current hook gets the settled count; a zero count is withheld from the
+    current hook too.
+    """
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    original = core.apply_finish_attempt
+    recorded: list[dict[str, object]] = []
+
+    def lifecycle(label: str, terminal: GatewayEvent) -> str:
+        """Accept, dispatch and settle one request through the blocking facade."""
+        grouped = GroupCommitAttemptLedger(core)
+        facade = SyncGroupCommitLedger(grouped)
+        authorization = _authorize(store, clock, raw_key, label)
+        facade.accept_request(authorization=authorization)
+        attempt_id = facade.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        usage = terminal.usage
+        facade.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=terminal,
+            failure=None,
+            upstream_provider="Azure",
+            web_search_requests=usage.web_search_requests if usage else 0,
+            tool_search_requests=usage.tool_search_requests if usage else 0,
+        )
+        facade.flush()
+        grouped.close()
+        return attempt_id
+
+    with mock.patch.object(
+        core, "apply_finish_attempt", _pre_tool_search_meter_hook(original, recorded)
+    ):
+        legacy_attempt = lifecycle("pre-tool-search-meter-hook", _tool_searching_terminal())
+    assert recorded == [
+        {"attempt_id": legacy_attempt, "upstream_provider": "Azure", "web_search_requests": 1}
+    ]
+
+    recorded.clear()
+    with mock.patch.object(core, "apply_finish_attempt", _search_meter_hook(original, recorded)):
+        billed_attempt = lifecycle("tool-search-meter-hook", _tool_searching_terminal())
+        unbilled_attempt = lifecycle("no-tool-search-hook", _searching_terminal())
+    assert [entry["attempt_id"] for entry in recorded] == [billed_attempt, unbilled_attempt]
+    assert recorded[0]["tool_search_requests"] == 2
+    assert recorded[0]["web_search_requests"] == 1
+    assert "tool_search_requests" not in recorded[1]
+    assert recorded[1]["web_search_requests"] == 2
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        rows = connection.execute(
+            "SELECT attempt_id, state, upstream_provider FROM gateway_attempts ORDER BY attempt_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert sorted(rows) == sorted(
+        [
+            (attempt, "completed", "Azure")
+            for attempt in (legacy_attempt, billed_attempt, unbilled_attempt)
+        ]
+    )
+
+
+def test_async_facade_withholds_tool_search_requests_from_a_pre_meter_host_hook(
+    tmp_path: Path,
+) -> None:
+    """``GroupCommitAttemptLedger.finish_attempt`` probes the hook for the tool-search meter too."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    original = core.apply_finish_attempt
+    recorded: list[dict[str, object]] = []
+
+    with mock.patch.object(
+        core, "apply_finish_attempt", _pre_tool_search_meter_hook(original, recorded)
+    ):
+        grouped = GroupCommitAttemptLedger(core)
+
+        async def lifecycle() -> str:
+            """Accept, dispatch and settle one tool-searching request through the async facade."""
+            authorization = _authorize(store, clock, raw_key, "async-pre-tool-search-meter-hook")
+            await grouped.accept_request(authorization=authorization)
+            attempt_id = await grouped.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+                route_reason="direct_alias",
+                fallback_reason=None,
+            )
+            await grouped.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=_tool_searching_terminal(),
+                failure=None,
+                upstream_provider="Azure",
+                web_search_requests=1,
+                tool_search_requests=2,
+            )
+            await grouped.flush()
+            return attempt_id
+
+        attempt_id = asyncio.run(lifecycle())
+        grouped.close()
+    assert recorded == [
+        {"attempt_id": attempt_id, "upstream_provider": "Azure", "web_search_requests": 1}
+    ]
     connection = sqlite3.connect(tmp_path / "gateway.db")
     try:
         assert connection.execute(

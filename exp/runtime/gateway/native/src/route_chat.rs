@@ -35,8 +35,10 @@ use crate::respond::{
 };
 use crate::server::AppState;
 use crate::settlement::{settle_guarded_failure, AttemptGuard};
+use crate::tool_search::{
+    adopt_outcome, annotate_chat_completion_for, configure_chat_encoder, disclose_after_collection,
+};
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
-use crate::web_search::annotate_chat_completion;
 
 pub(crate) async fn chat(
     State(state): State<AppState>,
@@ -149,7 +151,7 @@ pub(crate) async fn chat(
         }
         return error_response(&escalation_error());
     }
-    let admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
             // The request is durably accepted; abandon it before failing so
@@ -218,8 +220,10 @@ pub(crate) async fn chat(
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
+        tool_search: admission.tool_search.as_ref(),
     };
-    let won = acquire_attempt(&context, &mut guard).await;
+    let mut won = acquire_attempt(&context, &mut guard).await;
+    adopt_outcome(&mut admission, &mut won);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -351,9 +355,7 @@ async fn settled_chat_response(
         Ok(aggregated) => aggregated,
         Err(error) => return error_response(&error),
     };
-    if let Some(web_search) = admission.web_search.as_ref() {
-        annotate_chat_completion(&mut aggregated.body, web_search);
-    }
+    annotate_chat_completion_for(&mut aggregated.body, admission);
     if let Some(failure) = &aggregated.failure {
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
@@ -391,7 +393,7 @@ fn encode_chat_sse(
         admission.include_usage,
         admission.ignored_parameters.clone(),
     );
-    encoder.set_web_search(admission.web_search.clone());
+    configure_chat_encoder(&mut encoder, admission);
     encoder.set_reasoning_output_exposed(reasoning_output_exposed);
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string());
@@ -544,9 +546,7 @@ async fn respond_from_chat_events(
             return error_response(&error);
         }
     };
-    if let Some(web_search) = admission.web_search.as_ref() {
-        annotate_chat_completion(&mut aggregated.body, web_search);
-    }
+    annotate_chat_completion_for(&mut aggregated.body, &admission);
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
@@ -648,7 +648,7 @@ async fn respond_from_chat_events(
 
 #[allow(clippy::too_many_arguments)]
 async fn completed_response(
-    admission: Admission,
+    mut admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     created_at: i64,
@@ -683,6 +683,7 @@ async fn completed_response(
             return error_response(&error);
         }
     };
+    disclose_after_collection(&mut admission, &committed);
     respond_from_chat_events(
         admission,
         guard,
@@ -701,7 +702,7 @@ async fn completed_response(
 #[allow(clippy::too_many_arguments)]
 async fn guarded_chat_response(
     state: AppState,
-    admission: Admission,
+    mut admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     created_at: i64,
@@ -725,6 +726,7 @@ async fn guarded_chat_response(
             return error_response(&error);
         }
     };
+    disclose_after_collection(&mut admission, &committed);
     let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
@@ -785,7 +787,7 @@ async fn stream_response(
             include_usage,
             admission.ignored_parameters.clone(),
         );
-        encoder.set_web_search(admission.web_search.clone());
+        configure_chat_encoder(&mut encoder, &admission);
         encoder.set_reasoning_output_exposed(admission.reasoning_exposed_at(committed.depth));
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);

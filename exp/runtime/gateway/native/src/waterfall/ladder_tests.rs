@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
+use crate::bridge::Bridge;
+use crate::throttle_backoff::ThrottleRedial;
 use crate::upstream::build_client;
 
 /// A control plane that mirrors the python candidate policy for one two-rung
@@ -427,6 +429,7 @@ impl Harness {
             approximate_input_tokens: 10.0,
             output_less_retention: None,
             output_token_cap: None,
+            tool_search: None,
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)

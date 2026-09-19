@@ -19,6 +19,9 @@ from exp.runtime.gateway.native_settlement import (
     first_token_at_from_settlement,
     settlement_rate_limit,
     terminal_from_settlement,
+    tool_search_requests_from_settlement,
+    tool_search_requests_from_terminal,
+    tool_search_requests_kwarg,
     upstream_provider_from_settlement,
     upstream_provider_kwarg,
     web_search_requests_from_settlement,
@@ -512,3 +515,90 @@ def test_web_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger(
     assert web_search_requests_kwarg(absent, 2) == {}
     assert web_search_requests_kwarg(named, 0) == {}
     assert web_search_requests_kwarg(variadic, 0) == {}
+
+
+def test_tool_search_requests_parses_the_top_level_count_and_nothing_else() -> None:
+    """The count sits beside ``usage`` in the settle argument; anything unusable reads as zero."""
+    assert tool_search_requests_from_settlement({"tool_search_requests": 2}) == 2
+    assert tool_search_requests_from_settlement({}) == 0
+    assert tool_search_requests_from_settlement(None) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": None}) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": "2"}) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": True}) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": -1}) == 0
+    # Inside "usage" is the wrong place: the engine never puts it there.
+    assert tool_search_requests_from_settlement({"usage": {"tool_search_requests": 2}}) == 0
+    # The two meters are independent keys: one never reads as the other.
+    assert tool_search_requests_from_settlement({"web_search_requests": 2}) == 0
+    assert web_search_requests_from_settlement({"tool_search_requests": 2}) == 0
+
+
+def test_tool_search_requests_ride_on_the_settled_usage() -> None:
+    """Token-bearing and tool-only usage both carry the count; no usage means no carrier."""
+    tokens: JsonObject = {"input_tokens": 8, "output_tokens": 3}
+    terminal, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": [], "tool_search_requests": 2}
+    )
+    assert terminal.usage is not None and terminal.usage.tool_search_requests == 2
+    assert terminal.usage.web_search_requests == 0
+    assert tool_search_requests_from_terminal(terminal) == 2
+
+    tools_only, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": None,
+            "tool_names": ["tool_search"],
+            "tool_search_requests": 1,
+        }
+    )
+    assert tools_only.usage is not None and tools_only.usage.tool_search_requests == 1
+    assert not tools_only.usage.has_token_counts
+
+    # A count with neither tokens nor tool names has nothing to ride on: the
+    # contract's validator keeps a bare count from being usage, so it is dropped.
+    bare, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": None, "tool_names": [], "tool_search_requests": 3}
+    )
+    assert bare.usage is None
+    assert tool_search_requests_from_terminal(bare) == 0
+    assert tool_search_requests_from_terminal(None) == 0
+
+    # Absent stays byte-identical to the pre-field engine: zero on the usage.
+    absent, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": []}
+    )
+    assert absent.usage is not None and absent.usage.tool_search_requests == 0
+    assert _usage_from_payload(tokens, [], tool_search_requests=4) == GatewayUsage(
+        input_tokens=8, output_tokens=3, tool_search_requests=4
+    )
+    # Both meters settle side by side on one usage.
+    both, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": tokens,
+            "tool_names": [],
+            "web_search_requests": 1,
+            "tool_search_requests": 2,
+        }
+    )
+    assert both.usage is not None
+    assert (both.usage.web_search_requests, both.usage.tool_search_requests) == (1, 2)
+
+
+def test_tool_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger() -> None:
+    """Same seam as ``web_search_requests_kwarg``: zero or a pre-meter ledger gets nothing."""
+
+    def named(*, tool_search_requests: int = 0) -> None:
+        del tool_search_requests
+
+    def variadic(**kwargs: object) -> None:
+        del kwargs
+
+    def pre_tool_search(*, web_search_requests: int = 0) -> None:
+        del web_search_requests
+
+    assert tool_search_requests_kwarg(named, 2) == {"tool_search_requests": 2}
+    assert tool_search_requests_kwarg(variadic, 1) == {"tool_search_requests": 1}
+    assert tool_search_requests_kwarg(pre_tool_search, 2) == {}
+    assert tool_search_requests_kwarg(named, 0) == {}
+    assert tool_search_requests_kwarg(variadic, 0) == {}

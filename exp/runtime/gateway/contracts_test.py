@@ -781,9 +781,16 @@ def test_native_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> 
     )
     assert canonical_request_sha256(moved) != canonical_request_sha256(carried)
 
-    with pytest.raises(ValidationError, match="valid only for Responses"):
+    # Chat carries them too now (OpenRouter's server tools ride the same array);
+    # the Messages surface has its own server-tool carrier and rejects these.
+    GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        provider_native_tools=(native_entry.model_copy(update={"index": 0}),),
+    )
+    with pytest.raises(ValidationError, match="valid only for Responses and Chat"):
         GatewayRequest(
-            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            surface=GatewayApiSurface.MESSAGES,
             messages=(GatewayMessage(role="user", content="hi"),),
             provider_native_tools=(native_entry,),
         )

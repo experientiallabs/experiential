@@ -120,6 +120,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and not request.provider_native_tools
         and request.provider_preferences is None
         and request.web_search is None
+        and request.tool_search is None
     ):
         return None
     envelope: JsonObject = {
@@ -152,6 +153,9 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         # A pre-answer web search changes the answer for the same body; the
         # fetched results are derived at admission and never join identity.
         envelope["web_search"] = request.web_search.model_dump(mode="json")
+    if request.tool_search is not None:
+        # Deferred-tool discovery changes what the model can see and call.
+        envelope["tool_search"] = request.tool_search.model_dump(mode="json")
     if retained_tools:
         envelope["tools"] = retained_tools
     if request.provider_beta_tokens:

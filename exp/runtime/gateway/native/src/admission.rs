@@ -22,6 +22,7 @@ use crate::respond::error_response;
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::ThrottleRedial;
+use crate::tool_search::{ToolSearchAdmission, ToolSearchRound};
 use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
 use crate::web_search::WebSearchAdmission;
 
@@ -94,6 +95,17 @@ pub(crate) struct Admission {
     /// every response byte exactly as before.
     #[serde(default)]
     pub web_search: Option<WebSearchAdmission>,
+    /// The gateway-run tool search for this request: the function tool the
+    /// model was given in place of the deferred catalog, and the round
+    /// budget. Absent when the gateway runs no search (no deferred tools, or
+    /// a route that searches natively), which leaves every byte as before.
+    #[serde(default)]
+    pub tool_search: Option<ToolSearchAdmission>,
+    /// The search rounds the waterfall completed for this request, moved
+    /// here from the winning attempt (`tool_search::adopt_outcome`) so every
+    /// response surface renders them ahead of the answer. Never on the wire.
+    #[serde(skip)]
+    pub tool_search_rounds: Vec<ToolSearchRound>,
 }
 
 /// How one admission's output chain is enforced on the data plane.

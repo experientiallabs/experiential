@@ -34,11 +34,14 @@ use crate::respond::{
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
+use crate::tool_search::{
+    adopt_outcome, completed_messages_body_for, configure_messages_encoder_for,
+    disclose_after_collection,
+};
 use crate::waterfall::{
     acquire_attempt, billed_empty_completion, unreported_empty_completion, CommittedAttempt,
     Served, SettledAttempt, WaterfallContext, Won,
 };
-use crate::web_search::{completed_messages_body_with_web_search, configure_messages_encoder};
 
 /// Anthropic-enveloped variant of `error_response` for the Messages surface,
 /// mirroring `anthropic_error_response` in the python engine.
@@ -182,7 +185,7 @@ pub(crate) async fn messages(
         // servability, so an escalation disposition fails closed here.
         return messages_error_response(&escalation_error());
     }
-    let admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
             // The request is durably accepted; abandon it before failing so
@@ -216,8 +219,10 @@ pub(crate) async fn messages(
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
+        tool_search: admission.tool_search.as_ref(),
     };
-    let won = acquire_attempt(&context, &mut guard).await;
+    let mut won = acquire_attempt(&context, &mut guard).await;
+    adopt_outcome(&mut admission, &mut won);
 
     match won {
         Won::Failed(error) => messages_error_response(&error),
@@ -295,15 +300,7 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
         };
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_messages_body_with_web_search(
-        &admission.request_id,
-        &admission.alias,
-        &events,
-        &admission.ignored_parameters,
-        None,
-        exposed,
-        admission.web_search.as_ref(),
-    ) {
+    let aggregated = match completed_messages_body_for(admission, &events, None, exposed) {
         Ok(aggregated) => aggregated,
         Err(error) => return messages_error_response(&error),
     };
@@ -344,35 +341,28 @@ async fn respond_from_messages_events(
         }
     };
     let exposed = admission.reasoning_exposed_at(depth);
-    let aggregated = match completed_messages_body_with_web_search(
-        &admission.request_id,
-        &admission.alias,
-        &events,
-        &admission.ignored_parameters,
-        carrier.as_deref(),
-        exposed,
-        admission.web_search.as_ref(),
-    ) {
-        Ok(aggregated) => aggregated,
-        Err(error) => {
-            guard
-                .settle(
-                    "failed",
-                    usage.as_ref(),
-                    &tool_names,
-                    Some(
-                        &Failure::new(
-                            FailureClass::MalformedResponse,
-                            "provider stream ended without a terminal event",
-                        )
-                        .boundary(),
-                    ),
-                    true,
-                )
-                .await;
-            return messages_error_response(&error);
-        }
-    };
+    let aggregated =
+        match completed_messages_body_for(&admission, &events, carrier.as_deref(), exposed) {
+            Ok(aggregated) => aggregated,
+            Err(error) => {
+                guard
+                    .settle(
+                        "failed",
+                        usage.as_ref(),
+                        &tool_names,
+                        Some(
+                            &Failure::new(
+                                FailureClass::MalformedResponse,
+                                "provider stream ended without a terminal event",
+                            )
+                            .boundary(),
+                        ),
+                        true,
+                    )
+                    .await;
+                return messages_error_response(&error);
+            }
+        };
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
@@ -489,11 +479,7 @@ fn encode_messages_sse(
         &admission.alias,
         admission.ignored_parameters.clone(),
     );
-    configure_messages_encoder(
-        &mut encoder,
-        admission.web_search.as_ref(),
-        &admission.request_id,
-    );
+    configure_messages_encoder_for(&mut encoder, admission);
     encoder.set_reasoning_output_exposed(reasoning_output_exposed);
     encoder.set_pre_dispatch_input_estimate(admission.input_token_estimate);
     if let Some(carrier) = reasoning_content_carrier {
@@ -512,7 +498,7 @@ fn encode_messages_sse(
 }
 
 async fn completed_messages(
-    admission: Admission,
+    mut admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     deadline: Instant,
@@ -541,6 +527,7 @@ async fn completed_messages(
             return messages_error_response(&error);
         }
     };
+    disclose_after_collection(&mut admission, &committed);
     respond_from_messages_events(
         admission,
         guard,
@@ -555,7 +542,7 @@ async fn completed_messages(
 
 async fn guarded_messages(
     state: AppState,
-    admission: Admission,
+    mut admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     deadline: Instant,
@@ -584,6 +571,7 @@ async fn guarded_messages(
             return messages_error_response(&error);
         }
     };
+    disclose_after_collection(&mut admission, &committed);
     let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
@@ -634,7 +622,7 @@ async fn stream_messages(
         let mut committed = committed;
         let mut encoder =
             MessagesSseEncoder::new_with_ignored(&request_id, &alias, ignored_parameters);
-        configure_messages_encoder(&mut encoder, admission.web_search.as_ref(), &request_id);
+        configure_messages_encoder_for(&mut encoder, &admission);
         encoder.set_reasoning_output_exposed(admission.reasoning_exposed_at(committed.depth));
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);

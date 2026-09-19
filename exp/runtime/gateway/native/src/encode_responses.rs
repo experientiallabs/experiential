@@ -11,9 +11,11 @@ use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus, Usage,
 };
+use crate::tool_search::ResponsesToolSearch;
 use crate::web_search::{url_citations, CitationShape, WebSearchAdmission};
 
 mod aggregate;
+mod close;
 mod envelope;
 mod output;
 mod provider;
@@ -24,7 +26,8 @@ mod provider;
 #[allow(unused_imports)]
 pub use aggregate::{
     completed_responses_body, completed_responses_body_with_carrier,
-    completed_responses_body_with_web_search,
+    completed_responses_body_with_gateway_tools, completed_responses_body_with_web_search,
+    AggregatedResponses,
 };
 pub use envelope::ResponsesEnvelope;
 
@@ -63,6 +66,9 @@ pub struct ResponsesSseEncoder {
     provider_output_starts: HashMap<u32, ProviderOutputStart>,
     usage: Option<Usage>,
     web_search: Option<WebSearchAdmission>,
+    /// The gateway-run tool-search rounds, rendered as leading hosted items
+    /// at `start` and metered on usage; `None` changes nothing.
+    tool_search: Option<ResponsesToolSearch>,
 }
 
 impl ResponsesSseEncoder {
@@ -92,7 +98,22 @@ impl ResponsesSseEncoder {
             provider_output_starts: HashMap::new(),
             usage: None,
             web_search: None,
+            tool_search: None,
         }
+    }
+
+    /// Render the gateway-run tool-search rounds as `tool_search_call` /
+    /// `tool_search_output` items ahead of every provider item (see
+    /// `tool_search::responses_tool_search`); set before `start`.
+    pub fn set_tool_search(&mut self, tool_search: Option<ResponsesToolSearch>) {
+        self.tool_search = tool_search;
+    }
+
+    /// How many tool-search rounds this response meters.
+    pub(super) fn tool_search_requests(&self) -> u32 {
+        self.tool_search
+            .as_ref()
+            .map_or(0, |search| search.requests)
     }
 
     /// Cite the gateway-executed web search on the synthetic message and
@@ -117,7 +138,19 @@ impl ResponsesSseEncoder {
             "response.in_progress",
             json!({"response": self.response("in_progress", None)}),
         );
-        Ok(vec![created, in_progress])
+        let mut frames = vec![created, in_progress];
+        // The gateway's own search items lead the output, exactly where a
+        // native rung would stream its hosted tool calls.
+        if let Some(events) = self
+            .tool_search
+            .as_ref()
+            .map(|search| search.events.clone())
+        {
+            for event in &events {
+                frames.extend(self.feed(event)?);
+            }
+        }
+        Ok(frames)
     }
 
     /// Encode one ordered normalized event into Responses lifecycle frames.
@@ -853,128 +886,6 @@ impl ResponsesSseEncoder {
         frames.push(self.event(
             "response.output_item.done",
             json!({"output_index": output_index, "item": item}),
-        ));
-        frames
-    }
-
-    /// Emit content and output completion for one assistant message.
-    fn close_message(
-        &mut self,
-        key: MessageKey,
-        fallback_status: ProviderOutputItemStatus,
-    ) -> Vec<String> {
-        let (
-            item_id,
-            output_index,
-            text,
-            refusal,
-            annotations,
-            first_search_citation,
-            text_started,
-            refusal_started,
-            item,
-        ) = {
-            let state = match self.messages.get_mut(&key) {
-                Some(state) => state,
-                None => return Vec::new(),
-            };
-            if state.done {
-                return Vec::new();
-            }
-            state.done = true;
-            if matches!(
-                state.status,
-                None | Some(ProviderOutputItemStatus::InProgress)
-            ) {
-                state.status = Some(fallback_status);
-            }
-            // The gateway's own search cites the synthetic (foreign-rung)
-            // message it answered from; provider-keyed messages carry only
-            // the provider's own annotations.
-            let first_search_citation = state.annotations.len();
-            if let (MessageKey::Synthetic, Some(web_search)) = (key, self.web_search.as_ref()) {
-                state.annotations.extend(url_citations(
-                    &state.text,
-                    &web_search.results,
-                    CitationShape::Responses,
-                ));
-            }
-            (
-                state.item_id.clone(),
-                state.output_index,
-                state.text.clone(),
-                state.refusal.clone(),
-                state.annotations.clone(),
-                first_search_citation,
-                state.text_started,
-                state.refusal_started,
-                state.item(true, fallback_status),
-            )
-        };
-        let mut frames: Vec<String> = Vec::new();
-        let mut content_index = 0;
-        if text_started {
-            for (offset, annotation) in annotations[first_search_citation..].iter().enumerate() {
-                frames.push(self.event(
-                    "response.output_text.annotation.added",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": content_index,
-                        "annotation_index": first_search_citation + offset,
-                        "annotation": annotation,
-                    }),
-                ));
-            }
-            frames.push(self.event(
-                "response.output_text.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "text": text,
-                    "logprobs": [],
-                }),
-            ));
-            let part = json!({"type": "output_text", "text": text, "annotations": annotations});
-            frames.push(self.event(
-                "response.content_part.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "part": part,
-                }),
-            ));
-            content_index += 1;
-        }
-        if refusal_started {
-            frames.push(self.event(
-                "response.refusal.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "refusal": refusal,
-                }),
-            ));
-            let part = json!({"type": "refusal", "refusal": refusal});
-            frames.push(self.event(
-                "response.content_part.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": content_index,
-                    "part": part,
-                }),
-            ));
-        }
-        frames.push(self.event(
-            "response.output_item.done",
-            json!({
-                "output_index": output_index,
-                "item": item,
-            }),
         ));
         frames
     }

@@ -17,6 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.manifest import MESSAGES_SERVER_TOOL_TYPES_ACCEPTED
+from exp.runtime.gateway.tool_search.contracts import (
+    MESSAGES_TOOL_SEARCH_TYPES,
+    GatewayToolSearch,
+    mode_for_messages_type,
+)
 from exp.runtime.gateway.web_search.contracts import (
     DEFAULT_WEB_SEARCH_RESULTS,
     MAXIMUM_WEB_SEARCH_RESULTS,
@@ -112,4 +117,24 @@ def messages_web_search(payload: JsonObject, tools: Sequence[object]) -> Gateway
                 + str(detail["msg"]).removeprefix("Value error, ")
                 + ".",
             ) from exc
+    return None
+
+
+def messages_tool_search(tools: Sequence[object]) -> GatewayToolSearch | None:
+    """Normalize the first ``tool_search_tool_*`` server tool into a gateway declaration.
+
+    Args:
+        tools: The decoded ``tools`` entries.
+
+    Returns:
+        The normalized declaration, or ``None`` when none is declared.
+    """
+    for tool in tools:
+        if isinstance(tool, ServerTool) and tool.type in MESSAGES_TOOL_SEARCH_TYPES:
+            return GatewayToolSearch(
+                declared_as="messages_server_tool",
+                mode=mode_for_messages_type(tool.type),
+                tool_type=tool.type,
+                tool_name=tool.name,
+            )
     return None

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
+use crate::tool_search::annotate_tool_search_usage_details;
 use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
 /// Derive one replay-stable public object ID, mirroring `stable_public_id`.
@@ -183,6 +184,9 @@ pub struct ChatSseEncoder {
     reasoning_content_carrier: Option<String>,
     reasoning_output_exposed: bool,
     web_search: Option<ChatWebSearch>,
+    /// Gateway-run tool-search rounds metered on the usage chunk; zero
+    /// leaves every frame byte-identical.
+    tool_search_requests: u32,
 }
 
 impl ChatSseEncoder {
@@ -209,7 +213,14 @@ impl ChatSseEncoder {
             reasoning_content_carrier: None,
             reasoning_output_exposed: false,
             web_search: None,
+            tool_search_requests: 0,
         }
+    }
+
+    /// Meter the gateway-run tool-search rounds on the usage chunk; the Chat
+    /// surface renders no item for them.
+    pub fn set_tool_search_requests(&mut self, requests: u32) {
+        self.tool_search_requests = requests;
     }
 
     /// Attach an authenticated carrier before the terminal is encoded.
@@ -477,6 +488,7 @@ impl ChatSseEncoder {
             &mut usage,
             self.web_search.as_ref().map(ChatWebSearch::admission),
         );
+        annotate_tool_search_usage_details(&mut usage, self.tool_search_requests);
         let payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",

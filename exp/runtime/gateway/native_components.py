@@ -67,6 +67,7 @@ class SyncWriteLedger(Protocol):
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
+        tool_search_requests: int = 0,
     ) -> None:
         """Durably settle one attempt exactly once.
 
@@ -81,6 +82,9 @@ class SyncWriteLedger(Protocol):
         ``web_search_requests`` counts the gateway-executed web searches billed
         to the attempt, never a provider meter; the hosted ledger prices them
         per attempt, and the engine omits the keyword entirely at zero.
+        ``tool_search_requests`` counts the gateway-executed tool-search rounds
+        billed to the attempt under the same rules: never a provider meter,
+        priced by the hosted ledger, omitted entirely at zero.
         """
         ...
 

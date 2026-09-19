@@ -193,3 +193,40 @@ def test_convert_history_additional_tools_dropped() -> None:
     messages, disclosures = convert_native_history(request.messages, NativeToolMapping())
     assert messages == ()
     assert "input.additional_tools->dropped(declared_inline)" in disclosures
+
+
+def test_convert_history_replays_a_gateway_tool_search_round_as_a_function_pair() -> None:
+    request = _request(
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                provider_native_item={
+                    "type": "tool_search_call",
+                    "id": "tsc_1",
+                    "call_id": "call_ts",
+                    "status": "completed",
+                    "execution": "server",
+                    "arguments": {"goal": "weather"},
+                },
+            ),
+            GatewayMessage(
+                role="assistant",
+                provider_native_item={
+                    "type": "tool_search_output",
+                    "id": "tso_1",
+                    "call_id": "call_ts",
+                    "status": "completed",
+                    "execution": "server",
+                    "tools": [{"type": "function", "name": "get_weather"}],
+                },
+            ),
+        ),
+    )
+    messages, disclosures = convert_native_history(request.messages, NativeToolMapping())
+    assert disclosures == []
+    assert messages[0].role == "assistant"
+    assert messages[0].tool_calls[0].name == "tool_search"
+    assert messages[0].tool_calls[0].arguments == {"query": "weather"}
+    assert messages[1].role == "tool"
+    assert messages[1].tool_call_id == "call_ts"
+    assert '"get_weather"' in (messages[1].content or "")

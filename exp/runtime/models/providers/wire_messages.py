@@ -729,6 +729,9 @@ def add_openai_tools(
                     "description": tool.description,
                     "parameters": tool.parameters,
                     "strict": tool.strict,
+                    # OpenAI's deferred-loading marker for its native tool search;
+                    # a false or absent marker is omitted so today's bodies stay identical.
+                    **({"defer_loading": True} if tool.defer_loading else {}),
                 }
                 for tool in request.tools
             ]

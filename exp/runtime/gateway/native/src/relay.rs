@@ -18,6 +18,7 @@ use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::stop_sequences::StopSequenceGuard;
+use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
 use crate::tool_serialization::ToolCallSerializer;
 use crate::waterfall::CommittedAttempt;
 
@@ -147,6 +148,9 @@ pub struct UpstreamRelay {
     /// Response-side inversion map for Codex native tools translated on a
     /// foreign wire; empty on every native-Responses route (a no-op there).
     native_tool_inverter: NativeToolInverter,
+    /// Swallows every call to the gateway's tool-search tool so the caller
+    /// never sees it; inert until the tool is named (see `tool_search`).
+    tool_search: ToolSearchWithholder,
     stream: BoxStream<'static, reqwest::Result<Bytes>>,
     decoder: FrameDecoder,
     normalizer: Normalizer,
@@ -237,6 +241,7 @@ impl UpstreamRelay {
             first_byte_deadline,
             first_token_at: None,
             native_tool_inverter: NativeToolInverter::default(),
+            tool_search: ToolSearchWithholder::default(),
             carried_usage: None,
         }
     }
@@ -269,6 +274,30 @@ impl UpstreamRelay {
     /// yields. Empty leaves every event untouched.
     pub fn set_native_tool_translation(&mut self, translation: NativeToolTranslation) {
         self.native_tool_inverter.translation = translation;
+    }
+
+    /// Name the gateway's tool-search tool (see `tool_search`): every call to
+    /// it is withheld from the yielded events and accumulated for the
+    /// waterfall. `None` withholds nothing.
+    pub fn set_tool_search_tool_name(&mut self, tool_name: Option<String>) {
+        self.tool_search.set_tool_name(tool_name);
+    }
+
+    /// How many completed calls to the tool-search tool this relay withheld
+    /// and has not handed over yet.
+    pub fn withheld_search_call_count(&self) -> usize {
+        self.tool_search.withheld_count()
+    }
+
+    /// Whether this relay saw any call to the tool-search tool, completed or
+    /// still open.
+    pub fn withheld_search_call_seen(&self) -> bool {
+        self.tool_search.withheld_any()
+    }
+
+    /// Hand over the withheld tool-search calls, leaving none behind.
+    pub fn take_withheld_search_calls(&mut self) -> Vec<WithheldSearchCall> {
+        self.tool_search.take_withheld()
     }
 
     /// Name the customer-managed provider this relay dispatches on, so every
@@ -314,6 +343,12 @@ impl UpstreamRelay {
                 provider,
             ));
         }
+        // The gateway's own search tool is withheld first: it is not one of
+        // the caller's tools, so it never counts toward one-call-per-turn
+        // serialization and never reaches the Codex inversion or the caller.
+        let Some(mut event) = self.tool_search.filter(event) else {
+            return true;
+        };
         if let Some(serializer) = self.tool_serializer.as_mut() {
             let Some(kept) = serializer.filter(event) else {
                 return true;
@@ -543,253 +578,7 @@ pub async fn collect_committed(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dialects::Dialect;
-    use crate::events::Event;
-    use futures_util::stream;
-
-    #[tokio::test]
-    async fn first_token_at_is_stamped_on_the_first_output_delta() {
-        // A content delta then the OpenAI terminal sentinel.
-        let frames = vec![
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from("data: [DONE]\n\n")),
-        ];
-        let mut relay = UpstreamRelay::from_stream(
-            stream::iter(frames).boxed(),
-            Dialect::OpenAiCompatible,
-            Instant::now() + Duration::from_secs(5),
-        );
-        assert!(
-            relay.first_token_at().is_none(),
-            "no first-token time before any event is yielded"
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let per_chunk = Duration::from_secs(5);
-        let first = relay
-            .next_event(deadline, per_chunk, Instant::now())
-            .await
-            .expect("the stream yields")
-            .expect("an event is produced");
-        assert!(
-            matches!(&first, Event::TextDelta(text) if text == "hi"),
-            "the first output event is the content delta"
-        );
-        assert!(
-            relay.first_token_at().is_some(),
-            "the first content delta stamps time-to-first-token"
-        );
-    }
-
-    #[tokio::test]
-    async fn stop_sequences_cut_the_relayed_text_and_keep_usage_and_settlement_exact() {
-        // A Chat-compatible stream stands in for any dialect: "</block>" spans
-        // two content deltas, more text follows it, then usage and the
-        // provider's own terminal arrive. The guard cuts at the match, drops
-        // the trailing text, still yields the usage, and replaces the terminal.
-        let frames = vec![
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"allow</bl\"}}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"ock>ignored\"}}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from("data: [DONE]\n\n")),
-        ];
-        let mut relay = UpstreamRelay::from_stream(
-            stream::iter(frames).boxed(),
-            Dialect::OpenAiCompatible,
-            Instant::now() + Duration::from_secs(5),
-        );
-        relay.set_stop_sequences(["</block>"]);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let per_chunk = Duration::from_secs(5);
-        let mut events = Vec::new();
-        loop {
-            match relay.next_event(deadline, per_chunk, Instant::now()).await {
-                Ok(Some(event)) => {
-                    let terminal = event.is_terminal();
-                    events.push(event);
-                    if terminal {
-                        break;
-                    }
-                }
-                Ok(None) => panic!("the stream must end on a terminal"),
-                Err(failure) => panic!("unexpected failure: {failure:?}"),
-            }
-        }
-        let text: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::TextDelta(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "allow", "text stops exactly before the sequence");
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, Event::Usage(usage) if usage.has_token_counts())),
-            "usage still reaches settlement after the cut"
-        );
-        assert!(
-            matches!(events.last(), Some(Event::StoppedAtSequence(sequence)) if sequence == "</block>"),
-            "the terminal names the matched sequence"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_customer_managed_relay_re_owns_a_declared_credential_failure_after_output() {
-        // Text has already streamed (the attempt is committed) when the
-        // provider declares a 401 in-stream: the customer still gets their
-        // own message, not the house "ask the gateway operator" one.
-        let frames = vec![
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"error\":{\"code\":401,\"message\":\"Incorrect API key provided\"}}\n\n",
-            )),
-        ];
-        let mut relay = UpstreamRelay::from_stream(
-            stream::iter(frames).boxed(),
-            Dialect::OpenAiCompatible,
-            Instant::now() + Duration::from_secs(5),
-        );
-        relay.set_customer_managed_provider(Some("openai".to_string()));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let per_chunk = Duration::from_secs(5);
-        let first = relay
-            .next_event(deadline, per_chunk, Instant::now())
-            .await
-            .expect("yields")
-            .expect("event");
-        assert!(matches!(&first, Event::TextDelta(text) if text == "hi"));
-        let second = relay
-            .next_event(deadline, per_chunk, Instant::now())
-            .await
-            .expect("yields")
-            .expect("event");
-        match second {
-            Event::Failed(failure) => {
-                assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
-                assert!(failure.customer_owned);
-                assert!(failure
-                    .safe_message
-                    .contains("your connected openai credential"));
-                assert_eq!(failure.public_error().status_code, 400);
-            }
-            other => panic!("expected the re-owned failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_first_byte_stall_fails_over_without_redialing_the_dead_lane() {
-        let failure = first_byte_timeout_failure();
-        assert_eq!(failure.failure_class, FailureClass::Timeout);
-        assert!(failure.failover_eligible);
-        // A stalled lane is skipped, not redialed: redialing it would only
-        // stall again for another window.
-        assert!(!failure.retryable_same_deployment);
-    }
-
-    #[tokio::test]
-    async fn a_gemini_partial_then_abnormal_frame_ends_incomplete_not_failed() {
-        // A Gemini content frame, its usage, then a structurally malformed frame
-        // (a non-string text part). The relay must route the abnormal end
-        // through recovery: yield the content, fold the usage, and end on an
-        // Incomplete terminal instead of surfacing the malformed failure.
-        let frames = vec![
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":3}}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":5}]}}]}\n\n",
-            )),
-        ];
-        let mut relay = UpstreamRelay::from_stream(
-            stream::iter(frames).boxed(),
-            Dialect::GeminiGenerateContent,
-            Instant::now() + Duration::from_secs(5),
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let per_chunk = Duration::from_secs(5);
-        let mut seen: Vec<Event> = Vec::new();
-        loop {
-            let event = relay
-                .next_event(deadline, per_chunk, Instant::now())
-                .await
-                .expect("recovery yields events, never the malformed failure");
-            match event {
-                Some(event) => {
-                    let terminal = event.is_terminal();
-                    seen.push(event);
-                    if terminal {
-                        break;
-                    }
-                }
-                None => panic!("the recovered terminal must arrive before EOF"),
-            }
-        }
-        assert!(
-            matches!(seen.first(), Some(Event::TextDelta(text)) if text == "partial"),
-            "the partial content is delivered"
-        );
-        assert!(
-            seen.iter().any(|event| matches!(event, Event::Usage(_))),
-            "last-seen usage is folded so delivered tokens bill"
-        );
-        assert!(
-            matches!(seen.last(), Some(Event::Incomplete)),
-            "the turn ends incomplete, not failed"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stalled_first_byte_trips_the_ttft_bound_not_the_chunk_timeout() {
-        // A provider that opened the stream but never sends a byte must fail
-        // over in about the time-to-first-byte window, not the (far larger)
-        // per-chunk deployment timeout.
-        let never = stream::pending::<reqwest::Result<Bytes>>().boxed();
-        let time_to_first_byte = Duration::from_millis(80);
-        let mut relay = UpstreamRelay::from_stream(
-            never,
-            Dialect::OpenAiCompatible,
-            Instant::now() + time_to_first_byte,
-        );
-        let request_deadline = Instant::now() + Duration::from_secs(120);
-        let per_chunk_timeout = Duration::from_secs(35);
-
-        let started = Instant::now();
-        let outcome = relay
-            .next_event(request_deadline, per_chunk_timeout, started)
-            .await;
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "expected a fail-fast time-to-first-byte trip, waited {elapsed:?}"
-        );
-        let failure = outcome.expect_err("a never-yielding stream must not succeed");
-        assert_eq!(failure.failure_class, FailureClass::Timeout);
-        assert!(
-            failure.failover_eligible,
-            "a first-byte stall must advance to the next deployment"
-        );
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod h2_abort_tests {

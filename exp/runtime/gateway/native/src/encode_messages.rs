@@ -13,7 +13,8 @@ use crate::encode::{
 };
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
-use crate::web_search::{annotate_messages_usage, MessagesWebSearch};
+use crate::tool_search::MessagesToolSearch;
+use crate::web_search::MessagesWebSearch;
 
 /// The provider block index under which an exposure-gated rung's plaintext
 /// reasoning (`ReasoningContentDelta`, an OpenAI-wire event with no block
@@ -152,6 +153,10 @@ pub struct MessagesSseEncoder {
     /// The gateway-executed web search, rendered as the leading blocks at
     /// `start` and metered on every usage object; `None` changes nothing.
     web_search: Option<MessagesWebSearch>,
+    /// The gateway-run tool-search rounds, rendered as leading blocks after
+    /// the web search and metered on every usage object; `None` changes
+    /// nothing.
+    tool_search: Option<MessagesToolSearch>,
     /// How many leading blocks are the gateway's own, so the empty-completion
     /// check still sees a provider that rendered nothing.
     synthetic_blocks: usize,
@@ -195,8 +200,15 @@ impl MessagesSseEncoder {
             reasoning_content_carrier: None,
             reasoning_output_exposed: false,
             web_search: None,
+            tool_search: None,
             synthetic_blocks: 0,
         }
+    }
+
+    /// Render the gateway-run tool-search rounds ahead of every provider
+    /// block (see `tool_search::messages_tool_search`); set before `start`.
+    pub fn set_tool_search(&mut self, tool_search: Option<MessagesToolSearch>) {
+        self.tool_search = tool_search;
     }
 
     /// Render the gateway-executed web search ahead of every provider block
@@ -289,32 +301,25 @@ impl MessagesSseEncoder {
             event_frame("ping", &json!({"type": "ping"})),
         ];
         // The gateway's own search blocks lead the content, exactly where a
-        // native rung would stream its server tool use.
-        if let Some(events) = self.web_search.as_ref().map(|search| search.events.clone()) {
-            for event in &events {
+        // native rung would stream its server tool use: the pre-dispatch web
+        // search first, then the tool-search rounds in order.
+        let synthetic: Vec<Event> = self
+            .web_search
+            .iter()
+            .flat_map(|search| search.events.clone())
+            .chain(
+                self.tool_search
+                    .iter()
+                    .flat_map(|search| search.events.clone()),
+            )
+            .collect();
+        if !synthetic.is_empty() {
+            for event in &synthetic {
                 frames.extend(self.feed(event)?);
             }
             self.synthetic_blocks = self.blocks.len();
         }
         Ok(frames)
-    }
-
-    /// The `message_start` meters: the upstream's own start usage when known,
-    /// else the pre-dispatch estimate in Anthropic's start-frame shape (the
-    /// counted prompt as `input_tokens`, both cache legs `0` because nothing
-    /// is cached before dispatch, and Anthropic's `output_tokens: 1`
-    /// placeholder), else the zero placeholder.
-    fn start_usage(&self) -> Value {
-        let usage = match (self.usage.as_ref(), self.pre_dispatch_input_estimate) {
-            (Some(usage), _) => messages_usage(Some(usage)),
-            (None, Some(estimate)) => usage_object(estimate, 0, 0, 1),
-            (None, None) => messages_usage(None),
-        };
-        annotate_messages_usage(usage, self.web_search_requests())
-    }
-
-    fn web_search_requests(&self) -> Option<u32> {
-        self.web_search.as_ref().map(|search| search.requests)
     }
 
     pub fn saw_terminal(&self) -> bool {
@@ -499,10 +504,7 @@ impl MessagesSseEncoder {
                             "stop_reason": stop_reason(event, self.saw_tool_use),
                             "stop_sequence": stop_sequence_value(event),
                         },
-                        "usage": annotate_messages_usage(
-                            messages_usage(self.usage.as_ref()),
-                            self.web_search_requests(),
-                        ),
+                        "usage": self.metered(messages_usage(self.usage.as_ref())),
                     }),
                 ));
                 frames.push(event_frame(
@@ -944,7 +946,6 @@ pub use aggregate::{
     completed_messages_body, completed_messages_body_with_reasoning, AggregatedMessage,
 };
 pub(crate) use usage::messages_usage;
-use usage::usage_object;
 
 /// Attach the `x-experiential-ignored-parameters` disclosure to one message
 /// object when any control was dropped; an empty list adds nothing.

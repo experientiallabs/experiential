@@ -6,6 +6,7 @@ use super::{aggregate, OutputSlot, ResponsesSseEncoder};
 use crate::encode::compact_json;
 use crate::errors::Failure;
 use crate::events::ProviderOutputItemStatus;
+use crate::tool_search::annotate_tool_search_usage_details;
 use crate::web_search::annotate_usage_details;
 
 impl ResponsesSseEncoder {
@@ -80,6 +81,7 @@ impl ResponsesSseEncoder {
             "usage": if include_content {
                 let mut usage = aggregate::responses_usage(self.usage.as_ref());
                 annotate_usage_details(&mut usage, self.web_search.as_ref());
+                annotate_tool_search_usage_details(&mut usage, self.tool_search_requests());
                 usage
             } else {
                 Value::Null

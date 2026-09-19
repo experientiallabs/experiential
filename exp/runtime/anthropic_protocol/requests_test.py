@@ -2222,3 +2222,61 @@ def test_web_search_server_tool_also_normalizes_into_a_gateway_search() -> None:
             )
         )
     assert error.value.detail.param == "tools.0"
+
+
+def test_tool_search_server_tools_are_accepted_and_normalized() -> None:
+    """Anthropic's tool-search declarations are served (natively or by the gateway)."""
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {"name": "deferred", "input_schema": {"type": "object"}, "defer_loading": True},
+                {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+            ]
+        )
+    )
+    search = decoded.request.tool_search
+    assert search is not None
+    assert search.declared_as == "messages_server_tool"
+    assert search.mode == "regex"
+    assert search.tool_type == "tool_search_tool_regex_20251119"
+    assert search.tool_name == "tool_search_tool_regex"
+    assert decoded.request.tools[0].defer_loading is True
+    assert decoded.request.provider_server_tools[0]["type"] == "tool_search_tool_regex_20251119"
+    bm25 = decode_messages(
+        _body(tools=[{"type": "tool_search_tool_bm25", "name": "tool_search_tool_bm25"}])
+    )
+    assert bm25.request.tool_search is not None and bm25.request.tool_search.mode == "bm25"
+
+
+def test_tool_search_result_blocks_in_history_are_accepted() -> None:
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "find a weather tool"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_1",
+                            "name": "tool_search_tool_bm25",
+                            "input": {"query": "weather"},
+                        },
+                        {
+                            "type": "tool_search_tool_result",
+                            "tool_use_id": "srvtoolu_1",
+                            "content": {
+                                "type": "tool_search_tool_search_result",
+                                "tool_references": [
+                                    {"type": "tool_reference", "tool_name": "get_weather"}
+                                ],
+                            },
+                        },
+                        {"type": "text", "text": "Found it."},
+                    ],
+                },
+                {"role": "user", "content": "Use it."},
+            ]
+        )
+    )
+    assert len(decoded.request.messages) >= 3

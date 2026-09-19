@@ -1,5 +1,7 @@
 //! Unit tests for the waterfall's pure successor and allowance rules.
 
+use std::collections::HashMap;
+
 use super::*;
 
 fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {

@@ -1765,6 +1765,83 @@ def test_web_search_requests_are_accepted_and_not_yet_priced_by_the_local_ledger
     assert states == [("completed",), ("completed",)]
 
 
+def test_tool_search_requests_are_accepted_and_not_yet_priced_by_the_local_ledger(
+    tmp_path: Path,
+) -> None:
+    """The shared settle signature carries the tool-search meter; SQLite pricing is a follow-up.
+
+    Mirror of the ``web_search_requests`` seam: the hosted ledger prices
+    ``tool_search_requests`` per attempt, and locally both ``finish_attempt``
+    and ``apply_finish_attempt`` accept the keyword (beside the web-search one)
+    while the row, the attributed integer cost and the schema stay exactly what
+    an unmetered settle yields.
+    """
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    usage = GatewayUsage(
+        input_tokens=1_000,
+        cached_input_tokens=100,
+        output_tokens=500,
+        reasoning_tokens=50,
+        web_search_requests=1,
+        tool_search_requests=2,
+    )
+    attempts: list[str] = []
+    for label, apply_directly in (("tool-searching", False), ("tool-searching-applied", True)):
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(label),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        ledger.accept_request(authorization=authorization)
+        attempt_id = ledger.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        attempts.append(attempt_id)
+        terminal = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=3, usage=usage)
+        if apply_directly:
+            with ledger._transaction() as connection:  # noqa: SLF001 - the host hook seam.
+                ledger.apply_finish_attempt(
+                    connection,
+                    attempt_id=attempt_id,
+                    terminal_event=terminal,
+                    failure=None,
+                    web_search_requests=1,
+                    tool_search_requests=2,
+                )
+        else:
+            ledger.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=terminal,
+                failure=None,
+                web_search_requests=1,
+                tool_search_requests=2,
+            )
+
+    report = ledger.usage(organization_id="org-one")
+    assert len(report) == 1
+    assert report[0].attempts == 2
+    # Token pricing only: 2 x the 3_950 nano-USD an identical unmetered settle attributes.
+    assert report[0].known_estimated_cost_nano_usd == 7_900
+    assert report[0].unknown_cost_attempts == 0
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(gateway_attempts)")}
+        states = connection.execute(
+            "SELECT state FROM gateway_attempts WHERE attempt_id IN (?, ?)", tuple(attempts)
+        ).fetchall()
+    finally:
+        connection.close()
+    assert "tool_search_requests" not in columns
+    assert states == [("completed",), ("completed",)]
+
+
 def test_cache_write_bills_at_frozen_surcharge_and_persists_count(tmp_path: Path) -> None:
     """A cache-write leg bills disjointly and persists its observed count."""
     clock = FakeLedgerClock()

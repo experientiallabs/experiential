@@ -4793,3 +4793,64 @@ def test_responses_decoder_normalizes_the_hosted_web_search_tool() -> None:
     suffix_only = decode_responses({"model": "coding:online", "input": "hi"})
     assert suffix_only.request.web_search is not None
     assert suffix_only.request.web_search.declared_as == "model_suffix"
+
+
+def test_chat_decoder_accepts_openrouter_tool_search_and_deferred_tools() -> None:
+    """OpenRouter's server tool rides the tools array beside deferred function tools."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "loaded", "parameters": {"type": "object"}},
+                },
+                {
+                    "type": "function",
+                    "defer_loading": True,
+                    "function": {"name": "deferred", "parameters": {"type": "object"}},
+                },
+                {"type": "openrouter:tool_search", "max_results": 3},
+            ],
+        }
+    )
+    assert [tool.name for tool in decoded.request.tools] == ["loaded", "deferred"]
+    assert decoded.request.tools[0].defer_loading is None
+    assert decoded.request.tools[1].defer_loading is True
+    assert [entry.tool["type"] for entry in decoded.request.provider_native_tools] == [
+        "openrouter:tool_search"
+    ]
+    assert decoded.request.tool_search is not None
+    assert decoded.request.tool_search.declared_as == "openrouter_tool"
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "openrouter:tool_search", "function": {"name": "x"}}],
+            }
+        )
+
+
+def test_responses_decoder_normalizes_tool_search_and_deferred_tools() -> None:
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "loaded", "parameters": {"type": "object"}},
+                {
+                    "type": "function",
+                    "name": "deferred",
+                    "parameters": {"type": "object"},
+                    "defer_loading": True,
+                },
+                {"type": "tool_search"},
+            ],
+        }
+    )
+    assert [tool.defer_loading for tool in decoded.request.tools] == [None, True]
+    assert decoded.request.tool_search is not None
+    assert decoded.request.tool_search.declared_as == "responses_tool"
+    assert decoded.request.tool_search.tool_type == "tool_search"

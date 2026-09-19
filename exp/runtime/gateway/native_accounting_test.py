@@ -128,6 +128,7 @@ class _RecordingLedger:
         self.terminal_events: list[GatewayEvent | None] = []
         self.upstream_providers: list[str | None] = []
         self.web_search_requests: list[int | None] = []
+        self.tool_search_requests: list[int | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
@@ -192,15 +193,18 @@ class _RecordingLedger:
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
         web_search_requests: int | None = None,
+        tool_search_requests: int | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart.
 
-        ``web_search_requests`` defaults to ``None`` here (the protocol says
-        ``0``) so a recorded ``None`` proves the registry withheld the keyword.
+        ``web_search_requests`` and ``tool_search_requests`` default to ``None``
+        here (the protocol says ``0``) so a recorded ``None`` proves the
+        registry withheld the keyword.
         """
         del first_token_at
         self.upstream_providers.append(upstream_provider)
         self.web_search_requests.append(web_search_requests)
+        self.tool_search_requests.append(tool_search_requests)
         self.terminal_events.append(terminal_event)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1
@@ -312,6 +316,7 @@ def _start(
     failure: JsonObject | None = None,
     request_id: str = "request-one",
     throttle_backoff: bool = False,
+    tool_search_round: bool = False,
 ) -> JsonObject:
     """Call one start_attempt with the data plane's wire shape."""
     return json.loads(
@@ -323,6 +328,7 @@ def _start(
                     "current_depth": current_depth,
                     "failure": failure,
                     "throttle_backoff": throttle_backoff,
+                    "tool_search_round": tool_search_round,
                 }
             )
         )
@@ -2396,8 +2402,9 @@ def _settle_billing_searches(
     attempt_id: str,
     request_id: str,
     web_search_requests: int | None,
+    tool_search_requests: int | None = None,
 ) -> str:
-    """One completed, token-bearing settle that bills ``web_search_requests`` gateway searches.
+    """One completed, token-bearing settle that bills the gateway's own search meters.
 
     ``None`` omits the key exactly as an engine predating the field does.
     """
@@ -2413,6 +2420,8 @@ def _settle_billing_searches(
     }
     if web_search_requests is not None:
         payload["web_search_requests"] = web_search_requests
+    if tool_search_requests is not None:
+        payload["tool_search_requests"] = tool_search_requests
     return registry.settle(json.dumps(payload))
 
 
@@ -2474,3 +2483,131 @@ def test_swept_retained_settlement_still_bills_its_web_searches() -> None:
     assert entry.pending_settlement is None
     assert len(ledger.finished) == 1
     assert ledger.web_search_requests == [2, 2]
+
+
+class _PreToolSearchLedger(_RecordingLedger):
+    """A hosted ledger that learned the web-search meter but not ``tool_search_requests``."""
+
+    def finish_attempt(  # ty: ignore[invalid-method-override] - the drift under test
+        self,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int | None = None,
+    ) -> None:
+        """Record the settle exactly as the previous engine handed it over."""
+        del first_token_at, retry_after_seconds, ratelimit_limit_requests
+        del ratelimit_remaining_requests, ratelimit_limit_tokens, ratelimit_remaining_tokens
+        self.upstream_providers.append(upstream_provider)
+        self.web_search_requests.append(web_search_requests)
+        self.terminal_events.append(terminal_event)
+        self.finished.append(
+            {"attempt_id": attempt_id, "finalize": finalize_request, "failed": failure is not None}
+        )
+
+
+def test_settle_hands_tool_search_requests_only_to_a_ledger_that_accepts_it() -> None:
+    """The hosted-ledger seam for the tool-search meter mirrors ``web_search_requests``.
+
+    A ledger that learned the web-search meter but predates the tool-search
+    keyword settles cleanly with it withheld (and still receives the web-search
+    count); a current ledger receives the settled count; zero or an absent
+    count is withheld from every ledger.
+    """
+    legacy = _PreToolSearchLedger()
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", legacy))
+    deployments = _bounded_pair(1)
+    _admit(registry, deployments, request_id="request-1")
+    started = _start(registry, ordinal=0, request_id="request-1")
+    _settle_billing_searches(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        request_id="request-1",
+        web_search_requests=1,
+        tool_search_requests=3,
+    )
+    assert legacy.finished[-1]["finalize"] is True
+    assert legacy.web_search_requests == [1]
+    assert legacy.tool_search_requests == []
+
+    current = _RecordingLedger()
+    registry = NativeAttemptAccounting(current)
+    for ordinal, (request_id, count) in enumerate(
+        (("request-2", 3), ("request-3", 0), ("request-4", None))
+    ):
+        _admit(registry, deployments, request_id=request_id)
+        started = _start(registry, ordinal=0, request_id=request_id)
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id=request_id,
+            web_search_requests=None,
+            tool_search_requests=count,
+        )
+        assert len(current.finished) == ordinal + 1
+    terminal = current.terminal_events[0]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.tool_search_requests == 3
+    assert terminal.usage.web_search_requests == 0
+    assert current.tool_search_requests == [3, None, None]
+    assert current.web_search_requests == [None, None, None]
+
+
+def test_swept_retained_settlement_still_bills_its_tool_searches() -> None:
+    """A settlement the sweep recovers hands the ledger the same tool-search count as a direct."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        _settle_billing_searches(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            request_id="request-one",
+            web_search_requests=1,
+            tool_search_requests=2,
+        )
+    assert entry.pending_settlement is not None
+    registry.sweep_expired()
+    assert entry.pending_settlement is None
+    assert len(ledger.finished) == 1
+    assert ledger.web_search_requests == [1, 1]
+    assert ledger.tool_search_requests == [2, 2]
+
+
+class TestToolSearchRound:
+    """A gateway tool-search round re-dials the serving rung as a fresh attempt."""
+
+    def test_round_reserves_the_same_rung_with_its_own_dispatch_reason(self) -> None:
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(registry, deployments, request_id="request-1")
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="completed",
+            finalize=False,
+            request_id="request-1",
+        )
+        again = _start(
+            registry, ordinal=1, current_depth=0, request_id="request-1", tool_search_round=True
+        )
+        assert again["route_depth"] == 0
+        assert ledger.started[1]["dispatch_reason"] == "tool_search_round"
+        assert ledger.started[1]["route_depth"] == 0
+        # Not a throttle redial: the throttle budget is untouched.
+        assert registry.throttle_cache_counters() == (0, 0, 0, 0)

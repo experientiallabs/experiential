@@ -3,9 +3,10 @@
 //! when it is a failed attempt (`empty_completion`), and which rungs answer
 //! it at once instead of redialing.
 
-use super::DeploymentWire;
+use super::{AttemptEnd, DeploymentWire, SettledAttempt, WaterfallContext};
 use crate::errors::Failure;
 use crate::events::{Event, Usage};
+use crate::settlement::AttemptGuard;
 
 /// The empty-completion failure for one rung. On an image-output rung the
 /// redial and the ladder are switched off: the chat normalizers carry no
@@ -50,4 +51,52 @@ pub(crate) fn billed_empty_completion(terminal: &Event, usage: Option<&Usage>) -
 /// completed empty answer either way.
 pub(crate) fn unreported_empty_completion(terminal: &Event, usage: Option<&Usage>) -> bool {
     matches!(terminal, Event::Completed) && usage.is_none()
+}
+
+/// Settle one output-less terminal (`Completed` or `Incomplete`) reached
+/// before any semantic event: retain the output-less continuation while the
+/// attempt is still in flight, settle, then answer with the tracked usage
+/// ahead of the terminal so the encoders keep the client-visible token
+/// accounting.
+pub(super) async fn settle_output_less(
+    ctx: &WaterfallContext<'_>,
+    guard: &mut AttemptGuard,
+    terminal: Event,
+    usage: Option<Usage>,
+    tool_names: Vec<String>,
+    depth: usize,
+    encrypted_reasoning_stripped: bool,
+) -> AttemptEnd {
+    let retention_failure = match &ctx.output_less_retention {
+        Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
+        None => None,
+    };
+    let outcome = if matches!(terminal, Event::Incomplete) {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    if !guard
+        .settle(outcome, usage.as_ref(), &tool_names, None, true)
+        .await
+    {
+        return AttemptEnd::Accounting;
+    }
+    if let Some(error) = retention_failure {
+        // The provider outcome settled above, exactly like a committed
+        // attempt's retention failure; only the HTTP result reports it.
+        return AttemptEnd::Retention(error);
+    }
+    let mut events = Vec::with_capacity(2);
+    if let Some(tracked) = usage {
+        events.push(Event::Usage(tracked));
+    }
+    events.push(terminal);
+    AttemptEnd::Settled(SettledAttempt {
+        depth,
+        events,
+        encrypted_reasoning_stripped,
+        empty_completion: false,
+        tool_search_rounds: Vec::new(),
+    })
 }

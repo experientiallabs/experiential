@@ -72,6 +72,7 @@ from exp.runtime.openai_protocol.structured_text import (
     chat_structured_text,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
 from exp.runtime.openai_protocol.web_search import (
     chat_web_search,
@@ -249,6 +250,12 @@ def decode_chat(
         else request.stop
     )
     thinking = translate_enable_thinking(request)
+    raw_chat_tools = payload.get("tools")
+    chat_native_tools = tuple(
+        GatewayProviderNativeTool(index=index, tool=cast("JsonObject", raw_chat_tools[index]))
+        for index, tool in enumerate(request.tools)
+        if tool.type != "function" and isinstance(raw_chat_tools, list)
+    )
     messages, cache_disclosures = restore_chat_cache_control(
         _messages(request.messages, "messages"), cache_payload
     )
@@ -256,7 +263,9 @@ def decode_chat(
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             messages=messages,
-            tools=tuple(_chat_tool(tool) for tool in request.tools),
+            tools=tuple(_chat_tool(tool) for tool in request.tools if tool.type == "function"),
+            provider_native_tools=chat_native_tools,
+            tool_search=chat_tool_search(chat_native_tools),
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
@@ -422,6 +431,7 @@ def decode_responses(
             tools=tuple(function_tools),
             provider_native_tools=tuple(native_tools),
             web_search=responses_web_search(native_tools, online_suffix=online_suffix),
+            tool_search=responses_tool_search(native_tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
@@ -707,11 +717,13 @@ def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
 
 def _chat_tool(tool: _ChatTool) -> GatewayToolDefinition:
     """Convert one Chat function tool without weakening strictness."""
+    assert tool.function is not None  # the wire validator pairs type and body
     return GatewayToolDefinition(
         name=tool.function.name,
         description=tool.function.description,
         parameters=tool.function.parameters,
         strict=tool.function.strict,
+        defer_loading=tool.defer_loading,
     )
 
 
@@ -722,6 +734,7 @@ def _response_tool(tool: _ResponseTool) -> GatewayToolDefinition:
         description=tool.description,
         parameters=tool.parameters,
         strict=bool(tool.strict),
+        defer_loading=tool.defer_loading,
     )
 
 
