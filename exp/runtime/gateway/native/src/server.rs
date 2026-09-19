@@ -107,7 +107,8 @@ pub(crate) struct AppState {
     pub(crate) http: reqwest::Client,
     pub(crate) permits: Arc<Semaphore>,
     pub(crate) request_timeout: Duration,
-    /// Fail-fast flat bound on the wait for the first provider byte per attempt.
+    /// Fail-fast flat bound on the wait for the first provider TOKEN per attempt
+    /// (the first semantic event; headers and keepalives do not satisfy it).
     pub(crate) time_to_first_byte: Duration,
     /// Default input-scaled first-byte allowance in seconds per million
     /// approximate input tokens.

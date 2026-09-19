@@ -60,11 +60,16 @@ def serve_native_gateway(
             connection fails over in seconds instead of hanging on the
             per-deployment request timeout.
         time_to_first_byte_seconds: Fail-fast bound on the wait for a
-            provider's first streamed byte per attempt. It never caps total
-            generation time: once the first byte arrives, reads are paced by
-            the deployment's own per-chunk timeout, so slow reasoning models
-            keep streaming for as long as they need. Deployments may
-            override the flat bound through their gateway capabilities.
+            provider's first TOKEN per attempt: the first semantic event
+            (content, reasoning, a tool call), absolute from the dial.
+            Response headers, SSE keepalive comments and role-only frames
+            do not satisfy it (a lane that sends those at once and then
+            stalls for minutes is exactly the case it exists for). It never
+            caps total generation time: once the first token arrives, reads
+            are paced by the deployment's own per-chunk timeout, so slow
+            reasoning models keep streaming for as long as they need. A
+            stall fails over to the next rung. Deployments may override
+            the flat bound through their gateway capabilities.
         time_to_first_byte_seconds_per_million_input_tokens: Input-scaled
             first-byte allowance added on top of the flat bound, in seconds
             per million approximate input tokens (request bytes over four),

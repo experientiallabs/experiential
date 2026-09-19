@@ -500,9 +500,10 @@ class GatewayDeploymentCapabilities(ContractModel):
     """Deployment override for the lane's flat time-to-first-byte allowance.
 
     ``None`` uses the serving configuration's default. The effective bound on
-    the wait for a provider's response headers is this base plus the
-    input-scaled allowance below, so very large prompts are not misread as a
-    dead lane.
+    the wait for a provider's response headers AND for its first token (the
+    first semantic event; keepalive comments and role-only frames do not
+    count) is this base plus the input-scaled allowance below, so very large
+    prompts are not misread as a dead lane. A stall past it fails over.
     """
     time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
     """Deployment override for the input-scaled time-to-first-byte allowance.

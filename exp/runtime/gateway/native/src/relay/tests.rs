@@ -345,3 +345,121 @@ async fn the_tool_search_tool_is_withheld_at_the_relay_and_handed_over() {
     assert_eq!(plain.withheld_search_call_count(), 0);
     assert!(!plain.withheld_search_call_seen());
 }
+
+fn keepalive_then_pending() -> BoxStream<'static, reqwest::Result<Bytes>> {
+    // Headers already arrived (the relay is built from the body stream); the
+    // body opens with SSE keepalive comments -- bytes that decode to no event
+    // -- and then never sends a token.
+    stream::iter(vec![
+        Ok::<_, reqwest::Error>(Bytes::from(": keepalive\n\n")),
+        Ok::<_, reqwest::Error>(Bytes::from(": keepalive\n\n")),
+    ])
+    .chain(stream::pending())
+    .boxed()
+}
+
+#[tokio::test]
+async fn keepalive_comments_do_not_satisfy_the_first_token_bound() {
+    // 2026-09-19: a lane answered headers and keepalives at once, then stalled
+    // ~2 minutes before its first token; the old bound was satisfied by the
+    // first body byte and the request sat on the per-chunk timeout instead.
+    let time_to_first_token = Duration::from_millis(80);
+    let mut relay = UpstreamRelay::from_stream(
+        keepalive_then_pending(),
+        Dialect::OpenAiCompatible,
+        Instant::now() + time_to_first_token,
+    );
+    let request_deadline = Instant::now() + Duration::from_secs(120);
+    let per_chunk_timeout = Duration::from_secs(35);
+
+    let started = Instant::now();
+    let outcome = relay
+        .next_event(request_deadline, per_chunk_timeout, started)
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "keepalives must not buy the provider the per-chunk timeout, waited {elapsed:?}"
+    );
+    let failure = outcome.expect_err("a stream of comments and no token must not succeed");
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert!(
+        failure.failover_eligible && !failure.retryable_same_deployment,
+        "a first-token stall fails over without redialing the stalled lane"
+    );
+}
+
+#[tokio::test]
+async fn a_role_only_frame_does_not_satisfy_the_first_token_bound() {
+    // OpenAI-compatible streams open with a delta carrying only the role; it
+    // decodes to no semantic event, so the bound stays armed through it.
+    let frames = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+    ))])
+    .chain(stream::pending())
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(80),
+    );
+    let started = Instant::now();
+    let outcome = relay
+        .next_event(
+            Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(35),
+            started,
+        )
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let failure = outcome.expect_err("a role-only frame then silence is a stall");
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert!(failure.failover_eligible);
+}
+
+#[tokio::test]
+async fn the_first_token_disarms_the_bound_and_the_chunk_timeout_takes_over() {
+    // Keepalives, then a content token inside the bound: the token is yielded,
+    // and a later stall is paced by the per-chunk timeout (a transport
+    // failure at that horizon), never re-judged by the first-token bound.
+    let frames = stream::iter(vec![
+        Ok::<_, reqwest::Error>(Bytes::from(": keepalive\n\n")),
+        Ok::<_, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        )),
+    ])
+    .chain(stream::pending())
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(80),
+    );
+    let request_deadline = Instant::now() + Duration::from_secs(120);
+    let per_chunk_timeout = Duration::from_millis(300);
+    let started = Instant::now();
+    let first = relay
+        .next_event(request_deadline, per_chunk_timeout, started)
+        .await
+        .expect("the token arrives inside the bound")
+        .expect("an event is produced");
+    assert!(matches!(&first, Event::TextDelta(text) if text == "hi"));
+    assert!(relay.first_token_at().is_some());
+
+    let stall_started = Instant::now();
+    let failure = relay
+        .next_event(request_deadline, per_chunk_timeout, started)
+        .await
+        .expect_err("silence after the first token stalls on the chunk timeout");
+    let waited = stall_started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(250),
+        "after the first token the per-chunk timeout paces reads, waited only {waited:?}"
+    );
+    assert_eq!(
+        failure.failure_class,
+        FailureClass::Transport,
+        "a post-token stall is the ordinary chunk stall, not a first-token failure"
+    );
+}

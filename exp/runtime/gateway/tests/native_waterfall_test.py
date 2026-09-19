@@ -85,6 +85,11 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
                             "graceful_timeout_seconds": 2.0,
+                            # Short first-token bound so the stall scenario fails
+                            # over in about a second; every other upstream here
+                            # answers immediately, so it never fires for them.
+                            "time_to_first_byte_seconds": 1.0,
+                            "time_to_first_byte_seconds_per_million_input_tokens": 0.0,
                         }
                     ),
                 )
@@ -208,6 +213,24 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
         if prompt == "always-500":
             self.send_response(500)
             self.end_headers()
+            return
+        if prompt == "stall-after-headers":
+            # 2026-09-19: headers and SSE keepalive comments at once, then no
+            # token for far longer than the first-token bound. The gateway
+            # must fail over to the secondary within about the bound, not
+            # hold the request for the per-chunk timeout.
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            try:
+                for _ in range(200):
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+                self.wfile.write(_content_chunk("stalled-primary"))
+                self.wfile.flush()
+            except OSError:
+                pass
             return
         if prompt == "flood":
             self.send_response(200)
