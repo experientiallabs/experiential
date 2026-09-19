@@ -30,6 +30,7 @@ from exp.runtime.gateway.contracts import (
     StructuredTextFormat,
 )
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 
 
 def test_gateway_request_preserves_developer_and_raw_tool_history() -> None:
@@ -700,6 +701,80 @@ def test_tool_choice_may_name_a_server_tool() -> None:
             messages=(GatewayMessage(role="user", content="hi"),),
             provider_server_tools=(server_entry,),
             tool_choice=GatewayNamedToolChoice(name="absent"),
+        )
+
+
+def test_named_tool_choice_may_name_the_synthesized_tool_search_tool() -> None:
+    """A named choice may target the gateway tool-search function before it exists.
+
+    ``plan_tool_search`` only synthesizes the function once admission
+    completes, but its name is deterministic from the declared tool names, so
+    a caller naming it up front (the common shape for a forced first search)
+    must not be rejected as incoherent.
+    """
+    search = GatewayToolSearch(declared_as="openrouter_tool", tool_type="openrouter:tool_search")
+    deferred_tool = GatewayToolDefinition(
+        name="get_weather",
+        description="Look up the weather.",
+        parameters={"type": "object"},
+        defer_loading=True,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(deferred_tool,),
+        tool_search=search,
+        tool_choice=GatewayNamedToolChoice(name="tool_search"),
+    )
+    assert request.tool_choice == GatewayNamedToolChoice(name="tool_search")
+
+    # A name that collides with a declared tool falls back to the gateway's
+    # collision-avoiding name; that fallback must be accepted too.
+    taken_tool = GatewayToolDefinition(
+        name="tool_search",
+        description="A caller tool that happens to share the gateway's default name.",
+        parameters={"type": "object"},
+        defer_loading=True,
+    )
+    collision_request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(taken_tool,),
+        tool_search=search,
+        tool_choice=GatewayNamedToolChoice(name="gateway_tool_search"),
+    )
+    assert collision_request.tool_choice == GatewayNamedToolChoice(name="gateway_tool_search")
+
+    # Without a tool-search carrier, the same name is still incoherent.
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(deferred_tool,),
+            tool_choice=GatewayNamedToolChoice(name="tool_search"),
+        )
+
+    # A tool-search carrier does not excuse an unrelated absent name.
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(deferred_tool,),
+            tool_search=search,
+            tool_choice=GatewayNamedToolChoice(name="absent"),
+        )
+
+    # No deferred tools means plan_tool_search never synthesizes the search
+    # function at all (it drops the carrier instead), so the exemption must
+    # not apply: the named choice is still incoherent.
+    loaded_only_tool = deferred_tool.model_copy(update={"defer_loading": None})
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(loaded_only_tool,),
+            tool_search=search,
+            tool_choice=GatewayNamedToolChoice(name="tool_search"),
         )
 
 
