@@ -103,8 +103,11 @@ dial and both per-deployment overridable through the gateway capabilities:
   `time_to_first_byte_seconds_per_million_input_tokens` (240) bounds the wait for the
   provider's response headers (`upstream::open_stream`; overrides
   `time_to_first_byte_base_seconds` / `time_to_first_byte_seconds_per_million_input_tokens`).
-- **First token**: `time_to_first_token_seconds` (120 s) plus the same input slope bounds the
-  wait, in the relay, until the waterfall COMMITS the attempt on its first semantic event
+- **First token**: `time_to_first_token_seconds` (120 s, clamped to three quarters of the
+  request budget so a stall can still fail over: under the engine's own 120 s request
+  timeout the effective default is 90 s; the platform's 1500 s budget keeps the full
+  allowance) plus the same input slope bounds the wait, in the relay, until the waterfall
+  COMMITS the attempt on its first semantic event
   (`is_semantic`: content, reasoning, a tool call, an output item; override
   `time_to_first_token_base_seconds`). `UpstreamRelay::commit` disarms it at that point and
   nowhere else, so a refusal delta withheld under refusal failover leaves it armed.

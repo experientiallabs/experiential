@@ -79,7 +79,9 @@ def serve_native_gateway(
             exactly the case it exists for), and a thinking model on a chat
             wire streams nothing until its first content token, so the
             default is two minutes rather than the header bound's fifteen
-            seconds. It never caps total generation time: once the attempt
+            seconds (clamped to three quarters of ``request_timeout_seconds``
+            so the stall is caught while the request can still fail over).
+            It never caps total generation time: once the attempt
             commits, reads are paced by the deployment's own per-chunk
             timeout. A stall fails over to the next rung. Deployments may
             override the flat bound through their gateway capabilities.

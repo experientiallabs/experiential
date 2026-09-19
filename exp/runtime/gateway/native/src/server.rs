@@ -169,7 +169,13 @@ pub async fn run(
         time_to_first_byte_slope_seconds_per_million_input_tokens: config
             .time_to_first_byte_seconds_per_million_input_tokens
             .max(0.0),
-        time_to_first_token: Duration::from_secs_f64(config.time_to_first_token_seconds.max(0.001)),
+        // Clamped under the request budget so a default stall can still fail
+        // over (first_token_bound.rs): equal defaults would let the request
+        // deadline win every race and end the stall as a terminal timeout.
+        time_to_first_token: crate::first_token_bound::first_token_bound(
+            config.time_to_first_token_seconds,
+            config.request_timeout_seconds,
+        ),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
