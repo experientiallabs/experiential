@@ -119,7 +119,8 @@ class GatewayRungDispatchPolicy(ContractModel):
     ``overflow`` (the default, the historical behavior) force-admits the
     request past this rung's bound and discloses ``saturated_overflow``: an
     authored policy never manufactures a failure. ``refuse`` answers the
-    caller at once with a retryable 429 (``lane_saturated``, Retry-After 2)
+    caller at once with a retryable 429 (``lane_saturated``, the protocol's
+    throttle Retry-After)
     instead of dispatching one more request onto a lane already at its
     bound: the choice for a lane whose slow tail must never hold more of a
     worker's admission permits than its bound allows, at the price of a

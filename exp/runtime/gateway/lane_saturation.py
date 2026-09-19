@@ -23,7 +23,8 @@ Two rules close that:
    still the default for an AUTHORED bound, and an authored rung may opt into
    ``saturation="refuse"``; the default lane bound always refuses, because a
    protective bound that overflows protects nothing. A refusal is a fast,
-   retryable 429 (``lane_saturated_failure``) with Retry-After, answered
+   retryable 429 (``lane_saturated_failure``) with the protocol's throttle
+   Retry-After, answered
    before any dispatch, so the caller's retry lands when a slot frees rather
    than queueing behind the slow lane.
 """
@@ -35,6 +36,7 @@ import math
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungShed
 from exp.runtime.gateway.stream_contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.openai_protocol.errors import THROTTLED_RETRY_AFTER_SECONDS
 
 # The share of a worker's admission permits one unauthored lane may hold.
 # Half: a saturated lane leaves at least half the worker for every other
@@ -42,10 +44,12 @@ from exp.runtime.gateway.stream_contracts import GatewayFailure, GatewayFailureC
 # worker (its third lane would). Hosts tune it through the bound they pass.
 DEFAULT_LANE_SHARE = 0.5
 
-# What a refused caller is told to wait. Slots free at the pace the slow
-# lane finishes, seconds apart, so a short retry lands on a freed slot
-# instead of stacking a queue the request deadline would have to drain.
-LANE_SATURATED_RETRY_AFTER_SECONDS = 2
+# What a refused caller is told to wait: the protocol's throttle floor (the
+# renderer never emits a shorter Retry-After, so the message, the payload and
+# the header agree). Slots free at the pace the slow lane finishes, so a
+# retry after it lands on a freed slot instead of stacking a queue the
+# request deadline would have to drain.
+LANE_SATURATED_RETRY_AFTER_SECONDS = THROTTLED_RETRY_AFTER_SECONDS
 
 
 def default_lane_bound(max_active_requests: int, share: float = DEFAULT_LANE_SHARE) -> int:

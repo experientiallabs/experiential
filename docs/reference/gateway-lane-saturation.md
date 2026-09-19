@@ -39,10 +39,12 @@ failure"). Two things change:
   exists to protect the worker, and overflowing it would protect nothing.
 
 The refusal is `lane_saturated_failure()`: failure class `throttled`, safe message
-"every lane for this model is at its in-flight bound on this gateway worker; retry in 2
-seconds", `retry_after_seconds = 2`. The data plane renders it as the caller-facing 429
-`unavailable_route` with `Retry-After: 2`, before any dispatch, so the retry lands on a freed
-slot instead of queueing behind the slow lane. Nothing is down, so it is not
+"every lane for this model is at its in-flight bound on this gateway worker; retry in 5
+seconds", `retry_after_seconds = 5` (`THROTTLED_RETRY_AFTER_SECONDS`, the floor the protocol
+renderer applies to every throttled wait, so the message, the payload and the header agree).
+The data plane renders it as the caller-facing 429 `unavailable_route` with `Retry-After: 5`,
+before any dispatch, so the retry lands on a freed slot instead of queueing behind the slow
+lane. Nothing is down, so it is not
 `provider_internal`. The decision is `overflow_target(route, policy_sheds, shed_records)`; a
 bypass that was not a registry shed (a cold throttle failover) keeps the historical overflow.
 A reasoning-pinned continuation's first dispatch still force-admits its pinned rung for every

@@ -714,7 +714,7 @@ class TestLaneSaturation:
         assert refused["exhausted"] is True
         failure = cast("JsonObject", refused["failure"])
         assert failure["failure_class"] == "throttled"
-        assert failure["retry_after_seconds"] == 2
+        assert failure["retry_after_seconds"] == 5
         assert "in-flight bound" in str(failure["safe_message"])
         assert len(ledger.started) == 1
         assert registry.rung_admission_counters() == (1, 0, 1)
