@@ -714,6 +714,7 @@ async fn run_attempt(
                         let mut prefix = std::mem::take(&mut withheld);
                         prefix.push(event);
                         let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                        relay.commit();
                         return AttemptEnd::Committed(Box::new(CommittedAttempt {
                             depth,
                             prefix,
@@ -744,6 +745,7 @@ async fn run_attempt(
                 // A search call withheld in the same turn is dropped: the
                 // rung is frozen on this output, and the caller is told.
                 let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                relay.commit();
                 return AttemptEnd::Committed(Box::new(CommittedAttempt {
                     depth,
                     prefix,

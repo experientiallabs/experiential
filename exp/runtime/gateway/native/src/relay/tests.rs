@@ -419,6 +419,39 @@ async fn a_role_only_frame_does_not_satisfy_the_first_token_bound() {
 }
 
 #[tokio::test]
+async fn a_semantic_event_the_waterfall_did_not_commit_leaves_the_bound_armed() {
+    // Under refusal failover the waterfall withholds refusal deltas without
+    // committing; the relay must not disarm on its own, so a provider that
+    // stalls behind such an event still trips the fail-fast bound.
+    let frames = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+    ))])
+    .chain(stream::pending())
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(80),
+    );
+    let request_deadline = Instant::now() + Duration::from_secs(120);
+    let started = Instant::now();
+    let first = relay
+        .next_event(request_deadline, Duration::from_secs(35), started)
+        .await
+        .expect("the event arrives")
+        .expect("an event is produced");
+    assert!(matches!(&first, Event::TextDelta(_)));
+    // No commit() call: the waterfall withheld it.
+    let failure = relay
+        .next_event(request_deadline, Duration::from_secs(35), started)
+        .await
+        .expect_err("silence behind an uncommitted event is still a first-token stall");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert!(failure.failover_eligible);
+}
+
+#[tokio::test]
 async fn the_first_token_disarms_the_bound_and_the_chunk_timeout_takes_over() {
     // Keepalives, then a content token inside the bound: the token is yielded,
     // and a later stall is paced by the per-chunk timeout (a transport
@@ -446,6 +479,8 @@ async fn the_first_token_disarms_the_bound_and_the_chunk_timeout_takes_over() {
         .expect("an event is produced");
     assert!(matches!(&first, Event::TextDelta(text) if text == "hi"));
     assert!(relay.first_token_at().is_some());
+    // The waterfall commits on that first semantic event.
+    relay.commit();
 
     let stall_started = Instant::now();
     let failure = relay

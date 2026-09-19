@@ -20,7 +20,7 @@ use crate::metrics::METRICS;
 use crate::stop_sequences::StopSequenceGuard;
 use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
 use crate::tool_serialization::ToolCallSerializer;
-use crate::waterfall::{is_semantic, CommittedAttempt};
+use crate::waterfall::CommittedAttempt;
 
 /// Map one collection failure to its public error, honoring the shared
 /// aggregate-output overflow contract.
@@ -177,12 +177,14 @@ pub struct UpstreamRelay {
     /// medians on a lane whose first byte was instant).
     first_byte_recorded: bool,
     /// Whether the fail-fast first-token bound still applies. Armed until the
-    /// first SEMANTIC event (`waterfall::is_semantic`, the commit predicate:
-    /// content, reasoning, a tool call, an output item) is yielded; from then
-    /// on reads are paced by the deployment's per-chunk timeout, so a slow
-    /// reasoning model streams for as long as it needs once it has started
-    /// answering. Arming until commit keeps the stall failover-safe: nothing
-    /// before a semantic event has reached the caller.
+    /// waterfall COMMITS the attempt (`commit`, called at the moment the
+    /// first semantic event -- content, reasoning, a tool call, an output
+    /// item -- makes this attempt the answer); from then on reads are paced
+    /// by the deployment's per-chunk timeout, so a slow reasoning model
+    /// streams for as long as it needs once it has started answering. Armed
+    /// exactly until commit keeps the stall failover-safe: a refusal delta
+    /// the waterfall WITHHOLDS under refusal failover is semantic but not a
+    /// commit, and a provider that stalls behind it still trips the bound.
     stall_bound_armed: bool,
     /// Fail-fast bound for the provider's first token, absolute from the dial.
     first_byte_deadline: Instant,
@@ -257,6 +259,15 @@ impl UpstreamRelay {
             tool_search: ToolSearchWithholder::default(),
             carried_usage: None,
         }
+    }
+
+    /// The waterfall committed the attempt on this relay: the first-token
+    /// bound is disarmed and every later read is paced by the deployment's
+    /// per-chunk timeout. Called at the commit point and nowhere else, so a
+    /// semantic event the waterfall withholds (a refusal delta under refusal
+    /// failover) leaves the bound armed.
+    pub fn commit(&mut self) {
+        self.stall_bound_armed = false;
     }
 
     /// The wall-clock time this relay yielded its first output token, or
@@ -413,11 +424,6 @@ impl UpstreamRelay {
                 // whether it is later replayed from a prefix or drained live.
                 if self.first_token_at.is_none() && event.is_output_token() {
                     self.first_token_at = Some(SystemTime::now());
-                }
-                // The first semantic event commits the attempt (waterfall.rs)
-                // and disarms the first-token bound in the same breath.
-                if self.stall_bound_armed && is_semantic(&event) {
-                    self.stall_bound_armed = false;
                 }
                 if let (Event::Usage(usage), Some(carried)) =
                     (&mut event, self.carried_usage.as_ref())

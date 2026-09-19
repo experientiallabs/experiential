@@ -5,9 +5,10 @@
 //! rather than stream scaffolding (role-only chunks, pings, keepalive
 //! comments, usage). Before commit a failure fails over to the next rung;
 //! after it the attempt is the response and a failure is the caller's. The
-//! relay's fail-fast first-token bound is armed until exactly this event
-//! (`relay.rs`), so the two agree on the moment a stall stops being
-//! failover-eligible.
+//! relay's fail-fast first-token bound is disarmed by the waterfall at the
+//! commit (`UpstreamRelay::commit`), never by the relay on its own, so the two
+//! agree on the moment a stall stops being failover-eligible -- including a
+//! refusal delta that is semantic here but WITHHELD under refusal failover.
 
 use crate::events::Event;
 

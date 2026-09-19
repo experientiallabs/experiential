@@ -101,15 +101,16 @@ The serving configuration's `time_to_first_byte_seconds` (15 s) plus
 a provider's first TOKEN per attempt, absolute from the dial, and a deployment may override
 both through its gateway capabilities (`time_to_first_byte_base_seconds`,
 `time_to_first_byte_seconds_per_million_input_tokens`). It bounds two phases: the wait for
-response headers (`upstream::open_stream`) and, in the relay, the wait for the first
-SEMANTIC event -- the same `is_semantic` predicate that commits the attempt (content,
-reasoning, a tool call, an output item). Response headers, SSE keepalive comments,
+response headers (`upstream::open_stream`) and, in the relay, the wait until the waterfall
+COMMITS the attempt on its first semantic event (`is_semantic`: content, reasoning, a tool
+call, an output item; `UpstreamRelay::commit` disarms the bound at that point and nowhere
+else, so a refusal delta withheld under refusal failover leaves it armed). Response headers, SSE keepalive comments,
 Anthropic pings and role-only frames do not satisfy it: on 2026-09-19 a lane answered all
 of those at once and then stalled ~2 minutes before its first token, and the old bound,
 satisfied by the first body byte, let the request sit on the 60 s per-chunk timeout while it
 held a worker permit. A stall past the allowance is `first_byte_timeout_failure()`: class
 `timeout`, failover-eligible, never redialed on the stalled lane, so the ladder advances
-before anything has reached the caller. Once the first semantic event is yielded the bound
-is disarmed and reads are paced by the deployment's per-chunk timeout, so a slow reasoning
+before anything has reached the caller. Once the attempt is committed the bound is
+disarmed and reads are paced by the deployment's per-chunk timeout, so a slow reasoning
 model streams for as long as it needs. `time_to_first_byte_ms` in the metrics still records
 the first body byte; `first_token_at` on the attempt records the first output token.
