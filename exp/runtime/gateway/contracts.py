@@ -825,7 +825,7 @@ class GatewayRequest(ContractModel):
         server_names = tuple(
             str(entry["name"]) for entry in self.provider_server_tools if "name" in entry
         )
-        if self.tool_search is not None:  # plan_tool_search synthesizes this name later
+        if self.tool_search is not None and any(tool.defer_loading for tool in self.tools):
             server_names = (*server_names, gateway_tool_search_name(names))
         if (
             isinstance(self.tool_choice, GatewayNamedToolChoice)

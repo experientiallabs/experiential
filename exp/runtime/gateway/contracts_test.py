@@ -764,6 +764,19 @@ def test_named_tool_choice_may_name_the_synthesized_tool_search_tool() -> None:
             tool_choice=GatewayNamedToolChoice(name="absent"),
         )
 
+    # No deferred tools means plan_tool_search never synthesizes the search
+    # function at all (it drops the carrier instead), so the exemption must
+    # not apply: the named choice is still incoherent.
+    loaded_only_tool = deferred_tool.model_copy(update={"defer_loading": None})
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(loaded_only_tool,),
+            tool_search=search,
+            tool_choice=GatewayNamedToolChoice(name="tool_search"),
+        )
+
 
 def test_block_cache_markers_are_identity_inert_and_role_scoped() -> None:
     """Cache markers change cost, not semantics: no digest or replay effect."""
