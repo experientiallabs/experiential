@@ -911,6 +911,7 @@ def deployment_wire_entry(
         "time_to_first_byte_seconds_per_million_input_tokens": (
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
         ),
+        "time_to_first_token_base_seconds": capabilities.time_to_first_token_base_seconds,
         # A failover-only rung's tokens (`native_fallback_rules`): the data
         # plane never counts it as a first-dial or unmatched successor.
         "failover_only_on": (

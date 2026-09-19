@@ -94,6 +94,9 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "time_to_first_byte_seconds_per_million_input_tokens": config.get(
                                 "time_to_first_byte_seconds_per_million_input_tokens", 240.0
                             ),
+                            "time_to_first_token_seconds": config.get(
+                                "time_to_first_token_seconds", 120.0
+                            ),
                         }
                     ),
                 )
@@ -390,13 +393,13 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
 def serve_waterfall_engine(
     tmp_path_factory: pytest.TempPathFactory,
     *,
-    time_to_first_byte_seconds: float | None = None,
+    time_to_first_token_seconds: float | None = None,
 ) -> Iterator[_ServingEngine]:
     """Serve the primary/secondary harness engine; other modules build their own.
 
     Args:
         tmp_path_factory: Pytest's per-session temporary path factory.
-        time_to_first_byte_seconds: The engine's first-token allowance for
+        time_to_first_token_seconds: The engine's first-token allowance for
             this engine (input scaling disabled alongside it), or ``None``
             for the engine's defaults.
 
@@ -426,8 +429,8 @@ def serve_waterfall_engine(
         "root": str(root),
         "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
     }
-    if time_to_first_byte_seconds is not None:
-        config_values["time_to_first_byte_seconds"] = time_to_first_byte_seconds
+    if time_to_first_token_seconds is not None:
+        config_values["time_to_first_token_seconds"] = time_to_first_token_seconds
         config_values["time_to_first_byte_seconds_per_million_input_tokens"] = 0.0
     config = json.dumps(config_values)
     stderr_log = root / "driver-stderr.log"

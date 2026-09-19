@@ -60,6 +60,11 @@ pub struct ServeConfig {
     /// a very large prompt's prefill is not misread as a dead lane.
     #[serde(default = "default_time_to_first_byte_seconds_per_million_input_tokens")]
     pub time_to_first_byte_seconds_per_million_input_tokens: f64,
+    /// Fail-fast bound on the wait for a provider's first TOKEN (the first
+    /// semantic event) after its headers arrived, flat part; the same
+    /// per-million-input-tokens slope as the first-byte allowance is added.
+    #[serde(default = "default_time_to_first_token_seconds")]
+    pub time_to_first_token_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
     #[serde(default = "default_native_usage_enabled")]
@@ -82,6 +87,14 @@ fn default_time_to_first_byte_seconds() -> f64 {
 
 fn default_time_to_first_byte_seconds_per_million_input_tokens() -> f64 {
     240.0
+}
+
+/// A thinking model on a chat wire streams nothing until its first content
+/// token; production p99s (2026-09-19, 7 days) sat at 27-94 s on healthy
+/// lanes while the stalled lane's medians were 120 s+, so two minutes
+/// separates "thinking" from "stalled" without cutting real work.
+fn default_time_to_first_token_seconds() -> f64 {
+    120.0
 }
 
 fn default_max_active_requests() -> usize {
@@ -107,12 +120,16 @@ pub(crate) struct AppState {
     pub(crate) http: reqwest::Client,
     pub(crate) permits: Arc<Semaphore>,
     pub(crate) request_timeout: Duration,
-    /// Fail-fast flat bound on the wait for the first provider TOKEN per attempt
-    /// (the first semantic event; headers and keepalives do not satisfy it).
+    /// Fail-fast flat bound on the wait for the provider's response headers
+    /// per attempt.
     pub(crate) time_to_first_byte: Duration,
-    /// Default input-scaled first-byte allowance in seconds per million
-    /// approximate input tokens.
+    /// Default input-scaled allowance in seconds per million approximate
+    /// input tokens, added to both the header and the first-token bounds.
     pub(crate) time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
+    /// Fail-fast flat bound on the wait for the first TOKEN (the first
+    /// semantic event) once the headers arrived; keepalive comments and
+    /// role-only frames do not satisfy it.
+    pub(crate) time_to_first_token: Duration,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -152,6 +169,7 @@ pub async fn run(
         time_to_first_byte_slope_seconds_per_million_input_tokens: config
             .time_to_first_byte_seconds_per_million_input_tokens
             .max(0.0),
+        time_to_first_token: Duration::from_secs_f64(config.time_to_first_token_seconds.max(0.001)),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),

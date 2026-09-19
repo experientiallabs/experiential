@@ -186,8 +186,10 @@ pub struct UpstreamRelay {
     /// the waterfall WITHHOLDS under refusal failover is semantic but not a
     /// commit, and a provider that stalls behind it still trips the bound.
     stall_bound_armed: bool,
-    /// Fail-fast bound for the provider's first token, absolute from the dial.
-    first_byte_deadline: Instant,
+    /// Fail-fast bound for the provider's first token, absolute from the dial
+    /// (`waterfall::first_token_allowance`: the first-token base plus the
+    /// input slope; the header phase has its own, shorter first-byte bound).
+    first_token_deadline: Instant,
     /// Wall-clock time this relay yielded its first output token (a content,
     /// reasoning, or tool-call delta), or `None` before any token arrives.
     /// Distinct from `first_byte_recorded`: the first byte can be an SSE frame
@@ -204,21 +206,21 @@ impl UpstreamRelay {
     pub fn new(
         response: reqwest::Response,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
     ) -> Self {
-        Self::new_with_reasoning_content_route(response, dialect, first_byte_deadline, None)
+        Self::new_with_reasoning_content_route(response, dialect, first_token_deadline, None)
     }
 
     pub fn new_with_reasoning_content_route(
         response: reqwest::Response,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
         reasoning_content_route_sha256: Option<String>,
     ) -> Self {
         Self::from_stream_with_reasoning_content_route(
             response.bytes_stream().boxed(),
             dialect,
-            first_byte_deadline,
+            first_token_deadline,
             reasoning_content_route_sha256,
         )
     }
@@ -227,15 +229,15 @@ impl UpstreamRelay {
     fn from_stream(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
     ) -> Self {
-        Self::from_stream_with_reasoning_content_route(stream, dialect, first_byte_deadline, None)
+        Self::from_stream_with_reasoning_content_route(stream, dialect, first_token_deadline, None)
     }
 
     fn from_stream_with_reasoning_content_route(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
         reasoning_content_route_sha256: Option<String>,
     ) -> Self {
         Self {
@@ -253,7 +255,7 @@ impl UpstreamRelay {
             eof: false,
             first_byte_recorded: false,
             stall_bound_armed: true,
-            first_byte_deadline,
+            first_token_deadline,
             first_token_at: None,
             native_tool_inverter: NativeToolInverter::default(),
             tool_search: ToolSearchWithholder::default(),
@@ -448,7 +450,7 @@ impl UpstreamRelay {
             // so long-running generation is never capped.
             let waiting_for_first_token = self.stall_bound_armed;
             let bound = if waiting_for_first_token {
-                remaining(deadline).min(remaining(self.first_byte_deadline))
+                remaining(deadline).min(remaining(self.first_token_deadline))
             } else {
                 remaining(deadline).min(phase_timeout)
             };

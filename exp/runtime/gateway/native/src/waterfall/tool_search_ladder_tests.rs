@@ -231,6 +231,7 @@ impl SearchHarness {
             deadline: Instant::now() + Duration::from_secs(60),
             time_to_first_byte: Duration::from_secs(5),
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
+            time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
             output_less_retention: None,
             output_token_cap: None,

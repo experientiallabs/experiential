@@ -500,10 +500,10 @@ class GatewayDeploymentCapabilities(ContractModel):
     """Deployment override for the lane's flat time-to-first-byte allowance.
 
     ``None`` uses the serving configuration's default. The effective bound on
-    the wait for a provider's response headers AND for its first token (the
-    first semantic event; keepalive comments and role-only frames do not
-    count) is this base plus the input-scaled allowance below, so very large
-    prompts are not misread as a dead lane. A stall past it fails over.
+    the wait for a provider's response headers is this base plus the
+    input-scaled allowance below, so very large prompts are not misread as a
+    dead lane. The wait for the first TOKEN has its own base
+    (``time_to_first_token_base_seconds``) and shares the slope.
     """
     time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
     """Deployment override for the input-scaled time-to-first-byte allowance.
@@ -512,6 +512,16 @@ class GatewayDeploymentCapabilities(ContractModel):
     bytes divided by four; an allowance heuristic, never a billing quantity).
     ``None`` uses the serving configuration's default; ``0`` disables scaling
     for this deployment.
+    """
+    time_to_first_token_base_seconds: float | None = Field(default=None, gt=0)
+    """Deployment override for the lane's flat time-to-first-TOKEN allowance.
+
+    ``None`` uses the serving configuration's default (two minutes). The
+    effective bound on the wait from the dial to the first semantic event
+    (content, reasoning, a tool call; keepalive comments and role-only frames
+    do not count) is this base plus the input-scaled allowance above. A stall
+    past it fails over to the next rung. Author it above the lane's observed
+    first-token p99 on a thinking model, below the stall you want caught.
     """
     failover_only_on: tuple[FailoverToken, ...] | None = None
     """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.

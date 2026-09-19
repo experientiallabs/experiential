@@ -26,6 +26,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         idempotency_key: "op".to_string(),
         time_to_first_byte_base_seconds: base,
         time_to_first_byte_seconds_per_million_input_tokens: slope,
+        time_to_first_token_base_seconds: None,
         throttle_redial_budget: 0,
         failover_only_on: None,
         zdr_constrained: false,
@@ -329,4 +330,23 @@ fn an_image_output_rung_answers_its_empty_completion_without_redial_or_ladder() 
     let text = wire(None, None);
     let failure = empty_completion_failure(&text);
     assert!(failure.retryable_same_deployment && failure.failover_eligible);
+}
+
+#[test]
+fn first_token_allowance_has_its_own_base_and_shares_the_input_slope() {
+    // The first-token base is independent of the header base (a thinking
+    // model on a chat wire answers its headers at once and its first token a
+    // minute later), and the deployment override on it wins; the slope is
+    // the header allowance's, override or default.
+    let plain = wire(None, None);
+    let allowance = first_token_allowance(&plain, Duration::from_secs(120), 240.0, 1_000_000.0);
+    assert_eq!(allowance, Duration::from_secs_f64(360.0));
+    let mut overridden = wire(None, Some(0.0));
+    overridden.time_to_first_token_base_seconds = Some(30.0);
+    let allowance =
+        first_token_allowance(&overridden, Duration::from_secs(120), 240.0, 1_000_000.0);
+    assert_eq!(allowance, Duration::from_secs_f64(30.0));
+    // The header allowance is untouched by the token base.
+    let header = first_byte_allowance(&overridden, Duration::from_secs(15), 240.0, 0.0);
+    assert_eq!(header, Duration::from_secs_f64(15.0));
 }

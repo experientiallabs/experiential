@@ -94,6 +94,11 @@ pub struct DeploymentWire {
     /// configuration's default applies when absent.
     #[serde(default)]
     pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
+    /// Deployment override for the flat first-TOKEN allowance (the wait from
+    /// the dial to the first semantic event); the serving configuration's
+    /// default applies when absent. Absent or null on older admissions.
+    #[serde(default)]
+    pub time_to_first_token_base_seconds: Option<f64>,
     /// How many post-backoff redials a throttle on this rung is worth on
     /// this request: the pool's `throttle_redial` schedule scaled by the
     /// requesting organization's cache at stake here (the full schedule at
@@ -152,6 +157,11 @@ pub struct WaterfallContext<'a> {
     /// legitimately takes longer than the flat bound is not misread as a
     /// dead lane. Deployments may override it per wire entry.
     pub time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
+    /// Fail-fast flat bound on the wait for each physical attempt's first
+    /// TOKEN (the first semantic event), absolute from the dial and sharing
+    /// the slope above; keepalive comments and role-only frames do not
+    /// satisfy it. Deployments may override it per wire entry.
+    pub time_to_first_token: Duration,
     /// Approximate input tokens for this request: the raw body's bytes
     /// divided by four. An allowance heuristic only, never a billing
     /// quantity.
@@ -201,6 +211,25 @@ pub(crate) fn first_byte_allowance(
 ) -> Duration {
     let base = wire
         .time_to_first_byte_base_seconds
+        .unwrap_or(default_base.as_secs_f64());
+    let slope = wire
+        .time_to_first_byte_seconds_per_million_input_tokens
+        .unwrap_or(default_slope_seconds_per_million);
+    let scaled = slope * (approximate_input_tokens.max(0.0) / 1_000_000.0);
+    Duration::from_secs_f64((base + scaled).max(0.001))
+}
+
+/// The effective first-TOKEN allowance for one attempt: the deployment's (or
+/// serving default's) flat first-token base plus the same input-scaled
+/// allowance the header bound uses (prefill delays both).
+pub(crate) fn first_token_allowance(
+    wire: &DeploymentWire,
+    default_base: Duration,
+    default_slope_seconds_per_million: f64,
+    approximate_input_tokens: f64,
+) -> Duration {
+    let base = wire
+        .time_to_first_token_base_seconds
         .unwrap_or(default_base.as_secs_f64());
     let slope = wire
         .time_to_first_byte_seconds_per_million_input_tokens

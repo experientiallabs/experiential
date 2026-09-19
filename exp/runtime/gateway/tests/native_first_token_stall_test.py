@@ -28,7 +28,7 @@ def _stall_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Serving
     Its own engine so the short bound never leaks into the waterfall or soak
     modules, whose slow-box scenarios rely on the engine's default allowance.
     """
-    yield from serve_waterfall_engine(tmp_path_factory, time_to_first_byte_seconds=1.0)
+    yield from serve_waterfall_engine(tmp_path_factory, time_to_first_token_seconds=1.0)
 
 
 def test_first_token_stall_behind_keepalives_fails_over_to_the_second_deployment(
