@@ -6,12 +6,17 @@ on the exact release checkout.
 
 ## Supported and verified
 
-- Root CLI commands are exactly `build`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
+- Root CLI commands are exactly `build`, `capture`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
   opens the default gateway home screen. Optimizer commands are exactly `router` and `model`.
 - `exp login` opens the Platform approval flow for Experiential Cloud, stores the returned
   organization key in the user-data credential file, and synchronizes the authenticated account's
   hosted provider/model identities into the secret-free project catalog; no credential value is
   written to the project.
+- `exp capture` is a foreground macOS HTTPS collector on Python 3.13+ with normal Platform login, streamed
+  OpenAI/Anthropic protocol capture, asynchronous trace uploads, and bounded private retry files.
+  A separate temporary administrator helper owns only the selected hosts overrides and loopback
+  forwarding. `exp capture reset` repairs owned routing offline. Certificate trust persists
+  between runs. Synthetic provider and temporary hosts tests are separate from real client testing.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket
@@ -72,6 +77,12 @@ The machine-readable dated matrix is
 labeled as provider-byte incremental tool-argument streaming.
 
 ## Explicitly excluded
+
+- DNS Capture has not been certified against live Codex or Claude Code sessions. Their process
+  trust stores, existing connections, and DNS caches may require configuration or a restart.
+  No automatic reboot recovery is installed: after a power loss or a killed helper, run
+  `exp capture reset`. The feature does not bypass certificate pinning or claim complete capture
+  of applications using independent DNS, unselected domains, or unsupported protocols.
 
 - There is no budgets dashboard. Monthly allocation management and remaining-allocation reporting
   are explicit interactive or non-interactive CLI operations.

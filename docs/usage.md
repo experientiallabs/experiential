@@ -6,6 +6,8 @@ The root surface is deliberately small:
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
+| `exp capture [--domain HOST ...]` | Capture direct provider HTTPS traffic on macOS until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches, with managed hosts overrides while running. |
+| `exp capture reset` | Repair Capture's hosts overrides offline, without login. | Restored networking; existing login, captured traces, and local CA remain. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
@@ -19,6 +21,76 @@ The root surface is deliberately small:
 | `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. `experiential-cloud` points at the hosted Platform gateway and reuses the credential from `exp login`; login already performs its provider/model synchronization. Setup also persists, replaces, or removes user-local provider keys. | Local `.exp/models.toml` plus optional records in the user-data credential file. |
 | `exp config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
 | `exp config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
+
+## Direct provider capture on macOS
+
+Run `exp capture` in a terminal, choose **OpenAI / Codex**, **Anthropic / Claude Code**, or both,
+then leave it open while using your AI applications. Use arrow keys to move, Space to toggle
+providers, and Enter on **Complete** to start. Nothing is selected automatically; cancelling
+exits before login or networking setup. Capture reuses
+the normal Experiential login, or opens the same login flow when no credential exists. The
+Capture tab under API Keys shows the run and its upload statistics. No application attribution,
+separate capture credential, or background capture daemon is required.
+
+Capture requires Python 3.13 or newer. Other SDK and CLI commands, including `exp capture reset`,
+continue to support Python 3.12. In a checkout, use `uv run --python 3.13 exp capture`.
+The temporary networking helper uses Apple's system Python and requires the macOS Command Line
+Tools; run `xcode-select --install` if they are missing.
+
+OpenAI / Codex selects `api.openai.com` and `chatgpt.com`; Anthropic / Claude Code selects
+`api.anthropic.com`. Advanced users can repeat `--domain HOST` to supply an explicit set and skip
+the chooser, including for noninteractive use. Hosts overrides apply to all applications using
+the system resolver for those domains. Only supported model request paths produce uploaded
+traces; authentication and unrelated web requests are forwarded without retaining their bodies.
+Captured traces include prompts, responses, and tool content. Credential headers are never
+copied into uploaded traces. This is separate from anonymous aggregate product telemetry.
+
+The first run creates a private local certificate authority and requests trust for the current
+macOS user, scoped to the selected provider hostnames in native macOS trust settings. Clients
+that import CA certificates into their own TLS stacks may not preserve those hostname restrictions;
+the local signing key remains sensitive even when capture is stopped. A client
+with its own trust store may need that public CA certificate configured explicitly; certificate
+pinning is not bypassed. The certificate is under the `capture/ca` directory of the same user-data
+directory that owns the saved login. On macOS this defaults to
+`~/Library/Application Support/exp/capture/ca/mitmproxy-ca-cert.pem`. Never share the adjacent
+`mitmproxy-ca.pem`, which contains the private signing key.
+
+An administrator prompt authorizes the temporary networking helper. Certificate trust is stored
+for the current macOS user, without installing a system-wide root.
+Run the CLI as your normal user, not `sudo exp capture`. The helper journals its own marked
+hosts entries and relays loopback port 443 to the unprivileged proxy. Ctrl+C removes the overrides
+before the proxy exits. The helper also restores networking if the foreground process disappears.
+Existing intercepted connections can fail during shutdown, and application DNS caches may require
+an application restart. No system Network Extension or permanent privileged service is installed.
+Capture forwards TCP HTTPS on port 443. Clients using QUIC or HTTP/3 over UDP must fall back to
+TCP HTTPS; UDP traffic is not collected.
+
+If the machine loses power, the helper is killed, or provider requests fail after capture ends,
+run `exp capture reset`. Reset works offline without login, requests administrator authorization
+when needed, and removes only Capture's recorded hosts changes. It preserves unrelated hosts
+edits, the existing login, local CA trust, and trace retry files. If someone edits Capture's
+marked block, reset reports the conflict instead of overwriting their changes.
+
+Upload failures do not stall model responses. The collector retains bounded private retry files
+under the origin-and-organization-specific `capture/spool` directory. The next capture run with
+the same endpoint and organization retries pending files using their original batch IDs.
+When capture capacity is exhausted, collection drops copies and reports the count while model
+traffic continues. The CLI distinguishes captured requests, uploaded batches, and pending batches;
+upload acceptance does not imply that cloud projection has finished.
+Each run pins the storage origin and organization path configured by Platform. Upload tickets
+pointing outside that destination are rejected. Platform remains the trusted recipient and
+control plane for captured content.
+
+For an unreleased Platform preview, set both `EXP_GATEWAY_URL` to the preview API `/v1` URL and
+`EXP_PLATFORM_URL` to its web origin before `exp login` and `exp capture`. Saved credentials are
+bound to their endpoint, so a production login is not silently sent to a preview. If the saved
+login belongs to another endpoint, Capture opens normal login for the configured environment;
+successful login replaces the saved CLI login. To keep a preview's login and catalog separate,
+set `XDG_DATA_HOME` to a dedicated preview data directory and pass a separate `--root` to Capture.
+Keep that data directory selected when using `exp capture reset` for the preview.
+Capture checks the cloud API before installing hosts overrides. Live Codex and Claude Code
+compatibility remains part of local acceptance; existing open connections may need to be
+restarted to enter capture.
 
 `build`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
 policy. An estimate at or below 50% of the budget runs automatically. A higher estimate

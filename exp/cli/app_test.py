@@ -9,6 +9,7 @@ from typer.main import get_group
 from exp.cli.app import app
 
 EXPECTED_SUBCOMMANDS = {
+    "capture": {"reset"},
     "config": {"budget", "gateway", "judge", "providers", "telemetry"},
     "optimize": {"model", "router"},
 }
@@ -22,7 +23,14 @@ def test_root_cli_and_subgroups_are_exact() -> None:
     """
     root = get_group(app)
     root_context = Context(root)
-    assert set(root.list_commands(root_context)) == {"build", "config", "login", "optimize", "run"}
+    assert set(root.list_commands(root_context)) == {
+        "build",
+        "capture",
+        "config",
+        "login",
+        "optimize",
+        "run",
+    }
 
     for name, expected in EXPECTED_SUBCOMMANDS.items():
         command = root.get_command(root_context, name)

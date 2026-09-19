@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -89,6 +90,68 @@ def test_login_persists_platform_key_in_the_shared_cloud_record(
     assert "Synced Experiential Cloud:" in transcript.getvalue()
     assert "models." in transcript.getvalue()
     assert "Logged in to Experiential Cloud." in transcript.getvalue()
+
+
+@pytest.mark.parametrize("existing_catalog", [True, False])
+def test_login_preserves_catalog_and_old_key_when_credential_save_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing_catalog: bool
+) -> None:
+    """A failed atomic key replacement restores the pre-login catalog exactly."""
+    root = tmp_path / ".exp"
+    catalog_path = root / "models.toml"
+    if existing_catalog:
+        write_model_catalog(
+            catalog_path,
+            ModelCatalog(
+                connections={
+                    "experiential-cloud": ProviderConnection(
+                        name="experiential-cloud",
+                        provider="openai-compatible",
+                        api_key_env="EXPLABS_API_KEY",
+                        base_url="https://api.experientiallabs.ai/v1",
+                    ).catalog_config(),
+                },
+                models={
+                    "exp-chat": ModelRecord(
+                        connection="experiential-cloud",
+                        model="exp-chat",
+                        billing_source=BillingSource.HOST_MANAGED,
+                        capabilities=ModelCapabilities(),
+                    ),
+                },
+            ),
+        )
+    original_catalog = catalog_path.read_bytes() if existing_catalog else None
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put("experiential-cloud", "xpl_old_key", binding=hosted_credential_binding({}))
+    original_auth = store.path.read_bytes()
+    real_replace = os.replace
+
+    def reject_auth_replace(source: str | Path, destination: str | Path) -> None:
+        """Fail the credential rename while allowing catalog publication and rollback."""
+        if Path(destination) == store.path:
+            raise OSError("Synthetic credential write failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", reject_auth_replace)
+    monkeypatch.setattr(auth, "hosted_platform_login", lambda _connection, **_kwargs: "xpl_new_key")
+    with pytest.raises(OSError, match="Synthetic credential write failure"):
+        auth.run_login(
+            console=Console(file=io.StringIO()),
+            environment={
+                "EXP_GATEWAY_URL": "https://api.preview.experientiallabs.ai/v1",
+                "EXP_PLATFORM_URL": "https://preview.experientiallabs.ai",
+            },
+            store=store,
+            root=root,
+            lister=_AccountModelLister("xpl_new_key"),
+        )
+    if existing_catalog:
+        assert catalog_path.read_bytes() == original_catalog
+    else:
+        assert not catalog_path.exists()
+    assert store.path.read_bytes() == original_auth
+    assert store.get("experiential-cloud", binding=hosted_credential_binding({})) == "xpl_old_key"
 
 
 def test_login_rejects_endpoint_replacement_for_an_active_gateway(

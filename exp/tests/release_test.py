@@ -14,6 +14,7 @@ import sys
 import tarfile
 import termios
 import time
+import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -33,7 +34,11 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "boto3",
         "botocore",
         "click",
+        "dnspython",
+        "exp-gateway-native",
         "filelock",
+        "google-auth",
+        "google-re2",
         "httpx",
         "numpy",
         "openai",
@@ -45,6 +50,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "typer",
     }
 )
+REQUIRED_CAPTURE_REQUIREMENTS = frozenset({"brotli", "cryptography", "mitmproxy", "zstandard"})
 REQUIRED_WHEEL_MODULES = frozenset(
     {
         "exp/cli/gateway/app.py",
@@ -75,6 +81,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
     {
+        "LICENSE",
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
@@ -176,16 +183,37 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
     return extracted.read().decode("utf-8")
 
 
-def _core_requirement_names(metadata: str) -> frozenset[str]:
-    """Return normalized non-extra dependency names from package metadata."""
-    names: set[str] = set()
+def _assert_core_requirements(metadata: str) -> None:
+    """Check unconditional SDK dependencies and Python-gated Capture dependencies."""
+    requirements: dict[str, str] = {}
     for line in metadata.splitlines():
-        if not line.startswith("Requires-Dist:") or "; extra ==" in line:
+        if not line.startswith("Requires-Dist:"):
             continue
         requirement = line.removeprefix("Requires-Dist:").strip()
+        requirement, _, marker = requirement.partition(";")
+        if re.search(r"\bextra\s*==", marker):
+            continue
+        assert FORBIDDEN_REQUIREMENT.search(line) is None, f"forbidden core dependency: {line}"
         name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
-        names.add(name)
-    return frozenset(names)
+        assert name not in requirements, f"duplicate core dependency: {name}"
+        requirements[name] = re.sub(r"\s+", "", marker).replace("'", '"')
+    assert frozenset(requirements) == REQUIRED_CORE_REQUIREMENTS | REQUIRED_CAPTURE_REQUIREMENTS
+    for name, marker in requirements.items():
+        expected = 'python_version>="3.13"' if name in REQUIRED_CAPTURE_REQUIREMENTS else ""
+        assert marker == expected, f"unexpected dependency marker for {name}: {marker!r}"
+
+
+def test_core_dependency_markers_preserve_sdk_python_312() -> None:
+    """Gate Capture's TLS dependencies without silently narrowing SDK compatibility."""
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
+    assert project["requires-python"] == ">=3.12"
+    metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
+    _assert_core_requirements(metadata)
+    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    for marker in ("", '; python_version >= "3.13"'):
+        with pytest.raises(AssertionError, match="forbidden core dependency"):
+            _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
 
 
 def _assert_current_archive_members(
@@ -227,6 +255,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "git",
             "ls-files",
             ".gitignore",
+            "LICENSE",
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
@@ -3152,8 +3181,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         names = tuple(
@@ -3164,8 +3192,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:

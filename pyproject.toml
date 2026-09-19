@@ -12,9 +12,16 @@ dependencies = [
     "filelock>=3.12",
     "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
-    "pydantic>=2.6",
+    "pydantic>=2.12",
     "numpy>=1.26",
     "httpx>=0.27",
+    # The capture engine needs Python 3.13+ because mitmproxy on 3.12 conflicts with
+    # Pydantic's typing-extensions floor. Other commands remain available on 3.12.
+    "mitmproxy>=12.2.3,<13; python_version >= '3.13'",
+    "cryptography>=42,<49; python_version >= '3.13'",
+    "dnspython>=2.6,<3",
+    "brotli>=1.2,<2; python_version >= '3.13'",
+    "zstandard>=0.23,<1; python_version >= '3.13'",
     "rich>=14.1",
     "tomli-w>=1.0",  # writing project and telemetry TOML; every `exp build` needs it
     "posthog>=7.0",

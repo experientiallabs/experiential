@@ -20,6 +20,7 @@ ROOT_PYTHON_FILES = frozenset(
 CLI_PACKAGES = frozenset(
     {
         "build",
+        "capture",
         "config",
         "gateway",
         "judge",

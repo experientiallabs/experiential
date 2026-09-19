@@ -94,6 +94,16 @@ def run_login(
     if key is None or not key.strip():
         raise typer.Abort
 
+    auth_store = store if store is not None else ProviderAuthStore()
+
+    def persist_credential() -> None:
+        """Commit the matching credential inside the catalog synchronization lock."""
+        auth_store.put(
+            connection.name,
+            key,
+            binding=hosted_credential_binding(environment),
+        )
+
     try:
         sync_account_models(
             Path(ARTIFACT_DIR) if root is None else root,
@@ -101,17 +111,12 @@ def run_login(
             api_key=key,
             console=console,
             lister=lister,
+            on_commit=persist_credential,
         )
     except (ProviderConnectionAuthoringError, ProviderListingError) as exc:
         raise typer.BadParameter(
             f"Experiential Cloud authentication succeeded, but model synchronization failed: {exc}"
         ) from None
-    auth_store = store if store is not None else ProviderAuthStore()
-    auth_store.put(
-        connection.name,
-        key,
-        binding=hosted_credential_binding(environment),
-    )
     console.print("[green]Logged in to Experiential Cloud.[/green]")
 
 
