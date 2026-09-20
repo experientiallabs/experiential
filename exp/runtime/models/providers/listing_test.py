@@ -246,7 +246,8 @@ def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
                 "data": [
                     {"id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"},
                     {"display_name": "no identity"},
-                ]
+                ],
+                "has_more": False,
             }
         )
     )
@@ -259,6 +260,97 @@ def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
     request = transport.requests[0]
     assert request.headers["x-api-key"] == "secret-key"
     assert request.headers["anthropic-version"]
+
+
+def test_anthropic_listing_follows_after_id_pages() -> None:
+    """Anthropic discovery follows the documented cursor until the final page."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [{"id": "claude-opus-5"}],
+                "has_more": True,
+                "last_id": "claude-opus-5",
+            }
+        ),
+        _ok(
+            {
+                "data": [{"id": "claude-haiku-4-5"}],
+                "has_more": False,
+                "last_id": "claude-haiku-4-5",
+            }
+        ),
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(provider="anthropic", api_key="secret-key")
+    )
+
+    assert [model.model for model in models] == ["claude-haiku-4-5", "claude-opus-5"]
+    assert len(transport.requests) == 2
+    assert transport.requests[0].url == "https://api.anthropic.com/v1/models?limit=1000"
+    assert transport.requests[1].url == (
+        "https://api.anthropic.com/v1/models?limit=1000&after_id=claude-opus-5"
+    )
+
+
+def test_anthropic_listing_encodes_the_opaque_page_cursor() -> None:
+    """Reserved cursor characters remain one exact after_id query value."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [{"id": "claude-opus-5"}],
+                "has_more": True,
+                "last_id": "cursor/with ?&=",
+            }
+        ),
+        _ok({"data": [], "has_more": False}),
+    )
+
+    _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+    assert transport.requests[1].url == (
+        "https://api.anthropic.com/v1/models?limit=1000&after_id=cursor%2Fwith+%3F%26%3D"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ({"data": [], "has_more": "yes"}, "boolean has_more"),
+        ({"data": [], "has_more": True}, "non-empty last_id"),
+    ],
+)
+def test_anthropic_listing_rejects_malformed_pagination(body: JsonObject, message: str) -> None:
+    """Malformed pagination fails instead of silently returning a partial catalog."""
+    transport = _transport(_ok(body))
+
+    with pytest.raises(ProviderListingError, match=message):
+        _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+
+def test_anthropic_listing_rejects_a_repeated_cursor() -> None:
+    """A provider cursor cycle fails before issuing the same page request again."""
+    transport = _transport(
+        _ok({"data": [], "has_more": True, "last_id": "repeat"}),
+        _ok({"data": [], "has_more": True, "last_id": "repeat"}),
+    )
+
+    with pytest.raises(ProviderListingError, match="repeated last_id"):
+        _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+    assert len(transport.requests) == 2
+
+
+def test_anthropic_listing_fails_instead_of_truncating_at_the_page_cap() -> None:
+    """The finite request ceiling cannot turn into a partial successful catalog."""
+    transport = _transport(
+        *(_ok({"data": [], "has_more": True, "last_id": f"cursor-{page}"}) for page in range(10))
+    )
+
+    with pytest.raises(ProviderListingError, match="exceeded 10 pages"):
+        _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+    assert len(transport.requests) == 10
 
 
 def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
