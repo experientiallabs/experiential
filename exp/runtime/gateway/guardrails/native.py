@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Mapping
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
@@ -15,7 +17,9 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
+    OutputGuardrailMode,
 )
+from exp.runtime.gateway.guardrails.deterministic import NativeDetector, native_input_request
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 
 
@@ -25,14 +29,20 @@ def enforce_native_input(
     authorization: AuthorizationSnapshot,
     request: GatewayRequest,
     deadline_monotonic: float,
+    detectors: Mapping[str, NativeDetector] | None = None,
 ) -> tuple[GatewayRequest, GuardrailPolicy | None]:
     """Apply input enforcement after continuation and before native routing.
+
+    A chain built only from adapters with a compiled native detector runs
+    inline here, so it pays neither the contract projection nor the
+    isolation-worker round trip. Every other chain uses the engine.
 
     Args:
         engine: Optional composed engine. ``None`` skips all guardrail work.
         authorization: Frozen authenticated identity.
         request: Canonical request after continuation expansion.
         deadline_monotonic: Remaining request-wide deadline.
+        detectors: Compiled deterministic detectors, keyed by adapter.
 
     Returns:
         The validated or transformed request and the assigned policy, if any.
@@ -47,6 +57,16 @@ def enforce_native_input(
     policy = engine.policy_for(authorization.organization_id, authorization.identity_id)
     if policy is None:
         return request, None
+    if detectors:
+        native = native_input_request(
+            policy,
+            detectors,
+            request,
+            monotonic=time.monotonic,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if native is not None:
+            return native, policy
     return (
         run_on_native_loop(
             engine.enforce_input(
@@ -56,6 +76,37 @@ def enforce_native_input(
             )
         ),
         policy,
+    )
+
+
+def native_output_mode(
+    engine: GuardrailEngine | None,
+    policy: GuardrailPolicy | None,
+    request: GatewayRequest,
+) -> OutputGuardrailMode:
+    """Return the output enforcement shape one admission must use.
+
+    Args:
+        engine: Optional composed engine. ``None`` leaves the stream untouched.
+        policy: Policy resolved during input enforcement, if any.
+        request: Canonical request after continuation expansion.
+
+    Returns:
+        ``off``, ``buffer``, or ``stream`` for the data plane.
+    """
+    if engine is None:
+        return OutputGuardrailMode.OFF
+    return engine.output_mode(
+        policy,
+        streaming=request.stream,
+        tools_offered=bool(
+            request.tools or request.provider_native_tools or request.provider_server_tools
+        ),
+        reasoning_text_requested=bool(
+            request.reasoning_summary is not None
+            or request.reasoning_effort is not None
+            or request.thinking_default_enable
+        ),
     )
 
 
@@ -99,6 +150,79 @@ def encode_output_decision(
     if failure is not None:
         payload["failure"] = failure
     return json.dumps(payload, separators=(",", ":"))
+
+
+def _guardrail_failure_payload(safe_message: str, failure_class: str = "guardrail") -> JsonObject:
+    """Return one sanitized failure body for a native decision."""
+    return {"failure_class": failure_class, "safe_message": safe_message}
+
+
+def _settled_bytes(data: JsonObject) -> int:
+    """Return how many provider completion bytes already left the buffer."""
+    value = data.get("settled_bytes")
+    return value if isinstance(value, int) else 0
+
+
+def enforce_native_output_segment(
+    engine: GuardrailEngine | None,
+    policy: GuardrailPolicy | None,
+    argument: str,
+    *,
+    deadline_monotonic: float,
+) -> str:
+    """Redact and release the settled part of one streamed completion tail.
+
+    The data plane owns the buffer: it presents the tail it is holding and
+    receives back the text it may send now plus the text it must keep. The
+    call is synchronous on the caller's thread, because a deterministic
+    redactor is bounded CPU work and any hop would reintroduce the latency
+    this path exists to remove.
+
+    Args:
+        engine: Optional composed engine.
+        policy: Policy captured at admission. ``None`` means unguarded.
+        argument: JSON object with ``pending``, ``final``, and
+            ``settled_bytes``.
+        deadline_monotonic: Remaining request-wide deadline.
+
+    Returns:
+        JSON decision with ``action`` plus either ``release``, ``pending``,
+        and ``flagged``, or a sanitized ``failure``.
+    """
+    data = cast(JsonObject, json.loads(argument))
+    if engine is None or policy is None:
+        return _encode_segment_failure(
+            _guardrail_failure_payload("A gateway guardrail could not complete this request.")
+        )
+    try:
+        segment = engine.release_output_segment(
+            policy=policy,
+            pending=str(data.get("pending") or ""),
+            final=bool(data.get("final")),
+            settled_bytes=_settled_bytes(data),
+            deadline_monotonic=deadline_monotonic,
+        )
+    except GuardrailRejected as exc:
+        return _encode_segment_failure(
+            _guardrail_failure_payload(exc.failure.safe_message, exc.failure.failure_class.value)
+        )
+    return json.dumps(
+        {
+            "action": GuardrailAction.ALLOW.value,
+            "release": segment.release,
+            "pending": segment.pending,
+            "flagged": segment.flagged,
+        },
+        separators=(",", ":"),
+    )
+
+
+def _encode_segment_failure(failure: JsonObject) -> str:
+    """Encode one fail-closed streaming decision that releases nothing."""
+    return json.dumps(
+        {"action": GuardrailAction.ERROR.value, "failure": failure},
+        separators=(",", ":"),
+    )
 
 
 def enforce_native_output(

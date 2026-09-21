@@ -15,8 +15,36 @@ use serde_json::{json, Value};
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass};
-use crate::events::Usage;
+use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
+use crate::replay::OwnerLease;
+use crate::waterfall::CommittedAttempt;
+
+#[path = "settlement_observation.rs"]
+mod observation;
+pub(crate) use observation::Observation;
+
+/// Settle one guarded attempt as failed and release its owner lease.
+pub(crate) async fn settle_guarded_failure(
+    guard: &mut AttemptGuard,
+    committed: &mut CommittedAttempt,
+    lease: &mut Option<OwnerLease>,
+    failure: &Failure,
+) {
+    let usage = committed.usage.clone();
+    guard
+        .settle(
+            "failed",
+            usage.as_ref(),
+            &committed.tool_names,
+            Some(failure),
+            true,
+        )
+        .await;
+    if let Some(mut owner) = lease.take() {
+        owner.abandon().await;
+    }
+}
 
 /// Format one wall-clock instant as an RFC 3339 / ISO 8601 UTC string with
 /// millisecond precision, e.g. `2026-08-30T12:34:56.789+00:00`.
@@ -67,8 +95,11 @@ fn settle_argument(
     opened: bool,
     first_token_at: Option<SystemTime>,
     rate_limit_headers: Option<&serde_json::Map<String, Value>>,
+    upstream_provider: Option<&str>,
+    web_search_requests: u32,
+    tool_search_requests: u32,
 ) -> String {
-    compact_json(&json!({
+    let mut argument = json!({
         "request_id": request_id,
         "attempt_id": attempt_id,
         "outcome": outcome,
@@ -76,6 +107,8 @@ fn settle_argument(
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_input_tokens": usage.cached_input_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
         })),
         "tool_names": tool_names,
@@ -101,12 +134,35 @@ fn settle_argument(
         })),
         "finalize": finalize,
         "opened": opened,
+        // Explicit HTTP-rejection provenance for decisions only. Unknown
+        // outcomes and cancellation never authorize zero-cost accounting.
+        "decision_provider_rejected": failure.is_some_and(|failure| failure.decision_provider_rejected),
         "first_token_at": first_token_at.map(system_time_to_rfc3339),
         // Allowlisted rate-limit headers of the attempt's provider response
         // (successes and failures alike, absent when none were present); the
         // control plane normalizes and persists them per attempt.
         "rate_limit_headers": rate_limit_headers,
-    }))
+        // The upstream an aggregator rung named as serving the attempt
+        // (OpenRouter's per-chunk `provider` under its metadata opt-in),
+        // absent when the stream named none; the control plane persists it
+        // per attempt so a zero-data-retention dispatch shows WHICH
+        // retention-free upstream answered.
+        "upstream_provider": upstream_provider,
+    });
+    // The gateway's own pre-dispatch web searches, a request-level cost the
+    // control plane bills once: only the settlement that closes the request
+    // carries the count, so a failed rung's non-finalizing settlement can
+    // never bill it a second time. Absent at zero, so unsearched requests
+    // settle with exactly the bytes they always did.
+    if finalize && web_search_requests > 0 {
+        argument["web_search_requests"] = json!(web_search_requests);
+    }
+    // The gateway's own tool-search rounds bill the same way: once, on the
+    // settlement that closes the request, absent at zero.
+    if finalize && tool_search_requests > 0 {
+        argument["tool_search_requests"] = json!(tool_search_requests);
+    }
+    compact_json(&argument)
 }
 
 /// Deliver one control-plane write with bounded backoff; the control plane
@@ -161,6 +217,8 @@ pub struct AttemptGuard {
     /// Whether the active attempt's provider dispatch opened successfully;
     /// carried into settlement for deployment-health recording.
     opened: bool,
+    /// Dispatch began, even if response headers have not arrived yet.
+    dispatched: bool,
     /// The exact settlement whose delivery is in flight. The drop backstop
     /// re-delivers this decided settlement instead of a cancellation, so a
     /// task cancelled mid-write can neither downgrade the ledger outcome nor
@@ -176,6 +234,19 @@ pub struct AttemptGuard {
     /// outcome. An attempt that failed at open instead carries them on its
     /// `Failure`, which settlement hoists into the same payload field.
     rate_limit_headers: Option<serde_json::Map<String, Value>>,
+    /// The upstream an aggregator named as serving the active attempt's
+    /// committed stream, recorded at commit and settled alongside the outcome.
+    upstream_provider: Option<String>,
+    /// How many web searches the control plane executed for this request
+    /// before dispatch (from the admission); a request-level fact that
+    /// survives `rebind` and rides only the finalizing settlement.
+    web_search_requests: u32,
+    /// How many gateway-run tool-search rounds this request completed so
+    /// far (recorded by the waterfall as each round lands); request-level
+    /// like the web-search count, so it survives `rebind` and rides only the
+    /// finalizing settlement.
+    tool_search_requests: u32,
+    observation: Observation,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -218,23 +289,63 @@ impl AttemptGuard {
             armed: true,
             outcome_recorded: false,
             opened: false,
+            dispatched: false,
             decided_settlement: None,
             started,
             first_token_at: None,
             rate_limit_headers: None,
+            upstream_provider: None,
+            web_search_requests: 0,
+            tool_search_requests: 0,
+            observation: Observation::default(),
         }
+    }
+
+    pub(crate) fn begin_dial_observation(&mut self) -> Observation {
+        self.observation = Observation::default();
+        self.observation.clone()
+    }
+
+    /// Cancellation never certifies a partial meter as the provider's final bill.
+    fn log_cancelled_meter(&self, observed: &observation::Observed) {
+        let line = json!({
+            "event": "stream_meter_at_cancel", "request_id": self.request_id,
+            "attempt_id": self.attempt_id,
+            "provider_terminal_observed": observed.terminal.is_some(),
+            "usage_final": observed.terminal.is_some()
+                && observed.usage.as_ref().is_some_and(Usage::has_token_counts),
+            "input_tokens": observed.usage.as_ref().and_then(|usage| usage.input_tokens),
+            "output_tokens": observed.usage.as_ref().and_then(|usage| usage.output_tokens),
+        });
+        eprintln!("exp-gateway-native: {line}");
+    }
+
+    /// Record the admission's count of gateway-executed web searches, so the
+    /// finalizing settlement bills them.
+    pub fn record_web_search_requests(&mut self, requests: u32) {
+        self.web_search_requests = requests;
+    }
+
+    /// Record how many gateway-run tool-search rounds the request has
+    /// completed, so the finalizing settlement bills them.
+    pub fn record_tool_search_requests(&mut self, requests: u32) {
+        self.tool_search_requests = requests;
     }
 
     /// Bind one freshly reserved attempt as the active settlement target.
     pub fn rebind(&mut self, attempt_id: String) {
         self.attempt_id = Some(attempt_id);
+        self.observation = Observation::default();
         self.opened = false;
+        self.dispatched = false;
         self.decided_settlement = None;
         // Each physical attempt observes its own first token; a prior failed
         // attempt's timing never carries into its successor. The same holds
-        // for its provider response's rate-limit headers.
+        // for its provider response's rate-limit headers and the upstream
+        // its stream named.
         self.first_token_at = None;
         self.rate_limit_headers = None;
+        self.upstream_provider = None;
     }
 
     /// Record the wall-clock time the active attempt streamed its first output
@@ -246,8 +357,14 @@ impl AttemptGuard {
         }
     }
 
+    /// Mark physical dispatch before awaiting headers, so an early drop keeps its hold.
+    pub(crate) fn mark_dispatched(&mut self) {
+        self.dispatched = true;
+    }
+
     /// Record that the active attempt's provider dispatch opened.
     pub fn mark_opened(&mut self) {
+        self.dispatched = true;
         self.opened = true;
     }
 
@@ -255,6 +372,12 @@ impl AttemptGuard {
     /// opened provider response, for settlement.
     pub fn record_rate_limit_headers(&mut self, headers: Option<serde_json::Map<String, Value>>) {
         self.rate_limit_headers = headers;
+    }
+
+    /// Record the upstream the active attempt's committed stream named as
+    /// serving it (an aggregator's per-chunk provider label), for settlement.
+    pub fn record_upstream_provider(&mut self, provider: Option<String>) {
+        self.upstream_provider = provider;
     }
 
     /// Record this request's terminal outcome and duration exactly once, at
@@ -283,11 +406,17 @@ impl AttemptGuard {
         failure: Option<&Failure>,
         finalize: bool,
     ) -> bool {
+        if !self.armed {
+            return true;
+        }
         let Some(attempt_id) = self.attempt_id.clone() else {
             // No active attempt: nothing durable to close here. The abandon
             // path owns request-only terminalization.
             return true;
         };
+        let observed = self.observation.snapshot();
+        let usage = observed.usage.as_ref().or(usage);
+        self.record_first_token(observed.first_token_at);
         // An opened attempt's headers live on the guard; an attempt that
         // failed at open carries them on its failure instead.
         let rate_limit_headers = self
@@ -305,6 +434,16 @@ impl AttemptGuard {
             self.opened,
             self.first_token_at,
             rate_limit_headers,
+            self.upstream_provider.as_deref(),
+            self.web_search_requests,
+            self.tool_search_requests,
+        );
+        let argument = disconnect_provenance(
+            argument,
+            self.dispatched,
+            self.dispatched
+                && observed.terminal.is_none()
+                && failure.is_some_and(|failure| failure.failure_class == FailureClass::Cancelled),
         );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
@@ -333,15 +472,23 @@ impl AttemptGuard {
 
     /// Settle the active attempt as cancelled and finalize the request.
     pub async fn settle_cancelled(&mut self, usage: Option<&Usage>, tool_names: &[String]) -> bool {
+        if !self.armed {
+            return true;
+        }
         if self.attempt_id.is_some() {
+            let observed = self.observation.snapshot();
+            self.record_first_token(observed.first_token_at);
+            self.log_cancelled_meter(&observed);
+            let (outcome, failure) = cancellation_outcome(observed.terminal.as_ref());
             self.settle(
-                "failed",
-                usage,
-                tool_names,
-                Some(&Failure::new(
-                    FailureClass::Cancelled,
-                    "gateway request was cancelled",
-                )),
+                outcome,
+                observed.usage.as_ref().or(usage),
+                if observed.tool_names.is_empty() {
+                    tool_names
+                } else {
+                    &observed.tool_names
+                },
+                failure.as_ref(),
                 true,
             )
             .await
@@ -382,6 +529,31 @@ impl AttemptGuard {
     }
 }
 
+/// Stamp trusted dispatch evidence without changing the base settlement vocabulary.
+fn disconnect_provenance(argument: String, dispatched: bool, incomplete: bool) -> String {
+    let mut payload: Value =
+        serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
+    payload["dispatched"] = json!(dispatched);
+    payload["usage_incomplete_due_to_disconnect"] = json!(incomplete);
+    compact_json(&payload)
+}
+
+/// An already observed provider terminal wins over subscriber cancellation.
+fn cancellation_outcome(terminal: Option<&Event>) -> (&'static str, Option<Failure>) {
+    match terminal {
+        Some(Event::Failed(failure)) => ("failed", Some(failure.clone().boundary())),
+        Some(Event::Incomplete) => ("incomplete", None),
+        Some(_) => ("completed", None),
+        None => (
+            "failed",
+            Some(Failure::new(
+                FailureClass::Cancelled,
+                "gateway request was cancelled",
+            )),
+        ),
+    }
+}
+
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -392,27 +564,32 @@ impl Drop for AttemptGuard {
         // plane's own never-downgrade sweep semantics; an attempt with no
         // decided outcome settles as cancelled, and an accepted request with
         // no active attempt is abandoned.
+        let decided = self.decided_settlement.is_some();
         let (method, argument): (&'static str, String) = match self.decided_settlement.take() {
             Some(argument) => ("settle", argument),
             None => match self.attempt_id.take() {
                 Some(attempt_id) => {
-                    self.record_terminal("failed", true);
+                    let observed = self.observation.snapshot();
+                    self.log_cancelled_meter(&observed);
+                    let (outcome, failure) = cancellation_outcome(observed.terminal.as_ref());
+                    self.record_terminal(outcome, observed.terminal.is_none());
+                    crate::respond::log_stream_exit(&self.request_id, "handler_cancelled");
                     (
                         "settle",
                         settle_argument(
                             &self.request_id,
                             &attempt_id,
-                            "failed",
-                            None,
-                            &[],
-                            Some(&Failure::new(
-                                FailureClass::Cancelled,
-                                "gateway request was cancelled",
-                            )),
+                            outcome,
+                            observed.usage.as_ref(),
+                            &observed.tool_names,
+                            failure.as_ref(),
                             true,
                             self.opened,
-                            self.first_token_at,
+                            self.first_token_at.or(observed.first_token_at),
                             self.rate_limit_headers.as_ref(),
+                            self.upstream_provider.as_deref(),
+                            self.web_search_requests,
+                            self.tool_search_requests,
                         ),
                     )
                 }
@@ -431,6 +608,18 @@ impl Drop for AttemptGuard {
                 }
             },
         };
+        let argument = if method == "settle" && !decided {
+            // A decided retry already carries its exact provenance. New drop
+            // settlements identify only genuinely dispatched cancellation.
+            let observed = self.observation.snapshot();
+            disconnect_provenance(
+                argument,
+                self.dispatched,
+                self.dispatched && observed.terminal.is_none(),
+            )
+        } else {
+            argument
+        };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // Runtime teardown; startup reconciliation closes the row.
             return;
@@ -446,208 +635,5 @@ impl Drop for AttemptGuard {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rfc3339_formats_epoch_seconds_and_millis_in_utc() {
-        assert_eq!(
-            system_time_to_rfc3339(UNIX_EPOCH),
-            "1970-01-01T00:00:00.000+00:00"
-        );
-        // A fixed instant with sub-second precision (1_700_000_000.500s).
-        let at = UNIX_EPOCH + Duration::from_millis(1_700_000_000_500);
-        assert_eq!(system_time_to_rfc3339(at), "2023-11-14T22:13:20.500+00:00");
-        // A leap day exercises the civil-from-days month/day recovery.
-        let leap = UNIX_EPOCH + Duration::from_secs(1_582_934_400);
-        assert_eq!(
-            system_time_to_rfc3339(leap),
-            "2020-02-29T00:00:00.000+00:00"
-        );
-    }
-
-    #[test]
-    fn settle_argument_carries_first_token_at_only_when_observed() {
-        let observed = UNIX_EPOCH + Duration::from_millis(1_700_000_000_500);
-        let with_token = settle_argument(
-            "req",
-            "att",
-            "completed",
-            None,
-            &[],
-            None,
-            true,
-            true,
-            Some(observed),
-            None,
-        );
-        let parsed: Value = serde_json::from_str(&with_token).expect("valid json");
-        assert_eq!(
-            parsed["first_token_at"],
-            Value::String("2023-11-14T22:13:20.500+00:00".to_string())
-        );
-        // A non-streaming attempt observes no first token: the field is null,
-        // matching the control plane's backward-compatible parse.
-        let without = settle_argument(
-            "req",
-            "att",
-            "completed",
-            None,
-            &[],
-            None,
-            true,
-            true,
-            None,
-            None,
-        );
-        let parsed: Value = serde_json::from_str(&without).expect("valid json");
-        assert_eq!(parsed["first_token_at"], Value::Null);
-    }
-
-    #[test]
-    fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
-        let failure = Failure::new(FailureClass::InvalidRequest, "provider rejected")
-            .with_provider_detail(Some(
-                "max_tokens must be greater than thinking budget.".into(),
-            ));
-        let argument = settle_argument(
-            "req",
-            "att",
-            "failed",
-            None,
-            &[],
-            Some(&failure),
-            true,
-            true,
-            None,
-            None,
-        );
-        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
-        assert_eq!(parsed["failure"]["failure_class"], "invalid_request");
-        assert_eq!(
-            parsed["failure"]["provider_detail"],
-            "max_tokens must be greater than thinking budget."
-        );
-        assert_eq!(parsed["failure"]["customer_owned"], false);
-        let owned = crate::stream_errors::customer_credential_failure(
-            crate::upstream::transport_failure(Some(401)),
-            "openai",
-        );
-        let owned_argument = settle_argument(
-            "req",
-            "att",
-            "failed",
-            None,
-            &[],
-            Some(&owned),
-            true,
-            true,
-            None,
-            None,
-        );
-        let parsed: Value = serde_json::from_str(&owned_argument).expect("valid json");
-        assert_eq!(
-            parsed["failure"]["failure_class"],
-            "provider_authentication"
-        );
-        assert_eq!(parsed["failure"]["customer_owned"], true);
-        // A failure with no provider explanation carries an explicit null, which
-        // the control plane parses back to None.
-        let bare = Failure::new(FailureClass::ProviderInternal, "provider failed");
-        let bare_argument = settle_argument(
-            "req",
-            "att",
-            "failed",
-            None,
-            &[],
-            Some(&bare),
-            true,
-            true,
-            None,
-            None,
-        );
-        let parsed: Value = serde_json::from_str(&bare_argument).expect("valid json");
-        assert_eq!(parsed["failure"]["provider_detail"], Value::Null);
-    }
-
-    #[test]
-    fn settle_argument_carries_rate_limit_facts_when_harvested() {
-        // A throttled open: the failure carries the harvested headers and the
-        // integer Retry-After, both settled for the control plane.
-        let mut headers = serde_json::Map::new();
-        headers.insert("retry-after".to_string(), Value::String("3600".to_string()));
-        headers.insert(
-            "x-ratelimit-remaining-requests".to_string(),
-            Value::String("0".to_string()),
-        );
-        let throttled = crate::upstream::transport_failure(Some(429))
-            .with_rate_limit_facts(Some(headers.clone()), Some(3_600));
-        let argument = settle_argument(
-            "req",
-            "att",
-            "failed",
-            None,
-            &[],
-            Some(&throttled),
-            true,
-            false,
-            None,
-            throttled.rate_limit_headers.as_deref(),
-        );
-        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
-        assert_eq!(parsed["failure"]["retry_after_seconds"], 3_600);
-        assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
-        assert_eq!(
-            parsed["rate_limit_headers"]["x-ratelimit-remaining-requests"],
-            "0"
-        );
-        // A successful attempt settles the opened response's headers; absent
-        // headers settle an explicit null the control plane treats as absent.
-        let success = settle_argument(
-            "req",
-            "att",
-            "completed",
-            None,
-            &[],
-            None,
-            true,
-            true,
-            None,
-            Some(&headers),
-        );
-        let parsed: Value = serde_json::from_str(&success).expect("valid json");
-        assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
-        let bare = settle_argument(
-            "req",
-            "att",
-            "completed",
-            None,
-            &[],
-            None,
-            true,
-            true,
-            None,
-            None,
-        );
-        let parsed: Value = serde_json::from_str(&bare).expect("valid json");
-        assert_eq!(parsed["rate_limit_headers"], Value::Null);
-    }
-
-    #[test]
-    fn retry_after_fills_only_throttled_failures_and_never_overwrites() {
-        let throttled =
-            crate::upstream::transport_failure(Some(429)).with_rate_limit_facts(None, Some(30));
-        assert_eq!(throttled.retry_after_seconds, Some(30));
-        let already = Failure::new(FailureClass::Throttled, "throttled")
-            .with_rate_limit_facts(None, Some(30));
-        let kept = Failure {
-            retry_after_seconds: Some(7),
-            ..already
-        }
-        .with_rate_limit_facts(None, Some(30));
-        assert_eq!(kept.retry_after_seconds, Some(7));
-        let internal =
-            crate::upstream::transport_failure(Some(500)).with_rate_limit_facts(None, Some(30));
-        assert_eq!(internal.retry_after_seconds, None);
-    }
-}
+#[path = "settlement_tests.rs"]
+mod tests;

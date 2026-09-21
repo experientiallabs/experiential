@@ -182,6 +182,7 @@ impl Normalizer {
         let completed = tool.complete().map_err(|message| malformed(&message))?;
         Ok(vec![
             Event::ToolCallStarted {
+                custom: false,
                 index,
                 call_id,
                 name,
@@ -431,6 +432,38 @@ mod gemini_tests {
                 })],
                 "{reason}"
             );
+        }
+    }
+
+    #[test]
+    fn thinking_only_truncation_counts_thoughts_when_zero_candidates_are_omitted() {
+        // UsageMetadata's proto3 implicit-presence int32 fields omit zero:
+        // https://github.com/googleapis/googleapis/blob/master/google/ai/generativelanguage/v1beta/generative_service.proto
+        // https://protobuf.dev/programming-guides/json/#presence-and-default-values
+        let candidate =
+            json!({"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]});
+        for usage in [
+            Some(json!({"promptTokenCount":42,"thoughtsTokenCount":7,"totalTokenCount":49})),
+            None,
+        ] {
+            let mut payload = candidate.clone();
+            if let Some(usage) = usage.clone() {
+                payload["usageMetadata"] = usage;
+            }
+            let chunks = [sse(&payload)];
+            let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+            assert!(failure.is_none(), "{failure:?}");
+            assert_eq!(events.last().unwrap()["kind"], "incomplete");
+            let metered = events.iter().find(|event| event["kind"] == "usage");
+            if usage.is_some() {
+                let metered = metered.unwrap();
+                assert_eq!(metered["input_tokens"], 42);
+                assert_eq!(metered["output_tokens"], 7);
+                assert_eq!(metered["reasoning_tokens"], 7);
+            } else {
+                assert!(metered.is_none(), "an absent whole object is unknown");
+            }
         }
     }
 

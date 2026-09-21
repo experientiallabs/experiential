@@ -142,3 +142,9 @@ def test_every_official_sdk_tool_type_is_consciously_classified() -> None:
         sdk_types - MESSAGES_SERVER_TOOL_TYPES_ACCEPTED - MESSAGES_SERVER_TOOL_TYPES_REJECTED
     )
     assert not undecided, _decided(undecided, "Anthropic-defined tool")
+
+
+def test_openrouter_reasoning_extension_is_conditionally_supported() -> None:
+    """The OpenRouter ``reasoning`` object is an installed extension, not an SDK field."""
+    decisions = {field.field_path: field.disposition for field in MESSAGES_MANIFEST.fields}
+    assert decisions["reasoning"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED

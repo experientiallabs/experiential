@@ -6,7 +6,7 @@ import errno
 import os
 import pty
 import re
-import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -15,31 +15,47 @@ import tarfile
 import termios
 import time
 import zipfile
+from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import cast
 
 from click import unstyle
 
+if sys.platform != "win32":
+    import fcntl
+    import resource
+
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
-FORBIDDEN_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|environment-capture|gepa|mlx-lm|"
-    r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
+FORBIDDEN_REQUIREMENTS = frozenset(
+    {
+        "anthropic",
+        "environment-capture",
+        "gepa",
+        "mlx-lm",
+        "opentelemetry-proto",
+        "scikit-learn",
+        "transformers",
+    }
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
         "boto3",
         "botocore",
         "click",
+        "exp-gateway-native",
         "filelock",
+        "google-auth",
+        "google-re2",
         "httpx",
         "numpy",
         "openai",
         "posthog",
         "pydantic",
         "rich",
+        "tiktoken",
         "tomli-w",
         "typer",
     }
@@ -74,6 +90,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
     {
+        "LICENSE",
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
@@ -175,16 +192,55 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
     return extracted.read().decode("utf-8")
 
 
+def _metadata_requirements(metadata: str) -> tuple[tuple[str, str], ...]:
+    """Return normalized dependency names and markers from metadata headers only.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Dependency names paired with their environment-marker text.
+    """
+    requirements: list[tuple[str, str]] = []
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for requirement in headers.get_all("Requires-Dist", []):
+        name = re.split(r"[<>=;~!\[\s(]", requirement, maxsplit=1)[0]
+        name = re.sub(r"[-_.]+", "-", name).casefold()
+        marker = requirement.partition(";")[2].strip()
+        requirements.append((name, marker))
+    return tuple(requirements)
+
+
+def _assert_allowed_requirements(metadata: str) -> None:
+    """Reject forbidden dependencies, permitting Anthropic solely in the dev extra.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Raises:
+        AssertionError: A forbidden dependency appears outside the sole dev SDK exception.
+    """
+    for name, marker in _metadata_requirements(metadata):
+        allowed_dev_sdk = name == "anthropic" and re.fullmatch(r"extra\s*==\s*(['\"])dev\1", marker)
+        assert name not in FORBIDDEN_REQUIREMENTS or allowed_dev_sdk, (
+            f"forbidden release requirement: {name}; {marker}"
+        )
+
+
 def _core_requirement_names(metadata: str) -> frozenset[str]:
-    """Return normalized non-extra dependency names from package metadata."""
-    names: set[str] = set()
-    for line in metadata.splitlines():
-        if not line.startswith("Requires-Dist:") or "; extra ==" in line:
-            continue
-        requirement = line.removeprefix("Requires-Dist:").strip()
-        name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
-        names.add(name)
-    return frozenset(names)
+    """Return dependencies unless gated solely by one named extra equality.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Normalized names, conservatively retaining mixed or runtime-capable markers.
+    """
+    return frozenset(
+        name
+        for name, marker in _metadata_requirements(metadata)
+        if not re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker)
+    )
 
 
 def _assert_current_archive_members(
@@ -226,6 +282,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "git",
             "ls-files",
             ".gitignore",
+            "LICENSE",
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
@@ -352,9 +409,11 @@ def _run_tty_child(
     completion_seen = completion_marker is None
     terminal_closed = False
     deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
     try:
+        selector.register(master, selectors.EVENT_READ)
         while process.poll() is None and time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.1)
+            readable = selector.select(timeout=0.1)
             if readable:
                 try:
                     chunk = os.read(master, 65_536)
@@ -410,7 +469,7 @@ def _run_tty_child(
             raise AssertionError(f"interactive CLI timed out:\n{transcript}")
         if not terminal_closed:
             while True:
-                readable, _, _ = select.select([master], [], [], 0)
+                readable = selector.select(timeout=0)
                 if not readable:
                     break
                 try:
@@ -423,6 +482,7 @@ def _run_tty_child(
                     break
                 transcript += chunk.decode(errors="replace")
     finally:
+        selector.close()
         os.close(master)
     assert process.returncode == 0, transcript
     assert not pending, f"unanswered prompts {pending}:\n{transcript}"
@@ -1334,7 +1394,7 @@ def _installed_release_driver() -> None:
                 SELECT attempt_id, request_id, attempt_ordinal, route_depth,
                        deployment_id, billing_source, state, failure_class,
                        input_tokens, cached_input_tokens, output_tokens,
-                       reasoning_tokens, estimated_cost_micro_usd
+                       reasoning_tokens, estimated_cost_nano_usd
                 FROM gateway_attempts
                 ORDER BY started_at, request_id, attempt_ordinal, attempt_id
                 """
@@ -1353,7 +1413,7 @@ def _installed_release_driver() -> None:
             Billing source and attributed cost keyed by attempt ID.
         """
         return {
-            str(row["attempt_id"]): (row["billing_source"], row["estimated_cost_micro_usd"])
+            str(row["attempt_id"]): (row["billing_source"], row["estimated_cost_nano_usd"])
             for row in rows
         }
 
@@ -1377,7 +1437,11 @@ def _installed_release_driver() -> None:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 output = process.stdout.read() if process.stdout is not None else ""
-                raise AssertionError(f"exp gateway exited before startup:\n{output}")
+                errors = process.stderr.read() if process.stderr is not None else ""
+                raise AssertionError(
+                    f"exp gateway exited before startup (exit {process.returncode}):\n"
+                    f"{output}\n--- stderr ---\n{errors}"
+                )
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                     return
@@ -1536,14 +1600,15 @@ def _installed_release_driver() -> None:
             "--supports-streaming-tool-arguments",
             "--maximum-output-tokens",
             "4096",
+            # nano-USD per million tokens: $1 / $0.50 / $2 / $3.
             "--input-price",
-            "1000000",
+            "1000000000",
             "--cached-input-price",
-            "500000",
+            "500000000",
             "--output-price",
-            "2000000",
+            "2000000000",
             "--reasoning-price",
-            "3000000",
+            "3000000000",
             "--pricing-source",
             "deterministic loopback fixture",
             "--billing-source",
@@ -1710,10 +1775,11 @@ def _installed_release_driver() -> None:
         ]
         assert [row["state"] for row in auth_attempts] == ["failed", "completed"]
         assert auth_attempts[0]["failure_class"] == "provider_authentication"
-        assert auth_attempts[0]["estimated_cost_micro_usd"] is None
+        assert auth_attempts[0]["estimated_cost_nano_usd"] is None
         assert auth_attempts[1]["input_tokens"] == 3
         assert auth_attempts[1]["output_tokens"] == 2
-        assert auth_attempts[1]["estimated_cost_micro_usd"] == 7
+        # 3 input tokens at $1/M + 2 output tokens at $2/M = $0.000007 = 7_000 nano-USD.
+        assert auth_attempts[1]["estimated_cost_nano_usd"] == 7_000
 
         with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
             assert [model.id for model in client.models.list().data] == ["coding"]
@@ -2039,7 +2105,7 @@ def _installed_release_driver() -> None:
         identity_usage = usage_payload["identities"][0]
         assert usage_payload["totals"]["requests"] >= 14
         assert usage_payload["totals"]["attempts"] > usage_payload["totals"]["requests"]
-        assert usage_payload["totals"]["known_estimated_cost_micro_usd"] > 0
+        assert usage_payload["totals"]["known_estimated_cost_nano_usd"] > 0
         terminal_counts = {
             item["state"]: item["attempts"] for item in usage_payload["totals"]["terminal_counts"]
         }
@@ -2066,11 +2132,11 @@ def _installed_release_driver() -> None:
             == (usage_payload["totals"]["reasoning_tokens"])
         )
         assert (
-            sum(cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in attempt_rows)
-            == (usage_payload["totals"]["known_estimated_cost_micro_usd"])
+            sum(cast(int | None, row["estimated_cost_nano_usd"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["known_estimated_cost_nano_usd"])
         )
         assert (
-            sum(row["estimated_cost_micro_usd"] is None for row in attempt_rows)
+            sum(row["estimated_cost_nano_usd"] is None for row in attempt_rows)
             == (usage_payload["totals"]["unknown_cost_attempts"])
         )
         source_buckets = usage_payload["by_billing_source"]
@@ -2098,11 +2164,11 @@ def _installed_release_driver() -> None:
             assert bucket["reasoning_tokens"] == sum(
                 cast(int | None, row["reasoning_tokens"]) or 0 for row in source_rows
             )
-            assert bucket["known_estimated_cost_micro_usd"] == sum(
-                cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in source_rows
+            assert bucket["known_estimated_cost_nano_usd"] == sum(
+                cast(int | None, row["estimated_cost_nano_usd"]) or 0 for row in source_rows
             )
             assert bucket["unknown_cost_attempts"] == sum(
-                row["estimated_cost_micro_usd"] is None for row in source_rows
+                row["estimated_cost_nano_usd"] is None for row in source_rows
             )
             expected_source_terminals = {
                 state: sum(row["state"] == state for row in source_rows)
@@ -2119,7 +2185,7 @@ def _installed_release_driver() -> None:
             identity_usage["cached_input_tokens"],
             identity_usage["output_tokens"],
             identity_usage["reasoning_tokens"],
-            identity_usage["known_estimated_cost_micro_usd"],
+            identity_usage["known_estimated_cost_nano_usd"],
             identity_usage["unknown_cost_attempts"],
             identity_usage["total_latency_ms"],
             ", ".join(
@@ -2136,7 +2202,7 @@ def _installed_release_driver() -> None:
                 bucket["cached_input_tokens"],
                 bucket["output_tokens"],
                 bucket["reasoning_tokens"],
-                bucket["known_estimated_cost_micro_usd"],
+                bucket["known_estimated_cost_nano_usd"],
                 bucket["unknown_cost_attempts"],
                 ", ".join(
                     f"{item['state']}: {item['attempts']}" for item in bucket["terminal_counts"]
@@ -2221,11 +2287,12 @@ def _installed_release_driver() -> None:
             provider_model=provider_model,
             exact_model_id="project-exact-model",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=ModelCapabilities(maximum_output_tokens=32_000),
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=2_000_000,
+                # $1 / $2 per million tokens, in nano-USD.
+                input_nano_usd_per_million_tokens=1_000_000_000,
+                output_nano_usd_per_million_tokens=2_000_000_000,
             ),
             pricing_source="installed project fixture",
             billing_source=billing_source,
@@ -2987,6 +3054,47 @@ def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
     assert all("COMPLETE" in transcript for transcript in transcripts)
 
 
+def test_tty_child_supports_descriptors_above_select_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive a real pseudo-terminal whose master is above select's descriptor ceiling.
+
+    Args:
+        tmp_path: Isolated child working directory.
+        monkeypatch: Fixture replacing only pseudo-terminal descriptor allocation.
+    """
+    if sys.platform == "win32":
+        pytest.skip("High-numbered pseudo-terminal descriptors require POSIX.")
+
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1024:
+        pytest.skip("The process descriptor limit does not allow a high-numbered terminal.")
+    openpty = pty.openpty
+
+    def high_descriptor_pty() -> tuple[int, int]:
+        """Duplicate the real terminal master above FD_SETSIZE without opening many files."""
+        master, slave = openpty()
+        try:
+            high_master = fcntl.fcntl(master, fcntl.F_DUPFD, 1024)
+        except OSError:
+            os.close(slave)
+            raise
+        finally:
+            os.close(master)
+        return high_master, slave
+
+    monkeypatch.setattr(pty, "openpty", high_descriptor_pty)
+    transcript = _run_tty_child(
+        [sys.executable, "-c", "assert input('Prompt: ') == 'yes'; print('COMPLETE', flush=True)"],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        answers=[("Prompt:", "yes")],
+        completion_marker="COMPLETE",
+        timeout=5,
+    )
+    assert "COMPLETE" in transcript
+
+
 def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
     tmp_path: Path,
 ) -> None:
@@ -3112,6 +3220,65 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     )
 
 
+def test_release_requirements_allow_anthropic_only_in_the_dev_extra() -> None:
+    """Permit the SDK drift check without admitting Anthropic to installed runtime extras."""
+    for marker in ('extra == "dev"', "extra == 'dev'"):
+        _assert_allowed_requirements(f"Requires-Dist: anthropic<2,>=1.2; {marker}\n\n")
+    for marker in (
+        "",
+        'extra == "sft"',
+        'extra == "dev" or extra == "sft"',
+        'extra == "dev" or python_version >= "3.12"',
+        'extra != "dev"',
+    ):
+        metadata = f"Requires-Dist: anthropic<2,>=1.2{'; ' + marker if marker else ''}\n\n"
+        with pytest.raises(AssertionError, match="forbidden release requirement: anthropic"):
+            _assert_allowed_requirements(metadata)
+
+
+def test_release_requirements_keep_other_forbidden_dependencies_out_of_extras() -> None:
+    """The dev SDK exception never admits other removed dependencies or spelling aliases."""
+    for name in FORBIDDEN_REQUIREMENTS - {"anthropic"}:
+        for spelling in (name, name.replace("-", "_").upper()):
+            for marker in ("", '; extra == "dev"', '; extra == "sft"'):
+                metadata = f"Requires-Dist: {spelling}>=1{marker}\n\n"
+                with pytest.raises(AssertionError, match="forbidden release requirement"):
+                    _assert_allowed_requirements(metadata)
+
+
+def test_release_requirement_headers_ignore_description_body() -> None:
+    """Folded headers count as dependencies while README text never changes the contract."""
+    metadata = (
+        "Metadata-Version: 2.5\n"
+        "Requires-Dist: google_auth>=2\n"
+        'Requires-Dist: click>=8; python_version >= "3.12"\n'
+        "Requires-Dist: anthropic<2,>=1.2;\n"
+        ' extra == "dev"\n'
+        "\nRequires-Dist: transformers>=4\n"
+        "Requires-Dist: imaginary-core-package>=1\n"
+    )
+    _assert_allowed_requirements(metadata)
+    assert _core_requirement_names(metadata) == {"google-auth", "click"}
+
+
+def test_release_core_requirements_retain_runtime_capable_extra_markers() -> None:
+    """Runtime-active OR and empty-extra markers cannot hide a new core dependency."""
+    core_headers = "\n".join(f"Requires-Dist: {name}" for name in REQUIRED_CORE_REQUIREMENTS)
+    for marker in (
+        'extra == "dev" or python_version >= "3.12"',
+        'python_version >= "3.12" or extra == "dev"',
+        'extra == ""',
+        'extra != "dev"',
+    ):
+        metadata = f"{core_headers}\nRequires-Dist: unexpected-runtime-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS | {
+            "unexpected-runtime-package"
+        }
+    for marker in ('extra == "dev"', "extra == 'sft'"):
+        metadata = f"{core_headers}\nRequires-Dist: optional-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+
+
 def test_built_archives_match_current_package_contract() -> None:
     """Prove fresh wheel and sdist match the current package contract.
 
@@ -3144,7 +3311,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
+        _assert_allowed_requirements(metadata)
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
@@ -3156,7 +3323,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
+        _assert_allowed_requirements(metadata)
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
 
@@ -3212,7 +3379,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
 
     architecture = (docs / "reference" / "gateway-architecture.md").read_text(encoding="utf-8")
     assert "GET /v1/models" in architecture
-    assert "micro-USD-per-million-token" in architecture
+    assert "nano-USD-per-million-token" in architecture
     assert "POST /v1/chat/completions" in architecture
     assert "POST /v1/responses" in architecture
     assert "provider_certification.py" in architecture

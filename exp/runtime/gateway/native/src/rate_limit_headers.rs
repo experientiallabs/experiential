@@ -45,17 +45,25 @@ pub fn harvest_rate_limit_headers(headers: &HeaderMap) -> Option<Map<String, Val
     }
 }
 
-/// Parse one `Retry-After` header as whole seconds.
+/// Parse one `Retry-After` header as whole seconds from now.
 ///
-/// Only the integer-seconds form parses here; the HTTP-date form still rides
-/// the harvested map verbatim, where the control plane's fuller parser
-/// handles it. Anything unparseable yields `None` rather than a guess.
+/// Both wire forms parse: integer seconds verbatim, and an HTTP-date as the
+/// seconds remaining until it (rounded up), so a throttle backoff floors on
+/// the provider's stated wait whichever form the provider chose. A date
+/// already past, a zero, or anything unparseable yields `None` rather than a
+/// guess; the harvested map still carries the raw value for the ledger.
 pub fn retry_after_seconds(headers: &HeaderMap) -> Option<u32> {
-    headers
+    let value = headers
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|seconds| *seconds > 0)
+        .map(str::trim)?;
+    if let Ok(seconds) = value.parse::<u32>() {
+        return Some(seconds).filter(|seconds| *seconds > 0);
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    let remaining = date.duration_since(std::time::SystemTime::now()).ok()?;
+    let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+    u32::try_from(seconds).ok().filter(|seconds| *seconds > 0)
 }
 
 #[cfg(test)]
@@ -109,6 +117,21 @@ mod tests {
             Some(7)
         );
         assert_eq!(retry_after_seconds(&headers(&[("retry-after", "0")])), None);
+        // The HTTP-date form is the seconds remaining until it, rounded up;
+        // a date already past states no wait.
+        let future = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(90),
+        );
+        let remaining = retry_after_seconds(&headers(&[("retry-after", future.as_str())]))
+            .expect("a future date is a wait");
+        assert!((89..=90).contains(&remaining), "{remaining}");
+        let past = httpdate::fmt_http_date(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(90),
+        );
+        assert_eq!(
+            retry_after_seconds(&headers(&[("retry-after", past.as_str())])),
+            None
+        );
         assert_eq!(
             retry_after_seconds(&headers(&[(
                 "retry-after",

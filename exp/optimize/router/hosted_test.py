@@ -1316,8 +1316,14 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
         prepared.artifacts,
         current.router_report.spend_ledger,
     )
+    # Pick an incurred entry that CARRIES evidence: entries sort by operation id
+    # (a content digest), so which entry comes first shifts whenever any digest
+    # input changes, and an evidence-less retrieval entry would trip the
+    # "omits its source-bearing evidence" check before the changed-amount one.
     prior_entry = next(
-        item for item in policy_ledger.entries if item.status != ProviderSpendStatus.NOT_INCURRED
+        item
+        for item in policy_ledger.entries
+        if item.status != ProviderSpendStatus.NOT_INCURRED and item.evidence is not None
     )
     changed = ProviderSpendEntry.model_validate(
         {

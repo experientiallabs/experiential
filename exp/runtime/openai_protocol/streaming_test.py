@@ -148,7 +148,7 @@ def test_responses_sse_emits_full_lifecycle_monotonic_sequence_and_exact_argumen
     encoder = ResponsesSseEncoder(
         request_id="request-one",
         model="coding",
-        created_at=123.0,
+        created_at=123,
         request=request,
     )
     frames = encode_responses_events(encoder, _tool_events())
@@ -187,7 +187,7 @@ def test_responses_sse_exposes_ignored_compatibility_parameters() -> None:
     encoder = ResponsesSseEncoder(
         request_id="request-ignored",
         model="coding",
-        created_at=123.0,
+        created_at=123,
         request=request,
     )
 
@@ -211,7 +211,7 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
         ResponsesSseEncoder(
             request_id="request-reasoning",
             model="coding",
-            created_at=123.0,
+            created_at=123,
             request=request,
         ),
         (
@@ -268,7 +268,7 @@ def test_responses_sse_exposes_provider_encrypted_reasoning_only_when_requested(
         ResponsesSseEncoder(
             request_id="request-provider-encrypted",
             model="coding",
-            created_at=123.0,
+            created_at=123,
             request=request,
         ),
         (
@@ -309,7 +309,7 @@ def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal
         ResponsesSseEncoder(
             request_id="request-two",
             model="coding",
-            created_at=123.0,
+            created_at=123,
             request=request,
         ),
         (

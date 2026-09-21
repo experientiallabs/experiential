@@ -42,6 +42,34 @@ def test_unsupported_capability_rejections_never_open_the_circuit() -> None:
     assert registry.claim(_KEY)
 
 
+def test_empty_completions_never_open_the_circuit_but_release_probe_state() -> None:
+    """An empty completion is the model's answer to the content, not rung deadness.
+
+    2026-09-15: one Claude Code session re-sent the same prompt every minute
+    and OpenAI answered each with a 4-token empty message; as a
+    ``provider_internal`` those failures would have opened the luna rung's
+    circuit on that worker for every other caller. The class never counts
+    toward the threshold and never resets genuine progress, while a probe
+    that answered empty is still consumed like any other outcome.
+    """
+    registry = DeploymentHealthRegistry(failure_threshold=2, clock=lambda: 100.0)
+
+    for _ in range(50):
+        registry.failed(_KEY, _failure(GatewayFailureClass.EMPTY_COMPLETION))
+    assert registry.claim(_KEY)
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    registry.failed(_KEY, _failure(GatewayFailureClass.EMPTY_COMPLETION))
+    assert registry.claim(_KEY)
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    assert not registry.claim(_KEY)
+
+    state = registry._states[_KEY]  # noqa: SLF001 - probe bookkeeping is the assertion.
+    state.half_open_probe = True
+    registry.failed(_KEY, _failure(GatewayFailureClass.EMPTY_COMPLETION))
+    assert not state.half_open_probe
+
+
 def test_caller_invalid_requests_do_not_reset_operational_failure_progress() -> None:
     """Interleaved caller faults neither add to nor clear genuine failure counts."""
     registry = DeploymentHealthRegistry(failure_threshold=2, clock=lambda: 100.0)
@@ -206,3 +234,23 @@ def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:
     # One key outside its window makes the route dispatchable again.
     now[0] += 21.0
     assert registry.throttled_remaining_seconds((first, second)) is None
+
+
+def test_throttle_redial_claim_passes_the_window_but_not_an_open_circuit() -> None:
+    """A post-backoff redial re-enters the throttled rung; a dead rung still refuses it."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(
+        failure_threshold=1, throttle_seconds=30.0, clock=lambda: now[0]
+    )
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    # Every other claim honors the window the provider asked for...
+    assert not registry.claim(_KEY)
+    assert not registry.claim_last_resort(_KEY)
+    assert not registry.claim_forced(_KEY)
+    # ...while the request that waited the backoff is the one probing back.
+    assert registry.claim_throttle_redial(_KEY)
+
+    # Operational deadness marked meanwhile opens the circuit: no redial.
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    assert not registry.claim_throttle_redial(_KEY)

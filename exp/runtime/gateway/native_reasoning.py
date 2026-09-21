@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
@@ -12,7 +13,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
 from exp.runtime.gateway.native_components import NativeGatewayComponents
-from exp.runtime.gateway.native_execution import resolve_route_profiles
+from exp.runtime.gateway.native_execution import resolve_route_profiles, select_route_deployments
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
     parse_reasoning_carrier_tool_calls,
@@ -57,6 +58,80 @@ def strip_stale_reasoning_history(request: GatewayRequest) -> GatewayRequest:
         if retained != message.provider_reasoning:
             messages[index] = message.model_copy(update={"provider_reasoning": retained})
     return request.model_copy(update={"messages": tuple(messages)})
+
+
+_ACTIVE_REASONING_KINDS = frozenset({"sealed_reasoning_content", "reasoning_content"})
+"""Gateway-sealed reasoning kinds only the issuing rung's credential can replay."""
+
+
+def strip_active_reasoning_history(request: GatewayRequest) -> GatewayRequest:
+    """Remove the post-user-boundary sealed reasoning only the pinned rung could unseal.
+
+    The failover counterpart of :func:`strip_stale_reasoning_history`: where
+    that helper drops sealed state BEFORE the latest user boundary on every
+    route, this one drops the ACTIVE sealed and unsealed provider reasoning
+    after it, for a rung that is not the issuing deployment. Everything else
+    stays: the messages, their visible text, the assistant tool calls, the tool
+    results, and caller-owned plaintext (``exposed_reasoning_content``) or
+    foreign-wire blocks, which the rung's own payload builder disposes of. The
+    result is idempotent and leaves a request without active reasoning
+    unchanged. The stated loss is the model's thinking continuity across that
+    tool call and the issuing provider's prompt cache for the turn.
+
+    Args:
+        request: The admitted request with its reasoning history already
+            authenticated and unsealed for the pinned rung.
+
+    Returns:
+        The request with no post-boundary gateway-sealed reasoning.
+    """
+    last_user = max(
+        (index for index, message in enumerate(request.messages) if message.role == "user"),
+        default=-1,
+    )
+    messages = list(request.messages)
+    changed = False
+    for index, message in enumerate(messages):
+        if index <= last_user:
+            continue
+        retained = tuple(
+            block
+            for block in message.provider_reasoning
+            if block.kind not in _ACTIVE_REASONING_KINDS
+        )
+        if retained != message.provider_reasoning:
+            messages[index] = message.model_copy(update={"provider_reasoning": retained})
+            changed = True
+    if not changed:
+        return request
+    return request.model_copy(update={"messages": tuple(messages)})
+
+
+def rung_provider_request(
+    route: GatewayRoute,
+    deployment: ExactModelDeployment,
+    provider_request: GatewayRequest,
+) -> GatewayRequest:
+    """Return the provider request one rung of ``route`` dispatches.
+
+    The issuing rung of a reasoning-pinned route (and every rung of an unpinned
+    route) dispatches ``provider_request`` verbatim; a failover fallback that
+    ``route.requires_reasoning_strip`` receives it with the pinned provider's
+    active sealed reasoning removed, so a sealed block never reaches another
+    provider's payload. Both the admission compatibility probe and the frozen
+    dispatch build read the rung's request through this one seam.
+
+    Args:
+        route: The admitted route owning ``deployment``.
+        deployment: The rung whose payload is being built.
+        provider_request: The route-level streaming-forced provider request.
+
+    Returns:
+        The rung's provider request.
+    """
+    if route.requires_reasoning_strip(deployment):
+        return strip_active_reasoning_history(provider_request)
+    return provider_request
 
 
 def unseal_reasoning_history(
@@ -145,8 +220,14 @@ def _process_reasoning_history(
                 authorization,
                 carrier.deployment_hint,
             )
-            resolved = resolve_route_profiles(components.runtime_catalogs, route)
-            if len(resolved) != 1:
+            # The carrier authenticates against the issuing rung alone; the
+            # route's failover fallbacks (which dispatch without this
+            # reasoning) are resolved later, at admission, where a dead one
+            # is narrowed past instead of failing the continuation here.
+            resolved = resolve_route_profiles(
+                components.runtime_catalogs, select_route_deployments(route, (0,))
+            )
+            if len(resolved) != 1 or route.deployment.deployment_id != carrier.deployment_hint:
                 raise ValueError("reasoning carrier route must resolve one exact deployment")
             profile, _client = resolved[0]
             authority = reasoning_carrier_authority(

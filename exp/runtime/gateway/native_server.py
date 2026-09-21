@@ -7,6 +7,8 @@ import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, cast
 
+from exp.runtime.gateway.guardrails.deterministic import NativeDetector
+
 if TYPE_CHECKING:
     from exp_gateway_native import ShutdownHandle
 
@@ -19,6 +21,11 @@ class NativeServerControlPlane(Protocol):
     @property
     def request_timeout_seconds(self) -> float:
         """Return the shared request deadline."""
+        ...
+
+    @property
+    def guardrail_detectors(self) -> dict[str, NativeDetector]:
+        """Return the compiled deterministic guardrail rules, keyed by adapter."""
         ...
 
 
@@ -36,6 +43,7 @@ def serve_native_gateway(
     connect_timeout_seconds: float = 5.0,
     time_to_first_byte_seconds: float = 15.0,
     time_to_first_byte_seconds_per_million_input_tokens: float = 240.0,
+    time_to_first_token_seconds: float = 120.0,
     native_usage_enabled: bool = True,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
@@ -53,16 +61,30 @@ def serve_native_gateway(
             connection fails over in seconds instead of hanging on the
             per-deployment request timeout.
         time_to_first_byte_seconds: Fail-fast bound on the wait for a
-            provider's first streamed byte per attempt. It never caps total
-            generation time: once the first byte arrives, reads are paced by
-            the deployment's own per-chunk timeout, so slow reasoning models
-            keep streaming for as long as they need. Deployments may
-            override the flat bound through their gateway capabilities.
+            provider's response headers per attempt (the flat part; the
+            input-scaled allowance below is added). Deployments may
+            override it through their gateway capabilities.
         time_to_first_byte_seconds_per_million_input_tokens: Input-scaled
             first-byte allowance added on top of the flat bound, in seconds
             per million approximate input tokens (request bytes over four),
             so a very large prompt's prefill is not misread as a dead lane.
+            Added to both the header and the first-token bounds.
             Deployments may override it through their gateway capabilities.
+        time_to_first_token_seconds: Fail-fast bound on the wait for a
+            provider's first TOKEN per attempt: the first semantic event
+            (content, reasoning, a tool call), absolute from the dial, with
+            the same input-scaled allowance added. Response headers, SSE
+            keepalive comments and role-only frames do not satisfy it (a
+            lane that sends those at once and then stalls for minutes is
+            exactly the case it exists for), and a thinking model on a chat
+            wire streams nothing until its first content token, so the
+            default is two minutes rather than the header bound's fifteen
+            seconds (clamped to three quarters of ``request_timeout_seconds``
+            so the stall is caught while the request can still fail over).
+            It never caps total generation time: once the attempt
+            commits, reads are paced by the deployment's own per-chunk
+            timeout. A stall fails over to the next rung. Deployments may
+            override the flat bound through their gateway capabilities.
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
@@ -96,6 +118,7 @@ def serve_native_gateway(
         "time_to_first_byte_seconds_per_million_input_tokens": (
             time_to_first_byte_seconds_per_million_input_tokens
         ),
+        "time_to_first_token_seconds": time_to_first_token_seconds,
         "native_usage_enabled": native_usage_enabled,
     }
     try:
@@ -104,6 +127,7 @@ def serve_native_gateway(
             json.dumps(config),
             shutdown,
             on_listening,
+            control_plane.guardrail_detectors,
         )
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.

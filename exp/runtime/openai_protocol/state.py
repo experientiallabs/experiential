@@ -114,33 +114,6 @@ class ResponseReplayStore(Protocol):
         ...
 
 
-class ResponseContinuationStore(Protocol):
-    """Namespaced state operations required by Responses continuations.
-
-    Implementations must apply their finite retention policy to the complete namespace and public
-    response identity. Missing, expired, evicted, or cross-namespace state must fail closed.
-    """
-
-    async def remember(
-        self,
-        *,
-        namespace: ProtocolNamespace,
-        response_id: str,
-        state: ContinuationState,
-    ) -> None:
-        """Retain one completed Responses continuation within implementation bounds."""
-        ...
-
-    async def resolve(
-        self,
-        *,
-        namespace: ProtocolNamespace,
-        previous_response_id: str,
-    ) -> ContinuationState:
-        """Resolve an exact namespaced continuation or fail closed."""
-        ...
-
-
 class _BoundedReplayLease:
     """One local caller's ownership or join handle for a keyed response."""
 

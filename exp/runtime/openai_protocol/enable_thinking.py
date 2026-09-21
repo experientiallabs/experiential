@@ -1,25 +1,27 @@
 """Translate alternate enable-thinking Chat request shapes to canonical reasoning.
 
-Clients express "turn thinking on" three non-canonical ways on
-/v1/chat/completions: the Responses-style nested ``reasoning:{effort}``, the
-Anthropic-style ``thinking:{type}``, and the vLLM-native
-``chat_template_kwargs:{enable_thinking}``. Each is admitted and translated here
-to the canonical flat ``reasoning_effort`` (never dropped — dropping would leave
-thinking silently off), so one caller payload works in any shape. The
-model-aware default effort for a level-less enable is resolved later, at the
-route adaptation seam, via ``GatewayRequest.thinking_default_enable``.
+Clients express "turn thinking on" several non-canonical ways on
+/v1/chat/completions: the Responses-style nested ``reasoning:{effort}``,
+OpenRouter's unified ``reasoning:{enabled, max_tokens, exclude}``, the
+Anthropic-style ``thinking:{type}`` (``enabled`` or ``adaptive``), the vLLM-native
+``chat_template_kwargs:{enable_thinking}``, and DashScope's top-level
+``enable_thinking``. Each is admitted and translated here to the canonical flat
+``reasoning_effort`` (never dropped — dropping would leave thinking silently
+off), so one caller payload works in any shape. The model-aware default effort
+for a level-less enable is resolved later, at the route adaptation seam, via
+``GatewayRequest.thinking_default_enable``.
 """
 
 from __future__ import annotations
 
 from exp.common.models.model import ReasoningEffort
-from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.wire_models import _ChatRequest
 
 # Disclosure tokens (unified path->action(reason) vocabulary).
 _TRANSLATED = "{path}->translated(reasoning_effort)"
 _IGNORED = "{path}->ignored(explicit_reasoning_effort)"
-_BUDGET_DROPPED = "budget_tokens->dropped(not_carried)"
+_EXCLUDE_DROPPED = "reasoning.exclude->dropped(not_carried)"
 
 
 class _EnableThinkingResult:
@@ -38,21 +40,71 @@ class _EnableThinkingResult:
         self.disclosures = disclosures
 
 
+def _reasoning_object_intent(request: _ChatRequest) -> bool | None:
+    """Fold OpenRouter's ``reasoning`` object into one enable/disable vote.
+
+    ``effort`` votes by tier (``none`` disables), ``enabled`` votes literally,
+    and a ``max_tokens`` budget is an enable (OpenRouter infers ``enabled``
+    from either depth control). The three must agree; an explicit
+    ``enabled: false`` beside a tier or budget is a caller error named by
+    field. An empty object carries no intent.
+    """
+    reasoning = request.reasoning
+    if reasoning is None:
+        return None
+    votes: list[bool] = []
+    if reasoning.effort is not None:
+        votes.append(reasoning.effort != "none")
+    if reasoning.max_tokens is not None:
+        votes.append(True)
+    if reasoning.enabled is not None:
+        votes.append(reasoning.enabled)
+    if votes and any(vote != votes[0] for vote in votes):
+        raise invalid_field(
+            "reasoning.enabled",
+            "reasoning.enabled must agree with reasoning.effort / reasoning.max_tokens: "
+            "an effort tier or a token budget turns thinking on.",
+        )
+    return votes[0] if votes else None
+
+
 def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     """Resolve the effective reasoning control from the flat and alternate fields.
 
-    The explicit flat ``reasoning_effort`` always wins; a level-less enable defers
+    The explicit flat ``reasoning_effort`` selects depth when enable controls agree;
+    contradictory on/off controls are refused. A level-less enable defers
     to the model default (``thinking_default_enable``). Alternate fields that
     disagree on enable-vs-disable are a caller error and rejected by name.
+    Numerical thinking budgets have no enforceable Chat adapter representation
+    and are refused, even beside an explicit effort. Callers can use Messages
+    with a budget-capable model, or deliberately remove the budget and choose
+    an effort. ``exclude`` is disclosed as not carried.
     """
-    # (path, effort-or-None, is_present-with-intent) for each alternate field.
-    reasoning_effort = request.reasoning.effort if request.reasoning is not None else None
-    reasoning_present = request.reasoning is not None and request.reasoning.effort is not None
+    reasoning = request.reasoning
+    budget_param = (
+        "thinking.budget_tokens"
+        if request.thinking is not None and request.thinking.budget_tokens is not None
+        else "reasoning.max_tokens"
+        if reasoning is not None and reasoning.max_tokens is not None
+        else None
+    )
+    if budget_param is not None:
+        raise unsupported_field(
+            budget_param,
+            message=(
+                f"This Chat route cannot enforce {budget_param}. Use Messages with a "
+                "budget-capable model, or explicitly remove the budget and choose reasoning_effort."
+            ),
+        )
+    reasoning_intent = _reasoning_object_intent(request)
+    reasoning_present = reasoning_intent is not None
 
     thinking_enable: bool | None = None
     thinking_present = request.thinking is not None
     if request.thinking is not None:
-        thinking_enable = request.thinking.type == "enabled"
+        # ``adaptive`` is Anthropic's 4.6+ on-mode; on this surface it carries
+        # the same intent as ``enabled`` (think at the route's default depth).
+        thinking_enable = request.thinking.type in {"enabled", "adaptive"}
 
     cck_enable = (
         request.chat_template_kwargs.enable_thinking
@@ -60,55 +112,55 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
         else None
     )
     cck_present = cck_enable is not None
+    flat_enable_present = request.enable_thinking is not None
 
-    budget_present = request.thinking is not None and request.thinking.budget_tokens is not None
+    # Fields present-but-inert: told about, never carried.
+    dropped: list[str] = []
+    if reasoning is not None and reasoning.exclude:
+        dropped.append(_EXCLUDE_DROPPED)
 
-    # Explicit flat reasoning_effort wins: every present alternate field is a no-op
-    # the caller is told about, and the flat value is passed through unchanged.
+    alternates = (
+        ("reasoning", reasoning_present),
+        ("thinking", thinking_present),
+        ("chat_template_kwargs", cck_present),
+        ("enable_thinking", flat_enable_present),
+    )
+
+    # Flat effort selects depth, but cannot override an explicit on/off constraint.
     if request.reasoning_effort is not None:
-        disclosures: list[str] = []
-        if reasoning_present:
-            disclosures.append(_IGNORED.format(path="reasoning"))
-        if thinking_present:
-            disclosures.append(_IGNORED.format(path="thinking"))
-        if cck_present:
-            disclosures.append(_IGNORED.format(path="chat_template_kwargs"))
+        if any(
+            vote != (request.reasoning_effort != "none")
+            for vote in (reasoning_intent, thinking_enable, cck_enable, request.enable_thinking)
+            if vote is not None
+        ):
+            raise invalid_field(
+                "reasoning_effort",
+                "reasoning_effort conflicts with an enable-thinking control. "
+                "Use agreeing on/off settings or remove the conflicting control.",
+            )
+        # Each alternate object is ignored WHOLE, so its inner fields are not
+        # separately reported as translated or dropped.
+        disclosures = [_IGNORED.format(path=path) for path, present in alternates if present]
         return _EnableThinkingResult(request.reasoning_effort, False, tuple(disclosures))
 
     # No explicit flat value: fold the alternate fields into one intent. Each
     # present field votes enable ("on", possibly at a level) or disable ("none").
-    def _intent(effort_or_enable: ReasoningEffort | bool | None) -> bool | None:
-        if effort_or_enable is None:
-            return None
-        if isinstance(effort_or_enable, bool):
-            return effort_or_enable
-        return effort_or_enable != "none"  # a concrete effort: "none" disables
-
     votes = [
         vote
-        for vote in (
-            _intent(reasoning_effort if reasoning_present else None),
-            _intent(thinking_enable if thinking_present else None),
-            _intent(cck_enable if cck_present else None),
-        )
+        for vote in (reasoning_intent, thinking_enable, cck_enable, request.enable_thinking)
         if vote is not None
     ]
     if votes and any(vote != votes[0] for vote in votes):
         raise invalid_field(
             "thinking",
-            "conflicting enable-thinking fields: reasoning/thinking/chat_template_kwargs "
-            "must all enable or all disable.",
+            "conflicting enable-thinking fields: reasoning/thinking/chat_template_kwargs/"
+            "enable_thinking must all enable or all disable.",
         )
 
-    disclosures = []
-    if budget_present:
-        disclosures.append(_BUDGET_DROPPED)
-    if reasoning_present:
-        disclosures.append(_TRANSLATED.format(path="reasoning"))
-    if thinking_present:
-        disclosures.append(_TRANSLATED.format(path="thinking"))
-    if cck_present:
-        disclosures.append(_TRANSLATED.format(path="chat_template_kwargs"))
+    disclosures = [
+        *dropped,
+        *(_TRANSLATED.format(path=path) for path, present in alternates if present),
+    ]
 
     if not votes:
         # No alternate field carried an intent (absent, or an empty object).
@@ -116,8 +168,8 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     if votes[0] is False:
         # All present fields disable → canonical none.
         return _EnableThinkingResult("none", False, tuple(disclosures))
-    # Enabled: a nested reasoning effort pins the level; otherwise defer the
-    # model-aware default to the adaptation seam.
-    if reasoning_present and reasoning_effort is not None:
-        return _EnableThinkingResult(reasoning_effort, False, tuple(disclosures))
+    # A nested effort pins the level; otherwise defer the requested bare
+    # enable to the model-aware adaptation seam.
+    if reasoning is not None and reasoning.effort is not None:
+        return _EnableThinkingResult(reasoning.effort, False, tuple(disclosures))
     return _EnableThinkingResult(None, True, tuple(disclosures))

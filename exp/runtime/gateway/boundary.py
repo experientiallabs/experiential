@@ -21,6 +21,7 @@ from exp.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
     GatewayStoreError,
     InvalidVirtualKeyError,
+    ZdrRoutingUnavailableError,
 )
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -67,6 +68,18 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             ),
             error_type="permission_error",
             param="model",
+        )
+    elif isinstance(exception, ZdrRoutingUnavailableError):
+        error = OpenAIProtocolError(
+            status_code=403,
+            code="model_not_granted",
+            message=(
+                "provider.zdr demands zero-data-retention routing, which this gateway cannot "
+                "judge: it publishes no provider data-retention postures. Remove provider.zdr, "
+                "or use a host that publishes postures and routes on them."
+            ),
+            error_type="permission_error",
+            param="provider.zdr",
         )
     elif isinstance(exception, IdempotencyConflictError):
         error = OpenAIProtocolError(

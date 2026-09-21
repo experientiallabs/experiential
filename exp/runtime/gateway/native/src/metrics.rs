@@ -128,6 +128,8 @@ pub struct Metrics {
     escalated_host_policy: AtomicU64,
     escalated_other: AtomicU64,
     open_retries: AtomicU64,
+    encrypted_reasoning_stripped: AtomicU64,
+    encrypted_reasoning_stripped_proactive: AtomicU64,
     settlement_retries: AtomicU64,
     settlement_give_ups: AtomicU64,
     active_requests: AtomicU64,
@@ -155,6 +157,8 @@ impl Metrics {
             escalated_host_policy: AtomicU64::new(0),
             escalated_other: AtomicU64::new(0),
             open_retries: AtomicU64::new(0),
+            encrypted_reasoning_stripped: AtomicU64::new(0),
+            encrypted_reasoning_stripped_proactive: AtomicU64::new(0),
             settlement_retries: AtomicU64::new(0),
             settlement_give_ups: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
@@ -202,6 +206,20 @@ impl Metrics {
         self.open_retries.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one same-rung re-dial with the refused encrypted reasoning
+    /// items stripped from the replayed input.
+    pub fn record_encrypted_reasoning_stripped(&self) {
+        self.encrypted_reasoning_stripped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one dial whose replayed encrypted reasoning was stripped from
+    /// memory before the provider was asked, sparing the refused dial.
+    pub fn record_encrypted_reasoning_stripped_proactive(&self) {
+        self.encrypted_reasoning_stripped_proactive
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Count one retried settlement delivery after a failed write.
     pub fn record_settlement_retry(&self) {
         self.settlement_retries.fetch_add(1, Ordering::Relaxed);
@@ -241,6 +259,8 @@ impl Metrics {
                 "other": load(&self.escalated_other),
             },
             "open_retries": load(&self.open_retries),
+            "encrypted_reasoning_stripped": load(&self.encrypted_reasoning_stripped),
+            "encrypted_reasoning_stripped_proactive": load(&self.encrypted_reasoning_stripped_proactive),
             "settlement_retries": load(&self.settlement_retries),
             "settlement_give_ups": load(&self.settlement_give_ups),
             "active_requests": load(&self.active_requests),
@@ -273,6 +293,8 @@ mod tests {
         metrics.record_outcome("failed", true);
         metrics.record_escalation(EscalationKind::ProjectAlias);
         metrics.record_open_retry();
+        metrics.record_encrypted_reasoning_stripped();
+        metrics.record_encrypted_reasoning_stripped_proactive();
         metrics.record_settlement_retry();
         metrics.record_settlement_give_up();
         metrics.enter_request();
@@ -285,6 +307,8 @@ mod tests {
         assert_eq!(snapshot["escalated_requests"]["project_alias"], 1);
         assert_eq!(snapshot["escalated_requests"]["other"], 0);
         assert_eq!(snapshot["open_retries"], 1);
+        assert_eq!(snapshot["encrypted_reasoning_stripped"], 1);
+        assert_eq!(snapshot["encrypted_reasoning_stripped_proactive"], 1);
         assert_eq!(snapshot["settlement_retries"], 1);
         assert_eq!(snapshot["settlement_give_ups"], 1);
         assert_eq!(snapshot["active_requests"], 1);
@@ -359,6 +383,8 @@ mod tests {
                 "served_requests",
                 "escalated_requests",
                 "open_retries",
+                "encrypted_reasoning_stripped",
+                "encrypted_reasoning_stripped_proactive",
                 "settlement_retries",
                 "settlement_give_ups",
                 "active_requests",

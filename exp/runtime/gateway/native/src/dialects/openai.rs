@@ -4,15 +4,14 @@
 use serde_json::Value;
 
 use super::{
-    bounded_wire_token, complete_streamed_tool, complete_streamed_tool_truncated,
-    finish_open_tools, finish_open_tools_truncated, malformed, optional_text, parse_object,
-    provider_error_detail, refusal_failure, Normalizer,
+    bounded_wire_token, complete_streamed_tool, complete_streamed_tool_or_drop_cut,
+    complete_streamed_tool_truncated, finish_open_tools_relay, finish_open_tools_truncated,
+    malformed, optional_text, parse_object, provider_error_detail, refusal_failure, Normalizer,
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
-    openai_usage, require_bounded_string, require_string, require_u64, Event,
-    ProviderAssistantMessagePhase, ProviderOutputItemKind, ProviderOutputItemStatus,
-    ToolAccumulator,
+    require_bounded_string, require_string, require_u64, Event, ProviderAssistantMessagePhase,
+    ProviderOutputItemKind, ProviderOutputItemStatus, ToolAccumulator,
 };
 
 const MAXIMUM_OPENAI_ID_CHARS: usize = 256;
@@ -261,9 +260,16 @@ impl Normalizer {
                     .map(String::as_str)
                     .unwrap_or("");
                 if !streamed.is_empty() && streamed != final_text {
-                    return Err(malformed(
-                        "OpenAI reasoning summary fragments changed at done",
-                    ));
+                    // The summary is display-only prose and its deltas were
+                    // already relayed; a `done` text that differs (gpt-5.6-luna,
+                    // 9 streams in 14 days, 2026-09-12..13) is logged, never a
+                    // reason to fail a served answer.
+                    let line = serde_json::json!({
+                        "event": "reasoning_summary_changed_at_done",
+                        "streamed_bytes": streamed.len(),
+                        "final_bytes": final_text.len(),
+                    });
+                    eprintln!("exp-gateway-native: {line}");
                 }
                 if streamed.is_empty() && !final_text.is_empty() {
                     self.reserve_summary_entry(key)?;
@@ -333,6 +339,7 @@ impl Normalizer {
                         phase: None,
                     });
                     events.push(Event::ToolCallStarted {
+                        custom: false,
                         index,
                         call_id,
                         name,
@@ -398,6 +405,7 @@ impl Normalizer {
                         phase: None,
                     });
                     events.push(Event::ToolCallStarted {
+                        custom: false,
                         index,
                         call_id,
                         name,
@@ -657,8 +665,20 @@ impl Normalizer {
                             // mid-fragment call is the caller's budget to
                             // raise, never a malformed stream.
                             complete_streamed_tool_truncated(index, tool, &mut events)?;
-                        } else {
-                            complete_streamed_tool(index, tool, &mut events)?;
+                        } else if complete_streamed_tool_or_drop_cut(
+                            index,
+                            tool,
+                            &mut events,
+                            "completed",
+                        )? {
+                            // OpenAI marks a function_call item `completed`
+                            // while its arguments end mid-value (gpt-5.6-luna,
+                            // 2026-09-10..14, buffers of 30 KB to 900 KB;
+                            // exp#896): the item status misreports the cut.
+                            // The call is dropped and the terminal below
+                            // settles Incomplete; a syntax error inside the
+                            // arguments still fails closed.
+                            self.dropped_cut_call = true;
                         }
                     }
                     Some("custom_tool_call") => {
@@ -733,28 +753,7 @@ impl Normalizer {
                 } else {
                     ProviderOutputItemStatus::Completed
                 };
-                let unfinished: Vec<_> = self
-                    .openai_output_items
-                    .iter()
-                    .filter(|(index, _)| !self.openai_completed_output_items.contains(index))
-                    .map(|(index, (kind, item_id))| (*index, *kind, item_id.clone()))
-                    .collect();
-                for (output_index, kind, item_id) in unfinished {
-                    if kind == ProviderOutputItemKind::FunctionCall {
-                        if let Some(tool) = self.tools.get_mut(&output_index) {
-                            tool.provider_status = Some(terminal_item_status);
-                        }
-                    }
-                    self.openai_completed_output_items.insert(output_index);
-                    events.push(Event::ProviderOutputItemCompleted {
-                        output_index,
-                        item_id,
-                        kind,
-                        status: Some(terminal_item_status),
-                        phase: None,
-                    });
-                }
-                events.extend(self.openai_sweep_hosted_items());
+                events.extend(self.openai_close_unfinished_items(terminal_item_status));
                 // Every incomplete terminal is the provider declaring it cut
                 // the output early, so a call still open mid-fragment is
                 // legitimately partial for ANY of its reasons: a budget cut
@@ -763,22 +762,31 @@ impl Normalizer {
                 // cut still reaches its own refusal or provider_internal
                 // terminal below instead of being pre-empted here as a
                 // malformed 502 (which would misclassify a refusal and churn
-                // the ladder). Only a COMPLETED response keeps the strict
-                // argument contract, so corruption in a served answer stays
-                // fail-closed.
+                // the ladder). A COMPLETED response keeps the strict contract
+                // for corruption inside the arguments, but a call still open
+                // and cut mid-value is the same misreported truncation the
+                // relay lanes see (exp#896): dropped, and the turn settles
+                // Incomplete instead of Completed.
                 events.extend(if is_incomplete {
                     finish_open_tools_truncated(&mut self.tools)?
                 } else {
-                    finish_open_tools(&mut self.tools)?
+                    let (tool_events, dropped) =
+                        finish_open_tools_relay(&mut self.tools, "completed")?;
+                    self.dropped_cut_call |= dropped;
+                    tool_events
                 });
-                if let Some(usage) =
-                    openai_usage(response.get("usage")).map_err(|message| malformed(&message))?
+                if let Some(usage) = self
+                    .openai_usage
+                    .update_responses(response.get("usage"))
+                    .map_err(|message| malformed(&message))?
                 {
                     events.push(Event::Usage(usage));
                 }
                 if !is_incomplete {
                     if self.refusal_seen {
                         events.push(Event::Failed(refusal_failure()));
+                    } else if self.dropped_cut_call {
+                        events.push(Event::Incomplete);
                     } else {
                         events.push(Event::Completed);
                     }
@@ -822,7 +830,9 @@ impl Normalizer {
                 let mut code = None;
                 let mut message = None;
                 if let Some(response) = payload.get("response").and_then(Value::as_object) {
-                    if let Some(usage) = openai_usage(response.get("usage"))
+                    if let Some(usage) = self
+                        .openai_usage
+                        .update_responses(response.get("usage"))
                         .map_err(|message| malformed(&message))?
                     {
                         events.push(Event::Usage(usage));
@@ -916,3 +926,7 @@ mod hosted_tests;
 #[cfg(test)]
 #[path = "openai/truncation_tests.rs"]
 mod truncation_tests;
+
+#[cfg(test)]
+#[path = "openai/cut_tests.rs"]
+mod cut_tests;

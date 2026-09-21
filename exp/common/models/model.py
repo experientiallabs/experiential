@@ -242,6 +242,14 @@ class ToolCall(ContractModel):
     identity explicitly.
     """
     provider_caller: JsonObject | None = Field(default=None, exclude=True)
+    custom: bool = Field(default=False, exclude=True)
+    """Whether this call targets a freeform OpenAI Responses ``custom`` tool.
+
+    Set when a Codex ``custom`` tool declaration was translated to a function
+    tool for a foreign wire; the Responses response inverts it back to a
+    ``custom_tool_call`` whose ``input`` is the freeform text. Excluded from
+    serialization like the other replay carriers; it rides on the live
+    response only and never on an immutable artifact."""
     """Opaque SDK 3.0 ``caller`` attribution on a Responses tool-call item.
 
     Programmatic tool calling attributes a ``function_call`` or
@@ -315,7 +323,7 @@ class ModelMessage(ContractModel):
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
     content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
-    """Ordered caller content parts when a user message carries attachments.
+    """Ordered caller content parts when a user or tool message carries attachments.
 
     Empty on every text-only message. The text parts concatenate to
     ``content``, so selectors, simulators, and persisted artifacts keep
@@ -336,8 +344,14 @@ class ModelMessage(ContractModel):
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.content_parts:
-            if self.role != "user":
-                raise ValueError("content parts are valid only for user messages")
+            # Tool results carry screenshots too (Bedrock toolResult image
+            # blocks); the Gemini and Bedrock wires build from this contract.
+            if self.role not in ("user", "tool"):
+                raise ValueError("content parts are valid only for user and tool messages")
+            if self.role == "tool" and any(
+                part.kind not in ("text", "image") for part in self.content_parts
+            ):
+                raise ValueError("tool messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -450,6 +464,16 @@ class ModelCapabilities(ContractModel):
     # Image generation is served only on a positive claim, like embeddings:
     # ``None`` is unknown and never dispatches to the images surface.
     supports_image_generation: bool | None = None
+    # The model EMITS images inside a chat/Responses turn (a text+image model
+    # such as gpt-5.4-image-2 or the gemini image lanes). A data-plane lane
+    # fact only: the chat normalizers carry no image event, so such a turn
+    # ends output-less, and the waterfall answers its empty completion at
+    # once instead of redialing a second whole image. NEVER an admission
+    # signal -- ``/v1/images`` stays gated on ``supports_image_generation``
+    # plus an Images-API wire (the 2026-09-15 lesson: reusing that claim for
+    # chat lanes admitted image generations onto OpenRouter, whose wire
+    # profile carries an ``images_url`` unconditionally).
+    emits_images: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
@@ -472,6 +496,31 @@ class ModelCapabilities(ContractModel):
     opaque carrier regardless of this flag. Exposure is additionally gated at the
     wire on a carrier-route identity, so an absent capability fails closed and
     reasoning stays stripped even on an otherwise-exposable endpoint.
+    """
+    reasoning_content_native: bool = False
+    """Whether this OpenAI-compatible rung speaks the native ``reasoning_content`` contract.
+
+    The origin returns the model's chain-of-thought in the standard
+    ``reasoning_content`` response field and accepts it back on assistant turns
+    (Tencent Hunyuan's contract, and a self-hosted vLLM origin started with a
+    reasoning parser). Declaring it makes the rung a preserved-thinking carrier
+    route regardless of its hostname, so the same model self-hosted keeps the
+    contract Tencent's own origins carry by recognition. Off by default: an
+    undeclared origin never gets a carrier route, and exposure still requires
+    ``reasoning_output_exposed`` on top.
+    """
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message only as the first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not the first message
+    (a second leading system turn included), so a vLLM origin serving that
+    template 400s the whole request when a coding agent injects a system turn
+    mid-conversation. On a declared rung the Chat wire builder folds every
+    instruction turn past the first into user text in place; an undeclared
+    rung's messages are never rewritten. A per-rung serving-stack fact, so it
+    is an operator declaration and stays out of the frozen identity like the
+    other gateway flags.
     """
     chat_max_tokens_field: ChatMaxTokensField | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)
@@ -566,6 +615,8 @@ class ModelCapabilities(ContractModel):
             "reasoning_effort",
             "sampling_requires_reasoning_none",
             "reasoning_output_exposed",
+            "reasoning_content_native",
+            "system_messages_leading_only",
             "chat_max_tokens_field",
             "minimum_temperature",
             "maximum_temperature",
@@ -588,6 +639,9 @@ class ModelCapabilities(ContractModel):
         # it out of the identity like supports_completions so existing traces
         # and frozen catalogs keep their digests.
         excluded.add("supports_image_generation")
+        # Same reasoning: emitting images changes how the data plane settles an
+        # output-less turn, never what a dispatch may do.
+        excluded.add("emits_images")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 

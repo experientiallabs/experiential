@@ -9,6 +9,7 @@ engines cannot drift at the message boundary.
 from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import ImageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import (
     TOOL_ERROR_TEXT_PREFIX,
     GatewayMessage,
@@ -28,6 +29,84 @@ from exp.runtime.models.providers.images import (
     responses_image_part,
 )
 from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
+
+TOOL_RESULT_IMAGE_FOLD_HEADER = (
+    "Images returned by the tool results above. This model's wire carries only text "
+    "inside tool messages, so each image is attached here, numbered where it appeared:"
+)
+"""Leading text of the user message that carries folded tool-result images."""
+
+
+def tool_result_image_marker(ordinal: int) -> str:
+    """Return the in-place marker left where a folded tool-result image stood."""
+    return f"[image {ordinal}: attached in the next user message]"
+
+
+def fold_tool_result_images(
+    messages: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...]:
+    """Move tool-result images into one user message after each run of tool results.
+
+    Chat Completions and Gemini ``functionResponse`` define no image carrier
+    inside a tool result, while a user turn carries images on both wires. The
+    fold keeps every image the caller sent: each tool message keeps its text
+    with a numbered marker where the image stood, and one user message
+    following the LAST tool message of the contiguous run (a user message
+    between two results of one parallel batch breaks the tool-call linkage
+    both providers check) carries the images in order, each introduced by its
+    number and the tool call that returned it. The disclosure travels in
+    ``x-experiential-ignored-parameters`` as ``TOOL_RESULT_IMAGE_FOLD_DISCLOSURE``.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The folded messages; the same tuple when no tool message carries an image.
+    """
+    if not any(message.role == "tool" and message.images for message in messages):
+        return messages
+    out: list[GatewayMessage] = []
+    pending: list[tuple[int, str, ImageContentPart]] = []
+    ordinal = 0
+
+    def flush() -> None:
+        """Emit the pending images as one user message after the tool run."""
+        if not pending:
+            return
+        parts: list[TextContentPart | ImageContentPart] = [
+            TextContentPart(text=TOOL_RESULT_IMAGE_FOLD_HEADER)
+        ]
+        for number, call_id, image in pending:
+            parts.append(TextContentPart(text=f"\nImage {number} (tool_call_id {call_id}):"))
+            parts.append(image)
+        out.append(
+            GatewayMessage(
+                role="user",
+                content="".join(part.text for part in parts if part.kind == "text"),
+                content_parts=tuple(parts),
+            )
+        )
+        pending.clear()
+
+    for message in messages:
+        if message.role != "tool":
+            flush()
+            out.append(message)
+            continue
+        if not message.images:
+            out.append(message)
+            continue
+        texts: list[str] = []
+        for part in message.content_parts:
+            if part.kind == "image":
+                ordinal += 1
+                pending.append((ordinal, message.tool_call_id or "", part))
+                texts.append(tool_result_image_marker(ordinal))
+            elif part.kind == "text":
+                texts.append(part.text)
+        out.append(message.model_copy(update={"content": "".join(texts), "content_parts": ()}))
+    flush()
+    return tuple(out)
 
 
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
@@ -97,10 +176,14 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             # Plaintext reasoning replays only on an exposure-gated Chat rung;
             # route narrowing disclosed the drop for this wire.
             continue
+        if block.kind in {"thinking", "redacted_thinking"}:
+            # Anthropic-signed thinking replays only on its own wire; route
+            # shaping disclosed the drop for this one.
+            continue
         if block.kind != "encrypted_reasoning":
-            # Anthropic thinking cannot replay on the OpenAI wire; route
+            # A gateway reasoning carrier belongs to the Chat wire; route
             # admission rejects the combination before dispatch.
-            raise ProviderResponseError("thinking blocks cannot replay on the Responses wire")
+            raise ProviderResponseError("reasoning carriers cannot replay on the Responses wire")
         # Reasoning items precede the assistant action they belong to, and
         # the encrypted payload is the round-trip authority; the display-only
         # summary is deliberately empty on replay. The item id and status are
@@ -495,6 +578,8 @@ def openai_chat_message(
     *,
     reasoning_route_sha256: str | None = None,
     reasoning_output_exposed: bool = False,
+    deepseek_reasoning_history: bool = False,
+    forwards_cache_control: bool = False,
 ) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON.
 
@@ -517,6 +602,16 @@ def openai_chat_message(
     ``reasoning_output_exposed`` marks a rung whose plaintext reasoning the
     caller may replay verbatim (an ``exposed_reasoning_content`` block); any
     other rung omits that block, which route narrowing already disclosed.
+    ``deepseek_reasoning_history`` marks DeepSeek's own origin, whose thinking
+    mode 400s a tools request unless every assistant message of the CURRENT
+    turn (after the last user message, text-only messages that precede a
+    tool call included) carries ``reasoning_content`` (presence checked,
+    content not; verified live 2026-09-10): caller plaintext forwards verbatim
+    there without the exposure stamp, and EVERY assistant message with no
+    reasoning block (an absent field or an explicit null) is backfilled with
+    an empty string. An empty string is harmless on the turns the provider
+    exempts (earlier turns, tool-less requests), so the builder does not track
+    turn boundaries; no other origin is touched.
     """
     if message.role == "tool":
         tool_payload: JsonObject = {
@@ -529,6 +624,8 @@ def openai_chat_message(
         # stays absent, so name-free histories keep their exact wire bytes.
         if message.provider_tool_name is not None:
             tool_payload["name"] = message.provider_tool_name
+        if forwards_cache_control and message.cache_control is not None:
+            tool_payload["cache_control"] = message.cache_control
         return tool_payload
     payload: JsonObject = {
         "role": "system" if message.role == "developer" else message.role,
@@ -549,21 +646,50 @@ def openai_chat_message(
             else message.content or ""
         ),
     }
+    if forwards_cache_control and message.content_parts:
+        content = payload["content"]
+        assert isinstance(content, list)
+        marked = iter(retained_cache_marked_blocks(message.provider_text_blocks))
+        for part, block in zip(message.content_parts, content, strict=True):
+            assert isinstance(block, dict)
+            if part.kind == "text":
+                text_block = next(marked, {})
+                marker = text_block.get("cache_control", part.cache_control)
+            elif part.kind == "image" or part.kind == "document":
+                marker = part.cache_control
+            else:
+                marker = None
+            if isinstance(marker, dict):
+                block["cache_control"] = marker
+    if forwards_cache_control and message.provider_text_blocks and not message.content_parts:
+        payload["content"] = retained_cache_marked_blocks(message.provider_text_blocks)
     if message.tool_calls:
         payload["tool_calls"] = [
             {
+                **(
+                    {"cache_control": call.cache_control}
+                    if forwards_cache_control and call.cache_control is not None
+                    else {}
+                ),
                 "id": call.call_id,
                 "type": "function",
                 "function": {"name": call.name, "arguments": call.arguments_json()},
             }
             for call in message.tool_calls
         ]
-    if message.provider_reasoning:
-        if len(message.provider_reasoning) != 1:
+    # Anthropic-signed thinking replays only on its own wire; route shaping
+    # disclosed the drop for this one, so the Chat wire omits those blocks.
+    chat_reasoning = tuple(
+        block
+        for block in message.provider_reasoning
+        if block.kind not in {"thinking", "redacted_thinking"}
+    )
+    if chat_reasoning:
+        if len(chat_reasoning) != 1:
             raise ProviderResponseError("Chat reasoning history requires exactly one carrier")
-        block = message.provider_reasoning[0]
+        block = chat_reasoning[0]
         if block.kind == "exposed_reasoning_content":
-            if reasoning_output_exposed:
+            if reasoning_output_exposed or deepseek_reasoning_history:
                 payload["reasoning_content"] = block.content
             return payload
         if (
@@ -573,6 +699,16 @@ def openai_chat_message(
         ):
             raise ProviderResponseError("reasoning carrier belongs to a different Chat route")
         payload["reasoning_content"] = block.content
+    elif deepseek_reasoning_history and message.role == "assistant":
+        # DeepSeek's thinking mode rejects the whole request when any assistant
+        # message of the current turn arrives without the field — a text-only
+        # message before the tool call included (0.7.61 backfilled tool-call
+        # turns alone and the "text turn, then tool-call turn" agent shape
+        # still 400'd in production) — and accepts an empty one exactly like
+        # real reasoning, on exempt turns too. Histories that started on
+        # another provider, or that an OpenAI-compatible SDK re-serialized
+        # without the extension field, arrive this way on every turn.
+        payload["reasoning_content"] = ""
     return payload
 
 
@@ -581,6 +717,7 @@ def add_openai_tools(
     request: GatewayRequest,
     *,
     responses: bool,
+    forwards_cache_control: bool = False,
 ) -> None:
     """Add Responses-native or Chat-native tools and tool choice in place."""
     if request.tools or request.provider_native_tools:
@@ -592,6 +729,9 @@ def add_openai_tools(
                     "description": tool.description,
                     "parameters": tool.parameters,
                     "strict": tool.strict,
+                    # OpenAI's deferred-loading marker for its native tool search;
+                    # a false or absent marker is omitted so today's bodies stay identical.
+                    **({"defer_loading": True} if tool.defer_loading else {}),
                 }
                 for tool in request.tools
             ]
@@ -609,6 +749,11 @@ def add_openai_tools(
         elif request.tools:
             payload["tools"] = [
                 {
+                    **(
+                        {"cache_control": tool.cache_control}
+                        if forwards_cache_control and tool.cache_control is not None
+                        else {}
+                    ),
                     "type": "function",
                     "function": {
                         "name": tool.name,

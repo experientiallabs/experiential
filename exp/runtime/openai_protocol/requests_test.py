@@ -117,9 +117,9 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert request.metadata == {"cohort": "test"}
 
 
-def test_chat_decoder_translates_json_object_to_a_permissive_schema() -> None:
-    """response_format json_object is admitted and translated to an open, non-strict
-    json_schema so the caller's JSON intent serves on every rung, with disclosure."""
+def test_chat_decoder_carries_json_object_as_its_own_mode() -> None:
+    """response_format json_object rides json_object_output, not a permissive schema,
+    and is not disclosed as a translation."""
     request = decode_chat(
         {
             "model": "coding",
@@ -127,10 +127,9 @@ def test_chat_decoder_translates_json_object_to_a_permissive_schema() -> None:
             "response_format": {"type": "json_object"},
         }
     ).request
-    assert request.structured_text is not None
-    assert request.structured_text.json_schema == {"type": "object"}
-    assert request.structured_text.strict is False
-    assert request.ignored_parameters == ("response_format->translated(json_object)",)
+    assert request.json_object_output is True
+    assert request.structured_text is None
+    assert request.ignored_parameters == ()
 
 
 def test_chat_decoder_admits_sampling_penalties() -> None:
@@ -564,10 +563,9 @@ def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
 
 
 def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:
-    """A populated refusal, annotation, or LiteLLM carrier in history stays rejected."""
+    """A populated refusal or LiteLLM carrier in history stays rejected."""
     for extra in (
         {"refusal": "no"},
-        {"annotations": [{"type": "url_citation"}]},
         {"thinking_blocks": [{"type": "thinking", "thinking": "x", "signature": "y"}]},
         {"reasoning_items": [{"type": "reasoning"}]},
         {"images": [{"image_url": {"url": "https://example.test/a.png"}}]},
@@ -627,7 +625,7 @@ def _assert_no_cache_control(decoded: DecodedGatewayRequest) -> None:
         assert "cache_control" not in message.model_dump(mode="json")
 
 
-def test_chat_decoder_drops_opencode_message_cache_control() -> None:
+def test_chat_decoder_retains_opencode_message_cache_control() -> None:
     """OpenCode Chat Completions annotate messages with Anthropic cache_control.
 
     The live failure is Invalid value for 'messages.0.cache_control' because the
@@ -674,7 +672,7 @@ def test_chat_decoder_drops_opencode_message_cache_control() -> None:
     _assert_no_cache_control(decoded)
 
 
-def test_chat_decoder_drops_opencode_text_part_cache_control() -> None:
+def test_chat_decoder_retains_opencode_text_part_cache_control() -> None:
     """OpenCode openai-compatible conversion can put cache_control on text parts.
 
     applyCaching marks the last content part, and @ai-sdk/openai-compatible
@@ -882,6 +880,39 @@ def test_chat_decoder_rejects_store_true_retention_request() -> None:
     assert captured.value.detail.param == "store"
 
 
+def test_chat_decoder_accepts_verbosity_as_the_chat_spelling_of_text_verbosity() -> None:
+    """opencode sends ``verbosity`` on every Chat request (2026-09-10 400s).
+
+    It decodes onto the same canonical carrier as Responses ``text.verbosity``
+    with no disclosure at decode; the route step decides forward-or-drop.
+    """
+    for value in ("low", "medium", "high"):
+        decoded = decode_chat(
+            {
+                "model": "gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "hello"}],
+                "verbosity": value,
+            }
+        )
+        assert decoded.request.text_verbosity == value
+        assert decoded.request.ignored_parameters == ()
+
+
+def test_chat_decoder_rejects_an_unknown_verbosity_value() -> None:
+    """Accepting the field never means accepting any value: a typo is a client bug."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "hello"}],
+                "verbosity": "verbose",
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "verbosity"
+
+
 def test_chat_decoder_preserves_logprobs_for_route_validation() -> None:
     """The route gate distinguishes a semantic true request from a false no-op."""
     for value in (True, False):
@@ -907,12 +938,29 @@ def test_chat_decoder_preserves_gateway_top_k_extension() -> None:
     assert decoded.request.top_k == 40
 
 
-def test_empty_responses_input_is_a_public_protocol_error() -> None:
-    """Canonical validation failures do not leak internal Pydantic exceptions."""
+@pytest.mark.parametrize("empty", ["", []])
+def test_empty_responses_input_is_refused_before_dispatch(empty: object) -> None:
+    """An empty ``input`` with nothing to continue from is a 400 on ``input``.
+
+    OpenAI treats ``""`` and ``[]`` as an absent input and answers "One of
+    'input' or 'previous_response_id' ... must be provided" (probed live
+    2026-09-15); the gateway used to forward the request and bill a provider
+    rejection. The refusal names the caller's field, never the canonical
+    ``messages``.
+    """
     with pytest.raises(OpenAIProtocolError) as captured:
-        decode_responses({"model": "coding", "input": []})
+        decode_responses({"model": "coding", "input": cast(JsonObject, {"v": empty})["v"]})
     assert captured.value.detail.code == "invalid_parameter"
-    assert captured.value.detail.param == "messages"
+    assert captured.value.detail.param == "input"
+    assert "previous_response_id" in captured.value.detail.message
+
+
+def test_continuation_with_no_new_input_items_names_the_input_field() -> None:
+    """``input: []`` beside a previous_response_id has no turn to answer."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "coding", "input": [], "previous_response_id": "resp_1"})
+    assert captured.value.detail.param == "input"
+    assert "at least one new input item" in captured.value.detail.message
 
 
 def test_chat_decoder_captures_end_user_attribution_and_cache_hint() -> None:
@@ -970,6 +1018,90 @@ def test_responses_decoder_captures_end_user_attribution() -> None:
     assert request.safety_identifier == "sid-9"
     assert request.prompt_cache_key == "pck-1"
     assert request.attribution_label == "sid-9"
+
+
+def test_chat_decoder_folds_the_ai_sdk_prompt_cache_key_alias() -> None:
+    """A camelCase-only ``promptCacheKey`` (Vercel AI SDK) decodes as ``prompt_cache_key``."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "promptCacheKey": "opencode-session-1",
+        }
+    )
+    request = decoded.request
+    assert request.prompt_cache_key == "opencode-session-1"
+    assert request.attribution_label is None
+    assert request.ignored_parameters == ()
+
+
+def test_chat_decoder_prefers_snake_case_over_the_alias_and_discloses_the_drop() -> None:
+    """Both spellings present: the documented wire field wins and the alias is disclosed."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "snake",
+            "promptCacheKey": "camel",
+        }
+    )
+    request = decoded.request
+    assert request.prompt_cache_key == "snake"
+    assert request.ignored_parameters == ("promptCacheKey->ignored(explicit_prompt_cache_key)",)
+
+
+def test_chat_decoder_validates_the_alias_value_as_prompt_cache_key() -> None:
+    """The alias is renamed, not trusted: its value meets the canonical field's contract."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "promptCacheKey": ["not", "a", "string"],
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.param == "prompt_cache_key"
+
+
+@pytest.mark.parametrize("field", ["safetyIdentifier", "maxTokens", "serviceTier"])
+def test_chat_decoder_still_rejects_other_camel_case_fields(field: str) -> None:
+    """Only ``promptCacheKey`` is aliased; every other camelCase field stays a named 400."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                field: "value",
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.code == "unsupported_parameter"
+    assert captured.value.detail.param == field
+
+
+def test_responses_decoder_folds_the_ai_sdk_prompt_cache_key_alias() -> None:
+    """The Responses surface folds ``promptCacheKey`` the same way as Chat."""
+    decoded = decode_responses(
+        {"model": "coding", "input": "hi", "promptCacheKey": "opencode-session-2"}
+    )
+    assert decoded.request.prompt_cache_key == "opencode-session-2"
+    assert decoded.request.ignored_parameters == ()
+    both = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "prompt_cache_key": "snake",
+            "promptCacheKey": "camel",
+        }
+    )
+    assert both.request.prompt_cache_key == "snake"
+    assert both.request.ignored_parameters == (
+        "promptCacheKey->ignored(explicit_prompt_cache_key)",
+    )
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "coding", "input": "hi", "safetyIdentifier": "x"})
+    assert captured.value.detail.param == "safetyIdentifier"
 
 
 def test_responses_decoder_accepts_the_codex_request_shape() -> None:
@@ -1584,8 +1716,8 @@ def test_every_chat_cache_control_placement_follows_its_classified_decision() ->
     from exp.runtime.openai_protocol.manifest import CHAT_CACHE_CONTROL_PLACEMENTS
 
     assert CHAT_CACHE_CONTROL_PLACEMENTS == {
-        "messages": "validated_and_dropped",
-        "messages.content": "validated_and_dropped",
+        "messages": "validated_and_forwarded_to_cache_capable_adapters",
+        "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
         "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
     }
     decoded = decode_chat(
@@ -1628,7 +1760,11 @@ def test_every_chat_cache_control_placement_follows_its_classified_decision() ->
     calls = decoded.request.messages[1].tool_calls
     assert calls[0].cache_control is None
     assert calls[1].cache_control == {"type": "ephemeral"}
-    # Message- and part-level hints stay validated-and-dropped.
+    assert decoded.request.messages[0].provider_text_blocks[-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+    # Cache metadata stays outside content serialization.
     assert "cache_control" not in decoded.request.messages[0].model_dump(mode="json")
 
     with pytest.raises(OpenAIProtocolError) as raised:
@@ -1967,6 +2103,162 @@ def test_chat_decoder_retains_image_parts_in_caller_order() -> None:
     assert image.data == _PNG_BASE64
     assert image.media_type == "image/png"
     assert image.detail == "high"
+
+
+def _copilot_tool_screenshot_body(role: str, part: JsonObject) -> JsonObject:
+    """One Copilot/Codex-shaped Chat body whose tool result carries a media part.
+
+    The production rejection (``Invalid value for 'messages.N': image, video,
+    and audio parts are valid only for user messages``, ~1,000 a week from
+    GitHubCopilotChat, Codex Desktop and node agents) is exactly this
+    shape: an ``image_url`` part inside the ``role: "tool"`` message that
+    reports a screenshot.
+    """
+    return {
+        "model": "coding",
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "screenshot", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": role,
+                **({"tool_call_id": "call-1"} if role == "tool" else {}),
+                "content": [{"type": "text", "text": "Screenshot taken:"}, part],
+            },
+        ],
+    }
+
+
+def test_chat_decoder_accepts_image_parts_inside_a_tool_message() -> None:
+    """A tool result keeps its screenshot beside its text as a canonical tool message."""
+    part: JsonObject = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}", "detail": "high"},
+    }
+
+    decoded = decode_chat(_copilot_tool_screenshot_body("tool", part))
+
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.content == "Screenshot taken:"
+    assert [item.kind for item in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _PNG_BASE64
+    assert decoded.request.images == tool_message.images
+
+
+def test_chat_decoder_still_rejects_image_parts_on_an_assistant_message() -> None:
+    """No wire carries an image inside an assistant turn; the 400 names the tool exception."""
+    part: JsonObject = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+    }
+
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(_copilot_tool_screenshot_body("assistant", part))
+
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "messages.2"
+    assert "valid only for user messages" in captured.value.detail.message
+    assert "tool message may carry image parts" in captured.value.detail.message
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4"}},
+        {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+    ],
+)
+def test_chat_decoder_rejects_non_image_media_inside_a_tool_message(part: JsonObject) -> None:
+    """Tool results carry text and images only; video and audio stay a named 400."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(_copilot_tool_screenshot_body("tool", part))
+
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "messages.2"
+    assert "tool messages carry only text and image parts" in captured.value.detail.message
+
+
+@pytest.mark.parametrize("media_type", ["image/png", "image/jpeg", "image/gif", "image/webp", None])
+@pytest.mark.parametrize(
+    "url", ["https://example.test/attachment", f"data:image/png;base64,{_PNG_BASE64}"]
+)
+def test_chat_image_media_type_hint_preserves_the_url_contract(
+    media_type: str | None, url: str
+) -> None:
+    """Copilot's MIME hint changes neither the image nor canonical replay identity.
+
+    The fourth message reproduces the reported field path. The URL remains
+    authoritative, including when its embedded MIME type differs from the hint.
+    """
+    image_url: JsonObject = {"url": url, "detail": "high"}
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [
+            {"role": "system", "content": "Help with screenshots."},
+            {"role": "user", "content": "Hello."},
+            {"role": "assistant", "content": "Send the screenshot."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": image_url},
+                    {"type": "text", "text": "What is this?"},
+                ],
+            },
+        ],
+    }
+    expected = decode_chat(body).request
+    image_url["media_type"] = media_type
+
+    actual = decode_chat(body).request
+
+    assert actual == expected
+    assert sha256_json(actual) == sha256_json(expected)
+    assert actual.images[0].data_url() == url
+    assert actual.images[0].detail == "high"
+    assert image_url["media_type"] == media_type
+
+
+@pytest.mark.parametrize(
+    ("image_url", "param"),
+    [
+        ({"url": "https://example.test/image", "media_type": 42}, "media_type"),
+        ({"url": "https://example.test/image", "media_type": {}}, "media_type"),
+        ({"url": "https://example.test/image", "media_type": "image/svg+xml"}, "media_type"),
+        ({"url": "https://example.test/image", "media_type": ""}, "media_type"),
+        (
+            {"url": "https://example.test/image", "media_type": "image/png", "unknown": True},
+            "unknown",
+        ),
+        ({"url": "ftp://example.test/image", "media_type": "image/png"}, None),
+        ({"url": "data:image/png;base64,%%%", "media_type": "image/png"}, None),
+    ],
+)
+def test_chat_image_media_type_hint_keeps_image_validation_strict(
+    image_url: JsonObject, param: str | None
+) -> None:
+    """The MIME hint cannot admit malformed images, unsupported hints, or unknown fields."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": [{"type": "image_url", "image_url": image_url}]}
+                ],
+            }
+        )
+    location = "messages.0.content.0.image_url"
+    assert raised.value.detail.param == (f"{location}.{param}" if param else location)
 
 
 def test_an_empty_text_part_beside_an_image_drops() -> None:
@@ -3971,3 +4263,594 @@ def test_oversized_plaintext_reasoning_names_limit_and_remedy() -> None:
     assert error.value.detail.param == "messages.0.reasoning_content"
     assert "8,388,608 characters" in error.value.detail.message
     assert "Shorten" in error.value.detail.message
+
+
+def test_responses_decoder_accepts_an_assistant_history_message_without_an_item_id() -> None:
+    """A Chat-to-Responses bridge's assistant turn (typed parts, no id) decodes.
+
+    LiteLLM's Responses bridge and the AI SDK emit prior assistant turns as
+    ``{"role": "assistant", "content": [{"type": "output_text", ...}]}`` with
+    no item id; api.openai.com serves that shape (probed live 2026-09-15), but
+    the installed SDK types it as an input message (input parts only) or an
+    output item (id and status required), so the official probe rejected 4,623
+    requests across 95 organizations in a week. The canonical turn carries no
+    provider item identity, exactly like a plain-string assistant message.
+    """
+    typed = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+                {"role": "user", "content": "more"},
+            ],
+        }
+    )
+    plain = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "more"},
+            ],
+        }
+    )
+    assistant = typed.request.messages[1]
+    assert assistant.content == "hello"
+    assert assistant.provider_item_id is None
+    assert assistant.provider_output_index is None
+    assert typed.request == plain.request
+
+
+def test_responses_assistant_input_text_parts_keep_decoding() -> None:
+    """An assistant ``input_text`` part decoded before the probe typed assistant
+    history as an output item, and the wire re-emits text parts by role, so the
+    acceptance is kept: the canonical request equals the ``output_text`` form."""
+
+    def body(part_type: str) -> JsonObject:
+        return {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": part_type, "text": "yo"}]},
+                {"role": "user", "content": "more"},
+            ],
+        }
+
+    assert (
+        decode_responses(body("input_text")).request
+        == decode_responses(body("output_text")).request
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "spelling", "expected"),
+    [
+        ("user", "text", "one of 'input_text', 'input_image' or 'input_file'"),
+        ("system", "text", "one of 'input_text', 'input_image' or 'input_file'"),
+        ("user", "output_text", "one of 'input_text', 'input_image' or 'input_file'"),
+        ("assistant", "text", "'output_text'"),
+    ],
+)
+def test_responses_text_part_spellings_hold_openai_parity(
+    role: str, spelling: str, expected: str
+) -> None:
+    """The spellings api.openai.com refuses are refused here, naming the right one.
+
+    Probed live 2026-09-15: the Chat ``text`` tag is "Invalid value: 'text'" on
+    any role and ``output_text`` is refused in a user message. Owner decision:
+    parity, not leniency (6 such rejections across 4 organizations in 7 days).
+    """
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"role": role, "content": [{"type": spelling, "text": "yo"}]},
+                    {"role": "user", "content": "more"},
+                ],
+            }
+        )
+    assert raised.value.detail.param == "input.0.content.0.type"
+    assert raised.value.detail.message == (
+        f"Invalid value for 'input.0.content.0.type': expected {expected}, "
+        f"but got '{spelling}' instead."
+    )
+
+
+def test_responses_unknown_content_part_type_names_the_accepted_vocabulary() -> None:
+    """A part with an unaccepted or missing ``type`` names the tag field and the choices.
+
+    The Responses list omits the Chat-only spellings the provider itself
+    refuses; the arriving tag is a vocabulary token, so it is named (as the
+    provider's own "Invalid value: 'refusal'" does), never a content value.
+    """
+    with pytest.raises(OpenAIProtocolError) as refusal:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "content": [{"type": "refusal", "refusal": "no"}],
+                    }
+                ],
+            }
+        )
+    assert refusal.value.detail.param == "input.0.content.0.type"
+    assert refusal.value.detail.message == (
+        "Invalid value for 'input.0.content.0.type': expected one of 'input_text', "
+        "'output_text', 'input_image', 'input_audio' or 'input_file', but got 'refusal' instead."
+    )
+    with pytest.raises(OpenAIProtocolError) as chat_shape:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": "https://x/y"}}],
+                    }
+                ],
+            }
+        )
+    assert chat_shape.value.detail.param == "input.0.content.0.type"
+    # A Chat spelling that IS a member of the shared union fails the official
+    # probe instead, whose literal fault names the members only (#951).
+    assert chat_shape.value.detail.message == (
+        "Invalid value for 'input.0.content.0.type': expected one of 'input_text', "
+        "'input_image' or 'input_file'."
+    )
+    with pytest.raises(OpenAIProtocolError) as untyped:
+        decode_responses(
+            {"model": "coding", "input": [{"role": "user", "content": [{"text": "hi"}]}]}
+        )
+    assert untyped.value.detail.param == "input.0.content.0.type"
+    assert untyped.value.detail.message == (
+        "Invalid value for 'input.0.content.0.type': the field is required."
+    )
+    with pytest.raises(OpenAIProtocolError) as bare:
+        decode_responses({"model": "coding", "input": [{"role": "user", "content": ["hi"]}]})
+    assert bare.value.detail.param == "input.0.content.0"
+    assert bare.value.detail.message == (
+        "Invalid value for 'input.0.content.0': expected an object, but got a string instead."
+    )
+
+
+def test_vocabulary_rejections_name_the_members_and_a_bad_tag_names_the_tag() -> None:
+    """A literal member fault names the members (never the arriving JSON type);
+    a discriminated part's wrong tag additionally names the tag pydantic reports."""
+    with pytest.raises(OpenAIProtocolError) as detail:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": "https://x/y",
+                                "detail": "original",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    assert detail.value.detail.param == "input.0.content.0.input_image.detail"
+    assert detail.value.detail.message == (
+        "Invalid value for 'input.0.content.0.input_image.detail': expected one of 'auto', "
+        "'low' or 'high'."
+    )
+    with pytest.raises(OpenAIProtocolError) as chat_part:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": [{"type": "bogus", "text": "t"}]}],
+            }
+        )
+    assert chat_part.value.detail.param == "messages.0.content.0.type"
+    assert chat_part.value.detail.message.endswith("or 'input_file', but got 'bogus' instead.")
+
+
+def test_chat_decoder_drops_the_streaming_index_on_replayed_tool_calls() -> None:
+    """``tool_calls[].index`` (a stream-delta ordinal) is validated and dropped.
+
+    Streaming accumulators keep the delta ``index`` on the finished call and
+    replay it with the assistant message; OpenAI ignores it on a request.
+    The canonical request is byte-identical to the index-free replay.
+    """
+
+    def body(with_index: bool) -> JsonObject:
+        call: JsonObject = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        if with_index:
+            call["index"] = 0
+        return {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "look"},
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "found"},
+            ],
+        }
+
+    assert decode_chat(body(True)).request == decode_chat(body(False)).request
+    with pytest.raises(OpenAIProtocolError) as negative:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "index": -1,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    assert negative.value.detail.param == "messages.0.tool_calls.0.index"
+
+
+def test_chat_decoder_replays_openrouter_reasoning_details_as_plaintext_history() -> None:
+    """OpenRouter's ``reasoning_details`` echo folds onto the plaintext replay path.
+
+    ``reasoning.text`` blocks become the turn's exposed reasoning (the same
+    caller-owned history a ``reasoning_content`` echo produces); encrypted
+    and summary blocks cannot be replayed on another account and are dropped
+    with disclosure. The plaintext ``reasoning`` string is the documented
+    equivalent and folds the same way; the gateway's own ``reasoning_content``
+    wins over both.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "run ls"},
+                {
+                    "role": "assistant",
+                    "content": "ls",
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "List ", "format": "deepseek-v1"},
+                        {"type": "reasoning.text", "text": "the files.", "index": 1},
+                        {"type": "reasoning.encrypted", "data": "opaque", "id": "rs_1"},
+                    ],
+                },
+                {"role": "user", "content": "a.txt"},
+            ],
+        }
+    )
+    block = decoded.request.messages[1].provider_reasoning[0]
+    assert block.kind == "exposed_reasoning_content"
+    assert block.content == "List the files."
+    assert decoded.request.ignored_parameters == (
+        "messages.reasoning_details->translated(reasoning_content)",
+        "messages.reasoning_details->dropped(not_replayable)",
+    )
+
+    plaintext = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "run ls"},
+                {"role": "assistant", "content": "ls", "reasoning": "List the files."},
+                {"role": "user", "content": "a.txt"},
+            ],
+        }
+    )
+    plain_block = plaintext.request.messages[1].provider_reasoning[0]
+    assert plain_block.kind == "exposed_reasoning_content"
+    assert plain_block.content == "List the files."
+    assert plaintext.request.ignored_parameters == (
+        "messages.reasoning->translated(reasoning_content)",
+    )
+
+    both = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "run ls"},
+                {
+                    "role": "assistant",
+                    "content": "ls",
+                    "reasoning_content": "gateway text",
+                    "reasoning": "openrouter text",
+                    "reasoning_details": [{"type": "reasoning.summary", "summary": "s"}],
+                },
+                {"role": "user", "content": "a.txt"},
+            ],
+        }
+    )
+    own_block = both.request.messages[1].provider_reasoning[0]
+    assert own_block.kind == "exposed_reasoning_content"
+    assert own_block.content == "gateway text"
+    assert both.request.ignored_parameters == (
+        "messages.reasoning->dropped(shadowed_by_reasoning_content)",
+        "messages.reasoning_details->dropped(shadowed)",
+    )
+    # A reasoning-only assistant turn may ride the OpenRouter field too.
+    reasoning_only = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "think"},
+                {"role": "assistant", "content": None, "reasoning": "cut short"},
+                {"role": "user", "content": "go on"},
+            ],
+        }
+    )
+    assert reasoning_only.request.messages[1].content is None
+
+
+def test_chat_decoder_rejects_misplaced_or_malformed_reasoning_details() -> None:
+    """The OpenRouter fields are assistant-only and block types are ``reasoning.<kind>``."""
+    with pytest.raises(OpenAIProtocolError) as user_turn:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi", "reasoning": "mine"}],
+            }
+        )
+    assert user_turn.value.detail.param == "messages.0"
+    assert "valid only for assistant messages" in user_turn.value.detail.message
+    with pytest.raises(OpenAIProtocolError) as bad_type:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "x",
+                        "reasoning_details": [{"type": "thought", "text": "t"}],
+                    }
+                ],
+            }
+        )
+    assert bad_type.value.detail.param == "messages.0.reasoning_details.0.type"
+    # An unknown message key whose name collides with a Responses item variant
+    # label is still reported as the caller's field, not swallowed to the
+    # message index (``reasoning`` used to render as ``messages.0``).
+    with pytest.raises(OpenAIProtocolError) as unknown:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi", "compaction": 1}],
+            }
+        )
+    assert unknown.value.detail.param == "messages.0.compaction"
+
+
+def test_provider_zdr_demand_decodes_on_both_openai_surfaces() -> None:
+    """``provider: {"zdr": true}`` sets the demand; other keys ride along verbatim."""
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"zdr": True, "data_collection": "deny", "order": ["Azure"]},
+        }
+    ).request
+    assert chat.zdr_requested is True
+    assert chat.provider_preferences == {
+        "zdr": True,
+        "data_collection": "deny",
+        "order": ["Azure"],
+    }
+    responses = decode_responses(
+        {"model": "coding", "input": "hi", "provider": {"zdr": True}}
+    ).request
+    assert responses.zdr_requested is True
+    assert responses.provider_preferences == {"zdr": True}
+    # Preferences without the demand are carried but demand nothing.
+    plain = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"data_collection": "deny"},
+        }
+    ).request
+    assert plain.zdr_requested is False
+    assert plain.provider_preferences == {"data_collection": "deny"}
+    # No object: no demand, nothing to forward.
+    bare = decode_chat({"model": "coding", "messages": [{"role": "user", "content": "hi"}]}).request
+    assert bare.zdr_requested is False
+    assert bare.provider_preferences is None
+
+
+def test_provider_object_is_validated_where_the_gateway_reads_it() -> None:
+    """A non-boolean zdr or an unknown data_collection value is a 400, not a silent pass."""
+    for provider in ({"zdr": "yes"}, {"data_collection": "maybe"}, "Azure"):
+        with pytest.raises(OpenAIProtocolError) as captured:
+            decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "provider": provider,
+                }
+            )
+        assert captured.value.status_code == 400
+
+
+def test_chat_decoder_accepts_echoed_url_citation_annotations() -> None:
+    """A gateway-issued web-search citation echoed back in history is not a 400.
+
+    The gateway itself emits populated ``annotations`` on a web-searched
+    completion, so a caller replaying that assistant turn verbatim must keep
+    working; the annotations are display metadata and are not forwarded.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "What is new?"},
+                {
+                    "role": "assistant",
+                    "content": "See [example.com](https://example.com/a).",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url_citation": {
+                                "url": "https://example.com/a",
+                                "title": "A",
+                                "start_index": 4,
+                                "end_index": 41,
+                            },
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Summarize."},
+            ],
+        }
+    )
+    assert decoded.request.messages[1].content == "See [example.com](https://example.com/a)."
+
+
+def test_chat_decoder_normalizes_every_web_search_spelling() -> None:
+    """``web_search_options``, the ``web`` plugin, and ``:online`` all yield one request."""
+    base = {"messages": [{"role": "user", "content": "Latest Rust release?"}]}
+    options = decode_chat(
+        {"model": "coding", "web_search_options": {"search_context_size": "high"}, **base}
+    )
+    assert options.alias == "coding"
+    assert options.request.web_search is not None
+    assert options.request.web_search.declared_as == "web_search_options"
+    assert options.request.web_search.max_results == 8
+    plugin = decode_chat(
+        {
+            "model": "coding",
+            "plugins": [
+                {
+                    "id": "web",
+                    "max_results": 3,
+                    "search_prompt": "Cite carefully.",
+                    "include_domains": ["rust-lang.org"],
+                }
+            ],
+            **base,
+        }
+    )
+    assert plugin.request.web_search is not None
+    assert plugin.request.web_search.declared_as == "plugin"
+    assert plugin.request.web_search.max_results == 3
+    assert plugin.request.web_search.allowed_domains == ("rust-lang.org",)
+    assert plugin.request.web_search.search_prompt == "Cite carefully."
+    online = decode_chat({"model": "coding:online", **base})
+    assert online.alias == "coding"
+    assert online.request.web_search is not None
+    assert online.request.web_search.declared_as == "model_suffix"
+    plain = decode_chat({"model": "coding", **base})
+    assert plain.request.web_search is None
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat({"model": "coding", "plugins": [{"id": "response-healing"}], **base})
+    assert captured.value.detail.param == "plugins.0.id"
+    with pytest.raises(OpenAIProtocolError) as conflicting:
+        decode_chat(
+            {
+                "model": "coding",
+                "plugins": [
+                    {"id": "web", "include_domains": ["a.com"], "exclude_domains": ["b.com"]}
+                ],
+                **base,
+            }
+        )
+    assert conflicting.value.detail.param == "plugins"
+
+
+def test_responses_decoder_normalizes_the_hosted_web_search_tool() -> None:
+    """A Responses ``web_search`` tool stays a native carrier AND a gateway search."""
+    decoded = decode_responses(
+        {
+            "model": "coding:online",
+            "input": "What changed in Python 3.14?",
+            "tools": [
+                {
+                    "type": "web_search",
+                    "search_context_size": "low",
+                    "filters": {"allowed_domains": ["python.org"]},
+                }
+            ],
+        }
+    )
+    assert decoded.alias == "coding"
+    assert decoded.request.web_search is not None
+    assert decoded.request.web_search.declared_as == "responses_tool"
+    assert decoded.request.web_search.max_results == 3
+    assert decoded.request.web_search.allowed_domains == ("python.org",)
+    assert [entry.tool["type"] for entry in decoded.request.provider_native_tools] == ["web_search"]
+    suffix_only = decode_responses({"model": "coding:online", "input": "hi"})
+    assert suffix_only.request.web_search is not None
+    assert suffix_only.request.web_search.declared_as == "model_suffix"
+
+
+def test_chat_decoder_accepts_openrouter_tool_search_and_deferred_tools() -> None:
+    """OpenRouter's server tool rides the tools array beside deferred function tools."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "loaded", "parameters": {"type": "object"}},
+                },
+                {
+                    "type": "function",
+                    "defer_loading": True,
+                    "function": {"name": "deferred", "parameters": {"type": "object"}},
+                },
+                {"type": "openrouter:tool_search", "max_results": 3},
+            ],
+        }
+    )
+    assert [tool.name for tool in decoded.request.tools] == ["loaded", "deferred"]
+    assert decoded.request.tools[0].defer_loading is None
+    assert decoded.request.tools[1].defer_loading is True
+    assert [entry.tool["type"] for entry in decoded.request.provider_native_tools] == [
+        "openrouter:tool_search"
+    ]
+    assert decoded.request.tool_search is not None
+    assert decoded.request.tool_search.declared_as == "openrouter_tool"
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "openrouter:tool_search", "function": {"name": "x"}}],
+            }
+        )
+
+
+def test_responses_decoder_normalizes_tool_search_and_deferred_tools() -> None:
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "loaded", "parameters": {"type": "object"}},
+                {
+                    "type": "function",
+                    "name": "deferred",
+                    "parameters": {"type": "object"},
+                    "defer_loading": True,
+                },
+                {"type": "tool_search"},
+            ],
+        }
+    )
+    assert [tool.defer_loading for tool in decoded.request.tools] == [None, True]
+    assert decoded.request.tool_search is not None
+    assert decoded.request.tool_search.declared_as == "responses_tool"
+    assert decoded.request.tool_search.tool_type == "tool_search"

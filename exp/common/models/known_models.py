@@ -233,6 +233,24 @@ def _embedding(*, input_usd: float, context_window_tokens: int | None = None) ->
 
 
 _OPENAI_MODELS: dict[str, KnownModel] = {
+    # gpt-6-astra (released 2026-09-03): the platform's live probe of 2026-09-04
+    # found reasoning.effort low/medium/high/xhigh/max ('none' and 'minimal'
+    # 400) and temperature/top_p rejected outright; the model page lists
+    # function_calling and structured_outputs among its supported features.
+    # Absence here left every openai gpt-6-astra rung with no strict-tools
+    # verdict (the platform's known-model gate fails closed on an unknown
+    # id), so a strict function tool was refused pre-dispatch on a lane that
+    # honors it (production, 2026-09-15: ~980 refusals a day).
+    "gpt-6-astra": _chat(
+        input_usd=10.0,
+        cached_input_usd=1.0,
+        cache_write_usd=12.5,
+        output_usd=50.0,
+        context_window_tokens=1_050_000,
+        maximum_output_tokens=128_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
     "gpt-5.6-sol": _chat(
         input_usd=5.0,
         cached_input_usd=0.5,

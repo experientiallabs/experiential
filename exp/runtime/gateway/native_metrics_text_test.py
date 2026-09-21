@@ -43,8 +43,13 @@ def _control_plane() -> JsonObject:
         "admission_parameter_coercions": 0,
         "rung_admission_sheds": 0,
         "rung_saturated_overflows": 0,
+        "rung_saturation_refusals": 2,
         "rung_rate_limit_sheds": 3,
         "rung_fresh_session_spills": 1,
+        "throttle_surfaced_cache_preserving": 2,
+        "throttle_failover_cold": 5,
+        "throttle_backoff_redials": 7,
+        "throttle_backoff_forced_admissions": 6,
         "sticky_spill_bindings": 4,
         # JSON-snapshot-only: per-rung learned ceilings never render as text,
         # so the exposition carries no per-rung label cardinality.
@@ -71,6 +76,8 @@ def _snapshot() -> JsonObject:
                 "other": 0,
             },
             "open_retries": 2,
+            "encrypted_reasoning_stripped": 1,
+            "encrypted_reasoning_stripped_proactive": 3,
             "settlement_retries": 1,
             "settlement_give_ups": 0,
             "active_requests": 1,
@@ -121,12 +128,27 @@ exp_gateway_rung_admission_sheds_total 0
 # HELP exp_gateway_rung_saturated_overflows_total Dispatches forced past a saturated rung bound.
 # TYPE exp_gateway_rung_saturated_overflows_total counter
 exp_gateway_rung_saturated_overflows_total 0
+# HELP exp_gateway_rung_saturation_refusals_total Requests refused with every rung at its bound.
+# TYPE exp_gateway_rung_saturation_refusals_total counter
+exp_gateway_rung_saturation_refusals_total 2
 # HELP exp_gateway_rung_rate_limit_sheds_total Dispatches shed by a rung's rate window.
 # TYPE exp_gateway_rung_rate_limit_sheds_total counter
 exp_gateway_rung_rate_limit_sheds_total 3
 # HELP exp_gateway_rung_fresh_session_spills_total Fresh-session dispatches shed early to spill.
 # TYPE exp_gateway_rung_fresh_session_spills_total counter
 exp_gateway_rung_fresh_session_spills_total 1
+# HELP exp_gateway_throttle_surfaced_cache_preserving_total Throttles surfaced to keep warm cache.
+# TYPE exp_gateway_throttle_surfaced_cache_preserving_total counter
+exp_gateway_throttle_surfaced_cache_preserving_total 2
+# HELP exp_gateway_throttle_failover_cold_total Throttles failed over cold (cache below threshold).
+# TYPE exp_gateway_throttle_failover_cold_total counter
+exp_gateway_throttle_failover_cold_total 5
+# HELP exp_gateway_throttle_backoff_redials_total Throttled rungs re-dialed after backoff.
+# TYPE exp_gateway_throttle_backoff_redials_total counter
+exp_gateway_throttle_backoff_redials_total 7
+# HELP exp_gateway_throttle_backoff_forced_admissions_total Redials forced past a rung shed.
+# TYPE exp_gateway_throttle_backoff_forced_admissions_total counter
+exp_gateway_throttle_backoff_forced_admissions_total 6
 # HELP exp_gateway_reconciled_expired_requests_total Crashed requests reconciled at startup.
 # TYPE exp_gateway_reconciled_expired_requests_total counter
 exp_gateway_reconciled_expired_requests_total 0
@@ -165,6 +187,12 @@ exp_gateway_served_requests_total 7
 # HELP exp_gateway_open_retries_total Same-deployment retries at the upstream open phase.
 # TYPE exp_gateway_open_retries_total counter
 exp_gateway_open_retries_total 2
+# HELP exp_gateway_encrypted_reasoning_stripped_total Redials without refused encrypted reasoning.
+# TYPE exp_gateway_encrypted_reasoning_stripped_total counter
+exp_gateway_encrypted_reasoning_stripped_total 1
+# HELP exp_gateway_encrypted_reasoning_stripped_proactive_total Strips from remembered refusals.
+# TYPE exp_gateway_encrypted_reasoning_stripped_proactive_total counter
+exp_gateway_encrypted_reasoning_stripped_proactive_total 3
 # HELP exp_gateway_settlement_retries_total Settlement deliveries retried after a failed write.
 # TYPE exp_gateway_settlement_retries_total counter
 exp_gateway_settlement_retries_total 1

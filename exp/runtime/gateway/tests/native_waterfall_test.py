@@ -85,6 +85,18 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
                             "graceful_timeout_seconds": 2.0,
+                            # The first-token allowance: the engine's defaults
+                            # unless the scenario names its own (the stall
+                            # module shortens it to about a second).
+                            "time_to_first_byte_seconds": config.get(
+                                "time_to_first_byte_seconds", 15.0
+                            ),
+                            "time_to_first_byte_seconds_per_million_input_tokens": config.get(
+                                "time_to_first_byte_seconds_per_million_input_tokens", 240.0
+                            ),
+                            "time_to_first_token_seconds": config.get(
+                                "time_to_first_token_seconds", 120.0
+                            ),
                         }
                     ),
                 )
@@ -133,14 +145,68 @@ def _terminal_frames(*, prompt_tokens: int = 2, completion_tokens: int = 2) -> b
     )
 
 
+def _reasoning_only_stop_frames() -> bytes:
+    """Encode the live OpenRouter DeepSeek reasoning-only turn (2026-09-12).
+
+    Hidden reasoning streams on OpenRouter's ``reasoning`` delta field, the
+    content stays empty, the choice finishes ``stop``, and usage bills the
+    reasoning as completion tokens; the gateway strips the reasoning on this
+    unexposed rung, so nothing semantic reaches the caller.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "", "reasoning": "Let me"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "", "reasoning": " read the logs first."},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+            ),
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 15613,
+                        "completion_tokens": 147,
+                        "total_tokens": 15760,
+                        "completion_tokens_details": {"reasoning_tokens": 148},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
 class _PrimaryUpstream(BaseHTTPRequestHandler):
     """The first certified deployment; behavior is selected by the prompt.
 
     ``always-500`` fails every dispatch, ``retry-then-succeed`` fails once
     per process then answers, ``refuse`` streams a refusal-only completion,
     ``silent-length`` exhausts the output budget with no content (a
-    thinking-only turn: ``finish_reason: length``, zero deltas), and anything
-    else streams a plain success.
+    thinking-only turn: ``finish_reason: length``, zero deltas),
+    ``silent-stop-then-succeed`` answers its first dispatch per process with
+    a billed reasoning-only ``stop`` (OpenRouter's DeepSeek shape: hidden
+    ``reasoning`` deltas, empty content, 147 completion tokens) and then a
+    plain success, and anything else streams a plain success.
     """
 
     retry_counts: dict[str, int] = {}
@@ -154,6 +220,24 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
         if prompt == "always-500":
             self.send_response(500)
             self.end_headers()
+            return
+        if prompt == "stall-after-headers":
+            # 2026-09-19: headers and SSE keepalive comments at once, then no
+            # token for far longer than the first-token bound. The gateway
+            # must fail over to the secondary within about the bound, not
+            # hold the request for the per-chunk timeout.
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            try:
+                for _ in range(200):
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+                self.wfile.write(_content_chunk("stalled-primary"))
+                self.wfile.flush()
+            except OSError:
+                pass
             return
         if prompt == "flood":
             self.send_response(200)
@@ -177,10 +261,19 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.end_headers()
                 return
+        empty_stop = False
+        if prompt == "silent-stop-then-succeed":
+            with self.lock:
+                seen = self.retry_counts.get(prompt, 0)
+                self.retry_counts[prompt] = seen + 1
+            empty_stop = seen == 0
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if empty_stop:
+                self.wfile.write(_reasoning_only_stop_frames())
+                return
             if prompt == "silent-length":
                 self.wfile.write(
                     _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]})
@@ -294,6 +387,25 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
+    yield from serve_waterfall_engine(tmp_path_factory)
+
+
+def serve_waterfall_engine(
+    tmp_path_factory: pytest.TempPathFactory,
+    *,
+    time_to_first_token_seconds: float | None = None,
+) -> Iterator[_ServingEngine]:
+    """Serve the primary/secondary harness engine; other modules build their own.
+
+    Args:
+        tmp_path_factory: Pytest's per-session temporary path factory.
+        time_to_first_token_seconds: The engine's first-token allowance for
+            this engine (input scaling disabled alongside it), or ``None``
+            for the engine's defaults.
+
+    Yields:
+        The live serving facts as a :class:`_ServingEngine`.
+    """
     root = tmp_path_factory.mktemp("native-waterfall-root")
     primary = ThreadingHTTPServer((_HOST, 0), _PrimaryUpstream)
     secondary = ThreadingHTTPServer((_HOST, 0), _SecondaryUpstream)
@@ -313,12 +425,14 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     )
     driver = root / "native_waterfall_driver.py"
     driver.write_text(_DRIVER_SOURCE + "\n")
-    config = json.dumps(
-        {
-            "root": str(root),
-            "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-        }
-    )
+    config_values: dict[str, object] = {
+        "root": str(root),
+        "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+    }
+    if time_to_first_token_seconds is not None:
+        config_values["time_to_first_token_seconds"] = time_to_first_token_seconds
+        config_values["time_to_first_byte_seconds_per_million_input_tokens"] = 0.0
+    config = json.dumps(config_values)
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
     environment["TEST_PROVIDER_KEY"] = "provider-secret-canary"
@@ -396,6 +510,41 @@ def test_transient_primary_failure_redials_the_same_deployment(
     assert response.headers["x-gateway-route-depth"] == "0"
     rows = _attempt_rows(engine, response.headers["x-request-id"])
     assert rows == [(0, 0, "failed"), (1, 0, "completed")]
+
+
+def test_billed_empty_stop_redials_instead_of_settling_an_empty_success(
+    engine: _ServingEngine,
+) -> None:
+    """A ``stop`` that billed reasoning but delivered nothing is a failed attempt.
+
+    Reproduced on production 2026-09-12 (deepseek-v4-flash via OpenRouter, 2 of
+    6 replays on both the Chat and Messages surfaces): the rung answered a
+    reasoning-only turn, the gateway stripped the hidden reasoning, and the
+    waterfall settled the output-less terminal as a completed empty answer
+    that billed 42 to 750 output tokens. The empty completion now takes the
+    ladder like any pre-commit failure: the primary is redialed and serves,
+    and the ledger names the empty attempt ``empty_completion``.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("silent-stop-then-succeed"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "from-primary"
+    assert response.headers["x-gateway-route-depth"] == "0"
+    request_id = response.headers["x-request-id"]
+    assert _attempt_rows(engine, request_id) == [(0, 0, "failed"), (1, 0, "completed")]
+    with sqlite3.connect(engine.database_path) as connection:
+        failed = connection.execute(
+            "SELECT failure_class, output_tokens FROM gateway_attempts"
+            " WHERE request_id = ? AND attempt_ordinal = 0",
+            (request_id,),
+        ).fetchone()
+    assert failed[0] == "empty_completion"
+    # The empty attempt keeps the tokens the provider billed for it.
+    assert failed[1] == 147
 
 
 def test_refusal_failover_withholds_the_refused_route(engine: _ServingEngine) -> None:
@@ -502,6 +651,43 @@ def test_keyed_responses_replays_the_owner_response_exactly(
     assert rows == [(0, 0, "completed")]
 
 
+def test_responses_timestamps_are_integer_seconds(engine: _ServingEngine) -> None:
+    """Responses bodies and every stream envelope carry integer epoch seconds.
+
+    api.openai.com emits ``created_at`` and ``completed_at`` as integers, and
+    strict typed clients (Goose's Rust Responses decoder) reject a float.
+    """
+    headers = {"authorization": f"Bearer {engine.raw_key}"}
+    before = int(time.time())
+    plain = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers=headers,
+        json={"model": "coding", "input": "hello"},
+        timeout=30.0,
+    )
+    assert plain.status_code == 200, plain.text
+    body = plain.json()
+    assert type(body["created_at"]) is int and body["created_at"] >= before
+    assert type(body["completed_at"]) is int and body["completed_at"] == body["created_at"]
+
+    streamed = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers=headers,
+        json={"model": "coding", "input": "hello", "stream": True},
+        timeout=30.0,
+    )
+    assert streamed.status_code == 200, streamed.text
+    envelopes = [
+        json.loads(line[len("data: ") :])["response"]
+        for line in streamed.text.splitlines()
+        if line.startswith("data: ") and '"response":' in line
+    ]
+    assert envelopes and envelopes[-1]["status"] == "completed"
+    for envelope in envelopes:
+        assert type(envelope["created_at"]) is int, envelope
+        assert envelope["completed_at"] is None or type(envelope["completed_at"]) is int
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
 def test_output_less_incomplete_response_stays_continuable(
     engine: _ServingEngine, stream: bool
@@ -576,16 +762,36 @@ def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     assert rows == [(0, 0, "failed"), (1, 0, "failed"), (2, 1, "completed")]
 
 
+def _open_primary_circuit(engine: _ServingEngine) -> None:
+    """Make sure the primary's circuit is open before a scenario that relies on it.
+
+    The failover scenario opens it with two operational failures, but under
+    ``pytest -n --dist worksteal`` a module's tail can land on a worker whose
+    engine never ran that scenario. One ``always-500`` request either opens a
+    cold circuit (two primary failures, then the fallback) or, on an already
+    open one, dispatches straight to the fallback; both leave it open.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("always-500"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.headers["x-gateway-route-depth"] == "1"
+
+
 def test_streaming_request_skips_the_open_primary_circuit(
     engine: _ServingEngine,
 ) -> None:
     """An open primary circuit routes a streamed request straight to depth one.
 
-    The previous scenario's two operational failures opened the primary's
-    circuit, so this streamed request dispatches once on the fallback and its
-    committed headers name the winning deployment position before the first
-    byte flows.
+    With the primary's circuit open (the failover scenario's two operational
+    failures, re-established here so the scenario holds on any worker), this
+    streamed request dispatches once on the fallback and its committed headers
+    name the winning deployment position before the first byte flows.
     """
+    _open_primary_circuit(engine)
     collected = b""
     with httpx.stream(
         "POST",
@@ -608,9 +814,11 @@ def test_streaming_request_skips_the_open_primary_circuit(
 def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None:
     """Every accepted request settles: no open attempts, matched totals.
 
-    Runs last in the module (pytest preserves definition order), so it sees
-    the traffic of every scenario above plus its own success probe, which the
-    still-open primary circuit routes to the fallback in one dispatch.
+    Conservation is asserted against the ledger itself, whatever traffic this
+    worker's engine has seen (under ``pytest -n --dist worksteal`` a module's
+    tail may run on a worker that ran only some scenarios): the usage report's
+    request total equals the accepted request rows, every attempt row is
+    terminal, and the report's terminal attempt counts equal the attempt rows.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -620,16 +828,15 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    # Seven scenario requests, the output-less continuation scenario's four
-    # (two first turns and their two continuations), and this probe.
-    assert report["totals"]["requests"] == 12
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
+        (total_requests,) = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
         (open_attempts,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
+    # At least this probe was accepted and settled in one dispatch.
+    assert total_requests >= 1
+    assert report["totals"]["requests"] == total_requests
     assert open_attempts == 0
-    # Twelve single-dispatch requests plus the four extra physical attempts the
-    # redial and failover scenarios spend.
-    assert terminal_attempts == total_attempts == 16
+    assert terminal_attempts == total_attempts >= total_requests

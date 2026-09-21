@@ -37,7 +37,7 @@ pub struct AggregatedResponses {
 pub fn completed_responses_body(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     events: &[Event],
 ) -> Result<AggregatedResponses, PublicError> {
@@ -48,10 +48,61 @@ pub fn completed_responses_body(
 pub fn completed_responses_body_with_carrier(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
+) -> Result<AggregatedResponses, PublicError> {
+    completed_responses_body_with_web_search(
+        request_id,
+        model,
+        created_at,
+        envelope,
+        events,
+        reasoning_content_carrier,
+        None,
+    )
+}
+
+/// Build one non-streaming result that also cites and meters the
+/// gateway-executed web search; `None` renders exactly like the variants
+/// above.
+pub fn completed_responses_body_with_web_search(
+    request_id: &str,
+    model: &str,
+    created_at: i64,
+    envelope: ResponsesEnvelope,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+    web_search: Option<&WebSearchAdmission>,
+) -> Result<AggregatedResponses, PublicError> {
+    completed_responses_body_with_gateway_tools(
+        request_id,
+        model,
+        created_at,
+        envelope,
+        events,
+        reasoning_content_carrier,
+        web_search,
+        None,
+    )
+}
+
+/// Build one non-streaming result that also renders the gateway-run
+/// tool-search rounds as hosted items ahead of the provider output and
+/// meters them on usage. The rounds are fed to the encoder alone, never
+/// scanned for `tool_names`: they are the gateway's own work, billed through
+/// `tool_search_requests`. `None` renders exactly like the variants above.
+#[allow(clippy::too_many_arguments)]
+pub fn completed_responses_body_with_gateway_tools(
+    request_id: &str,
+    model: &str,
+    created_at: i64,
+    envelope: ResponsesEnvelope,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+    web_search: Option<&WebSearchAdmission>,
+    tool_search: Option<&ResponsesToolSearch>,
 ) -> Result<AggregatedResponses, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
@@ -105,6 +156,8 @@ pub fn completed_responses_body_with_carrier(
         });
     }
     let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
+    encoder.set_web_search(web_search.cloned());
+    encoder.set_tool_search(tool_search.cloned());
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string())?;
     }

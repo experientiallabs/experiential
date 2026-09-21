@@ -104,8 +104,8 @@ class MemoryCatalog:
                 provider_model="openai/gpt-oss-120b:batch",
                 credential_reference="secret://openrouter",
                 surfaces=("/v1/chat/completions",),
-                input_micro_usd_per_million_tokens=40_000,
-                output_micro_usd_per_million_tokens=80_000,
+                input_nano_usd_per_million_tokens=40_000,
+                output_nano_usd_per_million_tokens=80_000,
             ),
             "kimi-k3-batch": BatchDeployment(
                 model="kimi-k3-batch",
@@ -113,8 +113,8 @@ class MemoryCatalog:
                 provider_model="kimi-k3-batch",
                 credential_reference="secret://openai",
                 surfaces=("/v1/chat/completions", "/v1/responses"),
-                input_micro_usd_per_million_tokens=100_000,
-                output_micro_usd_per_million_tokens=200_000,
+                input_nano_usd_per_million_tokens=100_000,
+                output_nano_usd_per_million_tokens=200_000,
             ),
         }
 
@@ -260,7 +260,7 @@ def test_submit_accepts_valid_lines_and_reserves_each() -> None:
     )
     assert job.status is BatchStatus.VALIDATING
     assert job.counts.total == 2
-    assert job.reserved_micro_usd == 2_000
+    assert job.reserved_nano_usd == 2_000
     assert ledger.reserved == ["a", "b"]
     assert store.jobs[job.batch_id].provider == "openrouter"
 

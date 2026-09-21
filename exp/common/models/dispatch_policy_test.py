@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
-from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.dispatch_policy import (
+    GatewayRungDispatchPolicy,
+    GatewayThrottleRedialPolicy,
+)
 
 
 def test_rung_dispatch_policy_rejects_incoherent_authoring() -> None:
@@ -68,3 +72,35 @@ def test_default_policy_contributes_zero_identity_bytes() -> None:
         GatewayRungDispatchPolicy().model_dump(mode="json", by_alias=True, exclude_defaults=True)
         == {}
     )
+
+
+def test_throttle_redial_schedule_is_fully_stated_bounded_and_ordered() -> None:
+    """Authoring a schedule means stating every knob, within bounds, ceiling above base."""
+    schedule = GatewayThrottleRedialPolicy(max_attempts=3, base_delay_ms=500, max_delay_ms=8_000)
+    assert schedule.model_dump(mode="json") == {
+        "max_attempts": 3,
+        "base_delay_ms": 500,
+        "max_delay_ms": 8_000,
+    }
+    with pytest.raises(ValidationError, match="at least base_delay_ms"):
+        GatewayThrottleRedialPolicy(max_attempts=1, base_delay_ms=900, max_delay_ms=800)
+    for rejected in (
+        {"max_attempts": 0, "base_delay_ms": 500, "max_delay_ms": 8_000},
+        {"max_attempts": 7, "base_delay_ms": 500, "max_delay_ms": 8_000},
+        {"max_attempts": 1, "base_delay_ms": 0, "max_delay_ms": 8_000},
+        {"max_attempts": 1, "base_delay_ms": 500, "max_delay_ms": 120_001},
+        # Every knob is required: a half-stated schedule is not a schedule.
+        {"max_attempts": 2},
+    ):
+        with pytest.raises(ValidationError):
+            GatewayThrottleRedialPolicy.model_validate(rejected)
+
+
+def test_saturation_policy_defaults_to_overflow_and_accepts_refuse() -> None:
+    """The saturation lever is inert by default and validates its closed vocabulary."""
+    assert GatewayRungDispatchPolicy().saturation == "overflow"
+    assert (
+        GatewayRungDispatchPolicy(concurrency_bound=4, saturation="refuse").saturation == "refuse"
+    )
+    with pytest.raises(ValidationError):
+        GatewayRungDispatchPolicy.model_validate({"saturation": "queue"})

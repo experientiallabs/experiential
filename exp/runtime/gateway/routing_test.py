@@ -7,18 +7,16 @@ from datetime import UTC, datetime
 
 import pytest
 
-from exp.common.models.catalog import (
-    GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
-    GatewayTokenPrices,
-)
+from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import (
     SNAPSHOT_SCHEMA_VERSION,
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.common.models.model import ModelCapabilities
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.routing import CatalogRouteResolver, RouteResolver
 
 _REVISION = "revision-one"
@@ -48,7 +46,7 @@ def _deployment(
         deployment_id: Catalog deployment identifier.
         source_alias: Source alias recorded on the deployment.
         exact_model_id: Exact logical model identity shared with its pool.
-        input_price: Configured input micro-USD per million tokens.
+        input_price: Configured input nano-USD per million tokens.
 
     Returns:
         A secret-free deployment with declared tools, output limit, and prices.
@@ -69,8 +67,8 @@ def _deployment(
         ),
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                output_micro_usd_per_million_tokens=900_000,
+                input_nano_usd_per_million_tokens=input_price,
+                output_nano_usd_per_million_tokens=900_000,
             )
         ),
     )
@@ -142,9 +140,9 @@ def test_published_metadata_uses_the_revision_direct_pool_not_the_public_name() 
     assert metadata.supports_completions is True
     assert metadata.supports_tools is True
     assert metadata.maximum_output_tokens == 8_192
-    assert metadata.input_micro_usd_per_million_tokens == 900_000
+    assert metadata.input_nano_usd_per_million_tokens == 900_000
     assert metadata.context_window_tokens is None
-    assert metadata.cached_input_micro_usd_per_million_tokens is None
+    assert metadata.cached_input_nano_usd_per_million_tokens is None
 
 
 def test_published_metadata_ignores_a_deployment_that_only_shares_the_public_name() -> None:
@@ -183,7 +181,7 @@ def test_published_metadata_ignores_a_deployment_that_only_shares_the_public_nam
     )
 
     assert metadata is not None
-    assert metadata.input_micro_usd_per_million_tokens == 900_000
+    assert metadata.input_nano_usd_per_million_tokens == 900_000
 
 
 def test_published_metadata_stays_closed_for_multi_deployment_pools() -> None:
@@ -319,3 +317,135 @@ def test_index_serves_a_cross_version_catalog_under_its_pinned_digest() -> None:
     )
 
     assert metadata is not None
+
+
+def test_direct_route_carries_the_pools_throttle_cache_threshold() -> None:
+    """The authored cache-stakes threshold rides the execution snapshot like failover_mode."""
+    deployments = (
+        _deployment(deployment_id="route-a", source_alias="route-a"),
+        _deployment(deployment_id="route-b", source_alias="route-b"),
+    )
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-threshold",
+        provenance="operator comparison run 2026-09-10",
+        evidence_sha256="e" * 64,
+        certified_at=datetime(2026, 9, 10, tzinfo=UTC),
+    )
+    pool = ExactModelPool(
+        pool_id="pool-threshold",
+        exact_model_id="exact-one",
+        deployment_ids=("route-a", "route-b"),
+        equivalence=certification,
+        failover_mode="maximize_cache",
+        throttle_cache_threshold=0.5,
+    )
+    catalog, digest = _catalog(deployments, (pool,))
+    resolver = _resolver(catalog, digest)
+    authorization = AuthorizationSnapshot(
+        request_id="request-one",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        virtual_key_id="key-one",
+        alias="public-model",
+        alias_revision_id=_REVISION,
+        target=DirectTarget(pool_id="pool-threshold"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256=digest,
+        canonical_request_sha256="d" * 64,
+        deadline_monotonic=1.0,
+    )
+
+    route = resolver.resolve_direct(authorization)
+
+    assert route.snapshot.failover_mode == "maximize_cache"
+    assert route.snapshot.throttle_cache_threshold == 0.5
+    # An unauthored pool leaves the snapshot's threshold unset.
+    unauthored, unauthored_digest = _catalog(
+        deployments, (pool.model_copy(update={"throttle_cache_threshold": None}),)
+    )
+    plain = _resolver(unauthored, unauthored_digest).resolve_direct(
+        authorization.model_copy(update={"catalog_sha256": unauthored_digest})
+    )
+    assert plain.snapshot.throttle_cache_threshold is None
+
+
+def _hint_authorization(digest: str, pool_id: str) -> AuthorizationSnapshot:
+    """Build one direct-target authorization over the given frozen catalog."""
+    return AuthorizationSnapshot(
+        request_id="request-one",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        virtual_key_id="key-one",
+        alias="public-model",
+        alias_revision_id=_REVISION,
+        target=DirectTarget(pool_id=pool_id),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256=digest,
+        canonical_request_sha256="d" * 64,
+        deadline_monotonic=1.0,
+    )
+
+
+def test_deployment_hint_pins_the_issuing_rung_first_with_the_pool_as_fallbacks() -> None:
+    """A reasoning continuation walks the pool's ladder after its issuing rung.
+
+    The hinted deployment leads (it alone can unseal the request's reasoning)
+    and the pool's other certified rungs follow in pool order, each flagged for
+    the reasoning strip and recorded as ``reasoning_continuation_failover``,
+    so a throttle on the issuing rung no longer ends the request after one
+    attempt. The pool's failover policy rides the snapshot unchanged.
+    """
+    deployments = tuple(
+        _deployment(deployment_id=name, source_alias=name) for name in ("route-a", "route-b")
+    )
+    pool = ExactModelPool(
+        pool_id="pool-two",
+        exact_model_id="exact-one",
+        deployment_ids=("route-a", "route-b"),
+        equivalence=GatewayEquivalenceCertification(
+            certification_id="certification-pinned",
+            provenance="operator comparison run 2026-09-13",
+            evidence_sha256="e" * 64,
+            certified_at=datetime(2026, 9, 13, tzinfo=UTC),
+        ),
+        failover_mode="maximize_availability",
+        throttle_cache_threshold=0.25,
+    )
+    catalog, digest = _catalog(deployments, (pool,))
+    resolver = _resolver(catalog, digest)
+
+    route = resolver.resolve_deployment_hint(_hint_authorization(digest, "pool-two"), "route-b")
+
+    assert route.route_reason == "reasoning_continuation"
+    assert route.reasoning_pinned_deployment_id == "route-b"
+    assert [item.deployment_id for item in route.deployments] == ["route-b", "route-a"]
+    assert route.snapshot.deployment_ids == ("route-b", "route-a")
+    assert route.snapshot.failover_mode == "maximize_availability"
+    assert route.snapshot.throttle_cache_threshold == 0.25
+    issuing, fallback = route.deployments
+    assert route.requires_reasoning_strip(issuing) is False
+    assert route.requires_reasoning_strip(fallback) is True
+    assert route.attempt_route_reason(issuing) == "reasoning_continuation"
+    assert route.attempt_route_reason(fallback) == "reasoning_continuation_failover"
+    # A plain direct route never flags a rung for the strip.
+    direct = resolver.resolve_direct(_hint_authorization(digest, "pool-two"))
+    assert direct.reasoning_pinned_deployment_id is None
+    assert all(not direct.requires_reasoning_strip(item) for item in direct.deployments)
+    assert direct.attempt_route_reason(direct.deployments[1]) == "direct"
+
+
+def test_deployment_hint_on_a_single_rung_pool_has_no_fallbacks() -> None:
+    """A one-deployment pool pins its only rung and has nothing to fail over to."""
+    catalog = _single_pool_catalog()
+    digest = catalog.identity_sha256()
+    resolver = _resolver(catalog, digest)
+
+    route = resolver.resolve_deployment_hint(
+        _hint_authorization(digest, "pool-one"), "deployment-one"
+    )
+
+    assert route.deployment.deployment_id == "deployment-one"
+    assert route.fallback_deployments == ()
+    assert route.snapshot.deployment_ids == ("deployment-one",)
+    assert route.reasoning_pinned_deployment_id == "deployment-one"
+    assert route.route_reason == "reasoning_continuation"

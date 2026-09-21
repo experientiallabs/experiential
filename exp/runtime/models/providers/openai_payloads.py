@@ -11,16 +11,23 @@ from __future__ import annotations
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
+from exp.runtime.models.providers.deepseek import is_deepseek_model_id
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.fireworks import prepare_gateway_reasoning_history
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_first,
+    fold_trailing_instruction_turns,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
+    fold_tool_result_images,
     openai_chat_message,
     responses_items,
 )
@@ -91,6 +98,7 @@ def openai_responses_stream_payload(
     # ``stop_sequences`` (see ``deployment_wire_entry``), cutting the stream
     # at the first match and reporting a stop-sequence terminal.
     instructions: list[str] = []
+    instruction_roles: list[str] = []
     items: list[JsonObject] = []
     for message in request.messages:
         if message.provider_native_item is not None:
@@ -114,8 +122,25 @@ def openai_responses_stream_payload(
                 items.append({"role": message.role, "content": message.content})
             else:
                 instructions.append(message.content)
+                instruction_roles.append(message.role)
         else:
             items.extend(responses_items(message))
+    if not items and instructions:
+        # A request that is ONLY instructions (a system-prompt-only Chat call,
+        # a Responses body whose input is a lone system item) has nothing for
+        # the ``input`` field, and the provider refuses an empty one ("One of
+        # 'input' or 'previous_response_id' ... must be provided") while it
+        # serves the same instructions as input items (probed live
+        # 2026-09-15, api.openai.com). Emit them as items instead.
+        items = [
+            {"role": role, "content": content}
+            for role, content in zip(instruction_roles, instructions, strict=True)
+        ]
+        instructions = []
+    if request.json_object_output:
+        # JSON mode requires an instruction in input itself; the top-level
+        # instructions field alone does not satisfy the provider's check.
+        items.insert(0, {"role": "system", "content": JSON_OBJECT_SYSTEM_INSTRUCTION})
     # Upstream storage stays disabled regardless of the caller's `store`
     # selector: continuation state is gateway-owned, the gateway never
     # references a provider-stored response, and disabled storage is what
@@ -151,6 +176,8 @@ def openai_responses_stream_payload(
         if request.structured_text.description is not None:
             format_payload["description"] = request.structured_text.description
         text_payload["format"] = format_payload
+    elif request.json_object_output:
+        text_payload["format"] = {"type": "json_object"}
     if text_payload:
         payload["text"] = text_payload
     if request.maximum_output_tokens is not None:
@@ -214,8 +241,11 @@ def openai_compatible_stream_payload(
     fireworks_reasoning_route_sha256: str | None = None,
     hunyuan_reasoning_route_sha256: str | None = None,
     reasoning_output_exposed: bool = False,
+    deepseek_reasoning_history: bool = False,
+    system_messages_leading_only: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
+    forwards_cache_control: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -231,6 +261,15 @@ def openai_compatible_stream_payload(
         reasoning_effort: Optional catalog-pinned reasoning effort.
         reasoning_output_exposed: Whether this rung replays the caller's plaintext
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
+        deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
+            which replays caller plaintext regardless of exposure and requires
+            ``reasoning_content`` on every assistant message of the current turn
+            (an absent one is backfilled empty on every assistant message); see
+            ``openai_chat_message``.
+        system_messages_leading_only: Whether this rung's chat template accepts a
+            system message only as the very first message (the official Qwen3.6+
+            template raises otherwise), so every other instruction turn is folded
+            into user text; see ``fold_instruction_turns_after_the_first``.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -243,22 +282,42 @@ def openai_compatible_stream_payload(
         request.messages,
         route_sha256=reasoning_route_sha256,
     )
+    if deepseek_reasoning_history or is_deepseek_model_id(model_id):
+        # DeepSeek ends a tools+reasoning turn empty when the conversation
+        # ends on an instruction; see fold_trailing_instruction_turns.
+        messages = fold_trailing_instruction_turns(messages)
+    # Chat tool messages are text-only on every server behind this wire, so a
+    # tool screenshot rides a following user turn (see the fold's docstring).
+    messages = fold_tool_result_images(messages)
+    if system_messages_leading_only:
+        # The rung's template 400s on any system turn past the first; the
+        # text stays where the caller put it, as user text.
+        messages = fold_instruction_turns_after_the_first(messages)
+    wire_messages = [
+        openai_chat_message(
+            message,
+            reasoning_route_sha256=reasoning_route_sha256,
+            reasoning_output_exposed=reasoning_output_exposed,
+            deepseek_reasoning_history=deepseek_reasoning_history,
+            forwards_cache_control=forwards_cache_control,
+        )
+        for message in messages
+    ]
+    if request.json_object_output:
+        _instruct_json_object(wire_messages)
     payload: JsonObject = {
         "model": model_id,
-        "messages": [
-            openai_chat_message(
-                message,
-                reasoning_route_sha256=reasoning_route_sha256,
-                reasoning_output_exposed=reasoning_output_exposed,
-            )
-            for message in messages
-        ],
+        "messages": wire_messages,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
     if active_reasoning and fireworks_reasoning_route_sha256 is not None:
         payload["reasoning_history"] = "interleaved"
-    add_openai_tools(payload, request, responses=False)
+    add_openai_tools(
+        payload, request, responses=False, forwards_cache_control=forwards_cache_control
+    )
+    if forwards_cache_control and request.provider_cache_control is not None:
+        payload["cache_control"] = request.provider_cache_control
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
     if request.structured_text is not None:
@@ -270,6 +329,8 @@ def openai_compatible_stream_payload(
         if request.structured_text.description is not None:
             schema["description"] = request.structured_text.description
         payload["response_format"] = {"type": "json_schema", "json_schema": schema}
+    elif request.json_object_output:
+        payload["response_format"] = {"type": "json_object"}
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
@@ -309,3 +370,19 @@ def openai_compatible_stream_payload(
                 model_id, effective_reasoning_effort
             )
     return payload
+
+
+def _instruct_json_object(messages: list[JsonObject]) -> None:
+    """Add the JSON-mode instruction without a second system turn on strict templates."""
+    if messages and messages[0].get("role") == "system":
+        content = messages[0].get("content")
+        if isinstance(content, str):
+            messages[0]["content"] = f"{content}\n\n{JSON_OBJECT_SYSTEM_INSTRUCTION}"
+            return
+        if isinstance(content, list):
+            messages[0]["content"] = [
+                *content,
+                {"type": "text", "text": JSON_OBJECT_SYSTEM_INSTRUCTION},
+            ]
+            return
+    messages.insert(0, {"role": "system", "content": JSON_OBJECT_SYSTEM_INSTRUCTION})

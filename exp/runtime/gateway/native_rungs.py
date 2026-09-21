@@ -6,6 +6,11 @@ entry, the dispatch signer, the frozen-body binding and the reasoning-carrier
 authority. Rungs are shaped independently so a control (``parallel_tool_calls``
 today) can be honored natively on one rung and emulated on the next without
 the route-level request changing.
+
+A rung the host flagged in ``snapshot.zdr_constrained_deployment_ids`` is
+frozen with OpenRouter's zero-data-retention routing constraint on its payload
+and the metadata opt-in header on its dispatch; a flagged rung on any other
+wire fails closed here, never dispatching unconstrained.
 """
 
 from __future__ import annotations
@@ -31,9 +36,20 @@ from exp.runtime.models.providers import (
     require_gateway_provider,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
+from exp.runtime.models.providers.openrouter_routing import (
+    OPENROUTER_PROVIDER_ID,
+    constrain_openrouter_zero_data_retention,
+    forward_provider_preferences,
+    openrouter_metadata_headers,
+)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
+
+ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
+"""The capability a flagged rung's wire must express, named on the refusal."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +61,8 @@ class RungDispatch:
     binding: FrozenDispatchBinding | None
     carrier_authority: ReasoningCarrierAuthority | None
     parallel_disclosure: str | None
+    output_disclosure: str | None
+    reserved_output_tokens: int
 
 
 def build_rung_dispatch(
@@ -56,8 +74,14 @@ def build_rung_dispatch(
     provider_request: GatewayRequest,
     public_request: GatewayRequest,
     authorization: AuthorizationSnapshot,
+    throttle_redial_budget: int = 0,
 ) -> RungDispatch:
-    """Preflight, shape and freeze ``provider_request`` for one route rung."""
+    """Preflight, shape and freeze ``provider_request`` for one route rung.
+
+    ``throttle_redial_budget`` rides onto the wire entry unchanged: it is
+    the admission-time count of post-backoff redials a throttle on this rung
+    is worth under the pool's ``throttle_redial`` schedule for this request.
+    """
     require_gateway_provider(deployment.provider)
     preflight_gateway_request(
         provider_request,
@@ -72,13 +96,41 @@ def build_rung_dispatch(
     rung_request, parallel_disclosure = shape_parallel_tool_calls(
         provider_request, deployment.gateway.capabilities
     )
+    capabilities = deployment.capabilities
+    rung_request, output_bound = bounded_output_request(
+        profile,
+        rung_request,
+        model_maximum_output_tokens=(
+            capabilities.maximum_output_tokens if capabilities is not None else None
+        ),
+        context_window_tokens=(
+            capabilities.context_window_tokens if capabilities is not None else None
+        ),
+    )
+    output_disclosure = (
+        f"max_tokens->default({output_bound};anthropic_messages;declared_bound)"
+        if provider_request.maximum_output_tokens is None
+        and rung_request.maximum_output_tokens is not None
+        else None
+    )
     upstream_payload = dialect_stream_payload(profile, rung_request)
-    upstream_body, signer = frozen_dispatch(profile, client, upstream_payload)
+    if rung_request.provider_preferences is not None and _openrouter_wire(deployment, profile):
+        # The caller's routing preferences reach the one wire that defines
+        # them; every other dialect's builder never emits the field.
+        upstream_payload = forward_provider_preferences(
+            upstream_payload, rung_request.provider_preferences
+        )
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"
         else None
     )
+    zdr_constrained = deployment.deployment_id in route.snapshot.zdr_constrained_deployment_ids
+    if zdr_constrained:
+        upstream_payload, request_headers = zdr_constrained_dispatch(
+            deployment, profile, upstream_payload
+        )
+    upstream_body, signer = frozen_dispatch(profile, client, upstream_payload)
     wire_entry = deployment_wire_entry(
         route,
         deployment,
@@ -88,6 +140,9 @@ def build_rung_dispatch(
         headers=request_headers,
         stop_sequences=emulated_stop_sequences(profile.dialect, rung_request),
         serialize_tool_calls=rung_request.serialize_tool_calls,
+        throttle_redial_budget=throttle_redial_budget,
+        native_tool_translation=rung_request.native_tool_translation,
+        zdr_constrained=zdr_constrained,
     )
     binding = (
         None
@@ -116,4 +171,40 @@ def build_rung_dispatch(
         binding=binding,
         carrier_authority=carrier_authority,
         parallel_disclosure=parallel_disclosure,
+        output_disclosure=output_disclosure,
+        reserved_output_tokens=output_bound,
     )
+
+
+def zdr_constrained_dispatch(
+    deployment: ExactModelDeployment,
+    profile: GatewayWireProfile,
+    upstream_payload: JsonObject,
+) -> tuple[JsonObject, dict[str, str]]:
+    """Tighten one flagged rung's payload and headers to OpenRouter's ZDR constraint.
+
+    Args:
+        deployment: The flagged rung.
+        profile: Its resolved wire profile.
+        upstream_payload: The payload the dialect built for it.
+
+    Returns:
+        The payload with ``provider.zdr`` / ``provider.data_collection`` forced
+        strict and the rung's headers plus the OpenRouter metadata opt-in.
+
+    Raises:
+        ProviderCapabilityError: The rung is not an OpenRouter Chat Completions
+            wire, so no request field can express the constraint; the request
+            fails closed rather than dispatching to a retaining upstream.
+    """
+    if not _openrouter_wire(deployment, profile):
+        raise ProviderCapabilityError(capability=ZDR_CONSTRAINT_CAPABILITY)
+    return (
+        constrain_openrouter_zero_data_retention(upstream_payload),
+        openrouter_metadata_headers(dict(profile.headers)),
+    )
+
+
+def _openrouter_wire(deployment: ExactModelDeployment, profile: GatewayWireProfile) -> bool:
+    """Whether this rung is OpenRouter's Chat Completions wire (the only ``provider`` field)."""
+    return deployment.provider == OPENROUTER_PROVIDER_ID and profile.dialect == "openai_compatible"

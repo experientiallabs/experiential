@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -34,6 +35,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
 
 pytest.importorskip("exp_gateway_native")
 
@@ -120,21 +122,101 @@ def _content_chunk(text: str) -> bytes:
     )
 
 
-def _terminal_frames(finish_reason: str) -> bytes:
-    """Encode the finishing chunk, usage chunk, and done sentinel."""
+def _terminal_frames(finish_reason: str, *, cached: bool = True) -> bytes:
+    """Encode the finishing chunk, usage chunk, and done sentinel.
+
+    Args:
+        finish_reason: The provider finish reason on the closing choice.
+        cached: Whether the usage chunk reports a cached prefix through
+            ``prompt_tokens_details.cached_tokens`` (an uncached completion
+            omits the details object entirely, as OpenAI-compatible servers do).
+    """
+    usage: JsonObject = {"prompt_tokens": 9, "completion_tokens": 4}
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": 2}
     return b"".join(
         (
             _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
+            _sse_frame({"choices": [], "usage": usage}),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _reasoning_only_stop_frames() -> bytes:
+    """Encode the live OpenRouter DeepSeek reasoning-only turn (2026-09-12).
+
+    Hidden reasoning streams on OpenRouter's ``reasoning`` delta field, the
+    content stays empty, the choice finishes ``stop``, and usage bills the
+    reasoning as completion tokens. This unexposed rung strips the reasoning,
+    so nothing semantic reaches the caller while the tokens are billed.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "", "reasoning": "Let me"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "", "reasoning": " read the logs first."},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+            ),
             _sse_frame(
                 {
                     "choices": [],
                     "usage": {
                         "prompt_tokens": 9,
-                        "completion_tokens": 4,
+                        "completion_tokens": 147,
+                        "total_tokens": 156,
                         "prompt_tokens_details": {"cached_tokens": 2},
+                        "completion_tokens_details": {"reasoning_tokens": 148},
                     },
                 }
             ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _silent_stop_frames() -> bytes:
+    """Encode the live Meta muse-spark budget-exhausted turn (2026-09-15).
+
+    The model reasons privately and the reasoning counts toward ``max_tokens``;
+    when the cap is below that reasoning the wire is a role delta, an empty
+    delta finishing ``stop`` and ``[DONE]`` with NO usage frame at all, so the
+    gateway sees a completed turn with nothing sent and nothing accounted.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
             b"data: [DONE]\n\n",
         )
     )
@@ -248,8 +330,16 @@ class _SseUpstream(BaseHTTPRequestHandler):
                 self.wfile.write(_terminal_frames("tool_calls"))
             elif prompt == "empty-token":
                 self.wfile.write(_zero_output_terminal_frames("stop"))
+            elif prompt == "reasoning-only-token":
+                self.wfile.write(_reasoning_only_stop_frames())
+            elif prompt == "silent-stop-token":
+                self.wfile.write(_silent_stop_frames())
             elif prompt == "truncated-token":
                 self.wfile.write(_zero_output_terminal_frames("length"))
+            elif prompt == "uncached-token":
+                self.wfile.write(_content_chunk("hello "))
+                self.wfile.write(_content_chunk("world"))
+                self.wfile.write(_terminal_frames("stop", cached=False))
             else:
                 self.wfile.write(_content_chunk("hello "))
                 self.wfile.write(_content_chunk("world"))
@@ -761,6 +851,7 @@ def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Ser
             supports_reasoning=True,
             supports_tools=True,
             supports_temperature=False,
+            maximum_output_tokens=128_000,
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
@@ -887,7 +978,12 @@ def test_non_streaming_message_answers_the_anthropic_shape_and_accounts(
         "content": [{"type": "text", "text": "hello world"}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": 7, "output_tokens": 4, "cache_read_input_tokens": 2},
+        "usage": {
+            "input_tokens": 7,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 2,
+            "output_tokens": 4,
+        },
     }
     assert _completed_attempts(engine.base) == completed_before + 1
 
@@ -954,11 +1050,199 @@ def test_streaming_message_emits_the_full_anthropic_lifecycle(
     assert text == "hello world"
     message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "end_turn"
+    # OpenAI-wire ``prompt_tokens_details.cached_tokens`` comes back as the
+    # cache-read leg with ``input_tokens`` the uncached remainder; the
+    # creation leg is present at 0 (nothing on this wire reports cache writes).
     assert message_delta["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 4,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 4,
     }
+    # An OpenAI-wire upstream reports nothing before its final chunk, so the
+    # start frame carries the gateway's pre-dispatch prompt estimate (what a
+    # client that reads input from message_start, e.g. Claude Code, shows)
+    # in Anthropic's start shape: both cache legs 0 (nothing is cached before
+    # dispatch) and the ``output_tokens: 1`` placeholder; the authoritative
+    # meters stay on message_delta above and are what the ledger bills.
+    message_start = next(payload for payload in payloads if payload["type"] == "message_start")
+    start_usage = message_start["message"]["usage"]
+    assert isinstance(start_usage["input_tokens"], int) and start_usage["input_tokens"] > 0
+    assert {k: v for k, v in start_usage.items() if k != "input_tokens"} == {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    }
+
+
+def _claude_code_body(prompt: str, *, stream: bool = False) -> JsonObject:
+    """Return a Claude Code-shaped Messages body: system array, tools, many turns.
+
+    Several thousand tokens of prompt, so a start-frame estimate that missed
+    the system blocks, the tool definitions, or the earlier turns would be
+    off by an order of magnitude rather than by tokenizer drift. ``prompt``
+    is the final user turn, which also selects the loopback upstream's reply.
+    """
+    system_block = (
+        "You are Claude Code, an interactive CLI tool that helps users with software "
+        "engineering tasks. Use the instructions below and the tools available to you. "
+    ) * 40
+    tools: list[JsonObject] = [
+        {
+            "name": f"Tool{index}",
+            "description": f"Tool {index}. " + "Reads a file from the local filesystem. " * 8,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "The absolute path"},
+                    "offset": {"type": "number", "description": "The first line to read"},
+                    "limit": {"type": "number", "description": "How many lines to read"},
+                },
+                "required": ["file_path"],
+                "additionalProperties": False,
+            },
+        }
+        for index in range(12)
+    ]
+    messages: list[JsonObject] = []
+    for turn in range(6):
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Turn {turn}: " + "explain the module layout in detail. " * 10,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading the file now. " * 5},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{turn:03d}",
+                        "name": "Tool0",
+                        "input": {"file_path": "/repo/src/main.py"},
+                    },
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"toolu_{turn:03d}",
+                        "content": [{"type": "text", "text": "def main():\n    pass\n" * 20}],
+                    }
+                ],
+            }
+        )
+    messages.append({"role": "user", "content": prompt})
+    payload: JsonObject = {
+        "model": "coding",
+        "max_tokens": 64,
+        "system": [
+            {"type": "text", "text": system_block, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Project instructions: " + system_block[:2000]},
+        ],
+        "messages": messages,
+        "tools": tools,
+        "metadata": {"user_id": "harbor"},
+    }
+    if stream:
+        payload["stream"] = True
+    return payload
+
+
+def _stream_payloads(engine: _ServingEngine, body: JsonObject) -> list[JsonObject]:
+    """Stream one Messages request and return its decoded SSE data payloads."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=body,
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200, response.read()
+        raw = b"".join(response.iter_bytes()).decode()
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def test_start_frame_estimate_counts_the_whole_claude_code_prompt(
+    engine: _ServingEngine,
+) -> None:
+    """The pre-dispatch estimate covers system, every turn, and the tools.
+
+    Harbor's Claude Code (2026-09-11) read a ``message_start`` of
+    ``input_tokens: 10`` as a stub. The start frame's estimate is the same
+    count ``count_tokens`` answers for the same prompt, so a Claude Code
+    session of several thousand tokens shows thousands there, in Anthropic's
+    start shape (both cache legs 0, ``output_tokens: 1``).
+    """
+    payloads = _stream_payloads(engine, _claude_code_body("fast-token", stream=True))
+    message_start = next(payload for payload in payloads if payload["type"] == "message_start")
+    message = message_start["message"]
+    assert isinstance(message, dict)
+    start_usage = message["usage"]
+    assert isinstance(start_usage, dict)
+    input_tokens = start_usage["input_tokens"]
+    assert isinstance(input_tokens, int) and input_tokens > 1_000, start_usage
+    assert {k: v for k, v in start_usage.items() if k != "input_tokens"} == {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    }
+
+    count_body = {
+        k: v for k, v in _claude_code_body("fast-token").items() if k not in {"max_tokens"}
+    }
+    counted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json=count_body,
+        timeout=10.0,
+    )
+    assert counted.status_code == 200, counted.text
+    assert counted.json()["input_tokens"] == input_tokens
+
+
+def test_uncached_completion_reports_both_cache_legs_as_zero(engine: _ServingEngine) -> None:
+    """A provider reporting no cached tokens yields zero legs, not missing keys.
+
+    Anthropic's shape carries ``cache_creation_input_tokens`` and
+    ``cache_read_input_tokens`` on every usage object; the official SDK
+    accumulators and Claude Code read them by key, so an uncached completion
+    renders them as 0 on ``message_delta`` and on the non-streamed body.
+    """
+    expected = {
+        "input_tokens": 9,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 4,
+    }
+    payloads = _stream_payloads(engine, _messages_body("uncached-token", stream=True))
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["usage"] == expected
+
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("uncached-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.json()["usage"] == expected
 
 
 def test_tool_calls_translate_to_tool_use_blocks(engine: _ServingEngine) -> None:
@@ -1009,14 +1293,68 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     assert unknown_field.json()["error"]["type"] == "invalid_request_error"
     assert "unknown_field" in unknown_field.json()["error"]["message"]
 
-    count_tokens = httpx.post(
+    malformed_count = httpx.post(
         f"{engine.base}/v1/messages/count_tokens",
         headers={"x-api-key": engine.raw_key},
         json={},
         timeout=10.0,
     )
-    assert count_tokens.status_code == 404
-    assert count_tokens.json()["error"]["type"] == "not_found_error"
+    assert malformed_count.status_code == 400
+    assert malformed_count.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_count_tokens_answers_anthropic_shape_from_the_gateway_estimate(
+    engine: _ServingEngine,
+) -> None:
+    """``POST /v1/messages/count_tokens`` counts the prompt without a ledger row.
+
+    Anthropic's shape (``{"input_tokens": N}``) with the gateway's own
+    tokenizer estimate for a foreign rung, disclosed through the shared body
+    field; an ungranted alias answers the same no-oracle 404 as the model
+    listing; an unknown key answers 401 in the Anthropic envelope.
+    """
+
+    def counted_requests() -> int:
+        report = httpx.get(
+            f"{engine.base}/usage.json", headers={"x-api-key": engine.raw_key}, timeout=10.0
+        ).json()
+        return int(report["totals"]["requests"])
+
+    before = counted_requests()
+    # Anthropic's count body carries no max_tokens.
+    count_body = {k: v for k, v in _messages_body("fast-token").items() if k != "max_tokens"}
+    counted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json=count_body,
+        timeout=10.0,
+    )
+    assert counted.status_code == 200, counted.text
+    body = counted.json()
+    assert isinstance(body["input_tokens"], int) and body["input_tokens"] > 0
+    assert body["x-experiential-ignored-parameters"] == [
+        "input_tokens->estimated(gateway_tokenizer)"
+    ]
+    # A count is a read: no request is accepted, reserved, or charged.
+    assert counted_requests() == before
+
+    ungranted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json={**count_body, "model": "not-granted"},
+        timeout=10.0,
+    )
+    assert ungranted.status_code == 404
+    assert ungranted.json()["error"]["type"] == "not_found_error"
+
+    bad_key = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": "exp_vk_invalid"},
+        json=_messages_body("fast-token"),
+        timeout=10.0,
+    )
+    assert bad_key.status_code == 401
+    assert bad_key.json()["error"]["type"] == "authentication_error"
 
 
 def test_native_serves_an_effort_on_a_reasoning_less_route_by_dropping_it(
@@ -1248,8 +1586,9 @@ def test_messages_non_stream_zero_output_keeps_real_input_tokens(
     assert body["stop_reason"] == stop_reason
     assert body["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 0,
     }
 
 
@@ -1278,18 +1617,285 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
     assert message_delta["delta"]["stop_reason"] == stop_reason
     assert message_delta["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 0,
     }
 
 
-def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
+def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str | None]]:
+    """Read the most recent request's settled attempt rows (ordinal, state, failure class).
+
+    An exhausted ladder answers with the bare Anthropic error envelope and no
+    request-id header, so the request is found as the newest accepted row.
+    """
+    database_path = GatewayManagement(engine.root).database_path
+    deadline = time.monotonic() + 10.0
+    while True:
+        with sqlite3.connect(database_path) as connection:
+            latest = connection.execute(
+                "SELECT request_id FROM gateway_requests ORDER BY accepted_at DESC, rowid DESC"
+                " LIMIT 1"
+            ).fetchone()
+            rows = (
+                connection.execute(
+                    "SELECT attempt_ordinal, state, failure_class FROM gateway_attempts"
+                    " WHERE request_id = ? ORDER BY attempt_ordinal",
+                    (latest[0],),
+                ).fetchall()
+                if latest is not None
+                else []
+            )
+        if rows and all(state not in {"dispatched", "running"} for _, state, _ in rows):
+            break
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    return [(int(ordinal), str(state), failure) for ordinal, state, failure in rows]
+
+
+def test_messages_non_stream_billed_empty_stop_is_a_typed_empty_end_turn(
     engine: _ServingEngine,
 ) -> None:
-    """Replayed thinking HISTORY needs an Anthropic-only route and rejects
-    with no upstream dispatch; a live thinking CONFIG instead serves through
-    the admission coercion (dropped with disclosure on this non-reasoning
-    OpenAI-compatible route) because Claude Code pins one on every model."""
+    """A ``stop`` that billed reasoning yet rendered no block is a TYPED empty turn.
+
+    Production 2026-09-12 (deepseek-v4-flash via OpenRouter, Claude Code's
+    body): ``message_start`` then ``message_delta`` with ``end_turn``, zero
+    content blocks, and 42 to 750 billed output tokens, settled as a completed
+    success. The single rung here is redialed once (its bounded cap) and both
+    dispatches settle ``failed`` as ``empty_completion`` at $0; a route with a
+    second rung would fail over instead. The ladder exhausted on empty turns
+    answers the caller a 200 ``end_turn`` with no content under
+    ``x-gateway-warning: empty_completion`` -- never a 5xx, which every SDK
+    auto-retries (2026-09-15: one Claude Code session re-sent a 44k-token
+    prompt every minute for an hour against the earlier 502).
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == []
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_messages_stream_billed_empty_stop_is_a_typed_empty_end_turn_stream(
+    engine: _ServingEngine,
+) -> None:
+    """The streamed request opens only after the ladder settled: a typed empty stream.
+
+    Nothing semantic was ever committed, so the exhausted ladder's settled
+    events encode as one ``message_start`` / ``message_delta end_turn`` /
+    ``message_stop`` stream with no content block and the warning header on
+    the response (a settled stream still builds its headers before its first
+    frame), never an ``error`` event.
+    """
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token", stream=True),
+        timeout=30.0,
+    ) as response:
+        status = response.status_code
+        warning = response.headers.get("x-gateway-warning")
+        raw = b"".join(response.iter_bytes()).decode()
+    assert status == 200, raw
+    assert warning == "empty_completion"
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    kinds = [payload["type"] for payload in payloads]
+    assert "message_start" in kinds and "message_stop" in kinds
+    assert "error" not in kinds
+    assert "content_block_start" not in kinds
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_chat_capped_silent_stop_is_a_length_truncation_not_an_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """A ``stop`` with no output and no usage on a capped request answers ``length``.
+
+    Production 2026-09-15 (Meta muse-spark under ``max_tokens`` below the
+    model's private reasoning): 200 with ``content: null``, ``finish_reason:
+    stop`` and ``usage: null``, settled ``completed`` -- 895 such answers to
+    ~60 organizations in seven days. The only benign reading of that wire on a
+    capped request is a budget the hidden reasoning exhausted before the
+    first visible token, so the caller now sees the truncation it can act on
+    and the ledger records ``incomplete``.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_tokens": 40,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert body["choices"][0]["message"]["content"] is None
+    assert body["usage"] is None
+    assert _latest_attempt_states(engine) == [(0, "incomplete", None)]
+
+
+def test_chat_capped_silent_stop_stream_ends_with_length(engine: _ServingEngine) -> None:
+    """The streamed capped request finishes ``length`` on its one choice chunk."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_completion_tokens": 40,
+            "stream": True,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    finish_reasons = [
+        choice["finish_reason"]
+        for payload in payloads
+        for choice in payload.get("choices", [])
+        if choice.get("finish_reason") is not None
+    ]
+    assert finish_reasons == ["length"]
+
+
+def test_chat_uncapped_silent_stop_is_a_typed_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """Without a cap the same wire is the provider delivering nothing: a typed empty turn.
+
+    No budget could have been exhausted, nothing was sent and nothing was
+    accounted, so the attempt takes the ladder like the billed empty stop:
+    the single rung is redialed once and both dispatches settle ``failed`` as
+    ``empty_completion`` at $0; the exhausted ladder then answers the empty
+    turn as a 200 ``stop`` with null content under the warning header.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "messages": [{"role": "user", "content": "silent-stop-token"}]},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["message"]["content"] is None
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_responses_uncapped_silent_stop_is_a_typed_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """The Responses surface renders the exhausted empty ladder as a completed empty output."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "silent-stop-token"},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"] == []
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_capped_length_truncation_carries_no_empty_completion_warning(
+    engine: _ServingEngine,
+) -> None:
+    """An honest budget truncation is not an empty completion: no warning header."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_tokens": 40,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "x-gateway-warning" not in response.headers
+
+
+def test_responses_capped_silent_stop_is_incomplete_max_output_tokens(
+    engine: _ServingEngine,
+) -> None:
+    """The Responses surface renders the same truncation as ``incomplete``."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "silent-stop-token", "max_output_tokens": 40},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "incomplete"
+    assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert body["output"] == []
+
+
+def test_messages_silent_stop_is_a_max_tokens_stop(engine: _ServingEngine) -> None:
+    """Messages always carries ``max_tokens``, so the wire is a ``max_tokens`` stop."""
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("silent-stop-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["stop_reason"] == "max_tokens"
+    assert body["content"] == []
+    assert _latest_attempt_states(engine) == [(0, "incomplete", None)]
+
+
+def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
+    engine: _ServingEngine,
+) -> None:
+    """Preserve replayable history while refusing an unenforceable numeric budget.
+
+    Thinking history is disclosed and omitted on a non-Anthropic wire. A live
+    numeric thinking budget is a constraint, not permission to drop the field.
+    """
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
 
@@ -1298,28 +1904,29 @@ def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
         headers={"x-api-key": engine.raw_key},
         json={
             **_messages_body("thinking-config-serves"),
-            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            # This wire cannot enforce a numeric thinking budget, even one
+            # below the caller's total output ceiling.
+            "thinking": {"type": "enabled", "budget_tokens": 32},
         },
         timeout=10.0,
     )
-    assert config.status_code == 200
+    assert config.status_code == 400
+    assert "thinking" in config.json()["error"]["message"]
     with _SseUpstream.payloads_lock:
-        dispatched_config = _SseUpstream.payloads[dispatched_before:]
-        dispatched_before = len(_SseUpstream.payloads)
-    assert len(dispatched_config) == 1
-    assert "thinking" not in dispatched_config[0]
+        assert len(_SseUpstream.payloads) == dispatched_before
 
     history = httpx.post(
         f"{engine.base}/v1/messages",
         headers={"x-api-key": engine.raw_key},
         json={
-            **_messages_body("must-not-dispatch"),
+            **_messages_body("thinking-history-serves"),
             "messages": [
                 {"role": "user", "content": "go"},
                 {
                     "role": "assistant",
                     "content": [
                         {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                        {"type": "redacted_thinking", "data": "opaque=="},
                         {"type": "text", "text": "done"},
                     ],
                 },
@@ -1328,11 +1935,18 @@ def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
         },
         timeout=10.0,
     )
-    assert history.status_code == 400
-    assert "thinking" in history.json()["error"]["message"]
-
+    assert history.status_code == 200
+    assert (
+        "messages.thinking->dropped(unsupported_by_provider)"
+        in history.json()["x-experiential-ignored-parameters"]
+    )
     with _SseUpstream.payloads_lock:
-        assert len(_SseUpstream.payloads) == dispatched_before
+        dispatched_history = _SseUpstream.payloads[dispatched_before:]
+    assert len(dispatched_history) == 1
+    sent = json.dumps(dispatched_history[0])
+    assert "private" not in sent
+    assert "opaque==" not in sent
+    assert "done" in sent
 
 
 def test_encrypted_reasoning_include_rejects_non_responses_routes(
@@ -1745,3 +2359,97 @@ def test_hosted_web_search_serves_and_continues_through_the_native_responses_lan
     message_echo = cast(JsonObject, replay[hosted_position + 1])
     assert message_echo["type"] == "message"
     assert message_echo["id"] == "msg_cited"
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_reaches_the_native_responses_provider(
+    responses_engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve Chat verbosity through the gateway and retain it on the provider wire."""
+    with _ResponsesUpstream.payloads_lock:
+        before = len(_ResponsesUpstream.payloads)
+    response = httpx.post(
+        f"{responses_engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "messages": [{"role": "user", "content": "look up a result"}],
+            "verbosity": "high",
+            "stream": stream,
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert "x-experiential-ignored-parameters" not in response.text
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = _ResponsesUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert dispatched[0]["text"] == {"verbosity": "high"}
+    assert "verbosity" not in dispatched[0]
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_serves_with_disclosure_on_a_compatible_provider(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve an unsupported hint without forwarding it or losing its public disclosure."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "low",
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            chunk.get("x-experiential-ignored-parameters") == ["verbosity"] for chunk in chunks
+        )
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+        assert response.json()["x-experiential-ignored-parameters"] == ["verbosity"]
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert "verbosity" not in dispatched[0]
+    assert "text" not in dispatched[0]
+
+
+def test_invalid_chat_verbosity_is_rejected_before_provider_dispatch(
+    engine: _ServingEngine,
+) -> None:
+    """Reject an invalid hint as a named client error without paying for an attempt."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "verbose",
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "verbosity"
+    assert response.json()["error"]["code"] == "invalid_parameter"
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == before

@@ -25,16 +25,18 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         config_json: str,
         shutdown: object,
         on_listening: object,
+        guardrail_detectors: object,
     ) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
         captured["config"] = json.loads(config_json)
         captured["shutdown"] = shutdown
         captured["on_listening"] = on_listening
+        captured["guardrail_detectors"] = guardrail_detectors
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
-    control = SimpleNamespace(request_timeout_seconds=37.0)
+    control = SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=37.0)
 
     serve_native_gateway(
         control,
@@ -58,6 +60,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
     assert config["connect_timeout_seconds"] == 4.0
     assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
+    assert captured["guardrail_detectors"] == {}
 
 
 def test_host_forwards_an_embedder_owned_shutdown_handle(
@@ -71,9 +74,10 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
         config_json: str,
         shutdown: object,
         on_listening: object,
+        guardrail_detectors: object,
     ) -> None:
         """Capture the extension boundary call."""
-        del control_plane, config_json, on_listening
+        del control_plane, config_json, on_listening, guardrail_detectors
         captured["shutdown"] = shutdown
 
     native = SimpleNamespace(serve=serve)
@@ -81,7 +85,7 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
     handle = object()
 
     serve_native_gateway(
-        SimpleNamespace(request_timeout_seconds=12.0),
+        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=12.0),
         host="127.0.0.1",
         port=8080,
         shutdown=cast("native_server.ShutdownHandle", handle),
@@ -97,7 +101,7 @@ def test_host_maps_native_runtime_failures(monkeypatch: pytest.MonkeyPatch) -> N
 
     with pytest.raises(NativeGatewayServerError, match="bind failed"):
         serve_native_gateway(
-            SimpleNamespace(request_timeout_seconds=10.0),
+            SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
             host="127.0.0.1",
             port=8080,
         )
@@ -111,7 +115,7 @@ def test_host_treats_native_keyboard_interrupt_as_clean_shutdown(
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
 
     serve_native_gateway(
-        SimpleNamespace(request_timeout_seconds=10.0),
+        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
         host="127.0.0.1",
         port=8080,
     )
@@ -127,7 +131,7 @@ def test_host_requires_the_extension(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(native_server.importlib, "import_module", missing)
     with pytest.raises(NativeGatewayServerError, match="not installed"):
         serve_native_gateway(
-            SimpleNamespace(request_timeout_seconds=10.0),
+            SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
             host="127.0.0.1",
             port=8080,
         )

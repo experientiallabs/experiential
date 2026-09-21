@@ -15,11 +15,23 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.gateway.contracts import (
+    TOOL_ERROR_TEXT_PREFIX,
+    GatewayMessage,
+    GatewayNamedToolChoice,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
+from exp.runtime.models.providers.anthropic_tool_compat import anthropic_input_schema
 from exp.runtime.models.providers.audios import reject_audio_part
 from exp.runtime.models.providers.documents import bedrock_document_block
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.images import bedrock_image_block
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_leading_run,
+)
 from exp.runtime.models.providers.videos import bedrock_video_block
+from exp.runtime.models.providers.wire_messages import retained_cache_marked_blocks
 
 BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES = 25_000_000
 """Converse accepts inline media only while the whole request payload stays
@@ -30,7 +42,7 @@ system prompts, tools, and output configuration together."""
 
 def converse_request(
     model_id: str,
-    request: ModelRequest,
+    request: ModelRequest | GatewayRequest,
     *,
     supports_temperature: bool = True,
     supports_top_p: bool = True,
@@ -41,6 +53,7 @@ def converse_request(
     structured_output_description: str | None = None,
     structured_output_schema: JsonObject | None = None,
     strict_tool_names: Collection[str] = (),
+    json_object_instruction: str | None = None,
 ) -> JsonObject:
     """Translate one EXP request into boto Converse keyword arguments.
 
@@ -57,6 +70,8 @@ def converse_request(
         structured_output_description: Optional description for that output contract.
         structured_output_schema: Strict JSON schema admitted for structured output.
         strict_tool_names: Tool definitions whose schemas Bedrock must enforce.
+        json_object_instruction: Optional trailing system text requesting
+            schema-free JSON output (Converse has no native JSON mode).
 
     Returns:
         Keyword arguments accepted by ``bedrock-runtime`` Converse.
@@ -77,12 +92,13 @@ def converse_request(
             structured_output_description=structured_output_description,
             structured_output_schema=structured_output_schema,
             strict_tool_names=strict_tool_names,
+            json_object_instruction=json_object_instruction,
         ),
     }
 
 
 def converse_body(
-    request: ModelRequest,
+    request: ModelRequest | GatewayRequest,
     *,
     supports_temperature: bool = True,
     supports_top_p: bool = True,
@@ -93,6 +109,7 @@ def converse_body(
     structured_output_description: str | None = None,
     structured_output_schema: JsonObject | None = None,
     strict_tool_names: Collection[str] = (),
+    json_object_instruction: str | None = None,
 ) -> JsonObject:
     """Translate one EXP request into the Converse wire document.
 
@@ -110,6 +127,8 @@ def converse_body(
         structured_output_description: Optional description for that output contract.
         structured_output_schema: Strict JSON schema admitted for structured output.
         strict_tool_names: Tool definitions whose schemas Bedrock must enforce.
+        json_object_instruction: Optional trailing system text requesting
+            schema-free JSON output (Converse has no native JSON mode).
 
     Returns:
         The native Converse request document.
@@ -134,30 +153,36 @@ def converse_body(
             return
         messages.append({"role": role, "content": content})
 
-    for message in request.messages:
-        if message.role == "system":
+    # Converse's top-level ``system`` has no position inside messages, so an
+    # instruction after conversation start rides as user text where the
+    # caller put it (``push`` merges it into an adjacent user turn); only the
+    # leading run is hoisted.
+    for message in fold_instruction_turns_after_the_leading_run(request.messages):
+        if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ValueError("system messages need text content")
-            system.append({"text": message.content})
+            system.extend(_text_blocks(message))
             continue
         if message.role == "tool":
-            push(
-                "user",
-                [
-                    {
-                        "toolResult": {
-                            "toolUseId": message.tool_call_id or "",
-                            "content": [{"text": message.content or ""}],
-                        }
+            blocks: list[JsonObject] = [
+                {
+                    "toolResult": {
+                        "toolUseId": message.tool_call_id or "",
+                        "content": _tool_result_blocks(message),
                     }
-                ],
-            )
+                }
+            ]
+            if isinstance(message, GatewayMessage):
+                _append_cache_point(blocks, message.cache_control)
+            push("user", blocks)
             continue
         push(
             "assistant" if message.role == "assistant" else "user",
             _message_blocks(message),
         )
 
+    if json_object_instruction is not None:
+        system.append({"text": json_object_instruction})
     payload: JsonObject = {"messages": messages}
     inference = _inference_config(
         request,
@@ -195,12 +220,25 @@ def converse_body(
         }
     tool_config = _tool_config(request, strict_tool_names=strict_tool_names)
     if tool_config is not None:
+        if isinstance(request, GatewayRequest):
+            tools = cast(list[JsonObject], tool_config["tools"])
+            marked_tools: list[JsonObject] = []
+            for tool, block in zip(request.tools, tools, strict=True):
+                marked_tools.append(block)
+                _append_cache_point(marked_tools, tool.cache_control)
+            tool_config["tools"] = marked_tools
         payload["toolConfig"] = tool_config
+    if isinstance(request, GatewayRequest) and request.provider_cache_control is not None:
+        # Automatic caching's moving breakpoint follows the last message.
+        if messages:
+            last_content = cast(list[JsonObject], messages[-1]["content"])
+            if "cachePoint" not in last_content[-1]:
+                _append_cache_point(last_content, request.provider_cache_control)
     _require_inline_media_within_payload(request, payload)
     return payload
 
 
-def _carries_inline_media(request: ModelRequest) -> bool:
+def _carries_inline_media(request: ModelRequest | GatewayRequest) -> bool:
     """Return whether any message carries an inline image, video, or document."""
     return any(
         part.kind != "text" and part.data is not None
@@ -209,7 +247,9 @@ def _carries_inline_media(request: ModelRequest) -> bool:
     )
 
 
-def _require_inline_media_within_payload(request: ModelRequest, payload: JsonObject) -> None:
+def _require_inline_media_within_payload(
+    request: ModelRequest | GatewayRequest, payload: JsonObject
+) -> None:
     """Reject an inline-media request whose complete body exceeds the Converse payload cap.
 
     Text-only requests are not measured here: the ceiling is documented for
@@ -237,7 +277,35 @@ def _require_inline_media_within_payload(request: ModelRequest, payload: JsonObj
         )
 
 
-def _multimodal_blocks(message: ModelMessage) -> list[JsonObject]:
+def _tool_result_blocks(message: ModelMessage | GatewayMessage) -> list[JsonObject]:
+    """Emit one tool result's Converse content blocks in caller order.
+
+    A tool screenshot re-emits as a ``ToolResultContentBlock.image`` beside
+    its text (the union Converse documents for tool results; the model
+    contract restricts tool messages to text and image parts). Empty text
+    parts drop because Converse rejects an empty text block; a text-only
+    result keeps its single text block.
+    """
+    if not message.content_parts:
+        return [
+            {
+                "text": message.folded_tool_error_content()
+                if isinstance(message, GatewayMessage)
+                else message.content or ""
+            }
+        ]
+    blocks: list[JsonObject] = []
+    for part in message.content_parts:
+        if part.kind == "image":
+            blocks.append(bedrock_image_block(part))
+        elif part.kind == "text" and part.text:
+            blocks.append({"text": part.text})
+    if isinstance(message, GatewayMessage) and message.tool_is_error:
+        blocks.insert(0, {"text": TOOL_ERROR_TEXT_PREFIX})
+    return blocks or [{"text": message.content or ""}]
+
+
+def _multimodal_blocks(message: ModelMessage | GatewayMessage) -> list[JsonObject]:
     """Emit one multimodal user turn in caller order.
 
     Documents are named by their one-based position within the turn when the
@@ -246,22 +314,32 @@ def _multimodal_blocks(message: ModelMessage) -> list[JsonObject]:
     """
     blocks: list[JsonObject] = []
     document_ordinal = 0
+    marked = iter(
+        retained_cache_marked_blocks(message.provider_text_blocks)
+        if isinstance(message, GatewayMessage)
+        else ()
+    )
     for part in message.content_parts:
         if part.kind == "image":
             blocks.append(bedrock_image_block(part))
+            _append_cache_point(blocks, part.cache_control)
         elif part.kind == "document":
             document_ordinal += 1
             blocks.append(bedrock_document_block(part, document_ordinal))
+            _append_cache_point(blocks, part.cache_control)
         elif part.kind == "video":
             blocks.append(bedrock_video_block(part))
         elif part.kind == "audio":
             blocks.append(reject_audio_part(part))
         elif part.text:
             blocks.append({"text": part.text})
+            text_block = next(marked, {})
+            marker = text_block.get("cache_control")
+            _append_cache_point(blocks, marker if isinstance(marker, dict) else part.cache_control)
     return blocks
 
 
-def _message_blocks(message: ModelMessage) -> list[JsonObject]:
+def _message_blocks(message: ModelMessage | GatewayMessage) -> list[JsonObject]:
     """Convert one user or assistant message into Converse content blocks.
 
     Args:
@@ -273,19 +351,26 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
     Raises:
         ValueError: The message cannot be represented without dropping context.
     """
-    if message.role == "user" and message.assistant_action is not None:
+    action = message.assistant_action if isinstance(message, ModelMessage) else None
+    if message.role == "user" and action is not None:
         raise ValueError("user messages cannot carry assistant actions")
     if message.role == "user" and message.content is None:
         raise ValueError("user messages need text content")
     if message.content_parts:
         return _multimodal_blocks(message)
     blocks: list[JsonObject] = []
-    action = message.assistant_action
     text = message.content if message.content is not None else action.content if action else None
     if text:
-        blocks.append({"text": text})
-    if action is not None:
-        for call in action.tool_calls:
+        blocks.extend(_text_blocks(message))
+    calls = (
+        message.tool_calls
+        if isinstance(message, GatewayMessage)
+        else action.tool_calls
+        if action
+        else ()
+    )
+    if calls:
+        for call in calls:
             blocks.append(
                 {
                     "toolUse": {
@@ -295,13 +380,39 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
                     }
                 }
             )
+            _append_cache_point(blocks, call.cache_control)
     if not blocks:
         raise ValueError(f"{message.role} messages need text or a tool call")
     return blocks
 
 
+def _append_cache_point(blocks: list[JsonObject], marker: JsonObject | None) -> None:
+    """Translate an explicit ephemeral breakpoint into a Converse checkpoint."""
+    if marker is None:
+        return
+    point: JsonObject = {"type": "default"}
+    if marker.get("ttl") is not None:
+        point["ttl"] = marker["ttl"]
+    blocks.append({"cachePoint": point})
+
+
+def _text_blocks(message: ModelMessage | GatewayMessage) -> list[JsonObject]:
+    """Keep text boundaries and their cache checkpoints in provider order."""
+    if isinstance(message, GatewayMessage) and message.provider_text_blocks:
+        blocks: list[JsonObject] = []
+        for block in retained_cache_marked_blocks(message.provider_text_blocks):
+            if block.get("text"):
+                blocks.append({"text": block["text"]})
+            marker = block.get("cache_control")
+            if isinstance(marker, dict) and blocks:
+                _append_cache_point(blocks, marker)
+        return blocks
+    action = message.assistant_action if isinstance(message, ModelMessage) else None
+    return [{"text": message.content or (action.content if action else "") or ""}]
+
+
 def _inference_config(
-    request: ModelRequest,
+    request: ModelRequest | GatewayRequest,
     *,
     supports_temperature: bool,
     supports_top_p: bool,
@@ -321,7 +432,7 @@ def _inference_config(
 
 
 def _tool_config(
-    request: ModelRequest,
+    request: ModelRequest | GatewayRequest,
     *,
     strict_tool_names: Collection[str] = (),
 ) -> JsonObject | None:
@@ -336,8 +447,16 @@ def _tool_config(
     for tool in request.tools:
         tool_spec: JsonObject = {
             "name": tool.name,
-            "description": tool.description,
-            "inputSchema": {"json": tool.input_schema},
+            "description": tool.description or tool.name,
+            # Converse relays Anthropic's input_schema rules (root object,
+            # no root combinator), so the same reshaping applies here.
+            "inputSchema": {
+                "json": anthropic_input_schema(
+                    tool.parameters
+                    if isinstance(tool, GatewayToolDefinition)
+                    else tool.input_schema
+                )
+            },
         }
         if tool.name in strict_tool_names:
             tool_spec["strict"] = True
@@ -345,6 +464,6 @@ def _tool_config(
     config: JsonObject = {"tools": tools}
     if request.tool_choice == "required":
         config["toolChoice"] = {"any": {}}
-    elif isinstance(request.tool_choice, ToolChoice):
+    elif isinstance(request.tool_choice, (ToolChoice, GatewayNamedToolChoice)):
         config["toolChoice"] = {"tool": {"name": request.tool_choice.name}}
     return config

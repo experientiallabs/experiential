@@ -51,6 +51,22 @@ class GuardrailCheckStage(StrEnum):
     OUTPUT = "output"
 
 
+class OutputGuardrailMode(StrEnum):
+    """How the data plane must enforce one admission's output chain.
+
+    ``OFF`` means the identity has no output check, so bytes flow untouched.
+    ``BUFFER`` means the whole winning completion is collected and inspected
+    once before any caller byte, which is the only safe shape for a check
+    that can block or for a detector that needs the full text. ``STREAM``
+    means the completion is redacted incrementally as it arrives, with only a
+    bounded trailing window held back.
+    """
+
+    OFF = "off"
+    BUFFER = "buffer"
+    STREAM = "stream"
+
+
 class GuardrailCheck(ContractModel):
     """One ordered, timed inspection step in a policy chain."""
 

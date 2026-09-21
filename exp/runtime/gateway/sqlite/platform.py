@@ -14,7 +14,7 @@ from exp.runtime.gateway.budgets import (
     BudgetScopeKind,
     SQLiteBudgetStore,
 )
-from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage, ProjectTarget
+from exp.runtime.gateway.contracts import GatewayFailureClass, ProjectTarget
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import require_gateway_servable_provider
 from exp.runtime.gateway.platform import (
@@ -85,6 +85,9 @@ from exp.runtime.gateway.sqlite.platform_records import (
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     reservation_record as _reservation_record,
+)
+from exp.runtime.gateway.sqlite.platform_records import (
+    usage_record as _usage_record,
 )
 from exp.runtime.gateway.sqlite.provider_commands import sqlite_connection_config
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
@@ -295,7 +298,7 @@ class SQLiteGatewayPlatform:
                 pool_id=command.scope.pool_id,
                 deployment_id=command.scope.deployment_id,
             ),
-            limit_micro_usd=command.limit_micro_usd,
+            limit_nano_usd=command.limit_nano_usd,
             replace=command.replace,
         )
         return NaturalMutationOutcome(
@@ -530,10 +533,10 @@ class SQLiteGatewayPlatform:
                     pool_id=item.budget.scope.pool_id,
                     deployment_id=item.budget.scope.deployment_id,
                 ),
-                limit_micro_usd=item.budget.limit_micro_usd,
-                reserved_micro_usd=item.reserved_micro_usd,
-                settled_micro_usd=item.settled_micro_usd,
-                remaining_micro_usd=item.remaining_micro_usd,
+                limit_nano_usd=item.budget.limit_nano_usd,
+                reserved_nano_usd=item.reserved_nano_usd,
+                settled_nano_usd=item.settled_nano_usd,
+                remaining_nano_usd=item.remaining_nano_usd,
                 unknown_cost_attempts=item.unknown_cost_attempts,
                 exhausted=item.exhausted,
                 created_at=item.budget.created_at,
@@ -559,7 +562,7 @@ class SQLiteGatewayPlatform:
                 deployment=request.deployment,
                 attempt_ordinal=request.attempt_ordinal,
                 route_depth=request.route_depth,
-                maximum_cost_micro_usd=request.maximum_cost_micro_usd,
+                maximum_cost_nano_usd=request.maximum_cost_nano_usd,
             )
         except sqlite3.IntegrityError:
             concurrent = self._attempt_for_reservation(request)
@@ -575,7 +578,17 @@ class SQLiteGatewayPlatform:
         self,
         request: AttemptSettlementRequest,
     ) -> AttemptSettlementRecord:
-        """Settle only an attempt proven to belong to the requested tenant."""
+        """Settle a tenant's attempt and verify exact replay against durable evidence.
+
+        Args:
+            request: Tenant-scoped terminal outcome and provider usage.
+
+        Returns:
+            The persisted outcome with all frozen rates and observed token subsets.
+
+        Raises:
+            ValueError: Tenant ownership or replay evidence differs from the row.
+        """
         self._reservation(
             organization_id=request.organization_id,
             attempt_id=request.attempt_id,
@@ -595,20 +608,7 @@ class SQLiteGatewayPlatform:
             raise ValueError(
                 "attempt settlement replay cannot finalize its non-terminal parent request"
             )
-        usage = (
-            None
-            if row["input_tokens"] is None or row["output_tokens"] is None
-            else GatewayUsage(
-                input_tokens=int(row["input_tokens"]),
-                cached_input_tokens=(
-                    None if row["cached_input_tokens"] is None else int(row["cached_input_tokens"])
-                ),
-                output_tokens=int(row["output_tokens"]),
-                reasoning_tokens=(
-                    None if row["reasoning_tokens"] is None else int(row["reasoning_tokens"])
-                ),
-            )
-        )
+        usage = _usage_record(row)
         settlement = AttemptSettlementRecord(
             reservation=_reservation_record(row, organization_id=request.organization_id),
             state=AttemptTerminalState(str(row["state"])),
@@ -620,8 +620,8 @@ class SQLiteGatewayPlatform:
             ),
             usage=usage,
             usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
-            estimated_cost_micro_usd=_optional_int(row["estimated_cost_micro_usd"]),
-            settled_micro_usd=_optional_int(row["budget_settled_micro_usd"]),
+            estimated_cost_nano_usd=_optional_int(row["estimated_cost_nano_usd"]),
+            settled_nano_usd=_optional_int(row["budget_settled_nano_usd"]),
             first_token_at=_optional_datetime(row["first_token_at"]),
         )
         _require_settlement_replay(settlement, request=request)
@@ -650,7 +650,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     total_latency_ms=item.total_latency_ms,
                     average_latency_ms=item.average_latency_ms,
@@ -672,7 +672,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     terminal_counts=tuple(
                         UsageTerminalCount(

@@ -105,8 +105,11 @@ class GatewayWireProfile:
     url: str
     """Full endpoint URL, including provider-specific query parameters."""
 
-    headers: Mapping[str, str] = field(default_factory=dict)
-    """Authenticated request headers for every dispatch."""
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    """Authenticated request headers for every dispatch, excluded from diagnostics."""
+
+    inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
+    """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
 
     model_id: str = ""
     """Exact provider model identifier."""
@@ -153,6 +156,16 @@ class GatewayWireProfile:
     charges while the gateway bills catalog rates, so the field never
     reaches the provider there.
     """
+
+    forwards_cache_control: bool = False
+    """Whether this Chat adapter accepts explicit Anthropic cache markers."""
+
+    @property
+    def preserves_cache_control(self) -> bool:
+        """Whether this adapter can carry or translate explicit cache checkpoints."""
+        return self.dialect in {"anthropic_messages", "bedrock_converse_stream"} or (
+            self.dialect == "openai_compatible" and self.forwards_cache_control
+        )
 
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
@@ -204,7 +217,10 @@ class GatewayWireProfile:
     """Exact provider field used to carry normalized reasoning effort."""
 
     reasoning_effort: str | None = None
-    """Optional provider default used when the wire requires an explicit effort."""
+    """The rung's catalog default depth (``reasoning_default_effort``).
+
+    Emitted when the wire requires an explicit effort, and the depth a
+    budget-less caller ``thinking`` config translates to on this rung."""
 
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values declared by this deployment, in canonical order."""
@@ -232,11 +248,45 @@ class GatewayWireProfile:
     category (Tencent/DeepSeek/Anthropic) so the caller sees the model's thinking
     it is already billed for; the round-trip token stays the sealed carrier."""
 
+    deepseek_reasoning_history: bool = False
+    """Whether this rung is DeepSeek's own API, whose thinking mode enforces
+    ``reasoning_content`` on every assistant tool-call turn in the history.
+
+    Origin-derived (``is_deepseek_base_url``), never a catalog stamp: the Chat
+    wire builder replays caller plaintext ``reasoning_content`` verbatim on
+    this rung and backfills an empty string on every assistant message that
+    lacks it — the provider requires the field on each assistant message of
+    the current turn, text-only ones included, and accepts an empty one
+    anywhere (DeepSeek validates presence, not content; verified live
+    2026-09-10).
+    Independent of ``reasoning_output_exposed``, which still decides alone
+    whether the caller SEES the reasoning deltas on output."""
+
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message ONLY as the
+    very first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not ``loop.first`` (a
+    second leading system turn included), so a vLLM origin serving it 400s
+    the whole request; coding agents put instruction turns mid-conversation
+    on every tool loop. A catalog stamp (``ModelCapabilities
+    .system_messages_leading_only``), never a hostname rule: the Chat wire
+    builder folds every instruction turn past the first into user text on a
+    declared rung and leaves every other rung's messages untouched."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 
     maximum_output_tokens: int | None = None
     """Largest caller output-token ceiling accepted by this exact model."""
+
+    minimum_output_tokens: int | None = None
+    """Smallest output-token ceiling this rung's provider accepts, when declared.
+
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``).
+    A smaller explicit caller ceiling is refused before dispatch, never raised.
+    Route selection may keep another rung that accepts the caller's ceiling."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact
@@ -249,9 +299,23 @@ class GatewayWireProfile:
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
     embeddings surface excludes the rung instead of dispatching a chat URL."""
 
+    decisions_url: str | None = None
+    """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
+
     images_url: str | None = None
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
     sharing ``headers``; ``None`` when the connection speaks no images wire."""
+
+    @property
+    def replays_plaintext_reasoning(self) -> bool:
+        """Whether this rung forwards caller plaintext ``reasoning_content`` verbatim.
+
+        True on an exposure-stamped rung (the caller replays what that rung
+        itself returned) and on DeepSeek's origin, which REQUIRES the field on
+        tool-call history regardless of whether its output is exposed. Route
+        narrowing and the disclosure gate read this, never the two flags apart.
+        """
+        return self.reasoning_output_exposed or self.deepseek_reasoning_history
 
     def __post_init__(self) -> None:
         """Reject malformed operator wire contracts before admission."""
@@ -261,6 +325,7 @@ class GatewayWireProfile:
             "openai_compatible",
             "gemini_generate_content",
             "bedrock_converse_stream",
+            "typesafe_systemone",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {

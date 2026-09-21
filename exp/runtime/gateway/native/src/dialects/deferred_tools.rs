@@ -1,24 +1,34 @@
-//! Tool calls whose arguments fail to parse at their block stop, on wires
-//! that reveal the stop reason only afterwards (Anthropic `message_delta`,
-//! Bedrock `messageStop`). A provider-declared budget truncation makes the open
-//! fragment the provider's own honest cut (dropped, stream Incomplete); any
-//! other ending surfaces the parse failure as the malformed stream it is.
+//! Tool blocks whose stop reason arrives later (Anthropic `message_delta`,
+//! Bedrock `messageStop`). Missing arguments stay pending until a normal final
+//! reason authorizes the zero-argument seed. Complete argument objects still
+//! finish immediately. A mid-fragment call is dropped as incomplete; a syntax
+//! error is held until the stop reason, forgiven for a declared budget cut and
+//! otherwise surfaced as malformed.
 
-use super::{complete_streamed_tool, Normalizer};
+use super::{complete_streamed_tool, drop_cut_call, Normalizer};
 use crate::errors::Failure;
 use crate::events::{Event, ToolAccumulator};
 
 impl Normalizer {
-    /// Complete one tool call at its block stop when the stop reason is not
-    /// yet known. A parse failure is HELD rather than raised: the provider may
-    /// be about to say `max_tokens`, which makes the open fragment its own
-    /// truncation (dropped, stream Incomplete), not a malformed stream.
+    /// Complete a nonempty tool at its block stop before the final reason.
+    /// Missing arguments remain open; a parse failure is held rather than
+    /// raised because the final reason may declare budget truncation.
     pub(super) fn complete_tool_deferring_failure(
         &mut self,
         index: u32,
         tool: &mut ToolAccumulator,
         events: &mut Vec<Event>,
     ) {
+        // Missing argument bytes can mean a legitimate zero-argument call or
+        // a budget cut before any input arrived. Only the final reason can
+        // authorize the empty-object seed; keep nonempty calls streaming.
+        if !tool.custom && tool.raw_arguments.is_empty() {
+            return;
+        }
+        if drop_cut_call(tool, "block_stop") {
+            self.dropped_cut_call = true;
+            return;
+        }
         let mut tool_events = Vec::new();
         match complete_streamed_tool(index, tool, &mut tool_events) {
             Ok(()) => events.extend(tool_events),

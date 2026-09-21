@@ -26,6 +26,7 @@ from exp.common.models import (
     Usage,
     combine_economics,
 )
+from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
 from exp.common.tasks import ToolSchema
 
 _CAPABILITIES_DIGEST = "a" * 64
@@ -106,6 +107,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_tools": True,
         "supports_embeddings": None,
         "supports_image_generation": None,
+        "emits_images": False,
         "supports_structured_output": False,
         "supports_completions": None,
         "supports_temperature": True,
@@ -118,6 +120,8 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "reasoning_effort": None,
         "sampling_requires_reasoning_none": False,
         "reasoning_output_exposed": False,
+        "reasoning_content_native": False,
+        "system_messages_leading_only": False,
         "chat_max_tokens_field": None,
         "minimum_temperature": None,
         "maximum_temperature": None,
@@ -202,6 +206,34 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="user", assistant_action=AssistantAction(content="wrong"))
     with pytest.raises(ValidationError, match="tool messages require tool_call_id"):
         ModelMessage(role="tool", content="missing linkage")
+
+
+def test_model_messages_carry_image_parts_on_user_and_tool_roles_only() -> None:
+    """A tool result holds a screenshot beside its text; no other non-user role does."""
+    image = ImageContentPart(media_type="image/png", data="aGk=")
+    tool = ModelMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="shot",
+        content_parts=(TextContentPart(text="shot"), image),
+    )
+    assert tool.images == (image,)
+    with pytest.raises(ValidationError, match="valid only for user and tool messages"):
+        ModelMessage(
+            role="assistant",
+            content="shot",
+            content_parts=(TextContentPart(text="shot"), image),
+        )
+    with pytest.raises(ValidationError, match="tool messages carry only text and image parts"):
+        ModelMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="clip",
+            content_parts=(
+                TextContentPart(text="clip"),
+                VideoContentPart(media_type="video/mp4", data="aGk="),
+            ),
+        )
 
 
 def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payloads() -> None:
@@ -434,3 +466,34 @@ def test_generation_parameter_contract_rejects_inverted_ranges() -> None:
         ModelCapabilities(minimum_top_k=10, maximum_top_k=5)
     with pytest.raises(ValidationError, match="conditional sampling requires reasoning support"):
         ModelCapabilities(sampling_requires_reasoning_none=True)
+
+
+def test_reasoning_content_native_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The native reasoning_content declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().reasoning_content_native is False
+    assert (
+        ModelCapabilities(reasoning_content_native=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_system_messages_leading_only_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The leading-only system declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().system_messages_leading_only is False
+    assert (
+        ModelCapabilities(system_messages_leading_only=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_emits_images_stays_out_of_the_capability_identity() -> None:
+    """Emitting images is a data-plane settlement fact, never a dispatch contract.
+
+    Like ``supports_image_generation`` it is excluded from the capability
+    identity, so projecting it onto the text+image chat lanes leaves every
+    pinned ``capabilities_sha256`` where it was.
+    """
+    plain = ModelCapabilities(supports_tools=True)
+    emitting = ModelCapabilities(supports_tools=True, emits_images=True)
+    assert plain.identity_sha256() == emitting.identity_sha256()
+    assert emitting.emits_images is True and plain.emits_images is False

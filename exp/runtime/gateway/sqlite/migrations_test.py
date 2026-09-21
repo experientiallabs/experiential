@@ -30,6 +30,16 @@ from exp.runtime.gateway.sqlite.migrations import (
 from exp.runtime.gateway.sqlite.provider_authority import active_provider_connections
 
 
+def _replay_history(connection: sqlite3.Connection, *, upto: int) -> None:
+    """Build a source schema by applying migrations ``1..upto-1`` to a raw connection."""
+    for version in range(1, upto):
+        for step in migrations._MIGRATIONS[version]:
+            if isinstance(step, str):
+                connection.execute(step)
+            else:
+                step(connection)
+
+
 def test_persistent_connection_reuses_one_idle_connection_per_thread(tmp_path: Path) -> None:
     """Sequential checkouts on one thread reuse the same cached connection."""
     database = tmp_path / "reuse.db"
@@ -138,8 +148,11 @@ def test_initial_database_is_private_wal_with_foreign_keys(tmp_path: Path) -> No
         assert attempt_columns["billing_source"][3] == 1
         assert "customer_managed" in str(attempt_columns["billing_source"][4])
         assert "budget_period_start" in attempt_columns
-        assert "budget_reserved_micro_usd" in attempt_columns
-        assert "budget_settled_micro_usd" in attempt_columns
+        assert "budget_reserved_nano_usd" in attempt_columns
+        assert "budget_settled_nano_usd" in attempt_columns
+        assert "estimated_cost_nano_usd" in attempt_columns
+        assert "counterfactual_cost_nano_usd" in attempt_columns
+        assert not {name for name in attempt_columns if "micro_usd" in name}
         # v16 retains the provider's sanitized rejection sentence.
         assert "failure_message" in attempt_columns
         assert (
@@ -565,12 +578,13 @@ def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path
     try:
         row = current.execute(
             """
-            SELECT budget_period_start, budget_reserved_micro_usd,
-                   budget_settled_micro_usd
+            SELECT budget_period_start, budget_reserved_nano_usd,
+                   budget_settled_nano_usd
             FROM gateway_attempts WHERE attempt_id = 'attempt-one'
             """
         ).fetchone()
-        assert row == ("2026-08-01T00:00:00+00:00", None, 17)
+        # v7 settled 17 micro-USD; v20 carries the same amount as 17_000 nano-USD.
+        assert row == ("2026-08-01T00:00:00+00:00", None, 17_000)
         assert current.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     finally:
         current.close()
@@ -775,9 +789,7 @@ def test_v10_migration_widens_api_surface_and_preserves_rows(tmp_path: Path) -> 
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 10):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=10)
         connection.execute("PRAGMA user_version = 9")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
@@ -871,9 +883,7 @@ def test_v11_migration_adds_azure_surface_without_rewriting_existing_authority(
     )
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 11):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=11)
         connection.execute("PRAGMA user_version = 10")
         connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
         connection.execute(
@@ -933,9 +943,7 @@ def test_v12_adds_bedrock_auth_locators_and_preserves_ambient_authority(
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 12):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=12)
         connection.execute("PRAGMA user_version = 11")
         connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
         connection.execute(
@@ -1006,9 +1014,7 @@ def test_v14_migration_widens_api_surface_to_embeddings_and_preserves_rows(
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 14):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=14)
         connection.execute("PRAGMA user_version = 13")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
@@ -1083,25 +1089,25 @@ def test_v14_migration_widens_api_surface_to_embeddings_and_preserves_rows(
         migrated.close()
 
 
-def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
+@pytest.mark.parametrize(
+    ("source_version", "prior_surface", "added_surface"),
+    [(14, "embeddings", "images"), (20, "images", "decisions"), (21, "decisions", "messages")],
+)
+def test_surface_migration_preserves_requests_attempts_and_constraints(
     tmp_path: Path,
+    source_version: int,
+    prior_surface: str,
+    added_surface: str,
 ) -> None:
-    """The v15 rewrite admits the images surface without touching v14 data.
-
-    A v14 database with one full request-and-attempt chain migrates in place:
-    the existing rows and the child foreign key survive, an ``images``
-    request becomes insertable, and any other surface value stays rejected.
-    """
+    """CHECK-only expansion preserves child rows and admits only declared surfaces."""
     path = tmp_path / "gateway.db"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 15):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
-        connection.execute("PRAGMA user_version = 14")
+        _replay_history(connection, upto=source_version + 1)
+        connection.execute(f"PRAGMA user_version = {source_version}")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
             INSERT INTO identities VALUES ('id', 'org', 'Identity', NULL, 1, 't', 't');
@@ -1123,7 +1129,7 @@ def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
                 alias_revision_id, api_surface, canonical_request_sha256,
                 accepted_at, deadline_at
             ) VALUES (
-                'req-1', 'org', 'id', 'key', 'alias', 'rev', 'embeddings',
+                'req-1', 'org', 'id', 'key', 'alias', 'rev', '{prior_surface}',
                 '{digest}', 't', 't'
             );
             INSERT INTO gateway_attempts (
@@ -1134,34 +1140,61 @@ def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
                 'att-1', 'req-1', 'org', 0, 0, 'deploy', 'provider', 'exact',
                 'pool', '{digest}', 'completed', 't', '2026-08-01T00:00:00+00:00'
             );
-            """.format(fingerprint="a" * 64, digest="b" * 64)
+            """.format(fingerprint="a" * 64, digest="b" * 64, prior_surface=prior_surface)
         for statement in seed_statements.split(";"):
             if statement.strip():
                 connection.execute(statement)
+        if source_version >= 20:
+            connection.execute(
+                "UPDATE gateway_attempts SET input_rate = 3750000000, "
+                "cached_input_rate = 300000000, preferred_input_rate = 4000000000"
+            )
         connection.execute("COMMIT")
+        before_request = tuple(connection.execute("SELECT * FROM gateway_requests").fetchone())
+        before_attempt = tuple(connection.execute("SELECT * FROM gateway_attempts").fetchone())
     finally:
         connection.close()
 
     backup = initialize_database(path)
 
     assert backup is not None and backup.exists()
+    if source_version >= 20:
+        with sqlite3.connect(backup) as original:
+            assert original.execute("PRAGMA user_version").fetchone() == (source_version,)
+            assert original.execute("SELECT * FROM gateway_requests").fetchone() == before_request
+            assert original.execute("SELECT * FROM gateway_attempts").fetchone() == before_attempt
     migrated = connect_database(path)
     try:
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+        if source_version >= 20:
+            assert (
+                tuple(migrated.execute("SELECT * FROM gateway_requests").fetchone())
+                == before_request
+            )
+            assert tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone()) == (
+                *before_attempt,
+                *(None for _ in range(9)),
+            )
         surviving = migrated.execute(
             "SELECT api_surface FROM gateway_requests WHERE request_id = 'req-1'"
         ).fetchone()
-        assert surviving[0] == "embeddings"
+        assert surviving[0] == prior_surface
+        assert (
+            migrated.execute(
+                "SELECT request_id FROM gateway_attempts WHERE attempt_id = 'att-1'"
+            ).fetchone()[0]
+            == "req-1"
+        )
         request_columns = (
             "request_id, organization_id, identity_id, key_id, alias_id, "
             "alias_revision_id, api_surface, canonical_request_sha256, accepted_at, deadline_at"
         )
         migrated.execute(
             f"INSERT INTO gateway_requests ({request_columns}) "
-            "VALUES ('req-2', 'org', 'id', 'key', 'alias', 'rev', 'images', ?, 't', 't')",
-            ("c" * 64,),
+            "VALUES ('req-2', 'org', 'id', 'key', 'alias', 'rev', ?, ?, 't', 't')",
+            (added_surface, "c" * 64),
         )
         with pytest.raises(sqlite3.IntegrityError):
             migrated.execute(
@@ -1191,9 +1224,7 @@ def test_v17_migration_adds_null_dispatch_disclosures_to_existing_attempts(
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        for version in range(1, 17):
-            for statement in migrations._MIGRATIONS[version]:
-                connection.execute(statement)
+        _replay_history(connection, upto=17)
         connection.execute("PRAGMA user_version = 16")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
@@ -1247,7 +1278,7 @@ def test_v17_migration_adds_null_dispatch_disclosures_to_existing_attempts(
         "preferred_cached_input_rate",
         "preferred_output_rate",
         "preferred_reasoning_rate",
-        "counterfactual_cost_micro_usd",
+        "counterfactual_cost_nano_usd",
     )
     migrated = connect_database(path)
     try:

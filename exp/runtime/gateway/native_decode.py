@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
@@ -69,6 +69,34 @@ def decode_native_body(
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_count_tokens_body(
+    body: str,
+    *,
+    anthropic_beta: str | None = None,
+) -> DecodedGatewayRequest:
+    """Decode one raw ``/v1/messages/count_tokens`` body for prompt counting.
+
+    Anthropic's count body carries no ``max_tokens``, so it decodes through
+    the count-specific Messages entrypoint rather than the generation one.
+
+    Args:
+        body: Raw request body text.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+
+    Returns:
+        The public alias and the canonical request to count.
+
+    Raises:
+        NativeDecodeError: The body is not JSON, not an object, or fails
+            shared protocol validation.
+    """
+    payload = _load_object_body(body)
+    try:
+        return decode_messages_count_tokens(payload, anthropic_beta=anthropic_beta)
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc
 

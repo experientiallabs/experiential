@@ -379,7 +379,7 @@ def test_anthropic_chat_job_results_render_chat_completions_with_cache_usage() -
         "prompt_tokens": 4516,
         "completion_tokens": 4,
         "total_tokens": 4520,
-        "prompt_tokens_details": {"cached_tokens": 0},
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 4501},
         "completion_tokens_details": None,
     }
     assert (served.input_tokens, served.output_tokens) == (4516, 4)

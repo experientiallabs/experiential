@@ -20,6 +20,9 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     ProjectTarget,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.alias_activation import (
     AliasActivationOutcomeUnknownError,
@@ -160,6 +163,52 @@ def test_authorization_freezes_the_trusted_client_ip(tmp_path: Path) -> None:
         deadline_monotonic=clock.monotonic() + 30,
     )
     assert without_ip.client_ip is None
+
+
+def test_decisions_authorize_and_accept_without_keyed_replay_or_content_retention(
+    tmp_path: Path,
+) -> None:
+    """Identical decisions remain independent attempts and persist no raw key or input."""
+    store, clock, raw_key = _configured_store(tmp_path)
+    ledger = SQLiteAttemptLedger(store.database_path, clock=clock)
+    request = DecisionRequest(
+        state={"content": "decision-state-canary"},
+        questions={"check": NoulQuestion(instructions="decision-instruction-canary")},
+    )
+    first = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    second = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    assert first.surface is second.surface is GatewayApiSurface.DECISIONS
+    assert first.request_id != second.request_id
+    assert first.caller_operation_sha256 is second.caller_operation_sha256 is None
+    assert (
+        first.canonical_request_sha256
+        == second.canonical_request_sha256
+        == canonical_request_sha256(request)
+    )
+    ledger.accept_request(authorization=first)
+    ledger.accept_request(authorization=second)
+    with sqlite3.connect(store.database_path) as connection:
+        rows = connection.execute(
+            "SELECT api_surface, caller_operation_sha256, content_retained FROM gateway_requests"
+        ).fetchall()
+        assert rows == [("decisions", None, 0), ("decisions", None, 0)]
+        assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone() == (0,)
+        persisted = "\n".join(connection.iterdump())
+    assert raw_key not in persisted
+    assert "decision-state-canary" not in persisted
+    assert "decision-instruction-canary" not in persisted
+    assert raw_key not in first.model_dump_json()
+    assert "decision-state-canary" not in first.model_dump_json()
 
 
 def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(
@@ -1253,3 +1302,27 @@ def test_alias_activation_rejects_stale_provider_binding_atomically(tmp_path: Pa
         )
     finally:
         connection.close()
+
+
+def test_authorization_refuses_a_zdr_demand_this_gateway_cannot_judge(tmp_path: Path) -> None:
+    """The local store publishes no provider postures, so ``provider.zdr`` fails closed."""
+    from exp.runtime.gateway.sqlite.store import ZdrRoutingUnavailableError
+
+    store, clock, raw_key = _configured_store(tmp_path)
+    demanding = _request().model_copy(update={"zdr_requested": True})
+
+    with pytest.raises(ZdrRoutingUnavailableError, match="provider.zdr"):
+        store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=demanding,
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+    # The default request authorizes as before and carries no demand.
+    snapshot = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request(),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    assert snapshot.zdr_requested is False

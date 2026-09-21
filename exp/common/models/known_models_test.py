@@ -90,6 +90,7 @@ _SAMPLING_AT_NONE_MODELS = frozenset(
         "supports_structured_output",
     ),
     [
+        ("gpt-6-astra", 1_050_000, 128_000, 10.0, 50.0, 1.0, 12.5, True),
         ("gpt-5.6-sol", 1_050_000, 128_000, 5.0, 30.0, 0.5, 6.25, True),
         ("gpt-5.6-terra", 1_050_000, 128_000, 2.0, 12.0, 0.2, 2.5, True),
         ("gpt-5.6-luna", 1_050_000, 128_000, 0.2, 1.2, 0.02, 0.25, True),

@@ -29,18 +29,20 @@ import json
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
     MessageContentPart,
     TextContentPart,
 )
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol.gateway_reasoning import (
+    EMPTY_GATEWAY_BLOCK,
+    gateway_reasoning_block,
+)
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
-    MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
 )
 from exp.runtime.anthropic_protocol.media_blocks import (
     AnthropicWireModel,
@@ -50,6 +52,17 @@ from exp.runtime.anthropic_protocol.media_blocks import (
     document_part_from_block,
     image_part_from_block,
 )
+from exp.runtime.anthropic_protocol.reasoning_channels import (
+    ReasoningConfig,
+    resolve_reasoning_channels,
+)
+from exp.runtime.anthropic_protocol.server_tools import (
+    ServerTool,
+    messages_tool_search,
+    messages_web_search,
+    require_served_server_tool_types,
+)
+from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
 from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -61,22 +74,15 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
-from exp.runtime.models.providers.reasoning_compat import REASONING_EFFORTS
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
+from exp.runtime.models.providers.cache_policy import (
+    multimodal_text_cache_blocks,
+    retain_multimodal_cache_boundaries,
+)
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
-
-_REJECTED_BLOCK_HINTS = {
-    kind: (
-        f"{kind} blocks are not supported: the Anthropic Messages wire defines no "
-        f"{kind} content, so send {kind} on the Chat Completions surface"
-    )
-    for kind in ("video", "audio")
-}
-_REJECTED_TOOL_RESULT_BLOCK_HINTS = {
-    "document": "document blocks are not supported inside tool_result content",
-    **_REJECTED_BLOCK_HINTS,
-}
 
 
 class _TextBlock(AnthropicWireModel):
@@ -138,7 +144,7 @@ class _ToolResultBlock(AnthropicWireModel):
     cache_control: CacheControl | None = None
 
 
-class _ServerToolUseBlock(BaseModel):
+class ServerToolUseBlock(BaseModel):
     """One server-tool invocation echoed in history, carried shallowly.
 
     Server-tool block shapes are an evolving provider surface; a closed model
@@ -156,7 +162,7 @@ class _WebSearchToolResultBlock(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["web_search_tool_result"]
+    type: Literal["web_search_tool_result", "tool_search_tool_result", "tool_reference"]
 
 
 _ContentBlock = (
@@ -167,7 +173,7 @@ _ContentBlock = (
     | _RedactedThinkingBlock
     | _ToolUseBlock
     | _ToolResultBlock
-    | _ServerToolUseBlock
+    | ServerToolUseBlock
     | _WebSearchToolResultBlock
 )
 
@@ -212,28 +218,6 @@ class _Tool(AnthropicWireModel):
     input_examples: tuple[JsonObject, ...] | None = None
 
 
-class _ServerTool(BaseModel):
-    """One Anthropic server tool, validated shallowly and carried verbatim.
-
-    Server tools (``web_search_20250305``-style) execute at the provider and carry
-    no ``input_schema``; their per-type configuration is an evolving provider
-    surface, so only the discriminator pair is validated and the raw entry
-    forwards byte-for-byte on native Anthropic rungs.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
-    name: str = Field(min_length=1, max_length=256)
-
-    @model_validator(mode="after")
-    def _require_server_type(self) -> _ServerTool:
-        """Reject the custom discriminator: custom tools take the strict model."""
-        if self.type == "custom":
-            raise ValueError("custom tools must declare an input_schema")
-        return self
-
-
 class _ToolChoice(AnthropicWireModel):
     """Anthropic tool-choice selector."""
 
@@ -260,9 +244,15 @@ class _ThinkingConfig(AnthropicWireModel):
 
     @model_validator(mode="after")
     def _require_budget_only_when_enabled(self) -> _ThinkingConfig:
-        """Bind the token budget to the one mode Anthropic defines it for."""
-        if self.type == "enabled" and self.budget_tokens is None:
-            raise ValueError("thinking.budget_tokens is required when thinking is enabled")
+        """Bind the token budget to the one mode Anthropic defines it for.
+
+        A budget is legal only on ``enabled``, but it is not REQUIRED there at
+        this boundary: Claude Code sends a bare ``{"type": "enabled"}`` and the
+        provider wire needs a budget, so route shaping derives one for an
+        Anthropic rung (disclosed) and an effort route reads the bare config as
+        its default depth. Rejecting it here made every such session die at
+        the gateway (Harbor, 2026-09-11).
+        """
         if self.type != "enabled" and self.budget_tokens is not None:
             raise ValueError("thinking.budget_tokens is valid only when thinking is enabled")
         return self
@@ -280,10 +270,11 @@ class _MessagesRequest(AnthropicWireModel):
     top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
-    tools: tuple[_Tool | _ServerTool, ...] = ()
+    tools: tuple[_Tool | ServerTool, ...] = ()
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
+    reasoning: ReasoningConfig | None = None
     context_management: JsonObject | None = None
     output_config: JsonObject | None = None
     diagnostics: JsonObject | None = None
@@ -298,9 +289,23 @@ class _MessagesRequest(AnthropicWireModel):
     rungs, and dropped with disclosure elsewhere: a cache hint changes
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
+    provider: ProviderRoutingPreferences | None = None
+    """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
     """Inference-region selector, forwarded verbatim (accepted live without
     a beta, 2026-08-30). Bounded but deliberately not enumerated: the
     region set is an evolving provider surface."""
+
+
+class _CountTokensRequest(_MessagesRequest):
+    """The ``count_tokens`` body: a Messages body with no generation budget.
+
+    Anthropic's count endpoint takes the prompt-side fields (``model``,
+    ``messages``, ``system``, ``tools``, ``tool_choice``, ``thinking``) and
+    no ``max_tokens``; a body that carries one is still counted, since the
+    budget changes nothing about the prompt.
+    """
+
+    max_tokens: int | None = Field(default=None, gt=0)
 
 
 def decode_messages(
@@ -326,9 +331,50 @@ def decode_messages(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
             The HTTP layer renders it in the Anthropic error envelope.
     """
+    try:
+        return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
+
+
+def decode_messages_count_tokens(
+    payload: JsonObject,
+    *,
+    anthropic_beta: str | None = None,
+) -> DecodedGatewayRequest:
+    """Decode one Anthropic ``count_tokens`` body for prompt counting.
+
+    Identical to :func:`decode_messages` except that ``max_tokens`` is
+    optional: Anthropic's count request carries only prompt-side fields, so
+    the canonical request has no output budget (``maximum_output_tokens`` is
+    ``None``) and is never dispatched, only counted.
+
+    Args:
+        payload: Parsed JSON request body.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+
+    Returns:
+        Public alias and the canonical request to count.
+
+    Raises:
+        OpenAIProtocolError: The body is invalid, unknown, or unsupported.
+    """
+    try:
+        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
+
+
+def _decode(
+    payload: JsonObject,
+    wire: type[_MessagesRequest],
+    *,
+    anthropic_beta: str | None,
+) -> DecodedGatewayRequest:
+    """Validate ``payload`` against ``wire`` and build the canonical request."""
     _validate_manifest(payload)
-    request = _validate_wire(payload)
-    _require_served_server_tool_types(request.tools)
+    request = validate_wire(payload, wire)
+    require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
@@ -359,6 +405,17 @@ def decode_messages(
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
+    channels = resolve_reasoning_channels(
+        request.reasoning,
+        max_tokens=request.max_tokens,
+        thinking=cast(JsonObject, payload["thinking"]) if request.thinking is not None else None,
+        output_config=(
+            cast(JsonObject, payload["output_config"])
+            if request.output_config is not None
+            else None
+        ),
+    )
+    _require_thinking_budget_below_max_tokens(channels.thinking_config, request.max_tokens)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
@@ -369,12 +426,16 @@ def decode_messages(
             provider_server_tools=tuple(
                 cast(JsonObject, cast(list, payload["tools"])[tool_index])
                 for tool_index, tool in enumerate(request.tools)
-                if isinstance(tool, _ServerTool)
+                if isinstance(tool, ServerTool)
             ),
+            web_search=messages_web_search(payload, request.tools),
+            tool_search=messages_tool_search(request.tools),
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
-            maximum_output_tokens_parameter="max_tokens",
+            maximum_output_tokens_parameter="max_tokens"
+            if request.max_tokens is not None
+            else None,
             stop=_stop_sequences(request.stop_sequences),
             temperature=request.temperature,
             top_p=request.top_p,
@@ -382,11 +443,7 @@ def decode_messages(
             stream=request.stream,
             include_usage=request.stream,
             metadata=_gateway_metadata(request.metadata),
-            # The raw payload value, not the re-serialized wire model, so the
-            # provider receives the caller's thinking config byte-for-byte.
-            provider_thinking_config=(
-                cast(JsonObject, payload["thinking"]) if request.thinking is not None else None
-            ),
+            provider_thinking_config=channels.thinking_config,
             context_management=_context_management(payload),
             diagnostics=_diagnostics(payload),
             speed=request.speed,
@@ -399,57 +456,18 @@ def decode_messages(
             ),
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
-            ignored_parameters=dropped_beta_disclosures,
-            reasoning_effort=_output_config_effort(request.output_config),
-            provider_output_config=(
-                cast(JsonObject, payload["output_config"])
-                if request.output_config is not None
-                else None
+            ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=(
+                cast(JsonObject, payload["provider"]) if request.provider is not None else None
             ),
+            reasoning_effort=channels.effort,
+            reasoning_effort_parameter=channels.effort_parameter,
+            provider_output_config=channels.output_config,
         )
     except ValidationError as exc:
-        raise _validation_error(exc.errors(include_url=False)[0]) from exc
+        raise validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
-
-
-def _require_served_server_tool_types(tools: tuple[_Tool | _ServerTool, ...]) -> None:
-    """Reject any server tool type the gateway cannot serve truthfully.
-
-    Acceptance means the data plane carries every block the tool makes the
-    provider stream (see the decision tables in ``manifest.py``); an
-    unclassified type stays rejected until the SDK drift gate forces its
-    decision, so a new provider tool never half-works silently.
-
-    Raises:
-        OpenAIProtocolError: A tool entry names an unserved server tool type.
-    """
-    for tool_index, tool in enumerate(tools):
-        if isinstance(tool, _ServerTool) and tool.type not in MESSAGES_SERVER_TOOL_TYPES_ACCEPTED:
-            supported = ", ".join(sorted(MESSAGES_SERVER_TOOL_TYPES_ACCEPTED))
-            raise invalid_field(
-                f"tools.{tool_index}.type",
-                f"the server tool type '{tool.type}' is not supported by this gateway. "
-                f"Supported server tool types: {supported}. Remove the tool or use a "
-                "supported type.",
-            )
-
-
-def _output_config_effort(config: JsonObject | None) -> ReasoningEffort | None:
-    """Map a canonical caller ``output_config.effort`` into the shared field.
-
-    A canonical ladder value rides ``reasoning_effort`` so route narrowing,
-    the coercion policy, and non-Anthropic rungs all see it; the raw object
-    still forwards verbatim on Anthropic rungs with the caller's keys
-    winning, so an unrecognized future effort value stays provider-decided
-    instead of gateway-rejected.
-    """
-    if config is None:
-        return None
-    effort = config.get("effort")
-    if isinstance(effort, str) and effort in REASONING_EFFORTS:
-        # The membership check above is the narrowing proof for this cast.
-        return cast("ReasoningEffort", effort)
-    return None
 
 
 def _context_management(payload: JsonObject) -> JsonObject | None:
@@ -535,101 +553,6 @@ def _validate_manifest(payload: JsonObject) -> None:
             raise unsupported_field(field)
 
 
-def _validate_wire(payload: JsonObject) -> _MessagesRequest:
-    """Validate the strict wire model with a field-specific public error."""
-    try:
-        return _MessagesRequest.model_validate(payload)
-    except ValidationError as exc:
-        hint = _rejected_block_hint(payload)
-        if hint is not None:
-            param, message = hint
-            raise invalid_field(param, message) from exc
-        # A union miss reports one error PER ARM, and the first arm is the
-        # scalar one: naming it ("content.str: Input should be a valid
-        # string") misdirects a caller whose list merely held an unsupported
-        # block. The deepest location is the arm that actually matched the
-        # payload's shape, so its error names the offending element.
-        errors = exc.errors(include_url=False)
-        first = max(errors, key=lambda error: len(error["loc"]))
-        raise _validation_error(first) from exc
-
-
-def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
-    """Convert one Pydantic error location into a stable dotted field error.
-
-    The public message keeps the expected-vs-got shape: it names the field
-    and states what the decoder expected there (Pydantic's own expectation
-    text, which never echoes the caller's value), so a rejected request says
-    what to fix instead of only where it failed.
-    """
-    location = first["loc"]
-    cleaned: list[str] = []
-    for part in location:
-        text = str(part)
-        # Union arm labels in pydantic locations are noise for callers: wire
-        # model class names (private or public), scalar type names, and
-        # constrained-type spellings. Real wire fields are snake_case.
-        if isinstance(part, str) and (
-            part.startswith("_")
-            or "[" in text
-            or text[:1].isupper()
-            or text in ("str", "int", "float", "bool", "none", "list", "dict")
-        ):
-            continue
-        cleaned.append(text)
-    param = ".".join(cleaned) or "body"
-    if first["type"] == "extra_forbidden":
-        return invalid_field(
-            param,
-            f"Unknown parameter '{param}'. Remove the field and resend the request.",
-        )
-    if param == "body" and first["type"] == "value_error":
-        # A whole-request rule (such as the attachment count ceiling) has no
-        # field of its own, so its own wording is the only useful message.
-        return invalid_field(param, first["msg"].removeprefix("Value error, ") + ".")
-    return invalid_field(param, f"Invalid value for '{param}': {first['msg']}.")
-
-
-def _rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
-    """Return the field path and message for a known-but-unsupported block.
-
-    The path names the exact offending block (and, for a ``tool_result``, the
-    offending sub-block), so the caller is never sent to the union's string
-    arm for a list-shaped problem.
-    """
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return None
-    for message_index, message in enumerate(messages):
-        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
-            continue
-        for block_index, block in enumerate(cast(list[object], message["content"])):
-            if not isinstance(block, dict):
-                continue
-            block_object = cast(JsonObject, block)
-            param = f"messages.{message_index}.content.{block_index}"
-            hint = _REJECTED_BLOCK_HINTS.get(str(block_object.get("type")))
-            if hint is not None:
-                return param, hint
-            if block_object.get("type") == "tool_result" and isinstance(
-                block_object.get("content"), list
-            ):
-                for inner_index, inner in enumerate(cast(list[object], block_object["content"])):
-                    if not isinstance(inner, dict):
-                        continue
-                    inner_type = str(cast(JsonObject, inner).get("type"))
-                    inner_param = f"{param}.content.{inner_index}"
-                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(inner_type)
-                    if hint is not None:
-                        return inner_param, hint
-                    if inner_type not in ("text", "image"):
-                        return inner_param, (
-                            f"unsupported block type '{inner_type}' inside tool_result "
-                            "content; only text and image sub-blocks are supported."
-                        )
-    return None
-
-
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
     """Flatten the system prompt; blocks join with a blank line."""
     if system is None or isinstance(system, str):
@@ -639,6 +562,8 @@ def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
 
 def _marked_text_blocks(
     blocks: str | tuple[_TextBlock, ...] | None,
+    *,
+    text_only: bool = True,
 ) -> tuple[JsonObject, ...]:
     """Rebuild a text-block run verbatim when any block carries a cache marker.
 
@@ -653,6 +578,18 @@ def _marked_text_blocks(
         return ()
     if all(block.cache_control is None for block in blocks):
         return ()
+    if text_only:
+        retain_multimodal_cache_boundaries(
+            tuple(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+                for block in blocks
+            )
+        )
     rebuilt: list[JsonObject] = []
     for block in blocks:
         entry: JsonObject = {"type": "text", "text": block.text}
@@ -660,6 +597,44 @@ def _marked_text_blocks(
             entry["cache_control"] = block.cache_control.model_dump(mode="json", exclude_none=True)
         rebuilt.append(entry)
     return tuple(rebuilt)
+
+
+def _require_thinking_budget_below_max_tokens(
+    thinking_config: JsonObject | None,
+    max_tokens: int | None,
+) -> None:
+    """Refuse a thinking budget that leaves no room for the reply.
+
+    Anthropic requires ``thinking.budget_tokens < max_tokens`` (its own 400 reads
+    "max_tokens must be greater than thinking budget_tokens"), and the same
+    arithmetic holds on every route: a budget at or above the ceiling can only
+    end as thinking cut off at ``max_tokens`` with no text, so the request is
+    refused here, before a reservation or a provider round trip, exactly like
+    the sibling ``reasoning.max_tokens`` channel. A budget BELOW Anthropic's
+    1024 minimum is not refused: on an Anthropic rung route shaping replaces
+    it with the derived legal budget (disclosed), and on an effort rung it is
+    only a depth hint read through the tier table, so nothing about it can
+    fail. A ``count_tokens`` body carries no ``max_tokens`` and is not checked.
+    The check reads the RESOLVED thinking channel, after reasoning-channel
+    precedence: a ``thinking`` config that an explicit ``reasoning`` effort
+    supersedes is discarded, and a discarded budget cannot starve anything.
+
+    Args:
+        thinking_config: The thinking config the canonical request will carry.
+        max_tokens: The caller's reply ceiling, ``None`` for ``count_tokens``.
+
+    Raises:
+        OpenAIProtocolError: The budget is not below ``max_tokens``.
+    """
+    if thinking_config is None or max_tokens is None:
+        return
+    budget = thinking_config.get("budget_tokens")
+    if isinstance(budget, int) and not isinstance(budget, bool) and budget >= max_tokens:
+        raise invalid_field(
+            "thinking.budget_tokens",
+            "thinking.budget_tokens must be below max_tokens so the reply has room after "
+            "thinking. Raise max_tokens or lower the budget.",
+        )
 
 
 def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:
@@ -757,18 +732,37 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         if content is None and not tool_calls and not reasoning and not attachments:
             ordered_blocks.clear()
             return
+        if any(block.kind == "sealed_reasoning_content" for block in reasoning):
+            # A gateway tool turn returned its reasoning twice: the unsigned
+            # display block that streamed live and the sealed carrier that
+            # holds the same text authenticated. Only the carrier replays.
+            reasoning[:] = [
+                block for block in reasoning if block.kind != "exposed_reasoning_content"
+            ]
+        # The verbatim block order exists for Anthropic-signed history, whose
+        # signatures the provider verifies in place; gateway-issued blocks
+        # (unsigned plaintext, sealed carriers) never replay on that wire.
+        anthropic_thinking = any(
+            block.kind in {"thinking", "redacted_thinking"} for block in reasoning
+        )
+        retained = retain_multimodal_cache_boundaries(content_parts)[0] if attachments else ()
+        marked_text = (
+            multimodal_text_cache_blocks(retained)
+            if attachments
+            else _marked_text_blocks(tuple(text_parts), text_only=not (reasoning or tool_calls))
+        )
         out.append(
             GatewayMessage(
                 role=message.role,
                 content=content or ("" if attachments else None),
-                content_parts=tuple(content_parts) if attachments else (),
+                content_parts=retained,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
                 # The marked run is carried alongside the retained parts: its
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.
-                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
-                provider_anthropic_blocks=tuple(ordered_blocks) if reasoning else None,
+                provider_text_blocks=marked_text,
+                provider_anthropic_blocks=tuple(ordered_blocks) if anthropic_thinking else None,
             )
         )
         text_parts.clear()
@@ -801,10 +795,16 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             # carries no information and drops; a cache marker on the block
             # survives through the marked-run carrier.
             text_parts.append(block)
-            # An empty text block cannot ride a multimodal turn: Anthropic
-            # rejects a standalone empty block, so it never becomes a part.
-            if block.text:
-                content_parts.append(TextContentPart(text=block.text))
+            # Keep empty checkpoints until the complete media order is known;
+            # flush relocates the marker before dropping the unsupported text.
+            content_parts.append(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+            )
             # The ordered replay keeps an empty text block only for the cache
             # marker it may carry; emission drops the block and migrates the
             # marker (``ordered_blocks_with_markers``).
@@ -832,12 +832,16 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     f"{param}.content.{block_index}",
                     "thinking blocks are only valid in assistant messages.",
                 )
-            reasoning.append(
-                ThinkingBlock(text=block.thinking, signature=block.signature)
-                if isinstance(block, _ThinkingBlock)
-                else RedactedThinkingBlock(data=block.data)
-            )
-            ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+            gateway_block = gateway_reasoning_block(block, f"{param}.content.{block_index}")
+            if gateway_block is None:
+                reasoning.append(
+                    ThinkingBlock(text=block.thinking, signature=block.signature)
+                    if isinstance(block, _ThinkingBlock)
+                    else RedactedThinkingBlock(data=block.data)
+                )
+                ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+            elif gateway_block is not EMPTY_GATEWAY_BLOCK:
+                reasoning.append(gateway_block)
         elif isinstance(block, _ToolUseBlock):
             if message.role != "assistant":
                 raise invalid_field(
@@ -860,7 +864,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 )
             )
             ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
-        elif isinstance(block, (_ServerToolUseBlock, _WebSearchToolResultBlock)):
+        elif isinstance(block, (ServerToolUseBlock, _WebSearchToolResultBlock)):
             if message.role != "assistant":
                 raise invalid_field(
                     f"{param}.content.{block_index}",

@@ -150,8 +150,8 @@ def test_standard_preset_never_enables_a_global_policy() -> None:
 
 
 def test_unknown_adapter_kind_is_rejected() -> None:
-    """Built-in kinds are keyword and http_json; other kinds are injected in code."""
-    with pytest.raises(ValueError, match="keyword or http_json"):
+    """Unknown adapter kinds cannot become silently unconfigured checks."""
+    with pytest.raises(ValueError, match="keyword, regex, or http_json"):
         engine_from_document(
             {
                 "adapters": [{"adapter_id": "hosted", "kind": "hosted", "needles": ["x"]}],

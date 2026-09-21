@@ -1,6 +1,6 @@
 [package]
 name = "exp-gateway-native"
-version = "0.3.47"
+version = "0.3.92"
 edition = "2021"
 description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
 license = "Apache-2.0"
@@ -22,10 +22,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 tokio-stream = "0.1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 http = "1"
+httpdate = "1"
 http-body-util = "0.1"
 base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

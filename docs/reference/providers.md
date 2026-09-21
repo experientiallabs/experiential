@@ -63,9 +63,92 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Amazon Bedrock | `bedrock` | AWS credential chain. No `api_key_env` | Optional catalog `region` |
 | Vertex AI | `vertex` | `api_key_env` holding service-account JSON | Project-and-location `base_url` |
 | Tinker sampling | `tinker` | `api_key_env` | Official Tinker origin |
+| TypeSafe SystemOne | `typesafe` | `api_key_env` (suggested `TYPESAFE_API_KEY`) | `https://api.typesafe.ai/v1/systemone`, native decisions only |
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
+
+## TypeSafe SystemOne decisions
+
+Use `provider = "typesafe"` with an explicitly authored catalog connection and deployment.
+The interactive provider picker does not offer TypeSafe. The connection uses the official
+`https://api.typesafe.ai/v1` root and sends its provider credential as a Bearer header to
+`/systemone`; it exposes no chat, Responses, or embeddings endpoint. The public gateway route is
+`POST /v1/systemone`, authenticated with a gateway virtual key, not the provider key.
+
+A deployment must declare `gateway.capabilities.supports_decisions = true`. Its ordinary
+`ModelCapabilities` should declare `supports_completions = false` and
+`supports_embeddings = false`; decision support is gateway metadata, not an addition to the
+frozen model-capability identity. Admission requires a known nonnegative
+`gateway.prices.input_nano_usd_per_million_tokens` and an explicit
+`gateway.prices.output_nano_usd_per_million_tokens = 0`. Unknown prices are not free prices.
+Only direct exact-model pools serve decisions; project-backed aliases are refused.
+
+Send exactly three top-level fields: `model` (the granted public alias), `state`, and `questions`.
+State and each question's instructions may be a string, JSON object, or array. This example uses
+all three question types; replace `systemone` with the decision alias your gateway grants:
+
+```json
+{
+  "model": "systemone",
+  "state": {"payment_received": true, "message": "Please send my invoice."},
+  "questions": {
+    "paid": {"type": "noul", "instructions": "Was payment received?"},
+    "topic": {
+      "type": "choice",
+      "instructions": "Classify the customer's request.",
+      "criteria": {"billing": "Invoices and payments", "other": "Anything else"}
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "Rate the urgency.",
+      "criteria": ["low", "medium", "high"]
+    }
+  }
+}
+```
+
+| Type | Question criteria | Answer fields |
+|---|---|---|
+| `noul` | Optional object with `true` and `false` descriptions | `type`, `noul` (probability from 0 to 1) |
+| `choice` | Object mapping 2 through 64 category names to text, object, or array descriptions, or `null` | `type`, `choice`, `confidence`, `probabilities` keyed by the requested names |
+| `score` | Ordered array of 2 through 10 text, object, or array descriptions | `type`, `score`, `confidence`, `legend`, `probabilities` keyed by zero-based index strings |
+
+The response contains `id`, the requested public `model` alias, `answers` under the original
+question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
+values, not assistant text. Probabilities and confidence must be finite values from 0 to 1,
+distributions must sum to 1 within validation tolerance, the selected choice must have the highest
+probability, and a score must match the distribution's weighted zero-based index. Missing answers, mismatched types or criteria, and missing or invalid
+usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
+
+Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
+name, and at most 262,144 bytes for both the raw body and the normalized request. Duplicate JSON
+keys, non-finite numbers, unknown fields, chat messages, tools, generation controls, and `stream`
+are rejected before acceptance. Nested data must use valid UTF-8, integers in the inclusive range
+`-2^63` through `2^64 - 1`, and at most 64 JSON levels. These are gateway serialization bounds,
+not TypeSafe token limits. Objects and arrays retain their structure instead of becoming strings. Responses are buffered, never streamed. `Idempotency-Key` is
+ignored: resubmitting the same request is a new operation, not a replay. There is no continuation,
+prompt-based project selection, or chat input/output guardrail processing on this surface.
+
+The gateway reserves a bounded estimate for each dispatch: serialized state is counted for every
+question, question instructions and criteria add to input, and per-question protocol allowances
+cover input and output. This is an accounting estimate, not a provider-enforced token limit;
+no synthetic `max_tokens` field is sent. Settlement uses only TypeSafe's reported token counts,
+including reported output tokens even though their configured price is zero. Unknown outcomes
+retain a content-free unknown-cost attempt record and keep the monetary reservation held, with
+no invented usage, settled charge, or automatic retry. Only HTTP 400, 401, 403, 404, and 422
+establish a known rejection that releases the reservation without inventing zero-token usage.
+HTTP 402, 429, and 529 do not prove no work occurred: payment, throttle, and overload responses
+are terminal unknown outcomes with the hold retained, not automatic fallback signals. A known
+401 authentication rejection may advance to the next certified deployment. The route permits at
+most eight deployments and one dispatch per deployment, with no same-deployment or throttle redials.
+
+For a local SQLite gateway, an operator resolves one terminal decision hold explicitly through
+`SQLiteAttemptLedger.reconcile_decision_liability(attempt_id=..., assigned_cost_nano_usd=...)`
+after checking the provider's outcome. Zero releases the hold; a positive assignment records
+that budget amount while token usage and the provider cost estimate stay unknown. Repeating the
+same assignment is a no-op; a different assignment is refused. Holds survive request completion
+and process restarts until this explicit reconciliation, so unresolved work cannot fund repeats.
 
 ## OpenAI-compatible listing metadata
 
@@ -94,11 +177,12 @@ required price or limit remains unknown.
 | `supports_structured_output` | boolean | The alias accepts structured output |
 | `maximum_output_tokens` | positive integer | Declared output ceiling |
 | `context_window_tokens` | positive integer | Declared context window, only when the host publishes one |
-| `pricing.input_micro_usd_per_million_tokens` | integer `>= 0` | Configured input price in micro-USD per million tokens |
-| `pricing.output_micro_usd_per_million_tokens` | integer `>= 0` | Configured output price in micro-USD per million tokens |
-| `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
+| `pricing.input_nano_usd_per_million_tokens` | integer `>= 0` | Configured input price in nano-USD per million tokens |
+| `pricing.output_nano_usd_per_million_tokens` | integer `>= 0` | Configured output price in nano-USD per million tokens |
+| `pricing.cached_input_nano_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in nano-USD per million tokens |
 
-Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`.
+Nano-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000_000`
+(one nano-USD is a billionth of a dollar; `1_250_000_000` is $1.25 per million tokens).
 When a trusted third-party compatible host publishes these fields, completion, tool,
 structured-output, and input/output price declarations can assign world-model and judge roles
 without a questionnaire. Router-candidate setup still requires a published or
@@ -198,6 +282,28 @@ supports_embeddings = true
 input_cost_per_million_tokens_usd = 0
 ```
 
+## Anthropic inference geography
+
+For a reviewed first-party Claude 4.6+ route, set `inference_geo = "us"`
+on its `anthropic` connection. The connection identity includes the constraint.
+Both ordinary completions and gateway Messages payloads include it; the gateway
+applies it after translating Chat Completions, Responses, or Messages input.
+Caller-supplied `inference_geo = "global"` cannot override this connection setting.
+Each fallback needs its own constrained connection. No setting leaves existing
+caller behavior unchanged. Unsupported models return a provider error; model
+eligibility and the provider's 10% regional surcharge belong in the host catalog.
+
+```toml
+[connections.anthropic_us]
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+inference_geo = "us"
+```
+
+[Anthropic data residency](https://platform.claude.com/docs/en/manage-claude/data-residency)
+documents eligible models and scope. This parameter does not establish a
+geography guarantee for a proxy, Bedrock, Vertex, or Foundry endpoint.
+
 ## Vertex AI
 
 Use `provider = "vertex"` for Google-published models served from a Google Cloud project.
@@ -209,10 +315,36 @@ JSON itself never travels on the wire, and the endpoint host is pinned to HTTPS
 Requests use the same `generateContent` wire protocol as the Gemini provider on
 `publishers/google/models/` routes.
 
+The model id spelling picks the wire. A bare id (`gemini-2.5-pro`) or a Google resource path
+(`publishers/google/models/gemini-2.5-pro`) is a Google-published model on the Gemini wire. A
+`<publisher>/<model>` id (`deepseek-ai/deepseek-v3.2-maas`, `xai/grok-4.20-reasoning`,
+`qwen/qwen3-coder-480b-a35b-instruct-maas`) is a Model Garden model served as a managed API
+(MaaS), which Vertex serves only over its OpenAI-compatible route
+`{base_url}/endpoints/openapi/chat/completions` (dialect `openai_compatible`, the same
+Chat Completions request and stream handling as `openai-compatible`), still under the OAuth
+bearer. Most MaaS models are addressed through the `global` location
+(`https://aiplatform.googleapis.com/v1/projects/PROJECT/locations/global`); a listing-style
+`publishers/<publisher>/models/<model>` spelling is collapsed onto the `<publisher>/<model>`
+form the route accepts. Google's own managed endpoints share the Gemini resource path in
+the listing (`publishers/google/models/gemma-4-26b-a4b-it-maas`) and are told apart by
+Vertex's `-maas` endpoint suffix, so both that spelling and `google/gemma-4-26b-a4b-it-maas`
+take the MaaS route.
+
+For models available in Google's US or EU multi-region, set the entire project-and-location
+root to `https://aiplatform.us.rep.googleapis.com/v1/projects/PROJECT/locations/us`
+or `https://aiplatform.eu.rep.googleapis.com/v1/projects/PROJECT/locations/eu`.
+Both the synchronous client and native gateway preserve that endpoint. A global endpoint
+does not guarantee a processing location; verify the model's availability and the applicable
+[Google data residency commitments](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/data-residency)
+before selecting a jurisdiction. Endpoint support alone does not enforce a routing policy
+on other models or fallback connections.
+
 Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
 does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or
 prices, so every Vertex alias declares explicit capabilities. Embeddings are not supported on
-Vertex connections; use a `gemini` connection for Gemini embeddings.
+the Gemini-wire Vertex aliases; use a `gemini` connection for Gemini embeddings. MaaS aliases
+expose the compatible embeddings route (`endpoints/openapi/embeddings`) when their
+capabilities declare `supports_embeddings`.
 
 ```toml
 [connections.vertex]
@@ -237,3 +369,35 @@ a secret value. A missing Bedrock region lists the AWS resolution order. Azure e
 mismatches name `AZURE_OPENAI_ENDPOINT`, not the key. A malformed user-data credential file
 fails closed and tells the operator to move or delete it, then run `exp config providers`.
 Malformed provider responses fail closed and do not write partial catalog or evidence artifacts.
+
+## Novita error classification (2026-09-16)
+
+Novita is an OpenAI-compatible reseller whose gpt-5.6 lanes front per-region
+Azure OpenAI deployments. Three of its error shapes needed engine rules beyond
+the shared envelope reader (`crate::error_envelope`), all pinned in
+`upstream_reseller_tests.rs`:
+
+- **A 4xx that says the ACCOUNT cannot pay is `provider_quota`.** A drained
+  prepaid balance answers `400 "Insufficient quota available for instant
+  inference"`; a status-only read filed it as the caller's `invalid_request`.
+  A pre-stream 4xx whose code is a quota token or whose sentence carries
+  unambiguous funding wording (`rejected_by_account_quota`: insufficient
+  quota/balance/credits/funds, not enough balance, exceeded your current
+  quota — no bare "billing") takes the quota class, fails over, and keeps the
+  sentence ledger-only.
+- **A relay decode failure is unwrapped.** Novita's Responses relay sometimes
+  cannot decode the UPSTREAM error it received (`failed to decode error
+  response: json: cannot unmarshal number into Go struct field
+  ResponseError.error.code of type string, raw: {…}`) and answers its own 400
+  with the upstream document embedded after `raw: `. Pre-stream and in-stream
+  the engine reads that document (`relayed_decode_failure`; a zero code is
+  "no code", a truncated document still yields its message), classifies by
+  the UPSTREAM code and sentence (a relayed 429 throttles and fails over; a
+  relayed caller error keeps this status's caller class), and relays the
+  upstream sentence ("Exceeded maximum number of images (50) allowed in the
+  request.") instead of the decoder's noise.
+- **`reason` tokens classify** (`INVALID_REQUEST_BODY` generic,
+  `MODEL_NOT_FOUND` → lane policy, `NOT_ENOUGH_BALANCE` under 403 →
+  `provider_quota`, `RATE_LIMIT_EXCEEDED` / `TOKEN_LIMIT_EXCEEDED` throttle,
+  `FAILED_TO_AUTH` / `ACCESS_DENY` authenticate), see the architecture
+  reference.

@@ -4,7 +4,6 @@ The native engine (`exp_gateway_native`) owns sockets, upstream streaming,
 normalization, and SSE encoding. Shared Python contracts own decoding,
 authorization, payload construction, continuation state, and durable ledger
 transactions. Every boundary call takes and returns one JSON string.
-
 Admission returns the full ordered certified route (one wire configuration
 per deployment) plus the frozen retry-policy facts, accepting the request
 without starting any attempt. The data plane then reserves each physical
@@ -12,7 +11,6 @@ dispatch through ``start_attempt`` immediately before network work and lands
 each attempt's durable terminal through ``settle`` (finalizing the request
 only on the terminal attempt); candidate selection stays here: the frozen
 waterfall policy, health circuits, and budget skipping.
-
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
 the caller through the shared boundary mapping. Requests the native path
@@ -29,7 +27,8 @@ import logging
 import time
 from collections.abc import Callable
 
-from exp.common.core.artifacts import JsonObject, sha256_bytes
+from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -39,14 +38,19 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
+from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
+from exp.runtime.gateway.guardrails.native import (
+    enforce_native_input,
+    enforce_native_output,
+    enforce_native_output_segment,
+    native_output_mode,
+)
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
-    record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
@@ -54,8 +58,11 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_admission import (
     admitted_route_requests,
     fold_parallel_tool_call_disclosures,
+    log_reasoning_continuation_rejection,
+    record_dead_admission_rungs,
     resolve_admission_route,
 )
+from exp.runtime.gateway.native_authentication import NativeAuthenticationMixin
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
@@ -79,8 +86,10 @@ from exp.runtime.gateway.native_continuation import (
 from exp.runtime.gateway.native_continuation import (
     select_bound_continuation_route as _select_bound_continuation_route,
 )
+from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
+from exp.runtime.gateway.native_decisions import NativeDecisionsMixin
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
-from exp.runtime.gateway.native_dispatch import dispatch_signature_headers
+from exp.runtime.gateway.native_dispatch_signing import NativeDispatchSigningMixin
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
@@ -97,6 +106,7 @@ from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,
     has_active_reasoning_content,
+    rung_provider_request,
     seal_reasoning_carrier_content,
     strip_stale_reasoning_history,
     unseal_reasoning_history,
@@ -107,15 +117,21 @@ from exp.runtime.gateway.native_responses import (
     continued_request,
     responses_envelope,
 )
+from exp.runtime.gateway.native_rung_policy import throttle_redial_budgets
 from exp.runtime.gateway.native_rungs import build_rung_dispatch
 from exp.runtime.gateway.native_settlement import (
     gateway_updating_failure,
     optional_text,
 )
+from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
+from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.tool_search.plan import plan_tool_search
+from exp.runtime.gateway.web_search.backend import WebSearchBackend, default_web_search_backend
+from exp.runtime.gateway.web_search.plan import plan_web_search
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -138,37 +154,19 @@ from exp.runtime.openai_protocol.state import (
 _logger = logging.getLogger(__name__)
 
 
-def _log_reasoning_continuation_rejection(
-    authorization: AuthorizationSnapshot, stage: str, reason: object
-) -> None:
-    """Record why a reasoning-carrier continuation failed, for operators only.
-
-    The caller sees one opaque 400 (naming the differing bound claim would be an
-    authentic-continuation oracle), but an operator needs the exact reason to tell
-    a genuine tamper from a benign authority drift. Nothing here carries a
-    credential or the plaintext reasoning; the catalog-generation fields make a
-    cross-worker or post-republish drift obvious when diffed against the issuing
-    turn's admission log.
-    """
-    _logger.warning(
-        "reasoning carrier continuation rejected",
-        extra={
-            "operation": "native_reasoning_continuation",
-            "stage": stage,
-            "reason": str(reason),
-            "request_id": authorization.request_id,
-            "alias": authorization.alias,
-            "alias_revision_id": authorization.alias_revision_id,
-            "catalog_sha256": authorization.catalog_sha256,
-        },
-    )
-
-
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 class NativeControlPlane(
-    NativeBatchRelayMixin, NativeEmbeddingsMixin, NativeImagesMixin, NativeObservabilityMixin
+    NativeAuthenticationMixin,
+    NativeBatchRelayMixin,
+    NativeDispatchSigningMixin,
+    NativeToolSearchMixin,
+    NativeCountTokensMixin,
+    NativeDecisionsMixin,
+    NativeEmbeddingsMixin,
+    NativeImagesMixin,
+    NativeObservabilityMixin,
 ):
     """Authority and accounting callbacks for the native data plane.
 
@@ -190,16 +188,16 @@ class NativeControlPlane(
         cache_sample_gate: Callable[[str], bool] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
+        web_search: WebSearchBackend | None = None,
+        default_lane_bound: int | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
         Args:
             components: Authority, ledger, routes, and runtime catalogs.
             request_timeout_seconds: Total per-request budget from admission.
-            data_plane_metrics: Optional provider of the native engine's
-                content-free metrics snapshot as one JSON string; the local
-                launch injects ``exp_gateway_native.metrics_snapshot_json``.
-                Without it the snapshot reports ``data_plane`` as ``None``.
+            data_plane_metrics: Optional native metrics JSON supplier, typically
+                ``exp_gateway_native.metrics_snapshot_json``; otherwise reports ``None``.
             continuation_store: Optional injected Responses continuation
                 state; a host supplies its own bounded namespaced history,
                 and the default is one in-process bounded store.
@@ -213,6 +211,11 @@ class NativeControlPlane(
                 admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
+            web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
+            default_lane_bound: Per-worker in-flight cap for rungs that author
+                no ``concurrency_bound`` (``lane_saturation.default_lane_bound``
+                of the data plane's ``max_active_requests``); ``None`` leaves
+                unauthored rungs unbounded, the historical behavior.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -236,13 +239,28 @@ class NativeControlPlane(
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
+        self._web_search = web_search if web_search is not None else default_web_search_backend()
+        # Deterministic rules compile once here, never per request.
+        self._guardrail_detectors = deterministic.compile_native_detectors(
+            {} if guardrails is None else guardrails.deterministic_specifications
+        )
         # The accounting registry owns in-flight requests, per-dispatch
         # reservations, deployment-health circuits, and the deadline sweep.
         self._accounting = NativeAttemptAccounting(
             self._write_ledger,
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
+            default_lane_bound=default_lane_bound,
         )
+        # Every reservation tokenizes its prompt; build the packaged BPE now so
+        # a fresh process pays that once at bind time, never on its first
+        # request, and a corrupt table fails startup with its own message.
+        reservation_encoder()
+
+    @property
+    def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:
+        """Return the compiled deterministic rules the data plane enforces."""
+        return dict(self._guardrail_detectors)
 
     @property
     def request_timeout_seconds(self) -> float:
@@ -259,33 +277,11 @@ class NativeControlPlane(
         """Return crashed attempts reconciled at startup."""
         return self._components.reconciled_unknown_attempts
 
-    def authenticate(self, argument: str) -> str:
-        """Authenticate one virtual key before the data plane reads the body.
-
-        Args:
-            argument: JSON object with ``raw_key``.
-
-        Returns:
-            An empty JSON object on success.
-
-        Raises:
-            NativeBridgeError: The key is invalid, expired, or revoked.
-        """
-        data = json.loads(argument)
-        try:
-            self._components.store.authenticate_key(raw_key=data["raw_key"])
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise _authority_error(exc) from exc
-        return "{}"
-
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.
 
-        The raw body is decoded with the same ``decode_chat`` the python
-        engine uses, and every deployment's upstream payload is built with
-        the same shared payload builders, so the two engines cannot drift at
-        the protocol or provider boundary. No attempt row is written here:
-        each physical dispatch is reserved by :meth:`start_attempt`.
+        Shared decoders and payload builders preserve protocol parity.
+        Each physical dispatch is reserved separately by :meth:`start_attempt`.
 
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
@@ -294,13 +290,9 @@ class NativeControlPlane(
                 ``app_referer``/``app_title`` caller app identity.
 
         Returns:
-            JSON wire configuration carrying the full ordered certified
-            ``route`` (one dialect, endpoint, headers, payload, and
-            per-deployment idempotency key entry per deployment) plus the
-            frozen retry-policy facts, or an ``{"escalate": reason}``
-            disposition (its accepted request already finalized, with no
-            attempt row) naming why the native plane cannot serve the
-            request.
+            The ordered certified ``route`` with dispatch and retry configuration,
+            or ``{"escalate": reason}`` after finalizing an accepted request that
+            the native plane cannot serve without writing an attempt row.
 
         Raises:
             NativeBridgeError: Decoding, authorization, routing, or
@@ -320,11 +312,7 @@ class NativeControlPlane(
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
         try:
-            # ``app_referer``/``app_title`` are forwarded when the native engine includes the
-            # caller HTTP-Referer/X-Title in its admit payload; absent them app attribution
-            # stays null on the default path until the Rust engine populates them. ``client_ip``
-            # rides the same seam: the Rust engine resolves the trusted proxy hop and includes
-            # it so the hosted store can freeze it onto the snapshot for per-key IP enforcement.
+            # Freeze native app attribution and the trusted client IP onto caller authority.
             authorization = self._components.store.authorize_request(
                 raw_key=data["raw_key"],
                 alias=decoded.alias,
@@ -363,7 +351,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
-            _log_reasoning_continuation_rejection(authorization, "authenticate", exc)
+            log_reasoning_continuation_rejection(authorization, "authenticate", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -377,6 +365,7 @@ class NativeControlPlane(
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
+                detectors=self._guardrail_detectors,
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
@@ -388,7 +377,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
-            _log_reasoning_continuation_rejection(authorization, "unseal", exc)
+            log_reasoning_continuation_rejection(authorization, "unseal", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -399,7 +388,7 @@ class NativeControlPlane(
             and verified_reasoning_route is not None
             and pinned_reasoning_route.deployment != verified_reasoning_route.deployment
         ):
-            _log_reasoning_continuation_rejection(
+            log_reasoning_continuation_rejection(
                 authorization, "route_pin", "authenticate and unseal resolved different deployments"
             )
             raise NativeBridgeError(
@@ -433,6 +422,9 @@ class NativeControlPlane(
         # accounted content-free and never billed. Routing failures found by
         # the probe are raised against the accepted request below.
         probe_failure: Exception | None = None
+        web_search_admission: JsonObject | None = None
+        tool_search_admission: JsonObject | None = None
+        tool_search_state = None
         route: GatewayRoute | None = None
         resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
         try:
@@ -472,6 +464,18 @@ class NativeControlPlane(
                 )
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
+            # Caller-requested web search against the admitted route (see web_search.plan).
+            searched = plan_web_search(
+                request,
+                [profile.dialect for profile, _client in resolved_wires],
+                self._web_search,
+                deadline_monotonic=deadline,
+            )
+            request, web_search_admission = searched.request, searched.admission
+            # Caller-declared tool search on a route with no native one (tool_search.plan).
+            planned = plan_tool_search(request, [p.dialect for p, _c in resolved_wires])
+            request, tool_search_state = planned.request, planned.state
+            tool_search_admission = planned.admission
             _require_bound_wire_authority(
                 None
                 if continuation_context is None
@@ -532,23 +536,46 @@ class NativeControlPlane(
             )
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
+            output_bounds: list[int] = []
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
-            for deployment, (profile, client) in zip(
-                route.deployments, resolved_wires, strict=True
+            # How long a throttle is worth waiting on per rung for THIS
+            # request (the pool's schedule scaled by the cache at stake),
+            # decided here so the data plane never waits on a rung whose
+            # throttle should fail over cold at once. `route` is the admitted
+            # route (dead and incompatible rungs already removed), so its last
+            # rung is the one with no cold alternative; the sticky binding is
+            # the one placement already read.
+            redial_budgets = throttle_redial_budgets(
+                self._accounting.loads,
+                route,
+                authorization.organization_id,
+                sticky_deployment_id=placement.sticky_deployment_id,
+            )
+            for deployment, (profile, client), budget in zip(
+                route.deployments, resolved_wires, redial_budgets, strict=True
             ):
+                # A reasoning-pinned route's fallback rung is frozen WITHOUT
+                # the pinned provider's sealed reasoning (it cannot unseal
+                # it), so a failover past the issuing rung dispatches the
+                # conversation minus that turn's thinking, never a foreign
+                # sealed block.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,
                     profile,
                     client,
-                    provider_request=provider_request,
+                    provider_request=rung_provider_request(route, deployment, provider_request),
                     public_request=public_request,
                     authorization=authorization,
+                    throttle_redial_budget=budget,
                 )
                 if dispatch.parallel_disclosure is not None:
                     parallel_disclosures.add(dispatch.parallel_disclosure)
+                if dispatch.output_disclosure is not None:
+                    parallel_disclosures.add(dispatch.output_disclosure)
+                output_bounds.append(dispatch.reserved_output_tokens)
                 wire_route.append(dispatch.wire_entry)
                 signers.append(dispatch.signer)
                 dispatch_bindings.append(dispatch.binding)
@@ -634,6 +661,7 @@ class NativeControlPlane(
             self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
+        plan = deterministic.native_output_plan(policy, self._guardrail_detectors)
         self._accounting.register(
             InflightRequest(
                 authorization=authorization,
@@ -649,8 +677,13 @@ class NativeControlPlane(
                     profile.forwards_tier(provider_request.service_tier)
                     for profile, _client in resolved_wires
                 ),
+                reserved_output_tokens_by_depth=tuple(output_bounds),
                 affinity_fingerprint=placement.fingerprint,
                 sticky_preferred=placement.sticky_preferred,
+                throttle_redial_budgets=redial_budgets,
+                resolved_wires=None if tool_search_state is None else tuple(resolved_wires),
+                public_request=None if tool_search_state is None else public_request,
+                tool_search=tool_search_state,
             )
         )
         response: JsonObject = {
@@ -666,84 +699,44 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": bool(policy is not None and policy.output_checks),
+            "output_guardrail": native_output_mode(self._guardrails, policy, public_request).value,
+            "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
+        if route.snapshot.throttle_redial is not None:
+            # The pool's frozen backoff-and-redial schedule; absent (not null) on
+            # pools that keep throttles failover-only: their admission is byte-identical.
+            response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
+        if plan is not None:
+            response["guardrail_output_plan"] = plan
+        if web_search_admission is not None:
+            # The gateway searched: the data plane cites the sources and counts it.
+            response["web_search"] = web_search_admission
+        if tool_search_admission is not None:
+            response["tool_search"] = tool_search_admission
+        if request.surface == GatewayApiSurface.MESSAGES:
+            # Display-only: what `message_start` shows as input when the
+            # upstream reports nothing before its final chunk. The ledger
+            # never reads it; settlement keeps the provider's meters.
+            response["input_token_estimate"] = counted_input_tokens(public_request)
+        if public_request.maximum_output_tokens is not None:
+            # The caller's cap: classifies an output-less, usage-less `stop` (capped -> length).
+            response["maximum_output_tokens"] = public_request.maximum_output_tokens
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
         return json.dumps(response, separators=(",", ":"))
 
-    def sign_dispatch(self, argument: str) -> str:
-        """Sign one frozen dispatch body immediately before the provider POST.
-
-        The data plane calls this after it acquires its bounded dispatch
-        permit and immediately before the open attempt reserved by
-        ``start_attempt``, so queue time can never age a signature toward
-        AWS's short clock window; a same-deployment redial or a failover
-        advance is a fresh physical attempt through ``start_attempt``, so it
-        always signs afresh too.
-
-        Args:
-            argument: JSON object with ``request_id``, the exact ``url``, and
-                the exact frozen ``body`` string the data plane will send.
-
-        Returns:
-            JSON object with the ``headers`` to send verbatim.
-
-        Raises:
-            NativeBridgeError: The attempt is unknown, its route depth
-                carries no signer, or credential resolution failed.
-        """
-        data = json.loads(argument)
-        entry = self._accounting.entry(str(data.get("request_id") or ""))
-        signer = None
-        binding = None
-        if entry is not None and entry.active_attempt_id is not None:
-            depth = entry.attempt_depths.get(entry.active_attempt_id)
-            if depth is not None and depth < len(entry.signers):
-                signer = entry.signers[depth]
-            if depth is not None and depth < len(entry.dispatch_bindings):
-                binding = entry.dispatch_bindings[depth]
-        try:
-            url = str(data["url"])
-            body = str(data["body"])
-            if (
-                binding is None
-                or url != binding.url
-                or sha256_bytes(body.encode("utf-8")) != binding.body_sha256
-            ):
-                raise public_failure_error(
-                    GatewayFailure(
-                        failure_class=GatewayFailureClass.INTERNAL,
-                        safe_message=(
-                            "gateway dispatch differs from the admitted destination or frozen body"
-                        ),
-                    )
-                )
-            headers = dispatch_signature_headers(
-                signer,
-                url=url,
-                body=body,
-            )
-        except OpenAIProtocolError as exc:
-            raise NativeBridgeError(exc) from exc
-        return json.dumps({"headers": headers}, separators=(",", ":"))
-
     def start_attempt(self, argument: str) -> str:
         """Reserve one physical dispatch through the accounting registry.
 
         Args:
-            argument: JSON object with ``request_id``, ``attempt_ordinal``,
-                optional ``current_depth``, and the optional classified
-                ``failure``; see
-                :meth:`NativeAttemptAccounting.start_attempt`.
+            argument: JSON payload for ``NativeAttemptAccounting.start_attempt``.
 
         Returns:
             The registry's reservation or exhaustion disposition.
 
         Raises:
-            NativeBridgeError: The reservation failed; the request is
-                finalized before the error is raised.
+            NativeBridgeError: Reservation failed after finalizing the request.
         """
         return self._accounting.start_attempt(argument)
 
@@ -751,15 +744,13 @@ class NativeControlPlane(
         """Durably settle one reserved attempt through the accounting registry.
 
         Args:
-            argument: JSON settlement payload; see
-                :meth:`NativeAttemptAccounting.settle`.
+            argument: JSON payload for ``NativeAttemptAccounting.settle``.
 
         Returns:
             An empty JSON object; repeated settlement is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the entry
-                is retained so a retried settlement can still land.
+            NativeBridgeError: Write failed; the entry remains available for retry.
         """
         return self._accounting.settle(argument)
 
@@ -767,17 +758,24 @@ class NativeControlPlane(
         """Terminalize one accepted request through the accounting registry.
 
         Args:
-            argument: JSON object with ``request_id`` and optional
-                ``failure``; see :meth:`NativeAttemptAccounting.abandon`.
+            argument: JSON payload for ``NativeAttemptAccounting.abandon``.
 
         Returns:
             An empty JSON object; an unknown request is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the entry
-                is kept so the deadline sweep can still close it.
+            NativeBridgeError: Write failed; the entry remains for the deadline sweep.
         """
         return self._accounting.abandon(argument)
+
+    def enforce_output_segment(self, argument: str) -> str:
+        """Release the settled part of one streamed ``stream`` mode tail."""
+        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
+        policy = None if entry is None else entry.policy
+        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        return enforce_native_output_segment(
+            self._guardrails, policy, argument, deadline_monotonic=deadline
+        )
 
     def enforce_output(self, argument: str) -> str:
         """Run one output-chain callback for a native buffered completion."""
@@ -800,16 +798,9 @@ class NativeControlPlane(
     def claim_scope(self, argument: str) -> str:
         """Resolve the replay-store scope for one keyed request.
 
-        The data plane owns the bounded in-process replay store; this call
-        performs the decode and authorization once so the store key (tenant
-        namespace, hashed caller operation, canonical request digest) is
-        computed by exactly one implementation. The surface is part of the
-        key, so keyed Chat Completions and keyed Responses operations never
-        collide. A direct route whose provider has no native dialect is
-        escalated before any replay claim, so an unservable caller operation
-        never occupies the replay store; project targets resolve their
-        deployment at admission through the same frozen selection, so their
-        scope claims natively.
+        Decode and authorize once to scope replay by tenant, surface, operation,
+        and canonical request digest. Unsupported direct routes escalate before
+        any claim; project targets use the frozen admission deployment selection.
 
         Args:
             argument: JSON object with ``raw_key``, ``body``, optional

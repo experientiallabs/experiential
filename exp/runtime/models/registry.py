@@ -49,7 +49,13 @@ from exp.runtime.models.providers.tinker_sampling import (
     create_tinker_sampler,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport
-from exp.runtime.models.providers.vertex import VertexClient, VertexTokenProviderFactory
+from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
+from exp.runtime.models.providers.vertex import (
+    VertexClient,
+    VertexOpenAIClient,
+    VertexTokenProviderFactory,
+    vertex_wire_for_model,
+)
 
 ProviderTransport = AsyncJsonHttpTransport | JsonHttpTransport
 
@@ -300,6 +306,39 @@ class RuntimeModelCatalog:
                 if self._vertex_token_provider_factory is None
                 else self._vertex_token_provider_factory(credentials_json=api_key)
             )
+            if vertex_wire_for_model(snapshot.model_id) == "openai_compatible":
+                # A Model Garden MaaS id: Vertex serves it only over its
+                # OpenAI-compatible route, so the compatible client's wire and
+                # embeddings surface apply, under the same OAuth bearer.
+                maas_client = VertexOpenAIClient(
+                    model=snapshot,
+                    api_key=api_key,
+                    base_url=connection.base_url,
+                    transport=self._transport_factory(),
+                    token_provider=token_provider,
+                    supports_temperature=capabilities.supports_temperature,
+                    supports_top_p=_supports_top_p(capabilities),
+                    supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                    supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                    supports_frequency_penalty=_supports_flag(
+                        capabilities, "supports_frequency_penalty"
+                    ),
+                    supports_presence_penalty=_supports_flag(
+                        capabilities, "supports_presence_penalty"
+                    ),
+                    supports_reasoning=capabilities.supports_reasoning,
+                    reasoning_effort=capabilities.reasoning_effort,
+                    chat_max_tokens_field=capabilities.chat_max_tokens_field,
+                    sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+                )
+                return ResolvedModel(
+                    alias,
+                    snapshot,
+                    capabilities,
+                    maas_client,
+                    maas_client if capabilities.supports_embeddings is not False else None,
+                    served_model_id=record.served_model_id,
+                )
             vertex_client = VertexClient(
                 model=snapshot,
                 api_key=api_key,
@@ -497,6 +536,14 @@ class RuntimeModelCatalog:
             http_kwargs["reasoning_output_exposed"] = _supports_flag(
                 capabilities, "reasoning_output_exposed"
             )
+            http_kwargs["reasoning_content_native"] = _supports_flag(
+                capabilities, "reasoning_content_native"
+            )
+            http_kwargs["system_messages_leading_only"] = _supports_flag(
+                capabilities, "system_messages_leading_only"
+            )
+        if provider == "anthropic":
+            http_kwargs["inference_geo"] = connection.inference_geo
         http_client = factory(**http_kwargs)
         embedding_client = (
             http_client
@@ -585,6 +632,7 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "gemini": (GeminiClient, GEMINI_BASE_URL),
     "openai-compatible": (OpenAICompatibleClient, None),
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
+    "typesafe": (TypeSafeClient, TYPESAFE_BASE_URL),
 }
 
 SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {

@@ -10,13 +10,14 @@ from urllib.parse import urlsplit
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
-from exp.common.models.catalog import BillingSource, GatewayEquivalenceCertification
+from exp.common.models.catalog import BillingSource
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelDeployment,
     ExactModelId,
     ExactModelPoolId,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.contracts import (
     AttemptId,
     ExecutionSnapshot,
@@ -248,10 +249,10 @@ class MonthlyBudgetRecord(ContractModel):
     organization_id: OrganizationId
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     scope: MonthlyBudgetScope
-    limit_micro_usd: int = Field(ge=0)
-    reserved_micro_usd: int = Field(ge=0)
-    settled_micro_usd: int = Field(ge=0)
-    remaining_micro_usd: int = Field(ge=0)
+    limit_nano_usd: int = Field(ge=0)
+    reserved_nano_usd: int = Field(ge=0)
+    settled_nano_usd: int = Field(ge=0)
+    remaining_nano_usd: int = Field(ge=0)
     unknown_cost_attempts: int = Field(ge=0)
     exhausted: bool
     created_at: AwareDatetime
@@ -271,7 +272,7 @@ class AttemptReservationRequest(ContractModel):
     deployment: ExactModelDeployment
     attempt_ordinal: int = Field(ge=0)
     route_depth: int = Field(ge=0)
-    maximum_cost_micro_usd: int | None = Field(default=None, ge=0)
+    maximum_cost_nano_usd: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _require_matching_organization(self) -> AttemptReservationRequest:
@@ -302,6 +303,8 @@ class AttemptReservationRecord(ContractModel):
     billing_source: BillingSource
     input_rate: int | None = Field(default=None, ge=0)
     cached_input_rate: int | None = Field(default=None, ge=0)
+    cache_creation_input_rate: int | None = Field(default=None, ge=0)
+    cache_creation_1h_input_rate: int | None = Field(default=None, ge=0)
     output_rate: int | None = Field(default=None, ge=0)
     reasoning_rate: int | None = Field(default=None, ge=0)
     long_context_threshold_tokens: int | None = Field(default=None, gt=0)
@@ -312,12 +315,14 @@ class AttemptReservationRecord(ContractModel):
     """
     long_context_input_rate: int | None = Field(default=None, ge=0)
     long_context_cached_input_rate: int | None = Field(default=None, ge=0)
+    long_context_cache_creation_input_rate: int | None = Field(default=None, ge=0)
+    long_context_cache_creation_1h_input_rate: int | None = Field(default=None, ge=0)
     long_context_output_rate: int | None = Field(default=None, ge=0)
     long_context_reasoning_rate: int | None = Field(default=None, ge=0)
     attempt_ordinal: int = Field(ge=0)
     route_depth: int = Field(ge=0)
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
-    reserved_micro_usd: int | None = Field(default=None, ge=0)
+    reserved_nano_usd: int | None = Field(default=None, ge=0)
     started_at: AwareDatetime
 
 
@@ -380,8 +385,8 @@ class AttemptSettlementRecord(ContractModel):
     failure_class: GatewayFailureClass | None = None
     usage: GatewayUsage | None = None
     usage_source: AttemptUsageSource
-    estimated_cost_micro_usd: int | None = Field(default=None, ge=0)
-    settled_micro_usd: int | None = Field(default=None, ge=0)
+    estimated_cost_nano_usd: int | None = Field(default=None, ge=0)
+    settled_nano_usd: int | None = Field(default=None, ge=0)
     first_token_at: AwareDatetime | None = None
     """Wall-clock time this attempt streamed its first token, or ``None`` when it never did.
 
@@ -438,7 +443,7 @@ class IdentityUsageAttribution(ContractModel):
     cached_input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     reasoning_tokens: int = Field(ge=0)
-    known_estimated_cost_micro_usd: int = Field(ge=0)
+    known_estimated_cost_nano_usd: int = Field(ge=0)
     unknown_cost_attempts: int = Field(ge=0)
     total_latency_ms: int = Field(ge=0)
     average_latency_ms: float | None = Field(default=None, ge=0)
@@ -454,7 +459,7 @@ class BillingSourceUsageAttribution(ContractModel):
     cached_input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     reasoning_tokens: int = Field(ge=0)
-    known_estimated_cost_micro_usd: int = Field(ge=0)
+    known_estimated_cost_nano_usd: int = Field(ge=0)
     unknown_cost_attempts: int = Field(ge=0)
     terminal_counts: tuple[UsageTerminalCount, ...]
 
@@ -650,7 +655,7 @@ class SetMonthlyBudgetCommand(ContractModel):
     organization_id: OrganizationId
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     scope: MonthlyBudgetScope
-    limit_micro_usd: int = Field(ge=0)
+    limit_nano_usd: int = Field(ge=0)
     replace: bool = False
 
 

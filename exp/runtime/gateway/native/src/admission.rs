@@ -10,16 +10,21 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::bridge::Bridge;
 use crate::encode_responses::ResponsesEnvelope;
+use crate::errors::empty_completion_headers;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
 use crate::guardrails;
+use crate::guardrails::plan::OutputPlan;
 use crate::metrics::METRICS;
+use crate::replay_repair::replay_repair_headers;
 use crate::respond::error_response;
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
-use crate::waterfall::{DeploymentWire, RoutePolicy};
+use crate::throttle_backoff::ThrottleRedial;
+use crate::tool_search::{ToolSearchAdmission, ToolSearchRound};
+use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
+use crate::web_search::WebSearchAdmission;
 
 /// The wire configuration returned by one successful admission: the full
 /// ordered certified route (one wire configuration per deployment, each with
@@ -42,15 +47,89 @@ pub(crate) struct Admission {
     pub maximum_same_deployment_attempts: u32,
     #[serde(default)]
     pub refusal_failover: bool,
+    /// The pool's backoff-and-redial schedule for throttled rungs; absent on
+    /// pools that keep throttles failover-only, so their waterfall is
+    /// unchanged.
+    #[serde(default)]
+    pub throttle_redial: Option<ThrottleRedial>,
     /// Responses-only request-reflecting envelope fields; chat admissions
     /// omit it.
     #[serde(default)]
     pub envelope: Option<ResponsesEnvelope>,
-    /// When true, buffer the winning completion and call `enforce_output` once
-    /// before any caller byte or replay retention. Unguarded admissions omit
-    /// the flag (default false) and never invoke that callback.
+    /// How the identity's output chain must be enforced for this request.
+    /// Unguarded admissions omit the field and never call a guardrail
+    /// callback. See [`OutputGuardrailMode`].
     #[serde(default)]
-    pub output_guardrail: bool,
+    pub output_guardrail: OutputGuardrailMode,
+    /// The resolved output chain when every check binds a deterministic
+    /// detector. The data plane enforces it in place, so the request pays no
+    /// python callback. A chain with any non-deterministic adapter omits the
+    /// plan and sets `output_guardrail` instead.
+    #[serde(default)]
+    pub guardrail_output_plan: Option<OutputPlan>,
+    /// The control plane's pre-dispatch count of the prompt (the reservation
+    /// estimator without its headroom). Messages admissions carry it so the
+    /// caller's `message_start` shows a real input figure when the upstream
+    /// reports nothing before its final chunk; display-only, never settled.
+    #[serde(default)]
+    pub input_token_estimate: Option<u64>,
+    /// The caller's own output cap (`max_tokens`, `max_completion_tokens`
+    /// or `max_output_tokens`, normalized by the control plane), absent when
+    /// the request is uncapped. The waterfall reads it to classify a `stop`
+    /// that carried no output and no usage report: on a capped request that
+    /// is a budget the provider's hidden reasoning exhausted (an honest
+    /// `length`), never a completed empty answer.
+    #[serde(default)]
+    pub maximum_output_tokens: Option<u64>,
+    /// The caller's stable identity (organization and identity ids), the
+    /// scope of the data plane's per-caller replay-repair memory. The
+    /// request's own bearer cannot serve: in a hosted worker it is the
+    /// front's ephemeral exchanged token, different on every request.
+    /// Absent from an older control plane, which disables that memory.
+    #[serde(default)]
+    pub caller_scope: Option<String>,
+    /// The ONE web search the control plane executed before dispatch for a
+    /// request that asked for it on a route unable to serve it natively:
+    /// the query, the billed request count, and the ranked results it
+    /// injected into the prompt. Absent when no search ran, which leaves
+    /// every response byte exactly as before.
+    #[serde(default)]
+    pub web_search: Option<WebSearchAdmission>,
+    /// The gateway-run tool search for this request: the function tool the
+    /// model was given in place of the deferred catalog, and the round
+    /// budget. Absent when the gateway runs no search (no deferred tools, or
+    /// a route that searches natively), which leaves every byte as before.
+    #[serde(default)]
+    pub tool_search: Option<ToolSearchAdmission>,
+    /// The search rounds the waterfall completed for this request, moved
+    /// here from the winning attempt (`tool_search::adopt_outcome`) so every
+    /// response surface renders them ahead of the answer. Never on the wire.
+    #[serde(skip)]
+    pub tool_search_rounds: Vec<ToolSearchRound>,
+}
+
+/// How one admission's output chain is enforced on the data plane.
+///
+/// `Buffer` collects the whole winning completion and calls `enforce_output`
+/// once before any caller byte or replay retention: the only safe shape for a
+/// check that can block or for a detector that needs the full text. `Stream`
+/// releases the completion incrementally through `enforce_output_segment`,
+/// holding back only the bounded trailing window the detector cannot yet
+/// decide about. The control plane picks the mode at admit time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputGuardrailMode {
+    #[default]
+    Off,
+    Buffer,
+    Stream,
+}
+
+impl OutputGuardrailMode {
+    /// Whether this admission runs any output guardrail work at all.
+    pub(crate) fn enforces(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 impl Admission {
@@ -59,7 +138,22 @@ impl Admission {
             maximum_total_attempts: self.maximum_total_attempts.max(1),
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: self.refusal_failover,
+            throttle_redial: self.throttle_redial,
         }
+    }
+
+    /// How many gateway-executed web searches this request bills; `0` when
+    /// the control plane ran none.
+    pub(crate) fn web_search_requests(&self) -> u32 {
+        self.web_search
+            .as_ref()
+            .map_or(0, |web_search| web_search.requests)
+    }
+
+    /// Whether the winning completion must be buffered for an output chain,
+    /// natively or across the python boundary.
+    pub(crate) fn buffers_output(&self) -> bool {
+        self.output_guardrail.enforces() || self.guardrail_output_plan.is_some()
     }
 
     /// Whether the rung at `depth` returns plaintext reasoning to the caller.
@@ -67,6 +161,20 @@ impl Admission {
         self.route
             .get(depth)
             .is_some_and(|wire| wire.reasoning_output_exposed)
+    }
+
+    /// Whether the attempt at `depth` may enforce its output chain as bytes
+    /// stream, instead of buffering the whole completion first.
+    ///
+    /// Admission already proved the chain is one deterministic modify-only
+    /// check over a streamed request that offers no tools and asks for no
+    /// reasoning text. The remaining fact belongs to the winning rung: a
+    /// deployment that returns plaintext reasoning to the caller keeps the
+    /// buffered path, where a rewrite still drops that channel wholesale.
+    pub(crate) fn stream_incremental(&self, depth: usize) -> bool {
+        self.output_guardrail == OutputGuardrailMode::Stream
+            && self.stream
+            && !self.reasoning_exposed_at(depth)
     }
 
     /// The per-chunk transport bound of the deployment serving `depth`.
@@ -103,12 +211,11 @@ pub(crate) fn commit_independent(
 /// Commit-dependent headers, mirroring `commit_dependent_headers`: the
 /// deployment identity and route depth that actually served the request.
 pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
-    let (provider, deployment_id) = admission
-        .route
-        .get(depth)
+    let served = admission.route.get(depth);
+    let (provider, deployment_id) = served
         .map(|wire| (wire.provider.clone(), wire.deployment_id.clone()))
         .unwrap_or_default();
-    vec![
+    let mut headers = vec![
         (
             "x-gateway-canonical-model".to_string(),
             admission.exact_model_id.clone(),
@@ -120,7 +227,28 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
             "x-gateway-route-reason".to_string(),
             admission.route_reason.clone(),
         ),
-    ]
+    ];
+    // A rung dispatched under OpenRouter's zero-data-retention constraint
+    // says so, so the host can attest the answer as ZDR-served; absent on
+    // every ordinary rung rather than a literal `false`.
+    if served.is_some_and(|wire| wire.zdr_constrained) {
+        headers.push(("x-gateway-zdr-constrained".to_string(), "true".to_string()));
+    }
+    headers
+}
+
+/// Every header one served attempt carries: the request identity, the rung
+/// that served, and any data-plane repair of the replayed input.
+pub(crate) fn served_headers(
+    admission: &Admission,
+    client_request_id: Option<&str>,
+    served: Served,
+) -> Vec<(String, String)> {
+    let mut headers = commit_independent(admission, client_request_id);
+    headers.extend(commit_dependent(admission, served.depth));
+    headers.extend(replay_repair_headers(served.encrypted_reasoning_stripped));
+    headers.extend(empty_completion_headers(served.empty_completion));
+    headers
 }
 
 /// Build one request guard bound to this server's settlement bookkeeping.
@@ -191,13 +319,72 @@ pub(crate) async fn acquire_permit(
     }
 }
 
+/// Enforce the winning completion's output chain before any caller byte.
+///
+/// A deterministic chain is enforced natively against the compiled detectors
+/// this server was started with. Every other guarded admission crosses the
+/// python boundary exactly as before, and an unguarded admission does
+/// neither.
 pub(crate) async fn apply_output_guardrail(
+    state: &AppState,
     admission: &Admission,
-    bridge: &Bridge,
     events: Vec<Event>,
+    deadline: Instant,
 ) -> Result<Vec<Event>, Failure> {
-    if !admission.output_guardrail {
+    if let Some(plan) = admission.guardrail_output_plan.as_ref() {
+        return guardrails::plan::enforce(plan, &state.guardrail_detectors, events, deadline);
+    }
+    if !admission.output_guardrail.enforces() {
         return Ok(events);
     }
-    guardrails::enforce_collected_output(bridge, &admission.request_id, events).await
+    guardrails::enforce_collected_output(&state.bridge, &admission.request_id, events).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admission(zdr_constrained: bool) -> Admission {
+        serde_json::from_value(serde_json::json!({
+            "request_id": "req",
+            "alias": "public-model",
+            "alias_revision_id": "rev",
+            "stream": true,
+            "include_usage": true,
+            "exact_model_id": "exact",
+            "route_reason": "direct",
+            "route": [{
+                "provider": "openrouter",
+                "deployment_id": "or-rung",
+                "dialect": "openai_compatible",
+                "url": "https://openrouter.ai/api/v1/chat/completions",
+                "headers": {},
+                "model_id": "anthropic/claude-opus-5",
+                "billing_customer_managed": false,
+                "timeout_seconds": 60.0,
+                "upstream_payload": {},
+                "upstream_body": null,
+                "idempotency_key": "op",
+                "zdr_constrained": zdr_constrained,
+            }],
+            "maximum_total_attempts": 1,
+            "maximum_same_deployment_attempts": 1,
+        }))
+        .expect("admission decodes")
+    }
+
+    #[test]
+    fn a_zdr_constrained_rung_names_the_constraint_on_its_served_headers() {
+        let headers = commit_dependent(&admission(true), 0);
+        assert!(headers.contains(&("x-gateway-zdr-constrained".to_string(), "true".to_string())));
+        assert!(headers.contains(&("x-gateway-deployment".to_string(), "or-rung".to_string())));
+    }
+
+    #[test]
+    fn an_ordinary_rung_carries_no_constraint_header_at_all() {
+        let headers = commit_dependent(&admission(false), 0);
+        assert!(headers
+            .iter()
+            .all(|(name, _)| name != "x-gateway-zdr-constrained"));
+    }
 }

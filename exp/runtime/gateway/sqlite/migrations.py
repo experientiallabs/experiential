@@ -6,17 +6,28 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 19
+from exp.runtime.gateway.sqlite.cache_write_migration import migrate_cache_write
+from exp.runtime.gateway.sqlite.nano_usd_migration import (
+    NanoUsdMigrationError,
+    migrate_money_to_nano_usd,
+)
+
+SCHEMA_VERSION = 23
 
 
 class GatewaySchemaError(RuntimeError):
     """The gateway database schema cannot be opened safely."""
 
+
+MigrationStep = str | Callable[[sqlite3.Connection], None]
+"""One forward-migration step: a plain SQL statement, or a callable for a step
+that must read before it writes (the v20 money-unit move guards every amount
+before scaling it)."""
 
 _MIGRATION_1 = (
     """
@@ -567,12 +578,8 @@ _GATEWAY_REQUESTS_V10_SQL = """CREATE TABLE gateway_requests (
     ) STRICT"""
 
 _MIGRATION_10 = (
-    # SQLite cannot alter a CHECK constraint in place, and gateway_requests is
-    # the foreign-key parent of gateway_attempts, so the copy-and-rename
-    # rebuild used by migration 6 would trip immediate foreign keys inside
-    # this exclusive transaction. A CHECK-only change does not affect the
-    # on-disk record format, so the documented lightweight procedure rewrites
-    # the stored schema text in place instead.
+    # A CHECK-only schema rewrite preserves row layout and avoids rebuilding
+    # gateway_requests while gateway_attempts holds immediate foreign keys.
     "PRAGMA writable_schema = ON",
     (
         "UPDATE sqlite_master SET sql = '"
@@ -604,10 +611,9 @@ _MIGRATION_12 = (
     """,
 )
 
-# Long-context tier rates freeze on the attempt exactly like the base
-# rates, so settlement prices with the schedule that was live at dispatch.
-# The threshold column selects the schedule once provider-reported input
-# tokens reach it; NULL means the deployment had no tier.
+# Long-context rates freeze on the attempt like base rates. Settlement selects
+# the frozen tier once reported input tokens reach its threshold; NULL means
+# the deployment had no tier.
 _MIGRATION_13 = (
     """
     ALTER TABLE gateway_attempts
@@ -674,7 +680,8 @@ _MIGRATION_16 = ("ALTER TABLE gateway_attempts ADD COLUMN failure_message TEXT",
 # queue_bound, rung_dead, saturated_overflow) and the preferred_* columns
 # freeze the bypassed rung's identity and base token rates at reservation, so
 # settle can price the SAME observed usage counterfactually
-# (counterfactual_cost_micro_usd) without any content or re-derivation.
+# (counterfactual_cost_micro_usd, renamed counterfactual_cost_nano_usd at v20)
+# without any content or re-derivation.
 _MIGRATION_17 = (
     "ALTER TABLE gateway_attempts ADD COLUMN dispatch_reason TEXT",
     "ALTER TABLE gateway_attempts ADD COLUMN preferred_deployment_id TEXT",
@@ -711,7 +718,7 @@ _MIGRATION_19 = (
     "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_tokens INTEGER",
 )
 
-_MIGRATIONS = {
+_MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
@@ -731,6 +738,18 @@ _MIGRATIONS = {
     17: _MIGRATION_17,
     18: _MIGRATION_18,
     19: _MIGRATION_19,
+    20: (migrate_money_to_nano_usd,),
+    21: (
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''embeddings'', ''images'')', '''embeddings'', ''images'', ''decisions'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v21 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v21",
+    ),
+    22: ("ALTER TABLE gateway_attempts ADD COLUMN upstream_provider TEXT",),  # aggregator label
+    23: (migrate_cache_write,),
 }
 
 
@@ -860,8 +879,14 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
             if 0 < version < SCHEMA_VERSION:
                 backup = _backup_database(path, version)
             for next_version in range(version + 1, SCHEMA_VERSION + 1):
-                for statement in _MIGRATIONS[next_version]:
-                    connection.execute(statement)
+                for step in _MIGRATIONS[next_version]:
+                    if isinstance(step, str):
+                        connection.execute(step)
+                    else:
+                        try:
+                            step(connection)
+                        except NanoUsdMigrationError as exc:
+                            raise GatewaySchemaError(str(exc)) from exc
                 connection.execute(f"PRAGMA user_version = {next_version}")
             _require_schema_objects(connection)
             connection.execute("COMMIT")

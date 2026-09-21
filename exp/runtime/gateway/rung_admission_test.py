@@ -391,6 +391,40 @@ class TestCachePriority:
         # reading private state: with alpha=0 the estimate is inert.
         assert isinstance(_reserve(registry, "org-a", bound=8, fair_share=True), str)
 
+    def test_cached_fraction_reads_the_live_estimate_and_zero_without_a_signal(self) -> None:
+        """The public read returns the folded EWMA, scoped to one organization and rung."""
+        now = [0.0]
+        registry = _registry(now)
+        assert registry.cached_fraction(_KEY, "org-a") == 0.0
+        registry.record_settle(_KEY, "org-a", cached_tokens=800, input_tokens=1_000)
+        assert registry.cached_fraction(_KEY, "org-a") == pytest.approx(0.8)
+        # Another organization on the same rung, and the same organization on
+        # another rung, hold no signal.
+        assert registry.cached_fraction(_KEY, "org-b") == 0.0
+        assert registry.cached_fraction(("other", "connection"), "org-a") == 0.0
+        # One half-life later a fully cold sample halves the estimate.
+        now[0] = 600.0
+        registry.record_settle(_KEY, "org-a", cached_tokens=0, input_tokens=1_000)
+        assert registry.cached_fraction(_KEY, "org-a") == pytest.approx(0.4)
+
+    def test_cached_fraction_reads_zero_once_the_sample_ages_past_retention(self) -> None:
+        """Stale evidence never surfaces a throttle: the read enforces the horizon itself.
+
+        Nothing else is guaranteed to prune first: a rung without an admission
+        policy never reserves here, and a throttled attempt settles without
+        usage, so the read path must apply the retention limit on its own.
+        """
+        now = [0.0]
+        registry = _registry(now)
+        registry.record_settle(_KEY, "org-a", cached_tokens=900, input_tokens=1_000)
+        now[0] = 3_599.0
+        assert registry.cached_fraction(_KEY, "org-a") == pytest.approx(0.9)
+        now[0] = 3_600.5
+        assert registry.cached_fraction(_KEY, "org-a") == 0.0
+        # A fresh sample after the gap seeds a new live estimate.
+        registry.record_settle(_KEY, "org-a", cached_tokens=500, input_tokens=1_000)
+        assert registry.cached_fraction(_KEY, "org-a") == pytest.approx(0.5)
+
     def test_congestion_boost_flips_a_freed_slot_to_the_cached_org(self) -> None:
         """Exact margin arithmetic for alpha=2 on a contended bound of 8.
 

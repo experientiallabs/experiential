@@ -32,12 +32,41 @@ if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
 TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
+TOOL_RESULT_IMAGE_FOLD_DISCLOSURE = "messages.content.tool_result.image->following_user_message"
+"""Disclosed when a rung carries tool-result images in a user turn that follows
+the tool run (Chat Completions and Gemini define no image carrier inside a tool
+result; see ``wire_messages.fold_tool_result_images``)."""
+TOOL_RESULT_IMAGE_FOLD_DIALECTS = frozenset({"openai_compatible", "gemini_generate_content"})
+"""Dialects whose payload builders fold tool-result images into a user turn."""
+THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
+
+CACHE_CONTROL_NOT_FORWARDED_SUFFIX = (
+    "->not_forwarded(provider_decides_caching;"
+    " cache reads reported in usage.cache_read_input_tokens)"
+)
+"""Suffix for cache-marker disclosures on routes with no Anthropic rung.
+
+The marker has no wire field there, so it is not forwarded, and whether the
+prefix is cached is the provider's own decision: OpenAI-family and most
+OpenAI-compatible servers cache implicitly, without breakpoints, while a
+generic endpoint may never cache. Whatever the provider does shows up on the
+Anthropic usage leg named here (billed at the cached rate when nonzero, `0`
+when the provider caches nothing). The disclosure travels in
+``x-experiential-ignored-parameters``, so it has to say where the caller's
+caching is reported: a bare "not forwarded" next to a billed
+``cache_read_input_tokens`` read as "caching is ignored" (Harbor, 2026-09-11).
+The wording never claims caching is off or on."""
+"""Disclosed when Anthropic-signed thinking history is omitted for a foreign wire."""
 """Disclosure recorded when tool-result images degrade to placeholder text.
 
 A tool screenshot is baked into the caller's conversation history: rejecting
 it wedges every later turn of a multi-turn session, which is strictly worse
-than a disclosed degrade. Top-level user images keep the fail-closed contract
-because the caller can re-send those differently.
+than a disclosed degrade. Every wire now carries the image itself (natively
+inside the tool result on Anthropic, Responses and Bedrock; folded into a
+following user turn on Chat Completions and Gemini), so the degrade remains
+only for a rung with no image input at all (``capability_policy``). Top-level
+user images keep the fail-closed contract because the caller can re-send those
+differently.
 """
 
 TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
@@ -98,6 +127,8 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    if profile.inference_geo is not None and profile.dialect != "anthropic_messages":
+        raise ProviderCapabilityError(capability="inference_geo")
     if fireworks_continuation_required(profile, provider_request):
         require_responses_continuation_channel(provider_request)
     if provider_request.service_tier is not None and profile.dialect not in SERVICE_TIER_DIALECTS:
@@ -128,7 +159,7 @@ def dialect_stream_payload(
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
         )
     if profile.dialect == "anthropic_messages":
-        return anthropic_messages_stream_payload(
+        payload = anthropic_messages_stream_payload(
             profile.model_id,
             provider_request,
             supports_temperature=profile.supports_temperature,
@@ -141,7 +172,11 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
+            maximum_output_tokens=profile.maximum_output_tokens,
         )
+        if profile.inference_geo is not None:
+            payload["inference_geo"] = profile.inference_geo
+        return payload
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(
             profile.model_id,
@@ -194,7 +229,10 @@ def dialect_stream_payload(
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
             hunyuan_reasoning_route_sha256=profile.hunyuan_reasoning_route_sha256,
             reasoning_output_exposed=profile.reasoning_output_exposed,
+            deepseek_reasoning_history=profile.deepseek_reasoning_history,
+            system_messages_leading_only=profile.system_messages_leading_only,
             forwards_service_tier=profile.forwards_tier(provider_request.service_tier),
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
+            forwards_cache_control=profile.forwards_cache_control,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")

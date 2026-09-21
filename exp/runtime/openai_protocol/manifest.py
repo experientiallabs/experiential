@@ -64,6 +64,9 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field(
             "chat_template_kwargs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"
         ),
+        # DashScope's top-level spelling of the same switch (Qwen-family clients
+        # send it via extra_body); translated exactly like chat_template_kwargs.
+        _field("enable_thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Sampling penalties: admitted and adapted per rung — honored where the
@@ -97,9 +100,42 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # OpenRouter-shaped routing preferences. `zdr: true` demands
+        # zero-data-retention routing for this request (honored at admission
+        # on every route); the object forwards to OpenRouter rungs and is
+        # dropped on wires that have no such field.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
+        # Both API surfaces share the native Responses output-length hint;
+        # other routes omit it with disclosure. Values remain validated.
+        _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
+        # Pre-answer web search. OpenAI's ``web_search_options`` and the
+        # OpenRouter ``plugins: [{"id": "web"}]`` extension (and the ``:online``
+        # model suffix) normalize to one gateway search: a route with no
+        # provider-native search gets the gateway's own (results injected, sources
+        # cited, one search counted); without a configured backend the request
+        # still serves and the drop is disclosed.
+        _field(
+            "web_search_options", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"
+        ),
+        _field("plugins", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"),
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
+        # Explicit prompt-cache boundaries: Chat callers can name cache
+        # breakpoints and retention. No rung honors those selectors yet, so
+        # both stay refused rather than silently dropped. The
+        # ``prompt_cache_boundaries`` capability records that decision for
+        # catalog metadata; implicit prefix caching is a different fact.
+        _field(
+            "prompt_cache_options",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
+        _field(
+            "prompt_cache_retention",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -110,11 +146,7 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "modalities",
                 "moderation",
                 "prediction",
-                "prompt_cache_options",
-                "prompt_cache_retention",
                 "seed",
-                "verbosity",
-                "web_search_options",
             )
         ),
     ),
@@ -164,19 +196,26 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # (context is never truncated; served routes cache implicitly).
         _field("truncation", CompatibilityDisposition.SUPPORTED),
         _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # The Responses tool-call cap is refused until a route can honor it.
+        # ``tool_call_limit`` is the catalog vocabulary for that decision.
+        _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # OpenRouter-shaped routing preferences. `zdr: true` demands
+        # zero-data-retention routing for this request (honored at admission
+        # on every route); the object forwards to OpenRouter rungs and is
+        # dropped on wires that have no such field.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "background",
                 "context_management",
                 "conversation",
-                "max_tool_calls",
                 "moderation",
                 "prompt",
                 "prompt_cache_retention",
@@ -269,8 +308,8 @@ RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
 
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
-    "messages": "validated_and_dropped",
-    "messages.content": "validated_and_dropped",
+    "messages": "validated_and_forwarded_to_cache_capable_adapters",
+    "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
     "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
 }
 """Every Chat-surface ``cache_control`` placement and its conscious decision.
@@ -280,9 +319,8 @@ last content part of recent messages for Claude-family model ids; depending
 on that part's shape the hint lands on the message, a text part, or inside a
 ``tool_calls`` entry. Placements are classified here so a new placement is a
 recorded decision (this table plus its behavior test), never a silent 400.
-Only the tool-call placement forwards: Anthropic defines tool_use-block
-caching natively, and non-Anthropic routes disclose the omission through
-``ignored_parameters``.
+Validated placements ride canonical cache carriers. Anthropic, Bedrock and
+OpenRouter adapters forward or translate them; other routes disclose omission.
 """
 
 

@@ -10,7 +10,7 @@ use super::super::{bounded_wire_token, malformed, Normalizer, OpenAiHostedItem};
 use super::{openai_identity, openai_index};
 use crate::encode::compact_json;
 use crate::errors::Failure;
-use crate::events::{Event, ProviderOutputItemKind};
+use crate::events::{Event, ProviderOutputItemKind, ProviderOutputItemStatus};
 
 /// The documented Responses output-item union beyond the four typed kinds
 /// (`message`, `function_call`, `custom_tool_call`, `reasoning`): hosted
@@ -202,6 +202,39 @@ impl Normalizer {
     ///
     /// The last-seen verbatim JSON is re-served: the provider owns each item
     /// type's status vocabulary, so nothing inside is rewritten.
+    /// Close every provider output item still open at a terminal (or at a
+    /// clean stream end) with `status`, stamping open function calls with it
+    /// so their completion contract follows the terminal's declaration.
+    pub(in crate::dialects) fn openai_close_unfinished_items(
+        &mut self,
+        status: ProviderOutputItemStatus,
+    ) -> Vec<Event> {
+        let unfinished: Vec<_> = self
+            .openai_output_items
+            .iter()
+            .filter(|(index, _)| !self.openai_completed_output_items.contains(index))
+            .map(|(index, (kind, item_id))| (*index, *kind, item_id.clone()))
+            .collect();
+        let mut events = Vec::new();
+        for (output_index, kind, item_id) in unfinished {
+            if kind == ProviderOutputItemKind::FunctionCall {
+                if let Some(tool) = self.tools.get_mut(&output_index) {
+                    tool.provider_status = Some(status);
+                }
+            }
+            self.openai_completed_output_items.insert(output_index);
+            events.push(Event::ProviderOutputItemCompleted {
+                output_index,
+                item_id,
+                kind,
+                status: Some(status),
+                phase: None,
+            });
+        }
+        events.extend(self.openai_sweep_hosted_items());
+        events
+    }
+
     pub(in crate::dialects) fn openai_sweep_hosted_items(&mut self) -> Vec<Event> {
         let unfinished: Vec<_> = self
             .openai_hosted_items

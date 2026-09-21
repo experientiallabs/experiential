@@ -107,6 +107,11 @@ def _resolved_wire_profile(
             ),
             token_limit_key=capabilities.chat_max_tokens_field or profile.token_limit_key,
             maximum_output_tokens=min(output_limits) if output_limits else None,
+            # The provider's output-token floor is a catalog lane fact the
+            # client profile cannot know (a relay serves floored and unfloored
+            # models on one wire); the deployment declaration is the only
+            # source, so it is carried, never intersected.
+            minimum_output_tokens=gateway_capabilities.minimum_output_tokens,
         )
     raise TypeError(
         f"provider {deployment.provider!r} resolved to a client without a native wire profile"

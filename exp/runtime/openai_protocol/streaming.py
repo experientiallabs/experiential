@@ -260,7 +260,7 @@ class ResponsesSseEncoder:
         *,
         request_id: str,
         model: str,
-        created_at: float,
+        created_at: int,
         request: GatewayRequest,
     ) -> None:
         """Initialize one Responses stream and its request-reflecting envelope."""
@@ -881,7 +881,14 @@ def _chat_usage(usage: GatewayUsage) -> JsonObject:
         "prompt_tokens": usage.input_tokens,
         "completion_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
-        "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens or 0},
+        "prompt_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens or 0,
+            **(
+                {"cache_write_tokens": usage.cache_creation_input_tokens}
+                if usage.cache_creation_input_tokens is not None
+                else {}
+            ),
+        },
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
     }
 

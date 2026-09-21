@@ -25,7 +25,10 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
-from exp.runtime.gateway.reasoning_carrier import parse_reasoning_content_carrier
+from exp.runtime.gateway.reasoning_carrier import (
+    parse_reasoning_content_carrier,
+    scheme_for_carrier,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -417,7 +420,14 @@ def remember_turn(
     if raw_carrier is not None:
         if not isinstance(raw_carrier, str):
             raise ValueError("Responses reasoning carrier must be text")
-        sealed_carrier = parse_reasoning_content_carrier(raw_carrier)
+        # The carrier's own opaque prefix names the provider scheme it was
+        # sealed under; parsing under a fixed default rejected every Hunyuan
+        # carrier as "not a bounded gateway carrier" AFTER the attempt had
+        # settled and charged (Responses + tools on the Tencent lanes, 2026-09-15).
+        scheme = scheme_for_carrier(raw_carrier)
+        if scheme is None:
+            raise ValueError("reasoning_content is not a bounded gateway carrier")
+        sealed_carrier = parse_reasoning_content_carrier(raw_carrier, scheme=scheme)
     indexed_output = bool(encrypted or indexed_calls or message_outputs or indexed_natives)
     if sealed_carrier is not None and indexed_output:
         raise ValueError("Responses reasoning carrier cannot mix with provider-indexed output")

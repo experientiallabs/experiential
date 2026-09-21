@@ -17,40 +17,63 @@ from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
 class GatewayUsage(ContractModel):
     """Normalized token counts and invoked tool names from one provider attempt.
 
-    Cached-input and reasoning counts are subsets of the total input and output counts when
-    present. They identify differently priced portions of those totals and must not be added a
-    second time by callers.
+    Cached-input, cache-write, and reasoning counts are disjoint subsets of
+    the total input and output counts when present. They identify differently
+    priced portions of those totals and must not be added a second time by
+    callers. ``cache_creation_input_tokens`` is the provider cache-write
+    surcharge leg; it is disjoint from ``cached_input_tokens`` inside
+    ``input_tokens``, so ``fresh = input - cached - cache_creation``.
 
-    A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
-    case both token totals remain unknown instead of being represented as zero.
+    A terminal event may carry partial token totals or only ``tool_names``.
+    Missing totals remain unknown, never zero. Live usage events require both
+    totals; terminal accounting retains an observed leg without pricing the
+    missing leg or treating a partial report as a final meter.
+
+    ``web_search_requests`` and ``tool_search_requests`` ride along with either shape but never
+    make usage on their own: a count with neither token totals nor tool names is still rejected.
     """
 
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    """Cache-write tokens inside the input total (Anthropic-only today),
-    present only when the provider reported a nonzero count; billing keeps
-    using the folded input total."""
+    """Cache-write tokens inside the input total (Anthropic and Bedrock),
+    disjoint from the cache-read leg; present only when the provider reported
+    a nonzero count."""
+    cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
+    """Observed 1-hour subset of cache writes; zero proves all writes use 5m.
+    None means no complete TTL breakdown was reported, so write cost is unknown."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
+    web_search_requests: int = Field(default=0, ge=0)
+    """Gateway-executed web searches billed to this attempt; never a provider
+    meter and not a subset of any token total. Zero on every attempt that ran
+    no search, including every attempt settled by an engine predating it."""
+    tool_search_requests: int = Field(default=0, ge=0)
+    """Gateway-executed tool-search rounds billed to this attempt; never a
+    provider meter and not a subset of any token total. Zero on every attempt
+    that ran no tool search, including every attempt settled by an engine
+    predating it."""
 
     @model_validator(mode="after")
     def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:
-        """Require complete token totals unless this is tool-only terminal metadata."""
+        """Require observed tokens or tools and validate available covering totals.
+
+        Returns:
+            This validated token or tool-only usage record.
+
+        Raises:
+            ValueError: No token or tool was observed, or a subset contradicts its total.
+        """
         totals = (self.input_tokens, self.output_tokens)
-        if (totals[0] is None) != (totals[1] is None):
-            raise ValueError("input and output token counts must be reported together")
-        if totals[0] is None:
-            if (
-                self.cached_input_tokens is not None
-                or self.cache_creation_input_tokens is not None
-                or self.reasoning_tokens is not None
-            ):
-                raise ValueError("token detail counts require input and output totals")
-            if not self.tool_names:
-                raise ValueError("usage requires token totals or invoked tool names")
+        if totals == (None, None) and not self.tool_names:
+            raise ValueError("usage requires token totals or invoked tool names")
+        if self.cache_creation_1h_input_tokens is not None and (
+            self.cache_creation_input_tokens is None
+            or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens
+        ):
+            raise ValueError("1-hour cache writes require a covering cache-creation total")
         return self
 
     @property
@@ -101,6 +124,21 @@ class GatewayEvent(ContractModel):
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    usage_incomplete_due_to_disconnect: bool = Field(default=False, exclude=True, strict=True)
+    """Trusted evidence of caller loss after dispatch but before an observed provider terminal.
+
+    Observed usage remains evidence, not a claim that the provider's bill is
+    complete. Hosted ledgers retain unresolved exposure for later resolution;
+    the local monthly budget uses the full reserved bound as an unknown-cost
+    estimate. Neither policy treats the partial meter as a final provider bill.
+    This marker never joins public serialized events or replay identity.
+    """
+    decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
+    """Internal decision settlement evidence that an HTTP rejection preceded execution.
+
+    False leaves unmetered decision work financially unresolved. This is not
+    provider token usage and never joins serialized events or replay identity.
+    """
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:
@@ -112,6 +150,12 @@ class GatewayEvent(ContractModel):
         Raises:
             ValueError: The selected event kind lacks its required payload.
         """
+        if self.usage_incomplete_due_to_disconnect and (
+            self.kind is not GatewayEventKind.FAILED
+            or self.failure is None
+            or self.failure.failure_class is not GatewayFailureClass.CANCELLED
+        ):
+            raise ValueError("incomplete disconnect usage requires a cancelled terminal")
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")
@@ -173,6 +217,12 @@ class GatewayFailureClass(StrEnum):
     # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
     PROVIDER_QUOTA = "provider_quota"
     REFUSAL = "refusal"
+    # The provider closed the turn as complete and delivered nothing the caller
+    # can receive (an OpenAI empty assistant message; a reasoning-only turn on a
+    # rung whose reasoning the gateway strips). The model's answer to the
+    # request content, like REFUSAL: never a deployment-circuit failure, and a
+    # 400 the SDKs do not auto-retry.
+    EMPTY_COMPLETION = "empty_completion"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"
     CANCELLED = "cancelled"

@@ -209,7 +209,7 @@ def test_message_result_renders_as_a_chat_completion_with_cached_usage() -> None
         "prompt_tokens": 4516,
         "completion_tokens": 4,
         "total_tokens": 4520,
-        "prompt_tokens_details": {"cached_tokens": 0},
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 4501},
         "completion_tokens_details": None,
     }
 
@@ -254,7 +254,7 @@ def test_server_tool_blocks_render_as_the_cited_answer_not_a_failure() -> None:
     assert choice["finish_reason"] == "stop"
     rendered = _object(choice["message"])
     assert rendered["content"] == "Sunny in Bern."
-    assert rendered["tool_calls"] is None
+    assert "tool_calls" not in rendered
 
 
 def test_message_result_renders_as_a_response_object_on_the_responses_surface() -> None:
@@ -436,7 +436,7 @@ def test_refusal_with_partial_text_renders_content_free_on_both_surfaces() -> No
     rendered = _object(choice["message"])
     assert rendered["content"] is None
     assert rendered["refusal"] == "I can't help with that."
-    assert rendered["tool_calls"] is None
+    assert "tool_calls" not in rendered
     responses = anthropic_result_body(
         _line("/v1/responses", {"input": "Say hi"}), message, request_id="r", created_at=0.0
     )

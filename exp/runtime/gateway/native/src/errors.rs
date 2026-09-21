@@ -141,6 +141,13 @@ pub enum FailureClass {
     /// `QuotaExceeded`, which is the CALLER's gateway credit.
     ProviderQuota,
     Refusal,
+    /// The provider closed the turn as complete and delivered nothing the
+    /// caller can receive: no text, no tool call, no renderable reasoning
+    /// (an OpenAI empty assistant message, a reasoning-only turn on a rung
+    /// whose reasoning the gateway strips). Like a refusal it is the model's
+    /// answer to the request content, not rung deadness: it never opens the
+    /// deployment's health circuit and answers a 4xx no client auto-retries.
+    EmptyCompletion,
     MalformedResponse,
     ProviderInternal,
     Cancelled,
@@ -164,6 +171,7 @@ impl FailureClass {
             FailureClass::ProviderNotFound => "provider_not_found",
             FailureClass::ProviderQuota => "provider_quota",
             FailureClass::Refusal => "refusal",
+            FailureClass::EmptyCompletion => "empty_completion",
             FailureClass::MalformedResponse => "malformed_response",
             FailureClass::ProviderInternal => "provider_internal",
             FailureClass::Cancelled => "cancelled",
@@ -233,6 +241,32 @@ const REFUSAL_MESSAGE: &str = "provider refused the request";
 /// including the executor's per-failure retry classification: whether the
 /// same deployment may be redialed and whether a later certified deployment
 /// may serve the request instead.
+/// Safe message of [`Failure::empty_completion`]; content-free and stable so
+/// the ledger and the public error name the same shape.
+/// Response header that names a completed answer the caller should read
+/// with care; `empty_completion` is its one value today: every rung (or the
+/// committed rung) closed the turn with nothing, and the 200 the caller holds
+/// is that empty turn, not a delivered answer. Rides every non-streaming
+/// response and every settled stream; a live stream has already sent its
+/// headers, so there the terminal frames alone carry the shape.
+pub const GATEWAY_WARNING_HEADER: &str = "x-gateway-warning";
+pub const EMPTY_COMPLETION_WARNING: &str = "empty_completion";
+
+/// The `x-gateway-warning: empty_completion` header pair when `flagged`.
+pub fn empty_completion_headers(flagged: bool) -> Vec<(String, String)> {
+    if flagged {
+        vec![(
+            GATEWAY_WARNING_HEADER.to_string(),
+            EMPTY_COMPLETION_WARNING.to_string(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+pub const EMPTY_COMPLETION_MESSAGE: &str = "the model ended its turn without producing any output; \
+     adjust the request (for example, end the conversation on a user turn or ask for a text answer) and resend";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub failure_class: FailureClass,
@@ -266,6 +300,10 @@ pub struct Failure {
     /// answer is their 400 naming the fix, and settlement files it client-side.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub customer_owned: bool,
+    /// A TypeSafe HTTP response definitively rejected dispatch before work.
+    /// Only the transport may set this; unknown outcomes remain false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_provider_rejected: bool,
     /// The bounded category of a refusal, set by every refusal builder so
     /// the public error and the settlement ledger can name which policy
     /// declined the content without parsing `provider_detail`.
@@ -278,6 +316,13 @@ pub struct Failure {
     /// reach the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_headers: Option<Box<serde_json::Map<String, serde_json::Value>>>,
+    /// The provider refused a replayed reasoning item's `encrypted_content`
+    /// (OpenAI `invalid_encrypted_content`: a payload sealed by another
+    /// organization or tenant, or one it never issued). In-process only: the
+    /// waterfall re-dials the same rung once with those items stripped, so the
+    /// flag never crosses the bridge and never reaches settlement.
+    #[serde(skip)]
+    pub encrypted_reasoning_rejected: bool,
 }
 
 impl Failure {
@@ -291,8 +336,10 @@ impl Failure {
             provider_detail: None,
             retry_after_seconds: None,
             customer_owned: false,
+            decision_provider_rejected: false,
             refusal_reason: None,
             rate_limit_headers: None,
+            encrypted_reasoning_rejected: false,
         }
     }
 
@@ -309,6 +356,26 @@ impl Failure {
             refusal_reason: Some(reason),
             ..Self::new(FailureClass::Refusal, &safe_message)
         }
+    }
+
+    /// The provider closed the turn as complete while sending nothing the
+    /// caller can receive: no text, no tool call, and no reasoning the
+    /// surface renders (OpenRouter's DeepSeek rungs answer a reasoning-only
+    /// turn this way, live 2026-09-12; OpenAI returns a 4-token empty
+    /// assistant message to some Claude Code conversations, live
+    /// 2026-09-15). Pre-commit the redial and the ladder stay on (the empty
+    /// answer is not deterministic), but the class is [`FailureClass::
+    /// EmptyCompletion`]: the model's answer to the request content, so it
+    /// never feeds the rung's health circuit, and once the ladder is
+    /// exhausted (or post-commit, where there is no ladder) the caller
+    /// receives the empty turn as a typed 200 under
+    /// [`GATEWAY_WARNING_HEADER`] rather than a 502 that every SDK
+    /// auto-retries -- 2026-09-15 one Claude Code session re-sent the same
+    /// 44k-token prompt every minute for an hour against a 502. The 400
+    /// mapping below is the defensive shape for any path that still renders
+    /// the failure itself: 4xx, so no client retries it.
+    pub fn empty_completion() -> Self {
+        Self::new(FailureClass::EmptyCompletion, EMPTY_COMPLETION_MESSAGE).with_retry(true, true)
     }
 
     /// Attach one already-validated provider parameter path.
@@ -342,6 +409,12 @@ impl Failure {
         if self.failure_class == FailureClass::Throttled && self.retry_after_seconds.is_none() {
             self.retry_after_seconds = retry_after_seconds;
         }
+        self
+    }
+
+    /// Mark whether the provider refused replayed encrypted reasoning.
+    pub fn with_encrypted_reasoning_rejected(mut self, rejected: bool) -> Self {
+        self.encrypted_reasoning_rejected = rejected;
         self
     }
 
@@ -415,6 +488,12 @@ impl Failure {
             // convention is that status with its own code. The provider billed
             // the processed input, so a 502 would misdescribe a charged call.
             FailureClass::Refusal => (400, "refusal", "invalid_request_error"),
+            // An empty completion is the same family: the model's answer to
+            // the content was nothing. A 4xx is the shape no OpenAI or
+            // Anthropic SDK retries (both retry 408/409/429/5xx only), so a
+            // conversation that keeps yielding an empty turn surfaces once
+            // instead of looping; the message names the remedy.
+            FailureClass::EmptyCompletion => (400, "empty_completion", "invalid_request_error"),
             FailureClass::Unavailable => (503, "gateway_unavailable", "api_error"),
             _ => (502, "all_routes_failed", "api_error"),
         };

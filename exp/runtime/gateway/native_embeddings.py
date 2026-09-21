@@ -34,8 +34,8 @@ from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
     authority_error,
-    record_dead_admission_rungs,
 )
+from exp.runtime.gateway.native_admission import record_dead_admission_rungs
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_embeddings_body
 from exp.runtime.gateway.native_execution import (

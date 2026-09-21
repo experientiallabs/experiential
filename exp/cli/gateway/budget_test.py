@@ -91,13 +91,13 @@ def test_noninteractive_budget_management_reports_integer_remaining(tmp_path: Pa
     _configured(tmp_path)
     runner = CliRunner()
     commands = (
-        ["--scope", "team", "--limit-micro-usd", "20000000000"],
+        ["--scope", "team", "--limit-nano-usd", "20000000000"],
         [
             "--scope",
             "identity",
             "--identity",
             "identity-one",
-            "--limit-micro-usd",
+            "--limit-nano-usd",
             "15000000000",
         ],
         [
@@ -109,7 +109,7 @@ def test_noninteractive_budget_management_reports_integer_remaining(tmp_path: Pa
             "pool-one",
             "--deployment",
             "azure-primary",
-            "--limit-micro-usd",
+            "--limit-nano-usd",
             "10000000000",
         ],
     )
@@ -133,7 +133,7 @@ def test_noninteractive_budget_management_reports_integer_remaining(tmp_path: Pa
         assert result.exit_code == 0, result.output
         receipt = json.loads(result.stdout)
         assert receipt["operation"] == "budget.set"
-        assert isinstance(receipt["data"]["limit_micro_usd"], int)
+        assert isinstance(receipt["data"]["limit_nano_usd"], int)
 
     listed = runner.invoke(
         app,
@@ -168,7 +168,7 @@ def test_noninteractive_budget_management_reports_integer_remaining(tmp_path: Pa
     assert len(json.loads(listed.stdout)["items"]) == 3
     items = json.loads(remaining.stdout)["items"]
     assert len(items) == 3
-    assert all(item["remaining_micro_usd"] == item["budget"]["limit_micro_usd"] for item in items)
+    assert all(item["remaining_nano_usd"] == item["budget"]["limit_nano_usd"] for item in items)
     assert "dashboard" not in remaining.stdout.lower()
 
 
@@ -187,7 +187,7 @@ def test_set_records_opt_in_strict_unknown_cost(tmp_path: Path) -> None:
             "2026-08",
             "--scope",
             "team",
-            "--limit-micro-usd",
+            "--limit-nano-usd",
             "1000",
             "--root",
             str(tmp_path),
@@ -209,7 +209,7 @@ def test_set_records_opt_in_strict_unknown_cost(tmp_path: Path) -> None:
             "2026-08",
             "--scope",
             "team",
-            "--limit-micro-usd",
+            "--limit-nano-usd",
             "1000",
             "--strict-unknown-cost",
             "--replace",
@@ -235,7 +235,7 @@ def test_interactive_set_prompts_while_noninteractive_missing_values_fail(tmp_pa
         input="2026-08\nteam\n1000\n",
     )
     assert interactive.exit_code == 0, interactive.output
-    assert "2026-08 team limit_micro_usd=1000" in interactive.output
+    assert "2026-08 team limit_nano_usd=1000" in interactive.output
 
     missing = runner.invoke(
         app,
@@ -291,7 +291,7 @@ def _record_unknown_attempt(manager: GatewayManagement) -> None:
         deployment=_snapshot_catalog().deployments[0],
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=None,
+        maximum_cost_nano_usd=None,
     )
     ledger.finish_attempt(
         attempt_id=attempt,
@@ -322,7 +322,7 @@ def test_noninteractive_reconcile_settles_unknown_costs_and_reports_recovery(
             period,
             "--scope",
             "team",
-            "--limit-micro-usd",
+            "--limit-nano-usd",
             "1000000",
             "--root",
             str(tmp_path),
@@ -343,7 +343,7 @@ def test_noninteractive_reconcile_settles_unknown_costs_and_reports_recovery(
             period,
             "--scope",
             "team",
-            "--assigned-cost-micro-usd",
+            "--assigned-cost-nano-usd",
             "250",
             "--root",
             str(tmp_path),
@@ -356,11 +356,11 @@ def test_noninteractive_reconcile_settles_unknown_costs_and_reports_recovery(
     assert receipt["operation"] == "budget.reconcile"
     assert receipt["changed"] is True
     assert receipt["data"]["reconciled_attempts"] == 1
-    assert receipt["data"]["assigned_cost_micro_usd"] == 250
+    assert receipt["data"]["assigned_cost_nano_usd"] == 250
     balance = receipt["data"]["remaining"]
     assert balance["unknown_cost_attempts"] == 0
-    assert balance["settled_micro_usd"] == 250
-    assert balance["remaining_micro_usd"] == 1_000_000 - 250
+    assert balance["settled_nano_usd"] == 250
+    assert balance["remaining_nano_usd"] == 1_000_000 - 250
     assert balance["exhausted"] is False
 
     repeat = runner.invoke(
@@ -374,7 +374,7 @@ def test_noninteractive_reconcile_settles_unknown_costs_and_reports_recovery(
             period,
             "--scope",
             "team",
-            "--assigned-cost-micro-usd",
+            "--assigned-cost-nano-usd",
             "250",
             "--root",
             str(tmp_path),
@@ -412,7 +412,7 @@ def test_noninteractive_reconcile_requires_assigned_cost_and_existing_limit(
     )
     assert missing_cost.exit_code == 2
     normalized = " ".join(click.unstyle(missing_cost.output).replace("│", " ").split())
-    assert "--assigned-cost-micro-usd is required" in normalized
+    assert "--assigned-cost-nano-usd is required" in normalized
 
     missing_budget = runner.invoke(
         app,
@@ -425,7 +425,7 @@ def test_noninteractive_reconcile_requires_assigned_cost_and_existing_limit(
             "2026-08",
             "--scope",
             "team",
-            "--assigned-cost-micro-usd",
+            "--assigned-cost-nano-usd",
             "250",
             "--root",
             str(tmp_path),

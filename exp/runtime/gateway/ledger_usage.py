@@ -32,7 +32,7 @@ class IdentityUsage(ContractModel):
     cached_input_tokens: int
     output_tokens: int
     reasoning_tokens: int
-    known_estimated_cost_micro_usd: int
+    known_estimated_cost_nano_usd: int
     unknown_cost_attempts: int
     total_latency_ms: int
     average_latency_ms: float | None
@@ -48,7 +48,7 @@ class BillingSourceUsage(ContractModel):
     cached_input_tokens: int
     output_tokens: int
     reasoning_tokens: int
-    known_estimated_cost_micro_usd: int
+    known_estimated_cost_nano_usd: int
     unknown_cost_attempts: int
     terminal_counts: tuple[UsageTerminalCount, ...]
 
@@ -77,10 +77,10 @@ def identity_usage_rows(
                COALESCE(SUM(a.cached_input_tokens), 0) AS cached_input_tokens,
                COALESCE(SUM(a.output_tokens), 0) AS output_tokens,
                COALESCE(SUM(a.reasoning_tokens), 0) AS reasoning_tokens,
-               COALESCE(SUM(a.estimated_cost_micro_usd), 0) AS known_cost,
+               COALESCE(SUM(a.estimated_cost_nano_usd), 0) AS known_cost,
                COALESCE(SUM(CASE
                    WHEN a.attempt_id IS NOT NULL
-                    AND a.estimated_cost_micro_usd IS NULL THEN 1 ELSE 0 END), 0
+                    AND a.estimated_cost_nano_usd IS NULL THEN 1 ELSE 0 END), 0
                ) AS unknown_cost_attempts,
                COALESCE(SUM(CASE WHEN a.terminal_at IS NOT NULL THEN
                    ROUND((julianday(a.terminal_at) - julianday(a.started_at)) * 86400000)
@@ -124,7 +124,7 @@ def identity_usage_rows(
             cached_input_tokens=int(row["cached_input_tokens"]),
             output_tokens=int(row["output_tokens"]),
             reasoning_tokens=int(row["reasoning_tokens"]),
-            known_estimated_cost_micro_usd=int(row["known_cost"]),
+            known_estimated_cost_nano_usd=int(row["known_cost"]),
             unknown_cost_attempts=int(row["unknown_cost_attempts"]),
             total_latency_ms=int(row["total_latency_ms"]),
             average_latency_ms=(
@@ -151,9 +151,9 @@ def billing_source_usage_rows(
                COALESCE(SUM(a.cached_input_tokens), 0) AS cached_input_tokens,
                COALESCE(SUM(a.output_tokens), 0) AS output_tokens,
                COALESCE(SUM(a.reasoning_tokens), 0) AS reasoning_tokens,
-               COALESCE(SUM(a.estimated_cost_micro_usd), 0) AS known_cost,
+               COALESCE(SUM(a.estimated_cost_nano_usd), 0) AS known_cost,
                COALESCE(SUM(CASE
-                   WHEN a.estimated_cost_micro_usd IS NULL THEN 1 ELSE 0 END), 0
+                   WHEN a.estimated_cost_nano_usd IS NULL THEN 1 ELSE 0 END), 0
                ) AS unknown_cost_attempts
         FROM gateway_attempts AS a
         JOIN gateway_requests AS r ON r.request_id = a.request_id
@@ -185,7 +185,7 @@ def billing_source_usage_rows(
             cached_input_tokens=int(row["cached_input_tokens"]),
             output_tokens=int(row["output_tokens"]),
             reasoning_tokens=int(row["reasoning_tokens"]),
-            known_estimated_cost_micro_usd=int(row["known_cost"]),
+            known_estimated_cost_nano_usd=int(row["known_cost"]),
             unknown_cost_attempts=int(row["unknown_cost_attempts"]),
             terminal_counts=tuple(terminals.get(str(row["billing_source"]), ())),
         )

@@ -15,6 +15,28 @@ from exp.runtime.models.providers.gemini_requests import (
 )
 
 
+@pytest.mark.parametrize("maximum", (None, 1, 8_192, 128_000))
+def test_gateway_style_gemini_builder_preserves_omission_or_exact_cap(maximum: int | None) -> None:
+    """Gateway calls opt out of the non-gateway model client's explicit default."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),), maximum_output_tokens=maximum
+    )
+    payload = gemini_generate_request("gemini-2.5-pro", request, default_maximum_output_tokens=None)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    if maximum is None:
+        assert "maxOutputTokens" not in generation
+    else:
+        assert generation["maxOutputTokens"] == maximum
+
+
+def test_model_client_gemini_default_remains_explicit() -> None:
+    """The non-gateway execution budget is unchanged by gateway omission policy."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    payload = gemini_generate_request("gemini-2.5-pro", request)
+    assert payload["generationConfig"] == {"maxOutputTokens": 4096}
+
+
 def test_gemini_model_path_strips_the_optional_wire_prefix() -> None:
     """Prefixed and bare model identifiers resolve to one route segment."""
     assert gemini_model_path("models/gemini-2.5-pro") == "gemini-2.5-pro"
@@ -199,4 +221,37 @@ def test_gemini_generate_request_inlines_documents_in_caller_order() -> None:
                 {"inline_data": {"mime_type": "application/pdf", "data": "JVBERi0xLjcK"}},
             ],
         }
+    ]
+
+
+def test_gemini_folds_a_mid_conversation_system_turn_into_user_text_in_place() -> None:
+    """systemInstruction hoists only the leading run; a later instruction keeps its position.
+
+    Claude Code on the Chat wire injects a system turn after the first user
+    turn and after every tool result; the gateway used to refuse the whole
+    route for it. The text now rides as user content where the caller put it.
+    """
+    payload = gemini_generate_request(
+        "gemini-2.5-pro",
+        ModelRequest(
+            messages=(
+                ModelMessage(role="system", content="be terse"),
+                ModelMessage(role="system", content="answer in English"),
+                ModelMessage(role="user", content="hi"),
+                ModelMessage(role="system", content="# Environment\nPlatform: linux"),
+                ModelMessage(role="assistant", content="hello"),
+                ModelMessage(role="system", content="<total_tokens>1</total_tokens>"),
+                ModelMessage(role="user", content="go"),
+            ),
+            tools=(),
+        ),
+    )
+    assert payload["systemInstruction"] == {
+        "parts": [{"text": "be terse"}, {"text": "answer in English"}]
+    }
+    assert payload["contents"] == [
+        {"role": "user", "parts": [{"text": "hi\n\n# Environment\nPlatform: linux"}]},
+        {"role": "model", "parts": [{"text": "hello"}]},
+        {"role": "user", "parts": [{"text": "<total_tokens>1</total_tokens>"}]},
+        {"role": "user", "parts": [{"text": "go"}]},
     ]

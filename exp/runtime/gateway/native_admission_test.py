@@ -51,6 +51,8 @@ from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.openai_protocol.requests import decode_chat
 
 
 def _deployment(
@@ -69,6 +71,7 @@ def _deployment(
         provider_model="provider-model",
         connection_sha256="b" * 64,
         capabilities_sha256="c" * 64,
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway=gateway or GatewayDeploymentMetadata(),
     )
 
@@ -136,6 +139,39 @@ def _marked_request() -> GatewayRequest:
     )
 
 
+def test_omitted_cap_narrows_past_unbounded_rungs_without_limiting_survivors() -> None:
+    """Unknown metadata fails closed per rung rather than poisoning a bounded fallback."""
+    unknown = _deployment("unknown").model_copy(update={"capabilities": None})
+    bounded = _deployment("bounded", provider="anthropic")
+    route = _mixed_route("maximize_availability", (unknown, bounded))
+    wires = _wires()
+    indexes, errors = protocol_compatible_indexes(
+        route, wires, _marked_request(), public_stream=False
+    )
+    assert indexes == (1,)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProviderParameterError)
+    assert errors[0].param == "max_tokens"
+    assert "Supply an explicit max_tokens" in str(errors[0])
+
+
+def test_context_only_metadata_excludes_required_wire_but_keeps_optional_sibling() -> None:
+    """One context-only fallback never grants Anthropic an unsupported output maximum."""
+    metadata = ModelCapabilities(context_window_tokens=200_000)
+    deployments = (
+        _deployment("optional").model_copy(update={"capabilities": metadata}),
+        _deployment("required", provider="anthropic").model_copy(update={"capabilities": metadata}),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    indexes, errors = protocol_compatible_indexes(
+        route, _wires(), _marked_request(), public_stream=False
+    )
+    assert indexes == (0,)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProviderParameterError)
+    assert "no declared output maximum" in str(errors[0])
+
+
 def test_remote_url_refusal_outranks_a_text_only_rung_refusing_every_image() -> None:
     """A text-only rung ahead of an inline-only rung reports the URL, not the image."""
     text_only = ProviderCapabilityError(capability="image_input")
@@ -194,6 +230,71 @@ def test_cache_marked_requests_dispatch_marker_honoring_rungs_first() -> None:
         _marked_request(),
     )
     assert route.deployment.deployment_id == "shim"
+
+
+def test_reasoning_pin_holds_the_issuing_rung_first_only_while_it_survives() -> None:
+    """Ordering never demotes a live issuing rung, and a stale pin changes nothing.
+
+    While the rung that sealed the request's reasoning is still on the route
+    it leads (it alone can replay the thinking), so neither the cache-marker
+    preference nor affinity rendezvous reorders past it. Once admission has
+    narrowed that rung out as dead every survivor runs without the reasoning,
+    and the pool's normal ordering applies to them exactly as on a plain route.
+    """
+    pinned = _mixed_route("maximize_cache").model_copy(
+        update={
+            "route_reason": "reasoning_continuation",
+            "reasoning_pinned_deployment_id": "shim",
+        }
+    )
+    route, wires = _prefer_cache_capable_rungs(pinned, _wires(), _marked_request())
+    assert route is pinned
+    assert wires[0][0].dialect == "openai_compatible"
+    # The issuing rung ("issuer") was narrowed out at admission: the pin is
+    # stale and the marker-honoring rung is dispatched first as usual.
+    stale = pinned.model_copy(update={"reasoning_pinned_deployment_id": "issuer"})
+    route, wires = _prefer_cache_capable_rungs(stale, _wires(), _marked_request())
+    assert route.deployment.deployment_id == "native"
+    assert route.reasoning_pinned_deployment_id == "issuer"
+    assert wires[0][0].dialect == "anthropic_messages"
+
+    affinity_route, affinity_wires = _affinity_fixture()
+    live_pin = affinity_route.model_copy(
+        update={
+            "route_reason": "reasoning_continuation",
+            "reasoning_pinned_deployment_id": "dep-openrouter",
+        }
+    )
+    rendezvous, _wires_out, _placement = _affinity_ordered_rungs(
+        affinity_route,
+        affinity_wires,
+        _session_request("session-pinned"),
+        accounting=_affinity_accounting(),
+        authorization=affinity_route.snapshot.authorization,
+        continuation=None,
+    )
+    ordered, ordered_wires, placement = _affinity_ordered_rungs(
+        live_pin,
+        affinity_wires,
+        _session_request("session-pinned"),
+        accounting=_affinity_accounting(),
+        authorization=live_pin.snapshot.authorization,
+        continuation=None,
+    )
+    assert ordered is live_pin
+    assert ordered_wires is affinity_wires
+    assert placement.fingerprint is not None
+    stale_pin = live_pin.model_copy(update={"reasoning_pinned_deployment_id": "dep-dead"})
+    reordered, _wires_out, _placement = _affinity_ordered_rungs(
+        stale_pin,
+        affinity_wires,
+        _session_request("session-pinned"),
+        accounting=_affinity_accounting(),
+        authorization=stale_pin.snapshot.authorization,
+        continuation=None,
+    )
+    assert _order(reordered) == _order(rendezvous)
+    assert reordered.reasoning_pinned_deployment_id == "dep-dead"
 
 
 def test_video_requests_skip_rungs_whose_wire_cannot_carry_them() -> None:
@@ -285,6 +386,42 @@ def test_oversized_inline_media_skips_the_bedrock_rung() -> None:
     assert len(errors) == 1
     assert isinstance(errors[0], ProviderParameterError)
     assert errors[0].param == "messages"
+
+
+def test_unrepresentable_assistant_turn_is_a_messages_rejection_not_an_internal_error() -> None:
+    """An assistant turn with empty text and no tool call is refused on ``messages``.
+
+    The Converse payload builder cannot encode such a turn and reports it as a
+    response-contract violation; admission must surface that as a
+    field-specific parameter rejection so the caller receives a 400 instead of
+    the request escaping as an internal admission failure.
+    """
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = (_deployment("ministral", provider="bedrock", gateway=streaming),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"), client),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="hello"),
+            GatewayMessage(role="assistant", content=""),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    indexes, errors = protocol_compatible_indexes(route, wires, request, public_stream=False)
+    assert indexes == ()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProviderParameterError)
+    assert errors[0].param == "messages"
+    assert errors[0].code == "invalid_parameter"
+    assert "assistant messages need text or a tool call" in str(errors[0])
 
 
 def test_media_handle_requests_land_only_on_the_uploading_providers_rung() -> None:
@@ -555,14 +692,8 @@ def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
     assert "provider_prompt_cache_key" not in keyed.model_dump(mode="json")
 
 
-def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_disclosure() -> None:
-    """A dual-lane opus-5 route serves a disabled-thinking request instead of refusing.
-
-    The aggregator rung cannot carry Anthropic thinking at all and the
-    adaptive-only Anthropic rung rejects an explicit ``disabled``, so no rung
-    preserves the request verbatim. The disclosed drop lets the route serve,
-    the Anthropic rung emitting its sole supported mode.
-    """
+def test_disabled_thinking_keeps_the_opus_rung_that_honors_it() -> None:
+    """A mixed route keeps explicit thinking-off on the native supporting rung."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     streaming = GatewayDeploymentMetadata(
@@ -619,12 +750,10 @@ def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_discl
         authorization=route.snapshot.authorization,
     )
 
-    # With the config gone nothing Anthropic-only remains on the request, so
-    # the whole certified waterfall stays available, native rung first.
-    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native", "shim")
-    assert public.ignored_parameters == ("thinking.type->adaptive",)
-    assert provider.provider_thinking_config is None
-    assert accounting.recorded == 1
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert public.ignored_parameters == ()
+    assert provider.provider_thinking_config == {"type": "disabled"}
+    assert accounting.recorded == 0
 
 
 _TOOL_IMAGE_PNG = (
@@ -766,13 +895,78 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     assert accounting.recorded == 1
 
 
-def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> None:
-    """The full admit loop serves a thinking config on an all-OpenAI route.
+@pytest.mark.parametrize("stream", [True, False])
+def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(stream: bool) -> None:
+    """The Copilot/Codex repro (an ``image_url`` part inside a ``role: "tool"``
+    message on /v1/chat/completions) decodes, admits on an image-capable Chat
+    rung with the image intact, and the route discloses the user-turn fold
+    the Chat payload applies; nothing is coerced."""
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
+    )
+    from exp.runtime.openai_protocol.requests import decode_chat
 
-    Route shaping rejects the config by name, the coercion translates it to
-    the route's effort ladder, and the re-narrowed route serves with the
-    translation disclosed and counted.
-    """
+    body: JsonObject = {
+        "model": "coding",
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "screenshot", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": [
+                    {"type": "text", "text": "Screenshot taken:"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_TOOL_IMAGE_PNG}"},
+                    },
+                ],
+            },
+        ],
+    }
+    request = decode_chat(body).request.model_copy(update={"include_usage": True})
+    vision = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_image_input=True,
+        )
+    )
+    deployments = (_deployment("luna", provider="azure_openai", gateway=vision),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://chat.test"), client),)
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.role == "tool"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _TOOL_IMAGE_PNG
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 0
+
+
+def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> None:
+    """The full admit loop refuses a budget an OpenAI effort dial cannot enforce."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     request = GatewayRequest(
@@ -805,19 +999,17 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
             client,
         ),
     )
-    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
-        route,
-        wires,
-        request,
-        accounting=cast(NativeAttemptAccounting, accounting),
-        authorization=route.snapshot.authorization,
-    )
-
-    assert tuple(item.deployment_id for item in narrowed.deployments) == ("gpt",)
-    assert "thinking->reasoning_effort:medium" in public.ignored_parameters
-    assert provider.provider_thinking_config is None
-    assert provider.reasoning_effort == "medium"
-    assert accounting.recorded == 1
+    with pytest.raises(ProviderParameterError) as rejected:
+        admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=cast(NativeAttemptAccounting, accounting),
+            authorization=route.snapshot.authorization,
+        )
+    assert rejected.value.param == "thinking"
+    assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
+    assert accounting.recorded == 0
 
 
 def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
@@ -893,11 +1085,11 @@ def test_tier_priced_host_lane_admits_the_named_tier() -> None:
                 gateway=GatewayDeploymentMetadata(
                     capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        output_micro_usd_per_million_tokens=4_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=4_000_000,
                         flex=GatewayServiceTierPrices(
-                            input_micro_usd_per_million_tokens=500_000,
-                            output_micro_usd_per_million_tokens=2_000_000,
+                            input_nano_usd_per_million_tokens=500_000,
+                            output_nano_usd_per_million_tokens=2_000_000,
                         ),
                     ),
                 ),
@@ -954,11 +1146,11 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
                 gateway=GatewayDeploymentMetadata(
                     capabilities=streaming,
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        output_micro_usd_per_million_tokens=4_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=4_000_000,
                         flex=GatewayServiceTierPrices(
-                            input_micro_usd_per_million_tokens=500_000,
-                            output_micro_usd_per_million_tokens=2_000_000,
+                            input_nano_usd_per_million_tokens=500_000,
+                            output_nano_usd_per_million_tokens=2_000_000,
                         ),
                     ),
                 ),
@@ -1229,6 +1421,68 @@ def test_an_open_strict_schema_is_closed_for_the_anthropic_rung_with_disclosure(
     assert provider.tools[0].parameters == {**open_schema, "additionalProperties": False}
     assert public.ignored_parameters == ("tools.parameters.additionalProperties->false",)
     assert accounting.recorded == 1
+
+
+def test_a_rung_whose_window_cannot_hold_prompt_plus_budget_is_skipped_with_its_wire() -> None:
+    """Narrowing runs first and keeps route and wires aligned: the small rung is gone from both."""
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=1_000)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=2_000)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="x" * (600 * MAXIMUM_BYTES_PER_TOKEN)),),
+        maximum_output_tokens=500,
+        maximum_output_tokens_parameter="max_tokens",
+    )
+    wires = _wires()
+    narrowed, wires_out, _public, _provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == ("native",)
+    assert narrowed.deployment.deployment_id == "native"
+    assert wires_out == wires[1:]
+
+
+def test_an_omitted_output_budget_never_copies_a_fallback_cap_across_the_route() -> None:
+    """An optional rung keeps omission regardless of a required-cap sibling."""
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=1_000)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={
+                "capabilities": ModelCapabilities(
+                    context_window_tokens=8_000, maximum_output_tokens=4_000
+                )
+            }
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="x" * (600 * MAXIMUM_BYTES_PER_TOKEN)),),
+    )
+    wires = _wires()
+    narrowed, wires_out, _public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.maximum_output_tokens is None
+    assert narrowed.snapshot.deployment_ids == ("shim", "native")
+    assert wires_out == wires
 
 
 def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> None:
@@ -1512,6 +1766,24 @@ class TestAffinityOrderedRungs:
         )
         assert rendezvous_placement.fingerprint is not None
         assert rendezvous_placement.sticky_preferred is False
+        assert rendezvous_placement.sticky_deployment_id is None
+        # A binding to the rung rendezvous already ranks first moves nothing
+        # and is not disclosed as sticky, but placement still names the bound
+        # rung: the one registry read is what admission-time policy reuses.
+        accounting.sticky.bind(
+            rendezvous_placement.fingerprint, _order(rendezvous)[0], ttl_seconds=600.0
+        )
+        front, _wires_out, front_placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(front) == _order(rendezvous)
+        assert front_placement.sticky_preferred is False
+        assert front_placement.sticky_deployment_id == _order(rendezvous)[0]
         # Bind the conversation to a rung rendezvous did NOT rank first (the
         # spill target a congested preferred rung shed it onto).
         spill_target = _order(rendezvous)[1]
@@ -1526,6 +1798,7 @@ class TestAffinityOrderedRungs:
         )
         assert _order(sticky)[0] == spill_target
         assert sticky_placement.sticky_preferred is True
+        assert sticky_placement.sticky_deployment_id == spill_target
         assert _order(sticky)[1:] == tuple(
             name for name in _order(rendezvous) if name != spill_target
         )
@@ -1551,6 +1824,7 @@ class TestAffinityOrderedRungs:
         )
         assert _order(bypassed) == _order(rendezvous)
         assert bypassed_placement.sticky_preferred is False
+        assert bypassed_placement.sticky_deployment_id is None
         assert accounting.sticky.bound_deployment(rendezvous_placement.fingerprint) is None
         # An expired binding is ignored without needing a suppression event.
         clock = [0.0]
@@ -1558,3 +1832,264 @@ class TestAffinityOrderedRungs:
         expiring.bind(b"fingerprint", "dep-house", ttl_seconds=600.0)
         clock[0] = 601.0
         assert expiring.bound_deployment(b"fingerprint") is None
+
+
+def test_an_image_refusal_is_never_blamed_on_the_thinking_field() -> None:
+    """A modality refusal names ``messages`` even when ``thinking`` rides along.
+
+    On a text-only reasoning route (hy4-preview's shape) an image block is
+    refused at capability preflight. Claude Code sends a ``thinking`` field on
+    every request, and route shaping rejects that field by name on a foreign
+    wire before preflight ever runs, so with no correction the caller read
+    "The parameter 'thinking' is not supported by this model route" for a
+    pasted screenshot (25 such 400s on 2026-09-11; removing thinking still
+    failed). The rejection the caller sees must be the one the coerced request
+    hits: the image, on ``messages``.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("hy4", provider="tencent", gateway=text_only),),
+        GatewayApiSurface.MESSAGES,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://tokenhub.test/v1",
+                model_id="hy4-preview",
+                supports_reasoning=True,
+                reasoning_wire_format="reasoning_effort",
+                supported_reasoning_efforts=("none", "low", "medium", "high"),
+                reasoning_effort="high",
+            ),
+            client,
+        ),
+    )
+    image_turn: JsonObject = {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": _TOOL_IMAGE_PNG},
+            },
+            {"type": "text", "text": "What is this?"},
+        ],
+    }
+    for thinking in ({"type": "disabled"}, {"type": "enabled"}, {"type": "adaptive"}):
+        body: JsonObject = {
+            "model": "hy4-preview",
+            "max_tokens": 48,
+            "thinking": thinking,
+            "messages": [image_turn],
+        }
+        request = decode_messages(body).request.model_copy(update={"include_usage": True})
+        with pytest.raises(ProviderCapabilityError) as refused:
+            admitted_route_requests(
+                route,
+                wires,
+                request,
+                accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+                authorization=route.snapshot.authorization,
+            )
+        assert refused.value.capability == "image_input", thinking
+
+    # The control: the same body without thinking is refused the same way.
+    control = decode_messages(
+        {"model": "hy4-preview", "max_tokens": 48, "messages": [image_turn]}
+    ).request.model_copy(update={"include_usage": True})
+    with pytest.raises(ProviderCapabilityError) as refused:
+        admitted_route_requests(
+            route,
+            wires,
+            control,
+            accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+            authorization=route.snapshot.authorization,
+        )
+    assert refused.value.capability == "image_input"
+
+
+def test_a_tiny_max_tokens_on_a_default_reasoning_lane_dispatches_without_thinking() -> None:
+    """Through the admit loop: hy4's shape at ``max_tokens: 32`` with no
+    reasoning signal dispatches at ``reasoning_effort: none`` with the headroom
+    disclosure recorded and counted, so the caller gets text instead of a
+    thinking block truncated at the ceiling."""
+    reasoning = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("hy4", provider="tencent", gateway=reasoning),),
+        GatewayApiSurface.MESSAGES,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://tokenhub.test/v1",
+                model_id="hy4-preview",
+                supports_reasoning=True,
+                reasoning_wire_format="reasoning_effort",
+                supported_reasoning_efforts=("none", "low", "medium", "high"),
+                reasoning_effort="high",
+            ),
+            client,
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        maximum_output_tokens=32,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+    accounting = _AdmissionCoercionCounter()
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.reasoning_effort == "none"
+    assert "reasoning_effort->none(max_tokens_headroom)" in public.ignored_parameters
+    assert accounting.recorded == 1
+
+    roomy = request.model_copy(update={"maximum_output_tokens": 4096})
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        roomy,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.reasoning_effort is None
+    assert public.ignored_parameters == ()
+
+
+def test_the_headroom_rule_reads_the_rungs_that_survive_narrowing() -> None:
+    """A rung with no reasoning default that narrowing removes (its output
+    ceiling is below the caller's ``max_tokens``) must not veto the headroom
+    coercion for the default-on rung that actually serves; and a surviving
+    rung without a default still does, because it already answers in text."""
+    plain = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (
+            _deployment("text-only", gateway=plain),
+            _deployment("hy4", provider="tencent", gateway=plain),
+        ),
+        GatewayApiSurface.MESSAGES,
+    )
+    client = cast(NativeWireClient, object())
+    hy4 = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://tokenhub.test/v1",
+        model_id="hy4-preview",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "medium", "high"),
+        reasoning_effort="high",
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        maximum_output_tokens=32,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+
+    narrowed_out = GatewayWireProfile(
+        dialect="openai_compatible", url="https://plain.test/v1", maximum_output_tokens=16
+    )
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        ((narrowed_out, client), (hy4, client)),
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("hy4",)
+    assert provider.reasoning_effort == "none"
+    assert "reasoning_effort->none(max_tokens_headroom)" in public.ignored_parameters
+
+    surviving = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test/v1")
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        ((surviving, client), (hy4, client)),
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert len(narrowed.deployments) == 2
+    assert provider.reasoning_effort is None
+    assert public.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("mode", ["maximize_cache", "maximize_cache_affinity"])
+@pytest.mark.parametrize("wire", ["anthropic_messages", "bedrock_converse_stream", "openrouter"])
+@pytest.mark.parametrize(
+    "media",
+    [
+        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+        {
+            "type": "file",
+            "file": {"file_data": "data:application/pdf;base64,JVBERi0xLjcK", "filename": "a.pdf"},
+        },
+    ],
+)
+def test_media_cache_markers_order_and_disclose_routes(
+    mode: str, wire: str, media: JsonObject
+) -> None:
+    """A message-level media hint reaches both routing policies and omission disclosure."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "prefix"}, media],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ).request.model_copy(update={"client_request_id": "media-session"})
+    route = _mixed_route(mode, surface=GatewayApiSurface.CHAT_COMPLETIONS)
+    generic, client = _wires()[0]
+    capable = GatewayWireProfile(
+        dialect="openai_compatible" if wire == "openrouter" else wire,
+        url="https://cache.test",
+        forwards_cache_control=wire == "openrouter",
+    )
+    wires = ((generic, client), (capable, client))
+    if mode == "maximize_cache":
+        ordered, _ = _prefer_cache_capable_rungs(route, wires, request)
+    else:
+        ordered, _, _ = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+    assert ordered.deployment.deployment_id == "native"
+    public, _ = route_generation_parameter_requests((generic,), request)
+    assert any(
+        "messages.content.cache_control->not_forwarded" in value
+        for value in public.ignored_parameters
+    )

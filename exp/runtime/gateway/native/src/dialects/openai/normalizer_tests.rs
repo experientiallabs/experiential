@@ -883,3 +883,116 @@ fn responses_error_frames_keep_numeric_codes() {
             && failure.provider_detail.as_deref() == Some("429: Slow down.")
     ));
 }
+
+#[test]
+fn foundry_deepseek_zero_argument_call_streams_a_stray_empty_string_delta() {
+    // Azure Foundry serving DeepSeek-V4-Flash, captured live 2026-09-10 (ids
+    // redacted): a zero-argument call opens with `arguments: ""`, streams
+    // `{}`, then one more delta whose text is `""` (two quote characters),
+    // then finishes `tool_calls`. Verbatim assembly gave `{}""` and failed
+    // every such call as malformed_response ("trailing characters at line 1
+    // column 3 (4 bytes)"; 222 production attempts on 2026-09-10 alone). The
+    // stray delta is withheld from the caller and the call completes as `{}`.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let frames = [
+        serde_json::json!({"reasoning_content": null, "role": "assistant", "content": ""}),
+        serde_json::json!({"role": null, "content": "\n\n", "reasoning_content": null, "tool_calls": null}),
+        serde_json::json!({"role": null, "content": null, "reasoning_content": null, "tool_calls": [{
+            "id": "call_1ec818a39da5408bb7b383a9", "index": 0, "type": "function",
+            "function": {"name": "view_agent_graph", "arguments": ""},
+        }]}),
+        serde_json::json!({"role": null, "content": null, "reasoning_content": null, "tool_calls": [{
+            "id": null, "index": 0, "type": "function",
+            "function": {"name": null, "arguments": "{}"},
+        }]}),
+        serde_json::json!({"role": null, "content": null, "reasoning_content": null, "tool_calls": [{
+            "id": null, "index": 0, "type": "function",
+            "function": {"name": null, "arguments": "\"\""},
+        }]}),
+    ];
+    let mut events = Vec::new();
+    for frame in &frames {
+        events.extend(
+            normalizer
+                .feed(&compatible_chunk(frame.clone(), None))
+                .expect("every Foundry frame must normalize"),
+        );
+    }
+    events.extend(
+        normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"reasoning_content": null}),
+                Some("tool_calls"),
+            ))
+            .expect("finish chunk must normalize"),
+    );
+    events.extend(
+        normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: "[DONE]".to_string(),
+            })
+            .expect("the stream must complete"),
+    );
+    let shown: String = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolArgumentsDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, "{}", "the stray delta never reaches the caller");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::TextDelta(text),
+            Event::ToolCallStarted { call_id, name, .. },
+            Event::ToolArgumentsDelta { delta: opening, .. },
+            Event::ToolArgumentsDelta { delta, .. },
+            Event::ToolCallCompleted { call, .. },
+            Event::Completed,
+        ] if text == "\n\n"
+            && call_id == "call_1ec818a39da5408bb7b383a9"
+            && name == "view_agent_graph"
+            && opening.is_empty()
+            && delta == "{}"
+            && call.raw_arguments == "{}"
+    ));
+}
+
+#[test]
+fn compatible_stream_still_rejects_argument_content_after_the_object_closed() {
+    // The hold-back drops NOISE only: a second object after a complete one
+    // is two candidate parses, and the stream stays malformed, reporting
+    // the position in the bytes the provider actually sent.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    for arguments in ["{\"a\":1}", "{\"b\":2}"] {
+        normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "lookup", "arguments": arguments},
+                }]}),
+                None,
+            ))
+            .expect("fragments normalize until completion");
+    }
+    let failure = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        })
+        .expect_err("content after a closed object stays malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    assert!(
+        failure
+            .safe_message
+            .ends_with("trailing characters at line 1 column 8 (14 bytes)"),
+        "{}",
+        failure.safe_message
+    );
+    assert!(
+        failure.failover_eligible,
+        "a provider fault may fail over to a later rung"
+    );
+}

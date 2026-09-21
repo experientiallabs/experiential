@@ -7,13 +7,16 @@
 
 mod admission;
 mod bridge;
+mod codex_native_inversion;
 mod dialects;
 mod encode;
 mod encode_messages;
 mod encode_responses;
+mod error_envelope;
 mod errors;
 mod events;
 mod eventstream;
+mod first_token_bound;
 mod guardrails;
 mod memory;
 mod metrics;
@@ -22,10 +25,12 @@ mod rate_limit_headers;
 mod rejection_shapes;
 mod relay;
 mod replay;
+mod replay_repair;
 mod respond;
 mod responses_retention;
 mod route_batches;
 mod route_chat;
+mod route_decisions;
 mod route_embeddings;
 mod route_images;
 mod route_messages;
@@ -36,16 +41,23 @@ mod settlement;
 mod sse;
 mod stop_sequences;
 mod stream_errors;
+mod throttle_backoff;
+mod tool_search;
 mod tool_serialization;
 mod upstream;
 mod waterfall;
+mod web_search;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::bridge::Bridge;
+use crate::guardrails::detector::{Detector, DetectorSpec};
+use crate::guardrails::plan::DetectorMap;
 use crate::server::ServeConfig;
 
 /// Embedder-owned stop signal for one `serve` call.
@@ -79,6 +91,74 @@ impl ShutdownHandle {
     }
 }
 
+/// One compiled deterministic guardrail rule, owned by the control plane.
+///
+/// The control plane compiles each authored `regex` adapter once at policy
+/// load and reuses the handle for every request: in python for the input
+/// chain, and inside the data plane for a deterministic output chain. A rule
+/// the native detector cannot express raises at construction, and the caller
+/// keeps the python adapter for it.
+#[pyclass]
+pub struct RegexDetector {
+    inner: Arc<Detector>,
+}
+
+#[pymethods]
+impl RegexDetector {
+    /// Compile one authored rule from its JSON specification.
+    ///
+    /// `spec_json` carries `patterns`, `builtin_patterns`, and the literal
+    /// `replacement`.
+    #[new]
+    fn new(spec_json: &str) -> PyResult<Self> {
+        let spec: DetectorSpec = serde_json::from_str(spec_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid detector spec: {error}")))?;
+        let detector = Detector::compile(&spec).map_err(PyValueError::new_err)?;
+        Ok(Self {
+            inner: Arc::new(detector),
+        })
+    }
+
+    /// Redact one subject, returning `None` when nothing matched.
+    ///
+    /// The scan runs with the GIL released. A subject over the inspection
+    /// ceiling, or one that produces more matches than the ceiling allows,
+    /// raises so the caller fails closed.
+    fn redact(&self, py: Python<'_>, text: &str) -> PyResult<Option<String>> {
+        let detector = self.inner.clone();
+        py.detach(|| detector.redact(text))
+            .map_err(|limit| PyValueError::new_err(limit.message()))
+    }
+
+    /// Whether one subject matches at all, without building a replacement.
+    fn matches(&self, py: Python<'_>, text: &str) -> PyResult<bool> {
+        let detector = self.inner.clone();
+        py.detach(|| detector.matches(text))
+            .map_err(|limit| PyValueError::new_err(limit.message()))
+    }
+}
+
+impl RegexDetector {
+    /// Share the compiled rule with the serving runtime.
+    fn compiled(&self) -> Arc<Detector> {
+        self.inner.clone()
+    }
+}
+
+/// Collect the adapter-keyed detectors handed to `serve`.
+fn collect_detectors(detectors: Option<&Bound<'_, PyDict>>) -> PyResult<DetectorMap> {
+    let mut compiled: DetectorMap = HashMap::new();
+    let Some(mapping) = detectors else {
+        return Ok(compiled);
+    };
+    for (key, value) in mapping.iter() {
+        let adapter_id: String = key.extract()?;
+        let detector: PyRef<'_, RegexDetector> = value.extract()?;
+        compiled.insert(adapter_id, detector.compiled());
+    }
+    Ok(compiled)
+}
+
 /// Create one stop handle to pass to `serve`.
 #[pyfunction]
 fn shutdown_handle() -> ShutdownHandle {
@@ -94,24 +174,31 @@ fn shutdown_handle() -> ShutdownHandle {
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `start_attempt`, `sign_dispatch`, `settle`, `abandon`, `remember`,
-/// `enforce_output`, `models`, `model_detail`, `usage_json`, `usage_page`,
+/// `enforce_output`, `enforce_output_segment`, `models`, `model_detail`,
+/// `usage_json`, `usage_page`,
 /// `metrics_json`, `metrics_text`, `readiness`, and
 /// `close_thread_resources`, each taking and returning one JSON string.
 /// `config_json` carries host, port, and concurrency bounds.
-/// `enforce_output` is called only when admission sets `output_guardrail`;
+/// `enforce_output` is called only when admission sets `output_guardrail` to
+/// `buffer`, and `enforce_output_segment` only when it sets `stream`;
 /// `close_thread_resources` is called once per bridge worker thread as it
 /// exits so per-thread caches release with the pool.
+/// `guardrail_detectors` maps a policy `adapter_id` to one compiled
+/// `RegexDetector`, so an admission whose output chain is deterministic runs
+/// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None))]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
     config_json: &str,
     shutdown: Option<&ShutdownHandle>,
     on_listening: Option<Py<PyAny>>,
+    guardrail_detectors: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
+    let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
     let bridge = Arc::new(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
     );
@@ -121,7 +208,7 @@ fn serve(
             .enable_all()
             .build()
             .map_err(|error| format!("tokio runtime construction failed: {error}"))?;
-        runtime.block_on(server::run(bridge, config, stop, on_listening))
+        runtime.block_on(server::run(bridge, config, stop, on_listening, detectors))
     });
     outcome.map_err(PyRuntimeError::new_err)
 }
@@ -177,7 +264,7 @@ fn metrics_snapshot_json() -> String {
 fn encode_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<Vec<String>> {
@@ -205,7 +292,7 @@ fn encode_responses_fixture(
 fn completed_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<String> {
@@ -442,6 +529,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .to_string(),
             },
             "tool_call_started" => events::Event::ToolCallStarted {
+                custom: object
+                    .get("custom")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 index,
                 call_id: object
                     .get("call_id")
@@ -500,6 +591,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             "usage" => events::Event::Usage(events::Usage {
                 input_tokens: object
                     .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_creation_1h_input_tokens: object
+                    .get("cache_creation_1h_input_tokens")
                     .and_then(serde_json::Value::as_u64),
                 cache_creation_input_tokens: object
                     .get("cache_creation_input_tokens")
@@ -677,6 +771,7 @@ fn error_payload(error: &errors::PublicError) -> String {
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
+    module.add_class::<RegexDetector>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;

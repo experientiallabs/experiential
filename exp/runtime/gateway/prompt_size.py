@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Experiential Labs. All rights reserved.
-"""Pre-dispatch context-window check for the prompt itself.
+"""Pre-dispatch context-window narrowing for the prompt and its output budget.
 
 A prompt that cannot fit any rung's context window is doomed before dispatch:
 the provider only 400s it back, after a reservation, a round trip, and with a
@@ -7,13 +7,13 @@ provider-specific message. The gateway has no tokenizer for every model, so it
 never guesses the exact count. It bounds it from BELOW: at
 :data:`MAXIMUM_BYTES_PER_TOKEN` bytes of UTF-8 text per token, real tokenizers
 on prose, code, or CJK text all produce MORE tokens than this estimate, so a
-prompt whose lower bound already exceeds the largest window on the route is
-certain to fail and is refused here with the exact numbers. The bound is a
-documented heuristic, not a tokenizer proof, so it is deliberately loose and
-the check abstains whenever any rung leaves its window undeclared. A prompt
-under the bound is dispatched and left to the provider's precise count; output
-budgets are never inspected (a too-small ceiling is an ``incomplete`` answer,
-not a refusal).
+prompt whose lower bound (plus the caller's requested output budget) exceeds a
+rung's declared window is certain to fail THERE, so that rung is skipped and
+the request falls to the next one; only when no rung can hold it is the
+request refused, with the exact numbers. The bound is a documented heuristic,
+not a tokenizer proof, so it is deliberately loose, and a rung that leaves its
+window undeclared is permissive. A prompt under the bound is dispatched and
+left to the provider's precise count.
 
 Only text is counted. Inline media (images, audio, documents) tokenizes by its
 own rules and is left to the provider.
@@ -95,44 +95,77 @@ def minimum_prompt_tokens(request: GatewayRequest) -> int:
     return prompt_text_bytes(request) // MAXIMUM_BYTES_PER_TOKEN
 
 
-def require_prompt_fits_context_window(route: GatewayRoute, request: GatewayRequest) -> None:
-    """Refuse a prompt that is certain to exceed every rung's context window.
+def context_window_compatible_indexes(
+    route: GatewayRoute,
+    request: GatewayRequest,
+) -> tuple[int, ...]:
+    """Return the rungs whose declared context window can hold this request.
+
+    A rung is compatible when it declares no window (permissive: the provider's
+    own count decides) or when its window holds the prompt's lower-bound token
+    count PLUS the caller's requested ``max_tokens`` (any spelling). An
+    explicit ceiling is never increased to meet a provider floor: generation
+    policy rejects that rung instead. Omission contributes no output here;
+    required-wire caps and financial reservations are derived independently
+    from declared bounds at per-rung admission, never from this loose prompt
+    estimate. Per-rung windows differ on one model: the Experiential Cloud
+    qwen3.8-27b box serves
+    262,144 tokens while the OpenRouter and Novita rungs serve 1,000,000 — so
+    a request the box cannot hold must fall to a rung that can instead of
+    being refused by the box after a reservation and a round trip (140 such
+    terminal refusals in the week to 2026-09-15; 116 of them fit the box's
+    window on prompt alone and died on prompt + max_tokens).
+
+    ``max_tokens`` is never clamped to a smaller rung's window: the prompt
+    estimate is a loose lower bound, so a clamp computed from it could still
+    overflow at the provider, and it would silently change the caller's
+    request on one rung of the route. The rung is skipped; the refusal (when
+    no rung fits) names the largest budget that would.
 
     Args:
-        route: Resolved ordered route. A rung without a declared window is
-            permissive (it may accept anything), so the check abstains unless
-            EVERY rung declares one; refusing is only ever certain then.
-        request: Canonical request about to be shaped and dispatched.
+        route: Resolved ordered route.
+        request: Canonical request (decoded, or shaped for the provider).
+
+    Returns:
+        Strictly increasing indexes into ``route.deployments``.
 
     Raises:
-        ProviderParameterError: The prompt's lower-bound token count exceeds
-            the largest declared context window on the route
-            (``code='context_length_exceeded'``).
+        ProviderParameterError: No rung can hold the request
+            (``code='context_length_exceeded'``); the message carries the
+            prompt bound, the requested output budget, and the largest window.
     """
-    windows: list[int] = []
-    for deployment in route.deployments:
+    text_bytes = prompt_text_bytes(request)
+    minimum = text_bytes // MAXIMUM_BYTES_PER_TOKEN
+    requested = request.maximum_output_tokens or 0
+    compatible: list[int] = []
+    largest: int | None = None
+    reserve = requested
+    for index, deployment in enumerate(route.deployments):
         window = (
             None
             if deployment.capabilities is None
             else deployment.capabilities.context_window_tokens
         )
-        if window is None:
-            return
-        windows.append(window)
-    if not windows:
-        return
-    largest = max(windows)
-    text_bytes = prompt_text_bytes(request)
-    minimum = text_bytes // MAXIMUM_BYTES_PER_TOKEN
-    if minimum <= largest:
-        return
-    param = "input" if request.surface == GatewayApiSurface.RESPONSES else "messages"
-    raise ProviderParameterError(
-        message=(
+        if window is None or minimum + requested <= window:
+            compatible.append(index)
+        if window is not None and (largest is None or window > largest):
+            largest = window
+    if compatible or largest is None:
+        return tuple(compatible)
+    if minimum > largest:
+        param = "input" if request.surface == GatewayApiSurface.RESPONSES else "messages"
+        message = (
             f"The prompt is at least {minimum:,} tokens ({text_bytes:,} bytes of text), "
             f"but the largest context window on this model route is {largest:,} tokens. "
             "Shorten the conversation or choose a model with a larger context window."
-        ),
-        param=param,
-        code=CONTEXT_LENGTH_EXCEEDED_CODE,
-    )
+        )
+    else:
+        param = request.maximum_output_tokens_parameter or "max_tokens"
+        message = (
+            f"The prompt is at least {minimum:,} tokens ({text_bytes:,} bytes of text) and "
+            f"the request reserves {reserve:,} output tokens, but the largest context "
+            f"window on this model route is {largest:,} tokens. Lower {param} to at most "
+            f"{largest - minimum:,}, shorten the conversation, or choose a model with a "
+            "larger context window."
+        )
+    raise ProviderParameterError(message=message, param=param, code=CONTEXT_LENGTH_EXCEEDED_CODE)

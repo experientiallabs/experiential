@@ -138,6 +138,15 @@ class RungShed:
     it; the durable disclosure column stays the bare reason code. A float
     because the ceiling can sit below one request per minute per worker.
     """
+    default_bound: bool = False
+    """Whether the bound that shed was the worker's default lane share.
+
+    A ``queue_bound`` shed by a bound the rung never authored (the worker's
+    default in-flight share, ``exp.runtime.gateway.lane_saturation``) is never
+    force-admitted when the ladder is exhausted: the default exists to keep
+    one lane from holding every admission permit, so overflowing it would
+    protect nothing. An authored bound keeps its authored ``saturation``.
+    """
 
 
 @dataclass
@@ -194,18 +203,25 @@ class RungLoadRegistry:
         *,
         activity_window_seconds: float = ACTIVITY_WINDOW_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        default_bound: int | None = None,
     ) -> None:
         """Initialize empty counters with an injectable clock for tests.
 
         Args:
             activity_window_seconds: Recency horizon for share reservations.
             clock: Monotonic clock.
+            default_bound: The per-worker in-flight cap applied to every rung
+                that authors no ``concurrency_bound`` (the worker's default
+                lane share); ``None`` leaves unauthored rungs unbounded.
 
         Raises:
             ValueError: The activity window is not positive.
         """
         if activity_window_seconds <= 0:
             raise ValueError("activity window must be positive")
+        if default_bound is not None and default_bound < 1:
+            raise ValueError("default_bound must be at least one")
+        self.default_bound = default_bound
         self._window = activity_window_seconds
         self._clock = clock
         self._rungs: dict[RungLoadKey, _RungLoad] = {}
@@ -490,6 +506,38 @@ class RungLoadRegistry:
             retained = 0.5 ** (elapsed / EWMA_HALF_LIFE_SECONDS)
             signal.fraction = signal.fraction * retained + sample * (1.0 - retained)
             signal.sampled_at = now
+
+    def cached_fraction(self, key: RungLoadKey, organization_id: str) -> float:
+        """Return one organization's live cached-fraction estimate on a rung.
+
+        The same time-decayed EWMA the cache-priority fairness term weights,
+        read for the cross-rung throttle decision: it tells the waterfall how
+        much warm provider cache the organization actually holds on the rung
+        that just throttled. Zero when the organization has no live sample
+        there (never settled with usage on this worker, or its last sample is
+        older than the retention horizon), which is deliberately the fail-over
+        answer. Retention is enforced HERE, at read time, not only by the
+        amortized sweep: a rung without an admission policy never reserves
+        through this registry and a throttled attempt settles without usage,
+        so nothing else is guaranteed to have pruned a returning
+        organization's stale evidence before its throttle is decided.
+
+        Args:
+            key: Physical rung identity.
+            organization_id: The requesting organization.
+
+        Returns:
+            The estimate in ``[0, 1]``, or ``0.0`` without a live signal.
+        """
+        horizon = self._clock() - EWMA_RETENTION_SECONDS
+        with self._lock:
+            rung = self._rungs.get(key)
+            if rung is None:
+                return 0.0
+            signal = rung.cache_fractions.get(organization_id)
+            if signal is None or signal.sampled_at < horizon:
+                return 0.0
+            return signal.fraction
 
     def learned_ceilings(self) -> dict[str, float]:
         """Return live learned request ceilings keyed by rung, for metrics.

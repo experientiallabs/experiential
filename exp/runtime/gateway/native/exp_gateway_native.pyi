@@ -1,6 +1,6 @@
 """Type stubs for the exp_gateway_native extension module."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Protocol
 
 __version__: str
@@ -26,6 +26,19 @@ class _ControlPlane(Protocol):
     def readiness(self, argument: str) -> str: ...
     def close_thread_resources(self, argument: str) -> str: ...
 
+class _DeterministicDetector(Protocol):
+    """The compiled-rule surface the data plane accepts (see RegexDetector)."""
+
+    def redact(self, text: str) -> str | None: ...
+    def matches(self, text: str) -> bool: ...
+
+class RegexDetector:
+    """One compiled deterministic guardrail rule owned by the data plane."""
+
+    def __init__(self, spec_json: str) -> None: ...
+    def redact(self, text: str) -> str | None: ...
+    def matches(self, text: str) -> bool: ...
+
 class ShutdownHandle:
     """Embedder-owned stop signal for one `serve` call."""
 
@@ -37,6 +50,7 @@ def serve(
     config_json: str,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
+    guardrail_detectors: Mapping[str, _DeterministicDetector] | None = None,
 ) -> None: ...
 def metrics_snapshot_json() -> str: ...
 def encode_chat_fixture(
@@ -49,14 +63,14 @@ def encode_chat_fixture(
 def encode_responses_fixture(
     request_id: str,
     model: str,
-    created_at: float,
+    created_at: int,
     envelope_json: str,
     events_json: str,
 ) -> list[str]: ...
 def completed_responses_fixture(
     request_id: str,
     model: str,
-    created_at: float,
+    created_at: int,
     envelope_json: str,
     events_json: str,
 ) -> str: ...

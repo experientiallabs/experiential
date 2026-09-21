@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
@@ -15,15 +15,21 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCompletion,
     GuardrailPolicy,
     GuardrailRejected,
+    OutputGuardrailMode,
     guardrail_failure,
     request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.store import GuardrailPolicyStore
+from exp.runtime.gateway.guardrails.streaming import (
+    StreamingRedactor,
+    StreamSegment,
+    release_segment,
+)
 
 _logger = logging.getLogger(__name__)
 
 
-def _restored_provider_authority(
+def restored_provider_authority(
     original: Sequence[GatewayMessage],
     replacement: Sequence[GatewayMessage],
 ) -> tuple[GatewayMessage, ...] | None:
@@ -124,6 +130,7 @@ class GuardrailEngine:
         client: InternalClassifierClient,
         monotonic: Callable[[], float],
         inspects: BoundedInspect | None = None,
+        deterministic_specifications: Mapping[str, str] | None = None,
     ) -> None:
         """Bind lookup, the internal client, and the deadline clock.
 
@@ -133,7 +140,15 @@ class GuardrailEngine:
             monotonic: Process-local clock in seconds.
             inspects: Optional async inflight limiter. ``None`` uses the
                 default shared cap.
+            deterministic_specifications: Content-free native rules for the
+                registered deterministic adapters, keyed by adapter. A host
+                that runs the Rust data plane compiles these once and lets
+                matching chains run in plane. Omitting them keeps every
+                chain on this engine.
         """
+        self.deterministic_specifications: Mapping[str, str] = dict(
+            deterministic_specifications or {}
+        )
         self._store = store
         self._client = client
         self._monotonic = monotonic
@@ -226,6 +241,131 @@ class GuardrailEngine:
             current = self._apply_output(policy, check, current, verdict)
         return current
 
+    def output_mode(
+        self,
+        policy: GuardrailPolicy | None,
+        *,
+        streaming: bool,
+        tools_offered: bool,
+        reasoning_text_requested: bool,
+    ) -> OutputGuardrailMode:
+        """Decide how one admission's output chain must be enforced.
+
+        Incremental enforcement releases bytes the caller can never take
+        back, so it is offered only when every decision is final at the
+        moment it is made. That needs one output check whose action is
+        ``modify`` (a later ``block`` could not suppress bytes already sent)
+        and whose adapter offers a deterministic redactor (a detector that
+        needs the whole completion cannot decide about a prefix). A chain of
+        several checks would have to compose redactions over partially
+        released text, so it stays buffered.
+
+        The request shape decides the rest. A buffered rewrite protects the
+        caller from alternate channels by dropping them once it has the whole
+        completion: tool calls, reasoning text, server-tool activity, and
+        citations never survive a redaction. Incremental release cannot drop
+        what it has already sent, so a request that can produce one of those
+        channels stays buffered: any offered tool (which is also what admits
+        server tools and their citations) and any request for thinking or a
+        reasoning summary.
+
+        Args:
+            policy: Assigned identity policy, or ``None`` when unguarded.
+            streaming: Whether the caller asked for a streamed response.
+            tools_offered: Whether the request exposes any tool to the model.
+            reasoning_text_requested: Whether the caller asked for thinking
+                or a reasoning summary in its own output.
+
+        Returns:
+            The mode the data plane must apply for this admission.
+        """
+        if policy is None or not policy.output_checks:
+            return OutputGuardrailMode.OFF
+        if not streaming or tools_offered or reasoning_text_requested:
+            return OutputGuardrailMode.BUFFER
+        if len(policy.output_checks) != 1:
+            return OutputGuardrailMode.BUFFER
+        check = policy.output_checks[0]
+        if check.action is not GuardrailAction.MODIFY:
+            return OutputGuardrailMode.BUFFER
+        if self._stream_redactor(check) is None:
+            return OutputGuardrailMode.BUFFER
+        return OutputGuardrailMode.STREAM
+
+    def release_output_segment(
+        self,
+        *,
+        policy: GuardrailPolicy,
+        pending: str,
+        final: bool,
+        settled_bytes: int,
+        deadline_monotonic: float,
+    ) -> StreamSegment:
+        """Redact and release the settled part of one buffered stream tail.
+
+        The call is synchronous and keeps no per-request state: a
+        deterministic redactor is pure bounded CPU work, and keeping it off
+        the isolation worker is what preserves the caller's time to first
+        byte.
+
+        Every failure is terminal, for protected and unprotected identities
+        alike. The skip-and-continue path an unprotected buffered chain uses
+        would have to emit the unredacted tail, and released bytes cannot be
+        recalled, so the incremental path always fails closed.
+
+        Args:
+            policy: Assigned identity policy.
+            pending: Buffered completion tail, oldest character first.
+            final: Whether the provider stream has ended.
+            settled_bytes: Provider completion bytes already released from
+                the buffer, counted before redaction so a short replacement
+                cannot shrink the completion against its bound.
+            deadline_monotonic: Request-wide deadline that also bounds this segment.
+
+        Returns:
+            The redacted release, the tail to keep buffered, and the flag.
+
+        Raises:
+            GuardrailRejected: The chain is not stream eligible, a bound was
+                breached, or the adapter refused the subject.
+        """
+        self.output_invocations += 1
+        check = policy.output_checks[0] if len(policy.output_checks) == 1 else None
+        redactor = None if check is None else self._stream_redactor(check)
+        if check is None or check.action is not GuardrailAction.MODIFY or redactor is None:
+            self._record(policy, check, GuardrailAction.ERROR, 0.0)
+            raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
+        if settled_bytes + len(pending.encode("utf-8")) > policy.max_response_bytes:
+            self._record(policy, check, GuardrailAction.ERROR, 0.0)
+            raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
+        started = self._monotonic()
+        budget = min(check.timeout_ms / 1000.0, deadline_monotonic - started)
+        if budget <= 0:
+            self._record(policy, check, GuardrailAction.ERROR, 0.0)
+            raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
+        self.classifier_calls += 1
+        try:
+            segment = release_segment(redactor=redactor, pending=pending, final=final)
+        except Exception:  # noqa: BLE001 - an adapter failure releases nothing.
+            self._record(policy, check, GuardrailAction.ERROR, self._monotonic() - started)
+            raise GuardrailRejected(
+                guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
+            ) from None
+        elapsed = self._monotonic() - started
+        if elapsed > budget:
+            self._record(policy, check, GuardrailAction.ERROR, elapsed)
+            raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
+        if segment.flagged:
+            self._record(policy, check, check.action, elapsed)
+        return segment
+
+    def _stream_redactor(self, check: GuardrailCheck) -> StreamingRedactor | None:
+        """Return the check adapter's deterministic redactor, or ``None``."""
+        try:
+            return self._client.stream_redactor(check=check)
+        except Exception:  # noqa: BLE001 - an unresolvable adapter is not streamable.
+            return None
+
     async def _run_check(
         self,
         *,
@@ -299,7 +439,7 @@ class GuardrailEngine:
                 raise GuardrailRejected(
                     guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
                 )
-            restored = _restored_provider_authority(
+            restored = restored_provider_authority(
                 request.messages,
                 verdict.replacement_messages,
             )

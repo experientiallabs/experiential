@@ -23,6 +23,14 @@ _PREFIX = "exp_gateway_"
 _DATA_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
     ("served_requests", "Requests admitted and served natively."),
     ("open_retries", "Same-deployment retries at the upstream open phase."),
+    (
+        "encrypted_reasoning_stripped",
+        "Redials without refused encrypted reasoning.",
+    ),
+    (
+        "encrypted_reasoning_stripped_proactive",
+        "Strips from remembered refusals.",
+    ),
     ("settlement_retries", "Settlement deliveries retried after a failed write."),
     ("settlement_give_ups", "Settlements whose bounded retries were all exhausted."),
 )
@@ -68,12 +76,32 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Dispatches forced past a saturated rung bound.",
     ),
     (
+        "rung_saturation_refusals",
+        "Requests refused with every rung at its bound.",
+    ),
+    (
         "rung_rate_limit_sheds",
         "Dispatches shed by a rung's rate window.",
     ),
     (
         "rung_fresh_session_spills",
         "Fresh-session dispatches shed early to spill.",
+    ),
+    (
+        "throttle_surfaced_cache_preserving",
+        "Throttles surfaced to keep warm cache.",
+    ),
+    (
+        "throttle_failover_cold",
+        "Throttles failed over cold (cache below threshold).",
+    ),
+    (
+        "throttle_backoff_redials",
+        "Throttled rungs re-dialed after backoff.",
+    ),
+    (
+        "throttle_backoff_forced_admissions",
+        "Redials forced past a rung shed.",
     ),
     (
         "reconciled_expired_requests",

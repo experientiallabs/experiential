@@ -37,9 +37,19 @@ MESSAGES_MANIFEST = CompatibilityManifest(
                 "stream",
             )
         ),
+        # The gateway's cross-surface ZDR demand (`provider: {"zdr": true}`,
+        # OpenRouter's routing-preference shape); Anthropic's own API has no
+        # such field, so SDK callers send it through extra_body.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "extended_thinking"),
+        # OpenRouter's Anthropic-compatible Messages endpoint accepts its
+        # ``reasoning`` object (effort / max_tokens / enabled / exclude) on
+        # this surface, and agents built against it send the field verbatim.
+        # Not an official SDK field: an installed extension, decoded closed and
+        # mapped onto the canonical effort channel (see requests.py).
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field(
             "context_management",
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
@@ -154,6 +164,13 @@ MESSAGES_SERVER_TOOL_TYPES_ACCEPTED = frozenset(
         "web_search_20250305",
         "web_search_20260209",
         "web_search_20260318",
+        # Tool search: forwarded verbatim on an all-Anthropic route; on every
+        # other route the GATEWAY runs the search over the deferred tools
+        # (see exp.runtime.gateway.tool_search) and renders the same blocks.
+        "tool_search_tool_bm25",
+        "tool_search_tool_bm25_20251119",
+        "tool_search_tool_regex",
+        "tool_search_tool_regex_20251119",
     }
 )
 """Anthropic-defined tool types the gateway forwards verbatim.
@@ -188,10 +205,6 @@ MESSAGES_SERVER_TOOL_TYPES_REJECTED = frozenset(
         "text_editor_20250124",
         "text_editor_20250429",
         "text_editor_20250728",
-        "tool_search_tool_bm25",
-        "tool_search_tool_bm25_20251119",
-        "tool_search_tool_regex",
-        "tool_search_tool_regex_20251119",
         "web_fetch_20250910",
         "web_fetch_20260209",
         "web_fetch_20260309",
@@ -204,7 +217,7 @@ Each is rejected because the gateway cannot yet serve it truthfully, not
 because the provider would refuse it (a live probe on a plain key,
 2026-08-31, accepted the current-generation types bare; beta headers only
 matter for the 2024-10-22 family): ``web_fetch_*``, ``code_execution_*``,
-and ``tool_search_*`` stream result blocks the data plane does not carry
+stream result blocks the data plane does not carry
 (silently dropping them would falsify the response); ``code_execution_*``,
 ``browser_toolset_*``, ``computer*``, and ``mcp_toolset`` additionally bind
 provider-hosted execution state. ``bash_20250124``,

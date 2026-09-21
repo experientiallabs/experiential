@@ -226,3 +226,61 @@ def test_active_reasoning_rejects_duplicate_tool_results() -> None:
 
     with pytest.raises(ProviderParameterError, match="exactly one result"):
         prepare_gateway_reasoning_history(messages, route_sha256=_ROUTE_SHA256)
+
+
+def test_active_reasoning_accepts_a_trailing_mid_conversation_system_message() -> None:
+    """Claude Code's tool continuation ends on a system reminder, not on the tool result.
+
+    Claude Code (``mid-conversation-system`` beta) appends a ``system`` message
+    carrying its token budget after the ``tool_result`` turn, so the window after
+    the last user turn ends on ``system``. Every carrier-bound call has its result,
+    so the carrier replays; requiring the request to END on a tool message refused
+    the very continuation the gateway issued the carrier for.
+    """
+    messages = (
+        GatewayMessage(role="user", content="Use a tool"),
+        _assistant(),
+        GatewayMessage(role="tool", content="done", tool_call_id="call-one"),
+        GatewayMessage(role="system", content="<total_tokens>100</total_tokens>"),
+    )
+
+    prepared, active = prepare_gateway_reasoning_history(messages, route_sha256=_ROUTE_SHA256)
+
+    assert active
+    assert prepared[1].provider_reasoning != ()
+    assert prepared[3].role == "system"
+
+
+def test_active_reasoning_accepts_system_reminders_between_completed_rounds() -> None:
+    """A system reminder after each completed round leaves every carrier active."""
+    messages = (
+        GatewayMessage(role="user", content="Use a tool"),
+        _assistant(call_id="call-one"),
+        GatewayMessage(role="tool", content="done", tool_call_id="call-one"),
+        GatewayMessage(role="system", content="<total_tokens>200</total_tokens>"),
+        _assistant(call_id="call-two"),
+        GatewayMessage(role="tool", content="done", tool_call_id="call-two"),
+        GatewayMessage(role="system", content="<total_tokens>100</total_tokens>"),
+    )
+
+    prepared, active = prepare_gateway_reasoning_history(messages, route_sha256=_ROUTE_SHA256)
+
+    assert active
+    assert prepared[1].provider_reasoning != ()
+    assert prepared[4].provider_reasoning != ()
+
+
+def test_active_reasoning_rejects_a_carrier_turn_whose_results_never_arrive() -> None:
+    """A request ending on an unanswered carrier-bound turn is still refused.
+
+    The trailing-role rule is gone; the completion rule is what protects the
+    provider from resuming a tool round that has no results, whatever follows it.
+    """
+    messages = (
+        GatewayMessage(role="user", content="Use a tool"),
+        _assistant(),
+        GatewayMessage(role="system", content="<total_tokens>100</total_tokens>"),
+    )
+
+    with pytest.raises(ProviderParameterError, match="complete tool results"):
+        prepare_gateway_reasoning_history(messages, route_sha256=_ROUTE_SHA256)

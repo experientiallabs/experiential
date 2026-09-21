@@ -19,10 +19,15 @@ from exp.common.models.content import (
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
     MAXIMUM_VIDEO_BASE64_BYTES,
+    ImageMediaType,
 )
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
+from exp.runtime.openai_protocol.native_tools import NativeResponseTool
+from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
+from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
 
 
 class _WireModel(BaseModel):
@@ -72,10 +77,16 @@ _MAXIMUM_IMAGE_URL_CHARACTERS = MAXIMUM_IMAGE_BASE64_BYTES + 128
 
 
 class _ChatImageUrl(_WireModel):
-    """Chat Completions image reference: a remote URL or a base64 data URL."""
+    """Chat Completions image reference: a remote URL or a base64 data URL.
+
+    Copilot includes ``media_type`` as a MIME hint for uploaded images. It
+    is validated and discarded: the URL or its embedded data-URL media type
+    defines the image, so the hint never rewrites content or replay identity.
+    """
 
     url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
     detail: _ImageDetail | None = None
+    media_type: ImageMediaType | None = None
 
 
 class _ChatImagePart(_WireModel):
@@ -257,6 +268,15 @@ class _AssistantToolCall(_WireModel):
     type: Literal["function"] = "function"
     function: _FunctionCall
     cache_control: EphemeralCacheControl | None = None
+    index: int | None = Field(default=None, ge=0)
+    """Streaming delta ordinal, validated and dropped.
+
+    Accumulators that assemble an assistant message from ``tool_calls``
+    stream deltas keep the delta's ``index`` on the finished call and replay
+    it with the message; OpenAI ignores it on a request (2,069 rejections
+    across 99 organizations in the 7 days to 2026-09-15). It orders nothing
+    here: the array position already does.
+    """
 
 
 class _Message(_WireModel):
@@ -295,7 +315,7 @@ class _Message(_WireModel):
     elsewhere. Other roles keep the named rejection.
     """
     refusal: None = None
-    annotations: tuple[()] | None = None
+    annotations: tuple[JsonObject, ...] | None = None
     audio: None = None
     function_call: None = None
     provider_specific_fields: JsonObject | None = None
@@ -306,6 +326,16 @@ class _Message(_WireModel):
         default=None,
         max_length=MAXIMUM_REASONING_CARRIER_BYTES,
     )
+    reasoning: str | None = Field(default=None, max_length=MAXIMUM_REASONING_CARRIER_BYTES)
+    """OpenRouter's plaintext reasoning on a replayed assistant turn.
+
+    OpenRouter returns the model's reasoning as ``message.reasoning`` and
+    documents passing it back on the next turn; the gateway folds it onto
+    the same plaintext replay path as ``reasoning_content``
+    (:mod:`exp.runtime.openai_protocol.reasoning_replay`).
+    """
+    reasoning_details: tuple[ReasoningDetail, ...] | None = None
+    """OpenRouter's structured reasoning blocks on a replayed assistant turn."""
 
     @property
     def image_capable_parts(self) -> tuple[_ContentPart, ...]:
@@ -325,6 +355,8 @@ class _Message(_WireModel):
             and self.content is None
             and not self.history_tool_calls
             and self.reasoning_content is None
+            and self.reasoning is None
+            and not self.reasoning_details
         ):
             # A reasoning-only assistant turn is a shape the gateway itself
             # returns (an exposed rung's length-cut thinking turn: content null,
@@ -338,12 +370,24 @@ class _Message(_WireModel):
             raise ValueError("name is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
-        if self.role != "assistant" and self.reasoning_content is not None:
-            raise ValueError("reasoning_content is valid only for assistant messages")
-        if self.role != "user" and any(
-            not isinstance(part, _TextPart) for part in self.image_capable_parts
+        if self.role != "assistant" and (
+            self.reasoning_content is not None
+            or self.reasoning is not None
+            or self.reasoning_details is not None
         ):
-            raise ValueError("image, video, and audio parts are valid only for user messages")
+            raise ValueError(
+                "reasoning_content, reasoning, and reasoning_details are valid only "
+                "for assistant messages"
+            )
+        # Tool results carry images (agents report screenshots there); other roles stay text-only.
+        media = {type(part) for part in self.image_capable_parts} - {_TextPart}
+        if media and self.role not in ("user", "tool"):
+            raise ValueError(
+                "image, video, and audio parts are valid only for user messages "
+                "(a tool message may carry image parts beside its text)"
+            )
+        if self.role == "tool" and media - {_ChatImagePart, _ResponsesImagePart}:
+            raise ValueError("tool messages carry only text and image parts")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -385,10 +429,27 @@ class _FunctionDefinition(_WireModel):
 
 
 class _ChatTool(_WireModel):
-    """Chat Completions function tool wrapper."""
+    """Chat Completions function tool wrapper.
 
-    type: Literal["function"] = "function"
-    function: _FunctionDefinition
+    OpenRouter's ``openrouter:tool_search`` server tool rides the same array
+    without a ``function`` body; ``defer_loading`` (OpenRouter's spelling of
+    Anthropic's deferred-loading marker) makes a function tool searchable
+    instead of loaded up front.
+    """
+
+    type: Literal["function", "openrouter:tool_search"] = "function"
+    function: _FunctionDefinition | None = None
+    defer_loading: bool | None = None
+    max_results: int | None = Field(default=None, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def _require_function_body(self) -> _ChatTool:
+        """A function tool needs its body; a server tool must not carry one."""
+        if self.type == "function" and self.function is None:
+            raise ValueError("a function tool requires a function object")
+        if self.type != "function" and self.function is not None:
+            raise ValueError("a server tool cannot carry a function object")
+        return self
 
 
 class _StructuredSchema(_WireModel):
@@ -403,9 +464,8 @@ class _StructuredSchema(_WireModel):
 class _ChatResponseFormat(_WireModel):
     """Supported Chat text, JSON-object, or strict structured-text format.
 
-    ``json_object`` is admitted so the gateway can translate it to a permissive
-    ``json_schema`` and serve the caller's "give me JSON" intent on every rung
-    (the serving lanes emit only ``json_schema``); it carries no ``json_schema``
+    ``json_object`` is the schema-free JSON mode; each wire dialect honors it
+    natively or through an injected instruction. It carries no ``json_schema``
     details, exactly like ``text``.
     """
 
@@ -427,22 +487,42 @@ class _ChatStreamOptions(_WireModel):
 
 
 class _ChatReasoning(_WireModel):
-    """Nested ``reasoning`` object on a Chat request (the Responses shape some
-    clients also send on /v1/chat/completions). Translated to the canonical flat
-    ``reasoning_effort``; only ``effort`` is accepted here."""
+    """Nested ``reasoning`` object on a Chat request.
+
+    The Responses-style ``effort`` some clients send on /v1/chat/completions,
+    plus OpenRouter's unified reasoning object (``enabled``, ``max_tokens``,
+    ``exclude``; docs "Reasoning Tokens", read 2026-09-15). All are translated
+    to the canonical reasoning control at decode; ``effort`` and ``max_tokens``
+    are mutually exclusive there as on OpenRouter.
+    """
 
     effort: ReasoningEffort | None = None
+    enabled: bool | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
+    exclude: bool | None = None
+
+    @model_validator(mode="after")
+    def _require_one_depth_control(self) -> _ChatReasoning:
+        """Reject an effort tier beside a token budget (OpenRouter's own rule)."""
+        if self.effort is not None and self.max_tokens is not None:
+            raise ValueError("reasoning.effort and reasoning.max_tokens are mutually exclusive")
+        return self
 
 
 class _ThinkingConfig(_WireModel):
-    """Anthropic-style ``thinking`` enable/disable config on a Chat request.
+    """Anthropic-style ``thinking`` config on a Chat request.
 
-    Translated to the canonical reasoning control: ``enabled`` turns thinking on
-    at the model's default effort, ``disabled`` maps to ``reasoning_effort=none``.
-    ``budget_tokens`` has no canonical equivalent and is disclosed as not carried.
+    Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
+    turn thinking on at the model's default effort (``adaptive`` is the only
+    on-mode Anthropic's 4.6+ generation accepts, and the value Anthropic SDKs
+    and Claude-configured clients send on every model), ``disabled`` maps to
+    ``reasoning_effort=none``. ``budget_tokens`` has no canonical equivalent
+    and is disclosed as not carried. 3,935 Chat requests over 7 days (19
+    organizations, Claude and MiniMax routes alike) were refused at decode for
+    sending ``adaptive`` before it was admitted here (2026-09-15).
     """
 
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: int | None = Field(default=None, ge=0)
 
 
@@ -516,6 +596,11 @@ class _ChatRequest(_WireModel):
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
+    enable_thinking: bool | None = None
+    """DashScope's top-level enable-thinking switch (``extra_body``), translated
+    like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it
+    on every request (4,658 rejections across 110 organizations in the 7 days
+    to 2026-09-15)."""
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -525,7 +610,16 @@ class _ChatRequest(_WireModel):
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
+    provider: ProviderRoutingPreferences | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""
+    web_search_options: WebSearchOptions | None = None
+    plugins: tuple[ChatPlugin, ...] = ()
+    verbosity: Literal["low", "medium", "high"] | None = None
+    """Output-length hint (GPT-5 family), the Chat spelling of Responses ``text.verbosity``.
+
+    Forwarded on native Responses rungs and dropped with disclosure elsewhere;
+    the value itself stays validated so a typo is still a named 400.
+    """
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
@@ -537,65 +631,6 @@ class _ChatRequest(_WireModel):
         return self
 
 
-class _EmbeddingsRequest(_WireModel):
-    """Closed gateway embeddings request profile.
-
-    ``input`` narrows the official OpenAI union to text only: the token-array
-    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
-    are rejected here with a field-specific 400, since this surface serves
-    visible text, not pre-tokenized ids.
-    """
-
-    model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[str, ...]
-    dimensions: int | None = Field(default=None, gt=0)
-    encoding_format: Literal["float", "base64"] | None = None
-    user: str | None = Field(default=None, max_length=1024)
-
-    @field_validator("input")
-    @classmethod
-    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
-        """Reject empty text, an empty array, or empty array members."""
-        if isinstance(value, str):
-            if not value:
-                raise ValueError("input must not be an empty string")
-            return value
-        if not value:
-            raise ValueError("input must not be an empty array")
-        if any(not text for text in value):
-            raise ValueError("input array must not contain empty strings")
-        return value
-
-
-class _ImagesRequest(_WireModel):
-    """Closed gateway image-generation request profile (OpenAI Images API)."""
-
-    model: str = Field(min_length=1, max_length=256)
-    prompt: str = Field(min_length=1, max_length=32_000)
-    n: int | None = Field(default=None, ge=1, le=10)
-    size: (
-        Literal[
-            "auto",
-            "256x256",
-            "512x512",
-            "1024x1024",
-            "1536x1024",
-            "1024x1536",
-            "1792x1024",
-            "1024x1792",
-        ]
-        | None
-    ) = None
-    quality: Literal["standard", "hd", "low", "medium", "high", "auto"] | None = None
-    background: Literal["transparent", "opaque", "auto"] | None = None
-    output_format: Literal["png", "jpeg", "webp"] | None = None
-    output_compression: int | None = Field(default=None, ge=0, le=100)
-    moderation: Literal["low", "auto"] | None = None
-    response_format: Literal["url", "b64_json"] | None = None
-    style: Literal["vivid", "natural"] | None = None
-    user: str | None = Field(default=None, max_length=1024)
-
-
 class _ResponseTool(_WireModel):
     """Responses API function tool declaration."""
 
@@ -604,31 +639,8 @@ class _ResponseTool(_WireModel):
     description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
-
-
-class _NativeResponseTool(BaseModel):
-    """One non-function Responses tool declaration carried opaquely.
-
-    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool
-    tree), ``web_search``, and ``tool_search`` declarations whose shapes
-    exist on no other wire. Like ``_AdditionalToolsItem``, validation is
-    deliberately shallow and the raw declaration forwards byte-for-byte on
-    native Responses rungs only (each type captured live from Codex 0.151.0
-    and accepted by the provider with a plain API key, 2026-09-01); the
-    provider stays the authority on each declaration's internal shape.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: str = Field(min_length=1, max_length=64)
-
-    @field_validator("type")
-    @classmethod
-    def _require_non_function(cls, value: str) -> str:
-        """Keep typed function declarations on the strict model."""
-        if value == "function":
-            raise ValueError("function tool declarations use the typed profile")
-        return value
+    defer_loading: bool | None = None
+    """OpenAI's deferred-loading marker for a ``tool_search`` request."""
 
 
 class _ResponseFunctionCall(_WireModel):
@@ -941,7 +953,7 @@ class _ResponsesRequest(_WireModel):
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     store: bool | None = None
     include: tuple[str, ...] | None = None
-    tools: tuple[_ResponseTool | _NativeResponseTool, ...] = ()
+    tools: tuple[_ResponseTool | NativeResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
@@ -978,4 +990,5 @@ class _ResponsesRequest(_WireModel):
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
+    provider: ProviderRoutingPreferences | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""

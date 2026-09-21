@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
 use crate::errors::PublicError;
+use crate::guardrails::plan::DetectorMap;
 use crate::replay::ReplayStore;
 use crate::respond::{bearer_key, error_response, json_response, unknown_route_error};
 use crate::route_batches::{
@@ -30,6 +31,7 @@ use crate::route_batches::{
     files_content, files_create, files_retrieve,
 };
 use crate::route_chat::chat;
+use crate::route_decisions::decisions;
 use crate::route_embeddings::embeddings;
 use crate::route_images::images;
 use crate::route_messages::{messages, messages_count_tokens};
@@ -58,6 +60,11 @@ pub struct ServeConfig {
     /// a very large prompt's prefill is not misread as a dead lane.
     #[serde(default = "default_time_to_first_byte_seconds_per_million_input_tokens")]
     pub time_to_first_byte_seconds_per_million_input_tokens: f64,
+    /// Fail-fast bound on the wait for a provider's first TOKEN (the first
+    /// semantic event) after its headers arrived, flat part; the same
+    /// per-million-input-tokens slope as the first-byte allowance is added.
+    #[serde(default = "default_time_to_first_token_seconds")]
+    pub time_to_first_token_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
     #[serde(default = "default_native_usage_enabled")]
@@ -80,6 +87,14 @@ fn default_time_to_first_byte_seconds() -> f64 {
 
 fn default_time_to_first_byte_seconds_per_million_input_tokens() -> f64 {
     240.0
+}
+
+/// A thinking model on a chat wire streams nothing until its first content
+/// token; production p99s (2026-09-19, 7 days) sat at 27-94 s on healthy
+/// lanes while the stalled lane's medians were 120 s+, so two minutes
+/// separates "thinking" from "stalled" without cutting real work.
+fn default_time_to_first_token_seconds() -> f64 {
+    120.0
 }
 
 fn default_max_active_requests() -> usize {
@@ -105,11 +120,16 @@ pub(crate) struct AppState {
     pub(crate) http: reqwest::Client,
     pub(crate) permits: Arc<Semaphore>,
     pub(crate) request_timeout: Duration,
-    /// Fail-fast flat bound on the wait for the first provider byte per attempt.
+    /// Fail-fast flat bound on the wait for the provider's response headers
+    /// per attempt.
     pub(crate) time_to_first_byte: Duration,
-    /// Default input-scaled first-byte allowance in seconds per million
-    /// approximate input tokens.
+    /// Default input-scaled allowance in seconds per million approximate
+    /// input tokens, added to both the header and the first-token bounds.
     pub(crate) time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
+    /// Fail-fast flat bound on the wait for the first TOKEN (the first
+    /// semantic event) once the headers arrived; keepalive comments and
+    /// role-only frames do not satisfy it.
+    pub(crate) time_to_first_token: Duration,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -118,6 +138,10 @@ pub(crate) struct AppState {
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
+    /// Deterministic guardrail rules compiled once by the control plane,
+    /// keyed by policy `adapter_id`. An admission whose output chain names
+    /// only these adapters is enforced here instead of in python.
+    pub(crate) guardrail_detectors: Arc<DetectorMap>,
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
@@ -129,6 +153,7 @@ pub async fn run(
     config: ServeConfig,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     on_listening: Option<Py<PyAny>>,
+    guardrail_detectors: Arc<DetectorMap>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
     let http = crate::upstream::build_client(connect_timeout)?;
@@ -144,9 +169,17 @@ pub async fn run(
         time_to_first_byte_slope_seconds_per_million_input_tokens: config
             .time_to_first_byte_seconds_per_million_input_tokens
             .max(0.0),
+        // Clamped under the request budget so a default stall can still fail
+        // over (first_token_bound.rs): equal defaults would let the request
+        // deadline win every race and end the stall as a terminal timeout.
+        time_to_first_token: crate::first_token_bound::first_token_bound(
+            config.time_to_first_token_seconds,
+            config.request_timeout_seconds,
+        ),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
+        guardrail_detectors,
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
         state.permits.clone(),
@@ -159,6 +192,7 @@ pub async fn run(
         .route("/v1/models/{model_id}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/systemone", post(decisions))
         .route("/v1/images/generations", post(images))
         .route("/v1/responses", post(responses).get(responses_ws))
         .route("/v1/messages", post(messages))

@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
@@ -28,8 +29,10 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import (
+    OPENROUTER_BASE_URL,
     OpenAICompatibleClient,
     OpenAICompatibleResponseError,
+    OpenRouterClient,
     openai_compatible_request,
     openai_compatible_response,
     openai_embedding_request,
@@ -524,3 +527,246 @@ def test_tokenhub_intl_rung_resolves_a_carrier_route_and_exposes_when_declared()
     ).gateway_wire_profile()
     assert profile.hunyuan_reasoning_route_sha256 is not None
     assert profile.reasoning_output_exposed is True
+
+
+def test_deepseek_origin_replays_reasoning_history_without_the_exposure_stamp() -> None:
+    """DeepSeek's own API is a reasoning-HISTORY route by origin, not by catalog stamp.
+
+    Its thinking mode requires ``reasoning_content`` on every assistant tool-call
+    turn (400 otherwise), so the flag is derived from the base URL alone. Output
+    exposure stays the catalog's decision: an unstamped rung still hides the
+    deltas, and the rung is not a sealed-carrier route either.
+    """
+    for base_url in ("https://api.deepseek.com/v1", "https://api.deepseek.com"):
+        profile = OpenAICompatibleClient(
+            model=_snapshot(model_id="deepseek-flash"),
+            base_url=base_url,
+            api_key="fake-key",
+        ).gateway_wire_profile()
+        assert profile.deepseek_reasoning_history is True
+        assert profile.replays_plaintext_reasoning is True
+        assert profile.reasoning_output_exposed is False
+        assert profile.hunyuan_reasoning_route_sha256 is None
+        assert profile.fireworks_reasoning_route_sha256 is None
+
+
+def test_deepseek_reasoning_history_is_off_for_every_other_compatible_origin() -> None:
+    """Hunyuan and generic shims never backfill: an unknown field is a 400 on strict servers."""
+    for base_url in (_HUNYUAN_BASE_URL, "https://openrouter.ai/api/v1", "https://example.test/v1"):
+        profile = OpenAICompatibleClient(
+            model=_snapshot(model_id="deepseek-v4-flash"),
+            base_url=base_url,
+            api_key="fake-key",
+        ).gateway_wire_profile()
+        assert profile.deepseek_reasoning_history is False
+        assert profile.replays_plaintext_reasoning is False
+
+
+def test_buffered_request_backfills_reasoning_content_on_deepseek_assistant_turns() -> None:
+    """The non-streaming builder applies the DeepSeek rule too, tool-call and text turns alike.
+
+    ``RouterRuntime.complete`` serializes through ``openai_compatible_request``,
+    not the streaming ``openai_chat_message``; a text-then-tool-call history on
+    this path would otherwise still draw DeepSeek's thinking-mode 400. The
+    typed request carries no reasoning to forward, so the rule here is the
+    backfill alone; system, user, and tool messages are untouched.
+    """
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="read a.txt"),
+            ModelMessage(role="assistant", content="Let me read it."),
+            ModelMessage(
+                role="assistant",
+                assistant_action=AssistantAction(
+                    tool_calls=(ToolCall(call_id="call_foreign_1", name="read_file", arguments={}),)
+                ),
+            ),
+            ModelMessage(role="tool", content="hello", tool_call_id="call_foreign_1"),
+        ),
+        tools=(ToolSchema(name="read_file", description="Read.", input_schema={"type": "object"}),),
+    )
+    payload = openai_compatible_request("deepseek-flash", request, deepseek_reasoning_history=True)
+    system, user, text_turn, tool_call_turn, tool = cast("list[JsonObject]", payload["messages"])
+    assert text_turn == {"role": "assistant", "content": "Let me read it.", "reasoning_content": ""}
+    assert tool_call_turn["tool_calls"] and tool_call_turn["reasoning_content"] == ""
+    assert all("reasoning_content" not in message for message in (system, user, tool))
+    # Off the DeepSeek origin the buffered wire is byte-identical to before.
+    generic = cast(
+        "list[JsonObject]", openai_compatible_request("deepseek-flash", request)["messages"]
+    )
+    assert all("reasoning_content" not in message for message in generic)
+
+
+def test_deepseek_client_builds_buffered_requests_with_the_backfill_from_its_origin() -> None:
+    """The client derives the buffered-path backfill from its base URL, like the wire profile."""
+    deepseek = OpenAICompatibleClient(
+        model=_snapshot(model_id="deepseek-flash"),
+        base_url="https://api.deepseek.com/v1",
+        api_key="fake-key",
+    )
+    messages = cast("list[JsonObject]", deepseek._build_request(_request())["messages"])
+    assert messages[2]["tool_calls"] and messages[2]["reasoning_content"] == ""
+    generic = OpenAICompatibleClient(
+        model=_snapshot(model_id="deepseek-flash"),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+    )
+    generic_messages = cast("list[JsonObject]", generic._build_request(_request())["messages"])
+    assert "reasoning_content" not in generic_messages[2]
+
+
+_NATIVE_REASONING_ORIGIN = "https://hy4-preview--serve.modal.run/v1"
+
+
+def test_reasoning_content_native_rung_resolves_a_carrier_route_on_any_origin() -> None:
+    """The catalog flag, not the hostname, makes a rung a preserved-thinking route.
+
+    A self-hosted vLLM origin serving hy4-preview with ``--reasoning-parser``
+    returns the standard ``reasoning_content`` field and accepts it back, so a
+    rung declaring ``reasoning_content_native`` resolves the Hunyuan carrier
+    route and exposes plaintext when the exposure capability is declared. The
+    ``prompt_cache_key`` node pin stays Tencent-host-keyed: the declaration
+    says nothing about whether the origin tolerates unknown request fields.
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.fireworks_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is True
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_reasoning_content_native_rung_without_exposure_keeps_its_carrier_but_stays_stripped() -> (
+    None
+):
+    """Exposure still fails closed per rung on a flagged origin."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is False
+
+
+def test_an_unflagged_arbitrary_origin_stays_stripped_and_unpinned() -> None:
+    """Without the flag an unknown origin gets no carrier, no exposure, no cache hint."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is False
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_the_flag_matches_the_tencent_hosts_route_identity_for_one_model() -> None:
+    """A flagged origin and the Tencent host derive the same model-keyed route identity.
+
+    The carrier's route binding is the model's identity, so the same model
+    self-hosted resolves the same route digest the Tencent lane does; the
+    carrier domain stays the Hunyuan scheme either way.
+    """
+    flagged = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    tencent = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert flagged.hunyuan_reasoning_route_sha256 == tencent.hunyuan_reasoning_route_sha256
+
+
+def test_openrouter_routes_by_prompt_cache_key_as_its_sticky_session_key() -> None:
+    """OpenRouter documents ``prompt_cache_key`` as its sticky-routing fallback key.
+
+    OpenRouter load-balances one model across upstream providers and pins a
+    conversation to the provider that served it only after a cache hit is
+    observed, keyed by ``session_id`` else the OpenAI-style ``prompt_cache_key``
+    (openrouter.ai/docs/features/prompt-caching, read 2026-09-11). Without the
+    hint, two identical prefixes can land on different providers or nodes, so
+    the cache miss a caller sees is real and the metering of it is correct.
+    Forwarding the tenant-namespaced key makes placement deterministic per
+    conversation, and OpenRouter forwards provider-specific fields upstream,
+    so Tencent's per-node pin rides along on the hy4 lane.
+    """
+    profile = OpenRouterClient(
+        model=_snapshot(provider="openrouter", model_id="tencent/hy4-preview"),
+        base_url=OPENROUTER_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert profile.forwards_prompt_cache_key is True
+    # The OpenRouter origin is neither a Hunyuan nor a Fireworks carrier route.
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.fireworks_reasoning_route_sha256 is None
+
+
+def test_buffered_request_folds_a_trailing_system_turn_for_deepseek_only() -> None:
+    """The buffered builder applies the same DeepSeek trailing-instruction rule."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(role="system", content="Reminder: be terse."),
+        ),
+        tools=(),
+    )
+    folded = cast(
+        list[JsonObject], openai_compatible_request("DeepSeek-V4-Flash", request)["messages"]
+    )
+    assert folded == [{"role": "user", "content": "Create a ticket.\n\nReminder: be terse."}]
+    kept = cast(list[JsonObject], openai_compatible_request("fake-model", request)["messages"])
+    assert [message["role"] for message in kept] == ["user", "system"]
+
+
+def test_system_messages_leading_only_rung_threads_the_fold_to_its_wire_profile() -> None:
+    """The catalog declaration reaches the streaming profile; an undeclared rung stays off."""
+    declared = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://gateway.xplabs.ai/qwen/v1",
+        api_key="fake-key",
+        system_messages_leading_only=True,
+    ).gateway_wire_profile()
+    assert declared.system_messages_leading_only is True
+    undeclared = OpenAICompatibleClient(
+        model=_snapshot(), base_url="https://gateway.xplabs.ai/qwen/v1", api_key="fake-key"
+    ).gateway_wire_profile()
+    assert undeclared.system_messages_leading_only is False
+
+
+def test_buffered_request_folds_non_leading_system_turns_on_a_leading_only_rung() -> None:
+    """The buffered builder applies the same leading-only rule as the streaming one."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(role="system", content="Reminder: be terse."),
+            ModelMessage(role="user", content="Go."),
+        ),
+        tools=(),
+    )
+    folded = cast(
+        list[JsonObject],
+        openai_compatible_request("qwen3.8-27b", request, system_messages_leading_only=True)[
+            "messages"
+        ],
+    )
+    assert folded == [
+        {"role": "system", "content": "You are precise."},
+        {"role": "user", "content": "Create a ticket.\n\nReminder: be terse."},
+        {"role": "user", "content": "Go."},
+    ]
+    kept = cast(list[JsonObject], openai_compatible_request("qwen3.8-27b", request)["messages"])
+    assert [message["role"] for message in kept] == ["system", "user", "system", "user"]

@@ -86,6 +86,7 @@ mod tests {
 
     fn started(index: u32) -> Event {
         Event::ToolCallStarted {
+            custom: false,
             index,
             call_id: format!("call_{index}"),
             name: "lookup".to_string(),

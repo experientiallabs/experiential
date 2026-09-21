@@ -1044,7 +1044,9 @@ def _configured_gateway(
     *,
     base_url: str = "http://127.0.0.1:9/v1",
     capabilities: ModelCapabilities | None = None,
+    gateway_capabilities: GatewayDeploymentCapabilities | None = None,
     provider: str = "openai-compatible",
+    api_version: str | None = None,
 ) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
@@ -1056,6 +1058,7 @@ def _configured_gateway(
             provider=provider,
             # Fixed-origin providers (anthropic and friends) reject a base_url.
             base_url=None if provider == "anthropic" else base_url,
+            api_version=api_version,
             api_key_env="TEST_PROVIDER_KEY",
         ),
         replace=False,
@@ -1067,8 +1070,9 @@ def _configured_gateway(
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=capabilities or ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(
+        capabilities=capabilities or ModelCapabilities(maximum_output_tokens=128_000),
+        gateway_capabilities=gateway_capabilities
+        or GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_streaming_tool_arguments=True,
         ),

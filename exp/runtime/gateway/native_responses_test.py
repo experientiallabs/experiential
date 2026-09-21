@@ -17,7 +17,10 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext, remember_turn
-from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
+from exp.runtime.gateway.reasoning_carrier import (
+    FIREWORKS_REASONING_CONTENT_PREFIX,
+    HUNYUAN_SCHEME,
+)
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -49,11 +52,42 @@ def _context() -> ContinuationContext:
     )
 
 
-def _carrier() -> str:
-    """Build one structurally valid sealed Fireworks carrier."""
-    deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
+def _carrier(prefix: str = FIREWORKS_REASONING_CONTENT_PREFIX) -> str:
+    """Build one structurally valid sealed carrier under ``prefix``'s scheme."""
+    deployment = base64.urlsafe_b64encode(b"provider-rung").rstrip(b"=").decode()
     envelope = base64.urlsafe_b64encode(b"opaque-envelope").rstrip(b"=").decode()
-    return f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment}:{envelope}"
+    return f"{prefix}{deployment}:{envelope}"
+
+
+def test_remember_turn_retains_a_hunyuan_carrier_under_its_own_scheme() -> None:
+    """The carrier prefix selects the scheme; a Hunyuan carrier is not a Fireworks one.
+
+    Production 2026-09-15: Responses + tools on the Tencent Hunyuan lanes answered
+    500 AFTER the attempt settled and charged, because continuation storage parsed
+    every carrier under the Fireworks default and rejected the Hunyuan prefix.
+    """
+    store = BoundedContinuationStore()
+    context = _context()
+    carrier = _carrier(HUNYUAN_SCHEME.prefix)
+
+    remember_turn(
+        store,
+        context=context,
+        data={
+            "text": "",
+            "refusal": False,
+            "reasoning_content_carrier": carrier,
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    block = state.messages[-1].provider_reasoning[0]
+    assert block.kind == "sealed_reasoning_content"
+    assert block.carrier == carrier
 
 
 def test_remember_turn_retains_the_sealed_responses_carrier() -> None:

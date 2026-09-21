@@ -193,6 +193,7 @@ class AnthropicClient(ProviderHttpClient):
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
         authorization_bearer: bool = False,
+        inference_geo: Literal["us"] | None = None,
     ) -> None:
         """Create an Anthropic client with explicit generation capability gates.
 
@@ -219,6 +220,7 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
         self._authorization_bearer = authorization_bearer
+        self._inference_geo = inference_geo
 
     def _headers(self) -> dict[str, str]:
         """Build native Anthropic Messages headers with the connection's auth scheme."""
@@ -237,6 +239,7 @@ class AnthropicClient(ProviderHttpClient):
         """Return the native Messages wire profile for this connection."""
         return GatewayWireProfile(
             dialect="anthropic_messages",
+            inference_geo=self._inference_geo,
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
             headers=self._headers(),
             model_id=self._model.model_id,
@@ -259,7 +262,7 @@ class AnthropicClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native Messages payload."""
-        return anthropic_messages_request(
+        payload = anthropic_messages_request(
             self._model.model_id,
             request,
             supports_temperature=self._supports_temperature,
@@ -268,6 +271,10 @@ class AnthropicClient(ProviderHttpClient):
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
         )
+
+        if self._inference_geo is not None:
+            payload["inference_geo"] = self._inference_geo
+        return payload
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed Messages payload into the shared response contract."""

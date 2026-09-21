@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
-from typing import cast
+import logging
+from collections.abc import Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, cast
 
 from exp.common.models.known_models import canonical_model_id, known_model_metadata
 from exp.common.models.model import ReasoningEffort
@@ -11,6 +12,12 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.contracts import GatewayRequest
+    from exp.runtime.models.providers.base import GatewayWireProfile
+
+_logger = logging.getLogger(__name__)
 
 REASONING_EFFORTS = (
     "none",
@@ -51,9 +58,9 @@ def efforts_by_nearness(
     """Order supported efforts by closeness to the request on the ladder.
 
     Distance is measured in ladder positions (none < minimal < low < medium <
-    high < xhigh < ultra < max); a tie prefers the LOWER level so a coercion
-    never silently spends more reasoning than the caller asked for. Callers
-    must disclose any substitution: this helper only orders the candidates.
+    high < xhigh < ultra < max); a tie prefers the LOWER level. Callers must
+    restrict candidates to permitted substitutions and disclose any change:
+    this helper only orders the candidates.
 
     Args:
         requested: Caller-provided effort value.
@@ -165,23 +172,25 @@ _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES = (
     "claude-opus-4-7",
     "claude-sonnet-5",
 )
+_ANTHROPIC_ALWAYS_THINKING_FAMILIES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+)
 
 
 def anthropic_adaptive_only_thinking(model_id: str) -> bool:
-    """Return whether one Anthropic model accepts only adaptive thinking.
+    """Return whether adaptive is the model's only enabled thinking mode.
 
-    The adaptive-thinking generation (verified against the live API on
-    2026-08-28) rejects ``thinking.type.enabled`` and
-    ``thinking.type.disabled`` outright; earlier families (sonnet-4-6,
-    opus-4-6, haiku-4-5, and older) still honor the budgeted ``enabled``
-    form verbatim. The family list matches the xhigh effort generation.
+    These families reject budgeted ``thinking.type.enabled``. That does not
+    imply that thinking cannot be disabled: Sonnet and Opus support an off
+    switch, with Opus 5 restricting it to effort high or below.
 
     Args:
         model_id: Exact Anthropic model identifier.
 
     Returns:
-        ``True`` when the model rejects caller thinking configs other than
-        adaptive.
+        ``True`` when enabling thinking requires adaptive rather than a budget.
     """
     normalized = _normalized_model(model_id)
     return any(family in normalized for family in _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES)
@@ -243,59 +252,6 @@ def anthropic_thinking_budget_tokens(maximum_output_tokens: int | None) -> int |
     if MINIMUM_THINKING_BUDGET_TOKENS <= budget < maximum_output_tokens:
         return budget
     return None
-
-
-THINKING_BUDGET_EFFORT_TIERS: tuple[tuple[int, ReasoningEffort], ...] = (
-    (4096, "low"),
-    (MAXIMUM_THINKING_BUDGET_TOKENS, "medium"),
-)
-"""Budget ceilings mapping an Anthropic ``budget_tokens`` to an effort tier.
-
-The bands anchor on the two budget constants Anthropic semantics already pin:
-``MINIMUM_THINKING_BUDGET_TOKENS`` (1024) opens the low band and
-``MAXIMUM_THINKING_BUDGET_TOKENS`` (16384, the gateway's derived-budget
-ceiling) closes the medium band. A budget at or below 4096 reads as shallow
-deliberate reasoning (low), one up to 16384 as the default depth (medium),
-and anything larger as an explicit request for deep reasoning (high).
-"""
-
-
-def thinking_config_reasoning_effort(config: Mapping[str, object]) -> ReasoningEffort:
-    """Map one Anthropic thinking config to the nearest canonical effort tier.
-
-    The mapping serves routes whose reasoning channel is an OpenAI-style
-    effort rather than a token budget:
-
-    ==================================  ========
-    thinking config                     effort
-    ==================================  ========
-    ``disabled``                        none
-    ``adaptive`` or budget-less         medium
-    ``budget_tokens <= 4096``           low
-    ``budget_tokens <= 16384``          medium
-    ``budget_tokens > 16384``           high
-    ==================================  ========
-
-    ``adaptive`` means the model picks its own depth, whose closest effort
-    analog is the provider default (medium, OpenAI's own default). Callers
-    must snap the returned tier to the route's supported ladder and disclose
-    the translation.
-
-    Args:
-        config: Verbatim caller ``thinking`` object.
-
-    Returns:
-        The canonical effort tier for the requested reasoning depth.
-    """
-    if config.get("type") == "disabled":
-        return "none"
-    budget = config.get("budget_tokens")
-    if not isinstance(budget, int) or isinstance(budget, bool):
-        return "medium"
-    for ceiling, effort in THINKING_BUDGET_EFFORT_TIERS:
-        if budget <= ceiling:
-            return effort
-    return "high"
 
 
 def anthropic_reasoning_effort(model_id: str, effort: str) -> str:
@@ -441,3 +397,146 @@ def _require_exact_effort(
 def _normalized_model(model_id: str) -> str:
     """Normalize common provider separators without weakening identity checks."""
     return model_id.lower().replace(".", "-").replace("_", "-")
+
+
+def fill_bare_enabled_budget(
+    config: Mapping[str, object], maximum_output_tokens: int | None
+) -> dict[str, object] | None:
+    """Give a budget-less ``enabled`` thinking config the derived legal budget.
+
+    Claude Code sends ``{"type": "enabled"}``; the Anthropic wire requires
+    ``1024 <= budget_tokens < max_tokens``. The fill is the same derivation the
+    adaptive->enabled translation uses, so both paths agree on the depth an
+    unspecified budget means.
+
+    Args:
+        config: The caller's verbatim thinking object (type ``enabled``, no
+            budget).
+        maximum_output_tokens: The caller's reply ceiling.
+
+    Returns:
+        The config with ``budget_tokens`` filled, or ``None`` when no legal
+        budget fits under the ceiling (the caller cannot request thinking on
+        this turn at all).
+    """
+    budget = anthropic_thinking_budget_tokens(maximum_output_tokens)
+    if budget is None:
+        return None
+    return {**config, "budget_tokens": budget}
+
+
+THINKING_BUDGET_DERIVED_DISCLOSURE = "thinking.budget_tokens->derived"
+"""Disclosure recorded when a bare ``enabled`` config (no budget, Claude Code's
+shape) is forwarded to an Anthropic rung with the gateway's derived budget."""
+
+
+def shape_anthropic_thinking_config(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    provider_updates: dict[str, object],
+    ignored: list[str],
+) -> None:
+    """Family-gate a caller thinking config for a route with Anthropic rungs.
+
+    Budgeted-enabled support and the ability to disable thinking are separate
+    model facts. Valid off switches travel verbatim; an unsupported off switch
+    is refused before dispatch rather than removed. A bare ``enabled`` config
+    gets a disclosed budget only once its output ceiling is known. When the
+    ceiling is omitted, per-rung payload construction derives the budget from
+    that rung's required output limit. An impossible budget is a refusal.
+
+    Args:
+        profiles: The route's wire profiles.
+        request: The caller's canonical request; ``provider_thinking_config``
+            must be present.
+        provider_updates: The dispatched-request overrides, written in place.
+        ignored: The route's disclosure list, appended in place.
+
+    Raises:
+        ProviderParameterError: The config names a mode this family rejects.
+    """
+    config = request.provider_thinking_config
+    if config is None:
+        return
+
+    def disclose(path: str) -> None:
+        """Record a changed parameter exactly once."""
+        if path not in ignored:
+            ignored.append(path)
+
+    config_type = str(config.get("type"))
+    adaptive_only = all(anthropic_adaptive_only_thinking(profile.model_id) for profile in profiles)
+    budgeted_enabled_only = all(
+        profile.dialect == "anthropic_messages"
+        and anthropic_budgeted_enabled_only(profile.model_id)
+        for profile in profiles
+    )
+    if budgeted_enabled_only and config_type == "adaptive":
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'thinking.type' cannot be 'adaptive' on this model: "
+                "it reasons via an explicit token budget. Send thinking "
+                "{type: 'enabled', budget_tokens: N} or remove the field."
+            ),
+            param="thinking.type",
+            code="unsupported_parameter",
+        )
+    if adaptive_only and "budget_tokens" in config:
+        raise ProviderParameterError(
+            message=(
+                "This model cannot enforce thinking.budget_tokens. Choose a model that "
+                "supports a thinking-token budget, or explicitly remove the budget and "
+                "use adaptive thinking with effort instead."
+            ),
+            param="thinking.budget_tokens",
+            code="unsupported_parameter",
+        )
+    if adaptive_only and config_type == "enabled":
+        # A bare enable requests thinking but specifies no numerical bound.
+        provider_updates["provider_thinking_config"] = {"type": "adaptive"}
+        disclose("thinking.type->adaptive")
+        _logger.warning(
+            "translated a caller bare 'enabled' thinking config to adaptive; "
+            "the mode change was disclosed"
+        )
+    elif config_type == "enabled" and "budget_tokens" not in config:
+        if request.maximum_output_tokens is not None:
+            filled = fill_bare_enabled_budget(config, request.maximum_output_tokens)
+            if filled is None:
+                raise ProviderParameterError(
+                    message=(
+                        "The output limit cannot fit an enabled thinking budget. "
+                        "Increase max_tokens above 1024 or explicitly disable thinking."
+                    ),
+                    param="thinking.budget_tokens",
+                    code="invalid_parameter",
+                )
+            provider_updates["provider_thinking_config"] = filled
+        disclose(THINKING_BUDGET_DERIVED_DISCLOSURE)
+    elif config_type == "disabled":
+        for profile in profiles:
+            normalized = _normalized_model(profile.model_id)
+            always_thinks = any(
+                family in normalized for family in _ANTHROPIC_ALWAYS_THINKING_FAMILIES
+            )
+            effort = request.reasoning_effort
+            if request.provider_output_config is not None:
+                effort = request.provider_output_config.get("effort", effort)
+            if effort is None and profile.reasoning_effort_required:
+                effort = profile.reasoning_effort
+            restricted_effort = "claude-opus-5" in normalized and effort in ("xhigh", "max")
+            if always_thinks or restricted_effort:
+                reason = (
+                    "this model always reasons adaptively"
+                    if always_thinks
+                    else "this model requires thinking at effort xhigh or max"
+                )
+                raise ProviderParameterError(
+                    message=(
+                        f"The parameter 'thinking.type' cannot be 'disabled': {reason}. "
+                        "Choose a model and effort that support disabling thinking, or "
+                        "explicitly enable thinking."
+                    ),
+                    param="thinking.type",
+                    code="unsupported_parameter",
+                )

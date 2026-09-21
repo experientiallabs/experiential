@@ -461,8 +461,8 @@ def configure_gateway(root: Path, *, provider_base_url: str) -> str:
         capabilities=ModelCapabilities(),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=0,
-            output_micro_usd_per_million_tokens=0,
+            input_nano_usd_per_million_tokens=0,
+            output_nano_usd_per_million_tokens=0,
         ),
         pricing_source="latency-report-mock",
         replace=False,

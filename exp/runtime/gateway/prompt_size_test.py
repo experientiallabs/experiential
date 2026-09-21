@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Experiential Labs. All rights reserved.
-"""Tests for the pre-dispatch context-window refusal."""
+"""Tests for the pre-dispatch context-window narrowing and refusal."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.prompt_size import (
     MAXIMUM_BYTES_PER_TOKEN,
+    context_window_compatible_indexes,
     minimum_prompt_tokens,
     prompt_text_bytes,
-    require_prompt_fits_context_window,
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -76,9 +76,22 @@ def _route(*deployments: ExactModelDeployment) -> GatewayRoute:
 
 
 def _request(
-    text: str, surface: GatewayApiSurface = GatewayApiSurface.CHAT_COMPLETIONS
+    text: str,
+    surface: GatewayApiSurface = GatewayApiSurface.CHAT_COMPLETIONS,
+    *,
+    max_tokens: int | None = None,
 ) -> GatewayRequest:
-    return GatewayRequest(surface=surface, messages=(GatewayMessage(role="user", content=text),))
+    return GatewayRequest(
+        surface=surface,
+        messages=(GatewayMessage(role="user", content=text),),
+        maximum_output_tokens=max_tokens,
+        maximum_output_tokens_parameter=None if max_tokens is None else "max_tokens",
+    )
+
+
+def _tokens(count: int) -> str:
+    """Text whose lower-bound token count is exactly ``count``."""
+    return "x" * (count * MAXIMUM_BYTES_PER_TOKEN)
 
 
 def test_text_bytes_count_every_text_the_model_reads_and_no_media() -> None:
@@ -136,10 +149,10 @@ def test_a_prompt_certain_to_overflow_every_window_is_refused_with_the_numbers()
     """The lower bound exceeds the largest window: refuse before dispatch, naming both numbers."""
     route = _route(_deployment("small", 1_000), _deployment("large", 2_000))
     # 2,001 tokens even at the most generous bytes-per-token; certain to fail on both rungs.
-    request = _request("x" * (2_001 * MAXIMUM_BYTES_PER_TOKEN))
+    request = _request(_tokens(2_001))
 
     with pytest.raises(ProviderParameterError) as caught:
-        require_prompt_fits_context_window(route, request)
+        context_window_compatible_indexes(route, request)
 
     assert caught.value.code == "context_length_exceeded"
     assert caught.value.param == "messages"
@@ -147,30 +160,67 @@ def test_a_prompt_certain_to_overflow_every_window_is_refused_with_the_numbers()
     assert "largest context window on this model route is 2,000 tokens" in str(caught.value)
 
 
-def test_a_prompt_that_might_fit_the_largest_window_dispatches() -> None:
-    """Only certainty refuses: a prompt over the small rung but under the large one goes through."""
-    route = _route(_deployment("small", 1_000), _deployment("large", 2_000))
-    require_prompt_fits_context_window(route, _request("x" * (1_500 * MAXIMUM_BYTES_PER_TOKEN)))
-    # Exactly at the bound is not over it.
-    require_prompt_fits_context_window(route, _request("x" * (2_000 * MAXIMUM_BYTES_PER_TOKEN)))
+def test_a_prompt_over_a_small_rung_falls_to_the_larger_rung() -> None:
+    """The Experiential Cloud shape: a 262k box beside 1M rungs skips the box, never refuses."""
+    route = _route(_deployment("box", 1_000), _deployment("large", 2_000))
+    assert context_window_compatible_indexes(route, _request(_tokens(1_500))) == (1,)
+    # Exactly at a rung's bound is not over it.
+    assert context_window_compatible_indexes(route, _request(_tokens(1_000))) == (0, 1)
+    assert context_window_compatible_indexes(route, _request(_tokens(2_000))) == (1,)
+
+
+def test_the_requested_output_budget_counts_against_each_rung() -> None:
+    """116 of the 140 qwen refusals fit the box on prompt alone and died on prompt + max_tokens."""
+    route = _route(_deployment("box", 1_000), _deployment("large", 2_000))
+    # 600 prompt tokens fit the box; 600 + 500 requested output does not.
+    assert context_window_compatible_indexes(route, _request(_tokens(600), max_tokens=500)) == (1,)
+    assert context_window_compatible_indexes(route, _request(_tokens(600), max_tokens=400)) == (
+        0,
+        1,
+    )
+    # No requested budget reserves nothing: the provider sizes the output to its room.
+    assert context_window_compatible_indexes(route, _request(_tokens(999))) == (0, 1)
+
+
+def test_the_context_check_never_raises_a_small_caller_ceiling() -> None:
+    """Provider-floor incompatibility belongs to generation policy, not a budget rewrite."""
+    route = _route(_deployment("first", 1_000), _deployment("second", 1_000))
+    request = _request(_tokens(990), max_tokens=1)
+    assert context_window_compatible_indexes(route, request) == (0, 1)
+
+
+def test_no_rung_holds_prompt_plus_budget_refuses_naming_the_budget_field() -> None:
+    """When only max_tokens breaks it, the refusal points at max_tokens and says what fits."""
+    route = _route(_deployment("box", 1_000), _deployment("large", 2_000))
+    request = _request(_tokens(1_500), max_tokens=600)
+
+    with pytest.raises(ProviderParameterError) as caught:
+        context_window_compatible_indexes(route, request)
+
+    assert caught.value.code == "context_length_exceeded"
+    assert caught.value.param == "max_tokens"
+    assert "reserves 600 output tokens" in str(caught.value)
+    assert "Lower max_tokens to at most 500" in str(caught.value)
+    assert "2,000 tokens" in str(caught.value)
 
 
 def test_routes_without_a_declared_window_never_refuse() -> None:
     """No declaration means no bound: the provider's own count decides."""
     route = _route(_deployment("unknown", None))
-    require_prompt_fits_context_window(route, _request("x" * 10_000_000))
+    assert context_window_compatible_indexes(route, _request("x" * 10_000_000)) == (0,)
 
 
-def test_one_undeclared_rung_makes_the_whole_route_abstain() -> None:
-    """An undeclared rung is permissive elsewhere, so certainty is gone and nothing is refused."""
+def test_an_undeclared_rung_stays_while_a_declared_small_rung_is_skipped() -> None:
+    """An undeclared rung is permissive; a declared rung that cannot hold the request is not."""
     route = _route(_deployment("small", 100), _deployment("unknown", None))
-    require_prompt_fits_context_window(route, _request("x" * (10_000 * MAXIMUM_BYTES_PER_TOKEN)))
+    assert context_window_compatible_indexes(route, _request(_tokens(10_000))) == (1,)
+    assert context_window_compatible_indexes(route, _request(_tokens(50))) == (0, 1)
 
 
 def test_the_responses_surface_names_its_input_field() -> None:
     """The refusal points at the field the caller actually sent."""
     route = _route(_deployment("small", 10))
-    request = _request("x" * (11 * MAXIMUM_BYTES_PER_TOKEN), GatewayApiSurface.RESPONSES)
+    request = _request(_tokens(11), GatewayApiSurface.RESPONSES)
     with pytest.raises(ProviderParameterError) as caught:
-        require_prompt_fits_context_window(route, request)
+        context_window_compatible_indexes(route, request)
     assert caught.value.param == "input"

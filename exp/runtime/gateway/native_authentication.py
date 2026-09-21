@@ -1,0 +1,36 @@
+"""Virtual-key authentication callback for the native data plane."""
+
+from __future__ import annotations
+
+import json
+from typing import Protocol
+
+from exp.runtime.gateway.native_accounting import authority_error
+from exp.runtime.gateway.native_components import NativeGatewayComponents
+
+
+class _HasComponents(Protocol):
+    _components: NativeGatewayComponents
+
+
+class NativeAuthenticationMixin:
+    """Authenticate one bearer before the data plane reads a request body."""
+
+    def authenticate(self: _HasComponents, argument: str) -> str:
+        """Authenticate one virtual key before the data plane reads the body.
+
+        Args:
+            argument: JSON object with ``raw_key``.
+
+        Returns:
+            An empty JSON object on success.
+
+        Raises:
+            NativeBridgeError: The key is invalid, expired, or revoked.
+        """
+        data = json.loads(argument)
+        try:
+            self._components.store.authenticate_key(raw_key=data["raw_key"])
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            raise authority_error(exc) from exc
+        return "{}"

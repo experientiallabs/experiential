@@ -59,7 +59,6 @@ _CandidateAssignment = tuple[
     tuple[AvailableModel, ...],
 ]
 _MANUAL_MODEL_ROW = "declare-model-manually"
-_NO_REASONING_EFFORT = "__unset_reasoning_effort__"
 _REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 
 
@@ -343,38 +342,6 @@ def _declare_gateway_model(
 def _parse_reasoning_effort(value: str) -> ReasoningEffort | None:
     """Return the reasoning effort named by a picker value, or ``None`` for no pin."""
     return next((effort for effort in _REASONING_EFFORTS if effort == value), None)
-
-
-def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
-    """Choose an optional reasoning-effort pin for one manually declared completion model.
-
-    Args:
-        console: Terminal used for the screen.
-
-    Returns:
-        The chosen effort, or ``None`` so the parameter is never sent.
-
-    Raises:
-        SetupCancelled: The user cancelled setup.
-    """
-    result = choose_one(
-        console,
-        title="Reasoning effort (pin only for models accepting the OpenAI reasoning parameter)",
-        options=[
-            PickerOption(
-                value=_NO_REASONING_EFFORT,
-                label="unset",
-                detail="never send the reasoning parameter",
-            ),
-            *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),
-        ],
-        default=_NO_REASONING_EFFORT,
-    )
-    if result.action is PickerAction.CANCEL:
-        raise SetupCancelled
-    if result.action is PickerAction.BACK:
-        return None
-    return _parse_reasoning_effort(result.values[0])
 
 
 class _RoleEffortBack:

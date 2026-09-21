@@ -12,7 +12,9 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_input_schema,
     anthropic_rejects_forced_tool_choice,
     anthropic_strict_schema_unsupported,
 )
@@ -23,13 +25,16 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
+from exp.runtime.models.providers.generation_parameter_validation import require_output_bound
 from exp.runtime.models.providers.reasoning_compat import (
+    MINIMUM_THINKING_BUDGET_TOKENS,
     anthropic_budgeted_enabled_only,
     anthropic_reasoning_effort,
     anthropic_thinking_budget_tokens,
 )
 from exp.runtime.models.providers.wire_messages import (
     anthropic_blocks,
+    fold_tool_result_images,
     retained_cache_marked_blocks,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -45,12 +50,15 @@ def anthropic_messages_stream_payload(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    maximum_output_tokens: int | None = None,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Messages JSON.
 
     Args:
         model_id: Exact Anthropic model identifier.
         request: Canonical gateway request.
+        maximum_output_tokens: Declared ceiling for this exact model, required
+            when the caller omits the cap. No default is guessed.
 
     Returns:
         Native Messages request with streaming enabled.
@@ -121,10 +129,19 @@ def anthropic_messages_stream_payload(
             existing.extend(blocks)
         else:
             messages.append({"role": role, "content": blocks})
+    if request.json_object_output:
+        # Anthropic has no schema-free JSON mode, so the caller's intent rides
+        # the system prompt as a trailing instruction.
+        system_parts.append((JSON_OBJECT_SYSTEM_INSTRUCTION, ()))
+    output_limit = (
+        request.maximum_output_tokens
+        if request.maximum_output_tokens is not None
+        else require_output_bound(request, maximum_output_tokens)
+    )
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,
-        "max_tokens": request.maximum_output_tokens or 4096,
+        "max_tokens": output_limit,
         "stream": True,
     }
     if system_parts:
@@ -176,9 +193,13 @@ def anthropic_messages_stream_payload(
     if request.tools:
         tools: list[JsonObject] = []
         for tool in request.tools:
+            # Root combinators and a missing root type are reshaped into the
+            # object Anthropic accepts (disclosed at admission); everything
+            # else is the caller's schema verbatim.
+            input_schema = anthropic_input_schema(tool.parameters)
             translated: JsonObject = {
                 "name": tool.name,
-                "input_schema": tool.parameters,
+                "input_schema": input_schema,
             }
             # Anthropic rejects an explicit null description ("Input should
             # be a valid string"), so an absent description stays absent.
@@ -190,7 +211,7 @@ def anthropic_messages_stream_payload(
                 # 2026-09-05: ``maxItems`` on every current model). Declining
                 # here keeps the schema intact and lets admission drop only
                 # ``strict`` when no rung can honor it.
-                if anthropic_strict_schema_unsupported(tool.parameters) is not None:
+                if anthropic_strict_schema_unsupported(input_schema) is not None:
                     raise ProviderCapabilityError(capability="strict_tools")
                 translated["strict"] = True
             # Anthropic-native tool annotations forward verbatim on this
@@ -282,7 +303,27 @@ def anthropic_messages_stream_payload(
         # never reinterpreted by the gateway. An adaptive config (caller-sent
         # or route-translated) still composes with the route's pinned effort,
         # exactly like a request that carried no thinking config.
-        payload["thinking"] = request.provider_thinking_config
+        thinking = dict(request.provider_thinking_config)
+        if thinking.get("type") == "enabled":
+            budget = thinking.get("budget_tokens")
+            if budget is None:
+                budget = anthropic_thinking_budget_tokens(output_limit)
+                thinking["budget_tokens"] = budget
+            if (
+                not isinstance(budget, int)
+                or isinstance(budget, bool)
+                or not MINIMUM_THINKING_BUDGET_TOKENS <= budget < output_limit
+            ):
+                raise ProviderParameterError(
+                    message=(
+                        "The enabled thinking budget must be at least 1024 tokens and below "
+                        f"the output limit of {output_limit}. Raise the output limit, lower "
+                        "thinking.budget_tokens, or explicitly disable thinking."
+                    ),
+                    param="thinking.budget_tokens",
+                    code="invalid_parameter",
+                )
+        payload["thinking"] = thinking
         if (
             request.provider_thinking_config.get("type") == "adaptive"
             and supports_reasoning
@@ -294,10 +335,17 @@ def anthropic_messages_stream_payload(
                 model_id, effective_reasoning_effort
             )
     elif budgeted_only and effective_reasoning_effort not in (None, "none"):
-        # No legal budget under the output ceiling means thinking stays off;
-        # the model still answers, and route narrowing already disclosed any
-        # sampling interplay. output_config.effort is never emitted here.
-        budget = anthropic_thinking_budget_tokens(request.maximum_output_tokens)
+        budget = anthropic_thinking_budget_tokens(output_limit)
+        if budget is None and request.reasoning_effort not in (None, "none"):
+            raise ProviderParameterError(
+                message=(
+                    "The requested reasoning effort needs a thinking budget of at least 1024 "
+                    f"tokens, below the output limit of {output_limit}. Raise max_tokens above "
+                    "1024 or explicitly disable thinking."
+                ),
+                param=request.caller_effort_parameter,
+                code="invalid_parameter",
+            )
         if budget is not None:
             payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
     elif supports_reasoning and not budgeted_only and effective_reasoning_effort is not None:
@@ -432,10 +480,15 @@ def gemini_generate_content_stream_payload(
         ProviderResponseError: A message cannot preserve its tool linkage on
             Gemini's wire.
     """
+    # Gemini's functionResponse carries JSON text; a tool screenshot rides a
+    # following user content (one content per message, no role alternation
+    # rule on this wire). The native ``functionResponse.parts`` carrier is
+    # documented for the Gemini 3 series only and is not adopted unprobed.
+    folded = request.model_copy(update={"messages": fold_tool_result_images(request.messages)})
     try:
         return gemini_generate_request(
             model_id,
-            gateway_model_request(request),
+            gateway_model_request(folded),
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
@@ -446,6 +499,8 @@ def gemini_generate_content_stream_payload(
             response_json_schema=(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
+            json_object_output=request.json_object_output,
+            default_maximum_output_tokens=None,
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise
@@ -464,9 +519,8 @@ def bedrock_converse_stream_payload(
 ) -> JsonObject:
     """Translate one canonical request to the native ConverseStream REST body.
 
-    The body is built by the exact converter the Bedrock provider client
-    uses (canonical request through the shared model adapter, then the shared
-    Converse body builder), so both engines send one identical document. On
+    The body uses the shared Converse builder directly, retaining canonical
+    cache markers instead of losing them in a model-client projection. On
     the REST route the model travels in the URL path, never the body, and
     streaming is selected by the ``converse-stream`` route itself.
 
@@ -489,7 +543,7 @@ def bedrock_converse_stream_payload(
     del model_id
     try:
         return converse_body(
-            gateway_model_request(request),
+            request,
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
@@ -505,6 +559,9 @@ def bedrock_converse_stream_payload(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
             strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
+            json_object_instruction=(
+                JSON_OBJECT_SYSTEM_INSTRUCTION if request.json_object_output else None
+            ),
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise

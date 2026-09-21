@@ -56,3 +56,15 @@ def test_generic_typed_rejection_maps_through_its_own_failure_shape() -> None:
     assert error.detail.code == "invalid_key"
     assert error.detail.type == "authentication_error"
     assert error.detail.message == "the gateway key is invalid, expired, or revoked"
+
+
+def test_a_zdr_demand_the_local_gateway_cannot_judge_renders_as_a_403_on_provider_zdr() -> None:
+    """The local store's refusal names the field and the reason, never a 500."""
+    from exp.runtime.gateway.boundary import boundary_protocol_error
+    from exp.runtime.gateway.sqlite.store import ZdrRoutingUnavailableError
+
+    error = boundary_protocol_error(ZdrRoutingUnavailableError("no postures"))
+    assert error.status_code == 403
+    assert error.detail.code == "model_not_granted"
+    assert error.detail.param == "provider.zdr"
+    assert "provider.zdr" in error.detail.message

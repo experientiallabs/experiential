@@ -101,7 +101,7 @@ class BatchLedger(Protocol):
     """
 
     def reserve_line(self, *, job: BatchJob, line: BatchLine) -> int:
-        """Reserve one line's estimated cost; returns reserved micro-USD.
+        """Reserve one line's estimated cost; returns reserved nano-USD.
 
         Raises:
             Exception: Any host budget rejection; the engine converts it into

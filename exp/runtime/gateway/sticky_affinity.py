@@ -51,11 +51,16 @@ class AffinityPlacement:
     reservation can read and refresh the worker-local sticky binding and apply
     the fresh-session spill threshold. ``sticky_preferred`` marks a route
     whose depth 0 was chosen by a live sticky binding rather than rendezvous
-    order, for the ``affinity_sticky`` disclosure.
+    order, for the ``affinity_sticky`` disclosure. ``sticky_deployment_id``
+    names the admitted rung a live, unsuppressed binding points at, whether
+    or not the binding had to move that rung to the front: the conversation's
+    warm provider cache lives there, which admission-time policy (the
+    throttle redial budget) reads as cache evidence.
     """
 
     fingerprint: bytes | None = None
     sticky_preferred: bool = False
+    sticky_deployment_id: str | None = None
 
 
 def sticky_first_order(
@@ -66,14 +71,16 @@ def sticky_first_order(
     sticky: StickySpillRegistry,
     health: DeploymentHealthRegistry,
     authorization: AuthorizationSnapshot,
-) -> tuple[tuple[int, ...], int | None]:
+) -> tuple[tuple[int, ...], int | None, str | None]:
     """Move a live sticky binding's rung to the front of the rendezvous order.
 
     A binding whose rung left the route is ignored (the binding expires on its
     own); a binding whose rung is suppressed right now is cleared and ignored,
     so a throttled or dead spill target releases the conversation back to
     rendezvous placement. A binding already at the rendezvous front changes
-    nothing and is not reported as sticky.
+    nothing and is not reported as sticky, but it is still reported as the
+    bound rung: this is the one registry read admission makes, and the
+    warm-cache fact it carries is reused downstream.
 
     Args:
         order: Rendezvous permutation of the route's deployment indexes.
@@ -84,13 +91,14 @@ def sticky_first_order(
         authorization: Frozen authority, for the health key.
 
     Returns:
-        The (possibly reordered) permutation and the sticky rung's route
-        index when a live binding moved or confirmed the front (``None``
-        when rendezvous order stands on its own).
+        The (possibly reordered) permutation, the sticky rung's route index
+        when a live binding moved it to the front (``None`` when rendezvous
+        order stands on its own), and the deployment id of the live,
+        unsuppressed binding within the route (``None`` when there is none).
     """
     bound = sticky.bound_deployment(fingerprint)
     if bound is None:
-        return order, None
+        return order, None, None
     sticky_index = next(
         (
             index
@@ -100,13 +108,17 @@ def sticky_first_order(
         None,
     )
     if sticky_index is None:
-        return order, None
+        return order, None, None
     if health.suppressed(deployment_health_key(authorization, route.deployments[sticky_index])):
         sticky.clear(fingerprint)
-        return order, None
+        return order, None, None
     if order[0] == sticky_index:
-        return order, None
-    return (sticky_index, *(index for index in order if index != sticky_index)), sticky_index
+        return order, None, bound
+    return (
+        (sticky_index, *(index for index in order if index != sticky_index)),
+        sticky_index,
+        bound,
+    )
 
 
 class StickySpillRegistry:

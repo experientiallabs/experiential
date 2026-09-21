@@ -68,6 +68,7 @@ class ProviderCertificationMatrix(ContractModel):
             "openai",
             "openai-compatible",
             "openrouter",
+            "typesafe",
             "vertex",
         }
         expected = {
@@ -278,6 +279,45 @@ def _launch_provider_cells(
     return tuple(cells)
 
 
+def _decision_provider_cells() -> tuple[ProviderCertificationCell, ...]:
+    """Label SystemOne separately from chat, using native HTTP and SQLite evidence.
+
+    The fixture suite drives typed answers, exact usage, invalid responses, auth,
+    independent calls, overload, disconnects, and deadlines without provider spend.
+    It does not certify chat streams, content refusals, or a live TypeSafe account.
+    """
+    evidence = ("exp/runtime/gateway/tests/native_decisions_test.py",)
+    cells: list[ProviderCertificationCell] = []
+    for capability in ProviderCapability:
+        match capability:
+            case ProviderCapability.USAGE | ProviderCapability.CANCELLATION:
+                result = ProviderCertificationResult.PROVIDER_FIXTURE_PASS
+                limitation = "Native SystemOne HTTP against a loopback provider and real SQLite."
+            case ProviderCapability.CREDENTIAL_GATED_LIVE:
+                result = ProviderCertificationResult.NOT_RUN_REQUIRES_CREDENTIALS
+                limitation = "The deterministic lane does not call the live TypeSafe provider."
+            case ProviderCapability.TEXT_STREAM | ProviderCapability.TOOL_ARGUMENT_STREAM:
+                result = ProviderCertificationResult.UNSUPPORTED
+                limitation = "SystemOne returns buffered typed decisions, not chat or tool streams."
+            case ProviderCapability.REFUSAL:
+                result = ProviderCertificationResult.UNSUPPORTED
+                limitation = "SystemOne has no certified content-refusal protocol."
+        cells.append(
+            ProviderCertificationCell(
+                provider="typesafe",
+                provider_api_surface="POST /v1/systemone JSON",
+                client_sdk="reqwest (native HTTP; no decision SDK)",
+                gateway_api_surfaces=("decisions",),
+                capability=capability,
+                result=result,
+                evaluated_at=datetime(2026, 9, 16, tzinfo=UTC),
+                evidence=evidence,
+                limitation=limitation,
+            )
+        )
+    return tuple(cells)
+
+
 PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
     cells=tuple(
         sorted(
@@ -293,6 +333,7 @@ PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
                 *_native_provider_cells("bedrock", _BEDROCK_EVIDENCE),
                 *_compatible_provider_cells("azure"),
                 *_compatible_provider_cells("openrouter"),
+                *_decision_provider_cells(),
             ),
             key=lambda cell: (cell.provider, cell.capability.value),
         )
