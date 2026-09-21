@@ -394,143 +394,194 @@ class GatewayDeploymentCapabilities(ContractModel):
     These fields are intentionally separate from ``ModelCapabilities``. The latter participates
     in frozen optimizer and runtime identities, while this declaration can evolve with the
     gateway protocol without invalidating existing router artifacts.
+
+    Attributes:
+        supports_decisions: Whether this deployment serves native typed decisions instead of
+            chat.
+        supports_developer_messages: Whether developer-role messages are supported.
+        supports_streaming: Whether streaming responses are supported.
+        supports_streaming_tool_arguments: Whether tool arguments can be streamed incrementally.
+        supports_strict_tools: Whether strict function-tool schemas are supported.
+        supports_parallel_tool_calls: Whether parallel tool calls are supported.
+        supports_custom_tools: Whether this deployment's relevant native wire can preserve
+            free-form custom tools.
+
+            False means the capability is not declared. Public Chat still refuses custom tools
+            even when a Responses-native deployment declares this, because Chat accepts function
+            tools only. Read the flag with the parity row's dialect and the caller's public API
+            surface.
+        supports_grammar_tools: Whether grammar-constrained custom tools can be preserved on
+            this deployment.
+
+            This requires ``supports_custom_tools``. False means the capability is not declared;
+            it does not describe Chat, which still refuses custom and grammar tools.
+        supports_tool_call_limit: Whether a caller's Responses ``max_tool_calls`` limit can be
+            preserved.
+
+            False means the capability is not declared. The public Responses surface currently
+            refuses the field, so no authored catalog should set this until a route honors the
+            cap.
+        supports_structured_text: Whether schema-constrained text output is supported.
+        supports_stop_sequences: Whether caller-specified stop sequences are supported.
+        supports_image_input: Whether the wire and model accept images; undeclared image input
+            is rejected.
+        supports_image_url_input: Whether the provider fetches remote images; undeclared URLs
+            are rejected.
+
+            Every image-capable wire accepts inline base64; URL support varies by route.
+        supports_video_input: Whether the wire and model accept video; undeclared video input is
+            rejected.
+
+            Video carriers exist on Gemini, Bedrock Converse, and compatible ``video_url``
+            wires.
+        supports_video_url_input: Whether the provider fetches video URLs (Gemini and
+            OpenAI-compatible wires).
+
+            Bedrock requires inline bytes or an S3 location that the gateway does not author.
+        supports_audio_input: Whether the wire and model accept audio; undeclared audio input is
+            rejected.
+
+            Supported models use compatible Chat ``input_audio`` or Gemini ``inline_data``. No
+            public audio surface accepts remote URLs.
+        supports_pdf_input: Whether the wire and model accept PDFs; undeclared document input is
+            rejected.
+        supports_pdf_url_input: Whether this route's provider fetches a caller PDF URL itself.
+
+            Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url`` source)
+            wires fetch a remote document; Chat Completions ``file`` parts, Gemini, and Bedrock
+            accept inline bytes only.
+        supports_prompt_cache_boundaries: Whether explicit caller-selected prompt-cache
+            boundaries can be preserved.
+
+            This covers Chat ``prompt_cache_options`` and ``prompt_cache_retention``. False
+            means those explicit boundaries are not declared as preserved; it does not mean
+            implicit prefix caching is absent.
+        supports_media_handle_input: Whether this route forwards handles to media the caller
+            uploaded to its provider.
+
+            A handle (an OpenAI or Anthropic ``file_id``, a Gemini Files URI, a ``gs://`` object
+            on Vertex, an ``s3://`` object on Bedrock) is scoped to the provider that minted it
+            and never portable, so admission requires both this declaration and a handle
+            provider equal to the route's provider. Providers whose inference wire defines no
+            uploaded-media reference (Fireworks, OpenRouter) never declare it.
+        maximum_stop_sequences: Largest stop-sequence count this route accepts, when the
+            provider caps it.
+
+            ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
+            field). A concrete value lets admission reject an over-limit list locally with a
+            named parameter error instead of forwarding it and surfacing the provider's opaque
+            4xx (e.g. Gemini caps ``stopSequences`` at 5).
+        minimum_output_tokens: Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6
+            on Bedrock: 16); a smaller caller ceiling is floored to it with disclosure on every
+            surface (see the profile).
+        supported_reasoning_efforts: Exact caller values this deployment can preserve without
+            normalization.
+
+            An empty tuple means the gateway should use its maintained provider-family contract.
+            OpenRouter and other catalog-driven providers declare the exact ordered set here
+            because their supported values vary by model.
+        reasoning_default_effort: The depth this deployment reasons at when the caller names
+            none.
+
+            Emitted on a wire that requires an explicit effort, and read by Messages admission
+            as the depth a budget-less ``thinking`` config (``adaptive``, or Claude Code's bare
+            ``{type: enabled}``) asks for on an effort rung, so a lane's think-mode depth is set
+            here, not in code.
+        reasoning_effort_required: Whether this deployment requires an explicit reasoning effort
+            on its wire.
+        reports_refusals: Whether provider refusals are reported explicitly.
+        reports_cached_input_tokens: Whether cached input-token usage is reported.
+        reports_cache_creation_input_tokens: Whether cache-write input-token usage is reported.
+        reports_reasoning_tokens: Whether reasoning-token usage is reported separately.
+        reports_model_status: Whether provider model-status metadata is preserved in the
+            normalized response.
+
+            False means the capability is not declared. Gemini ``modelStatus`` is currently
+            unpreserved, so no authored catalog should set this until the response contract
+            carries that field.
+        supports_async_tools: Whether a tool may be flagged ``async`` so the model keeps
+            generating while the caller runs it, with the result returned later on the tool
+            call's ORIGINAL ``call_id`` (GPT-6 Astra Responses). Declaration-driven and off
+            until the decoder + turn lifecycle honor it; a route that declares it must not drop
+            an async tool call. See the platform's astra_responses helpers.
+        supports_mid_turn_steering: Whether the caller may inject additional input over the
+            Responses WebSocket WHILE the model is working, folded into a continuation that
+            preserves completed work (GPT-6 Astra). Off until the WS transport accepts inbound
+            mid-turn frames.
+        supports_reasoning_effort_update: Whether a ``configuration_update`` input item may
+            change reasoning effort mid-conversation without invalidating the cached prompt
+            prefix -- the request-level ``reasoning.effort`` stays fixed (GPT-6 Astra). Off
+            until the decoder recognizes the item (it must not hit the unknown-item reject path)
+            and applies the effort forward.
+        time_to_first_byte_base_seconds: Deployment override for the lane's flat
+            time-to-first-byte allowance.
+
+            ``None`` uses the serving configuration's default. The effective bound on the wait
+            for a provider's response headers is this base plus the input-scaled allowance
+            below, so very large prompts are not misread as a dead lane. The wait for the first
+            TOKEN has its own base (``time_to_first_token_base_seconds``) and shares the slope.
+        time_to_first_byte_seconds_per_million_input_tokens: Deployment override for the
+            input-scaled time-to-first-byte allowance.
+
+            Seconds added per million approximate input tokens (the request body's bytes divided
+            by four; an allowance heuristic, never a billing quantity). ``None`` uses the
+            serving configuration's default; ``0`` disables scaling for this deployment.
+        time_to_first_token_base_seconds: Deployment override for the lane's flat
+            time-to-first-TOKEN allowance.
+
+            ``None`` uses the serving configuration's default (two minutes). The effective bound
+            on the wait from the dial to the first semantic event (content, reasoning, a tool
+            call; keepalive comments and role-only frames do not count) is this base plus the
+            input-scaled allowance above. A stall past it fails over to the next rung. Author it
+            above the lane's observed first-token p99 on a thinking model, below the stall you
+            want caught.
+        failover_only_on: Failure tokens this rung serves as a failover for, or ``None`` for an
+            unrestricted rung.
+
+            A rung carrying a set is never dialed first and is dialed as a successor only when
+            the failure being failed over from spells one of its tokens (see
+            ``exp.common.models.failover_tokens``); a rule-carrying rung reached that way
+            records ``fallback_reason = failover_only_on:<token>``.
     """
 
     supports_decisions: bool = False
-    """Whether this deployment serves native typed decisions instead of chat."""
 
     supports_developer_messages: bool = False
     supports_streaming: bool = False
     supports_streaming_tool_arguments: bool = False
     supports_strict_tools: bool = False
     supports_parallel_tool_calls: bool = False
+    supports_custom_tools: bool = False
+    supports_grammar_tools: bool = False
+    supports_tool_call_limit: bool = False
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
-    """Whether the wire and model accept images; undeclared image input is rejected."""
     supports_image_url_input: bool = False
-    """Whether the provider fetches remote images; undeclared URLs are rejected.
-
-    Every image-capable wire accepts inline base64; URL support varies by route.
-    """
     supports_video_input: bool = False
-    """Whether the wire and model accept video; undeclared video input is rejected.
-
-    Video carriers exist on Gemini, Bedrock Converse, and compatible ``video_url`` wires.
-    """
     supports_video_url_input: bool = False
-    """Whether the provider fetches video URLs (Gemini and OpenAI-compatible wires).
-
-    Bedrock requires inline bytes or an S3 location that the gateway does not author.
-    """
     supports_audio_input: bool = False
-    """Whether the wire and model accept audio; undeclared audio input is rejected.
-
-    Supported models use compatible Chat ``input_audio`` or Gemini ``inline_data``.
-    No public audio surface accepts remote URLs.
-    """
     supports_pdf_input: bool = False
-    """Whether the wire and model accept PDFs; undeclared document input is rejected."""
     supports_pdf_url_input: bool = False
-    """Whether this route's provider fetches a caller PDF URL itself.
-
-    Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
-    source) wires fetch a remote document; Chat Completions ``file`` parts,
-    Gemini, and Bedrock accept inline bytes only.
-    """
+    supports_prompt_cache_boundaries: bool = False
     supports_media_handle_input: bool = False
-    """Whether this route forwards handles to media the caller uploaded to its provider.
-
-    A handle (an OpenAI or Anthropic ``file_id``, a Gemini Files URI, a
-    ``gs://`` object on Vertex, an ``s3://`` object on Bedrock) is scoped to
-    the provider that minted it and never portable, so admission requires
-    both this declaration and a handle provider equal to the route's
-    provider. Providers whose inference wire defines no uploaded-media
-    reference (Fireworks, OpenRouter) never declare it.
-    """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
-    """Largest stop-sequence count this route accepts, when the provider caps it.
-
-    ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
-    field). A concrete value lets admission reject an over-limit list locally with a
-    named parameter error instead of forwarding it and surfacing the provider's
-    opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
     minimum_output_tokens: int | None = Field(default=None, ge=1)
-    """Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6 on Bedrock: 16); a
-    smaller caller ceiling is floored to it with disclosure on every surface (see the profile)."""
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
-    """Exact caller values this deployment can preserve without normalization.
-
-    An empty tuple means the gateway should use its maintained provider-family
-    contract. OpenRouter and other catalog-driven providers declare the exact
-    ordered set here because their supported values vary by model.
-    """
     reasoning_default_effort: ReasoningEffort | None = None
-    """The depth this deployment reasons at when the caller names none.
-
-    Emitted on a wire that requires an explicit effort, and read by Messages
-    admission as the depth a budget-less ``thinking`` config (``adaptive``, or
-    Claude Code's bare ``{type: enabled}``) asks for on an effort rung, so a
-    lane's think-mode depth is set here, not in code.
-    """
     reasoning_effort_required: bool = False
-    """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_cache_creation_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+    reports_model_status: bool = False
     supports_async_tools: bool = False
-    """Whether a tool may be flagged ``async`` so the model keeps generating
-    while the caller runs it, with the result returned later on the tool call's
-    ORIGINAL ``call_id`` (GPT-6 Astra Responses). Declaration-driven and off
-    until the decoder + turn lifecycle honor it; a route that declares it must
-    not drop an async tool call. See the platform's astra_responses helpers."""
     supports_mid_turn_steering: bool = False
-    """Whether the caller may inject additional input over the Responses
-    WebSocket WHILE the model is working, folded into a continuation that
-    preserves completed work (GPT-6 Astra). Off until the WS transport accepts
-    inbound mid-turn frames."""
     supports_reasoning_effort_update: bool = False
-    """Whether a ``configuration_update`` input item may change reasoning effort
-    mid-conversation without invalidating the cached prompt prefix -- the
-    request-level ``reasoning.effort`` stays fixed (GPT-6 Astra). Off until the
-    decoder recognizes the item (it must not hit the unknown-item reject path)
-    and applies the effort forward."""
     time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
-    """Deployment override for the lane's flat time-to-first-byte allowance.
-
-    ``None`` uses the serving configuration's default. The effective bound on
-    the wait for a provider's response headers is this base plus the
-    input-scaled allowance below, so very large prompts are not misread as a
-    dead lane. The wait for the first TOKEN has its own base
-    (``time_to_first_token_base_seconds``) and shares the slope.
-    """
     time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
-    """Deployment override for the input-scaled time-to-first-byte allowance.
-
-    Seconds added per million approximate input tokens (the request body's
-    bytes divided by four; an allowance heuristic, never a billing quantity).
-    ``None`` uses the serving configuration's default; ``0`` disables scaling
-    for this deployment.
-    """
     time_to_first_token_base_seconds: float | None = Field(default=None, gt=0)
-    """Deployment override for the lane's flat time-to-first-TOKEN allowance.
-
-    ``None`` uses the serving configuration's default (two minutes). The
-    effective bound on the wait from the dial to the first semantic event
-    (content, reasoning, a tool call; keepalive comments and role-only frames
-    do not count) is this base plus the input-scaled allowance above. A stall
-    past it fails over to the next rung. Author it above the lane's observed
-    first-token p99 on a thinking model, below the stall you want caught.
-    """
     failover_only_on: tuple[FailoverToken, ...] | None = None
-    """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.
-
-    A rung carrying a set is never dialed first and is dialed as a successor only
-    when the failure being failed over from spells one of its tokens (see
-    ``exp.common.models.failover_tokens``); a rule-carrying rung reached that way
-    records ``fallback_reason = failover_only_on:<token>``.
-    """
 
     @property
     def declares_reasoning_contract(self) -> bool:
@@ -540,6 +591,21 @@ class GatewayDeploymentCapabilities(ContractModel):
             or self.reasoning_default_effort is not None
             or self.reasoning_effort_required
         )
+
+    @model_validator(mode="after")
+    def _require_custom_tools_for_grammar(self) -> GatewayDeploymentCapabilities:
+        """Reject grammar-tool support that is not backed by custom-tool support.
+
+        Returns:
+            The validated declaration.
+
+        Raises:
+            ValueError: ``supports_grammar_tools`` is true while
+                ``supports_custom_tools`` is false.
+        """
+        if self.supports_grammar_tools and not self.supports_custom_tools:
+            raise ValueError("supports_grammar_tools requires supports_custom_tools=true")
+        return self
 
     @model_validator(mode="after")
     def _require_valid_reasoning_contract(self) -> GatewayDeploymentCapabilities:

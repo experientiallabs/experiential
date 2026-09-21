@@ -182,14 +182,11 @@ def test_the_requested_output_budget_counts_against_each_rung() -> None:
     assert context_window_compatible_indexes(route, _request(_tokens(999))) == (0, 1)
 
 
-def test_a_rungs_declared_output_floor_raises_its_reserve_above_the_callers_budget() -> None:
-    """max_tokens=1 on a rung that floors ceilings at 16 is sent 16: the window must hold 16."""
-    route = _route(_deployment("floored", 1_000), _deployment("plain", 1_000))
+def test_the_context_check_never_raises_a_small_caller_ceiling() -> None:
+    """Provider-floor incompatibility belongs to generation policy, not a budget rewrite."""
+    route = _route(_deployment("first", 1_000), _deployment("second", 1_000))
     request = _request(_tokens(990), max_tokens=1)
-    # Without floors both rungs hold 991 tokens.
     assert context_window_compatible_indexes(route, request) == (0, 1)
-    # The floored rung would be sent 16 and overflow (990 + 16 > 1,000); its sibling stays.
-    assert context_window_compatible_indexes(route, request, output_floors=(16, None)) == (1,)
 
 
 def test_no_rung_holds_prompt_plus_budget_refuses_naming_the_budget_field() -> None:

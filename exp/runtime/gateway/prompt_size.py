@@ -22,7 +22,6 @@ own rules and is left to the provider.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from exp.common.models.content import TextContentPart
@@ -99,25 +98,18 @@ def minimum_prompt_tokens(request: GatewayRequest) -> int:
 def context_window_compatible_indexes(
     route: GatewayRoute,
     request: GatewayRequest,
-    *,
-    output_floors: Sequence[int | None] = (),
 ) -> tuple[int, ...]:
     """Return the rungs whose declared context window can hold this request.
 
     A rung is compatible when it declares no window (permissive: the provider's
     own count decides) or when its window holds the prompt's lower-bound token
-    count PLUS the output budget the rung will actually be sent: the caller's
-    requested ``max_tokens`` (any spelling) raised to the rung's own declared
-    output floor (``output_floors``, aligned with ``route.deployments``; a
-    provider that refuses ceilings under 16 is sent 16 however small the
-    caller's value). Nothing is reserved when the caller left the budget unset
-    and no floor applies, because the provider then sizes the output to the
-    room it has. Admission runs this twice: once on the decoded request, and
-    again on the SHAPED provider request, whose ``maximum_output_tokens``
-    carries every route-level raise (the Anthropic required default, the
-    OpenAI-wire minimum) so a rung the shaping pushed over its window is still
-    skipped rather than dispatched to fail. Per-rung windows
-    differ on one model — the Experiential Cloud qwen3.8-27b box serves
+    count PLUS the caller's requested ``max_tokens`` (any spelling). An
+    explicit ceiling is never increased to meet a provider floor: generation
+    policy rejects that rung instead. Omission contributes no output here;
+    required-wire caps and financial reservations are derived independently
+    from declared bounds at per-rung admission, never from this loose prompt
+    estimate. Per-rung windows differ on one model: the Experiential Cloud
+    qwen3.8-27b box serves
     262,144 tokens while the OpenRouter and Novita rungs serve 1,000,000 — so
     a request the box cannot hold must fall to a rung that can instead of
     being refused by the box after a reservation and a round trip (140 such
@@ -133,8 +125,6 @@ def context_window_compatible_indexes(
     Args:
         route: Resolved ordered route.
         request: Canonical request (decoded, or shaped for the provider).
-        output_floors: Per-rung declared output-token floors, aligned with
-            ``route.deployments``; ``None`` or a missing entry means no floor.
 
     Returns:
         Strictly increasing indexes into ``route.deployments``.
@@ -156,13 +146,10 @@ def context_window_compatible_indexes(
             if deployment.capabilities is None
             else deployment.capabilities.context_window_tokens
         )
-        floor = output_floors[index] if index < len(output_floors) else None
-        rung_reserve = max(requested, floor or 0)
-        if window is None or minimum + rung_reserve <= window:
+        if window is None or minimum + requested <= window:
             compatible.append(index)
         if window is not None and (largest is None or window > largest):
             largest = window
-            reserve = rung_reserve
     if compatible or largest is None:
         return tuple(compatible)
     if minimum > largest:

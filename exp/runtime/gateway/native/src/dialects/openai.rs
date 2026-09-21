@@ -10,9 +10,8 @@ use super::{
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
-    openai_usage, require_bounded_string, require_string, require_u64, Event,
-    ProviderAssistantMessagePhase, ProviderOutputItemKind, ProviderOutputItemStatus,
-    ToolAccumulator,
+    require_bounded_string, require_string, require_u64, Event, ProviderAssistantMessagePhase,
+    ProviderOutputItemKind, ProviderOutputItemStatus, ToolAccumulator,
 };
 
 const MAXIMUM_OPENAI_ID_CHARS: usize = 256;
@@ -776,8 +775,10 @@ impl Normalizer {
                     self.dropped_cut_call |= dropped;
                     tool_events
                 });
-                if let Some(usage) =
-                    openai_usage(response.get("usage")).map_err(|message| malformed(&message))?
+                if let Some(usage) = self
+                    .openai_usage
+                    .update_responses(response.get("usage"))
+                    .map_err(|message| malformed(&message))?
                 {
                     events.push(Event::Usage(usage));
                 }
@@ -829,7 +830,9 @@ impl Normalizer {
                 let mut code = None;
                 let mut message = None;
                 if let Some(response) = payload.get("response").and_then(Value::as_object) {
-                    if let Some(usage) = openai_usage(response.get("usage"))
+                    if let Some(usage) = self
+                        .openai_usage
+                        .update_responses(response.get("usage"))
                         .map_err(|message| malformed(&message))?
                     {
                         events.push(Event::Usage(usage));

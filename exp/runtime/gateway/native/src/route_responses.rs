@@ -803,15 +803,22 @@ async fn stream_responses(
                 {
                     Ok(Some(event)) => event,
                     Ok(None) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
                         fail_stream!(Failure::new(
                             FailureClass::MalformedResponse,
                             "provider stream ended without a terminal event",
                         ))
                     }
-                    Err(failure) => fail_stream!(failure),
+                    Err(failure) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
+                        fail_stream!(failure)
+                    }
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            if matches!(event, Event::Failed(_)) {
+                usage = committed.relay.usage_before_failure(usage.take());
+            }
             if redactor.is_none() {
                 // A guarded stream retains what the caller actually saw, so
                 // a continuation replays the redacted text, never the raw

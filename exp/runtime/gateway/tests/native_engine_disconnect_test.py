@@ -1,7 +1,7 @@
 """Failure-path integration tests for the native (Rust) gateway data plane.
 
-These tests exercise three reviewed-but-untested behaviors of the compiled
-``exp_gateway_native`` engine against a real serving process:
+These tests exercise disconnect, heartbeat, accounting, replay, and bounded
+backpressure behavior of the compiled engine against a real serving process:
 
 1. A client disconnect mid non-streaming request settles the admitted attempt
    through the ``AttemptGuard`` drop backstop.
@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -46,6 +48,9 @@ from exp.runtime.gateway.lifecycle_test import (
     _configured_gateway,
 )
 from exp.runtime.gateway.management import GatewayManagement
+
+if sys.platform != "win32":
+    import resource
 
 pytest.importorskip("exp_gateway_native")
 
@@ -68,6 +73,7 @@ _DRIVER_SOURCE = textwrap.dedent(
     import os
     import socket
     import sys
+    import time
     from pathlib import Path
 
     from exp.runtime.gateway.contracts import GatewayApiSurface
@@ -90,6 +96,31 @@ _DRIVER_SOURCE = textwrap.dedent(
         return route.snapshot.authorization.alias != "escalated"
 
 
+    class ObservedControlPlane(NativeControlPlane):
+        """Record content-free callback evidence and choose a loopback wire."""
+
+        def admit(self, argument: str) -> str:
+            """Use Messages wire only for the hidden-thinking socket fixtures."""
+            admission = json.loads(super().admit(argument))
+            request = json.loads(json.loads(argument)["body"])
+            prompt = request["messages"][-1]["content"]
+            if prompt.startswith("anthro-") and "route" in admission:
+                admission["route"][0]["dialect"] = "anthropic_messages"
+            if prompt.startswith("hidden-") and "route" in admission:
+                admission["route"][0]["fireworks_reasoning_route_sha256"] = "a" * 64
+            if prompt == "quiet-short-phase" and "route" in admission:
+                admission["route"][0]["timeout_seconds"] = 1.5
+            return json.dumps(admission)
+
+        def settle(self, argument: str) -> str:
+            """Observe every settlement and delay one write to expose close ordering."""
+            data = json.loads(argument)
+            with open(os.environ["SETTLEMENT_LOG"], "a") as sink:
+                sink.write(json.dumps(data) + "\\n")
+            time.sleep(0.3)
+            return super().settle(argument)
+
+
     def main() -> None:
         """Compose the control plane, announce the public port, and serve.
 
@@ -103,7 +134,7 @@ _DRIVER_SOURCE = textwrap.dedent(
             Path(config["root"]),
             environment={"TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"]},
         )
-        control_plane = NativeControlPlane(
+        control_plane = ObservedControlPlane(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
             native_route_eligible=native_route_eligible,
@@ -196,6 +227,9 @@ class _SseUpstream(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if prompt.startswith(("quiet-", "hidden-", "anthro-", "beforeheaders-", "keyed-")):
+                _serve_quiet(self, prompt)
+                return
             if prompt == "slow-token":
                 for _ in range(10):
                     self.wfile.write(_content_chunk("tick "))
@@ -224,12 +258,123 @@ class _SseUpstream(BaseHTTPRequestHandler):
         del format, args
 
 
+_PROVIDER_OPENED: dict[str, threading.Event] = {}
+_PROVIDER_CLOSED: dict[str, threading.Event] = {}
+_PROVIDER_CALLS: dict[str, int] = {}
+
+
+def _serve_quiet(handler: _SseUpstream, prompt: str) -> None:
+    """Serve silent bodies while observing the exact upstream socket close."""
+    _PROVIDER_CALLS[prompt] = _PROVIDER_CALLS.get(prompt, 0) + 1
+    closed = _PROVIDER_CLOSED.setdefault(prompt, threading.Event())
+    if prompt.startswith("anthro-"):
+        handler.wfile.write(
+            _sse_frame(
+                {
+                    "type": "message_start",
+                    "message": {"usage": {"input_tokens": 19, "output_tokens": 0}},
+                }
+            )
+        )
+        handler.wfile.write(
+            _sse_frame(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                }
+            )
+        )
+        handler.wfile.write(
+            _sse_frame(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "private canary"},
+                }
+            )
+        )
+    elif prompt.startswith("hidden-"):
+        if not prompt.startswith("hidden-preheaders-"):
+            # Heartbeats belong to an already committed public stream. Private
+            # reasoning alone must remain failover-safe before commitment.
+            handler.wfile.write(
+                _sse_frame({"choices": [{"index": 0, "delta": {"content": "public prefix"}}]})
+            )
+        handler.wfile.write(
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {"prompt_tokens": 19, "completion_tokens": 0},
+                }
+            )
+        )
+        handler.wfile.write(
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"reasoning_content": "private canary"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        )
+    elif prompt == "beforeheaders-known":
+        handler.wfile.write(
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {"prompt_tokens": 19, "completion_tokens": 7},
+                }
+            )
+        )
+    elif not prompt.startswith("beforeheaders-"):
+        if "partial" in prompt:
+            handler.wfile.write(_sse_frame({"choices": [], "usage": {"prompt_tokens": 19}}))
+        if "known" in prompt and "unknown" not in prompt:
+            handler.wfile.write(
+                _sse_frame(
+                    {
+                        "choices": [],
+                        "usage": {"prompt_tokens": 19, "completion_tokens": 7},
+                    }
+                )
+            )
+        handler.wfile.write(_content_chunk("usable partial answer"))
+    handler.wfile.flush()
+    _PROVIDER_OPENED.setdefault(prompt, threading.Event()).set()
+    until = time.monotonic() + (2.4 if prompt == "keyed-finish" else 8)
+    with selectors.DefaultSelector() as selector:
+        selector.register(handler.connection, selectors.EVENT_READ)
+        while time.monotonic() < until:
+            if selector.select(0.04):
+                try:
+                    if not handler.connection.recv(1, socket.MSG_PEEK):
+                        closed.set()
+                        return
+                except OSError:
+                    closed.set()
+                    return
+            if "pings" in prompt:
+                handler.wfile.write(b": provider ping\n\n")
+                handler.wfile.flush()
+    if prompt.startswith("keyed-"):
+        handler.wfile.write(_TERMINAL_FRAMES)
+        handler.wfile.flush()
+
+
 @dataclass(frozen=True)
 class _ServingEngine:
     """One live native serving subprocess and its access facts."""
 
     port: int
     raw_key: str
+    database_path: Path
+    settlement_log: Path
+    stderr_log: Path
 
     @property
     def base(self) -> str:
@@ -314,6 +459,8 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
     environment["TEST_PROVIDER_KEY"] = "provider-secret-canary"
+    settlement_log = root / "settlements.jsonl"
+    environment["SETTLEMENT_LOG"] = str(settlement_log)
     stderr_sink = stderr_log.open("wb")
     process = subprocess.Popen(  # noqa: S603 - the interpreter runs our generated driver.
         [sys.executable, str(driver), config],
@@ -360,7 +507,13 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
             assert process.poll() is None, f"driver died: {stderr_log.read_text()}"
             assert time.monotonic() < live_deadline, "native engine never became live"
             time.sleep(0.05)
-        yield _ServingEngine(port=port, raw_key=raw_key)
+        yield _ServingEngine(
+            port=port,
+            raw_key=raw_key,
+            database_path=manager.database_path,
+            settlement_log=settlement_log,
+            stderr_log=stderr_log,
+        )
     finally:
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)
@@ -370,6 +523,325 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         upstream.server_close()
         upstream_thread.join(timeout=5)
         assert exit_code == 0, f"driver exited {exit_code}: {stderr_log.read_text()}"
+
+
+def _open_quiet(
+    engine: _ServingEngine,
+    prompt: str,
+    *,
+    surface: str = "chat",
+    keyed: bool = False,
+) -> tuple[socket.socket, str, bytes]:
+    """Open a real public socket and read only its initial SSE bytes."""
+    body = json.loads(_chat_payload(prompt, stream=True))
+    if surface == "messages":
+        body["max_tokens"] = 128
+    request = _raw_chat_request(engine.raw_key, json.dumps(body).encode())
+    if surface == "messages":
+        request = request.replace(b"/v1/chat/completions", b"/v1/messages", 1)
+    if keyed:
+        request = request.replace(
+            b"content-type:", f"Idempotency-Key: {prompt}\r\ncontent-type:".encode(), 1
+        )
+    client = socket.create_connection((_HOST, engine.port), timeout=5)
+    client.sendall(request)
+    received = b""
+    while b"\r\n\r\n" not in received or b"data:" not in received:
+        chunk = client.recv(4096)
+        assert chunk, received
+        received += chunk
+    header_text = received.split(b"\r\n\r\n", 1)[0].decode()
+    assert "200 OK" in header_text, received
+    request_id = next(
+        line.split(": ", 1)[1]
+        for line in header_text.split("\r\n")
+        if line.lower().startswith("x-request-id:")
+    )
+    return client, request_id, received
+
+
+def _abort(client: socket.socket) -> None:
+    """Force an RST so a legitimate write-side half-close cannot mask loss."""
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    client.close()
+
+
+def _attempt(engine: _ServingEngine, request_id: str) -> sqlite3.Row:
+    """Await exactly one durable terminal row without relying on sweep cleanup."""
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with sqlite3.connect(engine.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT * FROM gateway_attempts WHERE request_id = ?", (request_id,)
+            ).fetchall()
+        if len(rows) == 1 and rows[0]["terminal_at"] is not None:
+            return rows[0]
+        time.sleep(0.02)
+    pytest.fail(f"one terminal attempt missing for {request_id}")
+
+
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+@pytest.mark.parametrize("known", [False, True])
+def test_quiet_disconnect_closes_transport_before_settlement(
+    engine: _ServingEngine,
+    surface: str,
+    known: bool,
+) -> None:
+    """Cancel while next_event waits; retain the meter or honest unknown."""
+    prompt = f"quiet-{'known' if known else 'unknown'}-{surface}"
+    client, request_id, _ = _open_quiet(engine, prompt, surface=surface)
+    started = time.monotonic()
+    _abort(client)
+    assert _PROVIDER_CLOSED[prompt].wait(0.25), "provider socket outlived delayed settlement"
+    assert time.monotonic() - started < 0.3
+    row = _attempt(engine, request_id)
+    assert row["state"] == "cancelled"
+    assert row["failure_class"] == "cancelled"
+    assert row["input_tokens"] == (19 if known else None)
+    assert row["output_tokens"] == (7 if known else None)
+    assert row["usage_source"] == ("observed" if known else "unknown")
+    payloads = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
+    writes = [entry for entry in payloads if entry["request_id"] == request_id]
+    assert len(writes) == 1
+    assert writes[0]["dispatched"] is True
+    assert writes[0]["usage_incomplete_due_to_disconnect"] is True
+
+
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+def test_partial_meter_disconnect_preserves_unknown_output(
+    engine: _ServingEngine, surface: str
+) -> None:
+    """The real wire's input-only report cannot become free zero-output final usage."""
+    prompt = f"quiet-partial-{surface}"
+    client, request_id, _ = _open_quiet(engine, prompt, surface=surface)
+    _abort(client)
+    assert _PROVIDER_CLOSED[prompt].wait(0.25)
+    row = _attempt(engine, request_id)
+    assert row["state"] == "cancelled"
+    assert row["input_tokens"] == 19
+    assert row["output_tokens"] is None
+    assert row["estimated_cost_nano_usd"] is None
+    writes = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
+    own = [entry for entry in writes if entry["request_id"] == request_id]
+    assert len(own) == 1
+    assert own[0]["usage_incomplete_due_to_disconnect"] is True
+
+
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+def test_hidden_thinking_has_heartbeats_and_retains_input_meter(
+    engine: _ServingEngine,
+    surface: str,
+) -> None:
+    """Hidden thought and provider pings neither count as public tokens nor suppress heartbeats."""
+    prompt = f"hidden-pings-{surface}"
+    client, request_id, received = _open_quiet(engine, prompt, surface=surface)
+    try:
+        until = time.monotonic() + 3
+        while b": keepalive" not in received:
+            assert time.monotonic() < until
+            received += client.recv(4096)
+        assert b"private canary" not in received
+    finally:
+        _abort(client)
+    assert _PROVIDER_CLOSED[prompt].wait(0.25)
+    row = _attempt(engine, request_id)
+    assert row["state"] == "cancelled"
+    assert row["input_tokens"] == 19
+    assert row["output_tokens"] == 0
+    logs = engine.stderr_log.read_text()
+    assert '"usage_final":false' in logs
+    assert "private canary" not in logs
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor limits are unavailable")
+def test_provider_close_observation_handles_file_descriptors_above_select_limit(
+    engine: _ServingEngine,
+) -> None:
+    """The loopback fixture still witnesses cancellation after a long suite uses high FDs."""
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit < 1100:
+        pytest.skip("existing file descriptor limit leaves insufficient safe high-FD headroom")
+    descriptors: list[int] = []
+    client: socket.socket | None = None
+    try:
+        for _ in range(1050):
+            try:
+                descriptor = os.open(os.devnull, os.O_RDONLY)
+            except OSError:
+                pytest.skip("existing file descriptor availability cannot support bounded fixture")
+            descriptors.append(descriptor)
+            if descriptor >= 1030:
+                break
+        assert descriptors[-1] >= 1030
+        prompt = "quiet-unknown-high-fd"
+        client, request_id, received = _open_quiet(engine, prompt)
+        assert client.fileno() > 1024
+        while b"partial answer" not in received:
+            received += client.recv(4096)
+        _abort(client)
+        client = None
+        assert _PROVIDER_CLOSED[prompt].wait(0.25)
+        assert _attempt(engine, request_id)["state"] == "cancelled"
+    finally:
+        if client is not None:
+            client.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def test_anthropic_start_meter_survives_chat_disconnect(engine: _ServingEngine) -> None:
+    """Retain native provider start usage before a delayed terminal meter."""
+    prompt = "anthro-start-usage"
+    client, request_id, _ = _open_quiet(engine, prompt)
+    _abort(client)
+    assert _PROVIDER_CLOSED[prompt].wait(0.25)
+    row = _attempt(engine, request_id)
+    assert row["state"] == "cancelled"
+    assert row["input_tokens"] == 19
+    assert row["output_tokens"] == 0
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_preheaders_disconnect_preserves_observed_unknown_and_closes_socket(
+    engine: _ServingEngine,
+    known: bool,
+) -> None:
+    """Cancel initial request while its committed token and public headers are still pending."""
+    prompt = "beforeheaders-known" if known else "beforeheaders-no-token"
+    previous = set()
+    if engine.settlement_log.exists():
+        previous = {
+            json.loads(line)["request_id"]
+            for line in engine.settlement_log.read_text().splitlines()
+        }
+    cancelled_before = _terminal_attempts(engine, "cancelled")
+    client = socket.create_connection((_HOST, engine.port), timeout=5)
+    client.sendall(_raw_chat_request(engine.raw_key, _chat_payload(prompt, stream=True)))
+    opened = _PROVIDER_OPENED.setdefault(prompt, threading.Event())
+    assert opened.wait(2)
+    time.sleep(0.05)
+    _abort(client)
+    assert _PROVIDER_CLOSED[prompt].wait(0.25)
+    assert _await_cancelled_attempts(
+        engine, minimum=cancelled_before + 1, deadline=time.monotonic() + 2
+    )
+    payloads = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
+    current = [entry for entry in payloads if entry["request_id"] not in previous]
+    assert len(current) == 1
+    assert current[0]["dispatched"] is True
+    assert current[0]["usage_incomplete_due_to_disconnect"] is True
+    assert current[0]["usage"] == (
+        {
+            "input_tokens": 19,
+            "output_tokens": 7,
+            "cached_input_tokens": None,
+            "cache_creation_input_tokens": None,
+            "cache_creation_1h_input_tokens": None,
+            "reasoning_tokens": None,
+        }
+        if known
+        else None
+    )
+
+
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+def test_private_preheaders_disconnect_stops_uncommitted_provider(
+    engine: _ServingEngine,
+    surface: str,
+) -> None:
+    """Private progress stays uncommitted while caller loss still closes its transport."""
+    prompt = f"hidden-preheaders-{surface}"
+    previous = (
+        {json.loads(line)["request_id"] for line in engine.settlement_log.read_text().splitlines()}
+        if engine.settlement_log.exists()
+        else set()
+    )
+    body = json.loads(_chat_payload(prompt, stream=True))
+    body["max_tokens"] = 128
+    request = _raw_chat_request(engine.raw_key, json.dumps(body).encode())
+    if surface == "messages":
+        request = request.replace(b"/v1/chat/completions", b"/v1/messages", 1)
+    cancelled_before = _terminal_attempts(engine, "cancelled")
+    client = socket.create_connection((_HOST, engine.port), timeout=5)
+    try:
+        client.sendall(request)
+        assert _PROVIDER_OPENED.setdefault(prompt, threading.Event()).wait(2)
+        client.settimeout(0.05)
+        with pytest.raises(TimeoutError):
+            client.recv(1)
+    finally:
+        _abort(client)
+    assert _PROVIDER_CLOSED[prompt].wait(0.25)
+    assert _await_cancelled_attempts(
+        engine, minimum=cancelled_before + 1, deadline=time.monotonic() + 2
+    )
+    current = [
+        entry
+        for line in engine.settlement_log.read_text().splitlines()
+        if (entry := json.loads(line))["request_id"] not in previous
+    ]
+    assert len(current) == 1
+    assert current[0]["dispatched"] is True
+    assert current[0]["usage_incomplete_due_to_disconnect"] is True
+    assert current[0]["usage"]["input_tokens"] == 19
+    assert current[0]["usage"]["output_tokens"] == 0
+    assert _PROVIDER_CALLS[prompt] == 1
+    assert "private canary" not in engine.stderr_log.read_text()
+
+
+def test_repeated_partial_answer_drops_never_fabricate_final_usage(engine: _ServingEngine) -> None:
+    """Adversarial drops retain UNKNOWN; they require platform unresolved-budget protection."""
+    for index in range(3):
+        prompt = f"quiet-unknown-repeat-{index}"
+        client, request_id, received = _open_quiet(engine, prompt)
+        while b"usable partial answer" not in received:
+            received += client.recv(4096)
+        _abort(client)
+        assert _PROVIDER_CLOSED[prompt].wait(0.25)
+        row = _attempt(engine, request_id)
+        assert row["state"] == "cancelled"
+        assert row["usage_source"] == "unknown"
+        assert row["estimated_cost_nano_usd"] is None
+        assert _PROVIDER_CALLS[prompt] == 1
+        writes = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
+        own = [entry for entry in writes if entry["request_id"] == request_id]
+        assert len(own) == 1
+        assert own[0]["usage_incomplete_due_to_disconnect"] is True
+
+
+def test_keyed_retry_replays_one_completed_provider_without_heartbeats(
+    engine: _ServingEngine,
+) -> None:
+    """A lost keyed subscriber does not abandon the bounded owner or poison its replay."""
+    prompt = "keyed-finish"
+    client, request_id, received = _open_quiet(engine, prompt, keyed=True)
+    while b": keepalive" not in received:
+        received += client.recv(4096)
+    _abort(client)
+    headers = {"authorization": f"Bearer {engine.raw_key}", "Idempotency-Key": prompt}
+    retry = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers=headers,
+        content=_chat_payload(prompt, stream=True),
+        timeout=5,
+    )
+    assert retry.status_code == 200
+    assert "usable partial answer" in retry.text
+    assert "[DONE]" in retry.text
+    assert ": keepalive" not in retry.text
+    assert retry.headers["x-request-id"] == request_id
+    assert _PROVIDER_CALLS[prompt] == 1
+    row = _attempt(engine, request_id)
+    assert row["state"] == "completed"
+    again = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers=headers,
+        content=_chat_payload(prompt, stream=True),
+        timeout=5,
+    )
+    assert again.content == retry.content
+    assert _PROVIDER_CALLS[prompt] == 1
 
 
 def test_client_disconnect_mid_nonstreaming_request_settles_cancelled(
@@ -475,3 +947,40 @@ def test_stalled_reader_cannot_pin_the_gateway_past_the_deadline(
         assert settled, "stalled stream was not settled by the request deadline"
     finally:
         client.close()
+
+
+def test_heartbeat_keeps_original_provider_phase_timeout(engine: _ServingEngine) -> None:
+    """An idle read's 1.5-second limit is not restarted by its one-second heartbeat."""
+    started = time.monotonic()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        content=_chat_payload("quiet-short-phase", stream=True),
+        timeout=4,
+    )
+    elapsed = time.monotonic() - started
+    assert response.status_code == 200
+    assert ": keepalive" in response.text
+    assert "[DONE]" in response.text
+    assert elapsed < 2.6
+    assert _PROVIDER_CLOSED["quiet-short-phase"].is_set()
+
+
+def test_keyed_disconnected_owner_stays_deadline_bounded(engine: _ServingEngine) -> None:
+    """A silent keyed owner times out once and its retry never dispatches another provider."""
+    prompt = "keyed-stall"
+    client, request_id, _ = _open_quiet(engine, prompt, keyed=True)
+    _abort(client)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}", "Idempotency-Key": prompt},
+        content=_chat_payload(prompt, stream=True),
+        timeout=7,
+    )
+    assert response.status_code == 200
+    assert "[DONE]" in response.text
+    assert '"error"' in response.text
+    assert ": keepalive" not in response.text
+    assert _PROVIDER_CALLS[prompt] == 1
+    assert _PROVIDER_CLOSED[prompt].is_set()
+    assert _attempt(engine, request_id)["state"] == "failed"

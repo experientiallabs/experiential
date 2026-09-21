@@ -2287,7 +2287,7 @@ def _installed_release_driver() -> None:
             provider_model=provider_model,
             exact_model_id="project-exact-model",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=ModelCapabilities(maximum_output_tokens=32_000),
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(
                 # $1 / $2 per million tokens, in nano-USD.

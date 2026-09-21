@@ -104,7 +104,7 @@ def _configure_json_gateway(root: Path, provider: str, base_url: str) -> str:
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(),
         pricing_source=None,

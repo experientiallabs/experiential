@@ -49,6 +49,7 @@ def test_connection_us_geography_overrides_caller_on_every_surface(
         dialect="anthropic_messages",
         url="https://api.anthropic.com/v1/messages",
         model_id="claude-sonnet-4-6",
+        maximum_output_tokens=128_000,
         inference_geo="us",
     )
     assert dialect_stream_payload(profile, request)["inference_geo"] == "us"
@@ -67,6 +68,7 @@ def test_unrestricted_connection_preserves_caller_geography(caller: str | None) 
         dialect="anthropic_messages",
         url="https://api.anthropic.com/v1/messages",
         model_id="claude-sonnet-4-6",
+        maximum_output_tokens=128_000,
     )
     assert dialect_stream_payload(profile, request).get("inference_geo") == caller
 

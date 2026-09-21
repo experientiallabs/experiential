@@ -207,6 +207,10 @@ impl Normalizer {
         // The stop reason arrives in the following messageStop, so a fragment
         // left open by the output budget cannot be told from garbage yet.
         self.complete_tool_deferring_failure(index, &mut tool, &mut events);
+        if !tool.completed {
+            self.bedrock_empty_stopped_tools.insert(index);
+            self.tools.insert(index, tool);
+        }
         Ok(events)
     }
 
@@ -216,7 +220,36 @@ impl Normalizer {
         let usage = bedrock_usage(payload.get("usage")).map_err(|message| malformed(&message))?;
         let mut events = vec![Event::Usage(usage)];
         if let Some(reason) = self.stop_reason.take() {
-            events.push(self.bedrock_terminal(&reason));
+            let result = if matches!(
+                reason.as_str(),
+                "max_tokens" | "model_context_window_exceeded"
+            ) {
+                let result = super::finish_open_tools_truncated(&mut self.tools);
+                self.tools.clear();
+                result
+            } else {
+                self.bedrock_finish_empty_stopped_tools(&reason)
+            };
+            match result {
+                Ok(tool_events) => {
+                    events.extend(tool_events);
+                    events.push(self.bedrock_terminal(&reason));
+                }
+                Err(failure) => events.push(Event::Failed(failure)),
+            }
+        }
+        Ok(events)
+    }
+
+    /// Resolve only stopped, argument-free blocks after a normal final reason.
+    fn bedrock_finish_empty_stopped_tools(&mut self, reason: &str) -> Result<Vec<Event>, Failure> {
+        let mut events = Vec::new();
+        for index in std::mem::take(&mut self.bedrock_empty_stopped_tools) {
+            if let Some(mut tool) = self.tools.remove(&index) {
+                if matches!(reason, "end_turn" | "stop_sequence" | "tool_use") {
+                    super::complete_streamed_tool(index, &mut tool, &mut events)?;
+                }
+            }
         }
         Ok(events)
     }
@@ -276,6 +309,78 @@ mod bedrock_tests {
             &[(":message-type", "exception"), (":exception-type", name)],
             br#"{"message":"redacted"}"#,
         )
+    }
+
+    #[test]
+    fn bedrock_empty_stopped_tool_waits_for_final_reason() {
+        for reason in [
+            "tool_use",
+            "end_turn",
+            "max_tokens",
+            "model_context_window_exceeded",
+        ] {
+            for block_stop in [true, false] {
+                if !block_stop && matches!(reason, "tool_use" | "end_turn") {
+                    continue;
+                }
+                let mut chunks = vec![event(
+                    "contentBlockStart",
+                    &json!({
+                        "contentBlockIndex": 0,
+                        "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
+                    }),
+                )];
+                if block_stop {
+                    chunks.push(event("contentBlockStop", &json!({"contentBlockIndex": 0})));
+                }
+                let mut decoder = super::super::FrameDecoder::new(Dialect::BedrockConverseStream);
+                let mut normalizer = Normalizer::new(Dialect::BedrockConverseStream);
+                for chunk in &chunks {
+                    for frame in decoder.feed(chunk).unwrap() {
+                        let events = normalizer.feed(&frame).unwrap();
+                        assert!(
+                            !events.iter().any(|event| matches!(
+                                event,
+                                Event::ToolCallCompleted { .. } | Event::ToolArgumentsDelta { .. }
+                            )),
+                            "block stop does not authorize an empty-object seed"
+                        );
+                    }
+                }
+                chunks.push(event("messageStop", &json!({"stopReason": reason})));
+                chunks.push(event(
+                    "metadata",
+                    &json!({"usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 12}}),
+                ));
+                let (events, failure) = run_stream(&chunks);
+                assert!(failure.is_none(), "{failure:?}");
+                let truncated = matches!(reason, "max_tokens" | "model_context_window_exceeded");
+                assert_eq!(
+                    events.last().unwrap()["kind"],
+                    if truncated { "incomplete" } else { "completed" }
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["kind"] == "tool_call_completed")
+                        .count(),
+                    usize::from(!truncated)
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["kind"] == "tool_arguments_delta")
+                        .count(),
+                    usize::from(!truncated)
+                );
+                if !truncated {
+                    assert!(events
+                        .iter()
+                        .any(|event| event["kind"] == "tool_call_completed"
+                            && event["raw_arguments"] == "{}"));
+                }
+            }
+        }
     }
 
     #[test]

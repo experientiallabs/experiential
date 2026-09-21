@@ -76,7 +76,7 @@ def test_sdk_replays_signed_tool_id_through_native_gateway(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url=f"http://127.0.0.1:{provider.server_port}/v1",
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
     )
     gateway = _ServedGateway(tmp_path, _unused_port())
     try:

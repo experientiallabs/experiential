@@ -252,7 +252,9 @@ def test_responses_payload_keeps_json_object_format_beside_text_verbosity() -> N
 def test_anthropic_payload_carries_json_object_as_a_trailing_system_instruction() -> None:
     """Anthropic has no JSON mode: the caller's system prompt is preserved first and the
     JSON-object instruction is appended; no output_config schema is emitted."""
-    payload = anthropic_messages_stream_payload("claude", _json_object_request())
+    payload = anthropic_messages_stream_payload(
+        "claude", _json_object_request(), maximum_output_tokens=128_000
+    )
 
     assert payload["system"] == "You are terse.\n\n" + JSON_OBJECT_SYSTEM_INSTRUCTION
     assert "output_config" not in payload
@@ -264,7 +266,7 @@ def test_anthropic_payload_json_object_without_caller_system_prompt() -> None:
     request = _json_object_request().model_copy(
         update={"messages": (GatewayMessage(role="user", content="hello"),)}
     )
-    payload = anthropic_messages_stream_payload("claude", request)
+    payload = anthropic_messages_stream_payload("claude", request, maximum_output_tokens=128_000)
 
     assert payload["system"] == JSON_OBJECT_SYSTEM_INSTRUCTION
 
@@ -297,7 +299,10 @@ def test_json_object_mode_is_absent_from_every_dialect_without_the_flag() -> Non
 
     assert "response_format" not in openai_compatible_stream_payload("m", request)
     assert "text" not in openai_responses_stream_payload("m", request, supports_temperature=True)
-    assert anthropic_messages_stream_payload("m", request)["system"] == "You are terse."
+    assert (
+        anthropic_messages_stream_payload("m", request, maximum_output_tokens=128_000)["system"]
+        == "You are terse."
+    )
     gemini_generation = gemini_generate_content_stream_payload("m", request).get(
         "generationConfig", {}
     )
@@ -311,7 +316,12 @@ def test_json_object_mode_is_admitted_on_every_supported_dialect() -> None:
     Anthropic, Gemini, Bedrock and OpenAI-compatible rungs is fully compatible and the
     provider request keeps the mode."""
     profiles = (
-        GatewayWireProfile(dialect="anthropic_messages", url="https://a.test", model_id="claude"),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://a.test",
+            model_id="claude",
+            maximum_output_tokens=128_000,
+        ),
         GatewayWireProfile(dialect="gemini_generate_content", url="https://g.test", model_id="g"),
         GatewayWireProfile(dialect="bedrock_converse_stream", url="https://b.test", model_id="b"),
         GatewayWireProfile(dialect="openai_compatible", url="https://o.test", model_id="gpt"),
@@ -379,9 +389,7 @@ def test_anthropic_stream_payload_omits_logprobs_even_when_flagged() -> None:
     """Anthropic's native Messages lane never receives an OpenAI logprob field."""
     request = _chat_request().model_copy(update={"logprobs": True, "top_logprobs": 5})
     payload = anthropic_messages_stream_payload(
-        "claude-sonnet-5",
-        request,
-        supports_logprobs=True,
+        "claude-sonnet-5", request, supports_logprobs=True, maximum_output_tokens=128_000
     )
     assert "logprobs" not in payload
     assert "top_logprobs" not in payload
@@ -423,6 +431,7 @@ def test_haiku_multi_turn_budgeted_thinking_is_honored_end_to_end() -> None:
         request,
         supports_temperature=True,
         supports_reasoning=True,
+        maximum_output_tokens=128_000,
     )
     assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2_048}
     messages = payload["messages"]
@@ -456,6 +465,7 @@ def test_haiku_thinking_off_temperature_is_honored_under_the_srn_hatch() -> None
         provider,
         supports_temperature=True,
         supports_reasoning=True,
+        maximum_output_tokens=128_000,
     )
     assert payload["temperature"] == 0.5
 
@@ -485,9 +495,7 @@ def test_haiku_bare_effort_realizes_as_a_token_budget_at_the_payload_seam() -> N
         stream=True,
     )
     payload = anthropic_messages_stream_payload(
-        "claude-haiku-4-5",
-        request,
-        supports_reasoning=True,
+        "claude-haiku-4-5", request, supports_reasoning=True, maximum_output_tokens=128_000
     )
     assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
     assert "output_config" not in payload
@@ -498,6 +506,7 @@ def test_haiku_bare_effort_realizes_as_a_token_budget_at_the_payload_seam() -> N
         request.model_copy(update={"reasoning_effort": None}),
         supports_reasoning=True,
         reasoning_effort="medium",
+        maximum_output_tokens=128_000,
     )
     assert pinned["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
     assert "output_config" not in pinned
@@ -507,17 +516,18 @@ def test_haiku_bare_effort_realizes_as_a_token_budget_at_the_payload_seam() -> N
         "claude-haiku-4-5",
         request.model_copy(update={"reasoning_effort": "none"}),
         supports_reasoning=True,
+        maximum_output_tokens=128_000,
     )
     assert "thinking" not in off
 
-    # A ceiling too small for any legal budget keeps thinking off rather than
-    # emitting an illegal budget the provider would reject.
-    tight = anthropic_messages_stream_payload(
-        "claude-haiku-4-5",
-        request.model_copy(update={"maximum_output_tokens": 1_024}),
-        supports_reasoning=True,
-    )
-    assert "thinking" not in tight
+    # An explicit depth cannot silently disappear under an incompatible ceiling.
+    with pytest.raises(ProviderParameterError, match="Raise max_tokens above 1024"):
+        anthropic_messages_stream_payload(
+            "claude-haiku-4-5",
+            request.model_copy(update={"maximum_output_tokens": 1_024}),
+            supports_reasoning=True,
+            maximum_output_tokens=128_000,
+        )
 
 
 def test_haiku_caller_output_config_effort_is_stripped_at_the_payload_seam() -> None:
@@ -531,9 +541,7 @@ def test_haiku_caller_output_config_effort_is_stripped_at_the_payload_seam() -> 
         stream=True,
     )
     payload = anthropic_messages_stream_payload(
-        "claude-haiku-4-5",
-        request,
-        supports_reasoning=True,
+        "claude-haiku-4-5", request, supports_reasoning=True, maximum_output_tokens=128_000
     )
     # The depth intent rides the budget; the by-name-rejected key is gone and
     # unrelated output_config keys survive verbatim.
@@ -550,9 +558,7 @@ def test_haiku_caller_output_config_effort_is_stripped_at_the_payload_seam() -> 
         }
     )
     payload = anthropic_messages_stream_payload(
-        "claude-haiku-4-5",
-        future,
-        supports_reasoning=True,
+        "claude-haiku-4-5", future, supports_reasoning=True, maximum_output_tokens=128_000
     )
     assert "thinking" not in payload
     assert payload["output_config"] == {"effort": "hyperdrive"}
@@ -763,7 +769,9 @@ def test_a_mixed_route_keeps_tool_result_images_and_discloses_the_chat_fold() ->
         messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
     )
     profiles = (
-        GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),
+        GatewayWireProfile(
+            dialect="anthropic_messages", url="https://a.test", maximum_output_tokens=128_000
+        ),
         GatewayWireProfile(dialect="openai_compatible", url="https://b.test"),
     )
 
@@ -912,7 +920,11 @@ def test_an_all_anthropic_route_keeps_tool_result_images() -> None:
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
     )
-    profiles = (GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),)
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages", url="https://a.test", maximum_output_tokens=128_000
+        ),
+    )
 
     public_request, provider_request = route_generation_parameter_requests(profiles, request)
 
@@ -935,6 +947,7 @@ def test_route_accepts_reasoning_summary_on_native_anthropic() -> None:
             model_id="claude-opus-5",
             supports_reasoning=True,
             reasoning_wire_format="anthropic_adaptive",
+            maximum_output_tokens=128_000,
         ),
     )
 
@@ -943,9 +956,7 @@ def test_route_accepts_reasoning_summary_on_native_anthropic() -> None:
     assert public_request.reasoning_summary == "auto"
     assert provider_request.reasoning_summary == "auto"
     assert "reasoning" not in anthropic_messages_stream_payload(
-        "claude-opus-5",
-        provider_request,
-        supports_reasoning=True,
+        "claude-opus-5", provider_request, supports_reasoning=True, maximum_output_tokens=128_000
     )
 
 
@@ -964,6 +975,7 @@ def test_reasoning_summary_narrows_a_mixed_claude_waterfall() -> None:
             model_id="claude-opus-5",
             supports_reasoning=True,
             reasoning_wire_format="anthropic_adaptive",
+            maximum_output_tokens=128_000,
         ),
         GatewayWireProfile(
             dialect="openai_compatible",
@@ -1012,6 +1024,7 @@ def test_route_generation_controls_use_the_whole_waterfall_intersection(
             supports_top_k=False,
             supports_reasoning=True,
             reasoning_wire_format="anthropic_adaptive",
+            maximum_output_tokens=128_000,
         ),
     )
 
@@ -1417,7 +1430,10 @@ def test_non_strict_json_schema_narrows_away_from_a_schema_closing_rung() -> Non
         ),
     )
     anthropic = GatewayWireProfile(
-        dialect="anthropic_messages", url="https://a.test", model_id="claude"
+        dialect="anthropic_messages",
+        url="https://a.test",
+        model_id="claude",
+        maximum_output_tokens=128_000,
     )
     openai = GatewayWireProfile(dialect="openai_compatible", url="https://o.test", model_id="gpt")
 
@@ -1453,6 +1469,7 @@ def test_route_accepts_anthropic_max_effort_without_translation() -> None:
         model_id="claude-opus-5",
         supports_reasoning=True,
         reasoning_wire_format="anthropic_adaptive",
+        maximum_output_tokens=128_000,
     )
 
     public_request, provider_request = route_generation_parameter_requests((profile,), request)
@@ -1484,7 +1501,10 @@ def test_mixed_route_keeps_the_prompt_cache_marker_when_any_rung_is_anthropic() 
     uncached (~10x on a large system prompt)."""
     request = _chat_request().model_copy(update={"provider_cache_control": {"type": "ephemeral"}})
     anthropic = GatewayWireProfile(
-        dialect="anthropic_messages", url="https://a.test", model_id="claude-fable-5"
+        dialect="anthropic_messages",
+        url="https://a.test",
+        model_id="claude-fable-5",
+        maximum_output_tokens=128_000,
     )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://b.test")
 
@@ -1587,6 +1607,7 @@ def test_route_rejects_non_strict_schema_on_a_strict_only_provider() -> None:
                 GatewayWireProfile(
                     dialect="anthropic_messages",
                     url="https://provider.test",
+                    maximum_output_tokens=128_000,
                 ),
             ),
             request,
@@ -1740,6 +1761,7 @@ def test_genuinely_unsupported_sampling_drops_with_its_own_disclosure() -> None:
         url="https://provider.test",
         model_id="claude-constrained",
         supports_temperature=False,
+        maximum_output_tokens=128_000,
     )
     public_request, provider_request = route_generation_parameter_requests(
         (profile,), _chat_request(temperature=0.2)
@@ -1784,6 +1806,7 @@ def test_thinking_default_enable_reads_the_lane_default_before_the_lowest_tier()
         reasoning_wire_format="anthropic_adaptive",
         reasoning_effort="high",
         supported_reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+        maximum_output_tokens=128_000,
     )
     request = _chat_request().model_copy(update={"thinking_default_enable": True})
 
@@ -1867,6 +1890,7 @@ def test_chat_adaptive_thinking_dispatches_natively_on_a_mixed_claude_route() ->
             reasoning_effort="medium",
             reasoning_effort_required=True,
             supported_reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+            maximum_output_tokens=128_000,
         ),
         GatewayWireProfile(
             dialect="openai_compatible",
@@ -1893,6 +1917,7 @@ def test_chat_adaptive_thinking_dispatches_natively_on_a_mixed_claude_route() ->
         supports_temperature=True,
         supports_reasoning=True,
         reasoning_effort="medium",
+        maximum_output_tokens=128_000,
     )
     assert anthropic_payload["thinking"] == {"type": "adaptive"}
     assert anthropic_payload["output_config"] == {"effort": "medium"}
@@ -2118,26 +2143,25 @@ def test_route_rejects_output_ceiling_above_smallest_waterfall_limit(
     assert "maximum of 64000" in str(raised.value)
 
 
-def test_route_supplies_anthropic_required_max_tokens_within_every_rung_limit() -> None:
-    """An omitted public limit becomes one safe route-wide Anthropic default."""
-    request = _chat_request()
+def test_omitted_output_caps_are_independent_for_each_rung() -> None:
+    """An optional fallback never caps its selected Anthropic sibling."""
     profiles = (
         GatewayWireProfile(
-            dialect="anthropic_messages",
-            url="https://anthropic.test",
-            maximum_output_tokens=8_192,
+            dialect="anthropic_messages", url="https://a.test", maximum_output_tokens=128_000
         ),
         GatewayWireProfile(
-            dialect="openai_compatible",
-            url="https://fallback.test",
-            maximum_output_tokens=2_048,
+            dialect="anthropic_messages", url="https://b.test", maximum_output_tokens=2_048
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible", url="https://c.test", maximum_output_tokens=1_024
         ),
     )
-
-    public_request, provider_request = route_generation_parameter_requests(profiles, request)
-
-    assert public_request.maximum_output_tokens is None
-    assert provider_request.maximum_output_tokens == 2_048
+    public, provider = route_generation_parameter_requests(profiles, _chat_request())
+    assert public.maximum_output_tokens is None
+    assert provider.maximum_output_tokens is None
+    assert dialect_stream_payload(profiles[0], provider)["max_tokens"] == 128_000
+    assert dialect_stream_payload(profiles[1], provider)["max_tokens"] == 2_048
+    assert "max_tokens" not in dialect_stream_payload(profiles[2], provider)
 
 
 def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
@@ -2161,6 +2185,7 @@ def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
             model_id="claude-sonnet-4-6",
             supports_reasoning=True,
             reasoning_wire_format="anthropic_adaptive",
+            maximum_output_tokens=128_000,
         ),
         request,
     )
@@ -2187,7 +2212,11 @@ def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
 @pytest.mark.parametrize(
     "profile",
     (
-        GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            maximum_output_tokens=128_000,
+        ),
         GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test"),
         GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"),
         GatewayWireProfile(dialect="openai_compatible", url="https://compatible.test"),
@@ -2208,8 +2237,7 @@ def test_non_native_reasoning_profiles_never_emit_openai_reasoning_fields(
 def test_anthropic_messages_stream_payload_forwards_top_p() -> None:
     """Native Anthropic streaming preserves nucleus sampling on the Messages wire."""
     payload = anthropic_messages_stream_payload(
-        "exact-model",
-        _chat_request(top_p=1.0, temperature=0.2),
+        "exact-model", _chat_request(top_p=1.0, temperature=0.2), maximum_output_tokens=128_000
     )
 
     assert payload["stream"] is True
@@ -2219,7 +2247,9 @@ def test_anthropic_messages_stream_payload_forwards_top_p() -> None:
 
 def test_anthropic_messages_stream_payload_omits_absent_top_p() -> None:
     """Native Anthropic streaming does not invent a nucleus-sampling value."""
-    payload = anthropic_messages_stream_payload("exact-model", _chat_request())
+    payload = anthropic_messages_stream_payload(
+        "exact-model", _chat_request(), maximum_output_tokens=128_000
+    )
 
     assert "top_p" not in payload
     assert "temperature" not in payload
@@ -2247,9 +2277,7 @@ def test_anthropic_payload_merges_reasoning_schema_and_tool_controls() -> None:
     )
 
     payload = anthropic_messages_stream_payload(
-        "claude-opus-5",
-        request,
-        supports_reasoning=True,
+        "claude-opus-5", request, supports_reasoning=True, maximum_output_tokens=128_000
     )
 
     assert payload["tools"] == [
@@ -2285,7 +2313,9 @@ def test_anthropic_messages_stream_payload_round_trips_tool_error_state() -> Non
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("exact-model", request)
+    payload = anthropic_messages_stream_payload(
+        "exact-model", request, maximum_output_tokens=128_000
+    )
     messages = cast("list[dict[str, object]]", payload["messages"])
     blocks = cast("list[dict[str, object]]", messages[0]["content"])
     assert blocks[0] == {
@@ -2316,7 +2346,9 @@ def test_an_empty_assistant_text_never_reaches_the_anthropic_wire() -> None:
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("exact-model", request)
+    payload = anthropic_messages_stream_payload(
+        "exact-model", request, maximum_output_tokens=128_000
+    )
     messages = cast("list[dict[str, object]]", payload["messages"])
     blocks = cast("list[dict[str, object]]", messages[1]["content"])
     assert [block["type"] for block in blocks] == ["tool_use"]
@@ -2337,8 +2369,7 @@ def test_tool_error_state_folds_with_disclosure_off_the_anthropic_wire() -> None
         ),
     )
     anthropic = GatewayWireProfile(
-        dialect="anthropic_messages",
-        url="https://anthropic.test",
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
     )
 
     public_request, provider_request = route_generation_parameter_requests((anthropic,), request)
@@ -2366,7 +2397,9 @@ def test_gemini_stream_payload_matches_the_provider_client_builder() -> None:
     request = _chat_request(temperature=0.3)
     payload = gemini_generate_content_stream_payload("gemini-2.5-pro", request)
 
-    assert payload == gemini_generate_request("gemini-2.5-pro", model_request(request))
+    assert payload == gemini_generate_request(
+        "gemini-2.5-pro", model_request(request), default_maximum_output_tokens=None
+    )
     assert payload["contents"] == [{"role": "user", "parts": [{"text": "hello"}]}]
     generation = cast("dict[str, object]", payload["generationConfig"])
     assert isinstance(generation, dict)
@@ -2551,6 +2584,7 @@ def test_anthropic_payload_carries_verbatim_thinking_config_over_adaptive() -> N
         request,
         supports_reasoning=True,
         reasoning_effort="high",
+        maximum_output_tokens=128_000,
     )
     assert payload["thinking"] == config
     # The adaptive default and its effort stay off the wire under an
@@ -2562,6 +2596,7 @@ def test_anthropic_payload_carries_verbatim_thinking_config_over_adaptive() -> N
         _thinking_history_request(),
         supports_reasoning=True,
         reasoning_effort="high",
+        maximum_output_tokens=128_000,
     )
     assert adaptive["thinking"] == {"type": "adaptive"}
     assert adaptive["output_config"] == {"effort": "high"}
@@ -2569,7 +2604,9 @@ def test_anthropic_payload_carries_verbatim_thinking_config_over_adaptive() -> N
 
 def test_anthropic_payload_replays_thinking_blocks_first_and_verbatim() -> None:
     """Thinking history leads the assistant turn with byte-exact signatures."""
-    payload = anthropic_messages_stream_payload("claude-fable-5", _thinking_history_request())
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", _thinking_history_request(), maximum_output_tokens=128_000
+    )
     messages = cast(list[JsonObject], payload["messages"])
     assistant_blocks = cast(list[JsonObject], messages[1]["content"])
     assert assistant_blocks[0] == {
@@ -2591,6 +2628,7 @@ def test_route_shaping_rejects_thinking_by_name_so_admission_can_coerce() -> Non
         dialect="anthropic_messages",
         url="https://anthropic.test",
         reasoning_wire_format="anthropic_adaptive",
+        maximum_output_tokens=128_000,
     )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
 
@@ -2881,7 +2919,9 @@ def test_union_tool_schemas_are_reshaped_on_anthropic_rungs_and_disclosed() -> N
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     tools = cast(list[JsonObject], payload["tools"])
     assert tools[0]["input_schema"] == {
         "type": "object",
@@ -2892,7 +2932,9 @@ def test_union_tool_schemas_are_reshaped_on_anthropic_rungs_and_disclosed() -> N
     responses_tools = cast(list[JsonObject], responses["tools"])
     assert responses_tools[0]["parameters"] == union
 
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
     public, _provider = route_generation_parameter_requests((anthropic,), request)
     assert "tools[0].parameters->reshaped(top_level_combinator_flattened)" in (
         public.ignored_parameters
@@ -2922,7 +2964,9 @@ def test_anthropic_tools_omit_an_absent_description() -> None:
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     tools = cast(list[JsonObject], payload["tools"])
     assert "description" not in tools[0]
     assert tools[1]["description"] == "Look up."
@@ -2948,30 +2992,32 @@ def _anthropic_profile(model_id: str) -> GatewayWireProfile:
         supports_reasoning=True,
         reasoning_wire_format="anthropic_adaptive",
         reasoning_effort="medium",
+        maximum_output_tokens=128_000,
     )
 
 
-def test_enabled_thinking_translates_to_adaptive_on_adaptive_only_models() -> None:
-    """The adaptive-only generation rejects caller enabled configs, so the
-    route translates to adaptive and DISCLOSES the dropped token budget
-    instead of silently mapping or silently failing."""
-    request = _thinking_config_request({"type": "enabled", "budget_tokens": 2048})
+def test_bare_enabled_thinking_translates_to_adaptive_without_a_budget_promise() -> None:
+    """A bare enable chooses native adaptive mode without discarding a hard budget."""
+    request = _thinking_config_request({"type": "enabled"})
     public, provider = route_generation_parameter_requests(
         (_anthropic_profile("claude-fable-5"),), request
     )
-    assert "thinking.budget_tokens" in public.ignored_parameters
+    assert "thinking.type->adaptive" in public.ignored_parameters
     assert provider.provider_thinking_config == {"type": "adaptive"}
     payload = anthropic_messages_stream_payload(
         "claude-fable-5",
         provider,
         supports_reasoning=True,
         reasoning_effort="medium",
+        maximum_output_tokens=128_000,
     )
     assert payload["thinking"] == {"type": "adaptive"}
     assert payload["output_config"] == {"effort": "medium"}
     # The translation stays explicit on routes that pin no effort, so the
     # caller's request to think never degrades to an implicit provider default.
-    bare = anthropic_messages_stream_payload("claude-fable-5", provider)
+    bare = anthropic_messages_stream_payload(
+        "claude-fable-5", provider, maximum_output_tokens=128_000
+    )
     assert bare["thinking"] == {"type": "adaptive"}
     assert "output_config" not in bare
 
@@ -2990,6 +3036,7 @@ def test_enabled_thinking_stays_verbatim_on_budget_capable_models() -> None:
         provider,
         supports_reasoning=True,
         reasoning_effort="medium",
+        maximum_output_tokens=128_000,
     )
     assert payload["thinking"] == config
 
@@ -3000,7 +3047,7 @@ def test_disabled_thinking_rejects_by_name_on_adaptive_only_models() -> None:
     explicitly disabled."""
     request = _thinking_config_request({"type": "disabled"})
     with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests((_anthropic_profile("claude-sonnet-5"),), request)
+        route_generation_parameter_requests((_anthropic_profile("claude-fable-5-1"),), request)
     assert raised.value.param == "thinking.type"
     assert raised.value.code == "unsupported_parameter"
 
@@ -3039,7 +3086,9 @@ def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() ->
         include_usage=True,
     )
 
-    anthropic_payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    anthropic_payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     messages = cast(list[JsonObject], anthropic_payload["messages"])
     blocks = cast(list[JsonObject], messages[1]["content"])
     assert "cache_control" not in blocks[0]
@@ -3059,7 +3108,13 @@ def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() ->
         in public.ignored_parameters
     )
     anthropic_public, _provider = route_generation_parameter_requests(
-        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"),),
+        (
+            GatewayWireProfile(
+                dialect="anthropic_messages",
+                url="https://anthropic.test",
+                maximum_output_tokens=128_000,
+            ),
+        ),
         request,
     )
     assert not any("cache_control" in path for path in anthropic_public.ignored_parameters)
@@ -3094,7 +3149,9 @@ def test_context_management_forwards_on_anthropic_and_discloses_elsewhere() -> N
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     assert payload["context_management"] == config
 
     headers = anthropic_request_headers({"x-api-key": "k"}, request)
@@ -3110,7 +3167,9 @@ def test_context_management_forwards_on_anthropic_and_discloses_elsewhere() -> N
     )
     assert "anthropic-beta" not in bare
 
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
     public, provider = route_generation_parameter_requests((anthropic,), request)
     assert "context_management" not in public.ignored_parameters
@@ -3133,7 +3192,10 @@ def test_tool_names_the_anthropic_wire_rejects_narrow_out_before_dispatch() -> N
         }
     )
     anthropic = GatewayWireProfile(
-        dialect="anthropic_messages", url="https://anthropic.test", model_id="claude-sonnet-4-5"
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-sonnet-4-5",
+        maximum_output_tokens=128_000,
     )
     bedrock = GatewayWireProfile(
         dialect="bedrock_converse_stream",
@@ -3164,7 +3226,10 @@ def test_assistant_prefill_narrows_out_rungs_whose_model_rejects_it() -> None:
         include_usage=True,
     )
     rejecting = GatewayWireProfile(
-        dialect="anthropic_messages", url="https://anthropic.test", model_id="claude-opus-5"
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-opus-5",
+        maximum_output_tokens=128_000,
     )
     bedrock = GatewayWireProfile(
         dialect="bedrock_converse_stream",
@@ -3177,7 +3242,10 @@ def test_assistant_prefill_narrows_out_rungs_whose_model_rejects_it() -> None:
         model_id="anthropic/claude-opus-5",
     )
     accepting = GatewayWireProfile(
-        dialect="anthropic_messages", url="https://anthropic.test", model_id="claude-sonnet-4-5"
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-sonnet-4-5",
+        maximum_output_tokens=128_000,
     )
     for profile in (rejecting, bedrock, relayed):
         with pytest.raises(ProviderParameterError) as prefill:
@@ -3218,7 +3286,9 @@ def test_mid_conversation_system_stays_positional_on_capable_wires() -> None:
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     assert payload["system"] == "lead instructions"
     # The mid-conversation instruction merges into the adjacent user turn.
     assert payload["messages"] == [
@@ -3253,7 +3323,9 @@ def test_mid_conversation_system_stays_positional_on_capable_wires() -> None:
         {"role": "user", "content": [{"text": "hi\n\nanswer in uppercase"}]},
     ]
 
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
     gemini = GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test")
     bedrock = GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test")
     # The route is served, not refused (1,747 requests in the seven days to
@@ -3282,7 +3354,11 @@ def test_output_config_seeds_the_payload_and_engine_keys_fill_gaps() -> None:
         include_usage=True,
     )
     payload = anthropic_messages_stream_payload(
-        "claude-fable-5", caller, supports_reasoning=True, reasoning_effort="low"
+        "claude-fable-5",
+        caller,
+        supports_reasoning=True,
+        reasoning_effort="low",
+        maximum_output_tokens=128_000,
     )
     # Caller effort survives verbatim over the catalog-pinned "low".
     assert payload["output_config"] == {"effort": "high", "future_key": 1}
@@ -3296,7 +3372,11 @@ def test_output_config_seeds_the_payload_and_engine_keys_fill_gaps() -> None:
         include_usage=True,
     )
     filled = anthropic_messages_stream_payload(
-        "claude-fable-5", pinned_only, supports_reasoning=True, reasoning_effort="low"
+        "claude-fable-5",
+        pinned_only,
+        supports_reasoning=True,
+        reasoning_effort="low",
+        maximum_output_tokens=128_000,
     )
     assert filled["output_config"] == {"future_key": 1, "effort": "low"}
 
@@ -3310,6 +3390,7 @@ def test_output_config_discloses_on_routes_that_cannot_honor_it() -> None:
         model_id="claude-fable-5",
         supports_reasoning=True,
         reasoning_wire_format="anthropic_adaptive",
+        maximum_output_tokens=128_000,
     )
     fallback = GatewayWireProfile(
         dialect="openai_compatible",
@@ -3446,7 +3527,9 @@ def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     assert payload["diagnostics"] == {"previous_message_id": "msg_prior"}
     assert payload["speed"] == "fast"
 
@@ -3456,7 +3539,9 @@ def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere
         f"{ANTHROPIC_DIAGNOSTICS_BETA},{ANTHROPIC_FAST_MODE_BETA}"
     )
 
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
     public, provider = route_generation_parameter_requests((anthropic,), request)
     assert public.ignored_parameters == ()
@@ -3507,7 +3592,9 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
         include_usage=True,
     )
 
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     tool = cast(list[JsonObject], payload["tools"])[0]
     assert tool["cache_control"] == {"type": "ephemeral"}
     assert tool["eager_input_streaming"] is True
@@ -3539,7 +3626,9 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     ):
         assert marker not in serialized
 
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
     public, provider = route_generation_parameter_requests((anthropic,), request)
     assert public.ignored_parameters == ()
@@ -3606,6 +3695,7 @@ def _anthropic_web_search_profile(url: str = "https://anthropic.test") -> Gatewa
         url=url,
         model_id="claude-haiku-4-5",
         reasoning_wire_format="anthropic_adaptive",
+        maximum_output_tokens=128_000,
     )
 
 
@@ -3658,7 +3748,9 @@ def test_anthropic_payload_appends_server_tools_verbatim_after_custom_tools() ->
             "tools": (GatewayToolDefinition(name="Bash", parameters={"type": "object"}),),
         }
     )
-    payload = anthropic_messages_stream_payload("claude-haiku-4-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", request, maximum_output_tokens=128_000
+    )
     assert payload["tools"] == [
         {"name": "Bash", "input_schema": {"type": "object"}},
         {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
@@ -3668,7 +3760,9 @@ def test_anthropic_payload_appends_server_tools_verbatim_after_custom_tools() ->
 
 def test_anthropic_payload_serves_a_server_tool_only_toolset() -> None:
     """A request whose only tools are server tools still sends a tools array."""
-    payload = anthropic_messages_stream_payload("claude-haiku-4-5", _web_search_messages_request())
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", _web_search_messages_request(), maximum_output_tokens=128_000
+    )
     assert payload["tools"] == [
         {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
     ]
@@ -3697,7 +3791,9 @@ def test_anthropic_payload_reemits_echoed_server_blocks_in_order() -> None:
         + request.messages[2:]
     )
     payload = anthropic_messages_stream_payload(
-        "claude-haiku-4-5", request.model_copy(update={"messages": messages})
+        "claude-haiku-4-5",
+        request.model_copy(update={"messages": messages}),
+        maximum_output_tokens=128_000,
     )
     wire_messages = cast(list[JsonObject], payload["messages"])
     assert [message["role"] for message in wire_messages] == ["user", "assistant", "user"]
@@ -3757,7 +3853,9 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     # The canonical blank-line separator folds into the following block
     # (the provider rejects whitespace-only blocks), so the system TEXT
     # equals the unmarked join with markers on their blocks.
@@ -3784,12 +3882,16 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
         stream=True,
         include_usage=True,
     )
-    plain_payload = anthropic_messages_stream_payload("claude-fable-5", plain)
+    plain_payload = anthropic_messages_stream_payload(
+        "claude-fable-5", plain, maximum_output_tokens=128_000
+    )
     assert plain_payload["system"] == "a\n\nb"
     plain_messages = cast(list[JsonObject], plain_payload["messages"])
     assert plain_messages[0]["content"] == [{"type": "text", "text": "hi"}]
 
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
     mixed_public, mixed_provider = route_generation_parameter_requests(
         (anthropic, fallback), request
@@ -3826,7 +3928,9 @@ def test_litellm_provider_specific_fields_are_dropped_with_disclosure_on_every_r
         ),
     )
     compatible = GatewayWireProfile(dialect="openai_compatible", url="https://hy4.test")
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
     for profiles in ((compatible,), (anthropic,), (compatible, anthropic)):
         public, provider = route_generation_parameter_requests(profiles, stamped)
         assert "messages.provider_specific_fields" in public.ignored_parameters
@@ -3913,7 +4017,9 @@ def test_block_cache_markers_survive_a_multimodal_user_turn() -> None:
         stream=True,
         include_usage=True,
     )
-    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request, maximum_output_tokens=128_000
+    )
     messages = cast(list[JsonObject], payload["messages"])
     assert messages[0]["content"] == [
         {"type": "text", "text": "context"},
@@ -3963,8 +4069,12 @@ def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:
             include_usage=True,
         )
 
-    unmarked_payload = anthropic_messages_stream_payload("claude-fable-5", request(False))
-    marked_payload = anthropic_messages_stream_payload("claude-fable-5", request(True))
+    unmarked_payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request(False), maximum_output_tokens=128_000
+    )
+    marked_payload = anthropic_messages_stream_payload(
+        "claude-fable-5", request(True), maximum_output_tokens=128_000
+    )
     unmarked_system = cast(str, unmarked_payload["system"])
     marked_system = cast(list[JsonObject], marked_payload["system"])
     assert "".join(str(block["text"]) for block in marked_system) == unmarked_system
@@ -4168,7 +4278,9 @@ def test_wires_without_a_video_carrier_narrow_past_the_rung() -> None:
             reasoning_effort=None,
         )
     with pytest.raises(ProviderCapabilityError, match="video_input"):
-        anthropic_messages_stream_payload("claude-fable-5", _video_request())
+        anthropic_messages_stream_payload(
+            "claude-fable-5", _video_request(), maximum_output_tokens=128_000
+        )
 
 
 _PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
@@ -4252,7 +4364,9 @@ def test_openai_responses_payload_carries_input_file_parts_in_caller_order() -> 
 def test_anthropic_payload_carries_document_blocks_in_caller_order() -> None:
     """The Messages wire carries each PDF as a ``document`` block at its position."""
     payload = anthropic_messages_stream_payload(
-        "claude-fable-5", _document_request(GatewayApiSurface.MESSAGES)
+        "claude-fable-5",
+        _document_request(GatewayApiSurface.MESSAGES),
+        maximum_output_tokens=128_000,
     )
     messages = cast(list[JsonObject], payload["messages"])
     assert messages[0]["content"] == [
@@ -4370,7 +4484,9 @@ def test_wires_without_an_audio_carrier_narrow_past_the_rung() -> None:
             reasoning_effort=None,
         )
     with pytest.raises(ProviderCapabilityError, match="audio_input"):
-        anthropic_messages_stream_payload("claude-fable-5", _audio_request())
+        anthropic_messages_stream_payload(
+            "claude-fable-5", _audio_request(), maximum_output_tokens=128_000
+        )
     with pytest.raises(ProviderCapabilityError, match="audio_input"):
         bedrock_converse_stream_payload("us.amazon.nova-lite-v1:0", _audio_request())
 
@@ -4420,6 +4536,7 @@ def test_service_tier_declines_dialects_without_a_wire_field(dialect: str) -> No
         dialect=dialect,
         url="https://provider.test",
         model_id="model-x",
+        maximum_output_tokens=128_000,
     )
     request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS)
 
@@ -4461,6 +4578,7 @@ def test_service_tier_route_shaping_forwards_on_byok_and_discloses_elsewhere() -
         dialect="anthropic_messages",
         url="https://anthropic.test",
         billing_customer_managed=True,
+        maximum_output_tokens=128_000,
     )
     foreign_public, foreign_provider = route_generation_parameter_requests(
         (anthropic_byok,), request
@@ -4538,9 +4656,10 @@ def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> No
     anthropic = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
-        model_id="claude-opus-5",
+        model_id="claude-fable-5-1",
         supports_reasoning=True,
         reasoning_wire_format="anthropic_adaptive",
+        maximum_output_tokens=128_000,
     )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
     request = _thinking_history_request().model_copy(
@@ -4716,6 +4835,7 @@ def test_a_failed_tool_result_stays_a_native_flag_on_an_anthropic_route() -> Non
         dialect="anthropic_messages",
         url="https://api.anthropic.com/v1/messages",
         model_id="claude-opus-5",
+        maximum_output_tokens=128_000,
     )
     public, provider = route_generation_parameter_requests((profile,), _tool_error_request())
 
@@ -4750,17 +4870,13 @@ def test_the_tool_error_fold_never_accumulates_across_replays() -> None:
     assert rendered.count("[tool error] [tool error] exit 1") == 1
 
 
-def test_a_messages_probe_below_the_openai_floor_rides_the_floor() -> None:
-    """Claude Code's max_tokens:1 probe serves instead of a provider 400."""
-    profile = _openai_reasoning_profile()
-    public, provider = route_generation_parameter_requests(
-        (profile,), _messages_request(maximum_output_tokens=1)
-    )
-
-    assert provider.maximum_output_tokens == 16
-    assert "max_tokens->16" in public.ignored_parameters
-    payload = dialect_stream_payload(profile, provider)
-    assert payload["max_output_tokens"] == 16
+def test_a_messages_probe_below_the_openai_floor_is_rejected() -> None:
+    """The gateway never increases an explicit ceiling, even for a tiny probe."""
+    with pytest.raises(ProviderParameterError, match="must be at least 16") as raised:
+        route_generation_parameter_requests(
+            (_openai_reasoning_profile(),), _messages_request(maximum_output_tokens=1)
+        )
+    assert raised.value.param == "max_tokens"
 
 
 def test_the_openai_floor_leaves_anthropic_routes_and_other_surfaces_alone() -> None:
@@ -4769,6 +4885,7 @@ def test_the_openai_floor_leaves_anthropic_routes_and_other_surfaces_alone() -> 
         dialect="anthropic_messages",
         url="https://api.anthropic.com/v1/messages",
         model_id="claude-opus-5",
+        maximum_output_tokens=128_000,
     )
     _public, provider = route_generation_parameter_requests(
         (anthropic,), _messages_request(maximum_output_tokens=1)
@@ -4859,7 +4976,9 @@ def test_plaintext_reasoning_replays_only_on_an_exposing_rung() -> None:
     assert isinstance(omitted_messages, list)
     assert "reasoning_content" not in omitted_messages[1]
     # Other wires drop the block instead of raising; narrowing disclosed it.
-    anthropic = anthropic_messages_stream_payload("claude-haiku-4-5", request)
+    anthropic = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", request, maximum_output_tokens=128_000
+    )
     anthropic_messages = anthropic["messages"]
     assert isinstance(anthropic_messages, list)
     assert anthropic_messages[1]["content"] == [{"type": "text", "text": '{"command": "ls"}'}]
@@ -5052,8 +5171,11 @@ def test_route_rejects_max_output_tokens_below_the_responses_minimum() -> None:
     assert public.ignored_parameters == ()
 
     # A mixed route keeps dispatching: the bound is OpenAI's, not the route's.
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://a.test")
-    public, _provider = route_generation_parameter_requests((responses, anthropic), request)
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://a.test", maximum_output_tokens=128_000
+    )
+    assert compatible_generation_parameter_profile_indexes((responses, anthropic), request) == (1,)
+    public, _provider = route_generation_parameter_requests((anthropic,), request)
     assert public.ignored_parameters == ()
 
 
@@ -5241,7 +5363,9 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
         stream=True,
         include_usage=True,
     )
-    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://a.test")
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://a.test", maximum_output_tokens=128_000
+    )
     with pytest.raises(ProviderParameterError) as rejected:
         route_generation_parameter_requests((anthropic,), request)
     assert rejected.value.param == "messages"
@@ -5292,140 +5416,87 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
     assert public.ignored_parameters == ()
 
 
-def test_a_declared_lane_minimum_floors_the_chat_wire_with_disclosure() -> None:
-    """A rung that declares ``minimum_output_tokens`` floors a smaller Chat
-    ceiling on its own wire, with the same disclosure the OpenAI translation
-    floor carries, instead of dispatching the value the provider 400s
-    ("Perplexity: max_tokens must be at least 16", 30-day ledger: every sonar
-    and fugu alias, 6-8 distinct orgs each)."""
+@pytest.mark.parametrize("surface", tuple(GatewayApiSurface))
+def test_a_declared_lane_minimum_rejects_without_raising_the_cap(
+    surface: GatewayApiSurface,
+) -> None:
+    """A declared floor rejects the caller's exact budget on every surface."""
     request = GatewayRequest(
-        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        surface=surface,
         messages=(GatewayMessage(role="user", content="hi"),),
         maximum_output_tokens=12,
         maximum_output_tokens_parameter="max_tokens",
-        stream=True,
-        include_usage=True,
     )
-    sonar = GatewayWireProfile(
-        dialect="openai_compatible",
-        url="https://openrouter.ai/api/v1/chat/completions",
-        model_id="perplexity/sonar",
-        minimum_output_tokens=16,
+    profile = GatewayWireProfile(
+        dialect="openai_compatible", url="https://p.test", minimum_output_tokens=16
     )
-    public, provider = route_generation_parameter_requests((sonar,), request)
-    assert provider.maximum_output_tokens == 16
-    assert public.ignored_parameters == ("max_tokens->16",)
-    payload = dialect_stream_payload(sonar, provider)
-    assert payload["max_tokens"] == 16
-
-    # The Messages surface floors identically (one contract on both wires),
-    # and the disclosure names the caller's own parameter.
+    with pytest.raises(ProviderParameterError, match="must be at least 16"):
+        route_generation_parameter_requests((profile,), request)
     public, provider = route_generation_parameter_requests(
-        (sonar,), _messages_request(maximum_output_tokens=1)
+        (profile,), request.model_copy(update={"maximum_output_tokens": 16})
     )
-    assert provider.maximum_output_tokens == 16
-    assert "max_tokens->16" in public.ignored_parameters
-
-    # A value at or above the floor is untouched and undisclosed.
-    at_floor = request.model_copy(update={"maximum_output_tokens": 16})
-    public, provider = route_generation_parameter_requests((sonar,), at_floor)
     assert provider.maximum_output_tokens == 16
     assert public.ignored_parameters == ()
 
 
-def test_the_route_floors_to_the_largest_declared_minimum() -> None:
-    """A waterfall floors once, to the largest minimum any rung declares, so
-    no rung dispatches a ceiling it would refuse; an undeclared sibling keeps
-    riding the floored value (it accepts every ceiling)."""
-    request = GatewayRequest(
-        surface=GatewayApiSurface.CHAT_COMPLETIONS,
-        messages=(GatewayMessage(role="user", content="hi"),),
-        maximum_output_tokens=4,
-        maximum_output_tokens_parameter="max_completion_tokens",
-        stream=True,
+def test_output_floor_selection_keeps_a_rung_that_honors_the_small_cap() -> None:
+    """An unsupported floor narrows out instead of expanding every rung's cap."""
+    request = _chat_request().model_copy(
+        update={
+            "maximum_output_tokens": 4,
+            "maximum_output_tokens_parameter": "max_completion_tokens",
+        }
     )
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test")
     floored = GatewayWireProfile(
-        dialect="openai_compatible", url="https://a.test", minimum_output_tokens=16
+        dialect="openai_compatible", url="https://floor.test", minimum_output_tokens=16
     )
     higher = GatewayWireProfile(
-        dialect="bedrock_converse_stream", url="https://b.test", minimum_output_tokens=32
+        dialect="bedrock_converse_stream", url="https://high.test", minimum_output_tokens=32
     )
-    plain = GatewayWireProfile(dialect="openai_compatible", url="https://c.test")
-    public, provider = route_generation_parameter_requests((plain, floored, higher), request)
-    assert provider.maximum_output_tokens == 32
-    assert public.ignored_parameters == ("max_completion_tokens->32",)
-
-    # A route whose declared output ceiling sits below the floor cannot ride
-    # it: the gateway never dispatches above a rung's declared capability, so
-    # the caller value stands and the provider's own rejection follows.
+    assert compatible_generation_parameter_profile_indexes((plain, floored, higher), request) == (
+        0,
+    )
+    public, provider = route_generation_parameter_requests((plain,), request)
+    assert provider.maximum_output_tokens == 4
+    assert public.ignored_parameters == ()
     capped = GatewayWireProfile(
         dialect="openai_compatible",
-        url="https://d.test",
+        url="https://bad.test",
         minimum_output_tokens=16,
         maximum_output_tokens=8,
     )
-    public, provider = route_generation_parameter_requests((capped,), request)
-    assert provider.maximum_output_tokens == 4
-    assert public.ignored_parameters == ()
+    with pytest.raises(ProviderParameterError, match="must be at least 16"):
+        route_generation_parameter_requests((capped,), request)
 
 
-def test_a_declared_minimum_never_floors_a_native_responses_route() -> None:
-    """A Responses caller below the surface's own minimum keeps the named
-    admission rejection even when the Responses rung declares a floor: sub-16
-    is invalid on that surface, so the lane fact must not turn a contract
-    error into a silent rewrite. A Responses value on a COMPATIBLE rung that
-    declares the floor still rides it (the provider's refusal, not the
-    surface's)."""
+@pytest.mark.parametrize("dialect", ("openai_responses", "openai_compatible"))
+def test_a_responses_ceiling_below_a_declared_floor_is_never_increased(dialect: str) -> None:
+    """Both native and translated Responses preserve the caller's budget authority."""
     request = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
         messages=(GatewayMessage(role="user", content="hi"),),
         maximum_output_tokens=1,
         maximum_output_tokens_parameter="max_output_tokens",
-        stream=True,
     )
-    responses_rung = GatewayWireProfile(
-        dialect="openai_responses", url="https://openai.test", minimum_output_tokens=16
-    )
-    with pytest.raises(ProviderParameterError, match="must be at least 16"):
-        route_generation_parameter_requests((responses_rung,), request)
-
-    compatible_rung = GatewayWireProfile(
-        dialect="openai_compatible", url="https://relay.test", minimum_output_tokens=16
-    )
-    public, provider = route_generation_parameter_requests((compatible_rung,), request)
-    assert provider.maximum_output_tokens == 16
-    assert "max_output_tokens->16" in public.ignored_parameters
+    profile = GatewayWireProfile(dialect=dialect, url="https://p.test", minimum_output_tokens=16)
+    with pytest.raises(ProviderParameterError, match="must be at least 16") as raised:
+        route_generation_parameter_requests((profile,), request)
+    assert raised.value.param == "max_output_tokens"
 
 
-def test_chat_surface_sub_16_output_ceiling_rides_the_openai_floor() -> None:
-    """A Chat-surface max_tokens below OpenAI's minimum translated onto an
-    OpenAI rung rides the disclosed 16-token floor (the Messages-surface
-    contract), instead of dispatching a value the provider 400s opaquely
-    post-commit (2026-09-05 stragglers)."""
-    request = GatewayRequest(
-        surface=GatewayApiSurface.CHAT_COMPLETIONS,
-        messages=(GatewayMessage(role="user", content="hi"),),
-        maximum_output_tokens=1,
-        maximum_output_tokens_parameter="max_tokens",
-        stream=True,
-        include_usage=True,
+@pytest.mark.parametrize("parameter", ("max_tokens", "max_completion_tokens"))
+def test_chat_sub_16_ceiling_narrows_away_from_the_responses_wire(parameter: str) -> None:
+    """A chat rung that accepts one token wins over a Responses minimum of 16."""
+    request = _chat_request().model_copy(
+        update={"maximum_output_tokens": 1, "maximum_output_tokens_parameter": parameter}
     )
-    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
-    chat_rung = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
-    # The floor applies on all-OpenAI routes AND mixed OpenAI routes, so no
-    # rung dispatches the sub-minimum value.
-    for route in ((responses,), (responses, chat_rung)):
-        public, provider = route_generation_parameter_requests(route, request)
-        assert provider.maximum_output_tokens == 16
-        assert "max_tokens->16" in public.ignored_parameters
-
-    # The disclosure names the caller's own parameter.
-    completion_request = request.model_copy(
-        update={"maximum_output_tokens_parameter": "max_completion_tokens"}
-    )
-    public, provider = route_generation_parameter_requests((responses,), completion_request)
-    assert provider.maximum_output_tokens == 16
-    assert "max_completion_tokens->16" in public.ignored_parameters
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://responses.test")
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    assert compatible_generation_parameter_profile_indexes((responses, chat), request) == (1,)
+    with pytest.raises(ProviderParameterError, match="must be at least 16") as raised:
+        route_generation_parameter_requests((responses,), request)
+    assert raised.value.param == parameter
 
 
 def test_a_tool_result_name_is_undisclosed_on_openai_wire_routes() -> None:
@@ -5468,7 +5539,9 @@ def test_a_tool_result_name_drops_with_disclosure_off_the_openai_wires() -> None
     )
     profiles = (
         GatewayWireProfile(dialect="openai_compatible", url="https://c.test"),
-        GatewayWireProfile(dialect="anthropic_messages", url="https://a.test"),
+        GatewayWireProfile(
+            dialect="anthropic_messages", url="https://a.test", maximum_output_tokens=128_000
+        ),
     )
 
     public_request, _provider = route_generation_parameter_requests(profiles, request)
@@ -5559,7 +5632,7 @@ def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_ro
     Anthropic rejects ``{type: enabled}`` without a budget (minimum 1024, below
     max_tokens), so a budgeted-only Anthropic route fills the same derived
     budget the adaptive->enabled translation uses and discloses the fill; with
-    no legal budget under the ceiling the config drops with disclosure.
+    no legal budget under the ceiling the request is refused before dispatch.
     """
     haiku = _anthropic_profile("claude-haiku-4-5")
     public, provider = route_generation_parameter_requests(
@@ -5568,11 +5641,11 @@ def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_ro
     assert provider.provider_thinking_config == {"type": "enabled", "budget_tokens": 2048}
     assert "thinking.budget_tokens->derived" in public.ignored_parameters
 
-    public, provider = route_generation_parameter_requests(
-        (haiku,), _messages_request(thinking={"type": "enabled"}, maximum_output_tokens=1024)
-    )
-    assert provider.provider_thinking_config is None
-    assert "thinking->dropped(no_legal_budget)" in public.ignored_parameters
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests(
+            (haiku,), _messages_request(thinking={"type": "enabled"}, maximum_output_tokens=1024)
+        )
+    assert rejected.value.param == "thinking.budget_tokens"
 
 
 def test_claude_code_beta_tokens_disclose_without_dropping_the_request_on_a_foreign_route() -> None:

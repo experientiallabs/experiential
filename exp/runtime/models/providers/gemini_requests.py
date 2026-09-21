@@ -60,6 +60,7 @@ def gemini_generate_request(
     stop_sequences: tuple[str, ...] = (),
     response_json_schema: JsonObject | None = None,
     json_object_output: bool = False,
+    default_maximum_output_tokens: int | None = DEFAULT_MAXIMUM_OUTPUT_TOKENS,
 ) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
@@ -78,6 +79,8 @@ def gemini_generate_request(
         response_json_schema: Strict JSON schema admitted for structured output.
         json_object_output: Whether to request schema-free JSON output
             (``responseMimeType`` only, no ``responseJsonSchema``).
+        default_maximum_output_tokens: Model-client default when the request
+            omits a ceiling. Gateway callers pass ``None`` to preserve omission.
 
     Returns:
         A native payload for the generateContent and streamGenerateContent
@@ -145,8 +148,8 @@ def gemini_generate_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
-    else:
-        generation["maxOutputTokens"] = DEFAULT_MAXIMUM_OUTPUT_TOKENS
+    elif default_maximum_output_tokens is not None:
+        generation["maxOutputTokens"] = default_maximum_output_tokens
     payload["generationConfig"] = generation
     return payload
 

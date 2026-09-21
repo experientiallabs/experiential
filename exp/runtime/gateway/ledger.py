@@ -606,7 +606,10 @@ class SQLiteAttemptLedger:
             and usage.input_tokens >= threshold
         )
         prefix = "long_context_" if long_context else ""
-        cost = frozen_usage_cost(row, usage, prefix=prefix)
+        # Partial disconnect usage remains evidence, not a final provider cost.
+        # Preserve its counts while consuming the conservative budget bound.
+        partial = terminal_event is not None and terminal_event.usage_incomplete_due_to_disconnect
+        cost = None if partial else frozen_usage_cost(row, usage, prefix=prefix)
         budget_settlement = (
             cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
         )
@@ -623,10 +626,8 @@ class SQLiteAttemptLedger:
             budget_settlement = 0 if rejected else None
         if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
             raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
-        # Cost-optimality counterfactual: the SAME observed usage priced at the
-        # bypassed preferred rung's frozen BASE rates (long-context tiers are
-        # deliberately not modeled here; this is telemetry, never billing). A
-        # missing preferred rate yields NULL rather than a guess.
+        # Price the same observed usage at the preferred rung's frozen base rates.
+        # This is telemetry, not billing; missing rates remain unknown.
         counterfactual_cost = (
             None
             if row["preferred_deployment_id"] is None

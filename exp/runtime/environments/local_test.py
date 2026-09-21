@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import resource
 import subprocess
 import sys
 import threading
@@ -45,6 +46,47 @@ def test_local_process_environment_executes_in_an_ephemeral_workspace(tmp_path: 
 
     assert not workspace.exists()
     assert list(tmp_path.glob("exp-sandbox-*")) == []
+
+
+@_DARWIN_ONLY
+def test_local_process_high_descriptors_execute_and_cleanup(tmp_path: Path) -> None:
+    """Real pipes above select's descriptor ceiling keep all three I/O paths usable."""
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit < 1150:
+        pytest.skip("host descriptor budget cannot exercise real pipes above FD 1100")
+    prior_threads = set(threading.enumerate())
+    held: list[int] = []
+    try:
+        while not held or held[-1] < 1100:
+            held.append(os.open(os.devnull, os.O_RDONLY))
+        runtime = _runtime(tmp_path)
+        with runtime.open(_task()) as session:
+            observation = session.execute(ToolCall(call_id="high-fd", name="workspace"))
+            workspace = Path(str(observation.metadata["workspace"]))
+            assert workspace.is_dir()
+        assert not workspace.exists()
+        with runtime.open(_task()) as session:
+            assert isinstance(session, local_module._LocalProcessSession)
+            with pytest.raises(LocalProcessCrashError, match="return code 7") as failed:
+                session.execute(ToolCall(call_id="high-fd-stderr", name="crash"))
+            assert "private child stderr" not in str(failed.value)
+            until = time.monotonic() + 1.0
+            while time.monotonic() < until:
+                with session._stderr_lock:
+                    if b"private child stderr" in session._stderr_tail:
+                        break
+                time.sleep(0.01)
+            with session._stderr_lock:
+                assert b"private child stderr" in session._stderr_tail
+        assert list(tmp_path.glob("exp-sandbox-*")) == []
+        assert not any(
+            thread not in prior_threads
+            and thread.name.startswith(("exp-local-environment-", "exp-local-descendants-"))
+            for thread in threading.enumerate()
+        )
+    finally:
+        for descriptor in held:
+            os.close(descriptor)
 
 
 @_DARWIN_ONLY

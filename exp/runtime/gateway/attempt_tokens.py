@@ -35,10 +35,7 @@ from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
-
-# Output tokens reserved when neither the caller nor the deployment bounds output
-# (an output bound is not a price, so its absence must not unprice a route).
-DEFAULT_RESERVATION_OUTPUT_TOKENS = 32_768
+from exp.runtime.models.providers.generation_parameter_validation import require_output_bound
 
 INPUT_TOKEN_HEADROOM_PERCENT = 15
 """Multiplicative margin on the counted prompt.
@@ -332,32 +329,11 @@ def worst_case_output_tokens(
         case DecisionRequest():
             return request.output_token_reservation
         case GatewayRequest():
-            output_tokens = request.maximum_output_tokens
-            deployment_ceiling = (
-                deployment.capabilities.maximum_output_tokens
-                if deployment.capabilities is not None
-                else None
+            capabilities = deployment.capabilities
+            return require_output_bound(
+                request,
+                capabilities.maximum_output_tokens if capabilities is not None else None,
+                capabilities.context_window_tokens if capabilities is not None else None,
             )
-            # Clamp caller output to the deployment ceiling: an unbounded value
-            # would inflate the estimate past MAXIMUM_NANO_USD and mis-refuse a
-            # fundable request. Settlement charges actual tokens, not this bound.
-            if output_tokens is None:
-                output_tokens = deployment_ceiling
-            elif deployment_ceiling is not None:
-                output_tokens = min(output_tokens, deployment_ceiling)
-            if output_tokens is None:
-                # No caller value and no ceiling: a realistic default, bounded by
-                # any known context window (the model cannot emit past it).
-                context_window = (
-                    deployment.capabilities.context_window_tokens
-                    if deployment.capabilities is not None
-                    else None
-                )
-                output_tokens = (
-                    min(DEFAULT_RESERVATION_OUTPUT_TOKENS, context_window)
-                    if context_window is not None
-                    else DEFAULT_RESERVATION_OUTPUT_TOKENS
-                )
-            return output_tokens
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)

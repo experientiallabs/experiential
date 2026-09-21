@@ -851,6 +851,7 @@ def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Ser
             supports_reasoning=True,
             supports_tools=True,
             supports_temperature=False,
+            maximum_output_tokens=128_000,
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
@@ -1890,12 +1891,11 @@ def test_messages_silent_stop_is_a_max_tokens_stop(engine: _ServingEngine) -> No
 def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
     engine: _ServingEngine,
 ) -> None:
-    """Replayed Anthropic thinking HISTORY serves on a non-Anthropic route with
-    the drop disclosed and the blocks omitted upstream (Claude Code carries
-    Claude's signed blocks into every later turn of a session, so the old
-    pre-dispatch 400 killed every session that switched models); a live
-    thinking CONFIG likewise serves through the admission coercion (dropped
-    with disclosure on this non-reasoning OpenAI-compatible route)."""
+    """Preserve replayable history while refusing an unenforceable numeric budget.
+
+    Thinking history is disclosed and omitted on a non-Anthropic wire. A live
+    numeric thinking budget is a constraint, not permission to drop the field.
+    """
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
 
@@ -1904,19 +1904,16 @@ def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
         headers={"x-api-key": engine.raw_key},
         json={
             **_messages_body("thinking-config-serves"),
-            # Below the 64-token ceiling: a budget at or above max_tokens is
-            # refused at the boundary (Anthropic's own rule), while one under
-            # Anthropic's 1024 minimum is only a depth hint on this route.
+            # This wire cannot enforce a numeric thinking budget, even one
+            # below the caller's total output ceiling.
             "thinking": {"type": "enabled", "budget_tokens": 32},
         },
         timeout=10.0,
     )
-    assert config.status_code == 200
+    assert config.status_code == 400
+    assert "thinking" in config.json()["error"]["message"]
     with _SseUpstream.payloads_lock:
-        dispatched_config = _SseUpstream.payloads[dispatched_before:]
-        dispatched_before = len(_SseUpstream.payloads)
-    assert len(dispatched_config) == 1
-    assert "thinking" not in dispatched_config[0]
+        assert len(_SseUpstream.payloads) == dispatched_before
 
     history = httpx.post(
         f"{engine.base}/v1/messages",

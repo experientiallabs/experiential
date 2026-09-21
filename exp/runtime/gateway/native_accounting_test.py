@@ -10,14 +10,20 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
+    GatewayTokenPrices,
 )
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
-from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
+from exp.runtime.gateway.budgets import (
+    BudgetReservationRejected,
+    BudgetScopeKind,
+    maximum_attempt_cost_nano_usd,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -61,6 +67,7 @@ def _deployment(
         provider_model="provider-model",
         connection_sha256=connection_sha256,
         capabilities_sha256="d" * 64,
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway=GatewayDeploymentMetadata(
             capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             dispatch=dispatch,
@@ -155,7 +162,7 @@ class _RecordingLedger:
         preferred_deployment: ExactModelDeployment | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
-        del snapshot, maximum_cost_nano_usd, fallback_reason
+        del snapshot, fallback_reason
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
@@ -169,6 +176,7 @@ class _RecordingLedger:
                 "route_depth": route_depth,
                 "reserved_input_tokens": reserved_input_tokens,
                 "reserved_output_tokens": reserved_output_tokens,
+                "maximum_cost_nano_usd": maximum_cost_nano_usd,
                 "route_reason": route_reason,
                 "dispatch_reason": dispatch_reason,
                 "preferred_deployment_id": (
@@ -306,6 +314,112 @@ def test_rejection_evidence_reaches_only_unopened_unmetered_decision_failures(
     assert event is not None
     assert event.decision_provider_rejected is expected
     assert (event.usage is not None) is has_usage
+
+
+@pytest.mark.parametrize("frozen_bound", (2_048, 100_000))
+def test_attempt_token_and_money_reservations_use_the_frozen_payload_bound(
+    frozen_bound: int,
+) -> None:
+    """Omitted public caps cannot reserve less than the selected wire may generate."""
+    registry, ledger, entry = _registry()
+    deployment = entry.route.deployment.model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_nano_usd_per_million_tokens=1_000_000,
+                    output_nano_usd_per_million_tokens=2_000_000,
+                )
+            )
+        }
+    )
+    entry.route = entry.route.model_copy(update={"deployment": deployment})
+    entry.reserved_output_tokens_by_depth = (frozen_bound, 128_000)
+    _start(registry, ordinal=0)
+    assert isinstance(entry.request, GatewayRequest)
+    assert entry.request.maximum_output_tokens is None
+    row = ledger.started[-1]
+    assert row["reserved_output_tokens"] == frozen_bound
+    assert row["maximum_cost_nano_usd"] == maximum_attempt_cost_nano_usd(
+        entry.request.model_copy(update={"maximum_output_tokens": frozen_bound}), deployment
+    )
+
+
+@pytest.mark.parametrize("partial_usage", (False, True))
+@pytest.mark.parametrize("retry", ("direct", "explicit", "sweep"))
+def test_disconnect_usage_evidence_survives_every_settlement_path(
+    partial_usage: bool, retry: str
+) -> None:
+    """Observed partial meters never erase the trusted incomplete-usage hold evidence."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": {"input_tokens": 7, "output_tokens": 3} if partial_usage else None,
+        "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+        "finalize": True,
+        "opened": partial_usage,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+    }
+    encoded = json.dumps(payload)
+    if retry != "direct":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        assert entry.pending_settlement == payload
+        assert ledger.terminal_events[-1] is not None
+        assert ledger.terminal_events[-1].usage_incomplete_due_to_disconnect is True
+    if retry == "sweep":
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.usage_incomplete_due_to_disconnect is True
+    assert (terminal.usage is not None) is partial_usage
+    if terminal.usage is not None:
+        assert terminal.usage.input_tokens == 7
+        assert terminal.usage.output_tokens == 3
+    assert registry.entry(entry.authorization.request_id) is None
+    assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "dispatched", "usage"),
+    (
+        ("failed", False, None),
+        ("completed", True, None),
+        ("completed", True, {"input_tokens": 7, "output_tokens": 3}),
+    ),
+)
+def test_predispatch_and_provider_terminal_settlements_do_not_invent_disconnect_evidence(
+    outcome: str, dispatched: bool, usage: JsonObject | None
+) -> None:
+    """No terminal meter is different from the native witness of an interrupted provider."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": outcome,
+                "usage": usage,
+                "failure": (
+                    {"failure_class": "cancelled", "safe_message": "cancelled before dispatch"}
+                    if outcome == "failed"
+                    else None
+                ),
+                "dispatched": dispatched,
+                "finalize": True,
+            }
+        )
+    )
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.usage_incomplete_due_to_disconnect is False
 
 
 def _start(

@@ -113,6 +113,7 @@ class _Provider:
 
 
 def _configure(root: Path, base_url: str) -> str:
+    """Configure the tool-capable fixture alias and return its authorized client key."""
     manager = GatewayManagement(root)
     manager.initialize()
     upsert_connection(
@@ -130,7 +131,7 @@ def _configure(root: Path, base_url: str) -> str:
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True, supports_streaming_tool_arguments=True
         ),

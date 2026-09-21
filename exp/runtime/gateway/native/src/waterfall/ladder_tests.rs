@@ -196,7 +196,7 @@ pub(super) struct Rung {
 
 /// Read one whole HTTP/1.1 request (headers, then `content-length` bytes of
 /// body) and return the body text.
-async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
+pub(super) async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
     let mut received: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16_384];
     loop {

@@ -345,6 +345,36 @@ fn a_search_call_turn_runs_a_round_and_the_same_rung_serves_the_answer() {
 }
 
 #[test]
+fn private_reasoning_does_not_hide_a_search_round() {
+    block_on(async {
+        let harness = SearchHarness::new();
+        let rung = spawn_rung(vec![
+            Answer::Stream(&[
+                "{\"choices\":[{\"delta\":{\"reasoning_content\":\"private thought\"}}]}",
+                SEARCH_START_FRAME,
+                SEARCH_ARGUMENTS_FRAME,
+                USAGE_FRAME,
+                FINISH_TOOL_CALLS_FRAME,
+            ]),
+            Answer::Stream(&[TEXT_FRAME]),
+        ])
+        .await;
+        harness
+            .configure(json!({"wire": wire_json(&rung.url)}))
+            .await;
+        let mut deployment = wire("a", &rung.url, 0);
+        deployment.fireworks_reasoning_route_sha256 = Some("a".repeat(64));
+        let (won, guard) = harness.run(&[deployment], &admission(3)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("search must reach the answer turn");
+        };
+        assert_eq!(committed.tool_search_rounds.len(), 1);
+        assert!(matches!(committed.prefix.first(), Some(Event::TextDelta(text)) if text == "hi"));
+        assert_eq!(harness.story().await["rounds"].as_array().unwrap().len(), 1);
+    });
+}
+
+#[test]
 fn a_round_followed_by_an_output_less_turn_settles_with_its_rounds() {
     block_on(async {
         let harness = SearchHarness::new();

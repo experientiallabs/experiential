@@ -15,6 +15,8 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import cast
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
@@ -167,6 +169,44 @@ def ledger_failure(failure: GatewayFailure) -> GatewayFailure:
     return failure
 
 
+class NativeSettlementPayload(BaseModel):
+    """Strict native-only provenance that can retain an unresolved reservation.
+
+    Remaining settlement fields keep their existing dedicated parsers. An
+    absent marker never authorizes a hold, and a malformed marker is rejected
+    rather than coerced from client-shaped strings or integers.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    dispatched: bool = Field(default=False, strict=True)
+    finalize: bool = Field(default=True, strict=True)
+    usage_incomplete_due_to_disconnect: bool = Field(default=False, strict=True)
+
+    def validate_disconnect(self, failure: GatewayFailure | None, kind: GatewayEventKind) -> bool:
+        """Reject inconsistent hold evidence and return the trusted marker.
+
+        Args:
+            failure: Normalized failure attached to this settlement.
+            kind: Normalized terminal event kind.
+
+        Returns:
+            Whether the cancelled dispatched attempt lacks a final meter.
+
+        Raises:
+            ValueError: A hold marker accompanies non-finalizing, non-cancelled,
+                or undispatched work.
+        """
+        if self.usage_incomplete_due_to_disconnect and (
+            not self.dispatched
+            or not self.finalize
+            or kind is not GatewayEventKind.FAILED
+            or failure is None
+            or failure.failure_class is not GatewayFailureClass.CANCELLED
+        ):
+            raise ValueError("incomplete disconnect usage requires dispatched cancelled work")
+        return self.usage_incomplete_due_to_disconnect
+
+
 def terminal_from_settlement(
     data: JsonObject,
     *,
@@ -181,6 +221,7 @@ def terminal_from_settlement(
     Returns:
         The normalized terminal event and optional failure.
     """
+    provenance = NativeSettlementPayload.model_validate(data)
     raw_usage = data.get("usage")
     raw_tool_names = data.get("tool_names")
     usage = _usage_from_payload(
@@ -228,6 +269,7 @@ def terminal_from_settlement(
         sequence_number=0,
         usage=_credible_usage(kind, usage),
         failure=failure if kind == GatewayEventKind.FAILED else None,
+        usage_incomplete_due_to_disconnect=provenance.validate_disconnect(failure, kind),
         decision_provider_rejected=(
             surface is GatewayApiSurface.DECISIONS
             and kind is GatewayEventKind.FAILED
@@ -468,7 +510,9 @@ def _usage_from_payload(
         ValueError: The observed token totals or subsets are contradictory.
     """
     names = tuple(str(name) for name in tool_names)
-    if payload is None or payload.get("input_tokens") is None:
+    if payload is None or (
+        payload.get("input_tokens") is None and payload.get("output_tokens") is None
+    ):
         if not names:
             return None
         return GatewayUsage(

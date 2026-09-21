@@ -310,13 +310,13 @@ def usage_record(row: sqlite3.Row) -> GatewayUsage | None:
         row: Durable attempt row including the cache-write total and TTL subset.
 
     Returns:
-        Complete observed usage, or None when provider totals remain unknown.
+        Observed usage, preserving a missing primary leg, or None without either total.
     """
-    if row["input_tokens"] is None or row["output_tokens"] is None:
+    if row["input_tokens"] is None and row["output_tokens"] is None:
         return None
     return GatewayUsage(
-        input_tokens=int(row["input_tokens"]),
-        output_tokens=int(row["output_tokens"]),
+        input_tokens=optional_int(row["input_tokens"]),
+        output_tokens=optional_int(row["output_tokens"]),
         cached_input_tokens=optional_int(row["cached_input_tokens"]),
         cache_creation_input_tokens=optional_int(row["cache_creation_input_tokens"]),
         cache_creation_1h_input_tokens=optional_int(row["cache_creation_1h_input_tokens"]),

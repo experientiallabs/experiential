@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_input_schema_reshaping,
     anthropic_rejects_assistant_prefill,
@@ -16,6 +16,97 @@ from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     supported_reasoning_efforts,
 )
+
+
+def output_limit_parameter(request: GatewayRequest) -> str:
+    """Name the caller's output limit, including the remedy for an omitted field."""
+    return request.maximum_output_tokens_parameter or (
+        "max_output_tokens" if request.surface == GatewayApiSurface.RESPONSES else "max_tokens"
+    )
+
+
+def require_output_bound(request: GatewayRequest, *declared_bounds: int | None) -> int:
+    """Resolve a finite output reservation without inventing a provider default.
+
+    Explicit caller ceilings remain authoritative. Catalog maxima and total
+    context windows bound omitted work; a window is not known remaining room,
+    so no estimated input count is subtracted from it.
+
+    Raises:
+        ProviderParameterError: Neither caller nor metadata bounds generation.
+    """
+    bounds = tuple(
+        bound for bound in (request.maximum_output_tokens, *declared_bounds) if bound is not None
+    )
+    if bounds:
+        return min(bounds)
+    parameter = output_limit_parameter(request)
+    raise ProviderParameterError(
+        message=(
+            "This model route has no declared output or context limit. "
+            f"Supply an explicit {parameter} to bound generation."
+        ),
+        param=parameter,
+        code="invalid_parameter",
+    )
+
+
+def bounded_output_request(
+    profile: GatewayWireProfile,
+    request: GatewayRequest,
+    *,
+    model_maximum_output_tokens: int | None = None,
+    context_window_tokens: int | None = None,
+) -> tuple[GatewayRequest, int]:
+    """Bound one dispatch financially, adding a cap only on a required wire.
+
+    The shared request stays untouched so a tighter fallback never limits its
+    selected sibling. The returned integer is the very same bound that must
+    be frozen for attempt reservation. A required wire needs a declared output
+    maximum; context can narrow it but cannot establish a legal wire maximum.
+    On optional wires context alone can bound financial exposure. It is not a
+    claim about exact remaining room; only the provider knows its input count.
+    """
+    if (
+        request.maximum_output_tokens is None
+        and profile.dialect == "anthropic_messages"
+        and profile.maximum_output_tokens is None
+        and model_maximum_output_tokens is None
+    ):
+        parameter = output_limit_parameter(request)
+        raise ProviderParameterError(
+            message=(
+                "This model route requires an output cap but has no declared output maximum. "
+                f"Supply an explicit {parameter}; a context window is not an output maximum."
+            ),
+            param=parameter,
+            code="invalid_parameter",
+        )
+    bound = require_output_bound(
+        request, profile.maximum_output_tokens, model_maximum_output_tokens, context_window_tokens
+    )
+    if request.maximum_output_tokens is not None and request.maximum_output_tokens > bound:
+        parameter = output_limit_parameter(request)
+        raise ProviderParameterError(
+            message=(
+                f"The parameter {parameter!r} exceeds this model's declared bound of {bound}. "
+                "Lower the value or choose another model."
+            ),
+            param=parameter,
+            code="invalid_parameter",
+        )
+    if request.maximum_output_tokens is None and profile.dialect == "anthropic_messages":
+        if bound < (profile.minimum_output_tokens or 1):
+            raise ProviderParameterError(
+                message=(
+                    "This model route's output bound is below its required minimum. "
+                    "Choose another model."
+                ),
+                param=output_limit_parameter(request),
+                code="invalid_parameter",
+            )
+        return request.model_copy(update={"maximum_output_tokens": bound}), bound
+    return request, bound
 
 
 def effective_profile_reasoning_effort(

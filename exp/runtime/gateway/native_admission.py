@@ -57,6 +57,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     ProviderResponseError,
 )
+from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
@@ -93,11 +94,6 @@ def _with_cache_affinity(
             ),
         }
     )
-
-
-def _output_floors(resolved_wires: _ResolvedWires) -> tuple[int | None, ...]:
-    """Each rung's declared output-token floor, aligned with the route."""
-    return tuple(profile.minimum_output_tokens for profile, _client in resolved_wires)
 
 
 def admitted_route_requests(
@@ -164,9 +160,7 @@ def admitted_route_requests(
     if len(chat_indexes) != len(route.deployments):
         route = select_route_deployments(route, chat_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in chat_indexes)
-    window_indexes = context_window_compatible_indexes(
-        route, request, output_floors=_output_floors(resolved_wires)
-    )
+    window_indexes = context_window_compatible_indexes(route, request)
     if len(window_indexes) != len(route.deployments):
         route = select_route_deployments(route, window_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in window_indexes)
@@ -245,14 +239,9 @@ def admitted_route_requests(
         tuple(profile for profile, _client in resolved_wires),
         admitted_request,
     )
-    # Shaping can RAISE the output budget past what the caller asked (the
-    # Anthropic required default when max_tokens is unset, the OpenAI-wire
-    # minimum, a rung's declared floor), so the window check runs again on the
-    # shaped budget: a rung it pushed over its window is skipped here, and the
-    # survivors are re-shaped so a floor a dropped rung imposed is not carried.
-    shaped_indexes = context_window_compatible_indexes(
-        route, provider_request, output_floors=_output_floors(resolved_wires)
-    )
+    # Re-check after semantic shaping. Output ceilings stay caller-owned;
+    # omitted wire-required caps are resolved independently at payload build.
+    shaped_indexes = context_window_compatible_indexes(route, provider_request)
     if len(shaped_indexes) != len(route.deployments):
         route = select_route_deployments(route, shaped_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in shaped_indexes)
@@ -638,6 +627,17 @@ def protocol_compatible_indexes(
         # legitimate failover rung out of the ladder.
         rung_request = rung_provider_request(route, deployment, provider_request)
         try:
+            capabilities = deployment.capabilities
+            rung_request, _bound = bounded_output_request(
+                profile,
+                rung_request,
+                model_maximum_output_tokens=(
+                    capabilities.maximum_output_tokens if capabilities is not None else None
+                ),
+                context_window_tokens=(
+                    capabilities.context_window_tokens if capabilities is not None else None
+                ),
+            )
             preflight_gateway_request(
                 rung_request,
                 deployment.gateway.capabilities,

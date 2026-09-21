@@ -434,12 +434,13 @@ class NativeAttemptAccounting:
                     and entry.tier_forwarded_by_depth[candidate]
                 ),
             )
-            # Reserve the worst-case in-flight tokens alongside the worst-case
-            # cost. The platform's token windows (promo free-tier, strict; org
-            # rate limits, soft) count these dispatched reservations, and the
-            # rung's own authored token window counts the same conservative
-            # bound, so a concurrent burst binds instead of leaking past caps.
-            reserved_output_tokens = worst_case_output_tokens(entry.request, deployment)
+            reservation_request = entry.request
+            if entry.reserved_output_tokens_by_depth:
+                frozen_bound = entry.reserved_output_tokens_by_depth[candidate]
+                reservation_request = entry.request.model_copy(
+                    update={"maximum_output_tokens": frozen_bound}
+                )
+            reserved_output_tokens = worst_case_output_tokens(reservation_request, deployment)
             ticket = self._reserve_rung_slot(
                 entry,
                 deployment,
@@ -474,7 +475,7 @@ class NativeAttemptAccounting:
                     attempt_ordinal=entry.total_attempts,
                     route_depth=candidate,
                     maximum_cost_nano_usd=maximum_attempt_cost_nano_usd(
-                        entry.request, deployment, input_tokens=reserved_input_tokens
+                        reservation_request, deployment, input_tokens=reserved_input_tokens
                     ),
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,

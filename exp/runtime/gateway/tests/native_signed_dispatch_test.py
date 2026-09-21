@@ -193,7 +193,7 @@ def _activate_bedrock_alias(root: Path, manager: GatewayManagement) -> None:
         provider_model="us.anthropic.claude-sonnet-4-5",
         exact_model_id="bedrock-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(),
         pricing_source=None,

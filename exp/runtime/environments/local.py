@@ -14,6 +14,7 @@ import math
 import os
 import queue
 import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -894,17 +895,16 @@ class _LocalProcessSession:
 
     @staticmethod
     def _write_pipe(file_descriptor: int, payload: bytes, timeout_seconds: float) -> None:
-        """Write a complete request through a nonblocking pipe within a finite wait."""
+        """Write within a finite wait using selectors without select's descriptor ceiling."""
         deadline = time.monotonic() + timeout_seconds
         offset = 0
-        while offset < len(payload):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("local environment request pipe write timed out")
-            _, writable, _ = select.select((), (file_descriptor,), (), remaining)
-            if not writable:
-                raise TimeoutError("local environment request pipe write timed out")
-            offset += os.write(file_descriptor, payload[offset:])
+        with selectors.DefaultSelector() as selector:
+            selector.register(file_descriptor, selectors.EVENT_WRITE)
+            while offset < len(payload):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise TimeoutError("local environment request pipe write timed out")
+                offset += os.write(file_descriptor, payload[offset:])
 
     def _remove_workspace(self) -> None:
         """Delete only the uniquely-created per-session workspace after process termination."""
@@ -949,21 +949,24 @@ class _LocalProcessSession:
         """Move framed output through a nonblocking reader that cleanup can always join."""
         buffered = bytearray()
         try:
-            while not self._io_stop.is_set():
-                readable, _, _ = select.select((file_descriptor,), (), (), 0.01)
-                if not readable:
-                    continue
-                chunk = os.read(file_descriptor, min(65_536, self._limits.maximum_output_bytes + 1))
-                if not chunk:
-                    return
-                buffered.extend(chunk)
-                newline = buffered.find(b"\n")
-                if newline >= 0:
-                    self._queue_stdout(bytes(buffered[: newline + 1]))
-                    del buffered[: newline + 1]
-                elif len(buffered) > self._limits.maximum_output_bytes:
-                    self._queue_stdout(bytes(buffered))
-                    buffered.clear()
+            with selectors.DefaultSelector() as selector:
+                selector.register(file_descriptor, selectors.EVENT_READ)
+                while not self._io_stop.is_set():
+                    if not selector.select(0.01):
+                        continue
+                    chunk = os.read(
+                        file_descriptor, min(65_536, self._limits.maximum_output_bytes + 1)
+                    )
+                    if not chunk:
+                        return
+                    buffered.extend(chunk)
+                    newline = buffered.find(b"\n")
+                    if newline >= 0:
+                        self._queue_stdout(bytes(buffered[: newline + 1]))
+                        del buffered[: newline + 1]
+                    elif len(buffered) > self._limits.maximum_output_bytes:
+                        self._queue_stdout(bytes(buffered))
+                        buffered.clear()
         except (OSError, ValueError):
             return
         finally:
@@ -972,18 +975,19 @@ class _LocalProcessSession:
     def _drain_stderr(self, file_descriptor: int) -> None:
         """Drain stderr nonblockingly while retaining only a bounded tail."""
         try:
-            while not self._io_stop.is_set():
-                readable, _, _ = select.select((file_descriptor,), (), (), 0.01)
-                if not readable:
-                    continue
-                chunk = os.read(file_descriptor, 4_096)
-                if not chunk:
-                    return
-                with self._stderr_lock:
-                    self._stderr_tail.extend(chunk)
-                    excess = len(self._stderr_tail) - self._limits.maximum_stderr_bytes
-                    if excess > 0:
-                        del self._stderr_tail[:excess]
+            with selectors.DefaultSelector() as selector:
+                selector.register(file_descriptor, selectors.EVENT_READ)
+                while not self._io_stop.is_set():
+                    if not selector.select(0.01):
+                        continue
+                    chunk = os.read(file_descriptor, 4_096)
+                    if not chunk:
+                        return
+                    with self._stderr_lock:
+                        self._stderr_tail.extend(chunk)
+                        excess = len(self._stderr_tail) - self._limits.maximum_stderr_bytes
+                        if excess > 0:
+                            del self._stderr_tail[:excess]
         except (OSError, ValueError):
             return
 

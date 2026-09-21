@@ -172,6 +172,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
+            maximum_output_tokens=profile.maximum_output_tokens,
         )
         if profile.inference_geo is not None:
             payload["inference_geo"] = profile.inference_geo

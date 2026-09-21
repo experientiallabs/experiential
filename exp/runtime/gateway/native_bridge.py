@@ -536,6 +536,7 @@ class NativeControlPlane(
             )
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
+            output_bounds: list[int] = []
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
@@ -572,6 +573,9 @@ class NativeControlPlane(
                 )
                 if dispatch.parallel_disclosure is not None:
                     parallel_disclosures.add(dispatch.parallel_disclosure)
+                if dispatch.output_disclosure is not None:
+                    parallel_disclosures.add(dispatch.output_disclosure)
+                output_bounds.append(dispatch.reserved_output_tokens)
                 wire_route.append(dispatch.wire_entry)
                 signers.append(dispatch.signer)
                 dispatch_bindings.append(dispatch.binding)
@@ -673,6 +677,7 @@ class NativeControlPlane(
                     profile.forwards_tier(provider_request.service_tier)
                     for profile, _client in resolved_wires
                 ),
+                reserved_output_tokens_by_depth=tuple(output_bounds),
                 affinity_fingerprint=placement.fingerprint,
                 sticky_preferred=placement.sticky_preferred,
                 throttle_redial_budgets=redial_budgets,

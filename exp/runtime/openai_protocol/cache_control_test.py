@@ -271,7 +271,11 @@ def test_chat_message_marker_cannot_overwrite_empty_checkpoint(same: bool, media
         request = decode_chat(body).request
         assert requests_hour_cache(request)
         payload = dialect_stream_payload(
-            GatewayWireProfile(dialect="anthropic_messages", url="https://example.invalid"),
+            GatewayWireProfile(
+                dialect="anthropic_messages",
+                url="https://example.invalid",
+                maximum_output_tokens=128_000,
+            ),
             request,
         )
         messages = payload["messages"]
@@ -311,6 +315,7 @@ def test_different_cache_durations_at_distinct_boundaries_remain_distinct(wire: 
         url="https://example.invalid",
         billing_customer_managed=True,
         forwards_cache_control=wire == "openrouter",
+        maximum_output_tokens=128_000,
     )
     payload = dialect_stream_payload(profile, request)
     assert '"ttl": "1h"' in json.dumps(payload) and '"ttl": "5m"' in json.dumps(payload)

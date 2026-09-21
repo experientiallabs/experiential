@@ -209,6 +209,8 @@ class InflightRequest:
     # (``GatewayWireProfile.forwards_tier``), so the reprice applies the per-tier
     # card only on a depth that emits the tier. Empty on tier-less surfaces.
     tier_forwarded_by_depth: tuple[bool, ...] = ()
+    # Exact finite output bound frozen alongside each admitted provider payload.
+    reserved_output_tokens_by_depth: tuple[int, ...] = ()
     # The request's tenant-isolated affinity fingerprint on a
     # ``maximize_cache_affinity`` pool (None elsewhere), captured at admission
     # so dispatch reservation can read and refresh the worker-local sticky

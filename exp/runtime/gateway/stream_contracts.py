@@ -24,8 +24,10 @@ class GatewayUsage(ContractModel):
     surcharge leg; it is disjoint from ``cached_input_tokens`` inside
     ``input_tokens``, so ``fresh = input - cached - cache_creation``.
 
-    A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
-    case both token totals remain unknown instead of being represented as zero.
+    A terminal event may carry partial token totals or only ``tool_names``.
+    Missing totals remain unknown, never zero. Live usage events require both
+    totals; terminal accounting retains an observed leg without pricing the
+    missing leg or treating a partial report as a final meter.
 
     ``web_search_requests`` and ``tool_search_requests`` ride along with either shape but never
     make usage on their own: a count with neither token totals nor tool names is still rejected.
@@ -56,27 +58,17 @@ class GatewayUsage(ContractModel):
 
     @model_validator(mode="after")
     def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:
-        """Require complete totals and a covering cache-write total for the TTL subset.
+        """Require observed tokens or tools and validate available covering totals.
 
         Returns:
             This validated token or tool-only usage record.
 
         Raises:
-            ValueError: Totals are incomplete or a TTL subset lacks a covering total.
+            ValueError: No token or tool was observed, or a subset contradicts its total.
         """
         totals = (self.input_tokens, self.output_tokens)
-        if (totals[0] is None) != (totals[1] is None):
-            raise ValueError("input and output token counts must be reported together")
-        if totals[0] is None:
-            if (
-                self.cached_input_tokens is not None
-                or self.cache_creation_input_tokens is not None
-                or self.cache_creation_1h_input_tokens is not None
-                or self.reasoning_tokens is not None
-            ):
-                raise ValueError("token detail counts require input and output totals")
-            if not self.tool_names:
-                raise ValueError("usage requires token totals or invoked tool names")
+        if totals == (None, None) and not self.tool_names:
+            raise ValueError("usage requires token totals or invoked tool names")
         if self.cache_creation_1h_input_tokens is not None and (
             self.cache_creation_input_tokens is None
             or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens
@@ -132,6 +124,15 @@ class GatewayEvent(ContractModel):
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    usage_incomplete_due_to_disconnect: bool = Field(default=False, exclude=True, strict=True)
+    """Trusted evidence of caller loss after dispatch but before an observed provider terminal.
+
+    Observed usage remains evidence, not a claim that the provider's bill is
+    complete. Hosted ledgers retain unresolved exposure for later resolution;
+    the local monthly budget uses the full reserved bound as an unknown-cost
+    estimate. Neither policy treats the partial meter as a final provider bill.
+    This marker never joins public serialized events or replay identity.
+    """
     decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
     """Internal decision settlement evidence that an HTTP rejection preceded execution.
 
@@ -149,6 +150,12 @@ class GatewayEvent(ContractModel):
         Raises:
             ValueError: The selected event kind lacks its required payload.
         """
+        if self.usage_incomplete_due_to_disconnect and (
+            self.kind is not GatewayEventKind.FAILED
+            or self.failure is None
+            or self.failure.failure_class is not GatewayFailureClass.CANCELLED
+        ):
+            raise ValueError("incomplete disconnect usage requires a cancelled terminal")
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")
