@@ -284,11 +284,9 @@ class GatewayWireProfile:
     minimum_output_tokens: int | None = None
     """Smallest output-token ceiling this rung's provider accepts, when declared.
 
-    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``),
-    never derived from the dialect: a caller ceiling below it is floored with
-    disclosure on every surface instead of dispatching a value the provider
-    400s (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
-    Bedrock all refuse ``max_tokens < 16`` on the Chat wire)."""
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``).
+    A smaller explicit caller ceiling is refused before dispatch, never raised.
+    Route selection may keep another rung that accepts the caller's ceiling."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact

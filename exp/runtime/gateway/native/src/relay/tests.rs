@@ -345,3 +345,536 @@ async fn the_tool_search_tool_is_withheld_at_the_relay_and_handed_over() {
     assert_eq!(plain.withheld_search_call_count(), 0);
     assert!(!plain.withheld_search_call_seen());
 }
+
+#[tokio::test]
+async fn ready_bytes_cannot_bypass_an_expired_first_token_deadline() {
+    let frames = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"too late\"}}]}\n\n",
+    ))])
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() - Duration::from_secs(1),
+    );
+    let failure = relay
+        .next_event(
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(10),
+            Instant::now(),
+        )
+        .await
+        .expect_err("an immediately ready read cannot outlive its deadline");
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+}
+
+#[tokio::test]
+async fn committed_keepalives_do_not_renew_generation_progress() {
+    let chunks = stream::once(async {
+        Ok::<_, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        ))
+    })
+    .chain(stream::unfold(0, |count| async move {
+        if count >= 30 {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Some((Ok(Bytes::from(": keepalive\n\n")), count + 1))
+    }))
+    .chain(stream::pending())
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        chunks,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_secs(1),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let idle = Duration::from_millis(80);
+    relay
+        .next_event(deadline, idle, Instant::now())
+        .await
+        .unwrap();
+    relay.commit();
+    let started = Instant::now();
+    let failure = relay
+        .next_event(deadline, idle, started)
+        .await
+        .expect_err("pings are not generation progress");
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(failure.failure_class, FailureClass::Transport);
+    assert!(!failure.retryable_same_deployment);
+}
+
+#[tokio::test]
+async fn always_ready_ping_flood_stops_at_the_absolute_deadline() {
+    let chunks =
+        stream::repeat_with(|| Ok::<_, reqwest::Error>(Bytes::from_static(b": ping\n\n"))).boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        chunks,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(30),
+    );
+    let started = Instant::now();
+    let failure = relay
+        .next_event(
+            started + Duration::from_secs(2),
+            Duration::from_secs(1),
+            started,
+        )
+        .await
+        .expect_err("an always-ready flood must not starve its timer");
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert!(started.elapsed() < Duration::from_millis(300));
+}
+
+#[tokio::test]
+async fn active_output_still_obeys_the_hard_total_deadline() {
+    let chunks = stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Some((
+            Ok::<_, reqwest::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"token\"}}]}\n\n",
+            )),
+            (),
+        ))
+    })
+    .boxed();
+    let started = Instant::now();
+    let mut relay = UpstreamRelay::from_stream(
+        chunks,
+        Dialect::OpenAiCompatible,
+        started + Duration::from_millis(50),
+    );
+    let deadline = started + Duration::from_millis(200);
+    let mut tokens = 0;
+    loop {
+        match relay
+            .next_event(deadline, Duration::from_millis(100), started)
+            .await
+        {
+            Ok(Some(Event::TextDelta(_))) => {
+                tokens += 1;
+                relay.commit();
+            }
+            Err(failure) => {
+                assert_eq!(failure.failure_class, FailureClass::Timeout);
+                assert_eq!(failure.safe_message, "gateway execution deadline exceeded");
+                break;
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+    assert!(
+        tokens > 5,
+        "active output survives the first-token allowance"
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[tokio::test]
+async fn structural_commit_keeps_first_progress_allowance_and_drains_received_terminal() {
+    let frames = stream::once(async { Ok::<_, reqwest::Error>(Bytes::from_static(
+        b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+    )) }).chain(stream::once(async {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        Ok::<_, reqwest::Error>(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_1\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+        ))
+    })).boxed();
+    let started = Instant::now();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiResponses,
+        started + Duration::from_millis(300),
+    );
+    let deadline = started + Duration::from_secs(2);
+    let idle = Duration::from_millis(60);
+    assert!(matches!(
+        relay.next_event(deadline, idle, started).await.unwrap(),
+        Some(Event::ProviderOutputItemStarted { .. })
+    ));
+    relay.commit();
+    assert!(matches!(
+        relay.next_event(deadline, idle, started).await.unwrap(),
+        Some(Event::ProviderTextDelta { .. })
+    ));
+    // The terminal already arrived in the same chunk as the text. A slow
+    // consumer must still receive its usage and terminal, not a false stall.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut terminal = false;
+    while let Some(event) = relay.next_event(deadline, idle, started).await.unwrap() {
+        if event.is_terminal() {
+            terminal = true;
+            break;
+        }
+    }
+    assert!(terminal);
+}
+
+#[tokio::test]
+async fn omitted_thinking_waits_for_signature_under_full_first_token_allowance() {
+    let frames = stream::once(async { Ok::<_, reqwest::Error>(Bytes::from_static(
+        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\"}}\n\n",
+    )) }).chain(stream::once(async {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        Ok::<_, reqwest::Error>(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque\"}}\n\n",
+        ))
+    })).boxed();
+    let started = Instant::now();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::AnthropicMessages,
+        started + Duration::from_millis(300),
+    );
+    let event = relay
+        .next_event(
+            started + Duration::from_secs(2),
+            Duration::from_millis(60),
+            started,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, Event::ThinkingSignature { .. }));
+    assert!(relay.first_token_at().is_none());
+}
+
+#[tokio::test]
+async fn provider_tool_phase_preserves_byte_idle_then_resumes_progress_idle() {
+    let scenarios = [
+        (Dialect::AnthropicMessages,
+         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n",
+         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[]}}\n\n"),
+        (Dialect::OpenAiResponses,
+         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"in_progress\"}}\n\n",
+         "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\"}}\n\n"),
+    ];
+    for (dialect, start, result) in scenarios {
+        let chunks = stream::once(async move { Ok::<_, reqwest::Error>(Bytes::from(start)) })
+            .chain(stream::unfold(0, move |count| async move {
+                if count == 25 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Some((
+                    Ok(Bytes::from(if count == 12 { result } else { ": ping\n\n" })),
+                    count + 1,
+                ))
+            }))
+            .chain(stream::pending())
+            .boxed();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        let idle = Duration::from_millis(60);
+        let mut relay =
+            UpstreamRelay::from_stream(chunks, dialect, started + Duration::from_millis(100));
+        relay
+            .next_event(deadline, idle, started)
+            .await
+            .unwrap()
+            .unwrap();
+        relay.commit();
+        let result = relay
+            .next_event(deadline, idle, started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Event::ServerToolResult { .. } | Event::HostedToolItemCompleted { .. }
+        ));
+        assert!(started.elapsed() > Duration::from_millis(100));
+        let idle_started = Instant::now();
+        let failure = relay.next_event(deadline, idle, started).await.unwrap_err();
+        assert!(idle_started.elapsed() < Duration::from_millis(120));
+        assert!(failure.safe_message.contains("stopped making progress"));
+    }
+}
+
+#[tokio::test]
+async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
+    let chunks = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from_static(
+        b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
+    ))]).chain(stream::pending()).boxed();
+    let started = Instant::now();
+    let mut relay = UpstreamRelay::from_stream(
+        chunks,
+        Dialect::OpenAiCompatible,
+        started + Duration::from_millis(30),
+    );
+    let carried = Usage {
+        input_tokens: Some(10),
+        output_tokens: Some(20),
+        ..Default::default()
+    };
+    relay.set_carried_usage(Some(carried.clone()));
+    relay
+        .next_event(
+            started + Duration::from_secs(2),
+            Duration::from_secs(1),
+            started,
+        )
+        .await
+        .unwrap_err();
+    let observed = relay.usage_before_failure(Some(carried)).unwrap();
+    assert_eq!(observed.input_tokens, Some(17));
+    assert_eq!(observed.output_tokens, Some(29));
+    let again = relay.usage_before_failure(Some(observed)).unwrap();
+    assert_eq!(again.input_tokens, Some(17));
+    assert_eq!(again.output_tokens, Some(29));
+}
+
+#[test]
+fn failure_without_current_usage_keeps_the_attempt_total_unknown() {
+    let mut relay = UpstreamRelay::from_stream(
+        stream::pending().boxed(),
+        Dialect::OpenAiCompatible,
+        Instant::now(),
+    );
+    assert!(relay.usage_before_failure(None).is_none());
+    relay.set_carried_usage(Some(Usage {
+        input_tokens: Some(10),
+        output_tokens: Some(20),
+        ..Default::default()
+    }));
+    // A repaired dial has also dispatched: its missing meter cannot be
+    // replaced by the earlier dial's subtotal as if that were a full total.
+    let unknown = relay.usage_before_failure(None).unwrap();
+    assert_eq!(unknown.input_tokens, None);
+    assert_eq!(unknown.output_tokens, None);
+    let again = relay.usage_before_failure(Some(unknown)).unwrap();
+    assert_eq!(again.input_tokens, None);
+    assert_eq!(again.output_tokens, None);
+    assert!(again.cached_input_tokens.is_none());
+}
+
+#[test]
+fn empty_private_reasoning_is_neither_progress_nor_commit() {
+    let event = Event::ReasoningContentDelta {
+        route_sha256: "a".repeat(64),
+        delta: String::new(),
+    };
+    assert!(!event.is_generation_progress());
+    assert!(!crate::waterfall::is_semantic(&event));
+}
+
+#[tokio::test]
+async fn responses_stop_drain_counts_hidden_generation_but_not_keepalives() {
+    for continuing_text in [true, false] {
+        let chunks = stream::once(async { Ok::<_, reqwest::Error>(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_1\",\"delta\":\"answer<STOP>hidden\"}\n\n",
+        )) }).chain(stream::unfold(0, move |count| async move {
+            if count == 12 { return None; }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let chunk: &'static [u8] = if count == 11 {
+                b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n"
+            } else if continuing_text {
+                b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_1\",\"delta\":\"hidden\"}\n\n"
+            } else {
+                b": ping\n\n"
+            };
+            Some((Ok(Bytes::from_static(chunk)), count + 1))
+        })).boxed();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        let idle = Duration::from_millis(70);
+        let mut relay = UpstreamRelay::from_stream(
+            chunks,
+            Dialect::OpenAiResponses,
+            started + Duration::from_millis(100),
+        );
+        relay.set_stop_sequences(["<STOP>"]);
+        assert!(matches!(
+            relay.next_event(deadline, idle, started).await.unwrap(),
+            Some(Event::ProviderOutputItemStarted { .. })
+        ));
+        relay.commit();
+        assert!(
+            matches!(relay.next_event(deadline, idle, started).await.unwrap(), Some(Event::ProviderTextDelta { delta, .. }) if delta == "answer")
+        );
+        if continuing_text {
+            let mut usage = None;
+            loop {
+                let event = relay
+                    .next_event(deadline, idle, started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match event {
+                    Event::Usage(report) => usage = Some(report),
+                    Event::StoppedAtSequence(sequence) => {
+                        assert_eq!(sequence, "<STOP>");
+                        break;
+                    }
+                    Event::ProviderTextDelta { .. } | Event::TextDelta(_) => {
+                        panic!("post-stop text escaped")
+                    }
+                    _ => {}
+                }
+            }
+            let usage = usage.unwrap();
+            assert_eq!(usage.input_tokens, Some(7));
+            assert_eq!(usage.output_tokens, Some(9));
+            assert!(started.elapsed() > idle);
+        } else {
+            let failure = relay.next_event(deadline, idle, started).await.unwrap_err();
+            assert!(failure.safe_message.contains("stopped making progress"));
+            assert!(started.elapsed() < Duration::from_millis(160));
+        }
+    }
+}
+
+fn keepalive_then_pending() -> BoxStream<'static, reqwest::Result<Bytes>> {
+    // Headers already arrived (the relay is built from the body stream); the
+    // body opens with SSE keepalive comments -- bytes that decode to no event
+    // -- and then never sends a token.
+    stream::iter(vec![
+        Ok::<_, reqwest::Error>(Bytes::from(": keepalive\n\n")),
+        Ok::<_, reqwest::Error>(Bytes::from(": keepalive\n\n")),
+    ])
+    .chain(stream::pending())
+    .boxed()
+}
+
+#[tokio::test]
+async fn keepalive_comments_do_not_satisfy_the_first_token_bound() {
+    // 2026-09-19: a lane answered headers and keepalives at once, then stalled
+    // ~2 minutes before its first token; the old bound was satisfied by the
+    // first body byte and the request sat on the per-chunk timeout instead.
+    let time_to_first_token = Duration::from_millis(80);
+    let mut relay = UpstreamRelay::from_stream(
+        keepalive_then_pending(),
+        Dialect::OpenAiCompatible,
+        Instant::now() + time_to_first_token,
+    );
+    let request_deadline = Instant::now() + Duration::from_secs(120);
+    let per_chunk_timeout = Duration::from_secs(35);
+
+    let started = Instant::now();
+    let outcome = relay
+        .next_event(request_deadline, per_chunk_timeout, started)
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "keepalives must not buy the provider the per-chunk timeout, waited {elapsed:?}"
+    );
+    let failure = outcome.expect_err("a stream of comments and no token must not succeed");
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert!(
+        failure.failover_eligible && !failure.retryable_same_deployment,
+        "a first-token stall fails over without redialing the stalled lane"
+    );
+}
+
+#[tokio::test]
+async fn a_role_only_frame_does_not_satisfy_the_first_token_bound() {
+    // OpenAI-compatible streams open with a delta carrying only the role; it
+    // decodes to no semantic event, so the bound stays armed through it.
+    let frames = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+    ))])
+    .chain(stream::pending())
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(80),
+    );
+    let started = Instant::now();
+    let outcome = relay
+        .next_event(
+            Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(35),
+            started,
+        )
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let failure = outcome.expect_err("a role-only frame then silence is a stall");
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert!(failure.failover_eligible);
+}
+
+#[tokio::test]
+async fn a_semantic_event_the_waterfall_did_not_commit_leaves_the_bound_armed() {
+    // Under refusal failover the waterfall withholds refusal deltas without
+    // committing; the relay must not disarm on its own, so a provider that
+    // stalls behind such an event still trips the fail-fast bound.
+    let frames = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+    ))])
+    .chain(stream::pending())
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(80),
+    );
+    let request_deadline = Instant::now() + Duration::from_secs(120);
+    let started = Instant::now();
+    let first = relay
+        .next_event(request_deadline, Duration::from_secs(35), started)
+        .await
+        .expect("the event arrives")
+        .expect("an event is produced");
+    assert!(matches!(&first, Event::TextDelta(_)));
+    // No commit() call: the waterfall withheld it.
+    let failure = relay
+        .next_event(request_deadline, Duration::from_secs(35), started)
+        .await
+        .expect_err("silence behind an uncommitted event is still a first-token stall");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert!(failure.failover_eligible);
+}
+
+#[tokio::test]
+async fn the_first_token_disarms_the_bound_and_the_chunk_timeout_takes_over() {
+    // Keepalives, then a content token inside the bound: the token is yielded,
+    // and a later stall is paced by the per-chunk timeout (a transport
+    // failure at that horizon), never re-judged by the first-token bound.
+    let frames = stream::iter(vec![
+        Ok::<_, reqwest::Error>(Bytes::from(": keepalive\n\n")),
+        Ok::<_, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        )),
+    ])
+    .chain(stream::pending())
+    .boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(80),
+    );
+    let request_deadline = Instant::now() + Duration::from_secs(120);
+    let per_chunk_timeout = Duration::from_millis(300);
+    let started = Instant::now();
+    let first = relay
+        .next_event(request_deadline, per_chunk_timeout, started)
+        .await
+        .expect("the token arrives inside the bound")
+        .expect("an event is produced");
+    assert!(matches!(&first, Event::TextDelta(text) if text == "hi"));
+    assert!(relay.first_token_at().is_some());
+    // The waterfall commits on that first semantic event.
+    relay.commit();
+
+    let stall_started = Instant::now();
+    let failure = relay
+        .next_event(request_deadline, per_chunk_timeout, started)
+        .await
+        .expect_err("silence after the first token stalls on the chunk timeout");
+    let waited = stall_started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(250),
+        "after the first token the per-chunk timeout paces reads, waited only {waited:?}"
+    );
+    assert_eq!(
+        failure.failure_class,
+        FailureClass::Transport,
+        "a post-token stall is the ordinary chunk stall, not a first-token failure"
+    );
+}

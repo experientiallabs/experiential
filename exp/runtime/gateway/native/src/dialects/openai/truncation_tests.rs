@@ -116,6 +116,61 @@ fn astra_budget_truncated_function_call_surfaces_incomplete_not_malformed() {
     }
 }
 
+#[test]
+fn empty_responses_function_is_not_invented_on_incomplete_item_or_terminal() {
+    for item_done in [true, false] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let item = |status: &str| {
+            serde_json::json!({
+                "id": "fc_1", "type": "function_call", "status": status,
+                "arguments": "", "call_id": "call_1", "name": "lookup",
+            })
+        };
+        let mut payloads = vec![serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0, "item": item("in_progress"),
+        })];
+        if item_done {
+            payloads.push(serde_json::json!({
+                "type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_1", "arguments": "",
+            }));
+            payloads.push(serde_json::json!({
+                "type": "response.output_item.done", "output_index": 0, "item": item("incomplete"),
+            }));
+        }
+        payloads.push(serde_json::json!({
+            "type": "response.incomplete", "response": {
+                "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        }));
+        let mut events = Vec::new();
+        for payload in payloads {
+            events.extend(
+                normalizer
+                    .feed(&SseEvent {
+                        event: None,
+                        data: payload.to_string(),
+                    })
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(events.last(), Some(Event::Incomplete)));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallCompleted { .. } | Event::ToolArgumentsDelta { .. }
+            )),
+            "{events:?}"
+        );
+        let body =
+            crate::encode::completed_chat_body_with_ignored("req", "alias", 0, &events, &[], false)
+                .unwrap()
+                .body;
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+    }
+}
+
 /// A truncated item whose accumulated arguments still parse (the budget cut
 /// after the closing brace) completes normally with its incomplete status.
 #[test]

@@ -231,6 +231,7 @@ impl SearchHarness {
             deadline: Instant::now() + Duration::from_secs(60),
             time_to_first_byte: Duration::from_secs(5),
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
+            time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
             output_less_retention: None,
             output_token_cap: None,
@@ -340,6 +341,36 @@ fn a_search_call_turn_runs_a_round_and_the_same_rung_serves_the_answer() {
         assert_eq!(settles[1]["finalize"], true);
         assert_eq!(settles[1]["tool_search_requests"], 1);
         assert!(story["abandons"].as_array().expect("abandons").is_empty());
+    });
+}
+
+#[test]
+fn private_reasoning_does_not_hide_a_search_round() {
+    block_on(async {
+        let harness = SearchHarness::new();
+        let rung = spawn_rung(vec![
+            Answer::Stream(&[
+                "{\"choices\":[{\"delta\":{\"reasoning_content\":\"private thought\"}}]}",
+                SEARCH_START_FRAME,
+                SEARCH_ARGUMENTS_FRAME,
+                USAGE_FRAME,
+                FINISH_TOOL_CALLS_FRAME,
+            ]),
+            Answer::Stream(&[TEXT_FRAME]),
+        ])
+        .await;
+        harness
+            .configure(json!({"wire": wire_json(&rung.url)}))
+            .await;
+        let mut deployment = wire("a", &rung.url, 0);
+        deployment.fireworks_reasoning_route_sha256 = Some("a".repeat(64));
+        let (won, guard) = harness.run(&[deployment], &admission(3)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("search must reach the answer turn");
+        };
+        assert_eq!(committed.tool_search_rounds.len(), 1);
+        assert!(matches!(committed.prefix.first(), Some(Event::TextDelta(text)) if text == "hi"));
+        assert_eq!(harness.story().await["rounds"].as_array().unwrap().len(), 1);
     });
 }
 

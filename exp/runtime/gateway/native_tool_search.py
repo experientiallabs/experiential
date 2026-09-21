@@ -82,6 +82,9 @@ class NativeToolSearchMixin:
             throttle_redial_budget=budget,
         )
         entry.request = outcome.request
+        output_bounds = list(entry.reserved_output_tokens_by_depth)
+        output_bounds[depth] = dispatch.reserved_output_tokens
+        entry.reserved_output_tokens_by_depth = tuple(output_bounds)
         signers = list(entry.signers)
         bindings = list(entry.dispatch_bindings)
         authorities = list(entry.reasoning_carrier_authorities)

@@ -25,7 +25,9 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
+from exp.runtime.models.providers.generation_parameter_validation import require_output_bound
 from exp.runtime.models.providers.reasoning_compat import (
+    MINIMUM_THINKING_BUDGET_TOKENS,
     anthropic_budgeted_enabled_only,
     anthropic_reasoning_effort,
     anthropic_thinking_budget_tokens,
@@ -48,12 +50,15 @@ def anthropic_messages_stream_payload(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    maximum_output_tokens: int | None = None,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Messages JSON.
 
     Args:
         model_id: Exact Anthropic model identifier.
         request: Canonical gateway request.
+        maximum_output_tokens: Declared ceiling for this exact model, required
+            when the caller omits the cap. No default is guessed.
 
     Returns:
         Native Messages request with streaming enabled.
@@ -128,10 +133,15 @@ def anthropic_messages_stream_payload(
         # Anthropic has no schema-free JSON mode, so the caller's intent rides
         # the system prompt as a trailing instruction.
         system_parts.append((JSON_OBJECT_SYSTEM_INSTRUCTION, ()))
+    output_limit = (
+        request.maximum_output_tokens
+        if request.maximum_output_tokens is not None
+        else require_output_bound(request, maximum_output_tokens)
+    )
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,
-        "max_tokens": request.maximum_output_tokens or 4096,
+        "max_tokens": output_limit,
         "stream": True,
     }
     if system_parts:
@@ -293,7 +303,27 @@ def anthropic_messages_stream_payload(
         # never reinterpreted by the gateway. An adaptive config (caller-sent
         # or route-translated) still composes with the route's pinned effort,
         # exactly like a request that carried no thinking config.
-        payload["thinking"] = request.provider_thinking_config
+        thinking = dict(request.provider_thinking_config)
+        if thinking.get("type") == "enabled":
+            budget = thinking.get("budget_tokens")
+            if budget is None:
+                budget = anthropic_thinking_budget_tokens(output_limit)
+                thinking["budget_tokens"] = budget
+            if (
+                not isinstance(budget, int)
+                or isinstance(budget, bool)
+                or not MINIMUM_THINKING_BUDGET_TOKENS <= budget < output_limit
+            ):
+                raise ProviderParameterError(
+                    message=(
+                        "The enabled thinking budget must be at least 1024 tokens and below "
+                        f"the output limit of {output_limit}. Raise the output limit, lower "
+                        "thinking.budget_tokens, or explicitly disable thinking."
+                    ),
+                    param="thinking.budget_tokens",
+                    code="invalid_parameter",
+                )
+        payload["thinking"] = thinking
         if (
             request.provider_thinking_config.get("type") == "adaptive"
             and supports_reasoning
@@ -305,10 +335,17 @@ def anthropic_messages_stream_payload(
                 model_id, effective_reasoning_effort
             )
     elif budgeted_only and effective_reasoning_effort not in (None, "none"):
-        # No legal budget under the output ceiling means thinking stays off;
-        # the model still answers, and route narrowing already disclosed any
-        # sampling interplay. output_config.effort is never emitted here.
-        budget = anthropic_thinking_budget_tokens(request.maximum_output_tokens)
+        budget = anthropic_thinking_budget_tokens(output_limit)
+        if budget is None and request.reasoning_effort not in (None, "none"):
+            raise ProviderParameterError(
+                message=(
+                    "The requested reasoning effort needs a thinking budget of at least 1024 "
+                    f"tokens, below the output limit of {output_limit}. Raise max_tokens above "
+                    "1024 or explicitly disable thinking."
+                ),
+                param=request.caller_effort_parameter,
+                code="invalid_parameter",
+            )
         if budget is not None:
             payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
     elif supports_reasoning and not budgeted_only and effective_reasoning_effort is not None:
@@ -463,6 +500,7 @@ def gemini_generate_content_stream_payload(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
             json_object_output=request.json_object_output,
+            default_maximum_output_tokens=None,
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise

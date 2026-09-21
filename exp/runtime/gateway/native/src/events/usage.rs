@@ -6,6 +6,34 @@ use serde_json::{Map, Value};
 
 use super::Usage;
 
+impl Usage {
+    /// Coalesce cumulative reports from one attempt, never adding snapshots or
+    /// replacing an observed count with an absent leg. A lower stale snapshot
+    /// cannot reduce an already witnessed count; explicit zero stays known.
+    pub(crate) fn merge_observed(&mut self, newer: &Usage) {
+        let writes = self.cache_creation_input_tokens;
+        let next_writes = newer.cache_creation_input_tokens;
+        let next_hour = newer
+            .cache_creation_1h_input_tokens
+            .filter(|hour| next_writes.or(writes).is_some_and(|total| *hour <= total));
+        if next_writes.is_some() && next_writes > writes {
+            // Only growth invalidates the earlier allocation. An equal total
+            // with no breakdown adds no evidence, and a lower total is stale.
+            self.cache_creation_1h_input_tokens = next_hour;
+        } else if next_writes.is_none() || next_writes == writes {
+            self.cache_creation_1h_input_tokens =
+                self.cache_creation_1h_input_tokens.max(next_hour);
+        }
+        self.input_tokens = self.input_tokens.max(newer.input_tokens);
+        self.output_tokens = self.output_tokens.max(newer.output_tokens);
+        self.cached_input_tokens = self.cached_input_tokens.max(newer.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .max(newer.cache_creation_input_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
+    }
+}
+
 /// Largest count the durable ledger can persist: usage lands in signed
 /// 64-bit SQLite INTEGER columns, so anything above `i64::MAX` could never
 /// settle and is treated as a provider contract violation at the parser.
@@ -87,7 +115,7 @@ pub fn bounded_ledger_sum(legs: &[u64], label: &str) -> Result<u64, String> {
 /// folded in. Without a decisive total, a reasoning count above the output
 /// total cannot occur under subset semantics and is folded.
 fn fold_openai_shaped_reasoning(
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     output_tokens: u64,
     reasoning_tokens: Option<u64>,
     total_tokens: Option<u64>,
@@ -96,7 +124,7 @@ fn fold_openai_shaped_reasoning(
     let Some(reasoning) = reasoning_tokens.filter(|reasoning| *reasoning > 0) else {
         return Ok(output_tokens);
     };
-    let subset_total = input_tokens.checked_add(output_tokens);
+    let subset_total = input_tokens.and_then(|input| input.checked_add(output_tokens));
     let additive_total = subset_total.and_then(|total| total.checked_add(reasoning));
     let additive = match total_tokens {
         Some(total) if Some(total) == subset_total => false,
@@ -114,6 +142,7 @@ fn fold_openai_shaped_reasoning(
 /// omitted object is unknown usage, while a malformed one fails the stream.
 /// `output_tokens_details.reasoning_tokens` folds into `output_tokens` when
 /// the provider's `total_tokens` shows it was reported additively.
+#[cfg(test)]
 pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -122,75 +151,172 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "OpenAI usage must be an object".to_string())?;
-    let input_tokens = count_or_zero(object, "input_tokens", "OpenAI input_tokens")?;
-    let reported_output = count_or_zero(object, "output_tokens", "OpenAI output_tokens")?;
-    let reasoning_tokens = optional_usage_detail(
-        object,
-        "output_tokens_details",
-        "reasoning_tokens",
-        "OpenAI reasoning_tokens",
+    OpenAiUsageAccumulator::default()
+        .update(object, false)
+        .map(Some)
+}
+
+/// Raw per-dial counters retained before additive reasoning normalization.
+/// Sparse reports must be combined before deciding whether reasoning is extra.
+#[derive(Clone, Default)]
+pub(crate) struct OpenAiUsageAccumulator {
+    reported: Usage,
+    total_tokens: Option<u64>,
+}
+
+impl OpenAiUsageAccumulator {
+    pub(crate) fn update_chat(&mut self, value: &Value) -> Result<Usage, String> {
+        let object = value
+            .as_object()
+            .ok_or("OpenAI-compatible usage must be an object")?;
+        self.update(object, true)
+    }
+
+    pub(crate) fn update_responses(
+        &mut self,
+        value: Option<&Value>,
+    ) -> Result<Option<Usage>, String> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => {
+                let object = value.as_object().ok_or("OpenAI usage must be an object")?;
+                self.update(object, false).map(Some)
+            }
+        }
+    }
+
+    fn update(&mut self, object: &Map<String, Value>, chat: bool) -> Result<Usage, String> {
+        let (input_key, output_key, input_details, output_details) = if chat {
+            (
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_tokens_details",
+                "completion_tokens_details",
+            )
+        } else {
+            (
+                "input_tokens",
+                "output_tokens",
+                "input_tokens_details",
+                "output_tokens_details",
+            )
+        };
+        let input_tokens = count_if_present(object, input_key, "OpenAI usage")?;
+        let output_tokens = count_if_present(object, output_key, "OpenAI usage")?;
+        let reasoning_tokens = optional_usage_detail(
+            object,
+            output_details,
+            "reasoning_tokens",
+            "OpenAI reasoning_tokens",
+        )?;
+        let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
+        let (cached_input_tokens, cache_creation_input_tokens) =
+            cache_subsets(object, input_details, input_tokens)?;
+        let mut candidate = self.clone();
+        candidate.reported.merge_observed(&Usage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: None,
+            reasoning_tokens,
+        });
+        candidate.total_tokens = candidate.total_tokens.max(total_tokens);
+        let mut normalized = candidate.reported.clone();
+        validate_cache_subsets(&normalized)?;
+        normalized.output_tokens = normalized
+            .output_tokens
+            .map(|output| {
+                fold_openai_shaped_reasoning(
+                    normalized.input_tokens,
+                    output,
+                    normalized.reasoning_tokens,
+                    candidate.total_tokens,
+                    "OpenAI output",
+                )
+            })
+            .transpose()?;
+        *self = candidate;
+        Ok(normalized)
+    }
+}
+
+#[cfg(test)]
+mod sparse_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn responses_sparse_raw_counters_match_whole_report_and_never_fold_twice() {
+        let full = json!({"input_tokens":100,"output_tokens":10,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":115});
+        let expected = openai_usage(Some(&full)).unwrap().unwrap();
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        for report in [
+            json!({"input_tokens":100}),
+            json!({"output_tokens":10}),
+            json!({"output_tokens_details":{"reasoning_tokens":5},"total_tokens":115}),
+            full.clone(),
+            full,
+        ] {
+            let result = accumulator
+                .update_responses(Some(&report))
+                .unwrap()
+                .unwrap();
+            if report.get("total_tokens").is_some() {
+                assert_eq!(result.input_tokens, expected.input_tokens);
+                assert_eq!(result.output_tokens, expected.output_tokens);
+                assert_eq!(result.reasoning_tokens, expected.reasoning_tokens);
+            }
+        }
+        assert_eq!(expected.output_tokens, Some(15));
+    }
+
+    #[test]
+    fn sparse_response_cache_is_checked_when_input_arrives_later() {
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        accumulator
+            .update_responses(Some(&json!({"input_tokens_details":{"cached_tokens":200}})))
+            .unwrap();
+        assert!(accumulator
+            .update_responses(Some(&json!({"input_tokens":100,"output_tokens":1})))
+            .is_err());
+        let valid = accumulator
+            .update_responses(Some(&json!({"input_tokens":250,"output_tokens":1})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(valid.input_tokens, Some(250));
+        assert_eq!(valid.cached_input_tokens, Some(200));
+    }
+}
+
+fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
+    let subsets = bounded_ledger_sum(
+        &[
+            usage.cached_input_tokens.unwrap_or(0),
+            usage.cache_creation_input_tokens.unwrap_or(0),
+        ],
+        "cache subsets",
     )?;
-    let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
-    let output_tokens = fold_openai_shaped_reasoning(
-        input_tokens,
-        reported_output,
-        reasoning_tokens,
-        total_tokens,
-        "OpenAI output",
-    )?;
-    let (cached_input_tokens, cache_creation_input_tokens) =
-        cache_subsets(object, "input_tokens_details", input_tokens)?;
-    Ok(Some(Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(output_tokens),
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        cache_creation_1h_input_tokens: None,
-        reasoning_tokens,
-    }))
+    if usage.input_tokens.is_some_and(|input| subsets > input) {
+        return Err("cache read and write tokens exceed total input tokens".into());
+    }
+    Ok(())
 }
 
 /// Parse a Chat Completions usage object: a malformed object fails the stream
 /// instead of silently dropping token accounting.
 /// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
 /// when the provider's `total_tokens` shows it was reported additively.
+#[cfg(test)]
 pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "OpenAI-compatible usage must be an object".to_string())?;
-    let input_tokens = count_or_zero(object, "prompt_tokens", "prompt_tokens")?;
-    let completion_tokens = count_or_zero(object, "completion_tokens", "completion_tokens")?;
-    let reasoning_tokens = optional_usage_detail(
-        object,
-        "completion_tokens_details",
-        "reasoning_tokens",
-        "reasoning_tokens",
-    )?;
-    let total_tokens = count_if_present(object, "total_tokens", "OpenAI-compatible usage")?;
-    let output_tokens = fold_openai_shaped_reasoning(
-        input_tokens,
-        completion_tokens,
-        reasoning_tokens,
-        total_tokens,
-        "OpenAI-compatible output",
-    )?;
-    let (cached_input_tokens, cache_creation_input_tokens) =
-        cache_subsets(object, "prompt_tokens_details", input_tokens)?;
-    Ok(Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(output_tokens),
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        cache_creation_1h_input_tokens: None,
-        reasoning_tokens,
-    })
+    OpenAiUsageAccumulator::default().update_chat(value)
 }
 
 /// Cache reads and writes are disjoint subsets of OpenAI-shaped total input.
 fn cache_subsets(
     object: &Map<String, Value>,
     detail_key: &str,
-    input_tokens: u64,
+    input_tokens: Option<u64>,
 ) -> Result<(Option<u64>, Option<u64>), String> {
     let reads = optional_usage_detail(object, detail_key, "cached_tokens", "cached_tokens")?;
     let writes = optional_usage_detail(
@@ -199,17 +325,20 @@ fn cache_subsets(
         "cache_write_tokens",
         "cache_write_tokens",
     )?;
-    if bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?
-        > input_tokens
-    {
+    let subsets = bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?;
+    if input_tokens.is_some_and(|input| subsets > input) {
         return Err("cache read and write tokens exceed total input tokens".to_string());
     }
     Ok((reads, writes))
 }
 
-/// Parse Gemini `usageMetadata`: cached tokens are an input subset, absent
-/// counts are zero (`require_integer` parity), and `thoughtsTokenCount` stays
-/// unknown when omitted.
+/// Parse a present Gemini `usageMetadata`: its non-optional proto3 int32
+/// fields have implicit presence, so omitted scalar counts mean zero.
+/// See google/ai/generativelanguage/v1beta/generative_service.proto in
+/// https://github.com/googleapis/googleapis and ProtoJSON default-value rules:
+/// https://protobuf.dev/programming-guides/json/#presence-and-default-values
+/// The dialect keeps an absent usage object unknown. An omitted thinking
+/// subset stays unspecified rather than asserting a model has reasoning.
 ///
 /// Google defines thinking tokens as ADDITIVE to `candidatesTokenCount`
 /// (`totalTokenCount` = prompt + candidates + thoughts, and response pricing
@@ -233,10 +362,10 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         "candidatesTokenCount",
         "Gemini candidatesTokenCount",
     )?;
-    let output_tokens = match reasoning_tokens {
-        Some(reasoning) => bounded_ledger_sum(&[candidates_tokens, reasoning], "Gemini output")?,
-        None => candidates_tokens,
-    };
+    let output_tokens = bounded_ledger_sum(
+        &[candidates_tokens, reasoning_tokens.unwrap_or(0)],
+        "Gemini output",
+    )?;
     Ok(Usage {
         input_tokens: Some(count_or_zero(
             object,
@@ -256,8 +385,8 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
 }
 
 /// Parse Bedrock `metadata.usage`: cache read and write legs fold into total
-/// input, cached input reports the read leg, and absent counts are zero
-/// (`require_integer` parity). Legs and the folded total beyond the
+/// input, cached input reports the read leg, and omitted cache legs mean
+/// zero. Primary omissions stay unknown. Legs and the folded total beyond the
 /// persistable ledger range are provider contract violations and fail the
 /// stream rather than reaching settlement as a value the ledger could never
 /// write. Converse bills a reasoning model's thinking inside `outputTokens`
@@ -266,7 +395,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
     let usage = value
         .and_then(Value::as_object)
         .ok_or_else(|| "Bedrock metadata.usage must be an object".to_string())?;
-    let fresh = count_or_zero(usage, "inputTokens", "Bedrock inputTokens")?;
+    let fresh = count_if_present(usage, "inputTokens", "Bedrock usage")?;
     let cache_read = count_or_zero(
         usage,
         "cacheReadInputTokens",
@@ -277,14 +406,12 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         "cacheWriteInputTokens",
         "Bedrock cacheWriteInputTokens",
     )?;
-    let input_tokens = bounded_ledger_sum(&[fresh, cache_read, cache_write], "Bedrock input")?;
+    let input_tokens = fresh
+        .map(|fresh| bounded_ledger_sum(&[fresh, cache_read, cache_write], "Bedrock input"))
+        .transpose()?;
     Ok(Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(count_or_zero(
-            usage,
-            "outputTokens",
-            "Bedrock outputTokens",
-        )?),
+        input_tokens,
+        output_tokens: count_if_present(usage, "outputTokens", "Bedrock usage")?,
         cached_input_tokens: Some(cache_read),
         cache_creation_input_tokens: count_if_present(
             usage,

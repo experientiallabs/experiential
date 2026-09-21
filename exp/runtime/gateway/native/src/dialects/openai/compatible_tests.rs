@@ -26,6 +26,176 @@ fn annotation(finish: Option<&str>) -> Value {
 }
 
 #[test]
+fn decoded_compatible_usage_is_observable_before_terminal_emission() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    assert!(normalizer.observed_usage().is_none());
+    let events = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 7}})
+                .to_string(),
+        })
+        .unwrap();
+    assert!(events.is_empty(), "usage keeps its terminal event timing");
+    let observed = normalizer.observed_usage().expect("decoded usage");
+    assert_eq!(observed.input_tokens, Some(13));
+    assert_eq!(observed.output_tokens, Some(7));
+    normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".into(),
+        })
+        .unwrap();
+    assert_eq!(normalizer.observed_usage().unwrap().output_tokens, Some(7));
+}
+
+#[test]
+fn partial_usage_wire_reports_coalesce_without_inventing_counts() {
+    for (reports, expected) in [
+        (vec![json!({})], (None, None)),
+        (vec![json!({"prompt_tokens":13})], (Some(13), None)),
+        (vec![json!({"completion_tokens":0})], (None, Some(0))),
+        (
+            vec![
+                json!({"prompt_tokens":13, "completion_tokens":7}),
+                json!({}),
+            ],
+            (Some(13), Some(7)),
+        ),
+        (
+            vec![json!({"prompt_tokens":13}), json!({"completion_tokens":7})],
+            (Some(13), Some(7)),
+        ),
+        (
+            vec![
+                json!({"prompt_tokens":13, "completion_tokens":7}),
+                json!({"completion_tokens":2}),
+            ],
+            (Some(13), Some(7)),
+        ),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        for report in reports {
+            normalizer
+                .feed(&SseEvent {
+                    event: None,
+                    data: json!({"choices":[], "usage":report}).to_string(),
+                })
+                .unwrap();
+        }
+        let observed = normalizer.observed_usage().unwrap();
+        assert_eq!((observed.input_tokens, observed.output_tokens), expected);
+        let events = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: "[DONE]".into(),
+            })
+            .unwrap();
+        let final_usage = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (final_usage.input_tokens, final_usage.output_tokens),
+            expected
+        );
+    }
+}
+
+#[test]
+fn malformed_frame_preserves_previous_meter_after_sparse_usage() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"choices":[],"usage":{"prompt_tokens":13,"completion_tokens":7}})
+                .to_string(),
+        })
+        .unwrap();
+    assert!(normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"choices":"bad","usage":{}}).to_string()
+        })
+        .is_err());
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(usage.input_tokens, Some(13));
+    assert_eq!(usage.output_tokens, Some(7));
+}
+
+#[test]
+fn sparse_usage_rejects_cache_subsets_above_the_coalesced_input() {
+    for reports in [
+        vec![
+            json!({"prompt_tokens":100,"completion_tokens":1}),
+            json!({"prompt_tokens_details":{"cached_tokens":200}}),
+        ],
+        vec![
+            json!({"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":100}}),
+            json!({"prompt_tokens":100,"prompt_tokens_details":{"cache_write_tokens":100}}),
+        ],
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: json!({"choices":[],"usage":reports[0]}).to_string(),
+            })
+            .unwrap();
+        let failure = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: json!({"choices":[],"usage":reports[1]}).to_string(),
+            })
+            .expect_err("coalesced cache subsets exceed input");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        assert!(
+            normalizer
+                .observed_usage()
+                .unwrap()
+                .cached_input_tokens
+                .unwrap_or(0)
+                <= 100
+        );
+    }
+}
+
+#[test]
+fn sparse_additive_reasoning_matches_full_usage_without_double_folding() {
+    let full = json!({"prompt_tokens":100,"completion_tokens":10,"completion_tokens_details":{"reasoning_tokens":5},"total_tokens":115});
+    for reports in [
+        vec![full.clone()],
+        vec![
+            json!({"prompt_tokens":100}),
+            json!({"completion_tokens":10,"completion_tokens_details":{"reasoning_tokens":5},"total_tokens":115}),
+        ],
+        vec![
+            json!({"completion_tokens":10}),
+            json!({"completion_tokens_details":{"reasoning_tokens":5}}),
+            json!({"prompt_tokens":100,"total_tokens":115}),
+        ],
+        vec![full.clone(), json!({"total_tokens":115}), full],
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        for usage in reports {
+            normalizer
+                .feed(&SseEvent {
+                    event: None,
+                    data: json!({"choices":[],"usage":usage}).to_string(),
+                })
+                .unwrap();
+        }
+        let usage = normalizer.observed_usage().unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(15));
+        assert_eq!(usage.reasoning_tokens, Some(5));
+    }
+}
+
+#[test]
 fn azure_annotations_preserve_text_finish_and_trailing_usage() {
     for after_stop in [false, true] {
         let mut frames = vec![
@@ -280,6 +450,63 @@ fn length_finish_without_done_sentinel_is_incomplete() {
     let (events, failure) = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, false));
     assert!(failure.is_none(), "{failure:?}");
     assert_eq!(events.last(), Some(&json!({"kind": "incomplete"})));
+}
+
+#[test]
+fn empty_compatible_tool_needs_a_normal_finish_before_seeding_arguments() {
+    for finish in [Some("length"), Some("tool_calls"), Some("stop"), None] {
+        for done in [true, false] {
+            // A sentinel without a declared finish follows the existing Chat
+            // completion contract; raw EOF has no such completion evidence.
+            if finish.is_none() && done {
+                continue;
+            }
+            for arguments in [None, Some(""), Some("{}"), Some("{\"city\":\"Paris\"}")] {
+                let mut function = json!({"name": "lookup"});
+                if let Some(arguments) = arguments {
+                    function["arguments"] = json!(arguments);
+                }
+                let mut frames = vec![json!({"choices": [{"index": 0, "delta": {
+                    "tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": function}]
+                }}]})];
+                if let Some(finish) = finish {
+                    frames.push(finish_frame(finish));
+                }
+                let (events, failure) =
+                    drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, done));
+                assert!(failure.is_none(), "{failure:?}");
+                let normal = matches!(finish, Some("tool_calls" | "stop"));
+                let supplied = arguments.is_some_and(|arguments| !arguments.is_empty());
+                let completed: Vec<_> = events
+                    .iter()
+                    .filter(|event| event["kind"] == "tool_call_completed")
+                    .collect();
+                assert_eq!(
+                    completed.len(),
+                    usize::from(normal || supplied),
+                    "{events:?}"
+                );
+                if let Some(call) = completed.first() {
+                    assert_eq!(
+                        call["raw_arguments"],
+                        arguments.filter(|args| !args.is_empty()).unwrap_or("{}")
+                    );
+                } else {
+                    assert!(
+                        events
+                            .iter()
+                            .all(|event| event["kind"] != "tool_arguments_delta"
+                                || event["text"] == ""),
+                        "{events:?}"
+                    );
+                }
+                assert_eq!(
+                    events.last().unwrap()["kind"],
+                    if normal { "completed" } else { "incomplete" }
+                );
+            }
+        }
+    }
 }
 
 /// Without a finish reason nothing is synthesized: a stream that emitted

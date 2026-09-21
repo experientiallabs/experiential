@@ -94,3 +94,13 @@ def test_throttle_redial_schedule_is_fully_stated_bounded_and_ordered() -> None:
     ):
         with pytest.raises(ValidationError):
             GatewayThrottleRedialPolicy.model_validate(rejected)
+
+
+def test_saturation_policy_defaults_to_overflow_and_accepts_refuse() -> None:
+    """The saturation lever is inert by default and validates its closed vocabulary."""
+    assert GatewayRungDispatchPolicy().saturation == "overflow"
+    assert (
+        GatewayRungDispatchPolicy(concurrency_bound=4, saturation="refuse").saturation == "refuse"
+    )
+    with pytest.raises(ValidationError):
+        GatewayRungDispatchPolicy.model_validate({"saturation": "queue"})

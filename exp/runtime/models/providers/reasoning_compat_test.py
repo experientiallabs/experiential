@@ -2,7 +2,13 @@
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.known_models import known_model_metadata
+from exp.common.models.model import ReasoningEffort
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.capability_policy import coerce_generation_parameters
+from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
@@ -16,6 +22,144 @@ from exp.runtime.models.providers.reasoning_compat import (
     require_sampling_reasoning_compatibility,
     supported_reasoning_efforts,
 )
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+
+
+def _anthropic_profile(model_id: str) -> GatewayWireProfile:
+    """Return an effort-capable native Messages profile with an optional default."""
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test/v1/messages",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+        reasoning_effort="high",
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ("claude-sonnet-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4.7"),
+)
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high"))
+def test_valid_thinking_off_reaches_native_payload(
+    model_id: str, effort: ReasoningEffort | None
+) -> None:
+    """A valid off switch survives route shaping and actual dialect encoding."""
+    profile = _anthropic_profile(model_id)
+    output_config: JsonObject | None = None if effort is None else {"effort": effort}
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize briefly."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "disabled"},
+        reasoning_effort=effort,
+        provider_output_config=output_config,
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["max_tokens"] == 4096
+    assert "thinking.type->adaptive" not in public.ignored_parameters
+    if effort is None:
+        assert "output_config" not in payload
+    else:
+        assert payload["output_config"] == {"effort": effort}
+
+
+@pytest.mark.parametrize(
+    ("model_id", "effort"),
+    (
+        ("claude-fable-5", None),
+        ("claude-fable-5-1", "low"),
+        ("anthropic/claude-fable-5.1", None),
+        ("claude-mythos-5-1", "high"),
+        ("claude-mythos-preview", None),
+        ("claude-opus-5", "xhigh"),
+        ("claude-opus-5", "max"),
+    ),
+)
+def test_unsupported_thinking_off_is_never_coerced(
+    model_id: str, effort: ReasoningEffort | None
+) -> None:
+    """Unsupported off requests retain their typed pre-dispatch refusal."""
+    profile = _anthropic_profile(model_id)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize briefly."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "disabled"},
+        reasoning_effort=effort,
+        provider_output_config=None if effort is None else {"effort": effort},
+    )
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests((profile,), request)
+    assert error.value.param == "thinking.type"
+    assert error.value.code == "unsupported_parameter"
+    assert coerce_generation_parameters((profile,), request) is None
+    assert request.provider_thinking_config == {"type": "disabled"}
+
+
+@pytest.mark.parametrize("model_id", ("claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"))
+def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None:
+    """A catalog default does not opt an unspecified request into reasoning."""
+    profile = _anthropic_profile(model_id)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize briefly."),),
+        maximum_output_tokens=4096,
+    )
+    _, provider = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider)
+    assert "thinking" not in payload
+    assert "output_config" not in payload
+
+
+@pytest.mark.parametrize("model_id", ("claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"))
+def test_adaptive_only_models_refuse_explicit_numeric_thinking_budgets(model_id: str) -> None:
+    """Mode translation cannot erase the caller's hard thinking-token bound."""
+    profile = _anthropic_profile(model_id)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Solve this."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "enabled", "budget_tokens": 1024},
+        reasoning_effort="high",
+    )
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests((profile,), request)
+    assert error.value.param == "thinking.budget_tokens"
+    assert coerce_generation_parameters((profile,), request) is None
+
+
+def test_bare_enabled_defers_budget_until_per_rung_output_is_known() -> None:
+    """An internal omitted ceiling defers its budget until rung selection."""
+    profile = _anthropic_profile("claude-haiku-4-5")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Solve this."),),
+        provider_thinking_config={"type": "enabled"},
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+    assert provider.provider_thinking_config == {"type": "enabled"}
+    assert provider.maximum_output_tokens is None
+    assert "thinking.budget_tokens->derived" in public.ignored_parameters
+
+
+@pytest.mark.parametrize("cap", (32, 1024))
+def test_bare_enabled_with_impossible_explicit_cap_refuses(cap: int) -> None:
+    """Requested thinking cannot be replaced by thinking-off to fit a tiny cap."""
+    profile = _anthropic_profile("claude-haiku-4-5")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Solve this."),),
+        maximum_output_tokens=cap,
+        provider_thinking_config={"type": "enabled"},
+    )
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests((profile,), request)
+    assert error.value.param == "thinking.budget_tokens"
+    assert coerce_generation_parameters((profile,), request) is None
 
 
 def test_anthropic_adaptive_efforts_are_never_silently_clamped() -> None:
@@ -260,19 +404,3 @@ def test_anthropic_point_releases_inherit_their_generation_effort_contract() -> 
         anthropic_reasoning_effort("claude-fable-5-1", "ultra")
     # Pre-adaptive families stay budgeted.
     assert anthropic_adaptive_only_thinking("claude-haiku-4-5") is False
-
-
-def test_thinking_budget_maps_onto_the_documented_effort_tiers() -> None:
-    """Every band of the thinking-to-effort table maps as documented."""
-    from exp.runtime.models.providers.reasoning_compat import thinking_config_reasoning_effort
-
-    assert thinking_config_reasoning_effort({"type": "disabled"}) == "none"
-    assert thinking_config_reasoning_effort({"type": "adaptive"}) == "medium"
-    assert thinking_config_reasoning_effort({"type": "enabled"}) == "medium"
-    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 1024}) == "low"
-    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 4096}) == "low"
-    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 4097}) == "medium"
-    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 16384}) == "medium"
-    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 16385}) == "high"
-    # A boolean is not a budget; the config falls back to the default depth.
-    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": True}) == "medium"

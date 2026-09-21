@@ -9,11 +9,13 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayEventKind,
+    GatewayFailure,
     GatewayFailureClass,
     GatewayRefusalReason,
     GatewayUsage,
 )
 from exp.runtime.gateway.native_settlement import (
+    NativeSettlementPayload,
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
     first_token_at_from_settlement,
@@ -28,6 +30,99 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
 )
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {"input_tokens": 19},
+        {"output_tokens": 7},
+        {"input_tokens": 19, "output_tokens": 0},
+        {"input_tokens": 19, "output_tokens": 7},
+    ],
+)
+def test_cancelled_disconnect_marker_retains_unknown_final_meter(usage: JsonObject | None) -> None:
+    """No observed-to-date token count certifies a cancelled attempt's final meter."""
+    data: JsonObject = {
+        "outcome": "failed",
+        "failure": {"failure_class": "cancelled", "safe_message": "cancelled"},
+        "usage": usage,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+    }
+    terminal, _ = terminal_from_settlement(data)
+    assert terminal.usage_incomplete_due_to_disconnect is True
+    if usage is not None:
+        assert terminal.usage is not None
+        assert terminal.usage.input_tokens == usage.get("input_tokens")
+        assert terminal.usage.output_tokens == usage.get("output_tokens")
+    assert "usage_incomplete_due_to_disconnect" not in terminal.model_dump()
+    replayed, _ = terminal_from_settlement(data)
+    assert replayed.usage_incomplete_due_to_disconnect is True
+
+
+@pytest.mark.parametrize("marker", ["true", 1, None, [], {}])
+def test_disconnect_marker_rejects_nonboolean_values(marker: object) -> None:
+    """Caller-shaped values never coerce into financial provenance."""
+    data: JsonObject = {
+        "outcome": "failed",
+        "failure": {"failure_class": "cancelled", "safe_message": "cancelled"},
+        "dispatched": True,
+    }
+    # model_validate receives the untrusted wire object before typed routing.
+    with pytest.raises(ValueError):
+        NativeSettlementPayload.model_validate(
+            {**data, "usage_incomplete_due_to_disconnect": marker}
+        )
+
+
+@pytest.mark.parametrize(
+    "outcome,failure,dispatched",
+    [
+        ("completed", None, True),
+        ("failed", "provider_internal", True),
+        ("failed", "cancelled", False),
+    ],
+)
+def test_disconnect_marker_rejects_inconsistent_work_state(
+    outcome: str, failure: str | None, dispatched: bool
+) -> None:
+    """Only dispatched cancellation can carry the unresolved-reservation signal."""
+    data: JsonObject = {
+        "outcome": outcome,
+        "dispatched": dispatched,
+        "usage_incomplete_due_to_disconnect": True,
+        "failure": None
+        if failure is None
+        else {"failure_class": failure, "safe_message": "failed"},
+    }
+    with pytest.raises(ValueError, match="dispatched cancelled"):
+        terminal_from_settlement(data)
+
+
+@pytest.mark.parametrize("finalize", [False, "true", 1, None])
+def test_disconnect_hold_requires_strict_request_finalization(finalize: object) -> None:
+    """A held cancelled attempt must close its request, never continue the ladder."""
+    payload = {
+        "outcome": "failed",
+        "failure": {"failure_class": "cancelled", "safe_message": "cancelled"},
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+        "finalize": finalize,
+    }
+    with pytest.raises(ValueError):
+        provenance = NativeSettlementPayload.model_validate(payload)
+        provenance.validate_disconnect(
+            GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled"),
+            GatewayEventKind.FAILED,
+        )
+
+
+def test_ordinary_terminal_without_meter_does_not_infer_disconnect_hold() -> None:
+    """Absent evidence leaves the separate terminal-without-meter policy unchanged."""
+    terminal, _ = terminal_from_settlement({"outcome": "completed", "usage": None})
+    assert terminal.usage_incomplete_due_to_disconnect is False
 
 
 def test_first_token_at_parses_the_native_plane_rfc3339_wire_format() -> None:

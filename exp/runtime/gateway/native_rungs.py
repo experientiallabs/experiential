@@ -37,6 +37,7 @@ from exp.runtime.models.providers import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
 from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_PROVIDER_ID,
     constrain_openrouter_zero_data_retention,
@@ -60,6 +61,8 @@ class RungDispatch:
     binding: FrozenDispatchBinding | None
     carrier_authority: ReasoningCarrierAuthority | None
     parallel_disclosure: str | None
+    output_disclosure: str | None
+    reserved_output_tokens: int
 
 
 def build_rung_dispatch(
@@ -92,6 +95,23 @@ def build_rung_dispatch(
     )
     rung_request, parallel_disclosure = shape_parallel_tool_calls(
         provider_request, deployment.gateway.capabilities
+    )
+    capabilities = deployment.capabilities
+    rung_request, output_bound = bounded_output_request(
+        profile,
+        rung_request,
+        model_maximum_output_tokens=(
+            capabilities.maximum_output_tokens if capabilities is not None else None
+        ),
+        context_window_tokens=(
+            capabilities.context_window_tokens if capabilities is not None else None
+        ),
+    )
+    output_disclosure = (
+        f"max_tokens->default({output_bound};anthropic_messages;declared_bound)"
+        if provider_request.maximum_output_tokens is None
+        and rung_request.maximum_output_tokens is not None
+        else None
     )
     upstream_payload = dialect_stream_payload(profile, rung_request)
     if rung_request.provider_preferences is not None and _openrouter_wire(deployment, profile):
@@ -151,6 +171,8 @@ def build_rung_dispatch(
         binding=binding,
         carrier_authority=carrier_authority,
         parallel_disclosure=parallel_disclosure,
+        output_disclosure=output_disclosure,
+        reserved_output_tokens=output_bound,
     )
 
 

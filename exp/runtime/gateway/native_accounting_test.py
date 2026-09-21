@@ -10,14 +10,20 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
+    GatewayTokenPrices,
 )
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
-from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
+from exp.runtime.gateway.budgets import (
+    BudgetReservationRejected,
+    BudgetScopeKind,
+    maximum_attempt_cost_nano_usd,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -61,6 +67,7 @@ def _deployment(
         provider_model="provider-model",
         connection_sha256=connection_sha256,
         capabilities_sha256="d" * 64,
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway=GatewayDeploymentMetadata(
             capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             dispatch=dispatch,
@@ -155,7 +162,7 @@ class _RecordingLedger:
         preferred_deployment: ExactModelDeployment | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
-        del snapshot, maximum_cost_nano_usd, fallback_reason
+        del snapshot, fallback_reason
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
@@ -169,6 +176,7 @@ class _RecordingLedger:
                 "route_depth": route_depth,
                 "reserved_input_tokens": reserved_input_tokens,
                 "reserved_output_tokens": reserved_output_tokens,
+                "maximum_cost_nano_usd": maximum_cost_nano_usd,
                 "route_reason": route_reason,
                 "dispatch_reason": dispatch_reason,
                 "preferred_deployment_id": (
@@ -306,6 +314,112 @@ def test_rejection_evidence_reaches_only_unopened_unmetered_decision_failures(
     assert event is not None
     assert event.decision_provider_rejected is expected
     assert (event.usage is not None) is has_usage
+
+
+@pytest.mark.parametrize("frozen_bound", (2_048, 100_000))
+def test_attempt_token_and_money_reservations_use_the_frozen_payload_bound(
+    frozen_bound: int,
+) -> None:
+    """Omitted public caps cannot reserve less than the selected wire may generate."""
+    registry, ledger, entry = _registry()
+    deployment = entry.route.deployment.model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_nano_usd_per_million_tokens=1_000_000,
+                    output_nano_usd_per_million_tokens=2_000_000,
+                )
+            )
+        }
+    )
+    entry.route = entry.route.model_copy(update={"deployment": deployment})
+    entry.reserved_output_tokens_by_depth = (frozen_bound, 128_000)
+    _start(registry, ordinal=0)
+    assert isinstance(entry.request, GatewayRequest)
+    assert entry.request.maximum_output_tokens is None
+    row = ledger.started[-1]
+    assert row["reserved_output_tokens"] == frozen_bound
+    assert row["maximum_cost_nano_usd"] == maximum_attempt_cost_nano_usd(
+        entry.request.model_copy(update={"maximum_output_tokens": frozen_bound}), deployment
+    )
+
+
+@pytest.mark.parametrize("partial_usage", (False, True))
+@pytest.mark.parametrize("retry", ("direct", "explicit", "sweep"))
+def test_disconnect_usage_evidence_survives_every_settlement_path(
+    partial_usage: bool, retry: str
+) -> None:
+    """Observed partial meters never erase the trusted incomplete-usage hold evidence."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": {"input_tokens": 7, "output_tokens": 3} if partial_usage else None,
+        "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+        "finalize": True,
+        "opened": partial_usage,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+    }
+    encoded = json.dumps(payload)
+    if retry != "direct":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        assert entry.pending_settlement == payload
+        assert ledger.terminal_events[-1] is not None
+        assert ledger.terminal_events[-1].usage_incomplete_due_to_disconnect is True
+    if retry == "sweep":
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.usage_incomplete_due_to_disconnect is True
+    assert (terminal.usage is not None) is partial_usage
+    if terminal.usage is not None:
+        assert terminal.usage.input_tokens == 7
+        assert terminal.usage.output_tokens == 3
+    assert registry.entry(entry.authorization.request_id) is None
+    assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "dispatched", "usage"),
+    (
+        ("failed", False, None),
+        ("completed", True, None),
+        ("completed", True, {"input_tokens": 7, "output_tokens": 3}),
+    ),
+)
+def test_predispatch_and_provider_terminal_settlements_do_not_invent_disconnect_evidence(
+    outcome: str, dispatched: bool, usage: JsonObject | None
+) -> None:
+    """No terminal meter is different from the native witness of an interrupted provider."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": outcome,
+                "usage": usage,
+                "failure": (
+                    {"failure_class": "cancelled", "safe_message": "cancelled before dispatch"}
+                    if outcome == "failed"
+                    else None
+                ),
+                "dispatched": dispatched,
+                "finalize": True,
+            }
+        )
+    )
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.usage_incomplete_due_to_disconnect is False
 
 
 def _start(
@@ -682,6 +796,96 @@ def _bounded_pair(
     )
 
 
+class TestLaneSaturation:
+    """The worker's default lane bound and refuse-instead-of-overflow (lane_saturation)."""
+
+    def test_default_lane_bound_spills_an_unauthored_rung_sideways(self) -> None:
+        """A rung with no authored policy still sheds at the worker's default share."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(registry, deployments, request_id="request-1")
+        _admit(registry, deployments, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        spilled = _start(registry, ordinal=0, request_id="request-2")
+        assert spilled["route_depth"] == 1
+        assert ledger.started[1]["dispatch_reason"] == "queue_bound"
+        assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
+        assert registry.rung_admission_counters() == (1, 0, 0)
+
+    def test_default_lane_bound_refuses_fast_instead_of_overflowing(self) -> None:
+        """Every unauthored rung at its default share: a retryable 429, no dispatch."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        only = (_deployment("deployment-a", connection_sha256="b" * 64),)
+        _admit(registry, only, request_id="request-1")
+        _admit(registry, only, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert refused["exhausted"] is True
+        failure = cast("JsonObject", refused["failure"])
+        assert failure["failure_class"] == "throttled"
+        assert failure["retry_after_seconds"] == 5
+        assert "in-flight bound" in str(failure["safe_message"])
+        assert len(ledger.started) == 1
+        assert registry.rung_admission_counters() == (1, 0, 1)
+        # The refused request is finished, so the slot it never took frees nothing
+        # and the next request after a settle admits again.
+        started = ledger.started[0]
+        _settle(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="request-1",
+        )
+        _admit(registry, only, request_id="request-3")
+        assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
+
+    def test_authored_bound_keeps_the_default_on_its_unauthored_sibling(self) -> None:
+        """The authored bound wins on its rung; the sibling gets the worker default."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployments = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=2),
+            ),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        for request_id in ("request-1", "request-2", "request-3"):
+            _admit(registry, deployments, request_id=request_id)
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        assert _start(registry, ordinal=0, request_id="request-2")["route_depth"] == 0
+        # Both slots of the authored bound are held; the third spills to the
+        # sibling, whose own (default) bound of one is still free.
+        assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 1
+        assert registry.rung_admission_counters() == (1, 0, 0)
+
+    def test_authored_refuse_saturation_replaces_the_overflow(self) -> None:
+        """``saturation="refuse"`` on a single authored rung refuses rather than overflows."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse"),
+            ),
+        )
+        _admit(registry, only, request_id="request-1")
+        _admit(registry, only, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+        assert registry.rung_admission_counters() == (1, 0, 1)
+
+
 class TestRungDispatchPolicy:
     """Bounded-queue spill, fair-share sheds, overflow, and their disclosures."""
 
@@ -700,7 +904,7 @@ class TestRungDispatchPolicy:
         assert spilled["route_depth"] == 1
         assert ledger.started[1]["dispatch_reason"] == "queue_bound"
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
 
     def test_settle_frees_the_bounded_slot(self) -> None:
         """A settled dispatch returns its slot so the next request is not shed."""
@@ -719,7 +923,7 @@ class TestRungDispatchPolicy:
         )
         follow = _start(registry, ordinal=0, request_id="request-2")
         assert follow["route_depth"] == 0
-        assert registry.rung_admission_counters() == (0, 0)
+        assert registry.rung_admission_counters() == (0, 0, 0)
 
     def test_saturated_overflow_never_manufactures_a_failure(self) -> None:
         """A single-rung pool at its bound still dispatches, disclosed as such."""
@@ -739,7 +943,7 @@ class TestRungDispatchPolicy:
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
         assert ledger.started[1]["preferred_deployment_id"] is None
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
 
     def test_fair_share_shed_discloses_and_spills(self) -> None:
         """An over-share organization spills while the under-share one admits."""
@@ -863,7 +1067,7 @@ class TestRungDispatchPolicy:
         assert all(row["dispatch_reason"] is None for row in ledger.started)
         assert all(row["preferred_deployment_id"] is None for row in ledger.started)
         assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
-        assert registry.rung_admission_counters() == (0, 0)
+        assert registry.rung_admission_counters() == (0, 0, 0)
 
     def test_budget_skip_releases_the_reserved_slot(self) -> None:
         """A deployment-budget rejection frees the rung's bounded reservation."""
@@ -1142,7 +1346,7 @@ class TestRateLimitSheds:
         assert spilled["route_depth"] == 1
         assert ledger.started[1]["dispatch_reason"] == "rate_limit"
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
 
     def test_rate_shed_force_admits_a_reasoning_pinned_rung_until_a_real_failure(self) -> None:
@@ -1171,7 +1375,7 @@ class TestRateLimitSheds:
         assert ledger.started[1]["deployment_id"] == "deployment-a"
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
         assert ledger.started[1]["route_reason"] == "reasoning_continuation"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
         throttled: JsonObject = {
             "failure_class": "throttled",
             "safe_message": "provider throttled the request",
@@ -1229,7 +1433,7 @@ class TestRateLimitSheds:
         overflow = _start(registry, ordinal=0, request_id="request-2")
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
 
     def test_whole_ladder_fresh_spill_limited_still_force_admits(self) -> None:
         """A narrow ladder blocked only by the fresh threshold never mints a 429.
@@ -1270,7 +1474,7 @@ class TestRateLimitSheds:
         overflow = _start(registry, ordinal=0, request_id="request-2")
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
         assert registry.rung_rate_counters() == (0, 1)
 
     def test_throttled_settle_teaches_the_rungs_learned_ceiling(self) -> None:
@@ -2107,7 +2311,7 @@ class TestThrottleRedial:
         assert ledger.started[1]["preferred_deployment_id"] is None
         # The rate shed happened and is counted as one; the forced admission is
         # a backoff redial, not a saturated overflow.
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
         assert registry.throttle_cache_counters() == (0, 0, 1, 1)
         _settle(
@@ -2193,7 +2397,7 @@ class TestThrottleRedial:
         assert ledger.started[3]["deployment_id"] == "deployment-c"
         assert ledger.started[3]["dispatch_reason"] == "throttle_failover_cold"
         assert ledger.started[3]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
         assert registry.throttle_cache_counters() == (0, 1, 1, 0)
 
@@ -2240,7 +2444,7 @@ class TestThrottleRedial:
             catalog_sha256="f" * 64,
         )
         assert _start(registry, ordinal=0, request_id="request-other")["route_depth"] == 0
-        sheds_before, overflows_before = registry.rung_admission_counters()
+        sheds_before, overflows_before, _ = registry.rung_admission_counters()
         redial = _start(
             registry,
             ordinal=1,
@@ -2253,7 +2457,7 @@ class TestThrottleRedial:
         assert ledger.started[2]["deployment_id"] == "deployment-b"
         assert ledger.started[2]["dispatch_reason"] == "queue_bound"
         assert ledger.started[2]["preferred_deployment_id"] == "deployment-a"
-        sheds_after, overflows_after = registry.rung_admission_counters()
+        sheds_after, overflows_after, _ = registry.rung_admission_counters()
         assert (sheds_after - sheds_before, overflows_after - overflows_before) == (1, 0)
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
 
@@ -2317,7 +2521,7 @@ class TestThrottleRedial:
         assert ledger.started[2]["deployment_id"] == "deployment-c"
         assert ledger.started[2]["dispatch_reason"] != "saturated_overflow"
         assert ledger.started[2]["dispatch_reason"] != "throttle_backoff"
-        assert registry.rung_admission_counters() == (2, 0)
+        assert registry.rung_admission_counters() == (2, 0, 0)
         assert registry.rung_rate_counters() == (2, 0)
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
         assert registry.loads.inflight(("deployment-b", "c" * 64)) == 1

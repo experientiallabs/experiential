@@ -20,6 +20,17 @@ use crate::relay::remaining;
 use crate::replay::{CachedResponse, OwnerLease};
 use crate::settlement::AttemptGuard;
 
+/// Log a content-free local reason whenever a live stream ends short.
+pub(crate) fn log_stream_exit(request_id: &str, reason: &'static str) {
+    let line = serde_json::json!({
+        "event": "stream_delivery_end", "request_id": request_id, "reason": reason,
+    });
+    eprintln!("exp-gateway-native: {line}");
+}
+
+#[path = "stream_delivery.rs"]
+pub(crate) mod stream_delivery;
+
 /// Build a chat encoder's sanitized failure frame and done sentinel when the
 /// stream has not already reached a terminal.
 pub(crate) fn failure_frames(encoder: &mut ChatSseEncoder, failure: &Failure) -> Vec<Bytes> {
@@ -255,7 +266,17 @@ pub(crate) fn cached_response(cached: &CachedResponse) -> Response {
 /// Append one frame while it remains within the replay capture ceiling,
 /// mirroring the python engine's `capture_frame`.
 pub(crate) fn capture_frame(buffer: &mut Vec<u8>, data: &[u8], replayable: bool) -> bool {
-    if !replayable || buffer.len() + data.len() > STREAM_REPLAY_CAPTURE_BYTES {
+    capture_frame_bounded(buffer, data, replayable, STREAM_REPLAY_CAPTURE_BYTES)
+}
+
+fn capture_frame_bounded(
+    buffer: &mut Vec<u8>,
+    data: &[u8],
+    replayable: bool,
+    limit: usize,
+) -> bool {
+    if !replayable || buffer.len().saturating_add(data.len()) > limit {
+        *buffer = Vec::new();
         return false;
     }
     buffer.extend_from_slice(data);
@@ -376,6 +397,11 @@ pub(crate) async fn finish_stream_terminal(
     cached_headers: &[(String, String)],
     frames: Vec<Bytes>,
 ) {
+    let request_id = cached_headers
+        .iter()
+        .find(|(name, _)| name == "x-request-id")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
     if lease.is_some() {
         for data in &frames {
             replayable = capture_frame(capture, data, replayable);
@@ -390,15 +416,18 @@ pub(crate) async fn finish_stream_terminal(
                 body: std::mem::take(capture),
             };
             if owner.complete(cached).await.is_err() {
+                log_stream_exit(request_id, "replay_publication_failed");
                 return;
             }
         } else {
             owner.abandon().await;
+            log_stream_exit(request_id, "replay_capture_overflow");
             return;
         }
     }
     for data in frames {
         if !send_bounded(sender, deadline, data).await {
+            log_stream_exit(request_id, "terminal_delivery_closed_or_deadline");
             return;
         }
     }

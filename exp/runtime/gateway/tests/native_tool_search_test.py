@@ -113,6 +113,7 @@ class _Provider:
 
 
 def _configure(root: Path, base_url: str) -> str:
+    """Configure the tool-capable fixture alias and return its authorized client key."""
     manager = GatewayManagement(root)
     manager.initialize()
     upsert_connection(
@@ -130,7 +131,7 @@ def _configure(root: Path, base_url: str) -> str:
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True, supports_streaming_tool_arguments=True
         ),
@@ -183,9 +184,11 @@ _TOOLS_CHAT = [
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("named_choice", [False, True])
 def test_chat_tool_search_round_trip_is_served_by_the_gateway(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: bool, named_choice: bool
 ) -> None:
+    """Serve a search round and clear an explicit search choice before the second dial."""
     provider = _Provider()
     monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-provider-key")
     raw_key = _configure(tmp_path, f"http://127.0.0.1:{provider.server.server_port}/v1")
@@ -201,6 +204,11 @@ def test_chat_tool_search_round_trip_is_served_by_the_gateway(
                 **({"stream_options": {"include_usage": True}} if stream else {}),
                 "messages": [{"role": "user", "content": "What's the weather in Bern?"}],
                 "tools": _TOOLS_CHAT,
+                **(
+                    {"tool_choice": {"type": "function", "function": {"name": "tool_search"}}}
+                    if named_choice
+                    else {}
+                ),
             },
             timeout=30,
         )
@@ -209,6 +217,12 @@ def test_chat_tool_search_round_trip_is_served_by_the_gateway(
         first, second = provider.requests
         first_names = [tool["function"]["name"] for tool in first["tools"]]
         assert first_names == ["send_email", "tool_search"]
+        if named_choice:
+            assert first["tool_choice"] == {
+                "type": "function",
+                "function": {"name": "tool_search"},
+            }
+        assert "tool_choice" not in second
         assert all("defer_loading" not in tool for tool in first["tools"])
         second_names = [tool["function"]["name"] for tool in second["tools"]]
         assert "get_weather" in second_names and "book_flight" not in second_names

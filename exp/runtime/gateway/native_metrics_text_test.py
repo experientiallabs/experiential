@@ -43,6 +43,7 @@ def _control_plane() -> JsonObject:
         "admission_parameter_coercions": 0,
         "rung_admission_sheds": 0,
         "rung_saturated_overflows": 0,
+        "rung_saturation_refusals": 2,
         "rung_rate_limit_sheds": 3,
         "rung_fresh_session_spills": 1,
         "throttle_surfaced_cache_preserving": 2,
@@ -127,6 +128,9 @@ exp_gateway_rung_admission_sheds_total 0
 # HELP exp_gateway_rung_saturated_overflows_total Dispatches forced past a saturated rung bound.
 # TYPE exp_gateway_rung_saturated_overflows_total counter
 exp_gateway_rung_saturated_overflows_total 0
+# HELP exp_gateway_rung_saturation_refusals_total Requests refused with every rung at its bound.
+# TYPE exp_gateway_rung_saturation_refusals_total counter
+exp_gateway_rung_saturation_refusals_total 2
 # HELP exp_gateway_rung_rate_limit_sheds_total Dispatches shed by a rung's rate window.
 # TYPE exp_gateway_rung_rate_limit_sheds_total counter
 exp_gateway_rung_rate_limit_sheds_total 3

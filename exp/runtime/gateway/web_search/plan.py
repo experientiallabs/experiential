@@ -215,8 +215,9 @@ def instruction_text(
     frame = search.search_prompt or (
         f"A web search was conducted on {date} for the user's latest message. "
         "Incorporate the following web search results into your response where "
-        "they help. IMPORTANT: cite each source you use inline as a markdown link "
-        "whose text is the source's domain, for example "
+        "they help. IMPORTANT: cite each source you use inline with its bracketed "
+        "result number, for example [1] or [2, 4], or as a markdown link whose "
+        "text is the source's domain, for example "
         "[nytimes.com](https://nytimes.com/some-page). Do not cite sources you did "
         "not use."
     )

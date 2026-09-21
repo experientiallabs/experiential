@@ -15,6 +15,28 @@ from exp.runtime.models.providers.gemini_requests import (
 )
 
 
+@pytest.mark.parametrize("maximum", (None, 1, 8_192, 128_000))
+def test_gateway_style_gemini_builder_preserves_omission_or_exact_cap(maximum: int | None) -> None:
+    """Gateway calls opt out of the non-gateway model client's explicit default."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),), maximum_output_tokens=maximum
+    )
+    payload = gemini_generate_request("gemini-2.5-pro", request, default_maximum_output_tokens=None)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    if maximum is None:
+        assert "maxOutputTokens" not in generation
+    else:
+        assert generation["maxOutputTokens"] == maximum
+
+
+def test_model_client_gemini_default_remains_explicit() -> None:
+    """The non-gateway execution budget is unchanged by gateway omission policy."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    payload = gemini_generate_request("gemini-2.5-pro", request)
+    assert payload["generationConfig"] == {"maxOutputTokens": 4096}
+
+
 def test_gemini_model_path_strips_the_optional_wire_prefix() -> None:
     """Prefixed and bare model identifiers resolve to one route segment."""
     assert gemini_model_path("models/gemini-2.5-pro") == "gemini-2.5-pro"

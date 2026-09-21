@@ -71,6 +71,7 @@ def _deployment(
         provider_model="provider-model",
         connection_sha256="b" * 64,
         capabilities_sha256="c" * 64,
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway=gateway or GatewayDeploymentMetadata(),
     )
 
@@ -136,6 +137,39 @@ def _marked_request() -> GatewayRequest:
             GatewayMessage(role="user", content="hi"),
         ),
     )
+
+
+def test_omitted_cap_narrows_past_unbounded_rungs_without_limiting_survivors() -> None:
+    """Unknown metadata fails closed per rung rather than poisoning a bounded fallback."""
+    unknown = _deployment("unknown").model_copy(update={"capabilities": None})
+    bounded = _deployment("bounded", provider="anthropic")
+    route = _mixed_route("maximize_availability", (unknown, bounded))
+    wires = _wires()
+    indexes, errors = protocol_compatible_indexes(
+        route, wires, _marked_request(), public_stream=False
+    )
+    assert indexes == (1,)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProviderParameterError)
+    assert errors[0].param == "max_tokens"
+    assert "Supply an explicit max_tokens" in str(errors[0])
+
+
+def test_context_only_metadata_excludes_required_wire_but_keeps_optional_sibling() -> None:
+    """One context-only fallback never grants Anthropic an unsupported output maximum."""
+    metadata = ModelCapabilities(context_window_tokens=200_000)
+    deployments = (
+        _deployment("optional").model_copy(update={"capabilities": metadata}),
+        _deployment("required", provider="anthropic").model_copy(update={"capabilities": metadata}),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    indexes, errors = protocol_compatible_indexes(
+        route, _wires(), _marked_request(), public_stream=False
+    )
+    assert indexes == (0,)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProviderParameterError)
+    assert "no declared output maximum" in str(errors[0])
 
 
 def test_remote_url_refusal_outranks_a_text_only_rung_refusing_every_image() -> None:
@@ -658,14 +692,8 @@ def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
     assert "provider_prompt_cache_key" not in keyed.model_dump(mode="json")
 
 
-def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_disclosure() -> None:
-    """A dual-lane opus-5 route serves a disabled-thinking request instead of refusing.
-
-    The aggregator rung cannot carry Anthropic thinking at all and the
-    adaptive-only Anthropic rung rejects an explicit ``disabled``, so no rung
-    preserves the request verbatim. The disclosed drop lets the route serve,
-    the Anthropic rung emitting its sole supported mode.
-    """
+def test_disabled_thinking_keeps_the_opus_rung_that_honors_it() -> None:
+    """A mixed route keeps explicit thinking-off on the native supporting rung."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     streaming = GatewayDeploymentMetadata(
@@ -722,12 +750,10 @@ def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_discl
         authorization=route.snapshot.authorization,
     )
 
-    # With the config gone nothing Anthropic-only remains on the request, so
-    # the whole certified waterfall stays available, native rung first.
-    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native", "shim")
-    assert public.ignored_parameters == ("thinking.type->adaptive",)
-    assert provider.provider_thinking_config is None
-    assert accounting.recorded == 1
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert public.ignored_parameters == ()
+    assert provider.provider_thinking_config == {"type": "disabled"}
+    assert accounting.recorded == 0
 
 
 _TOOL_IMAGE_PNG = (
@@ -939,13 +965,8 @@ def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(st
     assert accounting.recorded == 0
 
 
-def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> None:
-    """The full admit loop serves a thinking config on an all-OpenAI route.
-
-    Route shaping rejects the config by name, the coercion translates it to
-    the route's effort ladder, and the re-narrowed route serves with the
-    translation disclosed and counted.
-    """
+def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> None:
+    """The full admit loop refuses a budget an OpenAI effort dial cannot enforce."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     request = GatewayRequest(
@@ -978,19 +999,17 @@ def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> 
             client,
         ),
     )
-    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
-        route,
-        wires,
-        request,
-        accounting=cast(NativeAttemptAccounting, accounting),
-        authorization=route.snapshot.authorization,
-    )
-
-    assert tuple(item.deployment_id for item in narrowed.deployments) == ("gpt",)
-    assert "thinking->reasoning_effort:medium(budget_tokens)" in public.ignored_parameters
-    assert provider.provider_thinking_config is None
-    assert provider.reasoning_effort == "medium"
-    assert accounting.recorded == 1
+    with pytest.raises(ProviderParameterError) as rejected:
+        admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=cast(NativeAttemptAccounting, accounting),
+            authorization=route.snapshot.authorization,
+        )
+    assert rejected.value.param == "thinking"
+    assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
+    assert accounting.recorded == 0
 
 
 def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
@@ -1434,21 +1453,18 @@ def test_a_rung_whose_window_cannot_hold_prompt_plus_budget_is_skipped_with_its_
     assert wires_out == wires[1:]
 
 
-def test_the_shaped_output_budget_is_checked_against_each_rungs_window() -> None:
-    """Anthropic requires max_tokens: the route-wide 4,096 default the shaping adds must fit.
-
-    The caller sent no max_tokens, so the decoded request reserves nothing and
-    both rungs pass the first check; the shaped provider request carries the
-    Anthropic default (4,096), which the 1,000-token rung cannot hold beside a
-    600-token prompt, so it is skipped on the second pass and only the
-    8,000-token rung dispatches.
-    """
+def test_an_omitted_output_budget_never_copies_a_fallback_cap_across_the_route() -> None:
+    """An optional rung keeps omission regardless of a required-cap sibling."""
     deployments = (
         _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
             update={"capabilities": ModelCapabilities(context_window_tokens=1_000)}
         ),
         _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
-            update={"capabilities": ModelCapabilities(context_window_tokens=8_000)}
+            update={
+                "capabilities": ModelCapabilities(
+                    context_window_tokens=8_000, maximum_output_tokens=4_000
+                )
+            }
         ),
     )
     route = _mixed_route("maximize_availability", deployments)
@@ -1464,9 +1480,9 @@ def test_the_shaped_output_budget_is_checked_against_each_rungs_window() -> None
         accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
         authorization=route.snapshot.authorization,
     )
-    assert provider.maximum_output_tokens == 4_096
-    assert narrowed.snapshot.deployment_ids == ("native",)
-    assert wires_out == wires[1:]
+    assert provider.maximum_output_tokens is None
+    assert narrowed.snapshot.deployment_ids == ("shim", "native")
+    assert wires_out == wires
 
 
 def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> None:

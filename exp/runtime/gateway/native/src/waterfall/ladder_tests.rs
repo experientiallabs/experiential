@@ -196,7 +196,7 @@ pub(super) struct Rung {
 
 /// Read one whole HTTP/1.1 request (headers, then `content-length` bytes of
 /// body) and return the body text.
-async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
+pub(super) async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
     let mut received: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16_384];
     loop {
@@ -279,6 +279,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         idempotency_key: format!("op-{deployment_id}"),
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
+        time_to_first_token_base_seconds: None,
         throttle_redial_budget,
         failover_only_on: None,
         zdr_constrained: false,
@@ -426,6 +427,7 @@ impl Harness {
             deadline: Instant::now() + deadline,
             time_to_first_byte: Duration::from_secs(5),
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
+            time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
             output_less_retention: None,
             output_token_cap: None,

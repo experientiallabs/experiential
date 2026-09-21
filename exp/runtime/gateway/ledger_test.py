@@ -37,6 +37,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger, SyncGroupCommitLedger
 from exp.runtime.gateway.ledger import (
     GatewayLedgerError,
     IdempotencyConflictError,
@@ -164,6 +165,91 @@ def _execution(authorization: AuthorizationSnapshot) -> ExecutionSnapshot:
         pool_id="pool-one",
         deployment_ids=("deployment-one",),
     )
+
+
+@pytest.mark.parametrize("group_commit", [False, True])
+@pytest.mark.parametrize("output_tokens", [0, 7])
+@pytest.mark.parametrize("strict", [False, True])
+def test_disconnect_partial_usage_preserves_conservative_budget_exposure(
+    tmp_path: Path, group_commit: bool, output_tokens: int, strict: bool
+) -> None:
+    """Partial observations survive while the full unknown-cost bound stays consumed."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=400,
+        strict_unknown_cost=strict,
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=_request("cancel before final usage"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=300,
+    )
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.CANCELLED, safe_message="caller disconnected"
+    )
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        usage=GatewayUsage(input_tokens=19, output_tokens=output_tokens),
+        usage_incomplete_due_to_disconnect=True,
+    )
+    writer = GroupCommitAttemptLedger(ledger) if group_commit else None
+    sink = ledger if writer is None else SyncGroupCommitLedger(writer)
+    try:
+        sink.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+        sink.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+    finally:
+        if writer is not None:
+            writer.close()
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT input_tokens, output_tokens, usage_source, estimated_cost_nano_usd, "
+            "budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == (19, output_tokens, "observed", None, 300)
+        assert connection.execute(
+            "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges"
+        ).fetchone() == (300, 300)
+    remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert remaining.reserved_nano_usd == 0
+    assert remaining.settled_nano_usd == remaining.charged_nano_usd == 300
+    assert remaining.remaining_nano_usd == 100
+    assert remaining.unknown_cost_attempts == 0  # The conservative budget amount is known.
+    observed = ledger.usage(organization_id="org-one")[0]
+    assert observed.input_tokens == 19
+    assert observed.output_tokens == output_tokens
+    assert observed.known_estimated_cost_nano_usd == 0
+    assert observed.unknown_cost_attempts == 1  # The provider's final cost is not known.
+    second = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=_request("retry without an operation key"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=second)
+    with pytest.raises(BudgetReservationRejected):
+        ledger.start_attempt(
+            snapshot=_execution(second),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            maximum_cost_nano_usd=300,
+        )
 
 
 @pytest.mark.parametrize(

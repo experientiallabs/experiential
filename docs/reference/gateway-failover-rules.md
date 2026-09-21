@@ -55,3 +55,7 @@ rungs keep the route's own `fallback_reason`.
 - A rung restricted to one refusal category never takes an unnamed refusal (`refusal:unspecified`),
   and refusal text streamed by the provider is withheld for a rule rung downstream only when that
   rung accepts unnamed refusals.
+
+A rung at its per-worker in-flight bound is a different kind of bypass — a policy shed, not a
+failure — and what happens when every rung is shed is described in
+[gateway-lane-saturation.md](gateway-lane-saturation.md).

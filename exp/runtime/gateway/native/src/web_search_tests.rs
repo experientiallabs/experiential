@@ -85,6 +85,63 @@ fn url_citations_count_every_occurrence_in_char_offsets_sorted_by_start() {
 }
 
 #[test]
+fn url_citations_resolve_bracketed_result_numbers_to_their_ranked_source() {
+    let text = "Antonelli won [1, 3]. Norris was third [2][3], see [2].";
+    let citations = url_citations(text, &admission().results, CitationShape::Chat);
+    let titles: Vec<&str> = citations
+        .iter()
+        .map(|citation| citation["url_citation"]["title"].as_str().expect("title"))
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Python", "Unmentioned", "Docs.rs", "Unmentioned", "Docs.rs"]
+    );
+    for citation in &citations {
+        let start = citation["url_citation"]["start_index"]
+            .as_u64()
+            .expect("start") as usize;
+        let end = citation["url_citation"]["end_index"].as_u64().expect("end") as usize;
+        let span: String = text.chars().skip(start).take(end - start).collect();
+        assert!(
+            span.starts_with('[') && span.ends_with(']'),
+            "spans the group: {span}"
+        );
+    }
+    // A URL citation and a numbered citation of the same source both count.
+    let mixed = url_citations(
+        "see https://docs.rs/ and [2]",
+        &admission().results,
+        CitationShape::Responses,
+    );
+    assert_eq!(mixed.len(), 2);
+    assert!(mixed
+        .iter()
+        .all(|citation| citation["title"] == json!("Docs.rs")));
+}
+
+#[test]
+fn url_citations_ignore_markdown_labels_and_out_of_range_numbers() {
+    let sources = admission().results;
+    for text in [
+        "[python.org](https://example.com/) is a link label",
+        "out of range [4] and [0] and [1000]",
+        "not numbers [1a] [a, 2] [] [ , ]",
+        "unclosed [1",
+    ] {
+        assert!(
+            url_citations(text, &sources, CitationShape::Chat).is_empty(),
+            "{text}"
+        );
+    }
+    // An empty URL at a cited rank yields nothing for that rank alone.
+    let mut blank_second = sources.clone();
+    blank_second[1].url = String::new();
+    let citations = url_citations("[1, 2]", &blank_second, CitationShape::Chat);
+    assert_eq!(citations.len(), 1);
+    assert_eq!(citations[0]["url_citation"]["title"], json!("Python"));
+}
+
+#[test]
 fn url_citations_skip_unmatched_and_empty_sources() {
     let sources = vec![
         WebSearchSource {

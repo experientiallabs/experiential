@@ -157,6 +157,10 @@ uv run pytest -q
 - Every class, function, and method uses a Google-style docstring, including private helpers,
   nested functions, and test helpers, so each callable states its contract locally. An absolutely
   trivial callable may use one clear summary line.
+- Document dataclass and Pydantic model fields in a Google-style `Attributes:` section of the
+  class docstring. Do not use standalone string literals after field declarations as inline
+  attribute docstrings. Keep field declarations together below the class docstring; field
+  descriptions belong in `Attributes:`, including defaults, constraints, and behavioral caveats.
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through a local rich

@@ -136,37 +136,6 @@ impl SettledAttempt {
     }
 }
 
-fn is_semantic(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::TextDelta(_)
-            | Event::RefusalDelta(_)
-            | Event::ProviderTextDelta { .. }
-            | Event::ProviderRefusalDelta { .. }
-            | Event::ProviderOutputItemStarted { .. }
-            | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
-            | Event::ThinkingDelta { .. }
-            | Event::ThinkingSignature { .. }
-            | Event::RedactedThinking { .. }
-            | Event::EncryptedReasoning { .. }
-            | Event::ReasoningContentDelta { .. }
-            | Event::ToolCallStarted { .. }
-            | Event::ToolArgumentsDelta { .. }
-            | Event::ToolCallCompleted { .. }
-            | Event::TextBlockStarted { .. }
-            | Event::CitationDelta { .. }
-            | Event::ServerToolUseStarted { .. }
-            | Event::ServerToolArgumentsDelta { .. }
-            | Event::ServerToolUseCompleted { .. }
-            | Event::ServerToolResult { .. }
-            | Event::HostedToolItemStarted { .. }
-            | Event::HostedToolItemProgress { .. }
-            | Event::HostedToolItemCompleted { .. }
-            | Event::ProviderTextAnnotation { .. }
-    )
-}
-
 /// The control plane's answer to one `start_attempt` callback.
 #[derive(Debug, Deserialize)]
 pub(crate) struct StartResponse {
@@ -600,6 +569,18 @@ async fn run_attempt(
         )
     };
     let mut first_byte_deadline = Instant::now() + first_byte_allowance_for();
+    // The first-token bound the relay enforces once the headers are in: its
+    // own base (thinking models on a chat wire stream nothing for a minute
+    // and more), the same input slope, absolute from the same dial.
+    let first_token_allowance_for = || {
+        first_token_allowance(
+            wire,
+            ctx.time_to_first_token,
+            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+            ctx.approximate_input_tokens,
+        )
+    };
+    let mut first_token_deadline = Instant::now() + first_token_allowance_for();
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
@@ -619,7 +600,14 @@ async fn run_attempt(
     // reservation settles every token this attempt was charged for.
     let mut carried_usage: Option<Usage> = None;
     'dial: loop {
+        let observation = guard.begin_dial_observation();
+        if carried_usage.is_some() {
+            // A new dispatch makes the earlier dial only a subtotal until
+            // this dial supplies its own meter, including before headers.
+            observation.record_dial_total(Usage::default());
+        }
         let open_bound = open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline));
+        guard.mark_dispatched();
         let response = match open_stream(
             ctx.http,
             &wire.url,
@@ -640,6 +628,7 @@ async fn run_attempt(
                     // redial; the refused open must not eat into it.
                     redialed = true;
                     first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                    first_token_deadline = Instant::now() + first_token_allowance_for();
                     continue 'dial;
                 }
                 return AttemptEnd::Ladder {
@@ -668,11 +657,12 @@ async fn run_attempt(
             Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
                 response,
                 dialect,
-                first_byte_deadline,
+                first_token_deadline,
                 Some(route_sha256),
             ),
-            None => UpstreamRelay::new(response, dialect, first_byte_deadline),
+            None => UpstreamRelay::new(response, dialect, first_token_deadline),
         };
+        relay.set_observation(observation);
         relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
@@ -699,6 +689,7 @@ async fn run_attempt(
         let mut tool_names: Vec<String> = Vec::new();
         let mut withheld: Vec<Event> = Vec::new();
         let mut withheld_bytes = 0usize;
+        let mut private_reasoning = commit::PrivateReasoning::default();
         loop {
             let event = match relay
                 .next_event(ctx.deadline, phase_timeout, guard.started)
@@ -710,7 +701,7 @@ async fn run_attempt(
                         failure: ended_without_terminal(),
                         refusal_eligible: false,
                         exhaustion_flush: Vec::new(),
-                        usage,
+                        usage: relay.usage_before_failure(usage),
                         tool_names,
                         opened: true,
                         encrypted_reasoning_stripped,
@@ -721,7 +712,7 @@ async fn run_attempt(
                         failure,
                         refusal_eligible: false,
                         exhaustion_flush: Vec::new(),
-                        usage,
+                        usage: relay.usage_before_failure(usage),
                         tool_names,
                         opened: true,
                         encrypted_reasoning_stripped,
@@ -729,6 +720,11 @@ async fn run_attempt(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            guard.record_first_token(relay.first_token_at());
+            if private_reasoning.withhold(&event, wire.reasoning_output_exposed) {
+                relay.private_progress();
+                continue;
+            }
             let refusal_text = match &event {
                 Event::RefusalDelta(text) | Event::ProviderRefusalDelta { delta: text, .. } => {
                     Some(text)
@@ -742,9 +738,9 @@ async fn run_attempt(
                         || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
                     {
                         // Buffer overflow commits and flushes.
-                        let mut prefix = std::mem::take(&mut withheld);
-                        prefix.push(event);
+                        let prefix = private_reasoning.prefix(&mut withheld, event, usage.as_ref());
                         let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                        relay.commit();
                         return AttemptEnd::Committed(Box::new(CommittedAttempt {
                             depth,
                             prefix,
@@ -762,19 +758,22 @@ async fn run_attempt(
                     continue;
                 }
             }
-            if is_semantic(&event) {
-                // First outward semantic output freezes this deployment; any
-                // withheld refusals flush ahead of it.
+            if is_semantic(&event)
+                || (private_reasoning.completes(&event) && !relay.withheld_search_call_seen())
+            {
+                // Outward output freezes this deployment. A private-only
+                // successful terminal retains its existing encoding and seal
+                // contract; a private-only failure remains failover-safe.
                 let visible_refusal = !withheld.is_empty()
                     || matches!(
                         event,
                         Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
                     );
-                let mut prefix = std::mem::take(&mut withheld);
-                prefix.push(event);
+                let prefix = private_reasoning.prefix(&mut withheld, event, usage.as_ref());
                 // A search call withheld in the same turn is dropped: the
                 // rung is frozen on this output, and the caller is told.
                 let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                relay.commit();
                 return AttemptEnd::Committed(Box::new(CommittedAttempt {
                     depth,
                     prefix,
@@ -794,13 +793,15 @@ async fn run_attempt(
             }
             match &event {
                 Event::Failed(failure) => {
+                    usage = relay.usage_before_failure(usage);
                     if !redialed && withheld.is_empty() && repair.repair_after(failure) {
                         // The rung opened the stream and refused the replayed
                         // encrypted reasoning on its first frame: the same repair
                         // as a pre-stream 4xx, nothing outward was committed.
                         redialed = true;
-                        carried_usage = usage.take();
+                        carried_usage = Some(usage.take().unwrap_or_default());
                         first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                        first_token_deadline = Instant::now() + first_token_allowance_for();
                         continue 'dial;
                     }
                     let typed_refusal = failure.failure_class == FailureClass::Refusal;
@@ -942,9 +943,11 @@ async fn run_attempt(
     }
 }
 
+mod commit;
+pub(crate) use commit::is_semantic;
 mod fallback_rules;
 mod wire;
-pub(crate) use wire::{first_byte_allowance, open_phase_bound};
+pub(crate) use wire::{first_byte_allowance, first_token_allowance, open_phase_bound};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 mod empty;
@@ -964,6 +967,8 @@ mod search_round;
 
 #[cfg(test)]
 mod ladder_tests;
+#[cfg(test)]
+mod progress_tests;
 #[cfg(test)]
 mod repair_ladder_tests;
 #[cfg(test)]

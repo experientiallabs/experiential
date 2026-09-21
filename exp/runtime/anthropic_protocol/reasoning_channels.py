@@ -22,7 +22,6 @@ from exp.runtime.anthropic_protocol.media_blocks import AnthropicWireModel
 from exp.runtime.models.providers.reasoning_compat import (
     MINIMUM_THINKING_BUDGET_TOKENS,
     REASONING_EFFORTS,
-    thinking_config_reasoning_effort,
 )
 from exp.runtime.openai_protocol.errors import invalid_field
 
@@ -117,21 +116,23 @@ def resolve_reasoning_channels(
 
     Without the OpenRouter object, the surface behaves as Anthropic defines it:
     ``thinking`` forwards byte-for-byte and a canonical ``output_config.effort``
-    rides ``reasoning_effort``. With it, the explicit OpenRouter signal wins:
+    rides ``reasoning_effort``. Explicit thinking-off and numerical budgets
+    cannot be replaced by the extension: conflicting active controls are refused,
+    and visibility-only controls preserve off. Otherwise the OpenRouter signal wins:
 
     * ``effort`` is the canonical tier; ``max_tokens`` is a thinking budget
-      (forwarded as a budgeted ``enabled`` config on Anthropic rungs, mapped to
-      the nearest tier elsewhere); a bare or ``enabled: true`` object is
+      (forwarded as a budgeted ``enabled`` config only on budget-capable rungs);
+      a bare or ``enabled: true`` object is
       OpenRouter's default depth.
     * ``enabled: false`` (which wins over any depth sent beside it) and
       ``effort: none`` both mean "no reasoning" and become the one off form
       every route already honors, ``thinking: {type: disabled}``: Anthropic
-      rungs forward it (an adaptive-only model drops it with disclosure), and
+      rungs forward it or reject an unsupported off setting, and
       effort ladders translate it to their ``none`` without ever snapping to an
       active tier. Anthropic's own effort ladder has no ``none``, so the effort
       channel is left empty rather than carrying a tier no Anthropic rung
       accepts.
-    * A ``thinking`` config beside it is dropped with disclosure, and an
+    * A budgetless active ``thinking`` config beside it is dropped with disclosure, and an
       ``output_config.effort`` that disagrees is dropped with disclosure (an
       agreeing one stays, so the caller's forwarded object is untouched).
     * ``exclude: true`` is disclosed, never honored.
@@ -145,9 +146,9 @@ def resolve_reasoning_channels(
         output_config: The caller's raw ``output_config`` object, byte-for-byte.
 
     Raises:
-        OpenAIProtocolError: ``reasoning.max_tokens`` does not leave room for
-            the reply under ``max_tokens`` (both OpenRouter and Anthropic
-            require a strictly smaller budget).
+        OpenAIProtocolError: The extension conflicts with explicit thinking-off
+            or a numerical budget, or ``reasoning.max_tokens`` does not leave
+            room for the reply under ``max_tokens``.
     """
     if reasoning is None:
         return ReasoningChannels(
@@ -157,6 +158,40 @@ def resolve_reasoning_channels(
             output_config=output_config,
             disclosures=(),
         )
+    if thinking is not None and thinking.get("type") == "disabled":
+        if (
+            reasoning.enabled is not False
+            and reasoning.effort != "none"
+            and (
+                reasoning.enabled is True
+                or reasoning.effort is not None
+                or reasoning.max_tokens is not None
+            )
+        ):
+            raise invalid_field(
+                "thinking.type",
+                "Disabled thinking conflicts with active reasoning controls. Remove the "
+                "active reasoning control or explicitly enable thinking.",
+            )
+        return ReasoningChannels(
+            effort=output_config_effort(output_config),
+            effort_parameter=None,
+            thinking_config=thinking,
+            output_config=output_config,
+            disclosures=(REASONING_EXCLUDE_DISCLOSURE,) if reasoning.exclude else (),
+        )
+    if thinking is not None and "budget_tokens" in thinking:
+        same_budget = (
+            reasoning.max_tokens == thinking.get("budget_tokens")
+            and reasoning.enabled is not False
+            and reasoning.effort is None
+        )
+        if not same_budget:
+            raise invalid_field(
+                "thinking.budget_tokens",
+                "The reasoning extension cannot override an explicit thinking budget. "
+                "Send one budget-bearing thinking channel or explicitly remove the budget.",
+            )
     disclosures: list[str] = []
     effort: ReasoningEffort | None
     if reasoning.enabled is False or reasoning.effort == "none":
@@ -172,7 +207,7 @@ def resolve_reasoning_channels(
                 "after thinking.",
             )
         budget: JsonObject = {"type": "enabled", "budget_tokens": reasoning.max_tokens}
-        effort = thinking_config_reasoning_effort(budget)
+        effort = None
         resolved_thinking = budget
     else:
         effort = (

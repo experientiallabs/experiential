@@ -32,13 +32,13 @@ def test_absent_reasoning_keeps_the_anthropic_channels_verbatim() -> None:
     assert output_config_effort({"effort": "hyperdrive"}) is None
 
 
-def test_budget_form_becomes_a_budgeted_thinking_config_by_tier() -> None:
-    """A token budget forwards as ``enabled`` thinking and maps to the nearest tier."""
+def test_budget_form_stays_a_numeric_bound_without_an_advisory_effort() -> None:
+    """A token budget forwards exactly and never manufactures an effort level."""
     channels = resolve_reasoning_channels(
         ReasoningConfig(max_tokens=4096), max_tokens=8192, thinking=None, output_config=None
     )
     assert channels.thinking_config == {"type": "enabled", "budget_tokens": 4096}
-    assert channels.effort == "low"
+    assert channels.effort is None
     # A budget under Anthropic's floor is a named 400 here, never a provider reject.
     with pytest.raises(ValidationError):
         ReasoningConfig(max_tokens=1023)
@@ -97,3 +97,63 @@ def test_explicit_effort_supersedes_the_anthropic_channels_with_disclosure() -> 
         output_config={"effort": "low"},
     )
     assert alone.output_config is None
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    (
+        ReasoningConfig(exclude=True),
+        ReasoningConfig(),
+        ReasoningConfig(enabled=False),
+        ReasoningConfig(enabled=False, effort="high"),
+        ReasoningConfig(enabled=False, max_tokens=1024),
+        ReasoningConfig(enabled=True, effort="none"),
+    ),
+)
+def test_explicit_thinking_off_survives_visibility_only_reasoning(
+    reasoning: ReasoningConfig,
+) -> None:
+    """An extension without active depth cannot enable explicitly disabled thinking."""
+    channels = resolve_reasoning_channels(
+        reasoning,
+        max_tokens=4096,
+        thinking={"type": "disabled"},
+        output_config=None,
+    )
+    assert channels.thinking_config == {"type": "disabled"}
+    assert channels.effort is None
+    assert REASONING_SUPERSEDES_THINKING_DISCLOSURE not in channels.disclosures
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    (
+        ReasoningConfig(effort="high"),
+        ReasoningConfig(enabled=True),
+        ReasoningConfig(max_tokens=1024),
+    ),
+)
+def test_explicit_thinking_off_refuses_an_active_reasoning_extension(
+    reasoning: ReasoningConfig,
+) -> None:
+    """Contradictory caller controls are refused instead of choosing a paid depth."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        resolve_reasoning_channels(
+            reasoning,
+            max_tokens=4096,
+            thinking={"type": "disabled"},
+            output_config=None,
+        )
+    assert error.value.detail.param == "thinking.type"
+
+
+def test_effort_extension_cannot_erase_an_explicit_thinking_budget() -> None:
+    """A separate advisory channel cannot override a hard numerical bound."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        resolve_reasoning_channels(
+            ReasoningConfig(effort="high"),
+            max_tokens=4096,
+            thinking={"type": "enabled", "budget_tokens": 1024},
+            output_config=None,
+        )
+    assert error.value.detail.param == "thinking.budget_tokens"

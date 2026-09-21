@@ -25,7 +25,6 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.attempt_tokens import (
-    DEFAULT_RESERVATION_OUTPUT_TOKENS,
     worst_case_attempt_tokens,
     worst_case_input_tokens,
 )
@@ -59,6 +58,7 @@ from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.models.providers.errors import ProviderParameterError
 
 
 def _catalog() -> NormalizedGatewayCatalog:
@@ -311,45 +311,34 @@ def test_decision_output_reservation_sums_each_question_and_criterion(
     assert output_tokens == request.output_token_reservation
 
 
-def test_missing_output_ceiling_reserves_against_the_default_instead_of_failing_closed() -> None:
-    """A priced route with no output ceiling anywhere stays priceable.
-
-    An output bound is a token count, not a price, so its absence must not
-    unprice the route: when the caller omits ``maximum_output_tokens`` and the
-    deployment declares none, the reservation uses
-    ``DEFAULT_RESERVATION_OUTPUT_TOKENS``, bounded by a smaller declared context
-    window. Unknown required prices still fail closed.
-    """
+def test_missing_output_metadata_requires_an_explicit_budget() -> None:
+    """A price does not authorize unbounded generation or a guessed reservation."""
     request = _request("four bytes").model_copy(update={"maximum_output_tokens": None})
     no_ceiling = _deployment().model_copy(update={"capabilities": ModelCapabilities()})
-
-    default_bound = maximum_attempt_cost_nano_usd(request, no_ceiling)
-    assert default_bound is not None and isinstance(default_bound, int) and default_bound > 0
-    explicit_default = maximum_attempt_cost_nano_usd(
-        request.model_copy(update={"maximum_output_tokens": DEFAULT_RESERVATION_OUTPUT_TOKENS}),
-        no_ceiling,
-    )
-    # The fallback reserves exactly the default when nothing bounds it lower.
-    assert explicit_default is not None
-    assert abs(default_bound - explicit_default) < 100
-
-    small_window = _deployment().model_copy(
-        update={"capabilities": ModelCapabilities(context_window_tokens=1_024)}
-    )
-    windowed = maximum_attempt_cost_nano_usd(request, small_window)
-    explicit_window = maximum_attempt_cost_nano_usd(
-        request.model_copy(update={"maximum_output_tokens": 1_024}),
-        small_window,
-    )
-    # A smaller declared context window bounds the default.
-    assert windowed is not None and explicit_window is not None
-    assert abs(windowed - explicit_window) < 100
-
-    # A missing required price still fails closed regardless of the default.
+    with pytest.raises(ProviderParameterError, match="Supply an explicit max_tokens"):
+        maximum_attempt_cost_nano_usd(request, no_ceiling)
     assert (
         maximum_attempt_cost_nano_usd(
-            request,
-            _deployment(priced=False).model_copy(update={"capabilities": ModelCapabilities()}),
+            request.model_copy(update={"maximum_output_tokens": 100_000}), no_ceiling
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize("window", (1_024, 128_000))
+def test_missing_output_ceiling_reserves_the_full_declared_window(window: int) -> None:
+    """An optional provider cap stays omitted while its full bound is reserved."""
+    request = _request("four bytes").model_copy(update={"maximum_output_tokens": None})
+    deployment = _deployment().model_copy(
+        update={"capabilities": ModelCapabilities(context_window_tokens=window)}
+    )
+    assert worst_case_attempt_tokens(request, deployment)[1] == window
+    assert maximum_attempt_cost_nano_usd(request, deployment) == maximum_attempt_cost_nano_usd(
+        request.model_copy(update={"maximum_output_tokens": window}), deployment
+    )
+    assert (
+        maximum_attempt_cost_nano_usd(
+            request.model_copy(update={"maximum_output_tokens": 1_024}), _deployment(priced=False)
         )
         is None
     )

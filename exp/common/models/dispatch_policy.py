@@ -16,6 +16,7 @@ from pydantic import Field, model_validator
 from exp.common.core.artifacts import ContractModel
 
 FailoverMode = Literal["maximize_availability", "maximize_cache", "maximize_cache_affinity"]
+SaturationPolicy = Literal["overflow", "refuse"]
 """How a pool's waterfall orders its rungs and reacts to a failed attempt.
 
 ``maximize_availability`` (the default, historical behavior) fails over to the
@@ -111,6 +112,22 @@ class GatewayRungDispatchPolicy(ContractModel):
     The count is per worker process: the platform authors the per-worker value
     (fleet capacity divided by serving replicas), because enforcement is
     in-memory arithmetic with no shared state on the request path.
+    """
+    saturation: SaturationPolicy = "overflow"
+    """What a shed on this rung does when no other rung admits the request.
+
+    ``overflow`` (the default, the historical behavior) force-admits the
+    request past this rung's bound and discloses ``saturated_overflow``: an
+    authored policy never manufactures a failure. ``refuse`` answers the
+    caller at once with a retryable 429 (``lane_saturated``, the protocol's
+    throttle Retry-After)
+    instead of dispatching one more request onto a lane already at its
+    bound: the choice for a lane whose slow tail must never hold more of a
+    worker's admission permits than its bound allows, at the price of a
+    manufactured refusal when every rung of the pool is full. The default
+    bound a worker applies to rungs that author no ``concurrency_bound``
+    (``exp.runtime.gateway.lane_saturation``) always refuses: it exists to
+    protect the worker, and overflowing it would protect nothing.
     """
     fair_share: bool = False
     """Whether contended admission on this rung is weighted max-min fair.

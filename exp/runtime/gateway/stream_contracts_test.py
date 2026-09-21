@@ -60,6 +60,43 @@ def test_decision_rejection_evidence_is_strict_and_not_serialized() -> None:
         GatewayEvent.model_validate({**event.model_dump(), "decision_provider_rejected": "true"})
 
 
+@pytest.mark.parametrize("input_tokens,output_tokens", [(19, None), (None, 7)])
+def test_partial_meter_is_terminal_evidence_not_a_live_usage_event(
+    input_tokens: int | None, output_tokens: int | None
+) -> None:
+    """A terminal keeps either known leg but no incomplete live meter is invented."""
+    usage = GatewayUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+    assert usage.has_token_counts is False
+    terminal = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0, usage=usage)
+    assert terminal.usage == usage
+    with pytest.raises(ValidationError, match="complete normalized token"):
+        GatewayEvent(kind=GatewayEventKind.USAGE, sequence_number=0, usage=usage)
+
+
+def test_disconnect_hold_evidence_is_strict_cancel_only_and_internal() -> None:
+    """Financial provenance cannot leak onto public events or non-cancelled outcomes."""
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled"
+        ),
+        usage_incomplete_due_to_disconnect=True,
+    )
+    assert event.usage_incomplete_due_to_disconnect is True
+    assert "usage_incomplete_due_to_disconnect" not in event.model_dump_json()
+    with pytest.raises(ValidationError):
+        GatewayEvent.model_validate(
+            {**event.model_dump(), "usage_incomplete_due_to_disconnect": "true"}
+        )
+    with pytest.raises(ValidationError, match="cancelled terminal"):
+        GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=0,
+            usage_incomplete_due_to_disconnect=True,
+        )
+
+
 @pytest.mark.parametrize("length", [257, 65_536])
 def test_stream_started_event_preserves_long_tool_id(length: int) -> None:
     """Provider tool IDs fit the same bound on output as on replay."""

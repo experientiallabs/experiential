@@ -30,12 +30,83 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.videos import VIDEO_DIALECTS, VIDEO_URL_DIALECTS
 
-CAPABILITY_PARITY_SCHEMA_VERSION = 6
+CAPABILITY_PARITY_SCHEMA_VERSION = 7
 """Version of the parity-row contract; bump on any field change."""
 
 
 class DeploymentCapabilityParity(ContractModel):
-    """One deployment's effective capability surface, declaration plus ground truth."""
+    """One deployment's effective capability surface, declaration plus ground truth.
+
+    Attributes:
+        schema_version: Version of the exported capability-parity contract.
+        provider: Catalog provider identifier.
+        model_id: Provider-side model identifier.
+        dialect: Native wire dialect used by this deployment.
+        supports_streaming: Whether streaming responses are supported.
+        supports_developer_messages: Whether developer-role messages are supported.
+        supports_strict_tools: Whether strict function-tool schemas are supported.
+        supports_custom_tools: Whether the catalog declares free-form custom tools preserved on
+            this rung. Read with ``dialect``: public Chat still refuses custom tools even when a
+            Responses-native deployment declares this.
+        supports_grammar_tools: Whether the catalog declares grammar-constrained custom tools
+            preserved on this rung. Requires ``supports_custom_tools`` on the declaration.
+        supports_tool_call_limit: Whether the catalog declares that Responses ``max_tool_calls``
+            is preserved.
+        supports_prompt_cache_boundaries: Whether the catalog declares explicit prompt-cache
+            boundaries preserved.
+
+            This is not implicit prefix caching. False means explicit boundaries are not
+            declared as preserved.
+        reports_model_status: Whether the catalog declares provider model-status metadata
+            preserved.
+        reports_reasoning_tokens: Whether the catalog declares a distinct reasoning-token count
+            is reported.
+        supports_forced_tool_choice: Whether this rung can force a tool (``tool_choice``
+            ``required`` or a named tool) on any request. Engine ground truth, not a
+            declaration: the Anthropic releases that answer a forced choice with a 400 by name
+            (Fable 5.1, Mythos 5.1) report ``False``; every other rung reports ``True``. The
+            per-request rule that a budgeted ``thinking: enabled`` config cannot ride beside a
+            forced choice is not a rung fact and is not reflected here.
+        supports_parallel_tool_calls: Whether parallel tool calls are supported.
+        supports_structured_text: Whether schema-constrained text output is supported.
+        supports_stop_sequences: Whether caller-specified stop sequences are supported.
+        supports_image_input: Whether the catalog declares caller image parts servable on this
+            rung.
+        forwards_image_urls: Whether this rung's wire fetches a caller image URL itself.
+
+            Inline base64 images ride every image-capable wire. A remote URL is a provider-side
+            fetch, so the wires without one (Gemini and Bedrock) need the caller to inline the
+            bytes; a catalog can route an image-URL request to a rung that declares this
+            instead.
+        supports_video_input: Whether this rung carries caller video parts: declared by the
+            catalog and defined by the wire, since Responses and Anthropic have no carrier.
+        forwards_video_urls: Whether this rung's provider fetches a caller video URL itself;
+            only the Gemini and OpenAI-compatible video wires do.
+        supports_audio_input: Whether this rung carries caller audio parts: declared by the
+            catalog and defined by the wire, since only the OpenAI-compatible Chat and Gemini
+            wires carry a clip a model serves.
+        supports_pdf_input: Whether the catalog declares caller PDF document parts servable on
+            this rung.
+        forwards_pdf_urls: Whether this rung's wire fetches a caller document URL itself.
+
+            Only the OpenAI Responses and Anthropic Messages wires carry a remote document
+            reference; Chat Completions, Gemini, and Bedrock need the caller to inline the
+            bytes.
+        forwards_media_handles: Whether this rung forwards handles to media uploaded to its own
+            provider.
+
+            Handles are provider scoped: a catalog routes a request carrying an OpenAI
+            ``file_id`` only to a rung whose ``provider`` is ``openai`` and which declares this.
+            Fireworks and OpenRouter wires define no uploaded-media reference, so the flag is
+            always false there.
+        maximum_stop_sequences: Largest supported stop-sequence count, or None when unbounded.
+        reasoning_efforts: Exact efforts this rung preserves: the declared set when the catalog
+            declares one, otherwise the engine's provider-family ground truth.
+        thinking_config_support: Which caller ``thinking`` configuration generation the model
+            accepts: budgeted ``enabled`` (pre-adaptive families), ``adaptive`` only (the
+            adaptive generation rejects enabled/disabled outright), or ``none`` for
+            non-Anthropic wires.
+    """
 
     schema_version: int = CAPABILITY_PARITY_SCHEMA_VERSION
     provider: str = Field(min_length=1, max_length=128)
@@ -44,62 +115,27 @@ class DeploymentCapabilityParity(ContractModel):
     supports_streaming: bool
     supports_developer_messages: bool
     supports_strict_tools: bool
+    supports_custom_tools: bool
+    supports_grammar_tools: bool
+    supports_tool_call_limit: bool
+    supports_prompt_cache_boundaries: bool
+    reports_model_status: bool
+    reports_reasoning_tokens: bool
     supports_forced_tool_choice: bool
-    """Whether this rung can force a tool (``tool_choice`` ``required`` or a
-    named tool) on any request. Engine ground truth, not a declaration: the
-    Anthropic releases that answer a forced choice with a 400 by name (Fable
-    5.1, Mythos 5.1) report ``False``; every other rung reports ``True``. The
-    per-request rule that a budgeted ``thinking: enabled`` config cannot ride
-    beside a forced choice is not a rung fact and is not reflected here."""
     supports_parallel_tool_calls: bool
     supports_structured_text: bool
     supports_stop_sequences: bool
     supports_image_input: bool
-    """Whether the catalog declares caller image parts servable on this rung."""
     forwards_image_urls: bool
-    """Whether this rung's wire fetches a caller image URL itself.
-
-    Inline base64 images ride every image-capable wire. A remote URL is a
-    provider-side fetch, so the wires without one (Gemini and Bedrock) need
-    the caller to inline the bytes; a catalog can route an image-URL request
-    to a rung that declares this instead.
-    """
     supports_video_input: bool
-    """Whether this rung carries caller video parts: declared by the catalog
-    and defined by the wire, since Responses and Anthropic have no carrier."""
     forwards_video_urls: bool
-    """Whether this rung's provider fetches a caller video URL itself; only
-    the Gemini and OpenAI-compatible video wires do."""
     supports_audio_input: bool
-    """Whether this rung carries caller audio parts: declared by the catalog
-    and defined by the wire, since only the OpenAI-compatible Chat and Gemini
-    wires carry a clip a model serves."""
     supports_pdf_input: bool
-    """Whether the catalog declares caller PDF document parts servable on this rung."""
     forwards_pdf_urls: bool
-    """Whether this rung's wire fetches a caller document URL itself.
-
-    Only the OpenAI Responses and Anthropic Messages wires carry a remote
-    document reference; Chat Completions, Gemini, and Bedrock need the
-    caller to inline the bytes.
-    """
     forwards_media_handles: bool
-    """Whether this rung forwards handles to media uploaded to its own provider.
-
-    Handles are provider scoped: a catalog routes a request carrying an
-    OpenAI ``file_id`` only to a rung whose ``provider`` is ``openai`` and
-    which declares this. Fireworks and OpenRouter wires define no
-    uploaded-media reference, so the flag is always false there.
-    """
     maximum_stop_sequences: int | None
     reasoning_efforts: tuple[ReasoningEffort, ...]
-    """Exact efforts this rung preserves: the declared set when the catalog
-    declares one, otherwise the engine's provider-family ground truth."""
     thinking_config_support: Literal["enabled", "adaptive", "none"]
-    """Which caller ``thinking`` configuration generation the model accepts:
-    budgeted ``enabled`` (pre-adaptive families), ``adaptive`` only (the
-    adaptive generation rejects enabled/disabled outright), or ``none`` for
-    non-Anthropic wires."""
 
 
 def deployment_capability_parity(
@@ -148,6 +184,12 @@ def deployment_capability_parity(
         supports_streaming=capabilities.supports_streaming,
         supports_developer_messages=capabilities.supports_developer_messages,
         supports_strict_tools=capabilities.supports_strict_tools,
+        supports_custom_tools=capabilities.supports_custom_tools,
+        supports_grammar_tools=capabilities.supports_grammar_tools,
+        supports_tool_call_limit=capabilities.supports_tool_call_limit,
+        supports_prompt_cache_boundaries=capabilities.supports_prompt_cache_boundaries,
+        reports_model_status=capabilities.reports_model_status,
+        reports_reasoning_tokens=capabilities.reports_reasoning_tokens,
         # The model's own rule on every wire: a relay (OpenRouter, Azure)
         # forwards Anthropic's 400 unchanged, so scoping this to the native
         # dialect only let relayed rungs dispatch a request known to fail.

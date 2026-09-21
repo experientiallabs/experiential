@@ -189,6 +189,7 @@ class NativeControlPlane(
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
         web_search: WebSearchBackend | None = None,
+        default_lane_bound: int | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -211,6 +212,10 @@ class NativeControlPlane(
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
             web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
+            default_lane_bound: Per-worker in-flight cap for rungs that author
+                no ``concurrency_bound`` (``lane_saturation.default_lane_bound``
+                of the data plane's ``max_active_requests``); ``None`` leaves
+                unauthored rungs unbounded, the historical behavior.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -245,6 +250,7 @@ class NativeControlPlane(
             self._write_ledger,
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
+            default_lane_bound=default_lane_bound,
         )
         # Every reservation tokenizes its prompt; build the packaged BPE now so
         # a fresh process pays that once at bind time, never on its first
@@ -530,6 +536,7 @@ class NativeControlPlane(
             )
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
+            output_bounds: list[int] = []
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
@@ -566,6 +573,9 @@ class NativeControlPlane(
                 )
                 if dispatch.parallel_disclosure is not None:
                     parallel_disclosures.add(dispatch.parallel_disclosure)
+                if dispatch.output_disclosure is not None:
+                    parallel_disclosures.add(dispatch.output_disclosure)
+                output_bounds.append(dispatch.reserved_output_tokens)
                 wire_route.append(dispatch.wire_entry)
                 signers.append(dispatch.signer)
                 dispatch_bindings.append(dispatch.binding)
@@ -667,6 +677,7 @@ class NativeControlPlane(
                     profile.forwards_tier(provider_request.service_tier)
                     for profile, _client in resolved_wires
                 ),
+                reserved_output_tokens_by_depth=tuple(output_bounds),
                 affinity_fingerprint=placement.fingerprint,
                 sticky_preferred=placement.sticky_preferred,
                 throttle_redial_budgets=redial_budgets,

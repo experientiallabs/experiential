@@ -349,6 +349,92 @@ def _admit(
     return json.loads(control.admit(json.dumps(payload)))
 
 
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+@pytest.mark.parametrize("maximum", (2_048, 128_000))
+def test_omitted_cap_admission_freezes_provider_maximum_without_public_rewrite(
+    tmp_path: Path, provider: str, maximum: int
+) -> None:
+    """The real admission bridge reserves the same bound its per-rung payload permits."""
+    _manager, key = _configured_gateway(
+        tmp_path,
+        provider=provider,
+        capabilities=ModelCapabilities(maximum_output_tokens=maximum),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    admission = _admit(control, key, _chat_body())
+    assert "maximum_output_tokens" not in admission
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    if provider == "anthropic":
+        assert payload["max_tokens"] == maximum
+        assert admission["ignored_parameters"] == [
+            f"max_tokens->default({maximum};anthropic_messages;declared_bound)"
+        ]
+    else:
+        assert "max_tokens" not in payload
+        assert admission["ignored_parameters"] == []
+    entry = control._accounting.entry(str(admission["request_id"]))
+    assert entry is not None
+    assert entry.reserved_output_tokens_by_depth == (maximum,)
+    assert isinstance(entry.request, GatewayRequest)
+    assert entry.request.maximum_output_tokens is None
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+def test_omitted_cap_with_unknown_model_bounds_is_rejected_before_an_attempt(
+    tmp_path: Path, provider: str
+) -> None:
+    """A missing cap never creates a provider attempt with an invented money bound."""
+    manager, key = _configured_gateway(
+        tmp_path, provider=provider, capabilities=ModelCapabilities()
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    with pytest.raises(NativeBridgeError, match="Supply an explicit max_tokens"):
+        _admit(control, key, _chat_body())
+    with sqlite3.connect(manager.database_path) as connection:
+        assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
+    body = json.loads(_chat_body())
+    body["max_tokens"] = 128
+    admission = _admit(control, key, json.dumps(body))
+    assert admission["maximum_output_tokens"] == 128
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+def test_chat_omission_with_context_only_metadata_preserves_wire_authority(
+    tmp_path: Path, provider: str
+) -> None:
+    """Public Chat refuses to mistake a required provider's context for an output maximum."""
+    manager, key = _configured_gateway(
+        tmp_path, provider=provider, capabilities=ModelCapabilities(context_window_tokens=200_000)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    if provider == "anthropic":
+        with pytest.raises(NativeBridgeError, match="no declared output maximum"):
+            _admit(control, key, _chat_body())
+        with sqlite3.connect(manager.database_path) as connection:
+            assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
+    else:
+        admission = _admit(control, key, _chat_body())
+        entry = control._accounting.entry(str(admission["request_id"]))
+        assert entry is not None
+        assert entry.reserved_output_tokens_by_depth == (200_000,)
+        assert "maximum_output_tokens" not in admission
+        route = admission["route"]
+        assert isinstance(route, list) and isinstance(route[0], dict)
+        payload = route[0]["upstream_payload"]
+        assert isinstance(payload, dict) and "max_tokens" not in payload
+
+
 def _claim_scope(
     control: NativeControlPlane,
     raw_key: str,
@@ -418,7 +504,7 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.fireworks.ai/inference/v1",
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
     )
     first_control = NativeControlPlane(
         load_gateway_components(
@@ -549,7 +635,9 @@ def test_hunyuan_tool_turn_reasoning_round_trips_as_a_sealed_carrier(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.hunyuan.cloud.tencent.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(
@@ -660,7 +748,9 @@ def test_hunyuan_plain_turn_plaintext_reasoning_replays_verbatim(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -699,7 +789,9 @@ def test_hunyuan_mixed_carrier_and_plaintext_history_round_trips(tmp_path: Path)
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -780,7 +872,9 @@ def test_plaintext_reasoning_degrades_on_a_route_without_exposure(
     turn or a client re-serialization), so admission serves the request and
     discloses the drop — previously a named 400 that killed every session
     the moment it switched from a reasoning-exposed model to any other."""
-    _manager, raw_key = _configured_gateway(tmp_path, capabilities=ModelCapabilities())
+    _manager, raw_key = _configured_gateway(
+        tmp_path, capabilities=ModelCapabilities(maximum_output_tokens=128_000)
+    )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
     )
@@ -816,7 +910,7 @@ def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.hunyuan.cloud.tencent.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
     )
     control = NativeControlPlane(
         load_gateway_components(
@@ -975,8 +1069,10 @@ def _reasoning_failover_pool(
         root,
         base_urls=("https://api.hunyuan.cloud.tencent.com/v1", "http://127.0.0.1:10/v1"),
         model_capabilities=(
-            ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
-            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(
+                supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+            ),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
         ),
     )
     if issuing_requests_per_minute is not None:
@@ -1125,7 +1221,7 @@ def test_pinned_continuation_rate_shed_keeps_the_issuing_rung_then_fails_over(
     request_id = _admitted_request_id(continued)
     assert _attempt_dispatch_reasons(control, request_id) == ["saturated_overflow"]
     assert _attempt_route_reasons(control, request_id) == [(0, "reasoning_continuation")]
-    assert control._accounting.rung_admission_counters() == (1, 1)  # noqa: SLF001
+    assert control._accounting.rung_admission_counters() == (1, 1, 0)  # noqa: SLF001
 
     throttled = {
         "failure_class": "throttled",
@@ -1344,7 +1440,7 @@ def test_admit_marks_an_image_output_lane_on_the_wire(tmp_path: Path) -> None:
     image generations the same day.
     """
     _manager, raw_key = _configured_gateway(
-        tmp_path, capabilities=ModelCapabilities(emits_images=True)
+        tmp_path, capabilities=ModelCapabilities(emits_images=True, maximum_output_tokens=128_000)
     )
     control = NativeControlPlane(
         load_gateway_components(
@@ -1363,7 +1459,10 @@ def test_admit_marks_an_image_output_lane_on_the_wire(tmp_path: Path) -> None:
     # The Images-API claim alone does NOT mark the chat wire.
     images_root = tmp_path / "images"
     _manager, images_key = _configured_gateway(
-        images_root, capabilities=ModelCapabilities(supports_image_generation=True)
+        images_root,
+        capabilities=ModelCapabilities(
+            supports_image_generation=True, maximum_output_tokens=128_000
+        ),
     )
     images_control = NativeControlPlane(
         load_gateway_components(
@@ -1687,8 +1786,7 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         exact_model_id="bedrock-revision-exact",
         revision=None,
         capabilities=ModelCapabilities(
-            supports_tools=True,
-            supports_structured_output=True,
+            supports_tools=True, supports_structured_output=True, maximum_output_tokens=128_000
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
@@ -1889,7 +1987,9 @@ def test_admit_serves_gemini_stop_and_schema_on_the_native_wire(tmp_path: Path) 
         provider_model="gemini-2.5-pro",
         exact_model_id="gemini-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(supports_structured_output=True),
+        capabilities=ModelCapabilities(
+            supports_structured_output=True, maximum_output_tokens=128_000
+        ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_stop_sequences=True,
@@ -2011,8 +2111,8 @@ def _configured_pool_gateway(
         GatewayDeploymentCapabilities(supports_streaming=True),
     )
     declared_model_capabilities = model_capabilities or (
-        ModelCapabilities(),
-        ModelCapabilities(),
+        ModelCapabilities(maximum_output_tokens=128_000),
+        ModelCapabilities(maximum_output_tokens=128_000),
     )
     for alias, base_url, gateway_capability, model_capability, api_key_env, provider_model in zip(
         ("alpha", "beta"),
@@ -2187,7 +2287,10 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
                 supports_streaming_tool_arguments=True,
                 supports_strict_tools=True,
             ),
-            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+            (
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ),
         ),
         (
             {
@@ -2206,15 +2309,18 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
                 supports_structured_text=True,
             ),
             (
-                ModelCapabilities(supports_structured_output=True),
-                ModelCapabilities(supports_structured_output=True),
+                ModelCapabilities(supports_structured_output=True, maximum_output_tokens=128_000),
+                ModelCapabilities(supports_structured_output=True, maximum_output_tokens=128_000),
             ),
         ),
         (
             {"stream": True},
             GatewayDeploymentCapabilities(),
             GatewayDeploymentCapabilities(supports_streaming=True),
-            (ModelCapabilities(), ModelCapabilities()),
+            (
+                ModelCapabilities(maximum_output_tokens=128_000),
+                ModelCapabilities(maximum_output_tokens=128_000),
+            ),
         ),
         (
             {
@@ -2234,7 +2340,10 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
                 supports_streaming=True,
                 supports_streaming_tool_arguments=True,
             ),
-            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+            (
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+                ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ),
         ),
     ),
 )
@@ -2272,8 +2381,8 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
         tmp_path,
         gateway_capabilities=(unsupported, unsupported),
         model_capabilities=(
-            ModelCapabilities(supports_tools=True),
-            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
         ),
     )
     body = json.dumps(
@@ -2310,8 +2419,8 @@ def test_non_streaming_tool_transport_failure_names_tools(tmp_path: Path) -> Non
         tmp_path,
         gateway_capabilities=(unsupported, unsupported),
         model_capabilities=(
-            ModelCapabilities(supports_tools=True),
-            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
         ),
     )
     body = json.dumps(
@@ -2373,7 +2482,7 @@ def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Pa
         (
             {"stop": ["DONE"]},
             GatewayDeploymentCapabilities(supports_streaming=True),
-            ModelCapabilities(),
+            ModelCapabilities(maximum_output_tokens=128_000),
             "stop",
         ),
         (
@@ -2391,7 +2500,7 @@ def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Pa
                 supports_streaming=True,
                 supports_structured_text=True,
             ),
-            ModelCapabilities(),
+            ModelCapabilities(maximum_output_tokens=128_000),
             "response_format",
         ),
     ),
@@ -2452,6 +2561,7 @@ def _openai_responses_pool_control_plane(
         supports_reasoning=True,
         supports_tools=True,
         supports_temperature=False,
+        maximum_output_tokens=128_000,
     )
     _manager, raw_key = _configured_pool_gateway(
         root,
@@ -3276,7 +3386,7 @@ def _activate_revision_two(root: Path, manager: GatewayManagement) -> str:
         provider_model="provider-model-next",
         exact_model_id="model-revision-next",
         revision=None,
-        capabilities=ModelCapabilities(),
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(),
         pricing_source=None,
@@ -4025,7 +4135,7 @@ def test_fireworks_multihop_responses_retention_stays_sealed(tmp_path: Path) -> 
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.fireworks.ai/inference/v1",
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
     )
     control = NativeControlPlane(
         load_gateway_components(
@@ -4170,7 +4280,7 @@ def _configured_project_singletons(
         connection="cheap-provider",
         model="embedder-model",
         billing_source=BillingSource.CUSTOMER_MANAGED,
-        capabilities=ModelCapabilities(supports_embeddings=True),
+        capabilities=ModelCapabilities(supports_embeddings=True, maximum_output_tokens=128_000),
     )
     write_model_catalog(root / "models.toml", authored.model_copy(update={"models": models}))
     normalized = None
@@ -4183,7 +4293,7 @@ def _configured_project_singletons(
             provider_model=f"{deployment_alias}-model",
             exact_model_id="model-revision-exact",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=ModelCapabilities(maximum_output_tokens=128_000),
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(),
             pricing_source=None,
@@ -5396,16 +5506,10 @@ def test_effort_carrying_marked_request_serves_native_with_caching_intact(
     assert system[-1]["cache_control"] == {"type": "ephemeral"}
 
 
-def test_adaptive_thinking_drops_with_the_effort_on_a_reasoning_less_route(
+def test_adaptive_hint_can_drop_on_nonreasoning_but_a_numeric_budget_cannot(
     tmp_path: Path,
 ) -> None:
-    """Claude Code pins thinking adaptive with effortLevel; both drop, disclosed.
-
-    The effort alone dropping left the adaptive object on the wire, and a
-    non-reasoning Anthropic rung answers that with a post-dispatch 400 the
-    caller cannot act on. A budgeted thinking config carries its own
-    semantics and still travels verbatim.
-    """
+    """A nonreasoning route may drop an adaptive hint, never an explicit budget."""
     root = tmp_path / "anthropic-root"
     root.mkdir()
     _manager, raw_key = _configured_gateway(root, provider="anthropic")
@@ -5442,11 +5546,8 @@ def test_adaptive_thinking_drops_with_the_effort_on_a_reasoning_less_route(
             "output_config": {"effort": "high"},
         }
     )
-    admission = _flatten_started(control, _admit(control, raw_key, budgeted, surface="messages"))
-    assert admission["ignored_parameters"] == ["reasoning_effort"]
-    upstream = admission["upstream_payload"]
-    assert isinstance(upstream, dict)
-    assert upstream["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    with pytest.raises(NativeBridgeError, match="output_config.effort"):
+        _admit(control, raw_key, budgeted, surface="messages")
 
 
 def test_open_response_format_schema_closes_on_an_anthropic_rung(tmp_path: Path) -> None:
@@ -5466,7 +5567,9 @@ def test_open_response_format_schema_closes_on_an_anthropic_rung(tmp_path: Path)
         provider_model="provider-model-structured",
         exact_model_id="structured-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(supports_structured_output=True),
+        capabilities=ModelCapabilities(
+            supports_structured_output=True, maximum_output_tokens=128_000
+        ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_structured_text=True,
@@ -5513,7 +5616,10 @@ def test_open_response_format_schema_closes_on_an_anthropic_rung(tmp_path: Path)
         }
     )
     admission = _flatten_started(control, _admit(control, raw_key, body))
-    assert admission["ignored_parameters"] == ["json_schema.additionalProperties->false"]
+    assert admission["ignored_parameters"] == [
+        "json_schema.additionalProperties->false",
+        "max_tokens->default(128000;anthropic_messages;declared_bound)",
+    ]
     upstream = admission["upstream_payload"]
     assert isinstance(upstream, dict)
     output_config = cast("JsonObject", upstream["output_config"])
@@ -5811,7 +5917,10 @@ def test_reasoning_content_native_rung_round_trips_preserved_thinking_off_the_te
         tmp_path,
         base_url="https://hy4-preview--serve.modal.run/v1",
         capabilities=ModelCapabilities(
-            supports_tools=True, reasoning_output_exposed=True, reasoning_content_native=True
+            maximum_output_tokens=128_000,
+            supports_tools=True,
+            reasoning_output_exposed=True,
+            reasoning_content_native=True,
         ),
     )
     control = NativeControlPlane(
@@ -5925,7 +6034,9 @@ def test_an_unflagged_self_hosted_rung_stays_stripped_with_no_carrier_route(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://hy4-preview--serve.modal.run/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
@@ -5955,7 +6066,9 @@ def test_hunyuan_plain_turn_unsigned_thinking_replays_verbatim_on_messages(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -5993,7 +6106,9 @@ def test_hunyuan_tool_turn_redacted_carrier_round_trips_on_messages(tmp_path: Pa
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -6080,7 +6195,9 @@ def test_claude_code_tool_continuation_with_trailing_system_reminder_serves_on_m
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -6172,7 +6289,9 @@ def test_anthropic_signed_thinking_drops_with_disclosure_on_a_foreign_route(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, reasoning_output_exposed=True
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "k"})
@@ -6352,7 +6471,9 @@ def test_leading_only_rung_folds_mid_conversation_system_turns_on_chat_and_messa
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://gateway.xplabs.ai/qwen/v1",
-        capabilities=ModelCapabilities(supports_tools=True, system_messages_leading_only=True),
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000, supports_tools=True, system_messages_leading_only=True
+        ),
     )
     control = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
@@ -6458,7 +6579,7 @@ def test_gemini_rung_folds_a_mid_conversation_system_turn_instead_of_refusing(
         provider_model="gemini-2.5-pro",
         exact_model_id="gemini-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
+        capabilities=ModelCapabilities(maximum_output_tokens=128_000),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(),
         pricing_source=None,

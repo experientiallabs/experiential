@@ -56,10 +56,13 @@ pub enum CitationShape {
     Responses,
 }
 
-/// Every occurrence of every source URL inside `text`, as citation objects
-/// in `shape` with `start_index`/`end_index` counted in Unicode scalar
-/// values (end exclusive), sorted by `start_index`. A source never mentioned
-/// yields nothing; an empty URL can match nothing.
+/// Every citation of a source inside `text`, as citation objects in `shape`
+/// with `start_index`/`end_index` counted in Unicode scalar values (end
+/// exclusive), sorted by `start_index`. A source is cited by a literal
+/// occurrence of its URL or by the bracketed result number the prompt frame
+/// gave it (`[2]`, `[1, 3]`, `[2][4]`: 1-based ranks, one citation per
+/// number, spanning the bracket group). A source never cited yields nothing;
+/// an empty URL and an out-of-range number match nothing.
 pub fn url_citations(text: &str, sources: &[WebSearchSource], shape: CitationShape) -> Vec<Value> {
     // Byte offset of every char start plus the text end, so a matched byte
     // offset maps to its char index by binary search.
@@ -76,11 +79,59 @@ pub fn url_citations(text: &str, sources: &[WebSearchSource], shape: CitationSha
             ));
         }
     }
+    for (start, end, rank) in numbered_markers(text) {
+        if let Some(source) = rank
+            .checked_sub(1)
+            .and_then(|index| sources.get(index))
+            .filter(|source| !source.url.is_empty())
+        {
+            spans.push((char_index(start), char_index(end), source));
+        }
+    }
     spans.sort_by_key(|(start, _, _)| *start);
     spans
         .into_iter()
         .map(|(start, end, source)| citation(source, start, end, shape))
         .collect()
+}
+
+/// The bracketed result numbers in `text`: `(start_byte, end_byte, rank)` per
+/// number, the span covering the whole bracket group. A group is `[` then one
+/// or more decimal numbers separated by commas and spaces then `]`, so a
+/// markdown link's `[label]` never qualifies; a number above 999 is ignored
+/// since no frame carries that many results.
+fn numbered_markers(text: &str) -> Vec<(usize, usize, usize)> {
+    let mut markers = Vec::new();
+    let mut search_from = 0;
+    while let Some(open) = text[search_from..].find('[') {
+        let open = search_from + open;
+        search_from = open + 1;
+        let Some(close) = text[open + 1..].find(']') else {
+            break;
+        };
+        let close = open + 1 + close;
+        let inner = &text[open + 1..close];
+        if inner.is_empty()
+            || !inner
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b',' || byte == b' ')
+        {
+            continue;
+        }
+        let ranks: Vec<usize> = inner
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<usize>().ok())
+            .filter(|rank| (1..=999).contains(rank))
+            .collect();
+        if ranks.is_empty() {
+            continue;
+        }
+        markers.extend(ranks.into_iter().map(|rank| (open, close + 1, rank)));
+        search_from = close + 1;
+    }
+    markers
 }
 
 fn citation(source: &WebSearchSource, start: usize, end: usize, shape: CitationShape) -> Value {

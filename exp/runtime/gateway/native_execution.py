@@ -209,6 +209,8 @@ class InflightRequest:
     # (``GatewayWireProfile.forwards_tier``), so the reprice applies the per-tier
     # card only on a depth that emits the tier. Empty on tier-less surfaces.
     tier_forwarded_by_depth: tuple[bool, ...] = ()
+    # Exact finite output bound frozen alongside each admitted provider payload.
+    reserved_output_tokens_by_depth: tuple[int, ...] = ()
     # The request's tenant-isolated affinity fingerprint on a
     # ``maximize_cache_affinity`` pool (None elsewhere), captured at admission
     # so dispatch reservation can read and refresh the worker-local sticky
@@ -911,6 +913,7 @@ def deployment_wire_entry(
         "time_to_first_byte_seconds_per_million_input_tokens": (
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
         ),
+        "time_to_first_token_base_seconds": capabilities.time_to_first_token_base_seconds,
         # A failover-only rung's tokens (`native_fallback_rules`): the data
         # plane never counts it as a first-dial or unmatched successor.
         "failover_only_on": (

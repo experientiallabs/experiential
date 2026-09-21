@@ -1070,7 +1070,7 @@ def _configured_gateway(
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=capabilities or ModelCapabilities(),
+        capabilities=capabilities or ModelCapabilities(maximum_output_tokens=128_000),
         gateway_capabilities=gateway_capabilities
         or GatewayDeploymentCapabilities(
             supports_streaming=True,

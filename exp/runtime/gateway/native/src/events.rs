@@ -334,6 +334,30 @@ impl Event {
         )
     }
 
+    /// Whether this event advances generation rather than keeping transport
+    /// alive. Private reasoning is progress even when its text stays hidden.
+    /// Item-open scaffolding, empty deltas and usage alone do not renew idle.
+    pub fn is_generation_progress(&self) -> bool {
+        if self.is_output_token() {
+            return true;
+        }
+        match self {
+            Event::ThinkingSignature { signature, .. } => !signature.is_empty(),
+            Event::RedactedThinking { data, .. } => !data.is_empty(),
+            Event::EncryptedReasoning {
+                encrypted_content, ..
+            } => !encrypted_content.is_empty(),
+            Event::ToolCallCompleted { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. }
+            | Event::CitationDelta { .. }
+            | Event::ProviderTextAnnotation { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Whether this event carries the first visible model output, used to
     /// stamp time-to-first-token. A content, refusal, reasoning, or tool-argument
     /// delta counts only when it carries at least one character: an empty delta

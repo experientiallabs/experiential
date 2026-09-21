@@ -8,7 +8,7 @@ use super::super::{
     finish_open_tools_relay, finish_open_tools_truncated, malformed, parse_object, Normalizer,
 };
 use crate::errors::Failure;
-use crate::events::{openai_compatible_usage, require_u64, Event, ToolAccumulator};
+use crate::events::{require_u64, Event, ToolAccumulator};
 
 /// One optional wire text: absent or null reads as `None`, text as itself,
 /// and any other JSON type is the malformed shape it always was.
@@ -169,7 +169,9 @@ impl Normalizer {
         if let Some(raw_usage) = payload.get("usage") {
             if !raw_usage.is_null() {
                 self.usage = Some(
-                    openai_compatible_usage(raw_usage).map_err(|message| malformed(&message))?,
+                    self.openai_usage
+                        .update_chat(raw_usage)
+                        .map_err(|message| malformed(&message))?,
                 );
             }
         }

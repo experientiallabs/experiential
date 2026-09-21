@@ -16,6 +16,7 @@ mod error_envelope;
 mod errors;
 mod events;
 mod eventstream;
+mod first_token_bound;
 mod guardrails;
 mod memory;
 mod metrics;

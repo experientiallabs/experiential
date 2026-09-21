@@ -46,8 +46,9 @@ exclusive (the provider's rule) and are forwarded to the vendor as include/exclu
 
 * Chat: `choices[0].message.annotations[]` of `{"type": "url_citation", "url_citation": {"url",
   "title", "start_index", "end_index"}}` (character offsets into the final text, one entry per
-  occurrence of a result URL); when streaming, one chunk carrying `delta.annotations` precedes the
-  finish chunk. `usage.server_tool_use_details.web_search_requests` counts the search.
+  citation: a literal result URL, or a bracketed result number such as `[2]` or `[1, 3]` that
+  the injected frame numbers the results with); when streaming, one chunk carrying
+  `delta.annotations` precedes the finish chunk. `usage.server_tool_use_details.web_search_requests` counts the search.
 * Responses: the message's `output_text` part carries flat `{"type": "url_citation", "url",
   "title", "start_index", "end_index"}` annotations, each announced by a
   `response.output_text.annotation.added` event before `response.output_text.done`;

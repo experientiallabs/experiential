@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -13,8 +14,61 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.messages_payloads import anthropic_messages_stream_payload
+
+
+@pytest.mark.parametrize(
+    "controls",
+    (
+        {"reasoning": {"effort": "high"}},
+        {"output_config": {"effort": "high"}},
+        {"reasoning": {"enabled": True}},
+    ),
+)
+def test_budgeted_model_refuses_effort_when_no_thinking_budget_fits(controls: JsonObject) -> None:
+    """Every public active-effort spelling must fit or receive a named refusal."""
+    request = decode_messages(
+        {
+            "model": "claude-haiku-4-5",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": "hi"}],
+            **controls,
+        }
+    ).request
+    with pytest.raises(ProviderParameterError) as error:
+        anthropic_messages_stream_payload(
+            "claude-haiku-4-5", request, supports_reasoning=True, maximum_output_tokens=64_000
+        )
+    assert error.value.param == request.caller_effort_parameter
+    assert error.value.code == "invalid_parameter"
+
+
+def test_anthropic_builder_refuses_to_invent_a_missing_cap() -> None:
+    """A direct builder call needs caller authority or a declared model bound."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+    )
+    with pytest.raises(ProviderParameterError, match="Supply an explicit max_tokens"):
+        anthropic_messages_stream_payload("unknown-model", request)
+    for maximum in (2_048, 128_000):
+        assert (
+            anthropic_messages_stream_payload(
+                "declared-model", request, maximum_output_tokens=maximum
+            )["max_tokens"]
+            == maximum
+        )
+    for caller_limit in (1, 8_000, 128_000):
+        assert (
+            anthropic_messages_stream_payload(
+                "declared-model",
+                request.model_copy(update={"maximum_output_tokens": caller_limit}),
+                maximum_output_tokens=128_000,
+            )["max_tokens"]
+            == caller_limit
+        )
+
 
 _LOOKUP = GatewayToolDefinition(
     name="lookup",
@@ -57,12 +111,15 @@ def test_fable_5_1_declines_a_forced_tool_choice_before_dispatch(
             _tool_request(tool_choice=choice),
             supports_reasoning=True,
             reasoning_effort="medium",
+            maximum_output_tokens=128_000,
         )
     assert _capability(raised) == "forced_tool_choice"
     # auto and none stay servable on the same model.
     for open_choice in ("auto", "none", None):
         payload = anthropic_messages_stream_payload(
-            "claude-fable-5-1", _tool_request(tool_choice=open_choice)
+            "claude-fable-5-1",
+            _tool_request(tool_choice=open_choice),
+            maximum_output_tokens=128_000,
         )
         assert payload.get("tool_choice") == (
             {"type": open_choice} if open_choice is not None else None
@@ -76,12 +133,14 @@ def test_other_releases_force_tools_verbatim_under_adaptive_thinking() -> None:
         "claude-opus-5",
         _tool_request(tool_choice="required", reasoning_effort="high"),
         supports_reasoning=True,
+        maximum_output_tokens=128_000,
     )
     assert payload["tool_choice"] == {"type": "any"}
     assert payload["thinking"] == {"type": "adaptive"}
     named = anthropic_messages_stream_payload(
         "claude-sonnet-4-6",
         _tool_request(tool_choice=GatewayNamedToolChoice(name="lookup")),
+        maximum_output_tokens=128_000,
     )
     assert named["tool_choice"] == {"type": "tool", "name": "lookup"}
 
@@ -100,6 +159,7 @@ def test_budgeted_thinking_cannot_ride_beside_a_forced_choice() -> None:
                 maximum_output_tokens=4096,
             ),
             supports_reasoning=True,
+            maximum_output_tokens=128_000,
         )
     assert _capability(caller_budget) == "forced_tool_choice"
     with pytest.raises(ProviderCapabilityError) as derived_budget:
@@ -107,6 +167,7 @@ def test_budgeted_thinking_cannot_ride_beside_a_forced_choice() -> None:
             "claude-haiku-4-5",
             _tool_request(tool_choice="required", reasoning_effort="medium"),
             supports_reasoning=True,
+            maximum_output_tokens=128_000,
         )
     assert _capability(derived_budget) == "forced_tool_choice"
     # A disabled config forces fine on a model that accepts it.
@@ -114,6 +175,7 @@ def test_budgeted_thinking_cannot_ride_beside_a_forced_choice() -> None:
         "claude-sonnet-4-6",
         _tool_request(tool_choice="required", provider_thinking_config={"type": "disabled"}),
         supports_reasoning=True,
+        maximum_output_tokens=128_000,
     )
     assert payload["tool_choice"] == {"type": "any"}
     assert payload["thinking"] == {"type": "disabled"}
@@ -133,18 +195,24 @@ def test_strict_tools_with_unsupported_keywords_decline_as_strict_tools() -> Non
     schema untouched, so admission drops only ``strict`` when no rung can honor it."""
     strict = GatewayToolDefinition(name="list", parameters=_ARRAY_WITH_MAX_ITEMS, strict=True)
     with pytest.raises(ProviderCapabilityError) as raised:
-        anthropic_messages_stream_payload("claude-fable-5-1", _tool_request(tools=(strict,)))
+        anthropic_messages_stream_payload(
+            "claude-fable-5-1", _tool_request(tools=(strict,)), maximum_output_tokens=128_000
+        )
     assert _capability(raised) == "strict_tools"
 
     # The same schema without strict forwards verbatim, and a supported strict
     # schema keeps its strict flag on the wire.
     loose = strict.model_copy(update={"strict": False})
-    payload = anthropic_messages_stream_payload("claude-fable-5-1", _tool_request(tools=(loose,)))
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5-1", _tool_request(tools=(loose,)), maximum_output_tokens=128_000
+    )
     tools = payload["tools"]
     assert isinstance(tools, list)
     assert tools[0] == {"name": "list", "input_schema": _ARRAY_WITH_MAX_ITEMS}
     clean = _LOOKUP.model_copy(update={"strict": True})
-    payload = anthropic_messages_stream_payload("claude-fable-5-1", _tool_request(tools=(clean,)))
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5-1", _tool_request(tools=(clean,)), maximum_output_tokens=128_000
+    )
     tools = payload["tools"]
     assert isinstance(tools, list)
     assert tools[0]["strict"] is True
@@ -164,7 +232,9 @@ def test_system_prompts_with_no_readable_text_are_omitted() -> None:
             stream=True,
             include_usage=True,
         )
-        return anthropic_messages_stream_payload("claude-fable-5-1", request)
+        return anthropic_messages_stream_payload(
+            "claude-fable-5-1", request, maximum_output_tokens=128_000
+        )
 
     assert "system" not in payload_for(GatewayMessage(role="system", content=""))
     assert "system" not in payload_for(GatewayMessage(role="system", content="  \n"))
@@ -221,7 +291,9 @@ def test_a_marker_on_a_collapsed_assistant_turn_moves_to_a_neighboring_block() -
             stream=True,
             include_usage=True,
         )
-        built = anthropic_messages_stream_payload("claude-fable-5-1", request)["messages"]
+        built = anthropic_messages_stream_payload(
+            "claude-fable-5-1", request, maximum_output_tokens=128_000
+        )["messages"]
         assert isinstance(built, list)
         return built
 
