@@ -45,3 +45,12 @@ impl ProviderTools {
         }
     }
 }
+impl super::UpstreamRelay {
+    /// Refresh only generation idle when validated private reasoning arrives.
+    pub(super) fn observe_unexposed_reasoning_progress(&mut self) {
+        if self.normalizer.take_unexposed_reasoning_progress() {
+            self.last_progress_at = Some(std::time::Instant::now());
+            self.private_progress();
+        }
+    }
+}

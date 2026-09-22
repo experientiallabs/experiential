@@ -318,6 +318,7 @@ impl UpstreamRelay {
     }
 
     fn queue_events(&mut self, events: Vec<Event>) {
+        self.observe_unexposed_reasoning_progress();
         if let Some(observation) = &self.observation {
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.

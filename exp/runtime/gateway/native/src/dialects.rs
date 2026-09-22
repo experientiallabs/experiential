@@ -428,6 +428,8 @@ pub struct Normalizer {
     gemini_tool_index: u32,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
+    // Private generation can advance without an authorized replay carrier.
+    unexposed_reasoning_progress: bool,
     // Caller-known label words (the dispatched model id) exempt from the
     // provider-identifier screen on stream-error detail.
     request_words: Vec<String>,
@@ -487,6 +489,7 @@ impl Normalizer {
             finish_reason: None,
             gemini_tool_index: 0,
             reasoning_content_route_sha256,
+            unexposed_reasoning_progress: false,
             request_words: Vec::new(),
             deferred_tool_failure: None,
             bedrock_empty_stopped_tools: BTreeSet::new(),
