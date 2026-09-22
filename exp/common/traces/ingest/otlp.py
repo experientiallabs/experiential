@@ -416,7 +416,7 @@ def _normalize_span(raw: JsonObject, attributes: JsonObject) -> TraceSpan:
     span_id = _validate_w3c_id(_required_text(raw.get("spanId"), "spanId"), kind="span")
     parent_raw = raw.get("parentSpanId")
     parent_span_id = None
-    if parent_raw is not None:
+    if parent_raw is not None and parent_raw != "":
         parent_span_id = _validate_w3c_id(_required_text(parent_raw, "parentSpanId"), kind="span")
     name = _required_text(raw.get("name"), "span name")
     started_at = _timestamp(raw.get("startTimeUnixNano"), "startTimeUnixNano")
