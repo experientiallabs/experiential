@@ -12,6 +12,7 @@ from exp.common.judging.judgment import Judgment
 from exp.common.judging.rubric import JudgeCalibration
 from exp.common.models import ModelCapabilities, ModelSnapshot
 from exp.common.project import ProjectConfig, ProjectStore
+from exp.common.project.testing import RawArtifact
 from exp.optimize.router.judging.contracts import (
     HumanJudgeCorrection,
     JudgeCalibrationBudget,
@@ -361,7 +362,13 @@ def test_completed_replay_verifies_each_trace_review_without_provider_calls(
         reviewer=accept,
     )
     review_input = result.audit.trace_reviews[0]
-    review_path = store.artifacts.read(review_input.artifact_id).directory / "review.json"
+    review_path = (
+        RawArtifact(
+            store.artifacts._paths,
+            store.artifacts.read(review_input.artifact_id).manifest.artifact_id,
+        )
+        / "review.json"
+    )
     review_path.write_text("{}", encoding="utf-8")
     preflight_calls = runtime.preflight_calls
     provider_calls = len(client.requests)

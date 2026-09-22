@@ -8,13 +8,20 @@ from typing import Literal
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, assert_secret_free, stable_id
-from exp.common.core.files import write_text_atomic
+from exp.common.core.artifacts import (
+    ContractModel,
+    Sha256,
+    assert_secret_free,
+    canonical_json_bytes,
+    sha256_json,
+    stable_id,
+)
 from exp.common.core.locks import file_write_lock
 from exp.common.models import ModelCatalog
 from exp.common.progress import ProgressEvent, ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.project.paths import validate_local_id
+from exp.common.project.records import ProjectRecords
 from exp.common.tasks import TaskCase, load_task_set
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationBudget
@@ -48,6 +55,7 @@ class EvaluationRun(ContractModel):
 
     Attributes:
         run_id: Stable local receipt identity.
+        project_config_sha256: Exact retained project configuration used for execution and resume.
         created_at: Preparation timestamp reused on exact resume.
         code_revision: Producer revision recorded with immutable evidence.
         prepared: Frozen model, task, judge, and cost bindings.
@@ -63,6 +71,7 @@ class EvaluationRun(ContractModel):
     """
 
     run_id: str
+    project_config_sha256: Sha256
     created_at: datetime
     code_revision: str
     prepared: PreparedModelEvaluation
@@ -85,20 +94,16 @@ def run_directory(project: ProjectStore, run_id: str) -> Path:
 
 def load_defaults(project: ProjectStore) -> EvaluationDefaults:
     """Load project evaluation choices, with explicit product defaults before first use."""
-    path = project.paths.project_directory / "evaluation.json"
+    payload = project.records.read("evaluation-defaults")
     return (
-        EvaluationDefaults.model_validate_json(path.read_bytes())
-        if path.exists()
-        else EvaluationDefaults()
+        EvaluationDefaults() if payload is None else EvaluationDefaults.model_validate_json(payload)
     )
 
 
 def save_defaults(project: ProjectStore, defaults: EvaluationDefaults) -> None:
     """Atomically save secret-free project choices for subsequent evaluations."""
     assert_secret_free(defaults)
-    write_text_atomic(
-        project.paths.project_directory / "evaluation.json", defaults.model_dump_json(indent=2)
-    )
+    project.records.write("evaluation-defaults", canonical_json_bytes(defaults))
 
 
 def evaluation_tasks(project: ProjectStore) -> tuple[TaskCase, ...]:
@@ -132,6 +137,8 @@ def prepare_run(
     Returns:
         A saved prepared run, ready for review and spend consent.
     """
+    config = project.load_project()
+    project = project.snapshot(sha256_json(config))
     tasks = evaluation_tasks(project)
     if len(tasks) < defaults.minimum_scenarios:
         raise ValueError(
@@ -145,7 +152,6 @@ def prepare_run(
             raise ValueError(
                 f"scenario {task.task_id} has duplicate tool definitions; repair the trace export"
             )
-    config = project.load_project()
     if config.models is None:
         raise ValueError("project model roles are missing; configure ingestion first")
     assert config.build is not None
@@ -191,34 +197,53 @@ def prepare_run(
         code_revision=code_revision,
     )
     run = EvaluationRun(
-        run_id=run_id, created_at=created_at, code_revision=code_revision, prepared=prepared
+        run_id=run_id,
+        project_config_sha256=sha256_json(config),
+        created_at=created_at,
+        code_revision=code_revision,
+        prepared=prepared,
     )
     save_run(project, run)
     return run
 
 
+def _run_records(project: ProjectStore) -> ProjectRecords:
+    """Select the durable evaluation-run namespace."""
+    return ProjectRecords(project.paths.root, project.paths.project_id, "evaluation-runs")
+
+
 def save_run(project: ProjectStore, run: EvaluationRun) -> None:
-    """Atomically persist an index without copying credentials into the run receipt."""
+    """Commit progress while refusing to rewrite a run's frozen execution inputs."""
     assert_secret_free(run)
-    write_text_atomic(
-        run_directory(project, run.run_id) / "run.json", run.model_dump_json(indent=2)
-    )
+    validate_local_id(run.run_id, label="evaluation run ID")
+    records = _run_records(project)
+    with records.transaction():
+        previous = records.read(run.run_id)
+        if previous is not None:
+            saved = EvaluationRun.model_validate_json(previous)
+            fields = {"run_id", "created_at", "code_revision", "prepared", "project_config_sha256"}
+            if saved.model_dump(include=fields) != run.model_dump(include=fields):
+                raise ValueError("evaluation run inputs are immutable; prepare a new run")
+            if saved.status == "completed" and run != saved:
+                raise ValueError("completed evaluation metadata is immutable")
+        records.write(run.run_id, canonical_json_bytes(run))
 
 
 def load_run(project: ProjectStore, run_id: str) -> EvaluationRun:
-    """Load one exact saved run and reject mismatched directory identities."""
-    run = EvaluationRun.model_validate_json(
-        (run_directory(project, run_id) / "run.json").read_bytes()
-    )
+    """Load one exact saved run and reject mismatched persisted identities."""
+    validate_local_id(run_id, label="evaluation run ID")
+    payload = _run_records(project).read(run_id)
+    if payload is None:
+        raise ValueError("evaluation run does not exist; select a saved run")
+    run = EvaluationRun.model_validate_json(payload)
     if run.run_id != run_id or run.prepared.setup.run_id != run_id:
-        raise ValueError("evaluation run identity differs from its directory")
+        raise ValueError("evaluation run identity differs from its database record")
     return run
 
 
 def list_runs(project: ProjectStore) -> tuple[EvaluationRun, ...]:
     """List saved runs newest first without constructing provider clients."""
-    root = project.paths.runtime_directory / "evaluations"
-    runs = [load_run(project, path.parent.name) for path in root.glob("*/run.json")]
+    runs = [load_run(project, run_id) for run_id in _run_records(project).list_ids()]
     return tuple(sorted(runs, key=lambda item: item.created_at, reverse=True))
 
 
@@ -246,12 +271,23 @@ def execute_run(
         raise ValueError("review the evaluation estimate before launching")
     path = run_directory(project, run.run_id)
     with file_write_lock(path / "execution", what="evaluation run", timeout_s=0.1):
-        active = load_run(project, run.run_id).model_copy(update={"status": "running"})
+        saved = load_run(project, run.run_id)
+        if (
+            saved.prepared != run.prepared
+            or saved.project_config_sha256 != run.project_config_sha256
+        ):
+            raise ValueError("supplied run differs from its frozen database snapshot")
+        frozen_project = project.snapshot(saved.project_config_sha256)
+        active = (
+            saved if saved.status == "completed" else saved.model_copy(update={"status": "running"})
+        )
         save_run(project, active)
 
         def observe(event: ProgressEvent) -> None:
             """Persist progress before forwarding it to a transient observer."""
             nonlocal active
+            if active.status == "completed":
+                return
             active = active.model_copy(
                 update={"stage": event.stage, "completed": event.completed, "total": event.total}
             )
@@ -261,7 +297,7 @@ def execute_run(
 
         try:
             result = run_prepared_model_evaluation(
-                project,
+                frozen_project,
                 active.prepared,
                 catalog,
                 budget=EvaluationBudget(
@@ -274,6 +310,8 @@ def execute_run(
                 progress=observe,
             )
         except BaseException as exc:
+            if active.status == "completed":
+                raise
             save_run(
                 project,
                 active.model_copy(

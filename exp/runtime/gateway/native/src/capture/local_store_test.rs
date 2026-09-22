@@ -312,3 +312,46 @@ fn complete_import_names_cannot_hide_changed_columns_or_constraints() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn project_metadata_survives_capture_retention_and_schema_drift_is_rejected() {
+    let path = std::env::temp_dir().join(format!(
+        "capture-project-schema-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let existing = Connection::open(&path).unwrap();
+    for (_, sql) in PROJECT_TABLE_SQL {
+        existing.execute_batch(sql).unwrap();
+    }
+    existing
+        .execute_batch(
+            "INSERT INTO project_store_schema VALUES(1);
+        INSERT INTO project_state_records VALUES('project', 'runs', 'saved', 1,
+        X'7361766564', printf('%064d',0));",
+        )
+        .unwrap();
+    drop(existing);
+    let mut connection = open_database(&path).unwrap();
+    persist(&mut connection, pending("one", policy())).unwrap();
+    prune(&connection, &policy(), now() + 61).unwrap();
+    let saved: Vec<u8> = connection
+        .query_row("SELECT payload FROM project_state_records", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(saved, b"saved");
+    connection
+        .execute_batch("ALTER TABLE project_config_heads ADD COLUMN incompatible TEXT")
+        .unwrap();
+    drop(connection);
+    let before = std::fs::read(&path).unwrap();
+    assert!(open_database(&path)
+        .unwrap_err()
+        .contains("incompatible project table"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(path).unwrap();
+}

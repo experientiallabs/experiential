@@ -34,6 +34,7 @@ from exp.common.project import (
     ProjectPaths,
     artifact_input,
 )
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.simulation.ingest import (
     TraceNormalizationResult,
@@ -409,7 +410,7 @@ def test_non_real_trace_provenance_is_forbidden(tmp_path: Path, kind: SourceKind
 
 def test_loader_fails_closed_on_payload_hash_change(tmp_path: Path) -> None:
     store, rag_id = _built_index(tmp_path, "bad-hash")
-    path = store.project_directory / "artifacts" / rag_id / "transitions.jsonl"
+    path = RawArtifact(store._paths, rag_id) / "transitions.jsonl"
     path.write_bytes(path.read_bytes() + b"\n")
 
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
@@ -463,7 +464,7 @@ def test_loader_fails_closed_on_vector_dimension_change(tmp_path: Path) -> None:
 
 def test_loader_fails_closed_on_nan_vector(tmp_path: Path) -> None:
     store, rag_id = _built_index(tmp_path, "bad-nan")
-    directory = store.project_directory / "artifacts" / rag_id
+    directory = RawArtifact(store._paths, rag_id)
     vector_path = directory / "vectors.jsonl"
     value = json.loads(vector_path.read_text(encoding="utf-8").splitlines()[0])
     value["values"][0] = float("nan")

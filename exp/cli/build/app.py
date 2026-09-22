@@ -10,7 +10,14 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from exp.cli.build.checkpoints import (
+    reuse_completed_grounded_artifacts as _reuse_completed_grounded_artifacts,
+)
+from exp.cli.build.checkpoints import (
+    save_grounded_checkpoint,
+)
 from exp.cli.build.cost import over_ceiling_message
+from exp.cli.build.source import load_stored_build_import, project_for_build
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import (
     ProviderSetupOptions,
@@ -65,8 +72,6 @@ from exp.simulation.retrieval import (
 )
 from exp.simulation.retrieval.transitions import extract_real_transitions
 from exp.simulation.world_model.artifact import (
-    WORLD_MODEL_ARTIFACT_PATH,
-    GroundedWorldModelArtifact,
     persist_grounded_world_model,
 )
 
@@ -106,6 +111,9 @@ def build(
     project: str = _PROJECT_ARGUMENT,
     legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,
     trace_file: Path | None = _TRACE_FILE_OPTION,
+    import_id: str | None = typer.Option(
+        None, "--import-id", help="Exact stored trace import to build without rereading its source."
+    ),
     source: str = typer.Option(
         "otlp",
         "--source",
@@ -164,6 +172,7 @@ def build(
         project: Safe local project identifier below ``<root>/projects``.
         legacy_trace_file: Active positional trace-path compatibility for packaged examples.
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
+        import_id: Immutable stored import selected explicitly for this build.
         source: Declared local-export format.
         root: Local ``.exp`` artifact root.
         identity: Required local identity when using ``--source gateway``.
@@ -185,16 +194,20 @@ def build(
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
         trace_file = legacy_trace_file
-    if source.strip().casefold() == "gateway":
+    if import_id is not None and (
+        trace_file is not None or identity is not None or source != "otlp"
+    ):
+        raise typer.BadParameter("--import-id cannot be combined with traces, source, or identity")
+    if import_id is None and source.strip().casefold() == "gateway":
         if identity is None:
             raise typer.BadParameter("--source gateway requires --identity ID")
         trace_file = trace_file or local_capture_path(root)
     elif identity is not None:
         raise typer.BadParameter("--identity requires --source gateway")
-    if trace_file is None:
+    if trace_file is None and import_id is None:
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
-                "automation and dry runs require an explicit -t/--traces PATH; bare "
+                "automation and dry runs require -t/--traces PATH or --import-id ID; bare "
                 "`exp build PROJECT` is the interactive end-to-end build"
             )
         from exp.cli.build.wizard import run_build_wizard
@@ -258,14 +271,18 @@ def build(
             selected,
         )
         _console.print("[dim]loading[/dim] Normalize trace evidence")
-        path = _resolve_trace_file(trace_file)
         with progress_display(_console) as progress:
             report(progress, "normalization")
-            normalized = (
-                load_trace_source(source, path, identity_id=identity)
-                if identity is not None
-                else _load_canonical_traces(path, source)
-            )
+            if import_id is not None:
+                source, normalized = load_stored_build_import(root, project, import_id)
+            else:
+                assert trace_file is not None
+                path = _resolve_trace_file(trace_file)
+                normalized = (
+                    load_trace_source(source, path, identity_id=identity)
+                    if identity is not None
+                    else _load_canonical_traces(path, source)
+                )
             if not normalized.traces:
                 raise ValueError(
                     "no valid canonical traces were produced; inspect the input and provide at "
@@ -279,11 +296,12 @@ def build(
                 total=record_count,
                 detail="valid traces",
             )
-            store = _project_store(
+            store = project_for_build(
                 root,
                 ProjectConfig(
                     project_id=project,
                     trace_source=source.strip().casefold(),
+                    trace_import_id=import_id,
                     models=selected,
                     retrieval=ProjectRetrievalConfiguration(top_k=top_k),
                     budgets=ProjectBudgetConfiguration(
@@ -335,28 +353,32 @@ def build(
         if dry_run:
             _console.print("[green]dry run complete[/green] No provider calls or build selection.")
             return
-        if built is None:
-            if estimate is not None and estimate > maximum_build_cost_usd:
-                raise ValueError(
-                    over_ceiling_message(
-                        estimate=estimate,
-                        ceiling=maximum_build_cost_usd,
-                        project=project,
-                        trace_file=trace_file,
-                        source=source,
-                        root=root,
-                        world_model=world_model,
-                        judge=judge,
-                        embedder=embedder,
-                        top_k=top_k,
-                    )
+        if built is None and estimate is not None and estimate > maximum_build_cost_usd:
+            raise ValueError(
+                over_ceiling_message(
+                    estimate=estimate,
+                    ceiling=maximum_build_cost_usd,
+                    project=project,
+                    trace_file=trace_file,
+                    import_id=import_id,
+                    source=source,
+                    root=root,
+                    world_model=world_model,
+                    judge=judge,
+                    embedder=embedder,
+                    top_k=top_k,
                 )
+            )
         if not require_spend_consent(
             _console,
             root=root,
             yes=yes,
             estimated_cost_usd=estimate,
-            command=f"exp build {project} {trace_file}",
+            command=(
+                f"exp build {project} --import-id {import_id}"
+                if import_id is not None
+                else f"exp build {project} {trace_file}"
+            ),
             non_interactive=no_interactive,
         ):
             return
@@ -372,6 +394,7 @@ def build(
                 estimate=estimate,
                 maximum_build_cost_usd=maximum_build_cost_usd,
                 provider_spend_authorized=True,
+                trace_import_id=import_id,
                 progress=progress,
             )
         built = completion.artifacts
@@ -564,29 +587,6 @@ def _embedding_cost_ceiling(
     return maximum_input_tokens * price / 1_000_000
 
 
-def _project_store(root: Path, proposed: ProjectConfig) -> ProjectStore:
-    """Initialize one project or verify mutable build pointers are the only difference.
-
-    Args:
-        root: Local EXP root.
-        proposed: Complete project configuration for this build invocation.
-
-    Returns:
-        Initialized or verified project store.
-
-    Raises:
-        ValueError: Existing project configuration differs outside completed-build pointers.
-    """
-    store = ProjectStore(root, proposed.project_id)
-    if not store.paths.project_toml.exists():
-        store.initialize(proposed)
-        return store
-    existing = store.load_project()
-    if existing.model_copy(update={"build": None}) != proposed:
-        raise ValueError("project.toml already exists with different build configuration")
-    return store
-
-
 def _build_grounded_artifacts(
     store: ProjectStore,
     completed: ProjectBuild,
@@ -684,6 +684,7 @@ def _complete_grounded_build(
     maximum_build_cost_usd: float,
     provider_spend_authorized: bool,
     progress: ProgressHook | None = None,
+    trace_import_id: str | None = None,
 ) -> GroundedBuildCompletion:
     """Select matching grounded artifacts or execute their bounded embedding work.
 
@@ -698,6 +699,7 @@ def _complete_grounded_build(
         estimate: Conservative retry-inclusive embedding cost, or ``None`` when undefined.
         maximum_build_cost_usd: Strict grounded-build provider ceiling.
         provider_spend_authorized: Whether new embedding calls are authorized.
+        trace_import_id: Exact stored corpus selected atomically with the completed graph.
         progress: Optional observer of embedding, RAG, and finalization stages.
 
     Returns:
@@ -739,65 +741,10 @@ def _complete_grounded_build(
             top_k=top_k,
             progress=progress,
         )
+    save_grounded_checkpoint(store, built)
     report(progress, "finalization")
-    select_completed_build(store, built, completed.review)
+    select_completed_build(store, built, completed.review, trace_import_id=trace_import_id)
     return GroundedBuildCompletion(artifacts=built, reused=reused)
-
-
-def _reuse_completed_grounded_artifacts(
-    store: ProjectStore,
-    completed: ProjectBuild,
-    *,
-    world_alias: str,
-    world_snapshot: ModelSnapshot,
-    embedder_snapshot: ModelSnapshot,
-    top_k: int,
-) -> ProjectBuildArtifacts | None:
-    """Reuse a completely matching verified build without credentials or provider calls.
-
-    Args:
-        store: Project artifact store containing a possible completed build.
-        completed: Current persisted trace and task build.
-        world_alias: Configured world-model alias required by the artifact.
-        world_snapshot: Secret-free world-model identity required by the artifact.
-        embedder_snapshot: Secret-free embedder identity required by both indexes.
-        top_k: Requested retrieval result count.
-
-    Returns:
-        Verified existing build pointers, or ``None`` when any identity differs.
-
-    """
-    existing = store.load_project().build
-    if existing is None:
-        return None
-    trace_input = artifact_input(completed.artifacts.trace_dataset.manifest)
-    task_input = artifact_input(
-        store.artifacts.read(completed.artifacts.task_set.task_set_id).manifest
-    )
-    if existing.trace_dataset != trace_input or existing.task_set != task_input:
-        return None
-    serving = load_rag_index(store.artifacts, existing.serving_rag.artifact_id)
-    fit = load_rag_index(store.artifacts, existing.fit_rag.artifact_id)
-    if (
-        serving.index.embedder != embedder_snapshot
-        or fit.index.embedder != embedder_snapshot
-        or serving.index.default_top_k != top_k
-        or fit.index.default_top_k != top_k
-        or serving.index.included_partitions != ("fit", "held_out")
-        or fit.index.included_partitions != ("fit",)
-    ):
-        return None
-    world = GroundedWorldModelArtifact.model_validate_json(
-        store.artifacts.read_bytes(existing.world_model.artifact_id, WORLD_MODEL_ARTIFACT_PATH)
-    )
-    if (
-        world.serving_rag != existing.serving_rag
-        or world.model_alias != world_alias
-        or world.model != world_snapshot
-        or world.top_k != top_k
-    ):
-        return None
-    return existing
 
 
 def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:

@@ -25,6 +25,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.project.paths import ProjectPaths
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.simulation.build import build_project, build_task_set
 from exp.simulation.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
@@ -194,9 +195,9 @@ def test_package_root_prepares_and_reopens_exact_provider_free_project_stage(
     )
     assert issues["invalid_trace_count"] == 1
     assert len(issues["issues"]) == 1
-    assert not store.paths.review_json.exists()
+    assert store.read_review() is None
     temporary_prefix = str(tmp_path)
-    serialized = first.model_dump_json() + "\n" + store.paths.project_toml.read_text()
+    serialized = first.model_dump_json() + "\n" + store.load_project().model_dump_json()
     assert temporary_prefix not in serialized
     for project_file in store.paths.project_directory.rglob("*"):
         if project_file.is_file():
@@ -297,7 +298,7 @@ def test_provider_free_input_failures_do_not_mutate_project_pointer(
             settings=_provider_free_settings(source_kind=source_kind),
         )
 
-    assert not ProjectStore(root, "rejected-project").paths.project_toml.exists()
+    assert not ProjectStore(root, "rejected-project").exists()
 
 
 def test_concurrent_identical_provider_free_preparation_selects_one_stage(
@@ -489,7 +490,10 @@ def test_build_project_keeps_unselected_candidates_local_and_verifies_replay_pay
     assert changed.review != first.review
     assert store.read_review() is None
 
-    trace_directory = store.artifacts.read(first.review.trace_dataset.artifact_id).directory
+    trace_directory = RawArtifact(
+        store.artifacts._paths,
+        store.artifacts.read(first.review.trace_dataset.artifact_id).manifest.artifact_id,
+    )
     (trace_directory / "traces.jsonl").write_text("corrupt\n", encoding="utf-8")
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
         build_project(

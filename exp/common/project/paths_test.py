@@ -9,29 +9,11 @@ import pytest
 from exp.common.project import ProjectPathError, ProjectPaths
 
 
-def test_project_paths_reject_traversal_and_absolute_artifact_file_paths(tmp_path: Path) -> None:
-    """Artifact path helpers cannot escape the assigned project directory."""
-    paths = ProjectPaths(root=tmp_path / ".exp", project_id="support-project")
-
+@pytest.mark.parametrize("project_id", ["../outside", "/outside", "a/b", "a\\b"])
+def test_project_paths_reject_unsafe_project_identity(tmp_path: Path, project_id: str) -> None:
+    """A project namespace cannot escape its filesystem or SQLite ownership boundary."""
     with pytest.raises(ProjectPathError):
-        paths.artifact_directory("../outside")
-    with pytest.raises(ProjectPathError):
-        paths.artifact_file("artifact-1", "../outside.json")
-    with pytest.raises(ProjectPathError):
-        paths.artifact_file("artifact-1", "/outside.json")
-
-
-def test_project_paths_reject_a_symlink_escape(tmp_path: Path) -> None:
-    """Resolved artifact data paths must remain below their artifact directory."""
-    paths = ProjectPaths(root=tmp_path / ".exp", project_id="support-project")
-    artifact_directory = paths.artifact_directory("artifact-1")
-    artifact_directory.mkdir(parents=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (artifact_directory / "link").symlink_to(outside, target_is_directory=True)
-
-    with pytest.raises(ProjectPathError, match="escapes"):
-        paths.artifact_file("artifact-1", "link/data.json")
+        ProjectPaths(root=tmp_path, project_id=project_id)
 
 
 def test_project_paths_keep_runtime_state_outside_immutable_artifacts(tmp_path: Path) -> None:
@@ -40,4 +22,3 @@ def test_project_paths_keep_runtime_state_outside_immutable_artifacts(tmp_path: 
 
     assert paths.runtime_directory == tmp_path / ".exp/projects/support-project/runtime"
     assert paths.runtime_journal == paths.runtime_directory / "interactions.jsonl"
-    assert not paths.runtime_journal.is_relative_to(paths.artifacts_directory)

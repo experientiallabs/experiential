@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from exp.common.core.artifacts import ArtifactInput
-from exp.common.core.locks import file_write_lock
+from exp.common.project.database import project_connection
 from exp.common.project.manifests import ArtifactManifest, artifact_input
 from exp.common.project.project import (
     ProjectBuildArtifacts,
@@ -134,9 +134,10 @@ def _bind_hosted_setup(store: ProjectStore, setup: ProjectHostedSetup) -> Projec
     from exp.common.project.catalog import load_project_model_catalog
     from exp.common.project.store import ArtifactStoreError, ProjectStoreError
 
-    with file_write_lock(store.paths.project_toml, what="hosted Project setup"):
+    store._require_mutable_config()
+    with project_connection(store.paths.root, write=True):
         try:
-            existing = load_project_config(store.paths.project_toml)
+            existing = load_project_config(store.paths)
             if existing.provider_free_stage is None:
                 raise ValueError("hosted setup requires completed provider-free trace evidence")
             catalog = load_project_model_catalog(store.artifacts, setup.model_catalog)
@@ -184,7 +185,7 @@ def _bind_hosted_setup(store: ProjectStore, setup: ProjectHostedSetup) -> Projec
                     "budgets": setup.budgets,
                 }
             )
-            write_project_config(store.paths.project_toml, updated)
+            write_project_config(store.paths, updated)
         except (ArtifactStoreError, ValueError) as exc:
             raise ProjectStoreError(f"cannot bind hosted Project setup: {exc}") from exc
         return updated
@@ -199,9 +200,10 @@ def _bind_hosted_completed_build(
     """Apply or replay one verified hosted build and its spend evidence."""
     from exp.common.project.store import ArtifactStoreError, ProjectStoreError
 
-    with file_write_lock(store.paths.project_toml, what="hosted completed build"):
+    store._require_mutable_config()
+    with project_connection(store.paths.root, write=True):
         try:
-            existing = load_project_config(store.paths.project_toml)
+            existing = load_project_config(store.paths)
             _verify_completed_build(store, build)
             _verify_artifact_input(store, spend_ledger, artifact_type="provider-spend-ledger")
             if existing.system is None or existing.model_catalog is None:
@@ -224,7 +226,7 @@ def _bind_hosted_completed_build(
                     "build_spend_ledger": spend_ledger,
                 }
             )
-            write_project_config(store.paths.project_toml, updated)
+            write_project_config(store.paths, updated)
         except (ArtifactStoreError, ValueError) as exc:
             raise ProjectStoreError(f"cannot bind hosted completed build: {exc}") from exc
         return updated
@@ -241,11 +243,12 @@ def _bind_hosted_pointer_state(
     """Bind one verified write-once hosted pointer group under the Project lock."""
     from exp.common.project.store import ArtifactStoreError, ProjectStoreError
 
-    with file_write_lock(store.paths.project_toml, what=what):
+    store._require_mutable_config()
+    with project_connection(store.paths.root, write=True):
         try:
             for pointer, artifact_type in expected:
                 _verify_artifact_input(store, pointer, artifact_type=artifact_type)
-            existing = load_project_config(store.paths.project_toml)
+            existing = load_project_config(store.paths)
             current = getattr(existing, field_name)
             if current == value:
                 return existing
@@ -254,7 +257,7 @@ def _bind_hosted_pointer_state(
             updated = ProjectConfig.model_validate(
                 {**existing.model_dump(mode="python"), field_name: value}
             )
-            write_project_config(store.paths.project_toml, updated)
+            write_project_config(store.paths, updated)
         except (ArtifactStoreError, ValueError) as exc:
             raise ProjectStoreError(f"cannot bind {what}: {exc}") from exc
         return updated

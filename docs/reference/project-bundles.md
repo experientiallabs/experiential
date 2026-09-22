@@ -7,9 +7,8 @@ a different local Experiential root. The supported package-root API is limited t
 ## Selected immutable state
 
 The bundle contains `project.json` plus the exact transitive closure of every `ArtifactInput`
-selected by the Project configuration. Each artifact directory contains its verified
-`manifest.json` and the complete file set named by that manifest. Unselected artifacts that happen
-to exist below the same source root are not included.
+selected by the Project configuration. Each archive artifact directory contains its verified
+`manifest.json` and the complete file set named by that manifest. Unselected artifact records in the source database are not included.
 
 Artifact manifests remain authoritative for source identity, producer revision, dependency
 lineage, schema version, and payload digests. The bundle manifest does not copy those fields into a
@@ -40,9 +39,12 @@ source identities, catalog bindings, and hard size limits. It rejects symlinks, 
 duplicate or case-colliding names, compression, unsupported schemas, secret-bearing content, local
 absolute paths, extra artifacts, and incomplete content.
 
-Verified state is materialized beneath a private staging root and becomes visible only by renaming
-the completed Project directory into an absent `projects/<project_id>` destination. Failure removes
-the staging root and leaves no partially selected Project.
+Verified state is materialized in a private staging database. Referenced large files are published
+before one SQLite transaction installs the project's configuration and artifact records in
+`gateway/traffic.db`. Other projects, capture rows, and trace imports are unchanged. A failed commit
+rolls back the selected project records. A durable SQLite intent binds any published files to the
+exact bundle digest, so a retry verifies those bytes and completes the same restore. No partial
+project is selected, and a different bundle cannot adopt the interrupted publication.
 
 ## Stage events and runtime state
 

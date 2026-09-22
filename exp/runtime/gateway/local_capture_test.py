@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from exp.common.project import ProjectConfig, ProjectStore
 from exp.common.traces.sqlite import SQLiteTraceStore
 from exp.common.traces.sqlite_test import _save
 from exp.common.traces.trace_test import _trace
@@ -55,6 +56,9 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
     """Drive real JSON/SSE sockets and consume durable traffic after graceful shutdown."""
     retained = None
     if not ghost:
+        project = ProjectStore(tmp_path, "capture-project")
+        project.initialize(ProjectConfig(project_id="capture-project"))
+        project.write_review({"checkpoint": "retained"})
         retained = _save(SQLiteTraceStore(local_capture_path(tmp_path)), (_trace(),))
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
@@ -141,6 +145,8 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
     else:
         assert retained is not None
         assert SQLiteTraceStore(database).read_import(retained.import_id).traces == (_trace(),)
+        assert project.load_project().project_id == "capture-project"
+        assert project.read_review() == {"checkpoint": "retained"}
         result = load_gateway_capture(database, identity_id="default")
         assert not result.issues
         assert len(result.traces) == 7

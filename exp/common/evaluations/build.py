@@ -174,8 +174,7 @@ def build_evaluation_dataset(
         rows_sha256=sha256_bytes(rows_payload),
     )
     dataset = EvaluationDataset(manifest=manifest, rows=rows)
-    destination = store.project_directory / "artifacts" / evaluation_id
-    if destination.exists():
+    if store.exists(evaluation_id):
         existing = load_evaluation_dataset(store, evaluation_id)
         if existing != dataset:
             raise EvaluationEvidenceError(

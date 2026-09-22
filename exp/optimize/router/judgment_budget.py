@@ -131,7 +131,7 @@ def find_verified_judgments(
         JudgmentBudgetError: Matching evidence is duplicated or differs from frozen pins.
     """
     matches: dict[str, Judgment] = {}
-    for artifact_id in project.artifacts.list_ids():
+    for artifact_id in project.artifacts.list_ids(artifact_type="judgment"):
         stored = project.artifacts.read(artifact_id)
         if stored.manifest.artifact_type != "judgment":
             continue
@@ -187,8 +187,7 @@ def read_dispatch_reservation(
         project, plan_input, cell, rollout_id, rubric_id, calibration_id, protocol
     )
     dispatch_id, rollout_input, rubric_input, calibration_input, protocol_sha256 = material
-    destination = project.artifacts.project_directory / "artifacts" / dispatch_id
-    if not destination.exists():
+    if not project.artifacts.exists(dispatch_id):
         return None
     stored = project.artifacts.read(dispatch_id)
     if stored.manifest.artifact_type != "judgment-dispatch":
@@ -293,8 +292,7 @@ def read_judgment_exclusion(
         project, plan_input, cell, rollout_id, rubric_id, calibration_id, protocol
     )
     exclusion_id, rollout_input, rubric_input, calibration_input, protocol_sha256 = material
-    destination = project.artifacts.project_directory / "artifacts" / exclusion_id
-    if not destination.exists():
+    if not project.artifacts.exists(exclusion_id):
         return None
     stored = project.artifacts.read(exclusion_id)
     if stored.manifest.artifact_type != "judgment-exclusion":

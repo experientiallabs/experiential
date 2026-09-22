@@ -44,6 +44,7 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.project.store_test import _store
+from exp.common.project.testing import RawArtifact
 from exp.common.rollouts import (
     ProductionSimulatorSnapshot,
     RolloutArtifact,
@@ -888,12 +889,12 @@ def test_missing_hash_mismatched_wrong_type_and_altered_inputs_fail_closed(tmp_p
                 created_at=_TIME,
                 code_revision="calibration-revision",
             )
-    rollout_path = graph.store.paths.artifact_file("rollout-01", "rollout.json")
+    rollout_path = RawArtifact(graph.store.paths, "rollout-01") / "rollout.json"
     rollout_path.write_text("{}", encoding="utf-8")
     with pytest.raises(CalibrationError, match="missing or corrupt"):
         _build(graph)
     corrupt_manifest = _write_graph(tmp_path / "corrupt-manifest", _entries())
-    (corrupt_manifest.store.paths.artifact_directory("rollout-01") / "manifest.json").write_text(
+    (RawArtifact(corrupt_manifest.store.paths, "rollout-01") / "manifest.json").write_text(
         "{}", encoding="utf-8"
     )
     with pytest.raises(CalibrationError, match="missing or corrupt"):

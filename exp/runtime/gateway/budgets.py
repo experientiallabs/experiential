@@ -19,6 +19,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     read_pinned_normalized_snapshot,
 )
+from exp.common.sqlite.connection import persistent_connection
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.cache_write import requests_hour_cache
@@ -35,7 +36,7 @@ from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
     require_representable_nano_usd,
 )
-from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
+from exp.runtime.gateway.sqlite.migrations import initialize_database
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 __all__ = ["MAXIMUM_NANO_USD"]

@@ -285,8 +285,7 @@ def refresh_runtime_trace_rag(
     )
     lock_target = store.project_directory / "runtime" / f"{refresh_id}.receipt"
     with file_write_lock(lock_target, what="the runtime RAG refresh"):
-        destination = store.project_directory / "artifacts" / refresh_id
-        if destination.exists():
+        if store.exists(refresh_id):
             return _load_exact_refresh(
                 store,
                 refresh_id,

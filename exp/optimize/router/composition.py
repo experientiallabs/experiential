@@ -493,8 +493,7 @@ def _fit_and_lock_once(
         "router-policy-lock",
         {"plan": plan_input.model_dump(mode="json"), "fit_config_sha256": config_sha256},
     )
-    destination = project.artifacts.project_directory / "artifacts" / lock_id
-    if destination.exists():
+    if project.artifacts.exists(lock_id):
         if project.artifacts.read(lock_id).manifest.artifact_type != "router-policy-lock":
             raise RouterCompositionError("router policy lock identity has the wrong artifact type")
         lock = RouterPolicyLock.model_validate_json(

@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import TypeVar, cast
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
@@ -42,7 +43,6 @@ from exp.runtime.gateway.native_settlement import (
     upstream_provider_kwarg,
     web_search_requests_kwarg,
 )
-from exp.runtime.gateway.sqlite.migrations import connect_database
 
 _logger = logging.getLogger(__name__)
 

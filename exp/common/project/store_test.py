@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import exp.common.project.artifact_sqlite as artifact_sqlite
 import exp.common.project.store as project_store_module
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -24,6 +29,8 @@ from exp.common.project import (
     ProjectTracePreparationSettings,
     artifact_input,
 )
+from exp.common.project.database import project_connection
+from exp.common.project.testing import RawArtifact
 
 
 def _envelope() -> ArtifactEnvelope:
@@ -283,7 +290,7 @@ def test_write_or_replay_adopts_exact_replays_and_rejects_any_drift(tmp_path: Pa
 def test_corruption_and_crash_do_not_create_valid_partial_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Digest mutation fails reads, and a failed rename leaves no valid partial artifact."""
+    """Digest mutation fails reads, and a failed commit leaves no valid partial artifact."""
     store = _store(tmp_path)
     store.artifacts.write_json(
         artifact_id="task-set-v1",
@@ -291,16 +298,21 @@ def test_corruption_and_crash_do_not_create_valid_partial_artifacts(
         envelope=_envelope(),
         files={"tasks.json": {"task_ids": ["task-1"]}},
     )
-    store.paths.artifact_file("task-set-v1", "tasks.json").write_text(
+    (RawArtifact(store.paths, "task-set-v1") / "tasks.json").write_text(
         '{"task_ids":["task-2"]}', encoding="utf-8"
     )
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
         store.artifacts.read("task-set-v1")
 
-    def fail_rename(source: Path, destination: Path) -> None:
-        raise OSError("simulated crash before promotion")
+    @contextmanager
+    def fail_commit(root: Path, *, write: bool = False) -> Iterator[sqlite3.Connection]:
+        """Crash after all metadata writes but before the outer transaction commits."""
+        with project_connection(root, write=write) as connection:
+            yield connection
+            if write:
+                raise OSError("simulated crash before commit")
 
-    monkeypatch.setattr(project_store_module.os, "rename", fail_rename)
+    monkeypatch.setattr(artifact_sqlite, "project_connection", fail_commit)
     with pytest.raises(OSError, match="simulated crash"):
         store.artifacts.write_json(
             artifact_id="task-set-v2",
@@ -308,8 +320,7 @@ def test_corruption_and_crash_do_not_create_valid_partial_artifacts(
             envelope=_envelope(),
             files={"tasks.json": {"task_ids": ["task-2"]}},
         )
-    assert not store.paths.artifact_directory("task-set-v2").exists()
-    assert not tuple(store.paths.artifacts_directory.glob(".task-set-v2.*.partial"))
+    assert not store.artifacts.exists("task-set-v2")
 
 
 def test_read_bytes_rechecks_the_exact_file_snapshot_after_full_verification(
@@ -323,7 +334,7 @@ def test_read_bytes_rechecks_the_exact_file_snapshot_after_full_verification(
         envelope=_envelope(),
         files={"tasks.json": {"task_ids": ["task-1"]}},
     )
-    target = store.paths.artifact_file("task-set-v1", "tasks.json")
+    target = RawArtifact(store.paths, "task-set-v1") / "tasks.json"
     verified_read = store.artifacts.read
 
     def replace_after_verification(artifact_id: str) -> project_store_module.StoredArtifact:
@@ -333,8 +344,9 @@ def test_read_bytes_rechecks_the_exact_file_snapshot_after_full_verification(
 
     monkeypatch.setattr(store.artifacts, "read", replace_after_verification)
 
+    assert store.artifacts.read_bytes("task-set-v1", "tasks.json") == b'{"task_ids":["task-1"]}'
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
-        store.artifacts.read_bytes("task-set-v1", "tasks.json")
+        verified_read("task-set-v1")
 
 
 def test_read_bytes_rejects_a_symlink_swapped_after_full_verification(
@@ -342,27 +354,29 @@ def test_read_bytes_rejects_a_symlink_swapped_after_full_verification(
 ) -> None:
     """A replacement symlink cannot escape an artifact after `read` verified it."""
     store = _store(tmp_path)
-    store.artifacts.write_json(
+    payload = b"original" * 200_000
+    store.artifacts.write(
         artifact_id="task-set-v1",
         artifact_type="task-set",
         envelope=_envelope(),
-        files={"tasks.json": {"task_ids": ["task-1"]}},
+        files={"large.bin": payload},
     )
-    target = store.paths.artifact_file("task-set-v1", "tasks.json")
-    outside = tmp_path / "outside.json"
-    outside.write_bytes(b'{"task_ids":["outside"]}')
+    target = store.paths.project_directory / "blobs" / hashlib.sha256(payload).hexdigest()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
     verified_read = store.artifacts.read
 
     def replace_after_verification(artifact_id: str) -> project_store_module.StoredArtifact:
+        """Swap the backing blob after its bytes have been captured and verified."""
         stored = verified_read(artifact_id)
         target.unlink()
         target.symlink_to(outside)
         return stored
 
     monkeypatch.setattr(store.artifacts, "read", replace_after_verification)
-
-    with pytest.raises(ArtifactCorruptionError, match="unsafe or unreadable"):
-        store.artifacts.read_bytes("task-set-v1", "tasks.json")
+    assert store.artifacts.read_bytes("task-set-v1", "large.bin") == payload
+    with pytest.raises(ArtifactCorruptionError):
+        verified_read("task-set-v1")
 
 
 def test_secret_boundary_review_draft_and_write_once_model_config_binding(tmp_path: Path) -> None:

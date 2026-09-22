@@ -12,6 +12,11 @@ from pathlib import Path
 import pytest
 
 from exp.common.models import ConnectionConfig
+from exp.common.sqlite.connection import (
+    close_idle_connections,
+    connect_database,
+    persistent_connection,
+)
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.migrations import (
     _MIGRATION_1,
@@ -23,9 +28,7 @@ from exp.runtime.gateway.sqlite.migrations import (
     _MIGRATION_7,
     SCHEMA_VERSION,
     GatewaySchemaError,
-    connect_database,
     initialize_database,
-    persistent_connection,
 )
 from exp.runtime.gateway.sqlite.provider_authority import active_provider_connections
 
@@ -100,7 +103,7 @@ def test_close_idle_connections_releases_only_the_calling_thread_cache(
     database = tmp_path / "close.db"
     initialize_database(database)
     # Drain connections cached by earlier tests so the counts below are exact.
-    migrations.close_idle_connections()
+    close_idle_connections()
     with persistent_connection(database) as cached:
         pass
 
@@ -108,7 +111,7 @@ def test_close_idle_connections_releases_only_the_calling_thread_cache(
         """Cache one connection on a worker thread and close that thread's cache."""
         with persistent_connection(database) as connection:
             pass
-        closed = migrations.close_idle_connections()
+        closed = close_idle_connections()
         try:
             connection.execute("SELECT 1")
         except sqlite3.ProgrammingError:
@@ -120,10 +123,10 @@ def test_close_idle_connections_releases_only_the_calling_thread_cache(
     assert worker_closed == 1
     assert worker_connection_closed is True
     assert cached.execute("SELECT 1").fetchone()[0] == 1
-    assert migrations.close_idle_connections() == 1
+    assert close_idle_connections() == 1
     with pytest.raises(sqlite3.ProgrammingError):
         cached.execute("SELECT 1")
-    assert migrations.close_idle_connections() == 0
+    assert close_idle_connections() == 0
     with persistent_connection(database) as replacement:
         assert replacement is not cached
         assert replacement.execute("SELECT 1").fetchone()[0] == 1

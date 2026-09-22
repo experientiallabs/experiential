@@ -1,14 +1,12 @@
-"""Project configuration contract and TOML loading for the new local layout."""
+"""Project configuration contracts and immutable SQLite configuration versions."""
 
 from __future__ import annotations
 
-import tomllib
 from decimal import Decimal
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Literal
 from urllib.parse import urlsplit
 
-import tomli_w
 from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import (
@@ -17,9 +15,11 @@ from exp.common.core.artifacts import (
     ContractModel,
     SecretBoundaryError,
     assert_secret_free,
+    canonical_json_bytes,
 )
-from exp.common.core.files import write_text_atomic
 from exp.common.core.money import exact_usd
+from exp.common.project.config_sqlite import read_config, write_config
+from exp.common.project.paths import ProjectPaths
 
 
 def _exclude_absent(value: object) -> bool:
@@ -282,6 +282,7 @@ class ProjectConfig(ContractModel):
     schema_version: int = Field(default=4, ge=1)
     project_id: ArtifactId
     trace_source: str | None = Field(default=None, max_length=64)
+    trace_import_id: ArtifactId | None = None
     trace_preparation: ProjectTracePreparationSettings | None = None
     provider_free_stage: ProjectProviderFreeStage | None = None
     system: ProjectSystemConfiguration | None = None
@@ -338,46 +339,37 @@ class ProjectConfig(ContractModel):
         return self
 
 
-def load_project_config(path: Path) -> ProjectConfig:
-    """Load and validate one project TOML file.
+def load_project_config(paths: ProjectPaths, *, sha256: str | None = None) -> ProjectConfig:
+    """Load current configuration or one frozen version from the shared project database.
 
     Args:
-        path: Path to ``project.toml``.
+        paths: Root and project identity owning the configuration.
+        sha256: Optional exact immutable configuration version to replay.
 
     Returns:
-        The immutable typed configuration.
-
-    Raises:
-        ProjectConfigError: The file is missing, malformed, or does not satisfy the contract.
+        Validated secret-free configuration.
     """
     try:
-        with path.open("rb") as handle:
-            raw_config = tomllib.load(handle)
-    except FileNotFoundError as exc:
-        raise ProjectConfigError(f"project configuration does not exist: {path}") from exc
-    except tomllib.TOMLDecodeError as exc:
-        raise ProjectConfigError(f"project configuration is invalid TOML: {path}") from exc
-    try:
-        config = ProjectConfig.model_validate(raw_config)
+        config = ProjectConfig.model_validate_json(read_config(paths, sha256=sha256))
         assert_secret_free(config)
+        if config.project_id != paths.project_id:
+            raise ValueError("project configuration belongs to another project")
     except (SecretBoundaryError, ValueError) as exc:
         raise ProjectConfigError(f"project configuration is invalid: {exc}") from exc
     return config
 
 
-def write_project_config(path: Path, config: ProjectConfig) -> None:
-    """Atomically materialize a typed project configuration.
+def write_project_config(paths: ProjectPaths, config: ProjectConfig) -> None:
+    """Commit a new immutable configuration version and select it atomically.
 
     Args:
-        path: Destination ``project.toml`` path.
+        paths: Root and project identity owning the configuration.
         config: Validated project configuration.
-
-    Raises:
-        ProjectConfigError: The configuration violates the no-secret project boundary.
     """
     try:
         assert_secret_free(config)
-    except SecretBoundaryError as exc:
+        if config.project_id != paths.project_id:
+            raise ValueError("project configuration belongs to another project")
+        write_config(paths, canonical_json_bytes(config))
+    except (SecretBoundaryError, ValueError) as exc:
         raise ProjectConfigError(f"project configuration is invalid: {exc}") from exc
-    payload = tomli_w.dumps(config.model_dump(mode="json", exclude_none=True))
-    write_text_atomic(path, payload)

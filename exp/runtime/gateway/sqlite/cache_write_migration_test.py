@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.cache_write_migration import (
     CACHE_WRITE_COLUMNS,
@@ -13,7 +14,6 @@ from exp.runtime.gateway.sqlite.cache_write_migration import (
 )
 from exp.runtime.gateway.sqlite.migrations import (
     GatewaySchemaError,
-    connect_database,
     initialize_database,
 )
 from exp.runtime.gateway.sqlite.migrations_test import _replay_history

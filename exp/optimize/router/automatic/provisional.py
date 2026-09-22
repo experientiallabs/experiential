@@ -50,6 +50,7 @@ def prepare_hosted_provisional_judge(
     maximum_attempts: int,
     created_at: datetime,
     code_revision: str,
+    select_for_project: bool = True,
 ) -> HostedAutomaticJudgeEvidence:
     """Persist deterministic machine-only setup and zero-label provisional calibration.
 
@@ -61,6 +62,7 @@ def prepare_hosted_provisional_judge(
         maximum_attempts: Retry ceiling reserved for every judge request.
         created_at: Artifact completion time.
         code_revision: Exact producer revision.
+        select_for_project: Also advance the project configuration pointer when true.
 
     Returns:
         Verified setup, provisional calibration, and bounded request reservation.
@@ -180,12 +182,13 @@ def prepare_hosted_provisional_judge(
         maximum_output_tokens=maximum_output_tokens,
         maximum_attempts=maximum_attempts,
     )
-    project.bind_hosted_judge_evidence(
-        ProjectHostedJudgeEvidence(
-            setup=setup_input,
-            calibration=calibration_input,
+    if select_for_project:
+        project.bind_hosted_judge_evidence(
+            ProjectHostedJudgeEvidence(
+                setup=setup_input,
+                calibration=calibration_input,
+            )
         )
-    )
     return HostedAutomaticJudgeEvidence(
         setup=setup,
         setup_input=setup_input,

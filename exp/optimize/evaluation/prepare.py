@@ -177,6 +177,7 @@ def prepare_model_evaluation(
             maximum_attempts=RetryPolicy().maximum_attempts,
             created_at=created_at,
             code_revision=code_revision,
+            select_for_project=False,
         )
         judge_setup, calibration_id = default.setup_input, default.calibration_id
     assert calibration_id is not None

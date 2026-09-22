@@ -17,6 +17,7 @@ from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.models import ModelCatalog, load_model_catalog
 from exp.common.project import ProjectStore
+from exp.common.project.config_sqlite import list_projects
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import (
@@ -81,9 +82,7 @@ def run_evaluation(
             if not interactive:
                 raise ValueError("provide PROJECT or run exp eval in an interactive terminal")
             options = tuple(
-                PickerOption(path.name, path.name)
-                for path in sorted((root / "projects").glob("*/project.toml"))
-                for path in (path.parent,)
+                PickerOption(project_id, project_id) for project_id in list_projects(root)
             )
             if not options:
                 raise ValueError(

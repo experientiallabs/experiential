@@ -207,6 +207,30 @@ calls. The quote and result exclude earlier trace mining and grounding costs; a 
 those separately before offering a complete trace-to-report price. Credit conversion, promotions,
 identity authorization and job persistence remain hosting responsibilities.
 
+## Local project state
+
+`gateway/traffic.db` is the shared content database for captures, trace imports, and projects.
+Project configuration has immutable versions and a current selection. Dataset/scenario versions,
+judge definitions, judgments, and result manifests retain their exact IDs, lineage, and digests.
+Evaluation runs pin configuration and prepared inputs; progress updates cannot rewrite them.
+Checkpoint intents commit before provider dispatch so ambiguous completion never authorizes an
+automatic duplicate call.
+
+Large payloads remain digest-addressed files under `projects/PROJECT/blobs`, referenced by database
+records. HTML reports remain generated exports. Copying a project folder alone is not a backup:
+preserve a consistent SQLite backup and its referenced blobs together. Selected completed build
+graphs can also be moved with the project bundle API. The bundle excludes active run state.
+
+Build an imported corpus without rereading its source:
+
+```console
+exp build PROJECT --import-id IMPORT_ID --root ROOT
+```
+
+Folder layouts containing `project.toml` or `artifacts/` fail closed. Preserve them with their matching
+release; export a verified project bundle there and restore it into a fresh root. No automatic
+migration rewrites existing evidence.
+
 ## Gateway clients
 
 Official OpenAI SDK clients use the issued virtual key and loopback base URL:

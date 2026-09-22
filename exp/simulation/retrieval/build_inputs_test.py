@@ -21,6 +21,7 @@ from exp.common.project import (
 )
 from exp.common.project.manifests import file_digest
 from exp.common.project.paths import ProjectPaths
+from exp.common.project.testing import RawArtifact
 from exp.common.tasks import TaskSet
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
 from exp.simulation.build import TaskSetBuild, build_task_set
@@ -227,9 +228,7 @@ def test_binding_loader_rejects_tamper_and_wrong_completed_pointer(tmp_path: Pat
     with pytest.raises(ArtifactCorruptionError, match="task-set manifest digest"):
         load_completed_build_rag_lineage_bindings(store, tampered_pointer)
 
-    lineage_path = (
-        store.project_directory / "artifacts" / build.task_set.task_set_id / LINEAGE_BINDINGS_PATH
-    )
+    lineage_path = RawArtifact(store._paths, build.task_set.task_set_id) / LINEAGE_BINDINGS_PATH
     lineage_path.write_bytes(lineage_path.read_bytes() + b" ")
     with pytest.raises(ArtifactCorruptionError, match="digest"):
         load_completed_build_rag_lineage_bindings(store, completed)
@@ -267,7 +266,7 @@ def test_binding_loader_rejects_rehashed_semantic_tamper(tmp_path: Path) -> None
         }
     )
     tampered_bytes = canonical_json_bytes(tampered)
-    directory = stored.directory
+    directory = RawArtifact(store._paths, stored.manifest.artifact_id)
     (directory / LINEAGE_BINDINGS_PATH).write_bytes(tampered_bytes)
     files = tuple(
         file_digest(entry.path, tampered_bytes) if entry.path == LINEAGE_BINDINGS_PATH else entry
@@ -319,13 +318,17 @@ def test_binding_loader_rejects_rehashed_task_set_envelope_field(
     manifest_update: dict[str, object] = {} if envelope_field == "coverage_sha256" else update
     tampered = envelope.model_copy(update=update)
     tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / "task-set.json").write_bytes(tampered_bytes)
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "task-set.json").write_bytes(
+        tampered_bytes
+    )
     files = tuple(
         file_digest(entry.path, tampered_bytes) if entry.path == "task-set.json" else entry
         for entry in stored.manifest.files
     )
     tampered_manifest = stored.manifest.model_copy(update={**manifest_update, "files": files})
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+        canonical_json_bytes(tampered_manifest)
+    )
     completed = _completed(store, build).model_copy(
         update={"task_set": artifact_input(tampered_manifest)}
     )
@@ -349,13 +352,17 @@ def test_binding_loader_rejects_rehashed_unsupported_trace_dataset_schema(
     envelope = TraceDataset.model_validate_json(store.read_bytes(dataset_id, "trace-dataset.json"))
     tampered = envelope.model_copy(update={"schema_version": 3})
     tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / "trace-dataset.json").write_bytes(tampered_bytes)
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "trace-dataset.json").write_bytes(
+        tampered_bytes
+    )
     files = tuple(
         file_digest(entry.path, tampered_bytes) if entry.path == "trace-dataset.json" else entry
         for entry in stored.manifest.files
     )
     tampered_manifest = stored.manifest.model_copy(update={"schema_version": 3, "files": files})
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+        canonical_json_bytes(tampered_manifest)
+    )
 
     with pytest.raises(ArtifactCorruptionError, match="unsupported schema version 3"):
         load_task_set_lineage_bindings(store, build.task_set.task_set_id)
@@ -390,13 +397,17 @@ def test_binding_loader_rejects_rehashed_trace_source_contract(
         manifest_update = {changed_field: changed_source}
     tampered = envelope.model_copy(update=update)
     tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / "trace-dataset.json").write_bytes(tampered_bytes)
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "trace-dataset.json").write_bytes(
+        tampered_bytes
+    )
     files = tuple(
         file_digest(entry.path, tampered_bytes) if entry.path == "trace-dataset.json" else entry
         for entry in stored.manifest.files
     )
     tampered_manifest = stored.manifest.model_copy(update={**manifest_update, "files": files})
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+        canonical_json_bytes(tampered_manifest)
+    )
     completed = _rebind_task_set_to_dataset_manifest(store, build, tampered_manifest)
 
     with pytest.raises(ArtifactCorruptionError, match="source or convention"):
@@ -507,7 +518,9 @@ def test_binding_loader_rejects_rehashed_trace_dataset_input(tmp_path: Path) -> 
     forged_input = ArtifactInput(artifact_id="forged-parent", sha256="e" * 64)
     tampered = envelope.model_copy(update={"inputs": (forged_input,)})
     tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / "trace-dataset.json").write_bytes(tampered_bytes)
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "trace-dataset.json").write_bytes(
+        tampered_bytes
+    )
     files = tuple(
         file_digest(entry.path, tampered_bytes) if entry.path == "trace-dataset.json" else entry
         for entry in stored.manifest.files
@@ -515,7 +528,9 @@ def test_binding_loader_rejects_rehashed_trace_dataset_input(tmp_path: Path) -> 
     tampered_manifest = stored.manifest.model_copy(
         update={"inputs": (forged_input,), "files": files}
     )
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+        canonical_json_bytes(tampered_manifest)
+    )
     completed = _rebind_task_set_to_dataset_manifest(store, build, tampered_manifest)
 
     with pytest.raises(ArtifactCorruptionError, match="must not have artifact inputs"):
@@ -566,13 +581,17 @@ def test_binding_loader_rejects_noncanonical_trace_dataset_payloads(
     if relative_path == "trace-dataset.json":
         envelope_bytes = b" " + envelope_bytes
         stored = store.read(original.dataset_id)
-        (stored.directory / "trace-dataset.json").write_bytes(envelope_bytes)
+        (RawArtifact(store._paths, stored.manifest.artifact_id) / "trace-dataset.json").write_bytes(
+            envelope_bytes
+        )
         files = tuple(
             file_digest(entry.path, envelope_bytes) if entry.path == "trace-dataset.json" else entry
             for entry in stored.manifest.files
         )
         manifest = stored.manifest.model_copy(update={"files": files})
-        (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+        (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+            canonical_json_bytes(manifest)
+        )
     else:
         manifest = store.write(
             artifact_id=resolved_id,
@@ -625,8 +644,10 @@ def test_binding_loader_rejects_noncanonical_task_set_payloads(
     files = tuple(file_digest(path, payload) for path, payload in sorted(payloads.items()))
     tampered_manifest = stored.manifest.model_copy(update={"files": files})
     for path, payload in payloads.items():
-        (stored.directory / path).write_bytes(payload)
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
+        (RawArtifact(store._paths, stored.manifest.artifact_id) / path).write_bytes(payload)
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+        canonical_json_bytes(tampered_manifest)
+    )
     completed = _completed(store, build).model_copy(
         update={"task_set": artifact_input(tampered_manifest)}
     )
@@ -670,8 +691,12 @@ def test_binding_loader_rejects_rehashed_noncanonical_task_set_paths(
     envelope = TaskSet.model_validate_json(store.read_bytes(task_set_id, "task-set.json"))
     tampered = envelope.model_copy(update={envelope_field: alternate_path})
     tampered_bytes = canonical_json_bytes(tampered)
-    (stored.directory / canonical_path).rename(stored.directory / alternate_path)
-    (stored.directory / "task-set.json").write_bytes(tampered_bytes)
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / canonical_path).rename(
+        RawArtifact(store._paths, stored.manifest.artifact_id) / alternate_path
+    )
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "task-set.json").write_bytes(
+        tampered_bytes
+    )
     files = tuple(
         file_digest("task-set.json", tampered_bytes)
         if entry.path == "task-set.json"
@@ -683,7 +708,9 @@ def test_binding_loader_rejects_rehashed_noncanonical_task_set_paths(
     tampered_manifest = stored.manifest.model_copy(
         update={"files": tuple(sorted(files, key=lambda item: item.path))}
     )
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+        canonical_json_bytes(tampered_manifest)
+    )
     completed = _completed(store, build).model_copy(
         update={"task_set": artifact_input(tampered_manifest)}
     )
@@ -703,7 +730,7 @@ def test_binding_loader_rejects_rehashed_extra_task_set_file(tmp_path: Path) -> 
     task_set_id = build.task_set.task_set_id
     stored = store.read(task_set_id)
     extra_bytes = b"{}"
-    (stored.directory / "extra.json").write_bytes(extra_bytes)
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "extra.json").write_bytes(extra_bytes)
     files = tuple(
         sorted(
             (*stored.manifest.files, file_digest("extra.json", extra_bytes)),
@@ -711,7 +738,9 @@ def test_binding_loader_rejects_rehashed_extra_task_set_file(tmp_path: Path) -> 
         )
     )
     tampered_manifest = stored.manifest.model_copy(update={"files": files})
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(tampered_manifest))
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
+        canonical_json_bytes(tampered_manifest)
+    )
     completed = _completed(store, build).model_copy(
         update={"task_set": artifact_input(tampered_manifest)}
     )
@@ -789,7 +818,7 @@ def test_exact_build_replay_reuses_binding_payload_and_does_not_mutate_project(
     """
     project = ProjectStore(tmp_path, "support")
     project.initialize(ProjectConfig(project_id="support"))
-    before_project = project.paths.project_toml.read_bytes()
+    before_project = canonical_json_bytes(project.load_project())
     first = _build(project.artifacts)
     first_payload = project.artifacts.read_bytes(
         first.task_set.task_set_id,
@@ -810,4 +839,4 @@ def test_exact_build_replay_reuses_binding_payload_and_does_not_mutate_project(
         == first_payload
     )
     assert len(bindings) == 3
-    assert project.paths.project_toml.read_bytes() == before_project
+    assert canonical_json_bytes(project.load_project()) == before_project

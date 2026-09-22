@@ -5,31 +5,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-TRACE_TABLE_SQL = {
-    "trace_store_schema": "CREATE TABLE trace_store_schema "
-    "(version INTEGER PRIMARY KEY CHECK(version=1)) STRICT",
-    "trace_records": """CREATE TABLE trace_records (
-        record_sha256 TEXT PRIMARY KEY CHECK(length(record_sha256)=64),
-        trace_id TEXT NOT NULL, payload TEXT NOT NULL
-    ) STRICT""",
-    "trace_imports": """CREATE TABLE trace_imports (
-        import_id TEXT PRIMARY KEY, source_format TEXT NOT NULL,
-        source TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL
-    ) STRICT""",
-    "trace_import_records": """CREATE TABLE trace_import_records (
-        import_id TEXT NOT NULL REFERENCES trace_imports(import_id),
-        ordinal INTEGER NOT NULL CHECK(ordinal>=0),
-        record_sha256 TEXT NOT NULL REFERENCES trace_records(record_sha256),
-        source TEXT NOT NULL,
-        PRIMARY KEY(import_id,ordinal)
-    ) STRICT""",
-    "trace_project_imports": """CREATE TABLE trace_project_imports (
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id TEXT NOT NULL, import_id TEXT NOT NULL REFERENCES trace_imports(import_id),
-        UNIQUE(project_id,import_id)
-    ) STRICT""",
-}
-TRACE_TABLES = frozenset(TRACE_TABLE_SQL)
+from exp.common.sqlite.content_tables import TRACE_TABLE_SQL
+from exp.common.sqlite.schema import ContentSchemaError, validate_content_tables
 
 
 class TraceStoreError(ValueError):
@@ -50,38 +27,10 @@ def validate_schema(connection: sqlite3.Connection) -> None:
     Raises:
         TraceStoreError: Existing tables or the trace schema version are unsupported.
     """
-    tables = {
-        row[0]
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )
-    }
-    if tables - TRACE_TABLES - {"gateway_captures"}:
-        raise TraceStoreError(
-            "Unrecognized traffic database; preserve it and select another --root."
-        )
-    present = tables & TRACE_TABLES
-    if present and present != TRACE_TABLES:
-        raise TraceStoreError(
-            "Incomplete trace database schema; preserve it and select another --root."
-        )
-    for table in present:
-        saved_sql = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone()[0]
-        if (
-            " ".join(saved_sql.split()).casefold()
-            != " ".join(TRACE_TABLE_SQL[table].split()).casefold()
-        ):
-            raise TraceStoreError(
-                "Incompatible trace table definition; preserve it and select another --root."
-            )
-    if present and connection.execute("SELECT version FROM trace_store_schema").fetchall() != [
-        (1,)
-    ]:
-        raise TraceStoreError(
-            "Unsupported trace schema version; use a matching Experiential release."
-        )
+    try:
+        validate_content_tables(connection)
+    except ContentSchemaError as exc:
+        raise TraceStoreError(str(exc)) from exc
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:

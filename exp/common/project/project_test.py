@@ -1,4 +1,4 @@
-"""Tests for project TOML loading and immutable initialization."""
+"""Tests for project SQLite configuration loading and immutable initialization."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput
+from exp.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from exp.common.project import (
     AgentConfiguration,
     ProjectConfig,
@@ -16,6 +16,8 @@ from exp.common.project import (
     load_project_config,
     write_project_config,
 )
+from exp.common.project.config_sqlite import read_config, write_config
+from exp.common.project.paths import ProjectPaths
 from exp.common.project.project import require_durable_source_id
 
 _DIGEST = "a" * 64
@@ -55,7 +57,7 @@ def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(
     existing_default = ProjectConfig(project_id="existing-project")
     assert existing_default.retrieval is not None
     assert existing_default.budgets is not None
-    path = tmp_path / "project.toml"
+    path = ProjectPaths(tmp_path, "support-project")
     trace_first = ProjectConfig(
         project_id="trace-first-project",
         trace_preparation=ProjectTracePreparationSettings(source_kind="otlp"),
@@ -63,12 +65,13 @@ def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(
         budgets=None,
     )
 
+    path = ProjectPaths(tmp_path, "trace-first-project")
     write_project_config(path, trace_first)
 
     assert load_project_config(path) == trace_first
-    payload = path.read_text(encoding="utf-8")
-    assert "retrieval" not in payload
-    assert "budgets" not in payload
+    payload = read_config(path).decode()
+    assert '"retrieval":null' in payload
+    assert '"budgets":null' in payload
 
 
 def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> None:
@@ -108,8 +111,8 @@ def test_project_config_has_one_optional_project_scoped_catalog_pointer() -> Non
 
 
 def test_project_config_round_trip_preserves_safe_local_metadata(tmp_path: Path) -> None:
-    """Project TOML contains customer wiring metadata but no provider credential references."""
-    path = tmp_path / "project.toml"
+    """Project configuration round-trips customer wiring without credential references."""
+    path = ProjectPaths(tmp_path, "support-project")
     config = ProjectConfig(
         project_id="support-project",
         agent=AgentConfiguration(factory="acme_support.exp:create_agent_runtime"),
@@ -119,7 +122,7 @@ def test_project_config_round_trip_preserves_safe_local_metadata(tmp_path: Path)
     write_project_config(path, config)
 
     assert load_project_config(path) == config
-    assert "code_revision" not in path.read_text(encoding="utf-8")
+    assert "code_revision" not in read_config(path).decode()
 
 
 def test_custom_agent_revision_round_trip_is_explicit(tmp_path: Path) -> None:
@@ -128,7 +131,7 @@ def test_custom_agent_revision_round_trip_is_explicit(tmp_path: Path) -> None:
     Args:
         tmp_path: Isolated project configuration directory.
     """
-    path = tmp_path / "project.toml"
+    path = ProjectPaths(tmp_path, "support-project")
     config = ProjectConfig(
         project_id="support-project",
         agent=AgentConfiguration(
@@ -140,18 +143,15 @@ def test_custom_agent_revision_round_trip_is_explicit(tmp_path: Path) -> None:
     write_project_config(path, config)
 
     assert load_project_config(path) == config
-    assert 'code_revision = "agent-release-42"' in path.read_text(encoding="utf-8")
+    assert '"code_revision":"agent-release-42"' in read_config(path).decode()
 
 
 def test_project_config_rejects_secret_reference(tmp_path: Path) -> None:
-    """Project TOML cannot become an alternate home for model credential configuration."""
-    path = tmp_path / "project.toml"
-    path.write_text(
-        """
-project_id = "support-project"
-api_key_env = "OPENAI_API_KEY"
-""".strip(),
-        encoding="utf-8",
+    """Project configuration cannot become an alternate home for model credential configuration."""
+    path = ProjectPaths(tmp_path, "support-project")
+    write_config(
+        path,
+        canonical_json_bytes({"project_id": "support-project", "api_key_env": "OPENAI_API_KEY"}),
     )
 
     with pytest.raises(ProjectConfigError, match="api_key_env"):

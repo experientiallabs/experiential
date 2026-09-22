@@ -12,6 +12,7 @@ import pytest
 from exp.common.core.artifacts import SourceIdentity, canonical_json_bytes
 from exp.common.models import BillingSource, ModelSnapshot
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
 from exp.common.traces.store import load_trace_dataset
 from exp.simulation.ingest.dataset import persist_trace_dataset
@@ -114,7 +115,7 @@ def test_load_trace_dataset_rejects_payload_corruption(tmp_path: Path) -> None:
         created_at=datetime(2026, 8, 12, tzinfo=UTC),
         code_revision="test",
     )
-    path = store.read(persisted.dataset.dataset_id).directory / persisted.dataset.traces_path
+    path = RawArtifact(store._paths, persisted.dataset.dataset_id) / persisted.dataset.traces_path
     path.write_text('{"trace_id":"forged"}\n', encoding="utf-8")
 
     with pytest.raises(ArtifactCorruptionError, match="data file digest mismatch"):

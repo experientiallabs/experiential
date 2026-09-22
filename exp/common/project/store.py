@@ -1,17 +1,11 @@
-"""Atomic immutable artifact storage in the canonical project-local `.exp` layout."""
+"""Transactional project configuration and immutable digest-verified artifact storage."""
 
 from __future__ import annotations
 
-import hashlib
-import os
-import shutil
-import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from uuid import uuid4
+from pathlib import Path
 
 from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
@@ -27,10 +21,24 @@ from exp.common.core.artifacts import (
     envelope_matches_manifest,
     validate_artifact_file_path,
 )
-from exp.common.core.files import fsync_directory_best_effort, write_bytes_atomic
 from exp.common.core.locks import file_write_lock
+from exp.common.project.artifact_sqlite import (
+    StoredArtifact,
+    artifact_exists,
+    artifact_ids,
+    read_artifact,
+    write_artifact,
+)
+from exp.common.project.config_sqlite import config_exists, require_current_layout
+from exp.common.project.database import project_connection
+from exp.common.project.errors import (
+    ArtifactAlreadyExistsError,
+    ArtifactCorruptionError,
+    ArtifactStoreError,
+    ProjectStoreError,
+)
 from exp.common.project.hosted_state import HostedProjectStoreMixin
-from exp.common.project.manifests import ArtifactFile, ArtifactManifest, artifact_input, file_digest
+from exp.common.project.manifests import ArtifactManifest, artifact_input, file_digest
 from exp.common.project.paths import ProjectPaths, validate_local_id
 from exp.common.project.project import (
     ProjectBuildArtifacts,
@@ -40,6 +48,7 @@ from exp.common.project.project import (
     require_durable_source_id,
     write_project_config,
 )
+from exp.common.project.records import ProjectRecords
 
 _JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
 _ACTIVE_COMPLETED_BUILD_COORDINATION: ContextVar[str | None] = ContextVar(
@@ -48,42 +57,20 @@ _ACTIVE_COMPLETED_BUILD_COORDINATION: ContextVar[str | None] = ContextVar(
 )
 
 
-class ArtifactStoreError(RuntimeError):
-    """Base error for immutable local artifact storage failures."""
-
-
-class ArtifactAlreadyExistsError(ArtifactStoreError):
-    """A completed artifact ID was reused instead of creating a new artifact."""
-
-
-class ArtifactCorruptionError(ArtifactStoreError):
-    """A completed artifact no longer matches its immutable manifest."""
-
-
-class ProjectStoreError(RuntimeError):
-    """Project initialization or local configuration persistence failed."""
-
-
-@dataclass(frozen=True)
-class StoredArtifact:
-    """A digest-verified immutable artifact directory and its parsed manifest."""
-
-    directory: Path
-    manifest: ArtifactManifest
-
-
 class ArtifactStore:
-    """Writes and reads immutable, digest-verified artifact directories for one project."""
+    """Writes and reads immutable, digest-verified artifact records for one project."""
 
     def __init__(self, paths: ProjectPaths) -> None:
-        """Create a store rooted at one project's canonical artifact directory."""
+        """Bind one project namespace without creating any metadata."""
+        require_current_layout(paths)
         self._paths = paths
 
     @property
     def project_directory(self) -> Path:
         """Return the project-owned local state directory for durable coordination records.
 
-        Immutable artifacts remain under ``artifacts``. Callers that need a mutable, local-only
+        Artifact metadata lives in SQLite and large payloads remain in ``blobs``.
+        Callers that need a mutable, local-only
         coordination record, such as an in-flight paid-work lease, use this project directory so
         independent processes addressing the same project contend on one durable location.
         """
@@ -148,32 +135,7 @@ class ArtifactStore:
             assert_secret_free(manifest)
         except SecretBoundaryError as exc:
             raise ArtifactStoreError(str(exc)) from exc
-        self._paths.artifacts_directory.mkdir(parents=True, exist_ok=True)
-        destination = self._paths.artifact_directory(validated_artifact_id)
-        with file_write_lock(destination, what=f"artifact {validated_artifact_id}"):
-            if destination.exists():
-                raise ArtifactAlreadyExistsError(
-                    f"completed artifact already exists and is immutable: {validated_artifact_id}"
-                )
-            staging = self._paths.artifacts_directory / (
-                f".{validated_artifact_id}.{uuid4().hex}.partial"
-            )
-            try:
-                staging.mkdir(mode=0o700)
-                for relative_path, payload in normalized_files:
-                    _write_staged_file(staging / relative_path, payload)
-                _write_staged_file(staging / "manifest.json", canonical_json_bytes(manifest))
-                _fsync_staging_tree(staging)
-                if destination.exists():
-                    raise ArtifactAlreadyExistsError(
-                        "completed artifact already exists and is immutable: "
-                        f"{validated_artifact_id}"
-                    )
-                os.rename(staging, destination)
-            except BaseException:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
-        fsync_directory_best_effort(self._paths.artifacts_directory)
+        write_artifact(self._paths, manifest, dict(normalized_files))
         return manifest
 
     def write_json(
@@ -276,9 +238,7 @@ class ArtifactStore:
             ValueError: An existing artifact has different manifest fields or payload bytes.
             ArtifactStoreError: The existing artifact is corrupt or the write fails.
         """
-        if not self._paths.artifact_directory(
-            validate_local_id(artifact_id, label="artifact ID")
-        ).exists():
+        if not self.exists(artifact_id):
             # The existence probe only skips write() work that is doomed to AlreadyExists on a
             # replay; losing the creation race still lands in the verify branch below.
             try:
@@ -329,9 +289,7 @@ class ArtifactStore:
             ValueError: An existing artifact differs from the expected exact replay.
             ArtifactStoreError: The existing artifact is corrupt or the write fails.
         """
-        if not self._paths.artifact_directory(
-            validate_local_id(artifact_id, label="artifact ID")
-        ).exists():
+        if not self.exists(artifact_id):
             # The existence probe only skips write() work that is doomed to AlreadyExists on a
             # replay; losing the creation race still lands in the verify branch below.
             try:
@@ -417,7 +375,7 @@ class ArtifactStore:
             raise ArtifactCorruptionError(
                 f"artifact {stored.manifest.artifact_id} does not own data file {validated_path}"
             )
-        return _read_verified_artifact_file(stored.directory, stored.manifest.artifact_id, entry)
+        return stored.payloads[validated_path]
 
     def read(self, artifact_id: str) -> StoredArtifact:
         """Read and fully verify one completed immutable artifact.
@@ -431,33 +389,12 @@ class ArtifactStore:
         Raises:
             ArtifactCorruptionError: The directory, manifest, file list, or digest is invalid.
         """
-        directory = self._paths.artifact_directory(artifact_id)
-        if not directory.is_dir() or directory.is_symlink():
-            raise ArtifactCorruptionError(f"completed artifact is missing or unsafe: {artifact_id}")
-        manifest_path = directory / "manifest.json"
-        if not manifest_path.is_file() or manifest_path.is_symlink():
-            raise ArtifactCorruptionError(f"artifact {artifact_id} has no safe manifest.json")
-        try:
-            manifest = ArtifactManifest.model_validate_json(manifest_path.read_bytes())
-            assert_secret_free(manifest)
-        except (OSError, ValidationError, ValueError, SecretBoundaryError) as exc:
-            raise ArtifactCorruptionError(
-                f"artifact {artifact_id} has an invalid manifest"
-            ) from exc
-        if manifest.artifact_id != artifact_id:
-            raise ArtifactCorruptionError(
-                f"artifact directory {artifact_id} does not match manifest ID "
-                f"{manifest.artifact_id}"
-            )
-        expected_files = {entry.path: entry for entry in manifest.files}
-        actual_files = _artifact_data_files(directory)
-        if set(actual_files) != set(expected_files):
-            raise ArtifactCorruptionError(
-                f"artifact {artifact_id} data files do not match its manifest"
-            )
-        for entry in expected_files.values():
-            _read_verified_artifact_file(directory, artifact_id, entry)
-        return StoredArtifact(directory=directory, manifest=manifest)
+        validate_local_id(artifact_id, label="artifact ID")
+        stored = read_artifact(self._paths, artifact_id)
+        assert_secret_free(stored.manifest)
+        for path, payload in stored.payloads.items():
+            _assert_payload_secret_free(path, payload)
+        return stored
 
     def read_bytes(self, artifact_id: str, relative_path: str) -> bytes:
         """Read a named data file after verifying the complete immutable artifact.
@@ -481,35 +418,42 @@ class ArtifactStore:
             raise ArtifactCorruptionError(
                 f"artifact {artifact_id} does not own data file {validated_path}"
             )
-        return _read_verified_artifact_file(stored.directory, artifact_id, entry)
+        return stored.payloads[validated_path]
 
-    def list_ids(self) -> tuple[str, ...]:
-        """Return completed artifact IDs, excluding partial directories and lock files.
+    def list_ids(self, *, artifact_type: str | None = None) -> tuple[str, ...]:
+        """Return committed artifact IDs, optionally filtered by indexed domain type."""
+        return artifact_ids(self._paths, artifact_type=artifact_type)
 
-        Returns:
-            Sorted IDs for completed artifact directories that pass local ID validation.
-        """
-        directory = self._paths.artifacts_directory
-        if not directory.is_dir():
-            return ()
-        artifact_ids = []
-        for candidate in directory.iterdir():
-            if candidate.name.startswith(".") or not candidate.is_dir() or candidate.is_symlink():
-                continue
-            try:
-                artifact_ids.append(validate_local_id(candidate.name, label="artifact ID"))
-            except ValueError:
-                continue
-        return tuple(sorted(artifact_ids))
+    def exists(self, artifact_id: str) -> bool:
+        """Check a committed identity without consulting loose files or directories."""
+        validate_local_id(artifact_id, label="artifact ID")
+        return artifact_exists(self._paths, artifact_id)
 
 
 class ProjectStore(HostedProjectStoreMixin):
     """Own project configuration, immutable pointer bindings, review draft, and artifacts."""
 
-    def __init__(self, root: Path, project_id: str) -> None:
+    def __init__(self, root: Path, project_id: str, *, config_sha256: str | None = None) -> None:
         """Create a project-local store without writing state until an explicit method is called."""
         self.paths = ProjectPaths(root=root, project_id=project_id)
+        self._config_sha256 = config_sha256
         self.artifacts = ArtifactStore(self.paths)
+        self.records = ProjectRecords(root, project_id, "project")
+
+    def snapshot(self, sha256: str) -> ProjectStore:
+        """Bind exact configuration for reproducible execution while sharing immutable evidence."""
+        selected = ProjectStore(self.paths.root, self.paths.project_id, config_sha256=sha256)
+        selected.load_project()
+        return selected
+
+    def _require_mutable_config(self) -> None:
+        """Refuse configuration-head changes from an execution snapshot."""
+        if self._config_sha256 is not None:
+            raise ProjectStoreError("frozen project snapshots cannot change configuration")
+
+    def exists(self) -> bool:
+        """Return whether this project has committed configuration."""
+        return config_exists(self.paths)
 
     @property
     def model_catalog_path(self) -> Path:
@@ -527,20 +471,22 @@ class ProjectStore(HostedProjectStoreMixin):
         """
         if config.project_id != self.paths.project_id:
             raise ProjectStoreError("project configuration ID does not match the store project ID")
+        self._require_mutable_config()
+        require_current_layout(self.paths)
         self.paths.project_directory.mkdir(parents=True, exist_ok=True)
-        with file_write_lock(self.paths.project_toml, what="project configuration"):
-            if self.paths.project_toml.exists():
+        with project_connection(self.paths.root, write=True):
+            if self.exists():
                 try:
-                    existing = load_project_config(self.paths.project_toml)
+                    existing = load_project_config(self.paths)
                 except ValueError as exc:
                     raise ProjectStoreError(str(exc)) from exc
                 if existing != config:
                     raise ProjectStoreError(
-                        "project.toml already exists with different immutable config"
+                        "project already exists with different immutable config"
                     )
                 return
             try:
-                write_project_config(self.paths.project_toml, config)
+                write_project_config(self.paths, config)
             except ValueError as exc:
                 raise ProjectStoreError(str(exc)) from exc
 
@@ -554,7 +500,7 @@ class ProjectStore(HostedProjectStoreMixin):
             ProjectStoreError: If the configuration is missing or invalid.
         """
         try:
-            return load_project_config(self.paths.project_toml)
+            return load_project_config(self.paths, sha256=self._config_sha256)
         except ValueError as exc:
             raise ProjectStoreError(str(exc)) from exc
 
@@ -570,10 +516,11 @@ class ProjectStore(HostedProjectStoreMixin):
         Raises:
             ProjectStoreError: The graph is invalid, settings are absent, or another stage won.
         """
-        with file_write_lock(self.paths.project_toml, what="provider-free project stage"):
+        self._require_mutable_config()
+        with project_connection(self.paths.root, write=True):
             try:
                 self._verify_provider_free_stage(stage)
-                existing = load_project_config(self.paths.project_toml)
+                existing = load_project_config(self.paths)
                 if existing.trace_preparation is None:
                     raise ValueError("Project has no provider-free trace preparation settings")
                 if existing.provider_free_stage == stage:
@@ -581,7 +528,7 @@ class ProjectStore(HostedProjectStoreMixin):
                 if existing.provider_free_stage is not None:
                     raise ValueError("project already selects a different provider-free stage")
                 updated = existing.model_copy(update={"provider_free_stage": stage})
-                write_project_config(self.paths.project_toml, updated)
+                write_project_config(self.paths, updated)
             except (ArtifactStoreError, ValueError) as exc:
                 raise ProjectStoreError(f"cannot bind provider-free stage: {exc}") from exc
             return updated
@@ -609,11 +556,14 @@ class ProjectStore(HostedProjectStoreMixin):
         if task.code_revision != trace.code_revision:
             raise ValueError("provider-free trace and task manifest revisions differ")
 
-    def bind_completed_build(self, build: ProjectBuildArtifacts) -> ProjectConfig:
+    def bind_completed_build(
+        self, build: ProjectBuildArtifacts, *, trace_import_id: ArtifactId | None = None
+    ) -> ProjectConfig:
         """Atomically select a fully verified immutable build for future project workflows.
 
         Args:
             build: Exact trace, task, RAG, and world-model artifact manifest references.
+            trace_import_id: Optional exact stored corpus backing the selected graph.
 
         Returns:
             Updated project configuration naming the completed build.
@@ -628,7 +578,8 @@ class ProjectStore(HostedProjectStoreMixin):
             "fit_rag": "trace-rag-index",
             "world_model": "grounded-world-model",
         }
-        with file_write_lock(self.paths.project_toml, what="completed project build"):
+        self._require_mutable_config()
+        with project_connection(self.paths.root, write=True):
             try:
                 manifests: dict[str, ArtifactManifest] = {}
                 for field_name, artifact_type in expected_types.items():
@@ -653,9 +604,11 @@ class ProjectStore(HostedProjectStoreMixin):
                         raise ValueError(
                             f"{field_name} artifact does not bind the completed build graph"
                         )
-                existing = load_project_config(self.paths.project_toml)
-                updated = existing.model_copy(update={"build": build})
-                write_project_config(self.paths.project_toml, updated)
+                existing = load_project_config(self.paths)
+                updated = existing.model_copy(
+                    update={"build": build, "trace_import_id": trace_import_id}
+                )
+                write_project_config(self.paths, updated)
             except (ArtifactCorruptionError, ValueError) as exc:
                 raise ProjectStoreError(f"cannot bind completed build: {exc}") from exc
             return updated
@@ -688,7 +641,8 @@ class ProjectStore(HostedProjectStoreMixin):
             raise ProjectStoreError(
                 f"model optimization config binding is not a verified immutable artifact: {exc}"
             ) from exc
-        with file_write_lock(self.paths.project_toml, what="model optimization configuration"):
+        self._require_mutable_config()
+        with project_connection(self.paths.root, write=True):
             try:
                 self._verify_model_optimization_config_input(config, artifact_type=validated_type)
             except (ArtifactCorruptionError, ValueError) as exc:
@@ -696,7 +650,7 @@ class ProjectStore(HostedProjectStoreMixin):
                     f"model optimization config binding changed before commit: {exc}"
                 ) from exc
             try:
-                existing = load_project_config(self.paths.project_toml)
+                existing = load_project_config(self.paths)
             except ValueError as exc:
                 raise ProjectStoreError(str(exc)) from exc
             current_config = existing.model_optimization_config
@@ -704,11 +658,11 @@ class ProjectStore(HostedProjectStoreMixin):
                 return existing
             if current_config is not None:
                 raise ProjectStoreError(
-                    "project.toml already names a different immutable model optimization config"
+                    "project already names a different immutable model optimization config"
                 )
             updated = existing.model_copy(update={"model_optimization_config": config})
             try:
-                write_project_config(self.paths.project_toml, updated)
+                write_project_config(self.paths, updated)
             except ValueError as exc:
                 raise ProjectStoreError(str(exc)) from exc
             return updated
@@ -735,7 +689,7 @@ class ProjectStore(HostedProjectStoreMixin):
         Raises:
             ProjectStoreError: The draft crosses the local no-secret boundary.
         """
-        with file_write_lock(self.paths.review_json, what="project review"):
+        with self.records.transaction():
             self._write_review_unlocked(review)
 
     def update_review(
@@ -754,7 +708,7 @@ class ProjectStore(HostedProjectStoreMixin):
             ProjectStoreError: The current draft is corrupt or the replacement crosses the
                 no-secret boundary.
         """
-        with file_write_lock(self.paths.review_json, what="project review"):
+        with self.records.transaction():
             current = self._read_review_unlocked()
             replacement = update(current)
             payload = canonical_json_bytes(replacement)
@@ -782,16 +736,17 @@ class ProjectStore(HostedProjectStoreMixin):
             assert_secret_free(review)
         except SecretBoundaryError as exc:
             raise ProjectStoreError(str(exc)) from exc
-        write_bytes_atomic(self.paths.review_json, canonical_json_bytes(review))
+        self.records.write("review", canonical_json_bytes(review))
 
     def _read_review_unlocked(self) -> JsonValue | None:
         """Read the review value without taking a lock for callers that already hold it."""
-        if not self.paths.review_json.exists():
+        payload = self.records.read("review")
+        if payload is None:
             return None
         try:
-            return _JSON_VALUE_ADAPTER.validate_json(self.paths.review_json.read_bytes())
+            return _JSON_VALUE_ADAPTER.validate_json(payload)
         except (OSError, ValidationError) as exc:
-            raise ProjectStoreError("review.json is not valid JSON") from exc
+            raise ProjectStoreError("project review is not valid JSON") from exc
 
 
 @contextmanager
@@ -803,7 +758,7 @@ def coordinate_completed_build_selection(
     """Serialize build selection with mutable review writers for the selected task set.
 
     The coordination lock is reentrant only for the same project inside one execution context.
-    This lets a workflow hold the transaction across common review services without reacquiring
+    This lets a workflow coordinate common review services without reacquiring
     the non-reentrant filesystem lock. A task-set-bound writer verifies the current selection
     after acquiring the lock, so a service opened for an older build cannot restore its namespace
     after a replacement commits.
@@ -882,109 +837,3 @@ def _assert_payload_secret_free(relative_path: str, payload: bytes) -> None:
         raise ArtifactStoreError(
             f"artifact data file {relative_path} violates the secret boundary"
         ) from exc
-
-
-def _read_verified_artifact_file(
-    directory: Path,
-    artifact_id: str,
-    entry: ArtifactFile,
-) -> bytes:
-    """Read one artifact file from a stable descriptor and verify those exact bytes."""
-    try:
-        payload = _read_artifact_file_snapshot(directory, entry.path)
-    except OSError as exc:
-        raise ArtifactCorruptionError(
-            f"artifact {artifact_id} has an unsafe or unreadable data file: {entry.path}"
-        ) from exc
-    actual_digest = hashlib.sha256(payload).hexdigest()
-    if len(payload) != entry.size_bytes or actual_digest != entry.sha256:
-        raise ArtifactCorruptionError(
-            f"artifact {artifact_id} data file digest mismatch: {entry.path}"
-        )
-    try:
-        _assert_payload_secret_free(entry.path, payload)
-    except ArtifactStoreError as exc:
-        raise ArtifactCorruptionError(
-            f"artifact {artifact_id} data file violates the secret boundary: {entry.path}"
-        ) from exc
-    return payload
-
-
-def _read_artifact_file_snapshot(directory: Path, relative_path: str) -> bytes:
-    """Read a regular descendant without following a replaced path component."""
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise OSError("secure artifact reads require O_NOFOLLOW")
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW)
-    current_fd = directory_fd
-    try:
-        if not stat.S_ISDIR(os.fstat(current_fd).st_mode):
-            raise OSError("artifact directory is not a directory")
-        parts = PurePosixPath(relative_path).parts
-        for component in parts[:-1]:
-            next_fd = os.open(component, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
-            try:
-                if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
-                    raise OSError("artifact data path has a non-directory component")
-            except OSError:
-                os.close(next_fd)
-                raise
-            os.close(current_fd)
-            current_fd = next_fd
-        file_descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
-        try:
-            if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
-                raise OSError("artifact data path is not a regular file")
-            return _read_file_descriptor(file_descriptor)
-        finally:
-            os.close(file_descriptor)
-    finally:
-        os.close(current_fd)
-
-
-def _read_file_descriptor(file_descriptor: int) -> bytes:
-    """Read all available bytes from one already-open regular file descriptor."""
-    chunks: list[bytes] = []
-    while chunk := os.read(file_descriptor, 1024 * 1024):
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-def _artifact_data_files(directory: Path) -> tuple[str, ...]:
-    """Return all regular artifact data paths, rejecting symlinks and unexpected files."""
-    data_files = []
-    for candidate in directory.rglob("*"):
-        if candidate.is_symlink():
-            raise ArtifactCorruptionError(f"artifact contains unsupported symlink: {candidate}")
-        if candidate.is_file():
-            relative_path = candidate.relative_to(directory).as_posix()
-            if relative_path != "manifest.json":
-                data_files.append(relative_path)
-    return tuple(sorted(data_files))
-
-
-def _write_staged_file(path: Path, payload: bytes) -> None:
-    """Write and fsync one new file inside a private artifact staging directory."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _fsync_directory_strict(directory: Path) -> None:
-    """Persist a staged directory before atomically exposing it to readers."""
-    file_descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(file_descriptor)
-    finally:
-        os.close(file_descriptor)
-
-
-def _fsync_staging_tree(directory: Path) -> None:
-    """Persist nested staged directory entries before their top-level atomic rename."""
-    child_directories = [path for path in directory.rglob("*") if path.is_dir()]
-    for child_directory in sorted(
-        child_directories, key=lambda path: len(path.parts), reverse=True
-    ):
-        _fsync_directory_strict(child_directory)
-    _fsync_directory_strict(directory)

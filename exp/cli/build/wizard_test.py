@@ -46,6 +46,7 @@ from exp.optimize.router.automatic.service_test import (
     _EmbeddingClient,
     _ProviderState,
 )
+from exp.runtime.gateway.native_capture import CaptureController
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.simulation.build import ProjectBuild
 
@@ -485,6 +486,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
         max_active_requests: int = 64,
         graceful_timeout_seconds: float = 10.0,
         native_usage_enabled: bool = True,
+        capture: CaptureController | None = None,
         shutdown: object | None = None,
         on_listening: Callable[[], None] | None = None,
     ) -> None:
@@ -500,11 +502,12 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
             max_active_requests: Native concurrent-admission bound, unused.
             graceful_timeout_seconds: Drain bound, unused.
             native_usage_enabled: Usage-route ownership flag, unused.
+            capture: Optional capture controller, unused by the serving fixture.
             shutdown: Optional embedder stop handle, unused.
             on_listening: Bound-listener readiness callback.
         """
         del control_plane, max_active_requests, graceful_timeout_seconds
-        del native_usage_enabled, shutdown
+        del native_usage_enabled, shutdown, capture
         served.append((host, port))
         if on_listening is not None:
             on_listening()
@@ -629,7 +632,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="\ntraces.otel.jsonl\n1\n\n\nn\n",
+        input="\ntraces.otel.jsonl\n2\n\n\nn\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -675,7 +678,7 @@ def test_explicit_router_cap_below_required_fails_before_consent_or_paid_calls(
             "--max-router-cost-usd",
             "0.01",
         ],
-        input="\ntraces.otel.jsonl\n1\n\n\n",
+        input="\ntraces.otel.jsonl\n2\n\n\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -717,7 +720,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
             "--max-router-cost-usd",
             "5000",
         ],
-        input="\ntraces.otel.jsonl\n1\n\n\ny\n",
+        input="\ntraces.otel.jsonl\n2\n\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -759,6 +762,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
         estimate: float,
         maximum_build_cost_usd: float,
         provider_spend_authorized: bool,
+        trace_import_id: str | None = None,
         progress: build_command.ProgressHook | None = None,
     ) -> build_command.GroundedBuildCompletion:
         """Record both adapters using the shared typed execution seam.
@@ -791,6 +795,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             estimate=estimate,
             maximum_build_cost_usd=maximum_build_cost_usd,
             provider_spend_authorized=provider_spend_authorized,
+            trace_import_id=trace_import_id,
             progress=progress,
         )
 
@@ -799,7 +804,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
     explicit = _RUNNER.invoke(
         app,
         ["build", "explicit", "-t", str(traces), "--root", str(root)],
-        input="1\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
+        input="2\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert explicit.exit_code == 0, explicit.output
@@ -901,7 +906,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     first = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="\ntraces.otel.jsonl\n1\n\n\ny\n",
+        input="\ntraces.otel.jsonl\n2\n\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert first.exit_code == 1

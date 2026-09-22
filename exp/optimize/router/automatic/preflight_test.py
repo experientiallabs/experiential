@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import exp.runtime.models.registry as model_registry
+from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -41,7 +42,7 @@ def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     project = ProjectStore(root, "support")
     project.initialize(ProjectConfig(project_id="support"))
     write_model_catalog(project.model_catalog_path, _catalog())
-    before_project = project.paths.project_toml.read_bytes()
+    before_project = canonical_json_bytes(project.load_project())
     before_catalog = project.model_catalog_path.read_bytes()
     before_artifacts = project.artifacts.list_ids()
 
@@ -71,7 +72,7 @@ def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     assert "frozen model roles" in message
     assert "manual judge" in message
     assert "fidelity" not in message
-    assert project.paths.project_toml.read_bytes() == before_project
+    assert canonical_json_bytes(project.load_project()) == before_project
     assert project.model_catalog_path.read_bytes() == before_catalog
     assert project.artifacts.list_ids() == before_artifacts
     assert project.read_review() is None

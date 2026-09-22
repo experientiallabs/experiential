@@ -42,8 +42,8 @@ The source table is explicit, so an undeclared name fails closed rather than bei
 
 Ingest writes canonical traces and source provenance into the same SQLite content database as
 local gateway capture. Source files stay at the caller's path. The database owns normalized trace
-records, immutable imports, ordered import membership and project associations. It does not yet
-own the other project-folder artifacts. Import does not require an existing project configuration.
+records, immutable imports, ordered import membership and project associations. The same database also owns project configuration, immutable dataset/scenario and judge
+versions, evaluation runs, checkpoints, judgments, and result metadata. Import does not require an existing project configuration.
 
 Canonical content is hashed independently of per-import source provenance, so overlapping exports
 can share identical normalized records. An import ID binds the source format, source digest,
@@ -84,7 +84,9 @@ assert restored == result
 
 `exp build` remains a separate workflow: it mines representative tasks, selects project model
 roles, estimates embedding cost, builds serving and fit-only RAG indexes, and binds the grounded
-world model under the configured spend ceiling. Its current CLI reads an explicit source corpus.
+world model under the configured spend ceiling. Select the exact stored corpus with `exp build PROJECT --import-id IMPORT_ID --root ROOT`.
+The build pins that import in its configuration and does not reread the original source.
+An explicit `--traces PATH` remains available for direct builds.
 Ingest alone does not run or select a build, and does not produce an evaluation or HTML report.
 
 ## Authorized PostHog HogQL pull

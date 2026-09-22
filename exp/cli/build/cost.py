@@ -14,7 +14,8 @@ def over_ceiling_message(
     estimate: float,
     ceiling: float,
     project: str,
-    trace_file: Path,
+    trace_file: Path | None,
+    import_id: str | None = None,
     source: str,
     root: Path,
     world_model: str | None,
@@ -29,6 +30,7 @@ def over_ceiling_message(
         ceiling: Configured ``--max-build-cost-usd`` value that the estimate exceeded.
         project: Local project identifier from this invocation.
         trace_file: Trace export path from this invocation.
+        import_id: Exact stored import, mutually exclusive with a trace file.
         source: Selected canonical source format.
         root: Local ``.exp`` artifact root.
         world_model: Optional world-model alias override.
@@ -39,9 +41,14 @@ def over_ceiling_message(
     Returns:
         Fail-closed message naming both amounts and a sufficient rebuild command.
     """
-    command = ["exp", "build", project, "--traces", str(trace_file)]
-    if source.strip().casefold() != "otlp":
-        command.extend(["--source", source])
+    command = ["exp", "build", project]
+    if import_id is not None:
+        command.extend(["--import-id", import_id])
+    else:
+        assert trace_file is not None
+        command.extend(["--traces", str(trace_file)])
+        if source.strip().casefold() != "otlp":
+            command.extend(["--source", source])
     if root != Path(ARTIFACT_DIR):
         command.extend(["--root", str(root)])
     if world_model is not None:

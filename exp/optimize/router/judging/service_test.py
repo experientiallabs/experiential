@@ -53,6 +53,7 @@ from exp.common.project import (
     ProjectStoreError,
     artifact_input,
 )
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
@@ -568,7 +569,7 @@ def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale judge setup cannot cross an interrupted replacement selection.
+    """Interrupted replacement rolls back both pointers; old evidence stays valid until commit.
 
     Args:
         tmp_path: Isolated project and immutable artifact root.
@@ -642,7 +643,7 @@ def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
     builder = Thread(target=run_builder, daemon=True)
     builder.start()
     assert selection_paused.wait(timeout=5)
-    assert store.load_project().build == completed_b
+    assert store.load_project().build == selected_a
     stale_review = store.read_review()
     assert isinstance(stale_review, dict)
     assert stale_review["build_review"]["readiness_id"] == stale_plan.build.readiness_id
@@ -659,14 +660,15 @@ def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
     assert not judge.is_alive()
     assert len(builder_errors) == 1
     assert "injected interruption" in str(builder_errors[0])
-    assert len(judge_errors) == 1
-    assert isinstance(judge_errors[0], ManualJudgeError)
-    assert "not synchronized" in str(judge_errors[0])
-    assert store.load_project().build == completed_b
+    assert judge_errors == []
+    assert store.load_project().build == selected_a
     assert store.read_review() == stale_review
 
     monkeypatch.setattr(simulation_build, "select_build_review", original_select_review)
     select_completed_build(store, completed_b, replacement.review)
+    assert store.load_project().build == completed_b
+    with pytest.raises(ManualJudgeError):
+        commit_manual_judge_setup(store, stale_plan, confirmed=True)
     recovered_review = store.read_review()
     assert isinstance(recovered_review, dict)
     assert recovered_review["build_review"]["readiness_id"] == replacement.review.readiness_id
@@ -1130,7 +1132,12 @@ def test_completed_audit_tamper_fails_before_replay_or_approval(tmp_path: Path) 
         created_at=_TIME,
         code_revision="test-revision",
     )
-    audit_path = store.artifacts.read(result.audit.audit_id).directory / "audit.json"
+    audit_path = (
+        RawArtifact(
+            store.artifacts._paths, store.artifacts.read(result.audit.audit_id).manifest.artifact_id
+        )
+        / "audit.json"
+    )
     audit_path.write_text("{}", encoding="utf-8")
 
     with pytest.raises(ManualJudgeError, match="audit is unavailable"):

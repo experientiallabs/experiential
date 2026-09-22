@@ -30,6 +30,7 @@ from exp.common.project import (
     artifact_input,
     coordinate_completed_build_selection,
 )
+from exp.common.project.database import project_connection
 from exp.common.project.project import require_durable_source_id
 from exp.common.release_revision import installed_release_revision
 from exp.common.tasks import TaskSet
@@ -286,7 +287,7 @@ def _initialize_provider_free_project(
         retrieval=None,
         budgets=None,
     )
-    if not store.paths.project_toml.exists():
+    if not store.exists():
         try:
             store.initialize(proposed)
         except ProjectStoreError:
@@ -458,17 +459,19 @@ def select_completed_build(
     store: ProjectStore,
     build: ProjectBuildArtifacts,
     review: BuildReviewReadiness,
+    *,
+    trace_import_id: ArtifactId | None = None,
 ) -> None:
     """Select a completed graph before advancing its recoverable review handoff.
 
-    Official build writers share one cross-process coordination lock. The immutable build is
-    selected first, then review readiness advances. If execution stops between those writes, an
-    exact restart verifies the selected graph and repairs the review handoff without provider work.
+    Official build writers share one cross-process coordination lock. The configuration head and
+    review handoff commit in one short SQLite transaction after immutable evidence is complete.
 
     Args:
         store: Project store receiving the completed-build selection.
         build: Verified immutable trace, task, RAG, and world-model graph.
         review: Exact readiness record derived from the graph's trace and task artifacts.
+        trace_import_id: Stored corpus to pin with this build, or None for direct normalized input.
 
     Raises:
         ValueError: The proposed graph and review name different trace or task artifacts.
@@ -476,8 +479,9 @@ def select_completed_build(
     if build.trace_dataset != review.trace_dataset or build.task_set != review.task_set:
         raise ValueError("completed build does not match proposed build review")
     with _build_review_coordination(store):
-        store.bind_completed_build(build)
-        select_build_review(store, review)
+        with project_connection(store.paths.root, write=True):
+            store.bind_completed_build(build, trace_import_id=trace_import_id)
+            select_build_review(store, review)
 
 
 @contextmanager

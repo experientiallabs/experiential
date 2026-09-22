@@ -92,6 +92,7 @@ from exp.common.project import (
 from exp.optimize.model.sft.builder import SFTBuildError, load_verified_sft_dataset
 from exp.optimize.model.sft.contracts import PartitionedSFTExample
 from exp.optimize.model.sft.provider_resources import validate_provider_resource_id
+from exp.optimize.model.sft.run_manifest import sft_run_records
 from exp.optimize.model.sft.selection import (
     SFTModelOptimizationSelectionError,
     require_selected_sft_model_optimization_config,
@@ -834,9 +835,8 @@ def _verify_completed_run_if_present(
     code_revision: str,
 ) -> _VerifiedCompletedRun | None:
     """Recursively verify a claimed W13 terminal result without allowing provider dispatch."""
-    result_path = output_dir / _RESULT_FILE
-    model_path = output_dir / _MODEL_FILE
-    if not result_path.exists() and not model_path.exists():
+    state = sft_run_records(store, output_dir)
+    if state.read(_RESULT_FILE) is None and state.read(_MODEL_FILE) is None:
         return None
     try:
         result = train_tinker_sft(
@@ -848,7 +848,10 @@ def _verify_completed_run_if_present(
             created_at=datetime.now(UTC),
             code_revision=code_revision,
         )
-        model = TinkerSFTModelArtifact.model_validate_json((output_dir / _MODEL_FILE).read_bytes())
+        payload = state.read(_MODEL_FILE)
+        if payload is None:
+            raise ValueError("completed SFT model record is absent")
+        model = TinkerSFTModelArtifact.model_validate_json(payload)
         validate_provider_resource_id(model.sampling_handle, label="sampling handle")
     except (OSError, TinkerSFTError, ValueError) as exc:
         raise SFTModelOptimizationPreflightError(

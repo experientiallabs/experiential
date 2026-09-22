@@ -13,6 +13,7 @@ from exp.common.core.artifacts import SourceIdentity, canonical_json_bytes, stab
 from exp.common.models import BillingSource, ModelSnapshot
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from exp.common.project.paths import ProjectPaths
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan, load_trace_dataset
 from exp.simulation.ingest.dataset import (
     MODEL_IDENTITY_EVIDENCE_PATH,
@@ -188,11 +189,11 @@ def test_current_dataset_without_identity_evidence_is_corrupt(tmp_path: Path) ->
         code_revision="test-revision",
     )
     stored = store.read(persisted.dataset.dataset_id)
-    (stored.directory / MODEL_IDENTITY_EVIDENCE_PATH).unlink()
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / MODEL_IDENTITY_EVIDENCE_PATH).unlink()
     files = tuple(
         entry for entry in stored.manifest.files if entry.path != MODEL_IDENTITY_EVIDENCE_PATH
     )
-    (stored.directory / "manifest.json").write_bytes(
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "manifest.json").write_bytes(
         canonical_json_bytes(stored.manifest.model_copy(update={"files": files}))
     )
     loaded = load_trace_dataset(store, persisted.dataset.dataset_id)
@@ -474,4 +475,4 @@ def test_persist_trace_dataset_rejects_mixed_raw_source_provenance(tmp_path: Pat
         )
 
     paths = ProjectPaths(root=tmp_path, project_id="project-a")
-    assert not paths.artifacts_directory.exists()
+    assert ArtifactStore(paths).list_ids() == ()

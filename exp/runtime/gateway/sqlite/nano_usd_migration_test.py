@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.migrations import (
     SCHEMA_VERSION,
     GatewaySchemaError,
-    connect_database,
     initialize_database,
 )
 from exp.runtime.gateway.sqlite.nano_usd_migration import (

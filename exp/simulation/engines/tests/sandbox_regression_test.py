@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.models import ModelRequest, ModelResponse
+from exp.common.project.records import ProjectRecords
 from exp.common.rollouts import RolloutArtifact, StopReason
 from exp.simulation.engines.sandbox import (
     EnvironmentCostBinding,
@@ -95,12 +96,16 @@ def test_paid_dispatch_persistence_failure_retains_non_replay_barrier(
     with pytest.raises(OSError, match="injected persistence failure"):
         simulator.run(spec)
 
-    lease_directory = store.project_directory / "simulation-leases"
-    lease_paths = tuple(lease_directory.glob("*.json"))
+    lease_records = ProjectRecords(
+        store.project_directory.parent.parent, store.project_directory.name, "simulation-leases"
+    )
+    lease_ids = lease_records.list_ids()
     assert _artifact_ids_of_type(store, "rollout") == ()
     assert len(client.requests) == 1
-    assert len(lease_paths) == 1
-    retained = TextCellLease.model_validate_json(lease_paths[0].read_bytes())
+    assert len(lease_ids) == 1
+    payload = lease_records.read(lease_ids[0])
+    assert payload is not None
+    retained = TextCellLease.model_validate_json(payload)
     assert retained.status == TextCellLeaseStatus.ACTIVE
     assert retained.dispatch_intent_recorded
     assert not retained.unknown_spend_blocks_budget
@@ -121,7 +126,7 @@ def test_paid_dispatch_persistence_failure_retains_non_replay_barrier(
     assert len(client.requests) == 1
     assert runtime.opened_task_ids == ["task-a"]
     assert _artifact_ids_of_type(store, "rollout") == ()
-    assert len(tuple(lease_directory.glob("*.json"))) == 1
+    assert len(lease_records.list_ids()) == 1
 
 
 @pytest.mark.parametrize("interruption", (KeyboardInterrupt, SystemExit))
@@ -148,9 +153,11 @@ def test_pre_dispatch_construction_interrupt_releases_owned_lease(
     with pytest.raises(interruption, match="injected construction interruption"):
         interrupted.run(spec)
 
-    lease_directory = store.project_directory / "simulation-leases"
+    lease_records = ProjectRecords(
+        store.project_directory.parent.parent, store.project_directory.name, "simulation-leases"
+    )
     assert runtime.opened_task_ids == []
-    assert tuple(lease_directory.glob("*.json")) == ()
+    assert lease_records.list_ids() == ()
 
     recovered = _simulator(
         store,
@@ -192,12 +199,16 @@ def test_post_dispatch_interrupt_keeps_non_replay_barrier(
     with pytest.raises(interruption, match="injected post-dispatch interruption"):
         simulator.run(spec)
 
-    lease_directory = store.project_directory / "simulation-leases"
-    lease_paths = tuple(lease_directory.glob("*.json"))
+    lease_records = ProjectRecords(
+        store.project_directory.parent.parent, store.project_directory.name, "simulation-leases"
+    )
+    lease_ids = lease_records.list_ids()
     assert len(client.requests) == 1
     assert _artifact_ids_of_type(store, "rollout") == ()
-    assert len(lease_paths) == 1
-    retained = TextCellLease.model_validate_json(lease_paths[0].read_bytes())
+    assert len(lease_ids) == 1
+    payload = lease_records.read(lease_ids[0])
+    assert payload is not None
+    retained = TextCellLease.model_validate_json(payload)
     assert retained.status == TextCellLeaseStatus.ACTIVE
     assert retained.dispatch_intent_recorded
     assert retained.reserved_cost_usd == pytest.approx(1.0)
@@ -247,9 +258,11 @@ def test_pre_dispatch_persistence_failure_releases_owned_lease(
     with pytest.raises(OSError, match="injected pre-dispatch persistence failure"):
         simulator.run(spec)
 
-    lease_directory = store.project_directory / "simulation-leases"
+    lease_records = ProjectRecords(
+        store.project_directory.parent.parent, store.project_directory.name, "simulation-leases"
+    )
     assert runtime.opened_task_ids == []
-    assert tuple(lease_directory.glob("*.json")) == ()
+    assert lease_records.list_ids() == ()
     monkeypatch.undo()
 
     artifact_set = simulator.run(spec)

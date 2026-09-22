@@ -9,6 +9,7 @@ import pytest
 
 from exp.common.core.artifacts import SourceIdentity
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
+from exp.common.project.testing import RawArtifact
 from exp.common.tasks import TaskCase, TaskSet, ToolSchema
 from exp.common.tasks.store import load_task_set
 from exp.common.traces import Trace, TraceSource, TraceSpan
@@ -84,7 +85,7 @@ def test_load_task_set_rejects_a_typed_envelope_with_wrong_task_ids(tmp_path) ->
     """A manifest cannot silently point to task records that disagree with its envelope."""
     store, task_set = _task_set_store(tmp_path)
     artifact = store.read(task_set.task_set_id)
-    task_set_path = artifact.directory / "task-set.json"
+    task_set_path = RawArtifact(store._paths, artifact.manifest.artifact_id) / "task-set.json"
     payload = task_set.model_copy(update={"task_ids": tuple(reversed(task_set.task_ids))})
     task_set_path.write_text(payload.model_dump_json(), encoding="utf-8")
 

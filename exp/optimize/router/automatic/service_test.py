@@ -55,6 +55,7 @@ from exp.common.project import (
     write_project_config,
 )
 from exp.common.project.manifests import file_digest
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from exp.optimize.router.activation import load_project_router
 from exp.optimize.router.automatic.attribution import (
@@ -599,7 +600,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     assert state.credential_resolutions == completed_credentials
 
     redacted_config = store.load_project().model_copy(update={"redacted_field_names": ("email",)})
-    write_project_config(store.paths.project_toml, redacted_config)
+    write_project_config(store.paths, redacted_config)
     redacted_preflight = preflight_automatic_router(
         store,
         plan.selection,
@@ -628,7 +629,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
             )
         }
     )
-    write_project_config(store.paths.project_toml, changed_config)
+    write_project_config(store.paths, changed_config)
     custom_agent = preflight_automatic_router(
         store,
         plan.selection,
@@ -646,7 +647,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         is None
     )
     write_project_config(
-        store.paths.project_toml,
+        store.paths,
         changed_config.model_copy(
             update={
                 "agent": changed_config.agent.model_copy(
@@ -1287,7 +1288,9 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
         manifest = stored.manifest.model_copy(
             update={"files": (file_digest("attribution.json", payload),)}
         )
-        (stored.directory / "attribution.json").write_bytes(payload)
+        (
+            RawArtifact(store.artifacts._paths, stored.manifest.artifact_id) / "attribution.json"
+        ).write_bytes(payload)
         match = "content identity differs"
     elif tamper == "source":
         manifest = stored.manifest.model_copy(
@@ -1302,7 +1305,9 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
         match = "must not have source"
     else:
         extra = b"{}"
-        (stored.directory / "extra.json").write_bytes(extra)
+        (
+            RawArtifact(store.artifacts._paths, stored.manifest.artifact_id) / "extra.json"
+        ).write_bytes(extra)
         manifest = stored.manifest.model_copy(
             update={
                 "files": tuple(
@@ -1314,7 +1319,9 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
             }
         )
         match = "exact one-file shape"
-    (stored.directory / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+    (
+        RawArtifact(store.artifacts._paths, stored.manifest.artifact_id) / "manifest.json"
+    ).write_bytes(canonical_json_bytes(manifest))
     before_completion = tuple(state.completion_calls)
     before_embedding = tuple(state.embedding_calls)
     before_credentials = state.credential_resolutions
@@ -1732,7 +1739,7 @@ def test_runtime_activation_rejects_automatic_contract_tamper_before_credentials
     stored = store.artifacts.read(artifact_id)
     payload = canonical_json_bytes(value)
     manifest = stored.manifest.model_copy(update={"files": (file_digest(file_name, payload),)})
-    artifact_directory = store.paths.artifact_directory(artifact_id)
+    artifact_directory = RawArtifact(store.paths, artifact_id)
     (artifact_directory / file_name).write_bytes(payload)
     (artifact_directory / "manifest.json").write_bytes(canonical_json_bytes(manifest))
     before_credentials = state.credential_resolutions

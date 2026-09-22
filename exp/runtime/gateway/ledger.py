@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import persistent_connection
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.budgets import (
     MAXIMUM_NANO_USD,
@@ -38,7 +39,7 @@ from exp.runtime.gateway.ledger_usage import (
     identity_usage_rows,
 )
 from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int
-from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
+from exp.runtime.gateway.sqlite.migrations import initialize_database
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 
@@ -52,8 +53,7 @@ class AttemptRejectedError(GatewayLedgerError):
     The rejected reservation wrote nothing durable, so the executor must not
     latch accounting health, must not dispatch a provider, and must not advance
     the fallback waterfall; the exception reaches the protocol boundary
-    unchanged so the rejection keeps its own public error shape. ``failure`` is
-    the sanitized failure that settles the already-accepted parent request.
+    unchanged, preserving its public error shape. ``failure`` settles the accepted parent request.
     """
 
     def __init__(self, message: str, *, failure: GatewayFailure) -> None:

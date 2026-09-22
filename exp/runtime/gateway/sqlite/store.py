@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import assert_never
 
 from exp.common.core.artifacts import Sha256, sha256_json
+from exp.common.sqlite.connection import persistent_connection
 from exp.runtime.gateway.auth import (
     FingerprintPepperFile,
     GatewayAuthError,
@@ -40,7 +41,7 @@ from exp.runtime.gateway.sqlite.alias_activation import (
     activate_alias_revision_in_transaction,
     alias_activation_transaction,
 )
-from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
+from exp.runtime.gateway.sqlite.migrations import initialize_database
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
     ProviderConnectionMutation,

@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 import math
 import os
-import stat
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -20,8 +20,9 @@ from uuid import uuid4
 from pydantic import AwareDatetime, Field, ValidationError, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
-from exp.common.core.files import fsync_directory_best_effort
 from exp.common.core.locks import DEFAULT_LOCK_TIMEOUT_S, FileLockTimeout, file_write_lock
+from exp.common.project.database import project_connection
+from exp.common.project.records import ProjectRecordError, ProjectRecords
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ class TextCellLeaseStatus(StrEnum):
 
 
 class TextCellLease(ContractModel):
-    """One fsync-backed exclusive claim made before any provider call in a cell."""
+    """One durable exclusive claim made before any provider call in a cell."""
 
     lease_id: ArtifactId
     resolution_id: ArtifactId
@@ -112,7 +113,7 @@ class TextCellLeaseClaim:
 class TextCellLeaseStore:
     """Coordinate one local project's paid text-simulation cells across processes.
 
-    A claim file is atomically created before a candidate or world-model provider call. A process
+    A claim commits atomically before a candidate or world-model provider call. A process
     that sees a live claim waits for its immutable rollout up to a bounded deadline. An expired
     claim with a dead owner becomes a durable non-reserving tombstone: the earlier process may have
     paid a provider just before crashing, so the cell is not replayed.
@@ -151,6 +152,11 @@ class TextCellLeaseStore:
             raise ValueError("text-cell lease poll_interval_seconds must be positive")
         if not math.isfinite(wait_timeout_seconds) or wait_timeout_seconds <= 0:
             raise ValueError("text-cell lease wait_timeout_seconds must be finite and positive")
+        if project_directory.parent.name != "projects":
+            raise ValueError("text-cell leases require a canonical project directory")
+        self._records = ProjectRecords(
+            project_directory.parent.parent, project_directory.name, "simulation-leases"
+        )
         self._directory = project_directory / _LEASE_DIRECTORY_NAME
         self._clock = clock
         self._owner_alive = _owner_process_is_alive if owner_alive is None else owner_alive
@@ -426,7 +432,18 @@ class TextCellLeaseStore:
                 what="text simulation cell admission",
                 timeout_s=max(0.0, deadline - time.monotonic()),
             ):
-                yield
+                with project_connection(
+                    self._records.root,
+                    write=True,
+                    timeout_s=max(0.0, deadline - time.monotonic()),
+                ):
+                    yield
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise FileLockTimeout(
+                    "text simulation database is busy; retry the operation"
+                ) from exc
+            raise
         finally:
             self._admission_lock.release()
 
@@ -504,7 +521,8 @@ class TextCellLeaseStore:
     ) -> tuple[TextCellLease, ...]:
         """Reap completed claims, tombstone dead claims, and return valid reservations."""
         leases = []
-        for path in sorted(self._directory.glob(f"*{_LEASE_SUFFIX}")):
+        for record_id in self._records.list_ids():
+            path = self._path(record_id)
             lease = self._read_optional(path)
             if lease is None:
                 continue
@@ -541,83 +559,26 @@ class TextCellLeaseStore:
         return stale
 
     def _reap(self, path: Path, expected: TextCellLease) -> None:
-        """Remove a claim whose immutable rollout now makes replay impossible."""
-        descriptor, metadata = self._open_exact(path, expected)
+        """Delete an unchanged claim only after its immutable rollout is durable."""
         try:
-            current = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
-                raise TextCellLeaseError(f"text-cell lease {path} changed before reap")
-            os.unlink(path.name, dir_fd=descriptor)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            self._records.replace(
+                expected.lease_id, expected=canonical_json_bytes(expected), replacement=None
+            )
+        except ProjectRecordError as exc:
+            raise TextCellLeaseError(str(exc)) from exc
 
     def _replace_exact(
-        self,
-        path: Path,
-        *,
-        expected: TextCellLease,
-        replacement: TextCellLease,
+        self, path: Path, *, expected: TextCellLease, replacement: TextCellLease
     ) -> None:
-        """Replace one unchanged regular lease by directory-relative no-follow mutation."""
-        directory_descriptor, metadata = self._open_exact(path, expected)
-        staging_name = f".{path.name}.{uuid4().hex}.partial"
-        staging_descriptor: int | None = None
+        """Conditionally replace a claim without weakening its persisted identity."""
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            staging_descriptor = os.open(staging_name, flags, 0o600, dir_fd=directory_descriptor)
-            payload = canonical_json_bytes(replacement)
-            with os.fdopen(staging_descriptor, "wb", closefd=False) as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.close(staging_descriptor)
-            staging_descriptor = None
-            current = os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
-            if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
-                metadata.st_dev,
-                metadata.st_ino,
-            ):
-                raise TextCellLeaseError(f"text-cell lease {path} changed before tombstone")
-            os.replace(
-                staging_name,
-                path.name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
+            self._records.replace(
+                expected.lease_id,
+                expected=canonical_json_bytes(expected),
+                replacement=canonical_json_bytes(replacement),
             )
-            os.fsync(directory_descriptor)
-        finally:
-            if staging_descriptor is not None:
-                os.close(staging_descriptor)
-            with suppress(FileNotFoundError):
-                os.unlink(staging_name, dir_fd=directory_descriptor)
-            os.close(directory_descriptor)
-
-    def _open_exact(self, path: Path, expected: TextCellLease) -> tuple[int, os.stat_result]:
-        """Open the lease directory and prove its current name still denotes expected content."""
-        directory_descriptor = self._open_directory(path.parent)
-        lease_descriptor: int | None = None
-        try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            lease_descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
-            metadata = os.fstat(lease_descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise TextCellLeaseError(f"text-cell lease {path} is not a regular file")
-            payload = b""
-            while chunk := os.read(lease_descriptor, 64 * 1024):
-                payload += chunk
-            current = TextCellLease.model_validate_json(payload)
-            if current != expected:
-                raise TextCellLeaseError(f"text-cell lease {path} changed before mutation")
-            return directory_descriptor, metadata
-        except (OSError, ValidationError, ValueError, TextCellLeaseError) as exc:
-            os.close(directory_descriptor)
-            if isinstance(exc, TextCellLeaseError):
-                raise
-            raise TextCellLeaseError(f"text-cell lease {path} cannot be mutated safely") from exc
-        finally:
-            if lease_descriptor is not None:
-                os.close(lease_descriptor)
+        except ProjectRecordError as exc:
+            raise TextCellLeaseError(str(exc)) from exc
 
     def _require_same_claim(
         self,
@@ -658,74 +619,24 @@ class TextCellLeaseStore:
         return self._directory / "admission"
 
     def _read_optional(self, path: Path) -> TextCellLease | None:
-        """Load one regular, complete, typed lease record without following a symlink."""
-        if not path.exists():
-            return None
-        if path.is_symlink() or not path.is_file():
-            raise TextCellLeaseError(f"text-cell lease path {path} is not a safe regular file")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        """Read one verified claim from its project-owned database namespace."""
         try:
-            descriptor = os.open(path, flags)
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise TextCellLeaseError(f"text-cell lease {path} cannot be opened safely") from exc
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise TextCellLeaseError(f"text-cell lease {path} is not a regular file")
-            with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                payload = handle.read()
-        finally:
-            os.close(descriptor)
-        try:
+            payload = self._records.read(path.stem)
+            if payload is None:
+                return None
             lease = TextCellLease.model_validate_json(payload)
         except (ValidationError, ValueError) as exc:
-            raise TextCellLeaseError(f"text-cell lease {path} is malformed") from exc
-        expected_name = f"{lease.lease_id}{_LEASE_SUFFIX}"
-        if path.name != expected_name:
-            raise TextCellLeaseError(f"text-cell lease {path} does not match its record identity")
+            raise TextCellLeaseError(f"text-cell lease {path.stem} is malformed") from exc
+        if lease.lease_id != path.stem:
+            raise TextCellLeaseError("text-cell lease differs from its database identity")
         return lease
 
     def _write_exclusive(self, path: Path, lease: TextCellLease) -> None:
-        """Create and fsync one claim via ``O_EXCL`` before any provider call may begin."""
-        directory_descriptor = self._open_directory(path.parent)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        """Commit one exclusive claim before any provider dispatch can begin."""
         try:
-            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory_descriptor)
-        except FileExistsError as exc:  # pragma: no cover - admission lock serializes this race
-            os.close(directory_descriptor)
-            raise TextCellLeaseError(f"text-cell lease {lease.lease_id!r} already exists") from exc
-        except OSError as exc:
-            os.close(directory_descriptor)
-            raise TextCellLeaseError(
-                f"text-cell lease {lease.lease_id!r} cannot be created safely"
-            ) from exc
-        try:
-            payload = canonical_json_bytes(lease)
-            with os.fdopen(descriptor, "wb", closefd=False) as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except BaseException:
-            with suppress(FileNotFoundError):
-                os.unlink(path.name, dir_fd=directory_descriptor)
-            raise
-        finally:
-            os.close(descriptor)
-            os.close(directory_descriptor)
-        fsync_directory_best_effort(path.parent)
-
-    @staticmethod
-    def _open_directory(directory: Path) -> int:
-        """Open one real lease directory without following a swapped symlink."""
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            return os.open(directory, flags)
-        except OSError as exc:
-            raise TextCellLeaseError(
-                f"text simulation lease directory {directory} cannot be opened safely"
-            ) from exc
+            self._records.write(lease.lease_id, canonical_json_bytes(lease), exclusive=True)
+        except ProjectRecordError as exc:
+            raise TextCellLeaseError(str(exc)) from exc
 
 
 def _aware_now(clock: Callable[[], datetime]) -> datetime:

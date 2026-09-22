@@ -45,6 +45,78 @@ const TRACE_TABLE_SQL: &[(&str, &str)] = &[
     ),
 ];
 
+// Project-owned metadata shares the file but remains outside capture retention.
+const PROJECT_TABLE_SQL: &[(&str, &str)] = &[
+    (
+        "project_store_schema",
+        "CREATE TABLE project_store_schema (version INTEGER PRIMARY KEY CHECK(version=1)) STRICT",
+    ),
+    (
+        "project_config_versions",
+        "CREATE TABLE project_config_versions (
+        project_id TEXT NOT NULL, version INTEGER NOT NULL CHECK(version>0),
+        sha256 TEXT NOT NULL CHECK(length(sha256)=64), payload BLOB NOT NULL,
+        PRIMARY KEY(project_id, version), UNIQUE(project_id, sha256)
+    ) STRICT",
+    ),
+    (
+        "project_config_heads",
+        "CREATE TABLE project_config_heads (
+        project_id TEXT PRIMARY KEY, version INTEGER NOT NULL,
+        FOREIGN KEY(project_id, version) REFERENCES project_config_versions(project_id, version)
+    ) STRICT",
+    ),
+    (
+        "project_artifacts",
+        "CREATE TABLE project_artifacts (
+        project_id TEXT NOT NULL, artifact_id TEXT NOT NULL, artifact_type TEXT NOT NULL,
+        manifest BLOB NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+        PRIMARY KEY(project_id, artifact_id)
+    ) STRICT",
+    ),
+    (
+        "project_artifact_inputs",
+        "CREATE TABLE project_artifact_inputs (
+        project_id TEXT NOT NULL, artifact_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+        input_id TEXT NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+        PRIMARY KEY(project_id, artifact_id, ordinal),
+        FOREIGN KEY(project_id, artifact_id) REFERENCES project_artifacts(project_id, artifact_id)
+    ) STRICT",
+    ),
+    (
+        "project_artifact_files",
+        "CREATE TABLE project_artifact_files (
+        project_id TEXT NOT NULL, artifact_id TEXT NOT NULL, path TEXT NOT NULL,
+        sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+        size_bytes INTEGER NOT NULL CHECK(size_bytes>=0),
+        payload BLOB, blob_path TEXT,
+        PRIMARY KEY(project_id, artifact_id, path),
+        FOREIGN KEY(project_id, artifact_id) REFERENCES project_artifacts(project_id, artifact_id),
+        CHECK((payload IS NULL) != (blob_path IS NULL))
+    ) STRICT",
+    ),
+    (
+        "project_state_records",
+        "CREATE TABLE project_state_records (
+        project_id TEXT NOT NULL, namespace TEXT NOT NULL, record_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision>0), payload BLOB NOT NULL,
+        sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+        PRIMARY KEY(project_id, namespace, record_id)
+    ) STRICT",
+    ),
+    (
+        "project_state_events",
+        "CREATE TABLE project_state_events (
+        project_id TEXT NOT NULL, namespace TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence>0),
+        event_id TEXT NOT NULL, payload BLOB NOT NULL,
+        sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+        PRIMARY KEY(project_id, namespace, sequence), UNIQUE(project_id, namespace, event_id)
+    ) STRICT",
+    ),
+];
+
 pub(super) struct Pending {
     pub policy: Policy,
     pub payload: String,
@@ -132,7 +204,10 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
              AND name NOT LIKE 'sqlite_%' AND name NOT IN (
                'gateway_captures', 'trace_store_schema', 'trace_records',
-               'trace_imports', 'trace_import_records', 'trace_project_imports'))",
+               'trace_imports', 'trace_import_records', 'trace_project_imports',
+               'project_store_schema', 'project_config_versions', 'project_config_heads',
+               'project_artifacts', 'project_artifact_inputs', 'project_artifact_files',
+               'project_state_records', 'project_state_events'))",
             [],
             |row| row.get(0),
         )
@@ -187,6 +262,51 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
             return Err(
                 "unsupported trace import schema; use a matching Experiential release".into(),
             );
+        }
+    }
+    let project_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
+               'project_store_schema', 'project_config_versions', 'project_config_heads',
+               'project_artifacts', 'project_artifact_inputs', 'project_artifact_files',
+               'project_state_records', 'project_state_events')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(safe_error)?;
+    if project_tables != 0 {
+        if project_tables != 8 {
+            return Err("incomplete project schema; preserve this traffic database".into());
+        }
+        for (table, expected) in PROJECT_TABLE_SQL {
+            let saved: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(safe_error)?;
+            let normalize = |sql: &str| {
+                sql.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            };
+            if normalize(&saved) != normalize(expected) {
+                return Err(
+                    "incompatible project table definition; preserve this traffic database".into(),
+                );
+            }
+        }
+        let supported: bool = connection
+            .query_row(
+                "SELECT COUNT(*)=1 AND MIN(version)=1 FROM project_store_schema",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(safe_error)?;
+        if !supported {
+            return Err("unsupported project schema; use a matching Experiential release".into());
         }
     }
     connection

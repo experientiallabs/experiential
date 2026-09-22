@@ -183,7 +183,7 @@ def test_completed_prefix_is_reused_and_changed_redaction_is_rejected(
     )
     if drift:
         write_project_config(
-            project.paths.project_toml,
+            project.paths,
             project.load_project().model_copy(
                 update={
                     "redacted_field_names": ("private-value",),

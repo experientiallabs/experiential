@@ -17,6 +17,7 @@ from exp.common.core.artifacts import (
     FailureCode,
     SourceIdentity,
     StructuredFailure,
+    canonical_json_bytes,
     stable_id,
 )
 from exp.common.models import (
@@ -42,6 +43,7 @@ from exp.common.project import (
     ProjectPaths,
     artifact_input,
 )
+from exp.common.project.testing import RawArtifact
 from exp.common.routing import RouterFeatureExtractor, RoutingDecision
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from exp.runtime.router import RuntimeAcceptedEvent, RuntimeInteractionJournal
@@ -502,7 +504,7 @@ def test_zero_cost_int_and_float_share_identity_and_replay_without_dispatch(
         binding,
         maximum_embedding_cost_usd=0,
     )
-    completed_artifacts = {path.name for path in (store.project_directory / "artifacts").iterdir()}
+    completed_artifacts = set(store.list_ids())
     replay = _refresh(
         journal,
         store,
@@ -516,9 +518,7 @@ def test_zero_cost_int_and_float_share_identity_and_replay_without_dispatch(
     assert replay.refresh == first.refresh
     assert replay.retrieval.index == first.retrieval.index
     assert client.calls == 1
-    assert {
-        path.name for path in (store.project_directory / "artifacts").iterdir()
-    } == completed_artifacts
+    assert set(store.list_ids()) == completed_artifacts
 
 
 @pytest.mark.parametrize(
@@ -608,9 +608,8 @@ def test_exact_replay_dispatches_zero_embeds_and_append_creates_new_siblings(
     )
     first_payloads = {
         artifact_id: {
-            path.name: path.read_bytes()
-            for path in store.read(artifact_id).directory.iterdir()
-            if path.is_file()
+            **store.read(artifact_id).payloads,
+            "manifest.json": canonical_json_bytes(store.read(artifact_id).manifest),
         }
         for artifact_id in first_ids
     }
@@ -660,9 +659,8 @@ def test_exact_replay_dispatches_zero_embeds_and_append_creates_new_siblings(
     assert later.retrieval.index.transition_count == 2
     for artifact_id, payloads in first_payloads.items():
         assert {
-            path.name: path.read_bytes()
-            for path in store.read(artifact_id).directory.iterdir()
-            if path.is_file()
+            **store.read(artifact_id).payloads,
+            "manifest.json": canonical_json_bytes(store.read(artifact_id).manifest),
         } == payloads
 
 
@@ -1165,7 +1163,11 @@ def test_corrupt_snapshot_and_index_hash_fail_closed_on_replay(tmp_path: Path) -
     binding = _binding(client)
     result = _refresh(journal, store, binding)
     snapshot_path = (
-        store.read(result.snapshot_export.snapshot.snapshot_id).directory / "interactions.jsonl"
+        RawArtifact(
+            store._paths,
+            store.read(result.snapshot_export.snapshot.snapshot_id).manifest.artifact_id,
+        )
+        / "interactions.jsonl"
     )
     original_snapshot = snapshot_path.read_bytes()
     snapshot_path.write_bytes(original_snapshot + b"{}\n")
@@ -1175,7 +1177,10 @@ def test_corrupt_snapshot_and_index_hash_fail_closed_on_replay(tmp_path: Path) -
     assert client.calls == 1
 
     snapshot_path.write_bytes(original_snapshot)
-    vectors_path = store.read(result.retrieval.index.rag_id).directory / "vectors.jsonl"
+    vectors_path = (
+        RawArtifact(store._paths, store.read(result.retrieval.index.rag_id).manifest.artifact_id)
+        / "vectors.jsonl"
+    )
     vectors_path.write_bytes(vectors_path.read_bytes() + b"{}\n")
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
         load_runtime_rag_refresh(store, result.refresh.refresh_id, embedder=binding)

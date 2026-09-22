@@ -21,6 +21,8 @@ from typing import cast
 
 from click import unstyle
 
+from exp.common.core.artifacts import canonical_json_bytes
+
 if sys.platform != "win32":
     import fcntl
     import resource
@@ -2789,10 +2791,13 @@ def _installed_release_driver() -> None:
         assert "candidates: candidate-b, core-model" in optimization_output
         assert "incumbent: core-model" in optimization_output
         assert "Complete" in optimization_output
-        optimized_artifacts = directory_digest(support_store.paths.artifacts_directory)
+        optimized_artifacts = tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        )
         optimized_catalog = (root / "models.toml").read_bytes()
-        optimized_project = support_store.paths.project_toml.read_bytes()
-        optimized_review = support_store.paths.review_json.read_bytes()
+        optimized_project = canonical_json_bytes(support_store.load_project())
+        optimized_review = canonical_json_bytes(support_store.read_review())
         optimized_provider_requests = state.snapshot()
         replay_result = run_cli(
             *optimize_arguments[:-1],
@@ -2801,9 +2806,15 @@ def _installed_release_driver() -> None:
         assert "replay: verified completed optimization" in replay_result.stdout
         assert state.snapshot() == optimized_provider_requests
         assert (root / "models.toml").read_bytes() == optimized_catalog
-        assert support_store.paths.project_toml.read_bytes() == optimized_project
-        assert support_store.paths.review_json.read_bytes() == optimized_review
-        assert directory_digest(support_store.paths.artifacts_directory) == optimized_artifacts
+        assert canonical_json_bytes(support_store.load_project()) == optimized_project
+        assert canonical_json_bytes(support_store.read_review()) == optimized_review
+        assert (
+            tuple(
+                (artifact_id, support_store.artifacts.read(artifact_id))
+                for artifact_id in support_store.artifacts.list_ids()
+            )
+            == optimized_artifacts
+        )
 
         router_port = unused_loopback_port()
         provider_calls_before_run = state.snapshot()
@@ -2923,8 +2934,11 @@ def _installed_release_driver() -> None:
         events_before_public_replay = journal.read_events()
         provider_before_public_replay = state.snapshot()
         gateway_database = root / "gateway" / "gateway.db"
-        artifacts_before_public_replay = directory_digest(support_store.paths.artifacts_directory)
-        project_before_public_replay = support_store.paths.project_toml.read_bytes()
+        artifacts_before_public_replay = tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        )
+        project_before_public_replay = canonical_json_bytes(support_store.load_project())
         with sqlite3.connect(gateway_database) as connection:
             gateway_requests_before_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"
@@ -2966,10 +2980,11 @@ def _installed_release_driver() -> None:
             assert duplicate_second.choices[0].message.content == "Duplicate routed target"
         assert journal.read_events() == events_before_public_replay
         assert state.snapshot() != provider_before_public_replay
-        assert support_store.paths.project_toml.read_bytes() == project_before_public_replay
-        assert directory_digest(support_store.paths.artifacts_directory) == (
-            artifacts_before_public_replay
-        )
+        assert canonical_json_bytes(support_store.load_project()) == project_before_public_replay
+        assert tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        ) == (artifacts_before_public_replay)
         with sqlite3.connect(gateway_database) as connection:
             gateway_requests_after_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"

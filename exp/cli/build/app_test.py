@@ -38,9 +38,11 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import load_trace_dataset
 from exp.runtime.models import CatalogRoleName, ResolvedModel
 from exp.simulation.ingest.dataset import read_trace_model_identity_evidence
+from exp.simulation.ingest.persistence import ingest_traces
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model import GroundedWorldModelArtifact
 
@@ -670,7 +672,10 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
     second_build = store.load_project().build
     assert second_build is not None
     selected = first_build if selected_graph == "old" else second_build
-    trace_directory = store.artifacts.read(selected.trace_dataset.artifact_id).directory
+    trace_directory = RawArtifact(
+        store.artifacts._paths,
+        store.artifacts.read(selected.trace_dataset.artifact_id).manifest.artifact_id,
+    )
     trace_path = trace_directory / "traces.jsonl"
     trace_path.write_text("corrupt\n", encoding="utf-8")
 
@@ -984,7 +989,7 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Restart repairs review after completed-build selection without rebuilding providers.
+    """Restart selects the saved graph after an atomic selection rollback without new spend.
 
     Args:
         tmp_path: Temporary trace, catalog, and project root.
@@ -1046,7 +1051,7 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     assert "injected final review failure" in interrupted.output
     selected_build = store.load_project().build
     assert selected_build is not None
-    assert selected_build != first_build
+    assert selected_build == first_build
     assert store.read_review() == first_review
 
     monkeypatch.setattr(simulation_build, "select_build_review", original_select_review)
@@ -1067,7 +1072,8 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     )
 
     assert recovered.exit_code == 0, recovered.output
-    assert store.load_project().build == selected_build
+    selected_build = store.load_project().build
+    assert selected_build is not None and selected_build != first_build
     recovered_review = store.read_review()
     assert isinstance(recovered_review, dict)
     assert recovered_review["build_review"]["trace_dataset"] == (
@@ -1605,3 +1611,55 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "unsupported trace source 'helicone'" in unstyle(result.output)
     assert "posthog" in unstyle(result.output)
+
+
+def test_build_pins_stored_import_after_original_source_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The downstream build consumes the exact ingestion receipt without rereading a path."""
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    _, receipt = ingest_traces("support", root=root, source_format="otlp", path=source)
+    assert receipt is not None
+    source.unlink()
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--import-id", receipt.import_id, "--root", str(root), "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    store = ProjectStore(root, "support")
+    assert store.load_project().trace_import_id == receipt.import_id
+    assert store.artifacts.list_ids()
+    assert not (store.paths.project_directory / "project.toml").exists()
+
+
+def test_replacement_import_is_selected_with_its_completed_build(tmp_path: Path) -> None:
+    """A new corpus can replace a build while old configuration snapshots remain replayable."""
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    source = _otlp_export(tmp_path, count=1)
+    _, first = ingest_traces("support", root=root, source_format="otlp", path=source)
+    assert first is not None
+    command = ["build", "support", "--root", str(root), "--import-id"]
+    result = _RUNNER.invoke(app, [*command, first.import_id])
+    assert result.exit_code == 0, result.output
+    store = ProjectStore(root, "support")
+    original = store.load_project()
+    assert original.trace_import_id == first.import_id
+    frozen = store.snapshot(sha256_json(original))
+    source = _otlp_export(tmp_path, count=2)
+    _, second = ingest_traces("support", root=root, source_format="otlp", path=source)
+    assert second is not None and second.import_id != first.import_id
+    source.unlink()
+    preflight = _RUNNER.invoke(app, [*command, second.import_id, "--dry-run"])
+    assert preflight.exit_code == 0, preflight.output
+    assert store.load_project() == original
+    replaced = _RUNNER.invoke(app, [*command, second.import_id])
+    assert replaced.exit_code == 0, replaced.output
+    assert store.load_project().trace_import_id == second.import_id
+    assert store.load_project().build != original.build
+    assert frozen.load_project() == original

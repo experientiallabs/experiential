@@ -403,11 +403,11 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     list_ids_calls = 0
     list_ids = project.artifacts.list_ids
 
-    def count_list_ids() -> tuple[str, ...]:
-        """Count artifact-directory scans across the complete evidence workflow."""
+    def count_list_ids(*, artifact_type: str | None = None) -> tuple[str, ...]:
+        """Count indexed artifact queries across the complete evidence workflow."""
         nonlocal list_ids_calls
         list_ids_calls += 1
-        return list_ids()
+        return list_ids(artifact_type=artifact_type)
 
     monkeypatch.setattr(project.artifacts, "list_ids", count_list_ids)
     normalized = TraceNormalizationResult(
