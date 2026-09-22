@@ -86,7 +86,7 @@ pub fn completed_messages_body_with_reasoning(
             tool_names,
         });
     }
-    let incomplete = matches!(terminal, Event::Incomplete);
+    let incomplete = matches!(terminal, Event::Incomplete | Event::IncompleteToolArguments);
     if events.iter().any(|event| {
         matches!(
             event,

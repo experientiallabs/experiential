@@ -73,7 +73,10 @@ impl StopSequenceGuard {
                 Event::TextDelta(_) | Event::ProviderTextDelta { .. } => Vec::new(),
                 // The model's own ending is irrelevant: the caller's stop
                 // sequence ended this turn. A provider failure still fails.
-                Event::Completed | Event::Incomplete | Event::PausedTurn => {
+                Event::Completed
+                | Event::Incomplete
+                | Event::IncompleteToolArguments
+                | Event::PausedTurn => {
                     vec![Event::StoppedAtSequence(sequence)]
                 }
                 other => vec![other],
@@ -102,14 +105,16 @@ impl StopSequenceGuard {
             | Event::HostedToolItemStarted { .. }
             | Event::Completed
             | Event::Incomplete
+            | Event::IncompleteToolArguments
             | Event::PausedTurn
             | Event::Failed(_) => {
                 let mut events = self.finish_text();
                 if let Some(sequence) = self.matched.clone() {
                     events.push(match event {
-                        Event::Completed | Event::Incomplete | Event::PausedTurn => {
-                            Event::StoppedAtSequence(sequence)
-                        }
+                        Event::Completed
+                        | Event::Incomplete
+                        | Event::IncompleteToolArguments
+                        | Event::PausedTurn => Event::StoppedAtSequence(sequence),
                         other => other,
                     });
                 } else {
@@ -313,6 +318,17 @@ mod tests {
         assert_eq!(text(&out), "allow");
         // The provider's own max-tokens ending is superseded by the stop.
         assert!(stopped_at(out.last(), "</block>"));
+    }
+
+    #[test]
+    fn a_stop_match_supersedes_the_incomplete_tool_diagnostic() {
+        let out = run(
+            &["END"],
+            &["answerENDignored"],
+            Event::IncompleteToolArguments,
+        );
+        assert_eq!(text(&out), "answer");
+        assert!(stopped_at(out.last(), "END"));
     }
 
     #[test]

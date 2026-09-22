@@ -32,7 +32,7 @@ fn invalid_provider_stream(message: &str) -> PublicError {
 /// server-tool turn must keep `pause_turn` so the caller resumes it.
 pub(super) fn stop_reason(terminal: &Event, saw_tool_use: bool) -> &'static str {
     match terminal {
-        Event::Incomplete => "max_tokens",
+        Event::Incomplete | Event::IncompleteToolArguments => "max_tokens",
         Event::PausedTurn => "pause_turn",
         // A gateway-emulated stop cut the visible text: the caller's sequence
         // ended the turn, exactly as Anthropic reports a native match.
@@ -484,6 +484,7 @@ impl MessagesSseEncoder {
             }
             Event::Completed
             | Event::Incomplete
+            | Event::IncompleteToolArguments
             | Event::StoppedAtSequence(_)
             | Event::PausedTurn => {
                 self.terminal = true;

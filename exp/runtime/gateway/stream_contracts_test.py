@@ -14,6 +14,26 @@ from exp.runtime.gateway.stream_contracts import (
 )
 
 
+def test_incomplete_cause_is_typed_and_restricted_to_incomplete_terminals() -> None:
+    """An observed partial-tool cause cannot relabel a completed or failed turn."""
+    event = GatewayEvent(
+        kind=GatewayEventKind.INCOMPLETE,
+        sequence_number=0,
+        incomplete_reason="tool_arguments_incomplete",
+    )
+    assert GatewayEvent.model_validate_json(event.model_dump_json()) == event
+    with pytest.raises(ValidationError, match="incomplete terminal"):
+        GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=0,
+            incomplete_reason="tool_arguments_incomplete",
+        )
+    with pytest.raises(ValidationError, match="tool_arguments_incomplete"):
+        GatewayEvent.model_validate(
+            {"kind": "incomplete", "sequence_number": 0, "incomplete_reason": "provider prose"}
+        )
+
+
 def test_gateway_failure_carries_an_optional_bounded_refusal_reason() -> None:
     """The refusal reason is an optional typed field that round-trips through
     the contract's JSON serialization and defaults to absent."""

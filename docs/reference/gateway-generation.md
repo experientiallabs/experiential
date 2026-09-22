@@ -110,6 +110,15 @@ A non-streaming aggregate omits incomplete tool calls and retains the incomplete
 Clients must not execute a partial tool call from a length-limited answer. The gateway does
 not silently repair arguments, regenerate the answer, or retry a length termination.
 
+An OpenAI-compatible provider can also finish with `stop` or `tool_calls` while an argument
+object is unfinished. Chat keeps `finish_reason: "length"` to represent the incomplete
+delivery and adds `x-experiential-incomplete-reason: "tool_arguments_incomplete"` on the
+terminal SSE chunk or non-streaming response. This diagnostic means the gateway observed
+an unfinished argument object without a provider-declared output limit. It does not prove
+that increasing the token budget will help. Keep the incomplete attempt separate from a
+completed result, inspect the provider stream, and retry deliberately if appropriate.
+The diagnostic contains no argument content; streamed fragments remain unchanged.
+
 A provider's normal completed call containing `{}` is passed through. Completion is not a
 promise that the call satisfies every caller-defined JSON Schema constraint or that a client
 successfully executed it. Schema validity, provider outcome, delivery, and billing are separate

@@ -397,7 +397,7 @@ impl ResponsesSseEncoder {
             Event::Completed | Event::StoppedAtSequence(_) | Event::PausedTurn => {
                 self.finish("completed", None)
             }
-            Event::Incomplete => self.finish("incomplete", None),
+            Event::Incomplete | Event::IncompleteToolArguments => self.finish("incomplete", None),
             Event::Failed(failure) => self.finish("failed", Some(failure)),
         }
     }

@@ -204,7 +204,7 @@ impl ResponsesRetention {
             Event::Completed | Event::StoppedAtSequence(_) => {
                 self.finish_open_items(ProviderOutputItemStatus::Completed)
             }
-            Event::Incomplete | Event::Failed(_) => {
+            Event::Incomplete | Event::IncompleteToolArguments | Event::Failed(_) => {
                 self.finish_open_items(ProviderOutputItemStatus::Incomplete);
             }
             _ => {}

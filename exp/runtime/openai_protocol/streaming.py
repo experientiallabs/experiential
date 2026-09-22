@@ -177,7 +177,11 @@ class ChatSseEncoder:
                 if self._tool_indices
                 else "stop"
             )
-            frames.append(self._chunk(delta={}, finish_reason=finish_reason))
+            frames.append(
+                self._chunk(
+                    delta={}, finish_reason=finish_reason, incomplete_reason=event.incomplete_reason
+                )
+            )
             if self.include_usage and self._usage is not None:
                 frames.append(self._usage_chunk(self._usage))
         frames.append("data: [DONE]\n\n")
@@ -189,6 +193,7 @@ class ChatSseEncoder:
         delta: JsonObject,
         finish_reason: str | None = None,
         logprobs: JsonObject | None = None,
+        incomplete_reason: str | None = None,
     ) -> str:
         """Build one official Chat completion chunk SSE frame."""
         payload: JsonObject = {
@@ -207,6 +212,8 @@ class ChatSseEncoder:
         }
         if self.ignored_parameters:
             payload["x-experiential-ignored-parameters"] = list(self.ignored_parameters)
+        if incomplete_reason is not None:
+            payload["x-experiential-incomplete-reason"] = incomplete_reason
         return _chat_data(payload)
 
     def _usage_chunk(self, usage: GatewayUsage) -> str:

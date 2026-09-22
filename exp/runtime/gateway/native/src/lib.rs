@@ -779,6 +779,14 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .to_string(),
             },
             "completed" => events::Event::Completed,
+            "incomplete"
+                if object
+                    .get("incomplete_reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("tool_arguments_incomplete") =>
+            {
+                events::Event::IncompleteToolArguments
+            }
             "incomplete" => events::Event::Incomplete,
             "paused_turn" => events::Event::PausedTurn,
             "failed" => events::Event::Failed(errors::Failure::new(

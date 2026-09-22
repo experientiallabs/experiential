@@ -52,7 +52,7 @@ fn a_relay_stop_finish_with_arguments_cut_mid_fragment_settles_incomplete() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::Incomplete)),
+            .any(|event| matches!(event, Event::IncompleteToolArguments)),
         "the turn settles Incomplete: {events:?}"
     );
     assert!(
@@ -144,7 +144,91 @@ fn a_dangling_fragment_on_a_normal_relay_finish_is_truncation_not_malformed() {
         })
         .expect("a dangling fragment on a normal relay finish is truncation");
     assert!(
-        matches!(events.as_slice(), [Event::Incomplete]),
+        matches!(events.as_slice(), [Event::IncompleteToolArguments]),
         "{events:?}"
     );
+}
+
+#[test]
+fn chat_discloses_an_unfinished_tool_object_separately_from_declared_length() {
+    // Synthetic payload: an encoded array string and an absent outer brace.
+    // The gateway must not invent that brace or change the string to an array.
+    let raw = "{\"items\":\"[{\\\"label\\\":\\\"synthetic\\\"}]\"";
+    for declared in [Some("stop"), Some("tool_calls"), None, Some("length")] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let mut events = normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0, "id": "call_partial", "type": "function",
+                    "function": {"name": "record_findings", "arguments": raw},
+                }]}),
+                declared,
+            ))
+            .unwrap();
+        events.extend(
+            normalizer
+                .feed(&SseEvent {
+                    event: None,
+                    data: "[DONE]".to_string(),
+                })
+                .unwrap(),
+        );
+        let mut encoder = crate::encode::ChatSseEncoder::new_with_ignored(
+            "request-partial",
+            "test-model",
+            1,
+            false,
+            Vec::new(),
+        );
+        let mut public = encoder.start().unwrap();
+        for event in &events {
+            public.extend(encoder.feed(event).unwrap());
+        }
+        let frames: Vec<serde_json::Value> = public
+            .iter()
+            .filter_map(|frame| {
+                frame
+                    .strip_prefix("data: ")
+                    .and_then(|data| serde_json::from_str(data.trim()).ok())
+            })
+            .collect();
+        let terminal = frames
+            .iter()
+            .find(|frame| frame["choices"][0]["finish_reason"] == "length")
+            .unwrap();
+        let fragments: String = frames
+            .iter()
+            .filter_map(|frame| {
+                frame["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert_eq!(fragments, raw, "streamed arguments stay byte-exact");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallCompleted { .. })));
+        let body = crate::encode::completed_chat_body_with_ignored(
+            "request-partial",
+            "test-model",
+            1,
+            &events,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(body.incomplete);
+        assert!(body.body["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none());
+        let expected = if declared == Some("length") {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!("tool_arguments_incomplete")
+        };
+        assert_eq!(terminal["x-experiential-incomplete-reason"], expected);
+        assert_eq!(body.body["x-experiential-incomplete-reason"], expected);
+        assert_eq!(
+            crate::events::simplified_event(events.last().unwrap())["incomplete_reason"],
+            expected
+        );
+    }
 }

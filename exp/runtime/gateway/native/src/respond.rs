@@ -360,7 +360,7 @@ pub(crate) async fn settle_stream_end(
                 .settle("failed", usage, tool_names, Some(&failure), true)
                 .await
         }
-        Some(Event::Incomplete) => {
+        Some(Event::Incomplete | Event::IncompleteToolArguments) => {
             guard
                 .settle("incomplete", usage, tool_names, None, true)
                 .await

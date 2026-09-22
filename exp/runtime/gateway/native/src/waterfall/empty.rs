@@ -70,7 +70,7 @@ pub(super) async fn settle_output_less(
         Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
         None => None,
     };
-    let outcome = if matches!(terminal, Event::Incomplete) {
+    let outcome = if matches!(terminal, Event::Incomplete | Event::IncompleteToolArguments) {
         "incomplete"
     } else {
         "completed"

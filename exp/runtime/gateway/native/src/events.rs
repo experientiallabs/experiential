@@ -323,6 +323,8 @@ pub enum Event {
     Usage(Usage),
     Completed,
     Incomplete,
+    /// A compatible provider ended with an unfinished tool argument object.
+    IncompleteToolArguments,
     /// The gateway cut the stream at one of the caller's stop sequences on a
     /// wire that has no stop field (OpenAI Responses). Settles as completed;
     /// the Messages encoder reports `stop_sequence` with this exact value.
@@ -336,17 +338,6 @@ pub enum Event {
 }
 
 impl Event {
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Event::Completed
-                | Event::Incomplete
-                | Event::StoppedAtSequence(_)
-                | Event::PausedTurn
-                | Event::Failed(_)
-        )
-    }
-
     /// Whether this event advances generation rather than keeping transport
     /// alive. Private reasoning is progress even when its text stays hidden.
     /// Item-open scaffolding, empty deltas and usage alone do not renew idle.
@@ -693,6 +684,9 @@ pub fn simplified_event(event: &Event) -> Value {
         // (guardrails, retention); only the public encoders name the sequence.
         Event::Completed | Event::StoppedAtSequence(_) => serde_json::json!({"kind": "completed"}),
         Event::Incomplete => serde_json::json!({"kind": "incomplete"}),
+        Event::IncompleteToolArguments => serde_json::json!({
+            "kind": "incomplete", "incomplete_reason": "tool_arguments_incomplete",
+        }),
         Event::PausedTurn => serde_json::json!({"kind": "paused_turn"}),
         Event::Failed(failure) => {
             let mut value = serde_json::json!({
@@ -709,6 +703,7 @@ pub fn simplified_event(event: &Event) -> Value {
 }
 
 mod item_metadata;
+mod terminal;
 use item_metadata::add_provider_item_metadata;
 pub use item_metadata::hosted_item_type_is_invocation;
 

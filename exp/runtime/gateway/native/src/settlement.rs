@@ -552,7 +552,7 @@ fn disconnect_provenance(argument: String, dispatched: bool, incomplete: bool) -
 fn cancellation_outcome(terminal: Option<&Event>) -> (&'static str, Option<Failure>) {
     match terminal {
         Some(Event::Failed(failure)) => ("failed", Some(failure.clone().boundary())),
-        Some(Event::Incomplete) => ("incomplete", None),
+        Some(Event::Incomplete | Event::IncompleteToolArguments) => ("incomplete", None),
         Some(_) => ("completed", None),
         None => (
             "failed",

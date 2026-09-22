@@ -194,7 +194,7 @@ pub fn completed_responses_body_with_gateway_tools(
         body,
         failure: None,
         usage,
-        incomplete: matches!(terminal, Event::Incomplete),
+        incomplete: matches!(terminal, Event::Incomplete | Event::IncompleteToolArguments),
         tool_names,
     })
 }

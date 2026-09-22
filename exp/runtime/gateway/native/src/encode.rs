@@ -177,6 +177,7 @@ pub struct ChatSseEncoder {
     ignored_parameters: Vec<String>,
     started: bool,
     terminal: bool,
+    incomplete_tool_arguments: bool,
     tool_indices: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
     usage: Option<Usage>,
@@ -206,6 +207,7 @@ impl ChatSseEncoder {
             ignored_parameters,
             started: false,
             terminal: false,
+            incomplete_tool_arguments: false,
             tool_indices: HashMap::new(),
             tool_arguments: HashMap::new(),
             usage: None,
@@ -418,16 +420,19 @@ impl ChatSseEncoder {
             }
             Event::Completed
             | Event::Incomplete
+            | Event::IncompleteToolArguments
             | Event::StoppedAtSequence(_)
             | Event::PausedTurn => {
                 self.terminal = true;
-                let finish_reason = if matches!(event, Event::Incomplete) {
-                    "length"
-                } else if !self.tool_indices.is_empty() {
-                    "tool_calls"
-                } else {
-                    "stop"
-                };
+                self.incomplete_tool_arguments = matches!(event, Event::IncompleteToolArguments);
+                let finish_reason =
+                    if matches!(event, Event::Incomplete | Event::IncompleteToolArguments) {
+                        "length"
+                    } else if !self.tool_indices.is_empty() {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    };
                 let mut frames = Vec::new();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
                     && self.reasoning.candidate()?.is_some()
@@ -501,6 +506,9 @@ impl ChatSseEncoder {
                     "x-experiential-ignored-parameters".to_string(),
                     json!(self.ignored_parameters),
                 );
+        }
+        if finish_reason.is_some() && self.incomplete_tool_arguments {
+            payload["x-experiential-incomplete-reason"] = json!("tool_arguments_incomplete");
         }
         chat_data(&payload)
     }
@@ -694,7 +702,7 @@ pub fn completed_chat_body_with_carrier(
         .collect();
     let logprobs = crate::logprobs::aggregate(events);
     let reasoning = reasoning_carrier_candidate(events)?;
-    let incomplete = matches!(terminal, Event::Incomplete);
+    let incomplete = matches!(terminal, Event::Incomplete | Event::IncompleteToolArguments);
     let finish_reason = if incomplete {
         "length"
     } else if !tool_calls.is_empty() {
@@ -793,6 +801,9 @@ pub fn completed_chat_body_with_carrier(
                 "x-experiential-ignored-parameters".to_string(),
                 json!(ignored_parameters),
             );
+    }
+    if matches!(terminal, Event::IncompleteToolArguments) {
+        body["x-experiential-incomplete-reason"] = json!("tool_arguments_incomplete");
     }
     Ok(AggregatedCompletion {
         body,

@@ -159,7 +159,11 @@ class GatewayEventKind(StrEnum):
 
 
 class GatewayEvent(ContractModel):
-    """One ordered provider-neutral stream event, including raw tool fragments."""
+    """One ordered provider-neutral stream event, including raw tool fragments.
+
+    Attributes:
+        incomplete_reason: Optional typed cause on an incomplete terminal.
+    """
 
     kind: GatewayEventKind
     sequence_number: int = Field(ge=0)
@@ -181,6 +185,7 @@ class GatewayEvent(ContractModel):
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    incomplete_reason: Literal["tool_arguments_incomplete"] | None = None
     choice_logprobs_delta: ChoiceLogprobsDelta | None = None
     usage_incomplete_due_to_disconnect: bool = Field(default=False, exclude=True, strict=True)
     """Trusted evidence of caller loss after dispatch but before an observed provider terminal.
@@ -218,6 +223,8 @@ class GatewayEvent(ContractModel):
         Raises:
             ValueError: The selected event kind lacks its required payload.
         """
+        if self.incomplete_reason is not None and self.kind is not GatewayEventKind.INCOMPLETE:
+            raise ValueError("incomplete_reason requires an incomplete terminal")
         if self.usage_incomplete_due_to_disconnect and (
             self.kind is not GatewayEventKind.FAILED
             or self.failure is None

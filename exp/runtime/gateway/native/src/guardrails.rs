@@ -120,6 +120,7 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
             }
             Event::Completed
             | Event::Incomplete
+            | Event::IncompleteToolArguments
             | Event::StoppedAtSequence(_)
             | Event::PausedTurn
             | Event::Failed(_)
@@ -277,6 +278,7 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::Usage(_)
         | Event::Completed
         | Event::Incomplete
+        | Event::IncompleteToolArguments
         | Event::StoppedAtSequence(_)
         | Event::PausedTurn
         | Event::GeminiThoughtPart(_)

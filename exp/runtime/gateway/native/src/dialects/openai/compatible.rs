@@ -437,7 +437,9 @@ impl Normalizer {
                 _ => crate::errors::RefusalReason::Unspecified,
             };
             events.push(Event::Failed(Failure::refusal(reason)));
-        } else if finish == Some("length") || cut_mid_fragment {
+        } else if cut_mid_fragment {
+            events.push(Event::IncompleteToolArguments);
+        } else if finish == Some("length") {
             events.push(Event::Incomplete);
         } else {
             events.push(Event::Completed);
