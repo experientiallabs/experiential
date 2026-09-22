@@ -29,7 +29,7 @@ from exp.runtime.gateway.embeddings_contracts import (
     ServingRequest,
     embeddings_input_ceiling_nano_usd,
 )
-from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_nano_usd
+from exp.runtime.gateway.images_contracts import ImagesRequest, images_attempt_ceiling
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
@@ -573,12 +573,7 @@ def maximum_attempt_cost_nano_usd(
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
             )
         case ImagesRequest():
-            return images_ceiling_nano_usd(
-                request,
-                input_tokens=input_tokens,
-                input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
-                output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
-            )
+            return images_attempt_ceiling(request, deployment.gateway.prices, input_tokens)
         case GatewayRequest() | DecisionRequest():
             return _token_attempt_cost_nano_usd(request, deployment, input_tokens)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.

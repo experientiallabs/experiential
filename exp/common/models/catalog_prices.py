@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import Field
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer
 
 from exp.common.core.artifacts import ContractModel
 
@@ -59,6 +59,19 @@ class GatewayServiceTierPrices(ContractModel):
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
 
 
+class GatewayImagePrices(ContractModel):
+    """Separate token rates and conservative image ceiling, never applied to chat."""
+
+    maximum_output_tokens_per_image: int = Field(gt=0, le=1_000_000)
+
+    input_nano_usd_per_million_tokens: int = Field(
+        ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+    output_nano_usd_per_million_tokens: int = Field(
+        ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    )
+
+
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
@@ -86,10 +99,20 @@ class GatewayTokenPrices(ContractModel):
     the full 1M window at standard pricing (no tier), so current Anthropic
     deployments leave this ``None``.
     """
+    images: GatewayImagePrices | None = None
+    """Dedicated image-generation rates; required for OpenRouter Images admission."""
     flex: GatewayServiceTierPrices | None = None
     """Pass-through rates when the caller requests ``service_tier='flex'``."""
     priority: GatewayServiceTierPrices | None = None
     """Pass-through rates when the caller requests ``service_tier='priority'``."""
+
+    @model_serializer(mode="wrap")
+    def _serialize_rates(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        """Omit an absent image card so ordinary catalog snapshots stay unchanged."""
+        serialized: dict[str, object] = handler(self)
+        if self.images is None:
+            serialized.pop("images", None)
+        return serialized
 
     def service_tier(self, tier: str | None) -> GatewayServiceTierPrices | None:
         """Find the pass-through card for a requested processing tier.

@@ -642,6 +642,7 @@ class OpenRouterClient(OpenAICompatibleClient):
         """
         return replace(
             super().gateway_wire_profile(),
+            images_url=f"{self._base_url}/images",
             forwards_prompt_cache_key=True,
             forwards_cache_control=True,
         )

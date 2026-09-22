@@ -1057,7 +1057,7 @@ def _configured_gateway(
         connection=ConnectionConfig(
             provider=provider,
             # Fixed-origin providers (anthropic and friends) reject a base_url.
-            base_url=None if provider == "anthropic" else base_url,
+            base_url=None if provider in {"anthropic", "openrouter"} else base_url,
             api_version=api_version,
             api_key_env="TEST_PROVIDER_KEY",
         ),

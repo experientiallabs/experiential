@@ -18,8 +18,10 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import openai
@@ -32,8 +34,11 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.models.catalog_prices import GatewayImagePrices
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
+from exp.runtime.gateway.tests.launch_test import _ServedGateway, _unused_port
 from exp.runtime.gateway.tests.native_messages_test import (
     _DRIVER_SOURCE,
     _HOST,
@@ -43,7 +48,9 @@ from exp.runtime.gateway.tests.native_messages_test import (
 
 pytest.importorskip("exp_gateway_native")
 
-_PIXEL = base64.b64encode(b"\x89PNG\r\n\x1a\nfake-pixels").decode()
+_PIXEL = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+)
 
 
 class _ImagesUpstream(BaseHTTPRequestHandler):
@@ -51,6 +58,7 @@ class _ImagesUpstream(BaseHTTPRequestHandler):
 
     payloads: list[JsonObject] = []
     payloads_lock = threading.Lock()
+    openrouter = False
 
     def _answer(self, status: int, body: JsonObject) -> None:
         encoded = json.dumps(body).encode()
@@ -66,7 +74,20 @@ class _ImagesUpstream(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length))
         with self.payloads_lock:
             self.payloads.append(payload)
-        if not self.path.endswith("/images/generations"):
+        if self.path.endswith("/chat/completions"):
+            frames = (
+                b'data: {"choices":[{"index":0,"delta":{"content":"Still text"},'
+                b'"finish_reason":"stop"}]}\n\n'
+                b'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":2}}\n\n'
+                b"data: [DONE]\n\n"
+            )
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(frames)))
+            self.end_headers()
+            self.wfile.write(frames)
+            return
+        if not self.path.endswith("/images" if self.openrouter else "/images/generations"):
             self._answer(404, {"error": {"message": "unknown route", "type": "invalid_request"}})
             return
         prompt = str(payload["prompt"])
@@ -88,7 +109,7 @@ class _ImagesUpstream(BaseHTTPRequestHandler):
             return
         count = int(payload.get("n", 1))
         if prompt == "short-count":
-            count -= 1
+            count = 0
         data: list[JsonObject] = [
             {"b64_json": _PIXEL, "revised_prompt": f"{prompt} #{index}"} for index in range(count)
         ]
@@ -105,6 +126,13 @@ class _ImagesUpstream(BaseHTTPRequestHandler):
                 "total_tokens": len(prompt.split()) + 272 * count,
                 "input_tokens_details": {"text_tokens": len(prompt.split()), "image_tokens": 0},
             }
+        if self.openrouter and "usage" in body:
+            body["usage"] = {
+                "prompt_tokens": len(prompt.split()),
+                "completion_tokens": 272 * count,
+                "total_tokens": len(prompt.split()) + 272 * count,
+                "cost": 0.008184,
+            }
         self._answer(200, body)
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib name.
@@ -112,17 +140,22 @@ class _ImagesUpstream(BaseHTTPRequestHandler):
         del format, args
 
 
-@pytest.fixture(scope="module", name="engine")
-def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+@pytest.fixture(scope="module", name="engine", params=["openai-compatible", "openrouter"])
+def _engine(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_ServingEngine]:
     """Serve one shared native engine over a root with chat and image aliases."""
     root = tmp_path_factory.mktemp("native-images-root")
+    _ImagesUpstream.openrouter = request.param == "openrouter"
     with _ImagesUpstream.payloads_lock:
         _ImagesUpstream.payloads.clear()
     upstream = ThreadingHTTPServer((_HOST, 0), _ImagesUpstream)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
     manager, raw_key = _configured_gateway(
-        root, base_url=f"http://{_HOST}:{upstream.server_address[1]}/v1"
+        root,
+        base_url=f"http://{_HOST}:{upstream.server_address[1]}/v1",
+        provider=request.param,
     )
     normalized, snapshot, _changed = upsert_singleton_deployment(
         root,
@@ -136,6 +169,13 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         prices=GatewayTokenPrices(
             input_nano_usd_per_million_tokens=5_000_000,
             output_nano_usd_per_million_tokens=40_000_000,
+            images=GatewayImagePrices(
+                maximum_output_tokens_per_image=128_000,
+                input_nano_usd_per_million_tokens=8_000_000_000,
+                output_nano_usd_per_million_tokens=30_000_000_000,
+            )
+            if _ImagesUpstream.openrouter
+            else None,
         ),
         pricing_source=None,
         replace=False,
@@ -150,7 +190,14 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     )
     manager.add_grant(identity_id="default", alias_id="painter")
     driver = root / "native_images_driver.py"
-    driver.write_text(_DRIVER_SOURCE + "\n")
+    driver_source = _DRIVER_SOURCE
+    if _ImagesUpstream.openrouter:
+        driver_source = (
+            "import exp.runtime.models.registry as model_registry\n"
+            f"model_registry._HTTP_PROVIDERS['openrouter'] = (model_registry.OpenRouterClient, 'http://{_HOST}:{upstream.server_port}/v1')\n"
+            + driver_source
+        )
+    driver.write_text(driver_source + "\n")
     config = json.dumps({"root": str(root), "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS})
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
@@ -232,6 +279,7 @@ def test_official_client_generates_images_and_settles_both_token_legs(
     completed_before = _terminal_attempts(engine.base, "completed")
     input_before = _total(engine.base, "input_tokens")
     output_before = _total(engine.base, "output_tokens")
+    cost_before = _total(engine.base, "known_estimated_cost_nano_usd")
     client = openai.OpenAI(base_url=f"{engine.base}/v1", api_key=engine.raw_key)
     raw = client.images.with_raw_response.generate(
         model="painter", prompt="a calico cat", n=2, size="1024x1024", quality="low"
@@ -239,14 +287,22 @@ def test_official_client_generates_images_and_settles_both_token_legs(
     response = raw.parse()
     assert isinstance(response, ImagesResponse)
     assert raw.headers["x-gateway-alias"] == "painter"
-    assert raw.headers["x-gateway-provider"] == "openai-compatible"
+    assert raw.headers["x-gateway-provider"] == (
+        "openrouter" if _ImagesUpstream.openrouter else "openai-compatible"
+    )
     assert response.data is not None and len(response.data) == 2
     assert response.data[0].b64_json == _PIXEL
+    decoded = base64.b64decode(response.data[0].b64_json, validate=True)
+    assert decoded.startswith(b"\x89PNG\r\n\x1a\n")
+    assert decoded.endswith(b"IEND\xaeB`\x82")
+    assert zlib.decompress(decoded[41:53]) == b"\x00\xff\xff\xff"
     assert response.data[1].revised_prompt == "a calico cat #1"
     assert response.usage is not None
     assert (response.usage.input_tokens, response.usage.output_tokens) == (3, 544)
     with _ImagesUpstream.payloads_lock:
         upstream = _ImagesUpstream.payloads[-1]
+    if _ImagesUpstream.openrouter:
+        assert upstream.pop("provider") == {"allow_fallbacks": False}
     assert upstream == {
         "model": "painter-model-exact",
         "prompt": "a calico cat",
@@ -257,6 +313,8 @@ def test_official_client_generates_images_and_settles_both_token_legs(
     assert _terminal_attempts(engine.base, "completed") == completed_before + 1
     assert _total(engine.base, "input_tokens") == input_before + 3
     assert _total(engine.base, "output_tokens") == output_before + 544
+    expected_cost = 16_344_000 if _ImagesUpstream.openrouter else 21_775
+    assert _total(engine.base, "known_estimated_cost_nano_usd") == cost_before + expected_cost
 
 
 def test_raw_request_defaults_n_and_ignores_idempotency_key(engine: _ServingEngine) -> None:
@@ -273,6 +331,8 @@ def test_raw_request_defaults_n_and_ignores_idempotency_key(engine: _ServingEngi
     assert body["usage"]["output_tokens"] == 272
     with _ImagesUpstream.payloads_lock:
         upstream = _ImagesUpstream.payloads[-1]
+    if _ImagesUpstream.openrouter:
+        assert upstream.pop("provider") == {"allow_fallbacks": False}
     assert upstream == {"model": "painter-model-exact", "prompt": "one cat", "n": 1}
 
 
@@ -316,8 +376,79 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
 ) -> None:
     """No usage, a missing image, or a 5xx never hands the caller an unaccounted image."""
     failed_before = _terminal_attempts(engine.base, "failed")
+    with _ImagesUpstream.payloads_lock:
+        calls_before = len(_ImagesUpstream.payloads)
     response = _post(engine, {"model": "painter", "prompt": prompt, "n": 2})
     assert response.status_code == 502, response.text
     assert response.json()["error"]["code"] == "all_routes_failed"
     assert expected_fragment in response.json()["error"]["message"]
     assert _terminal_attempts(engine.base, "failed") == failed_before + 1
+    with _ImagesUpstream.payloads_lock:
+        assert len(_ImagesUpstream.payloads) == calls_before + 1
+
+
+def test_text_chat_still_uses_chat_wire(engine: _ServingEngine) -> None:
+    """The image adapter must leave ordinary chat dispatch and delivery intact."""
+    client = openai.OpenAI(base_url=f"{engine.base}/v1", api_key=engine.raw_key)
+    response = client.chat.completions.create(
+        model="coding", messages=[{"role": "user", "content": "Say hello"}]
+    )
+    assert response.choices[0].message.content == "Still text"
+
+
+def test_sdk_does_not_retry_a_failed_generation(engine: _ServingEngine) -> None:
+    """Even SDK defaults must not repeat a possibly completed image generation."""
+    with _ImagesUpstream.payloads_lock:
+        before = len(_ImagesUpstream.payloads)
+    client = openai.OpenAI(base_url=f"{engine.base}/v1", api_key=engine.raw_key)
+    with pytest.raises(openai.APIStatusError):
+        client.images.generate(model="painter", prompt="server-error")
+    with _ImagesUpstream.payloads_lock:
+        assert len(_ImagesUpstream.payloads) == before + 1
+
+
+def test_conditional_fallback_cannot_repeat_a_failed_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A matching conditional fallback never authorizes a second image dispatch."""
+
+    class ConditionalUpstream(_ImagesUpstream):
+        """Isolated provider counters for the two-rung image route."""
+
+        openrouter = False
+        payloads: list[JsonObject] = []
+
+    upstream = ThreadingHTTPServer((_HOST, 0), ConditionalUpstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://{_HOST}:{upstream.server_port}/v1"
+    _manager, raw_key = _configured_pool_gateway(
+        tmp_path,
+        base_urls=(url, url),
+        model_capabilities=(
+            ModelCapabilities(supports_image_generation=True),
+            ModelCapabilities(supports_image_generation=True),
+        ),
+        gateway_capabilities=(
+            GatewayDeploymentCapabilities(),
+            GatewayDeploymentCapabilities(failover_only_on=("provider_internal",)),
+        ),
+    )
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-provider-key")
+    gateway = _ServedGateway(tmp_path, _unused_port())
+    try:
+        gateway.start()
+        reply = httpx.post(
+            f"http://{_HOST}:{gateway.port}/v1/images/generations",
+            headers={"authorization": f"Bearer {raw_key}"},
+            json={"model": "coding", "prompt": "server-error"},
+            timeout=10,
+        )
+        assert reply.status_code == 502
+        assert reply.headers["x-should-retry"] == "false"
+        assert len(ConditionalUpstream.payloads) == 1
+    finally:
+        gateway.stop()
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=2)

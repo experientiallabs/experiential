@@ -708,6 +708,8 @@ def test_openrouter_routes_by_prompt_cache_key_as_its_sticky_session_key() -> No
         base_url=OPENROUTER_BASE_URL,
         api_key="fake-key",
     ).gateway_wire_profile()
+    assert profile.url == f"{OPENROUTER_BASE_URL}/chat/completions"
+    assert profile.images_url == f"{OPENROUTER_BASE_URL}/images"
     assert profile.forwards_prompt_cache_key is True
     # The OpenRouter origin is neither a Hunyuan nor a Fireworks carrier route.
     assert profile.hunyuan_reasoning_route_sha256 is None

@@ -53,3 +53,18 @@ def test_reservation_ceiling_prices_prompt_tokens_and_maximum_image_tokens() -> 
     # or read as "unpriced".
     with pytest.raises(NanoUsdOverflowError):
         images_ceiling_nano_usd(request, input_tokens=10**16, input_rate=10**12, output_rate=1)
+
+
+def test_image_card_ceiling_does_not_reuse_the_smaller_gpt_image_one_bound() -> None:
+    """A provider-specific ceiling reserves every requested image at its own rate."""
+    request = ImagesRequest(prompt="a cat", n=2)
+    assert (
+        images_ceiling_nano_usd(
+            request,
+            input_tokens=3,
+            input_rate=8_000_000_000,
+            output_rate=30_000_000_000,
+            output_tokens_per_image=128_000,
+        )
+        == 7_680_024_000
+    )

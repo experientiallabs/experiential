@@ -32,7 +32,13 @@ It serves:
   out, never streamed; served only by aliases whose catalog capabilities declare
   `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported
   prompt and image tokens, so a model that answers without token usage is refused as
-  unbillable rather than served for free)
+  unbillable rather than served for free). OpenRouter uses its dedicated `/api/v1/images`
+  adapter, maps `prompt_tokens` and `completion_tokens` into public image usage, and requires
+  a separate `gateway.prices.images` card. Text-chat pricing and dispatch stay unchanged.
+  Images requests never automatically retry after dispatch, including on transport failures;
+  errors carry `x-should-retry: false` for SDKs. There is no keyed image replay. Provider
+  sandbox artifacts such as `sandbox:/mnt/data/0.png` are not image payloads or downloadable
+  gateway files; `/v1/files` remains a batch-file surface.
 - `POST /v1/systemone` (TypeSafe native decisions: typed `noul`, `choice`, and `score`
   questions, buffered answers, provider-reported usage, and explicit decision capability and
   pricing admission; no chat, streaming, continuation, or idempotency replay)
