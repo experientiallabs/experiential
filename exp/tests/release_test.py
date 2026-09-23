@@ -2619,7 +2619,7 @@ def _installed_release_driver() -> None:
             "world model  core-model (core-model)",
             "embedder     core-model (core-model)",
             "embedding    at most $0.000000",
-            "ceiling      $5.000000",
+            "budget       $5.000000",
         ):
             assert expected in plain_build_output, build_output
         assert "Proceed?" not in plain_build_output
