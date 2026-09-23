@@ -162,16 +162,14 @@ def embed_rag_texts(
         raise ValueError("RAG embedding cache differs from the model or chunking identity")
     missing = tuple(text for text in plan.texts if text not in active.vectors)
     completed = len(plan.texts) - len(missing)
-    report(progress, "embeddings", completed=completed, total=len(plan.texts), detail="text chunks")
+    report(progress, "embeddings", completed=completed, total=len(plan.texts))
     for batch in embedding_batches(missing):
         vectors = _embed_batch(binding, batch)
         if active.vectors and len(next(iter(active.vectors.values()))) != len(vectors[0]):
             raise ValueError("RAG embedder returned vectors with inconsistent dimensions")
         active.vectors.update(zip(batch, vectors, strict=True))
         completed += len(batch)
-        report(
-            progress, "embeddings", completed=completed, total=len(plan.texts), detail="text chunks"
-        )
+        report(progress, "embeddings", completed=completed, total=len(plan.texts))
     for components in plan.keys:
         for component in components:
             if component not in active.components:

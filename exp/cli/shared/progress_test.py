@@ -10,6 +10,13 @@ from rich.text import Text
 
 from exp.cli.shared.progress import ProgressDisplay, progress_display, qualified
 from exp.common.progress import ProgressEvent
+from exp.simulation.retrieval.contracts import RAGAction
+from exp.simulation.retrieval.embedding import (
+    RAGEmbeddingCache,
+    default_rag_embedder,
+    embed_rag_texts,
+)
+from exp.simulation.retrieval.transitions import render_rag_key
 
 
 def _plain_console(*, interactive: bool) -> tuple[Console, io.StringIO]:
@@ -35,6 +42,24 @@ def test_noninteractive_output_is_stable_lines_without_cursor_control() -> None:
     output = buffer.getvalue()
     assert output == ("  . normalization\n  . embeddings (serving index) 2/5\n")
     assert "\x1b[" not in output
+
+
+def test_embedding_batches_retain_the_serving_and_fit_index_labels() -> None:
+    """Chunk progress must preserve the index qualifier, including a fully reused fit index."""
+    console, buffer = _plain_console(interactive=False)
+    binding = default_rag_embedder()
+    cache = RAGEmbeddingCache(binding, maximum_chunk_bytes=2_048)
+    keys = (
+        render_rag_key(
+            task="task", initial_context={}, action=RAGAction(kind="message", content="action")
+        ),
+    )
+    with progress_display(console) as observe:
+        embed_rag_texts(binding, keys, cache=cache, progress=qualified(observe, "serving index"))
+        embed_rag_texts(binding, keys, cache=cache, progress=qualified(observe, "fit-only index"))
+    output = buffer.getvalue()
+    assert "embeddings (serving index) 2/2" in output
+    assert "embeddings (fit-only index) 2/2" in output
 
 
 def test_interactive_display_prints_each_finished_stage_once() -> None:

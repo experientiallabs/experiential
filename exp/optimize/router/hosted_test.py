@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -1205,10 +1206,12 @@ def test_bundle_restore_rejects_grounded_build_from_another_model_setup(
         )
 
 
-def test_bundle_restore_rejects_rag_with_an_alternate_task_partition(
+@pytest.mark.parametrize("mismatch", ["partition", "chunk_bound"])
+def test_bundle_restore_rejects_rag_with_inconsistent_retrieval_identity(
     tmp_path: Path,
+    mismatch: str,
 ) -> None:
-    """Canonical same-source RAGs cannot replace the selected task-set lineage split."""
+    """Canonical same-source RAGs cannot replace the selected lineage or chunk identity."""
     prepared, catalog = _restored_prepared_project(tmp_path)
     state = _ProviderState()
     runtime = _RuntimeCatalog(catalog, state)
@@ -1249,6 +1252,8 @@ def test_bundle_restore_rejects_rag_with_an_alternate_task_partition(
         )
         for item in bindings
     )
+    if mismatch == "chunk_bound":
+        alternate_bindings = bindings
     resolved_embedder = runtime.resolve("embedder")
     assert resolved_embedder.embedding_client is not None
     embedder = RAGEmbedderBinding(
@@ -1273,7 +1278,9 @@ def test_bundle_restore_rejects_rag_with_an_alternate_task_partition(
         alternate_bindings,
         created_at=_TIME + timedelta(hours=10),
         code_revision=_REVISION,
-        embedder=embedder,
+        embedder=replace(embedder, maximum_input_tokens=64)
+        if mismatch == "chunk_bound"
+        else embedder,
         default_top_k=2,
         included_partitions=frozenset({"fit"}),
     )
