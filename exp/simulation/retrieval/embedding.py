@@ -165,8 +165,7 @@ def embed_rag_texts(
     report(progress, "embeddings", completed=completed, total=len(plan.texts), detail="text chunks")
     for batch in embedding_batches(missing):
         vectors = _embed_batch(binding, batch)
-        dimensions = {len(vector) for vector in (*active.vectors.values(), *vectors)}
-        if len(dimensions) > 1:
+        if active.vectors and len(next(iter(active.vectors.values()))) != len(vectors[0]):
             raise ValueError("RAG embedder returned vectors with inconsistent dimensions")
         active.vectors.update(zip(batch, vectors, strict=True))
         completed += len(batch)

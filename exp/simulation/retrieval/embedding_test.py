@@ -95,3 +95,29 @@ def test_frozen_chunks_cannot_exceed_a_newly_configured_context() -> None:
     binding = replace(default_rag_embedder(), maximum_input_tokens=512)
     with pytest.raises(ValueError, match="context window"):
         embed_rag_texts(binding, (_key(0),), maximum_chunk_bytes=2_048)
+
+
+def test_provider_dimension_drift_between_batches_is_rejected_before_cache_write() -> None:
+    """A model that changes vector shape mid-build cannot contaminate reusable earlier vectors."""
+
+    class DriftingEmbedder:
+        """Return a different valid unit-vector width on the second request."""
+
+        def __init__(self) -> None:
+            """Start before the first bounded request."""
+            self.calls = 0
+
+        def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+            """Produce valid per-batch vectors with intentionally inconsistent widths."""
+            self.calls += 1
+            values = (1.0, 0.0) if self.calls == 1 else (1.0, 0.0, 0.0)
+            return tuple(Embedding(values=values) for _ in texts)
+
+    client = DriftingEmbedder()
+    binding = replace(default_rag_embedder(), client=client)
+    cache = RAGEmbeddingCache(binding, maximum_chunk_bytes=2_048)
+    with pytest.raises(ValueError, match="inconsistent dimensions"):
+        embed_rag_texts(binding, tuple(_key(index) for index in range(150)), cache=cache)
+    assert client.calls == 2
+    assert len(cache.vectors) == 100
+    assert all(len(vector) == 2 for vector in cache.vectors.values())

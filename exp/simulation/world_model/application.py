@@ -428,6 +428,7 @@ def load_world_model(
                 snapshot=resolved_embedder.snapshot,
                 maximum_attempts=RetryPolicy().maximum_attempts,
                 input_usd_per_million_tokens=(0.0 if embedding_price is None else embedding_price),
+                maximum_input_tokens=resolved_embedder.capabilities.context_window_tokens,
             ),
         )
         _require_project_binding(runtime, config.build.world_model, config.build.serving_rag)

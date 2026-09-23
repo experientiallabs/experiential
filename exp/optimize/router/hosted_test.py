@@ -15,7 +15,7 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
     sorted_unique_inputs,
 )
-from exp.common.core.money import USD_ZERO
+from exp.common.core.money import USD_ZERO, reserve_usd
 from exp.common.evaluations import EvaluationDatasetManifest, fidelity
 from exp.common.judging import JudgeCalibration
 from exp.common.models import (
@@ -38,6 +38,7 @@ from exp.common.project import (
     ProjectRouterPolicyArtifacts,
     ProjectRouterReportArtifacts,
     ProjectStage,
+    ProjectStageEvent,
     ProjectStageEventKind,
     ProjectStore,
     ProjectSystemConfiguration,
@@ -90,6 +91,7 @@ from exp.optimize.router.spend import (
     persist_provider_spend_ledger,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import build_project
 from exp.simulation.mining.service import MiningSpec
 from exp.simulation.retrieval import (
@@ -729,6 +731,72 @@ def test_hosted_preflight_reserves_full_simulation_before_build_dispatch(tmp_pat
     assert state.completion_calls == []
     assert prepared.load_project() == before_config
     assert prepared.artifacts.list_ids() == before_artifacts
+
+
+def test_hosted_build_uses_one_bounded_embedding_plan_for_cost_and_both_indexes(
+    tmp_path: Path,
+) -> None:
+    """Hosted preflight and dispatch share the smaller context bound and deduplicated inputs."""
+    catalog = _catalog()
+    record = catalog.models["embedder"]
+    assert record.capabilities is not None
+    capabilities = record.capabilities.model_copy(update={"context_window_tokens": 64})
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "embedder": record.model_copy(update={"capabilities": capabilities}),
+            }
+        }
+    )
+    prepared, catalog = _restored_prepared_project(tmp_path, model_catalog=catalog)
+    quote = preflight_hosted(prepared, _setup(), catalog, _options())
+    setup = _setup().model_copy(
+        update={
+            "budgets": _setup().budgets.model_copy(
+                update={"maximum_build_cost_usd": quote.build_cost_usd}
+            )
+        }
+    )
+    state = _ProviderState()
+    build_calls: list[tuple[str, ...]] = []
+
+    def capture_build(event: ProjectStageEvent) -> None:
+        """Capture only provider inputs dispatched before the durable build completion."""
+        if (
+            event.stage == ProjectStage.BUILDING_WORLD_MODEL
+            and event.kind == ProjectStageEventKind.COMPLETED
+        ):
+            build_calls.extend(state.embedding_calls)
+
+    attempt_store = FileHostedAttemptAuthorityStore(tmp_path / "bounded-build-authority")
+    authority = attempt_store.create()
+    run_hosted_router_workflow(
+        prepared,
+        setup,
+        catalog,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        attempt_store,
+        bundle_directory=tmp_path / "bounded-build-bundles",
+        attempt_id=authority.attempt_id,
+        created_at=_TIME + timedelta(hours=4),
+        code_revision=_REVISION,
+        options=_options(),
+        event_sink=capture_build,
+    )
+
+    inputs = tuple(text for batch in build_calls for text in batch)
+    assert inputs
+    assert len(inputs) == len(set(inputs))
+    assert all(len(text.encode("utf-8")) <= 64 for text in inputs)
+    price = capabilities.input_cost_per_million_tokens_usd
+    assert price is not None
+    assert quote.build_cost_usd == reserve_usd(
+        sum(len(text.encode("utf-8")) for text in inputs)
+        * RetryPolicy().maximum_attempts
+        * price
+        / 1_000_000
+    )
 
 
 def test_hosted_automatic_ceiling_never_widens_a_large_one_microunit_boundary() -> None:

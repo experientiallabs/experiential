@@ -69,7 +69,7 @@ class TraceRAGRetriever:
 
     @property
     def maximum_attempts(self) -> int:
-        """Return the maximum provider attempts made by one query embedding."""
+        """Return the maximum provider attempts made by each query-embedding batch."""
         return self._embedder.maximum_attempts
 
     @property
