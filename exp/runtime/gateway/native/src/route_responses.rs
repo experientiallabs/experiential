@@ -19,6 +19,7 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
     Admission,
 };
+use crate::capture::reasoning::{checkpoint_winner, observe_winner};
 use crate::encode::{compact_json, reasoning_carrier_candidate};
 use crate::encode_responses::ResponsesSseEncoder;
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -232,7 +233,15 @@ pub(crate) async fn responses(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
-    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &guard, &mut won);
+    won = checkpoint_winner(
+        state.capture.as_ref(),
+        &admission,
+        &mut guard,
+        won,
+        deadline,
+    )
+    .await;
+    observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)

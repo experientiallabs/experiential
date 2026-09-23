@@ -19,6 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::admission::{
     acquire_permit, apply_output_guardrail, new_guard, served_headers, Admission,
 };
+use crate::capture::reasoning::{checkpoint_winner, observe_winner};
 use crate::encode::compact_json;
 use crate::encode_messages::{anthropic_error_body, AggregatedMessage, MessagesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -228,7 +229,15 @@ pub(crate) async fn messages(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
-    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &guard, &mut won);
+    won = checkpoint_winner(
+        state.capture.as_ref(),
+        &admission,
+        &mut guard,
+        won,
+        deadline,
+    )
+    .await;
+    observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let capture = state.capture.clone();
     let capture_request_id = admission.request_id.clone();

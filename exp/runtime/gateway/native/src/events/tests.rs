@@ -571,14 +571,30 @@ fn pretty_printed_arguments_with_a_trailing_newline_complete() {
         &mut tool,
         &["{\n  \"a\": [1, 2],\n", "  \"b\": {}\n}", "\n"],
     );
-    assert_eq!(shown.concat(), "{\n  \"a\": [1, 2],\n  \"b\": {}\n}");
-    assert_eq!(tool.withheld_tail, "\n");
+    assert_eq!(shown.concat(), "{\n  \"a\": [1, 2],\n  \"b\": {}\n}\n");
+    assert!(tool.withheld_tail.is_empty());
     assert_eq!(
         redundant_tail("{}", " \n\t"),
         Some(RedundantTail::Whitespace)
     );
     tool.complete()
         .expect("whitespace after the object is not content");
+}
+
+#[test]
+fn valid_argument_whitespace_survives_every_fragment_boundary() {
+    let original = " { \"n\": 1e2, \"path\": \"雪\" } \r\n\t";
+    for split in (0..=original.len()).filter(|index| original.is_char_boundary(*index)) {
+        let mut tool = ToolAccumulator::new("call".into(), "inspect".into());
+        let shown = push_all(&mut tool, &[&original[..split], &original[split..]]);
+        assert_eq!(shown.concat(), original);
+        assert_eq!(tool.complete().unwrap().raw_arguments, original);
+        assert!(tool.withheld_tail.is_empty());
+    }
+    let mut tool = ToolAccumulator::new("call".into(), "inspect".into());
+    assert_eq!(push_all(&mut tool, &["{} ", "{}", " \n"]).concat(), "{} ");
+    assert_eq!(tool.withheld_tail, "{} \n");
+    assert_eq!(tool.complete().unwrap().raw_arguments, "{} ");
 }
 
 #[test]

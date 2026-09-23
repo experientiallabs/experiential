@@ -29,7 +29,7 @@ impl Configuration {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         self.delivery.validate()?;
         if !(1..=4096).contains(&self.maximum_pending_records)
-            || !(1..=1024 * 1024).contains(&self.maximum_request_bytes)
+            || !(1..=4 * 1024 * 1024).contains(&self.maximum_request_bytes)
             || !(1..=4 * 1024 * 1024).contains(&self.maximum_response_bytes)
             || self.maximum_pending_bytes < self.maximum_request_bytes
             || self.maximum_pending_bytes < self.maximum_response_bytes
@@ -46,28 +46,30 @@ impl Configuration {
 struct Admission {
     count: Arc<AtomicUsize>,
     handoff_bytes: Arc<AtomicUsize>,
-    retained_bytes: usize,
+    retained_bytes: AtomicUsize,
 }
 
 impl Admission {
     /// Transfer the map's charge before releasing its lock, without a capacity gap.
-    fn handoff(&mut self, bytes: usize) {
-        debug_assert_eq!(self.retained_bytes, 0);
-        self.handoff_bytes.fetch_add(bytes, Ordering::AcqRel);
-        self.retained_bytes = bytes;
+    fn handoff(&self, bytes: usize) {
+        let previous = self.retained_bytes.fetch_max(bytes, Ordering::AcqRel);
+        self.handoff_bytes
+            .fetch_add(bytes.saturating_sub(previous), Ordering::AcqRel);
     }
 }
 
 impl Drop for Admission {
     fn drop(&mut self) {
-        self.handoff_bytes
-            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        self.handoff_bytes.fetch_sub(
+            self.retained_bytes.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
         self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 struct Entry {
-    _admission: Admission,
+    _admission: Arc<Admission>,
     record: Record,
     observation: Option<crate::settlement::Observation>,
     winning_model: Option<String>,
@@ -79,8 +81,40 @@ struct Entry {
     bytes: usize,
     attached: bool,
     output_finished: bool,
+    checkpointing: bool,
+    checkpoint_started: bool,
+    unexposed: bool,
     response_allowed: bool,
     response_discarded: Arc<AtomicBool>,
+}
+
+impl Entry {
+    /// The map owns only bytes not already pinned by this request's shared admission.
+    fn map_bytes(&self) -> usize {
+        self.bytes
+            .saturating_sub(self._admission.retained_bytes.load(Ordering::Acquire))
+    }
+}
+
+/// Accepted checkpoint ownership survives its request waiter and terminal map removal.
+pub(super) struct CheckpointLease {
+    admission: Arc<Admission>,
+    pending: Arc<Mutex<Pending>>,
+    request_id: String,
+    ttl: Duration,
+}
+
+impl Drop for CheckpointLease {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(&self.request_id) {
+                if Arc::ptr_eq(&entry._admission, &self.admission) {
+                    entry.checkpointing = false;
+                    entry.expires = Instant::now() + self.ttl;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -131,6 +165,11 @@ impl<S: Sink> Sink for MaintainedSink<S> {
         self.sink.take_maintenance_failures()
     }
 
+    #[cfg(test)]
+    fn before_receive(&mut self) {
+        self.sink.before_receive();
+    }
+
     fn maintain(&mut self) -> Result<(), ()> {
         if let Ok(mut pending) = self.pending.lock() {
             expire_pending(&mut pending, &self.skipped);
@@ -142,8 +181,8 @@ impl<S: Sink> Sink for MaintainedSink<S> {
 fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
     let now = Instant::now();
     pending.entries.retain(|_, entry| {
-        if entry.expires <= now {
-            pending.bytes -= entry.bytes;
+        if entry.expires <= now && !entry.checkpointing {
+            pending.bytes -= entry.map_bytes();
             skipped.fetch_add(1, Ordering::Relaxed);
             false
         } else {
@@ -228,11 +267,11 @@ impl Collector {
         pending.entries.insert(
             record.request.request_id.clone(),
             Entry {
-                _admission: Admission {
+                _admission: Arc::new(Admission {
                     count: self.admissions.clone(),
                     handoff_bytes: self.handoff_bytes.clone(),
-                    retained_bytes: 0,
-                },
+                    retained_bytes: AtomicUsize::new(0),
+                }),
                 record,
                 observation: None,
                 winning_model: None,
@@ -244,6 +283,9 @@ impl Collector {
                 bytes,
                 attached: false,
                 output_finished: false,
+                checkpointing: false,
+                checkpoint_started: false,
+                unexposed: false,
                 response_allowed: !self.config.settlement_required,
                 response_discarded: Arc::new(AtomicBool::new(false)),
             },
@@ -261,7 +303,7 @@ impl Collector {
             let Some(mut entry) = pending.entries.remove(request_id) else {
                 return;
             };
-            pending.bytes -= entry.bytes;
+            pending.bytes -= entry.map_bytes();
             if entry.record.request.model_id.is_none() && !entry.attached {
                 // Replace the original JSON null, including escapes in the selected id.
                 entry.request_bytes = entry.request_bytes - 4 + string_bytes(model_id);
@@ -269,14 +311,17 @@ impl Collector {
                 entry.bytes += model.capacity();
                 entry.record.request.model_id = Some(model);
             }
-            if self.retained_bytes(&pending).saturating_add(entry.bytes)
-                > self.config.maximum_pending_bytes
+            if self.retained_bytes(&pending).saturating_add(
+                entry
+                    .bytes
+                    .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+            ) > self.config.maximum_pending_bytes
                 || entry.request_bytes > self.config.maximum_request_bytes
             {
                 self.skip();
                 return;
             }
-            pending.bytes += entry.bytes;
+            pending.bytes += entry.map_bytes();
             pending.entries.insert(request_id.to_owned(), entry);
         }
     }
@@ -318,25 +363,99 @@ impl Collector {
             let Some(mut entry) = pending.entries.remove(request_id) else {
                 return;
             };
-            pending.bytes -= entry.bytes;
+            pending.bytes -= entry.map_bytes();
             if entry.winning_model.is_none() && !entry.attached {
                 let model = model_id.to_owned();
                 entry.bytes += model.capacity();
                 entry.winning_model = Some(model);
             }
-            if self.retained_bytes(&pending).saturating_add(entry.bytes)
-                > self.config.maximum_pending_bytes
+            if self.retained_bytes(&pending).saturating_add(
+                entry
+                    .bytes
+                    .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+            ) > self.config.maximum_pending_bytes
             {
                 self.skip();
                 return;
             }
-            pending.bytes += entry.bytes;
+            pending.bytes += entry.map_bytes();
             pending.entries.insert(request_id.to_owned(), entry);
         }
     }
 
-    /// Hosted terminal eligibility precedes durable content, so a dropped BYOK
-    /// discard can never leave a previously queued prompt behind.
+    /// Checkpoint a hosted prompt after the winning host-funded lane is frozen.
+    /// The destination must recheck consent and merge this idempotent update
+    /// without replacing a later response. Keep the shared request tree live
+    /// until terminal settlement; no provider response belongs in this write.
+    #[cfg(test)]
+    pub(crate) fn checkpoint(&self, request_id: &str) -> bool {
+        self.checkpoint_receipt(request_id).is_ok_and(|receipt| {
+            receipt.is_none_or(|receipt| receipt.blocking_recv().unwrap_or(false))
+        })
+    }
+
+    pub(crate) fn checkpoint_receipt(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<bool>>, ()> {
+        if !self.config.settlement_required {
+            return Ok(None);
+        }
+        let mut pending = self.pending.lock().map_err(|_| ())?;
+        let Some(entry) = pending.entries.get_mut(request_id) else {
+            return Ok(None);
+        };
+        if entry.checkpoint_started {
+            return Err(());
+        }
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            request: entry.record.request.clone(),
+            response: None,
+            provider_reasoning: None,
+            provider_reasoning_source_json: None,
+            provider_tool_calls_json: None,
+            deployment_id: None,
+            canonical_model_id: None,
+            metrics: None,
+            gemini_thought_parts: Vec::new(),
+            gemini_thought_parts_truncated: None,
+            gemini_thought_parts_source_json: None,
+            captured_at: entry.record.captured_at,
+        };
+        // The context Arc is shared; charge the copied identifiers and receipt/queue nodes.
+        let extra = record.request.request_id.capacity() * 2
+            + record.request.scope.organization_id.capacity()
+            + record.request.scope.identity_id.capacity()
+            + record.request.scope.application_id.capacity()
+            + record.request.model_id.as_ref().map_or(0, String::capacity)
+            + 2 * std::mem::size_of::<Record>()
+            + 2 * std::mem::size_of::<CheckpointLease>()
+            + 1024;
+        let map_bytes = entry.map_bytes();
+        let shared = entry._admission.clone();
+        let bytes = entry.bytes.saturating_add(extra);
+        if self.retained_bytes(&pending).saturating_add(extra) > self.config.maximum_pending_bytes {
+            return Err(());
+        }
+        let entry = pending.entries.get_mut(request_id).ok_or(())?;
+        entry.bytes = bytes;
+        shared.handoff(bytes);
+        entry.checkpointing = true;
+        entry.checkpoint_started = true;
+        let lease = CheckpointLease {
+            admission: entry._admission.clone(),
+            pending: self.pending.clone(),
+            request_id: request_id.to_owned(),
+            ttl: Duration::from_secs(self.config.ttl_seconds),
+        };
+        pending.bytes -= map_bytes;
+        drop(pending);
+        self.delivery.checkpoint(record, None, lease).map(Some)
+    }
+
+    /// Terminal policy controls response retention; the winning lane was frozen
+    /// before any hosted prompt checkpoint. The sink rechecks live consent.
     pub(crate) fn settle(&self, request_id: &str, keep_prompt: bool, keep_response: bool) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
@@ -345,7 +464,7 @@ impl Collector {
         let Some(mut entry) = pending.entries.remove(request_id) else {
             return;
         };
-        pending.bytes -= entry.bytes;
+        pending.bytes -= entry.map_bytes();
         if !keep_prompt {
             entry.response_discarded.store(true, Ordering::Release);
             return;
@@ -353,6 +472,7 @@ impl Collector {
         if !keep_response {
             entry.response_discarded.store(true, Ordering::Release);
             entry.record.response = None;
+            entry.wire = None;
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
             entry.record.metrics = None;
@@ -360,23 +480,23 @@ impl Collector {
             entry.record.gemini_thought_parts_truncated = None;
             entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, None);
+            self.emit_entry(entry);
             return;
         }
         entry.response_allowed = true;
         if !entry.output_finished {
-            // Emit once at response completion. A preliminary prompt write could
-            // otherwise overtake the response after releasing the pending lock.
-            pending.bytes += entry.bytes;
+            // The terminal update supplies output to the earlier prompt checkpoint.
+            pending.bytes += entry.map_bytes();
             pending.entries.insert(request_id.to_owned(), entry);
         } else {
             entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, entry.wire);
+            self.emit_entry(entry);
         }
     }
 
     /// Output may arrive before or after settlement; unpermitted output stays bounded.
+    #[cfg(test)]
     pub(crate) fn finish(
         &self,
         request_id: &str,
@@ -384,6 +504,16 @@ impl Collector {
         deployment_id: Option<String>,
     ) -> bool {
         self.finish_output(request_id, response, None, deployment_id)
+    }
+
+    /// A request ending before public output has no response tap to finish its capture entry.
+    pub(crate) fn finish_unexposed(&self, request_id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(request_id) {
+                entry.unexposed = true;
+            }
+        }
+        self.finish_output(request_id, None, None, None);
     }
 
     /// Transfer bounded wire bytes; only the destination worker builds JSON trees.
@@ -414,7 +544,7 @@ impl Collector {
         let Some(mut entry) = pending.entries.remove(request_id) else {
             return false;
         };
-        pending.bytes -= entry.bytes;
+        pending.bytes -= entry.map_bytes();
         if response_bytes > self.config.maximum_response_bytes {
             return self.skip();
         }
@@ -441,15 +571,35 @@ impl Collector {
         if entry.response_allowed {
             entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, entry.wire)
-        } else if self.retained_bytes(&pending).saturating_add(entry.bytes)
-            <= self.config.maximum_pending_bytes
+            self.emit_entry(entry)
+        } else if self.retained_bytes(&pending).saturating_add(
+            entry
+                .bytes
+                .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+        ) <= self.config.maximum_pending_bytes
         {
-            pending.bytes += entry.bytes;
+            pending.bytes += entry.map_bytes();
             pending.entries.insert(request_id.to_owned(), entry);
             true
         } else {
             self.skip()
+        }
+    }
+
+    /// A terminal racing an unacknowledged checkpoint stays worker-owned, never pins cancellation.
+    fn emit_entry(&self, entry: Entry) -> bool {
+        if entry.checkpointing || (entry.checkpoint_started && entry.unexposed) {
+            let lease = CheckpointLease {
+                admission: entry._admission,
+                pending: self.pending.clone(),
+                request_id: entry.record.request.request_id.clone(),
+                ttl: Duration::from_secs(self.config.ttl_seconds),
+            };
+            self.delivery
+                .checkpoint(entry.record, entry.wire, lease)
+                .is_ok()
+        } else {
+            self.emit(entry.record, entry.wire)
         }
     }
 
@@ -488,7 +638,7 @@ impl Collector {
         let Some(mut entry) = pending.entries.remove(request_id) else {
             return;
         };
-        pending.bytes -= entry.bytes;
+        pending.bytes -= entry.map_bytes();
         let text = entry
             .record
             .provider_reasoning
@@ -498,7 +648,11 @@ impl Collector {
         if required > self.config.maximum_response_bytes
             || self
                 .retained_bytes(&pending)
-                .saturating_add(entry.bytes)
+                .saturating_add(
+                    entry
+                        .bytes
+                        .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+                )
                 .saturating_add(delta.len())
                 > self.config.maximum_pending_bytes
             || text.try_reserve_exact(delta.len()).is_err()
@@ -507,14 +661,17 @@ impl Collector {
             return;
         }
         entry.bytes += text.capacity() - previous;
-        if self.retained_bytes(&pending).saturating_add(entry.bytes)
-            > self.config.maximum_pending_bytes
+        if self.retained_bytes(&pending).saturating_add(
+            entry
+                .bytes
+                .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+        ) > self.config.maximum_pending_bytes
         {
             self.skip();
             return;
         }
         text.push_str(delta);
-        pending.bytes += entry.bytes;
+        pending.bytes += entry.map_bytes();
         pending.entries.insert(request_id.to_owned(), entry);
     }
 
@@ -530,10 +687,12 @@ impl Collector {
         if entry.response_discarded.load(Ordering::Acquire) {
             return None;
         }
-        let released = Self::clear_gemini(entry);
+        let previous = entry.map_bytes();
+        Self::clear_gemini(entry);
         entry.gemini_generation = entry.gemini_generation.wrapping_add(1);
         let generation = entry.gemini_generation;
         entry.record.gemini_thought_parts_truncated = gemini.then_some(false);
+        let released = previous.saturating_sub(entry.map_bytes());
         pending.bytes -= released;
         gemini.then(|| {
             super::reasoning::GeminiObserver::new(self.clone(), request_id.to_owned(), generation)
@@ -563,11 +722,11 @@ impl Collector {
         let Some(mut entry) = pending.entries.remove(request_id) else {
             return;
         };
-        pending.bytes -= entry.bytes;
+        pending.bytes -= entry.map_bytes();
         if generation != entry.gemini_generation
             || entry.record.gemini_thought_parts_truncated == Some(true)
         {
-            pending.bytes += entry.bytes;
+            pending.bytes += entry.map_bytes();
             pending.entries.insert(request_id.to_owned(), entry);
             return;
         }
@@ -579,7 +738,11 @@ impl Collector {
             || entry.record.gemini_thought_parts.len() >= 4096
             || self
                 .retained_bytes(&pending)
-                .saturating_add(entry.bytes)
+                .saturating_add(
+                    entry
+                        .bytes
+                        .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+                )
                 .saturating_add(heap + 64)
                 > self.config.maximum_pending_bytes
             || entry
@@ -601,14 +764,17 @@ impl Collector {
                     * std::mem::size_of::<Arc<serde_json::Value>>()
                 - previous;
             entry.record.gemini_thought_parts_truncated = Some(false);
-            if self.retained_bytes(&pending).saturating_add(entry.bytes)
-                > self.config.maximum_pending_bytes
+            if self.retained_bytes(&pending).saturating_add(
+                entry
+                    .bytes
+                    .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+            ) > self.config.maximum_pending_bytes
             {
                 Self::clear_gemini(&mut entry);
                 entry.record.gemini_thought_parts_truncated = Some(true);
             }
         }
-        pending.bytes += entry.bytes;
+        pending.bytes += entry.map_bytes();
         pending.entries.insert(request_id.to_owned(), entry);
     }
 
@@ -640,7 +806,7 @@ impl Collector {
         let Some(mut entry) = pending.entries.remove(request_id) else {
             return;
         };
-        pending.bytes -= entry.bytes;
+        pending.bytes -= entry.map_bytes();
         let text = entry
             .record
             .provider_tool_calls_json
@@ -650,7 +816,11 @@ impl Collector {
         if text.len().saturating_add(extra) > self.config.maximum_response_bytes
             || self
                 .retained_bytes(&pending)
-                .saturating_add(entry.bytes)
+                .saturating_add(
+                    entry
+                        .bytes
+                        .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+                )
                 .saturating_add(extra + 2)
                 > self.config.maximum_pending_bytes
             || text.try_reserve_exact(extra).is_err()
@@ -660,8 +830,11 @@ impl Collector {
         }
         // Charge the initial [] as well as actual allocator growth.
         entry.bytes += text.capacity() - previous + if text == "[]" { previous } else { 0 };
-        if self.retained_bytes(&pending).saturating_add(entry.bytes)
-            > self.config.maximum_pending_bytes
+        if self.retained_bytes(&pending).saturating_add(
+            entry
+                .bytes
+                .saturating_sub(entry._admission.retained_bytes.load(Ordering::Acquire)),
+        ) > self.config.maximum_pending_bytes
         {
             self.skip();
             return;
@@ -672,7 +845,7 @@ impl Collector {
         }
         text.push_str(&encoded);
         text.push(']');
-        pending.bytes += entry.bytes;
+        pending.bytes += entry.map_bytes();
         pending.entries.insert(request_id.to_owned(), entry);
     }
 

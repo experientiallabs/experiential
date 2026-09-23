@@ -47,12 +47,28 @@ retains its selected root identity. Record-level `canonical_model_id` names the
 actual semantic winner, separately from the root and alongside `deployment_id`.
 Both destination fields share the same output/permission retention boundary and
 remain absent before that boundary. An accepted request that fails before routing
-has no selected root model; a legacy record never gains an inferred winner. A successful exchange emits one complete
-record after both output completion and permission. A prompt-only permission emits
-only the prompt. This avoids a delayed prompt update overwriting a full response.
-A hosted collector
-does not enqueue content until terminal eligibility permits it, so queue overload
-cannot lose a BYOK deletion behind an already queued prompt.
+has no selected root model; a legacy record never gains an inferred winner.
+
+A hosted, host-funded winner checkpoints its prompt before committed output becomes
+client-visible. This preliminary schema2 record has no response, actual winner,
+deployment, metrics or Gemini truncation assertion. The terminal update supplies
+permitted response evidence and provenance later. BYOK winners do not checkpoint;
+local collectors retain their completed-exchange flow. Destinations must recheck live
+consent and merge updates idempotently, never allowing a late prompt-only update to
+erase a stored response. Terminal denial alone cannot retract an earlier durable
+checkpoint; the destination owns that live privacy enforcement. This is a required
+hosted consumer behavior, not an append-only one-record-per-request contract.
+
+An accepted checkpoint and any terminal update racing it retain the same request's
+admission count and byte charge through their acknowledgements. Waiting updates use
+the existing destination worker, with no thread or blocking task per request. The
+request awaits a cancellable receipt bounded by its original deadline; cancellation
+closes the provider transport and settles the attempt without waiting for storage.
+The accepted capture jobs remain bounded and retryable after the caller leaves.
+A close timeout reports unfinished capture rather than purging accepted content.
+No-capture requests and local SQLite collection do not enter this checkpoint path.
+The native request envelope defaults to 4 MiB; `CaptureController` no longer accepts
+a separate `maximum_request_bytes` argument. Configure that bound on the collector.
 
 Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
 JSON bodies and ordered SSE data payloads retain unknown fields. The observation

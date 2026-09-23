@@ -6,7 +6,11 @@ from unittest.mock import patch
 import pytest
 
 from exp.runtime.anthropic_protocol.requests import decode_messages
-from exp.runtime.gateway.capture_context import capture_request_context, restore_capture_context
+from exp.runtime.gateway.capture_context import (
+    capture_context_document,
+    capture_request_context,
+    restore_capture_context,
+)
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.replay_identity import canonical_request_sha256, provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_chat
@@ -116,6 +120,17 @@ def test_storable_context_is_encoded_once_without_a_normalization_copy() -> None
         assert capture_request_context(request) is not None
     assert dumps.call_count == 1
     normalize.assert_not_called()
+
+
+def test_native_context_projection_never_serializes_ordinary_input() -> None:
+    """The native envelope owns sizing; no intermediate JSON copy precedes it."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "x" * 1_100_000 + "雪"}]}
+    ).request
+    with patch("exp.runtime.gateway.capture_context.json.dumps") as dumps:
+        context = capture_context_document(request)
+    dumps.assert_not_called()
+    assert context["request"] == request.model_dump(mode="json", exclude_none=True)
 
 
 def test_valid_surrogate_pair_and_literal_escape_do_not_need_a_second_encoding() -> None:

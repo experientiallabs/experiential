@@ -197,10 +197,6 @@ pub(crate) fn capture_response(
     let Some(discarded) = collector.attach(request_id) else {
         return response;
     };
-    if !response.status().is_success() {
-        collector.finish(request_id, None, None);
-        return response;
-    }
     let sse = response
         .headers()
         .get("content-type")

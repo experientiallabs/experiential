@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Annotated, Literal
 from pydantic import Field, JsonValue, field_validator, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.runtime.gateway.capture_context import capture_request_context
+from exp.runtime.gateway.capture_context import capture_context_document
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 
 if TYPE_CHECKING:
@@ -55,7 +55,7 @@ class CaptureConfiguration(ContractModel):
         maximum_pending_bytes: Pending request and handoff memory ceiling,
             defaulting to 64 MiB. Handoffs keep their charge while waiting for
             destination capacity or acknowledgement.
-        maximum_request_bytes: Encoded request ceiling, defaulting to 1 MiB.
+        maximum_request_bytes: Encoded request ceiling, defaulting to 4 MiB.
         maximum_response_bytes: Response buffer ceiling, defaulting to 3,670,016 bytes.
         ttl_seconds: Unsettled request lifetime, defaulting to 1800 seconds.
         settlement_required: Require hosted retention permission, true by default.
@@ -66,7 +66,9 @@ class CaptureConfiguration(ContractModel):
     maximum_pending_bytes: int = Field(
         default=64 * 1024 * 1024, strict=True, ge=1, le=256 * 1024 * 1024
     )
-    maximum_request_bytes: int = Field(default=1024 * 1024, strict=True, ge=1, le=1024 * 1024)
+    maximum_request_bytes: int = Field(
+        default=4 * 1024 * 1024, strict=True, ge=1, le=4 * 1024 * 1024
+    )
     maximum_response_bytes: int = Field(default=3_670_016, strict=True, ge=1, le=4 * 1024 * 1024)
     ttl_seconds: int = Field(default=1800, strict=True, ge=1, le=3600)
     settlement_required: bool = True
@@ -301,18 +303,15 @@ class CaptureController:
         native: CaptureCollector,
         *,
         application_for: Callable[[AuthorizationSnapshot], str | None],
-        maximum_request_bytes: int = 1_048_576,
     ) -> None:
         """Bind the collector to a host-owned authenticated capture-policy decision.
 
         Args:
             native: Shared collector also passed to the native server.
             application_for: Return a configured application or None to decline capture.
-            maximum_request_bytes: Effective-context projection budget.
         """
         self.native = native
         self._application_for = application_for
-        self._maximum_request_bytes = maximum_request_bytes
 
     def begin(
         self,
@@ -330,11 +329,7 @@ class CaptureController:
             "messages",
         }:
             return True
-        context = capture_request_context(
-            request, maximum_bytes=self._maximum_request_bytes, session_id=session_id
-        )
-        if context is None:
-            return False
+        context = capture_context_document(request, session_id=session_id)
         record = CaptureRequest.model_validate(
             {
                 "request_id": authorization.request_id,

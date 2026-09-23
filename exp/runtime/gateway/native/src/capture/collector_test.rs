@@ -260,6 +260,51 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 }
 
 #[test]
+fn hosted_checkpoint_is_durable_before_terminal_and_shares_effective_input() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("checkpoint")));
+    collector.reasoning("checkpoint", "not yet eligible output");
+    assert!(collector.checkpoint("checkpoint"));
+    let prompt = receiver
+        .try_recv()
+        .expect("checkpoint returned before durable write");
+    assert_eq!(prompt.request.request_id, "checkpoint");
+    assert!(prompt.response.is_none());
+    assert!(prompt.provider_reasoning.is_none());
+    assert!(prompt.metrics.is_none());
+    {
+        let pending = collector.pending.lock().unwrap();
+        // The test sink encodes and decodes, but the collector still owns its input.
+        assert_eq!(
+            prompt.request.context,
+            pending.entries["checkpoint"].record.request.context
+        );
+    }
+    collector.settle("checkpoint", true, true);
+    assert!(collector.finish("checkpoint", Some(response()), None));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].response.is_some());
+    assert_eq!(records[0].request.context, prompt.request.context);
+    assert_eq!(records[0].captured_at, prompt.captured_at);
+}
+
+#[test]
+fn unregistered_and_local_requests_do_not_pretend_to_checkpoint() {
+    let (hosted, receiver) = collector(config());
+    assert!(hosted.checkpoint("capture-off"));
+    assert!(drain(&hosted, receiver).is_empty());
+    let mut configuration = config();
+    configuration.settlement_required = false;
+    let (local, receiver) = collector(configuration);
+    assert!(local.begin(request("local")));
+    assert!(local.checkpoint("local"));
+    assert!(receiver.try_recv().is_err());
+    assert!(local.finish("local", Some(response()), None));
+    assert_eq!(drain(&local, receiver).len(), 1);
+}
+
+#[test]
 fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
     struct CleanupFailure;
     impl Sink for CleanupFailure {
@@ -684,7 +729,7 @@ fn shutdown_keeps_delivery_open_during_the_pending_map_handoff() {
     // Pause exactly where finish/settle releases the map lock before emit().
     let entry = {
         let mut pending = collector.pending.lock().unwrap();
-        let mut entry = pending.entries.remove("handoff").unwrap();
+        let entry = pending.entries.remove("handoff").unwrap();
         pending.bytes -= entry.bytes;
         entry._admission.handoff(entry.bytes);
         entry
@@ -720,6 +765,44 @@ impl Sink for PausedSink {
         }
         self.records.write(record)
     }
+}
+
+#[test]
+fn checkpoint_backpressure_does_not_expire_the_terminal_response_owner() {
+    let (entered, started) = mpsc::channel();
+    let (records, receiver) = mpsc::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let collector = Arc::new(
+        Collector::new(
+            config(),
+            PausedSink {
+                entered,
+                released: released.clone(),
+                records: MemorySink(records),
+            },
+        )
+        .unwrap(),
+    );
+    assert!(collector.begin(request("slow-checkpoint")));
+    let writer = collector.clone();
+    let thread = std::thread::spawn(move || writer.checkpoint("slow-checkpoint"));
+    let waiting = started.recv_timeout(Duration::from_secs(2)).is_ok();
+    let retained = {
+        let mut pending = collector.pending.lock().unwrap();
+        pending.entries.get_mut("slow-checkpoint").unwrap().expires = Instant::now();
+        expire_pending(&mut pending, &collector.skipped);
+        pending.entries.contains_key("slow-checkpoint")
+    };
+    released.store(true, Ordering::Release);
+    let acknowledged = thread.join().unwrap();
+    assert!(waiting && retained && acknowledged);
+    collector.settle("slow-checkpoint", true, true);
+    assert!(collector.finish("slow-checkpoint", Some(response()), None));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 2);
+    assert!(records[0].response.is_none());
+    assert!(records[1].response.is_some());
+    assert_eq!(collector.counts()[4..], [0, 0]);
 }
 
 #[test]
@@ -785,3 +868,6 @@ fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
         }
     }
 }
+
+#[path = "checkpoint_test.rs"]
+mod checkpoints;

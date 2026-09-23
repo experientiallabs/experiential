@@ -1,5 +1,6 @@
 //! Count- and byte-bounded delivery, isolated from request and bridge executors.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -7,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::collector::CheckpointLease;
 use super::record::Record;
 use super::response::WireResponse;
 
@@ -51,6 +53,9 @@ pub(crate) trait Sink: Send + 'static {
         0
     }
 
+    #[cfg(test)]
+    fn before_receive(&mut self) {}
+
     /// Run retention maintenance without adding storage work to serving.
     fn maintain(&mut self) -> Result<(), ()> {
         Ok(())
@@ -91,12 +96,21 @@ struct Counters {
     available: Condvar,
 }
 
+struct Checkpoint {
+    value: Record,
+    wire: Option<WireResponse>,
+    bytes: usize,
+    lease: CheckpointLease,
+    completed: tokio::sync::oneshot::Sender<bool>,
+}
+
 struct Pending {
     value: Option<Record>,
     wire: Option<WireResponse>,
     bytes: usize,
     counters: Arc<Counters>,
     completed: Option<mpsc::SyncSender<bool>>,
+    checkpoint: Option<(CheckpointLease, tokio::sync::oneshot::Sender<bool>)>,
 }
 
 struct Prepared<P> {
@@ -108,11 +122,14 @@ struct Prepared<P> {
 /// Failed members keep their slot while acknowledged neighbors release theirs.
 fn run_worker<S: Sink>(
     receiver: mpsc::Receiver<Pending>,
+    checkpoints: Arc<Mutex<VecDeque<Checkpoint>>>,
+    limits: Limits,
+    maximum_queued_bytes: usize,
     mut sink: S,
     counters: Arc<Counters>,
-    maximum_record_bytes: usize,
     preparation_bytes: usize,
 ) {
+    let maximum_record_bytes = limits.maximum_record_bytes;
     let mut pending: Vec<Prepared<S::Prepared>> = Vec::new();
     let mut maintained = Instant::now();
     let mut delay = Duration::from_millis(25);
@@ -124,10 +141,24 @@ fn run_worker<S: Sink>(
             maintained = Instant::now();
         }
         if pending.is_empty() {
+            if let Some(item) =
+                admit_checkpoint(&checkpoints, &counters, &limits, maximum_queued_bytes)
+            {
+                pending.push(Prepared { item, value: None });
+            }
+        }
+        if pending.is_empty() {
+            #[cfg(test)]
+            sink.before_receive();
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(item) => pending.push(Prepared { item, value: None }),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if checkpoints.lock().is_ok_and(|waiting| waiting.is_empty()) {
+                        break;
+                    }
+                    continue;
+                }
             }
         }
         counters
@@ -190,12 +221,16 @@ fn run_worker<S: Sink>(
         drop(ready);
         let mut outcome = outcomes.into_iter();
         let mut acknowledged = 0;
-        pending.retain(|entry| {
+        pending.retain_mut(|entry| {
             let persisted = entry.value.is_some() && valid && outcome.next().unwrap_or(false);
             if persisted {
                 counters.persisted.fetch_add(1, Ordering::Relaxed);
                 acknowledged += 1;
                 if let Some(completed) = &entry.item.completed {
+                    let _ = completed.send(true);
+                }
+                if let Some((lease, completed)) = entry.item.checkpoint.take() {
+                    drop(lease);
                     let _ = completed.send(true);
                 }
             } else if entry.value.is_some() {
@@ -222,6 +257,38 @@ fn run_worker<S: Sink>(
     }
 }
 
+/// Move an already admission-charged checkpoint into delivery only when its budget fits.
+fn admit_checkpoint(
+    waiting: &Mutex<VecDeque<Checkpoint>>,
+    counters: &Arc<Counters>,
+    limits: &Limits,
+    maximum_queued_bytes: usize,
+) -> Option<Pending> {
+    let mut waiting = waiting.lock().ok()?;
+    let value = waiting.front()?;
+    let _capacity = counters.capacity.lock().unwrap_or_else(|e| e.into_inner());
+    if counters.pending.load(Ordering::Acquire) >= limits.maximum_records
+        || counters
+            .bytes
+            .load(Ordering::Acquire)
+            .saturating_add(value.bytes)
+            > maximum_queued_bytes
+    {
+        return None;
+    }
+    let checkpoint = waiting.pop_front()?;
+    counters.bytes.fetch_add(checkpoint.bytes, Ordering::AcqRel);
+    counters.pending.fetch_add(1, Ordering::AcqRel);
+    Some(Pending {
+        value: Some(checkpoint.value),
+        wire: checkpoint.wire,
+        bytes: checkpoint.bytes,
+        counters: counters.clone(),
+        completed: None,
+        checkpoint: Some((checkpoint.lease, checkpoint.completed)),
+    })
+}
+
 impl Drop for Pending {
     fn drop(&mut self) {
         let _capacity = self
@@ -240,6 +307,7 @@ pub(crate) struct Delivery {
     maximum_queued_bytes: usize,
     sender: Mutex<Option<mpsc::SyncSender<Pending>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    checkpoints: Arc<Mutex<VecDeque<Checkpoint>>>,
     counters: Arc<Counters>,
 }
 
@@ -255,15 +323,19 @@ impl Delivery {
         let (sender, receiver) = mpsc::sync_channel::<Pending>(limits.maximum_records);
         let counters = Arc::new(Counters::default());
         let worker_counters = counters.clone();
-        let maximum_record_bytes = limits.maximum_record_bytes;
+        let checkpoints = Arc::new(Mutex::new(VecDeque::new()));
+        let worker_checkpoints = checkpoints.clone();
+        let worker_limits = limits.clone();
         let worker = std::thread::Builder::new()
             .name("exp-capture".into())
             .spawn(move || {
                 run_worker(
                     receiver,
+                    worker_checkpoints,
+                    worker_limits,
+                    maximum_queued_bytes,
                     sink,
                     worker_counters,
-                    maximum_record_bytes,
                     preparation_bytes,
                 )
             })
@@ -273,8 +345,39 @@ impl Delivery {
             maximum_queued_bytes,
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
+            checkpoints,
             counters,
         })
+    }
+
+    /// Retain accepted work on the existing worker; cancelling the receipt never drops the job.
+    pub(super) fn checkpoint(
+        &self,
+        value: Record,
+        wire: Option<WireResponse>,
+        lease: CheckpointLease,
+    ) -> Result<tokio::sync::oneshot::Receiver<bool>, ()> {
+        let bytes = value.heap_bytes() + wire.as_ref().map_or(0, WireResponse::heap_bytes);
+        if bytes > self.maximum_queued_bytes {
+            self.dropped();
+            return Err(());
+        }
+        let sender = self.sender.lock().map_err(|_| ())?;
+        if sender.is_none() {
+            return Err(());
+        }
+        let (completed, receipt) = tokio::sync::oneshot::channel();
+        self.checkpoints
+            .lock()
+            .map_err(|_| ())?
+            .push_back(Checkpoint {
+                value,
+                wire,
+                bytes,
+                lease,
+                completed,
+            });
+        Ok(receipt)
     }
 
     /// Wait for capacity; accepted records are never discarded to make room.
@@ -332,6 +435,7 @@ impl Delivery {
             bytes,
             counters: self.counters.clone(),
             completed,
+            checkpoint: None,
         };
         if sender.send(item).is_err() {
             return self.dropped();

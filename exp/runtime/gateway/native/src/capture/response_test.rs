@@ -615,7 +615,7 @@ async fn oversized_stream_is_forwarded_in_full_but_capture_is_a_marked_prefix() 
 }
 
 #[tokio::test]
-async fn unregistered_requests_and_failed_responses_never_capture_response_content() {
+async fn unregistered_requests_are_excluded_but_admitted_errors_are_evidence() {
     let (collector, receiver) = collector(4096);
     let body = capture_response(
         Some(collector.clone()),
@@ -630,7 +630,7 @@ async fn unregistered_requests_and_failed_responses_never_capture_response_conte
     assert_eq!(body.as_ref(), b"not-captured");
     let failed = Response::builder()
         .status(429)
-        .body(Body::from("failure"))
+        .body(Body::from(r#"{"error":{"message":"provider throttled"}}"#))
         .unwrap();
     let body = capture_response(Some(collector.clone()), "request", failed)
         .into_body()
@@ -638,6 +638,14 @@ async fn unregistered_requests_and_failed_responses_never_capture_response_conte
         .await
         .unwrap()
         .to_bytes();
-    assert_eq!(body.as_ref(), b"failure");
-    assert!(record(&collector, receiver).response.is_none());
+    assert_eq!(
+        body.as_ref(),
+        br#"{"error":{"message":"provider throttled"}}"#
+    );
+    let Some(CapturedResponse::Json { status, body, .. }) = record(&collector, receiver).response
+    else {
+        panic!("admitted provider error was discarded");
+    };
+    assert_eq!(status, 429);
+    assert_eq!(body, json!({"error":{"message":"provider throttled"}}));
 }
