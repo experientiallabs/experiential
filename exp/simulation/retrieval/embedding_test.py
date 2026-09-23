@@ -28,7 +28,7 @@ class RecordingEmbedder:
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
         """Fail fixture execution if a provider request violates either size limit."""
         assert all(0 < len(text.encode("utf-8")) <= 2_048 for text in texts)
-        assert len(texts) <= 128
+        assert len(texts) <= 100
         assert sum(len(text.encode("utf-8")) for text in texts) <= 262_144
         self.batches.append(tuple(texts))
         return self.delegate.embed(texts)
