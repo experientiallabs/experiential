@@ -213,7 +213,17 @@ def build(
                 providers=tuple(provider or ()),
                 console=_console,
             )
-        except ValueError as exc:
+        except ArtifactStoreError as exc:
+            raise typer.BadParameter(
+                f"could not save build evidence: {exc}; check the trace file and rerun exp build"
+            ) from exc
+        except (
+            ModelCapabilityError,
+            ModelCatalogError,
+            ModelConnectionError,
+            ProjectStoreError,
+            ValueError,
+        ) as exc:
             raise typer.BadParameter(str(exc)) from exc
         except ProviderTransportError as exc:
             _console.print(f"[red]error[/red] a provider request failed: {exc}")

@@ -330,7 +330,11 @@ def validate_artifact_file_path(value: str) -> PurePosixPath:
 
 
 def assert_secret_free(value: BaseModel | JsonValue) -> None:
-    """Reject secret values and credential references at immutable artifact boundaries.
+    """Reject secret values and credential configuration fields in structured artifacts.
+
+    Public credential-variable names in recorded prose or code are ordinary text, not secret
+    values. Structured fields such as ``api_key_env`` and ``credential_ref`` still cannot carry
+    local provider configuration into evidence.
 
     Args:
         value: The structured content about to enter an immutable artifact.
@@ -428,8 +432,4 @@ def _assert_json_value_secret_free(value: JsonValue, *, path: str) -> None:
         if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
             raise SecretBoundaryError(
                 f"immutable artifacts cannot contain a secret-like value at {path}"
-            )
-        if _SECRET_ENVIRONMENT_NAME_PATTERN.search(value):
-            raise SecretBoundaryError(
-                f"immutable artifacts cannot contain a credential environment name at {path}"
             )

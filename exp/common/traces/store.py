@@ -69,7 +69,7 @@ def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceData
     try:
         traces = tuple(
             _decode_trace_record(line, legacy=dataset.schema_version == 1)
-            for line in payload.decode("utf-8").splitlines()
+            for line in payload.decode("utf-8").split("\n")
             if line
         )
     except (UnicodeDecodeError, ValidationError, ValueError) as exc:

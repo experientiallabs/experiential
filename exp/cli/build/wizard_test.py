@@ -369,11 +369,44 @@ def test_default_build_prepares_saved_scenarios_without_rollouts(
     assert "router-policy" not in artifact_types
 
 
-def test_bare_build_chat_export_completes_with_saved_provider_roles(
+def test_wizard_reports_rejected_evidence_without_a_traceback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A real secret-shaped value stays blocked with a short, actionable CLI error."""
+    trace_path = _default_trace_corpus(tmp_path)
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    trace_path.write_text(trace_path.read_text().replace("What account email?", secret))
+    monkeypatch.chdir(tmp_path)
+    state = _ProviderState()
+    _install_integrated_runtime(monkeypatch, state)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--root", str(tmp_path / ".exp"), "--provider", "openai"],
+        input="\ntraces.otel.jsonl\n\ny\n",
+        env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
+    )
+
+    assert result.exit_code == 2
+    output = _compact_terminal_text(result.output).replace("│", "")
+    assert "couldnotsavebuildevidence" in output
+    assert "secretboundary" in output
+    assert "rerunexpbuild" in output
+    assert "Traceback" not in result.output
+    assert secret not in result.output
+    assert not state.embedding_calls and not state.completion_calls
+
+
+@pytest.mark.parametrize(
+    "documentation",
+    ["Acme is a company.", "Use BOLTZ_API_KEY.\u0085First\u2028second\u2029paragraph."],
+)
+def test_bare_build_chat_export_completes_with_saved_provider_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, documentation: str
+) -> None:
     """The three-command UX accepts a chat JSONL file with no source or root flags."""
-    _chat_export(tmp_path)
+    trace_path = _chat_export(tmp_path)
+    trace_path.write_text(trace_path.read_text().replace("Acme is a company.", documentation))
     monkeypatch.chdir(tmp_path)
     root = tmp_path / ".exp"
     write_model_catalog(root / "models.toml", _catalog())
@@ -391,10 +424,14 @@ def test_bare_build_chat_export_completes_with_saved_provider_roles(
     assert "Format: chat-json" in unstyle(result.output)
     store = wizard.ProjectStore(root, "powerset")
     assert store.load_project().trace_source == "chat-json"
-    assert store.load_project().build is not None
+    selected = store.load_project().build
+    assert selected is not None
     traces = SQLiteTraceStore(trace_database_path(root))
     imports = traces.list_imports("powerset")
     assert len(imports) == 1 and len(traces.read_import(imports[0]).traces) == 20
+    restored = wizard.load_trace_dataset(store.artifacts, selected.trace_dataset.artifact_id)
+    assert restored.traces == traces.read_import(imports[0]).traces
+    assert documentation in restored.traces[0].model_dump_json()
     assert state.embedding_calls and not state.completion_calls
 
 

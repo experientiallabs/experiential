@@ -1249,12 +1249,15 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
 
 def test_build_retains_active_positional_trace_consumer_but_rejects_project_option(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The hidden trace positional remains active while PROJECT stays positional.
 
     Args:
         tmp_path: Temporary project and trace root.
+        monkeypatch: Keep operator-owned local catalogs and projects outside the test.
     """
+    monkeypatch.chdir(tmp_path)
     source = _otlp_export(tmp_path)
     positional = _RUNNER.invoke(app, ["build", "support", str(source)])
     project_option = _RUNNER.invoke(
