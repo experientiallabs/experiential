@@ -157,8 +157,9 @@ output subset), an observed leg is kept when it is at least the estimate, an unr
 estimated at the organization's recent cached share of input on the actual attempt's rung (the
 same observed-meter EWMA the cache-priority term reads; zero without a live sample). That fraction
 is frozen per attempt for concurrent or retained settlement retries. Imputed reads cannot overlap
-provider-reported cache writes or erase their unknown TTL cost. Cache-write legs stay unknown
-unless the provider reported an input total. The terminal then carries the internal
+provider-reported cache writes or erase their unknown TTL cost. Reported cache legs remain intact
+even when the input total is missing; the estimated total is raised to contain those disjoint
+read/write subsets. An unreported read stays unknown when observed writes leave no room. The terminal then carries the internal
 `usage_estimated` marker and settles at the estimated cost with `usage_source = estimated`,
 releasing the rest of the reserved bound; the local gateway's monthly allocation charges the same
 figure. Known gateway web/tool-search counts survive an absent provider meter and remain

@@ -18,6 +18,7 @@ from exp.runtime.gateway.disconnect_estimate import (
     estimate_disconnect_usage,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
+from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd
 from exp.runtime.gateway.native_settlement import StreamedOutput
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayEventKind
@@ -106,19 +107,66 @@ def test_observed_legs_win_unless_the_streamed_text_already_exceeds_them() -> No
     assert (kept.output_tokens, kept.reasoning_tokens) == (500, 200)
 
 
-def test_cache_legs_are_dropped_without_a_reported_input_total() -> None:
-    """A cache subset cannot be squared with an estimated prompt count."""
+def test_observed_cache_legs_survive_an_estimated_input_total() -> None:
+    """A partial report's cache subsets are kept and the estimated total is raised to hold them."""
+    request = _request()
+    counted = counted_input_tokens(request)
     observed = GatewayUsage(output_tokens=3, cached_input_tokens=50)
     usage = estimate_disconnect_usage(
         _disconnect(observed),
-        request=_request(),
+        request=request,
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         opened=True,
         streamed=StreamedOutput(),
     ).usage
     assert usage is not None
-    assert usage.cached_input_tokens is None
+    assert usage.cached_input_tokens == 50
+    assert usage.input_tokens == max(counted, 50)
     assert usage.output_tokens == 3
+    # Writes reported without an input total: kept, the estimated read
+    # leaves room for them, and an unknown TTL split keeps the cost unknown.
+    writes_only = GatewayUsage(output_tokens=2, cache_creation_input_tokens=counted + 100)
+    usage = estimate_disconnect_usage(
+        _disconnect(writes_only),
+        request=request,
+        surface=GatewayApiSurface.MESSAGES,
+        opened=True,
+        streamed=StreamedOutput(),
+        cached_fraction=0.9,
+    ).usage
+    assert usage is not None
+    assert usage.input_tokens == counted + 100
+    assert usage.cache_creation_input_tokens == counted + 100
+    assert usage.cache_creation_1h_input_tokens is None
+    assert usage.cached_input_tokens is None
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=3_000_000_000,
+            cached_input_rate=300_000_000,
+            cache_creation_input_rate=3_750_000_000,
+            cache_creation_1h_input_rate=None,
+            output_rate=15_000_000_000,
+            reasoning_rate=None,
+        )
+        is None
+    )
+    # Writes smaller than the counted prompt leave room: the estimated read
+    # fills only that room.
+    assert counted > 5
+    partial_writes = GatewayUsage(output_tokens=2, cache_creation_input_tokens=5)
+    usage = estimate_disconnect_usage(
+        _disconnect(partial_writes),
+        request=request,
+        surface=GatewayApiSurface.MESSAGES,
+        opened=True,
+        streamed=StreamedOutput(),
+        cached_fraction=0.9,
+    ).usage
+    assert usage is not None
+    assert usage.input_tokens == counted
+    assert usage.cache_creation_input_tokens == 5
+    assert usage.cached_input_tokens == min(counted - 5, int(counted * 0.9))
 
 
 @pytest.mark.parametrize(
@@ -184,15 +232,17 @@ def test_estimated_reads_cannot_displace_provider_observed_writes(
     expected_read = (
         reported_read
         if reported_read is not None
-        else min(max(0, 1_000 - writes), int(1_000 * fraction))
+        else min(1_000 - writes, int(1_000 * fraction))
+        if writes < 1_000
+        else None
     )
     assert usage.cached_input_tokens == expected_read
     assert usage.cache_creation_input_tokens == writes
     assert usage.cache_creation_1h_input_tokens == hour_tokens
 
 
-def test_unbound_cache_subsets_do_not_override_a_missing_input_estimate() -> None:
-    """Without a reported input total, prior cache subsets remain unknown rather than invented."""
+def test_observed_cache_subsets_raise_missing_input_without_changing_their_values() -> None:
+    """Reported disjoint read/write subsets survive while the estimated total contains both."""
     terminal = estimate_disconnect_usage(
         _disconnect(
             GatewayUsage(
@@ -209,9 +259,65 @@ def test_unbound_cache_subsets_do_not_override_a_missing_input_estimate() -> Non
         cached_fraction=1.0,
     )
     assert terminal.usage is not None
-    assert terminal.usage.cached_input_tokens == terminal.usage.input_tokens
-    assert terminal.usage.cache_creation_input_tokens is None
-    assert terminal.usage.cache_creation_1h_input_tokens is None
+    assert terminal.usage.input_tokens == 807
+    assert terminal.usage.cached_input_tokens == 7
+    assert terminal.usage.cache_creation_input_tokens == 800
+    assert terminal.usage.cache_creation_1h_input_tokens == 0
+
+
+def test_estimated_cache_reads_never_displace_observed_cache_writes() -> None:
+    """A read estimate leaves room for every reported write, so write liability survives pricing."""
+    observed = GatewayUsage(input_tokens=1_000, output_tokens=1, cache_creation_input_tokens=300)
+    usage = estimate_disconnect_usage(
+        _disconnect(observed),
+        request=_request(),
+        surface=GatewayApiSurface.MESSAGES,
+        opened=True,
+        streamed=StreamedOutput(text="partial"),
+        cached_fraction=0.9,
+    ).usage
+    assert usage is not None
+    assert usage.cached_input_tokens == 700
+    assert usage.cache_creation_input_tokens == 300
+    # The read-first clamps keep all 300 writes, and an unknown TTL split
+    # keeps the cost unknown instead of pricing the writes away.
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=3_000_000_000,
+            cached_input_rate=300_000_000,
+            cache_creation_input_rate=3_750_000_000,
+            cache_creation_1h_input_rate=None,
+            output_rate=15_000_000_000,
+            reasoning_rate=None,
+        )
+        is None
+    )
+    priced = estimated_cost_nano_usd(
+        usage.model_copy(update={"cache_creation_1h_input_tokens": 0}),
+        input_rate=3_000_000_000,
+        cached_input_rate=300_000_000,
+        cache_creation_input_rate=3_750_000_000,
+        cache_creation_1h_input_rate=6_000_000_000,
+        output_rate=15_000_000_000,
+        reasoning_rate=None,
+    )
+    assert priced == round(
+        (0 * 3_000 + 300 * 3_750 + 700 * 300 + 1 * 15_000) * 1_000_000 / 1_000_000
+    )
+    # Writes that already fill the input leave nothing to estimate.
+    full = estimate_disconnect_usage(
+        _disconnect(
+            GatewayUsage(input_tokens=500, output_tokens=1, cache_creation_input_tokens=500)
+        ),
+        request=_request(),
+        surface=GatewayApiSurface.MESSAGES,
+        opened=True,
+        streamed=StreamedOutput(),
+        cached_fraction=0.9,
+    ).usage
+    assert full is not None
+    assert full.cached_input_tokens is None
 
 
 def test_overflow_extrapolates_from_the_retained_ratio_or_the_fallback_density() -> None:

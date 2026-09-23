@@ -332,8 +332,13 @@ def test_estimated_disconnect_usage_settles_at_its_priced_cost(
 
 @pytest.mark.parametrize("retry", ["direct", "sweep"])
 @pytest.mark.parametrize("hour_tokens", [None, 0, 800])
+@pytest.mark.parametrize("reported_input", [True, False])
 def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry: str, hour_tokens: int | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry: str,
+    hour_tokens: int | None,
+    reported_input: bool,
 ) -> None:
     """Unknown write TTL keeps the full bound; known writes cannot become discounted reads."""
     clock = FakeLedgerClock()
@@ -405,7 +410,7 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
             "outcome": "failed",
             "failure": {"failure_class": "cancelled", "safe_message": "cut"},
             "usage": {
-                "input_tokens": 1_000,
+                "input_tokens": 1_000 if reported_input else None,
                 "output_tokens": 1,
                 "cache_creation_input_tokens": 800,
                 "cache_creation_1h_input_tokens": hour_tokens,
@@ -431,7 +436,9 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
     else:
         accounting.settle(payload)
     accounting.settle(payload)
-    cost = None if hour_tokens is None else (2_021 if hour_tokens == 0 else 3_221)
+    cost = None if hour_tokens is None else (2_001 if hour_tokens == 0 else 3_201)
+    if cost is not None and reported_input:
+        cost += 20
     settled = 4_000 if cost is None else cost
     with sqlite3.connect(store.database_path) as connection:
         row = connection.execute(
@@ -440,7 +447,15 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
             "budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone()
-        assert row == (1_000, 200, 800, hour_tokens, "estimated", cost, settled)
+        assert row == (
+            1_000 if reported_input else 800,
+            200 if reported_input else None,
+            800,
+            hour_tokens,
+            "estimated",
+            cost,
+            settled,
+        )
         assert connection.execute(
             "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges"
         ).fetchone() == (4_000, settled)
