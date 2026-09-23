@@ -125,4 +125,25 @@ pub(super) fn bound(request: &mut Request, maximum: usize) {
         *context = json!({"schema_version":1,"request":{"messages":messages},
             "capture_limits":limits});
     }
+    if request.json_bytes() > maximum {
+        // A configured request cap can be smaller than the column cap. Account
+        // for the retained authority/envelope and truncation markers as well.
+        let original = json_bytes(&request.context["request"]["messages"]);
+        let overhead = request.json_bytes().saturating_sub(original);
+        let message_budget = maximum.saturating_sub(overhead + 256);
+        let context = Arc::make_mut(&mut request.context);
+        let messages = &mut context["request"]["messages"];
+        let strings = trim_strings(messages, message_budget);
+        let mut dropped = 0;
+        if json_bytes(messages) > message_budget {
+            dropped = messages.as_array().map_or(0, Vec::len);
+            *messages = json!([{"role":"system", "truncated":true,
+                "content":format!("[{dropped} messages ({original} bytes) not captured: over capture limit]")}]);
+        }
+        let limits = &mut context["capture_limits"];
+        limits["messages_truncated"] = Value::Bool(true);
+        limits["messages_bytes"] = original.into();
+        limits["messages_truncated_strings"] = strings.into();
+        limits["messages_dropped"] = dropped.into();
+    }
 }

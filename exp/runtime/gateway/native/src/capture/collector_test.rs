@@ -517,6 +517,34 @@ fn hosted_structural_envelope_overflow_does_not_discard_the_prompt() {
 }
 
 #[test]
+fn hosted_structural_messages_honor_the_configured_request_limit() {
+    for maximum in [1024, 4096, 8192, 65536] {
+        let mut configuration = config();
+        configuration.truncate_request = true;
+        configuration.maximum_request_bytes = maximum;
+        let (collector, receiver) = collector(configuration);
+        let mut input = request("many-messages");
+        // No individual string exceeds the 4096-byte truncation threshold.
+        // Also cover messages below the cap but above it with the envelope.
+        let content = "x".repeat(100);
+        let messages = vec![json!({"role":"user","content":content}); maximum / 128];
+        input.context = Arc::new(json!({"schema_version":1,"request": {
+            "messages":messages,"tools":[{"name":"search"}]
+        }}));
+        assert!(input.json_bytes() > maximum);
+        assert!(collector.begin(input));
+        collector.settle("many-messages", true, false);
+        let records = drain(&collector, receiver);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].request.json_bytes() <= maximum);
+        let limits = &records[0].request.context["capture_limits"];
+        assert_eq!(limits["messages_truncated"], true);
+        assert_eq!(limits["messages_dropped"], maximum / 128);
+        assert_eq!(collector.counts()[4..], [0, 0]);
+    }
+}
+
+#[test]
 fn local_capture_does_not_require_hosted_settlement() {
     let mut configuration = config();
     configuration.settlement_required = false;
