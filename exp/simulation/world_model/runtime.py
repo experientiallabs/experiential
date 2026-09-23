@@ -352,6 +352,7 @@ def bind_fit_grounded_world_model(
         or serving.index.key_schema_version != fit.key_schema_version
         or serving.index.embedder != fit.embedder
         or serving.index.embedding_dimension != fit.embedding_dimension
+        or serving.index.embedding_chunk_bytes != fit.embedding_chunk_bytes
         or serving.index.fit_lineage_ids != fit.fit_lineage_ids
         or serving.index.default_top_k != fit.default_top_k
         or artifact.top_k != fit.default_top_k

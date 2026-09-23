@@ -56,7 +56,10 @@ def load_rag_index(store: ArtifactStore, rag_id: str) -> LoadedRAGIndex:
     try:
         index = RAGIndex.model_validate_json(store.read_bytes(rag_id, RAG_INDEX_PATH))
     except (ValidationError, ValueError) as exc:
-        raise ArtifactCorruptionError(f"RAG index {rag_id} has an invalid envelope") from exc
+        raise ArtifactCorruptionError(
+            f"RAG index {rag_id} has an invalid or unsupported envelope; "
+            "rebuild the project's indexes"
+        ) from exc
     if index.rag_id != rag_id:
         raise ArtifactCorruptionError(
             f"RAG envelope ID {index.rag_id} does not match artifact {rag_id}"
