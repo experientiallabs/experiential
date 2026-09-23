@@ -168,8 +168,15 @@ def estimate_disconnect_usage(
     # included) is kept as reported.
     reported_input = observed is not None and observed.input_tokens is not None
     cached_input_tokens = observed.cached_input_tokens if reported_input else None
-    if cached_input_tokens is None and cached_fraction > 0 and input_tokens > 0:
-        cached_input_tokens = min(input_tokens, int(input_tokens * min(cached_fraction, 1.0)))
+    # Reads and writes are disjoint subsets of the input total and settlement
+    # clamps reads FIRST, so an estimated read must leave room for every
+    # observed write: capping it at the total would displace reported
+    # cache-write liability (and an unknown-TTL write's unpriced status).
+    observed_writes = (observed.cache_creation_input_tokens or 0) if reported_input else 0
+    if cached_input_tokens is None and cached_fraction > 0 and input_tokens > observed_writes:
+        cached_input_tokens = min(
+            input_tokens - observed_writes, int(input_tokens * min(cached_fraction, 1.0))
+        )
     usage = GatewayUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
