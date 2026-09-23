@@ -9,9 +9,10 @@ use crate::events::Event;
 use crate::settlement::AttemptGuard;
 use crate::waterfall::Won;
 
-/// Preserve a hosted prompt before any committed output becomes client-visible.
+/// Queue a hosted prompt before any committed output becomes client-visible.
 /// Losing lanes never checkpoint: a later BYOK winner must not inherit a
-/// host-funded lane's capture. SQL remains the final live-consent authority.
+/// host-funded lane's capture. Persistence is off the serving path; SQL remains
+/// the final live-consent authority.
 pub(crate) async fn checkpoint_winner(
     collector: Option<&Arc<Collector>>,
     admission: &Admission,

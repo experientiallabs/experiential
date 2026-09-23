@@ -44,6 +44,8 @@ fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<R
                 maximum_response_bytes,
                 ttl_seconds: 30,
                 settlement_required: false,
+                relay_metadata: false,
+                truncate_request: false,
             },
             MemorySink(sender),
         )
@@ -100,7 +102,7 @@ impl Sink for HeldSink {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn stalled_writer_backpressures_complete_responses_without_blocking_the_runtime() {
+async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
     for fail in [false, true] {
         let (started, entered) = tokio::sync::oneshot::channel();
         let (resume, paused) = mpsc::channel();
@@ -120,6 +122,8 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                     maximum_response_bytes: 16384,
                     ttl_seconds: 30,
                     settlement_required: false,
+                    relay_metadata: false,
+                    truncate_request: false,
                 },
                 HeldSink {
                     entered: Some(started),
@@ -184,8 +188,8 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
         )
         .await
         .unwrap();
-        assert!(tasks.iter().all(|task| !task.is_finished()));
-        assert_eq!(&collector.counts()[3..], &[0, 0, 0]);
+        let completed = tasks.iter().filter(|task| task.is_finished()).count();
+        let failures = collector.counts()[3..].to_vec();
         resume.send(()).unwrap();
         for task in tasks {
             tokio::time::timeout(Duration::from_secs(2), task)
@@ -194,6 +198,10 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                 .unwrap();
         }
         assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+        // The first response leaves without waiting for storage, then the
+        // single-slot destination applies bounded backpressure to the rest.
+        assert_eq!(completed, 1);
+        assert_eq!(failures, [0, 0, 0]);
         let rows: Vec<_> = observed.try_iter().collect();
         assert_eq!(rows.len(), 8);
         assert!(rows
@@ -215,6 +223,60 @@ fn record(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Record {
     let records: Vec<Record> = receiver.try_iter().collect();
     assert_eq!(records.len(), 1);
     records.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn relay_metadata_rendezvous_preserves_wire_and_does_not_duplicate_replays() {
+    for metadata_first in [false, true] {
+        let (mut collector, receiver) = collector(4096);
+        Arc::get_mut(&mut collector).unwrap().config.relay_metadata = true;
+        assert!(collector.claim_relay("request"));
+        assert!(!collector.claim_relay("request"));
+        assert!(!collector.claim_relay("unknown"));
+        let metadata = || super::super::relay::Relay {
+            metadata: serde_json::from_value(json!({
+                "wire_request": {"method":"POST", "path":"/v1/chat/completions",
+                    "headers":[["authorization","<redacted>"]], "body_bytes":14},
+                "headers":[["x-gateway-provider","Experiential Cloud"]],
+                "timing":{"total_ms":12.5},
+                "relay_completed":true,"client_disconnected":false
+            }))
+            .unwrap(),
+            body: br#"{"raw":"wire"}"#.to_vec(),
+        };
+        if metadata_first {
+            assert!(collector.finish_relay("request", metadata()));
+        }
+        let body = capture_response(
+            Some(collector.clone()),
+            "request",
+            Response::new(Body::from(r#"{"choices":[]}"#)),
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        assert_eq!(&body[..], br#"{"choices":[]}"#);
+        if !metadata_first {
+            assert!(receiver.try_recv().is_err());
+            assert!(collector.finish_relay("request", metadata()));
+        }
+        let record = record(&collector, receiver);
+        assert_eq!(
+            record.transport.as_ref().unwrap()["wire_request"]["body"],
+            json!({"raw":"wire"})
+        );
+        assert_eq!(
+            record.transport.as_ref().unwrap()["timing"]["total_ms"],
+            12.5
+        );
+        assert!(matches!(
+            record.response,
+            Some(CapturedResponse::Json { .. })
+        ));
+        assert_eq!(collector.counts()[4..], [0, 0]);
+    }
 }
 
 #[tokio::test]

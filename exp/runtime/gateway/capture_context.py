@@ -6,6 +6,7 @@ import json
 import re
 
 from pydantic import JsonValue
+from pydantic_core import to_jsonable_python
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.core.durable_json import normalize_durable_object
@@ -53,6 +54,15 @@ def capture_context_document(
         "request": request.model_dump(mode="json", exclude_none=True, exclude={"idempotency_key"}),
         "provider_context": _captured_provider_context(request),
     }
+    # Match the hosted capture envelope: effective settings excluded from the
+    # public protocol serializer are still part of the observed request.
+    internal = {
+        name: to_jsonable_python(value)
+        for name, field in type(request).model_fields.items()
+        if field.exclude and (value := getattr(request, name)) not in (None, (), {}, False, "")
+    }
+    if internal:
+        document["provider_internal"] = internal
     if session_id and len(session_id) <= 512 and all("!" <= char <= "~" for char in session_id):
         document["session_id"] = session_id
     if not _exceptional_text(document):

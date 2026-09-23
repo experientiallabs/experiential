@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::collector::Admission;
 use super::record::Record;
 use super::response::WireResponse;
 
@@ -68,7 +69,7 @@ pub(crate) struct Limits {
 impl Limits {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if !(1..=4096).contains(&self.maximum_records)
-            || !(1..=8 * 1024 * 1024).contains(&self.maximum_record_bytes)
+            || !(1..=16 * 1024 * 1024).contains(&self.maximum_record_bytes)
             || self.maximum_bytes < self.maximum_record_bytes
             || self.maximum_bytes > 256 * 1024 * 1024
         {
@@ -96,7 +97,8 @@ struct Pending {
     wire: Option<WireResponse>,
     bytes: usize,
     counters: Arc<Counters>,
-    completed: Option<mpsc::SyncSender<bool>>,
+    // Keep collector admission charged until the destination acknowledges.
+    _admission: Option<Admission>,
 }
 
 struct Prepared<P> {
@@ -148,7 +150,8 @@ fn run_worker<S: Sink>(
                         .value
                         .as_mut()
                         .expect("unprepared record retained");
-                    if let Some(wire) = entry.item.wire.take() {
+                    if let Some(mut wire) = entry.item.wire.take() {
+                        record.transport = wire.relay.take().map(super::relay::Relay::decode);
                         record.response = wire.decode();
                         if record.response.is_none() {
                             record.provider_reasoning = None;
@@ -191,9 +194,6 @@ fn run_worker<S: Sink>(
             if persisted {
                 counters.persisted.fetch_add(1, Ordering::Relaxed);
                 acknowledged += 1;
-                if let Some(completed) = &entry.item.completed {
-                    let _ = completed.send(true);
-                }
             } else if entry.value.is_some() {
                 counters.failed.fetch_add(1, Ordering::Relaxed);
             }
@@ -279,17 +279,21 @@ impl Delivery {
         self.enqueue(value, None, None)
     }
 
-    /// A successful completion means the destination has persisted this update.
-    pub(super) fn submit_wait(&self, value: Record, wire: Option<WireResponse>) -> bool {
-        let (completed, outcome) = mpsc::sync_channel(1);
-        self.enqueue(value, wire, Some(completed)) && outcome.recv().unwrap_or(false)
+    /// Transfer ownership to the background writer, not to the database caller.
+    pub(super) fn submit_record(
+        &self,
+        value: Record,
+        wire: Option<WireResponse>,
+        admission: Option<Admission>,
+    ) -> bool {
+        self.enqueue(value, wire, admission)
     }
 
     fn enqueue(
         &self,
         value: Record,
         wire: Option<WireResponse>,
-        completed: Option<mpsc::SyncSender<bool>>,
+        admission: Option<Admission>,
     ) -> bool {
         let bytes = value.heap_bytes() + wire.as_ref().map_or(0, WireResponse::heap_bytes);
         if bytes > self.maximum_queued_bytes {
@@ -327,7 +331,7 @@ impl Delivery {
             wire,
             bytes,
             counters: self.counters.clone(),
-            completed,
+            _admission: admission,
         };
         if sender.send(item).is_err() {
             return self.dropped();

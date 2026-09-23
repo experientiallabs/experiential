@@ -17,6 +17,7 @@ fn record<R>(response: R) -> Record<R> {
             context: Arc::new(json!({"schema_version":1,"request":{"messages":[]}})),
         },
         response: Some(response),
+        transport: None,
         provider_reasoning: None,
         provider_reasoning_source_json: None,
         provider_tool_calls_json: None,

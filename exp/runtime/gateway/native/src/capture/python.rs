@@ -190,7 +190,9 @@ impl CaptureCollector {
     fn begin(&self, py: Python<'_>, request_json: &str) -> bool {
         let collector = self.inner.clone();
         py.detach(|| {
-            if request_json.len() > collector.config.maximum_request_bytes {
+            if !collector.config.truncate_request
+                && request_json.len() > collector.config.maximum_request_bytes
+            {
                 return collector.skip();
             }
             let Ok(request) = serde_json::from_str::<Request>(request_json) else {
@@ -204,6 +206,31 @@ impl CaptureCollector {
     fn select_model(&self, py: Python<'_>, request_id: &str, model_id: &str) {
         let collector = self.inner.clone();
         py.detach(|| collector.select_model(request_id, model_id));
+    }
+
+    /// Claim caller-facing metadata only for an admitted original response.
+    fn claim_relay(&self, py: Python<'_>, request_id: &str) -> bool {
+        py.detach(|| self.inner.claim_relay(request_id))
+    }
+
+    /// Transfer raw wire bytes once; the delivery worker alone parses their JSON.
+    fn finish_relay(
+        &self,
+        py: Python<'_>,
+        request_id: &str,
+        metadata_json: &str,
+        body: Vec<u8>,
+    ) -> bool {
+        py.detach(|| {
+            if metadata_json.len() > 65536 || body.len() > 4 * 1024 * 1024 {
+                return false;
+            }
+            let Ok(metadata) = serde_json::from_str(metadata_json) else {
+                return false;
+            };
+            self.inner
+                .finish_relay(request_id, super::relay::Relay { metadata, body })
+        })
     }
 
     /// Apply the host's final content eligibility, independently of inference accounting.

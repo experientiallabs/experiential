@@ -133,6 +133,9 @@ pub(crate) struct Record<R = Response> {
     pub schema_version: u32,
     pub request: Request,
     pub response: Option<R>,
+    /// Caller-facing headers, timing and optional redacted wire request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Value>,
     /// Provider-returned plaintext from an explicitly exposure-enabled winning rung.
     pub provider_reasoning: Option<String>,
     pub provider_reasoning_source_json: Option<String>,
@@ -212,6 +215,9 @@ impl<R: Serialize> Serialize for Record<R> {
         record.serialize_field("schema_version", &self.schema_version)?;
         record.serialize_field("request", &self.request)?;
         record.serialize_field("response", &self.response)?;
+        if let Some(transport) = &self.transport {
+            record.serialize_field("transport", transport)?;
+        }
         record.serialize_field("provider_reasoning", &reasoning.text)?;
         record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
         record.serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
@@ -273,6 +279,7 @@ impl Record {
         std::mem::size_of::<Self>()
             + self.request.heap_bytes()
             + self.response.as_ref().map_or(0, Response::heap_bytes)
+            + self.transport.as_ref().map_or(0, budget::heap_bytes)
             + self.provider_reasoning.as_ref().map_or(0, String::capacity)
             + self
                 .provider_reasoning_source_json

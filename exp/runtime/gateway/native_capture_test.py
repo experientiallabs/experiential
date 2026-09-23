@@ -121,7 +121,8 @@ def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
         assert pending == 1 and retained > 0
         assert successes == drops == skips == 0
         assert failures >= 1
-        assert settlement.is_alive()
+        settlement.join(1)
+        assert not settlement.is_alive()
     finally:
         recovering.set()
         settlement.join(3)

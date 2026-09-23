@@ -289,7 +289,7 @@ fn shutdown_timeout_reports_incomplete_drain_without_purging_accepted_records() 
 }
 
 #[test]
-fn synchronous_completion_waits_for_acknowledgement_including_retries() {
+fn queued_completion_does_not_wait_for_storage_and_retries_keep_ownership() {
     for fail in [false, true] {
         let (delivery, entered, resume) = paused(limits(), fail);
         let delivery = Arc::new(delivery);
@@ -297,18 +297,19 @@ fn synchronous_completion_waits_for_acknowledgement_including_retries() {
         let producer = delivery.clone();
         let waiting = std::thread::spawn(move || {
             returned
-                .send(producer.submit_wait(record("ack"), None))
+                .send(producer.submit_record(record("ack"), None, None))
                 .unwrap();
         });
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert_eq!(delivery.counts()[0], 1);
+        assert!(!delivery.close_until(Instant::now()));
         resume.send(()).unwrap();
         if fail {
             assert_eq!(entered.recv_timeout(Duration::from_secs(1)).unwrap(), "ack");
-            assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
+            assert_eq!(delivery.counts()[0], 1);
             resume.send(()).unwrap();
         }
-        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
         waiting.join().unwrap();
         assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
         assert_eq!(delivery.counts()[4], 0);
@@ -339,8 +340,8 @@ fn limits_reject_zero_unbounded_and_incoherent_configuration() {
             ..limits()
         },
         Limits {
-            maximum_record_bytes: 9 * 1024 * 1024,
-            maximum_bytes: 10 * 1024 * 1024,
+            maximum_record_bytes: 17 * 1024 * 1024,
+            maximum_bytes: 18 * 1024 * 1024,
             ..limits()
         },
     ] {

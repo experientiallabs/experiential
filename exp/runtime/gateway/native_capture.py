@@ -33,7 +33,7 @@ class CaptureDeliveryLimits(ContractModel):
     maximum_records: int = Field(default=256, strict=True, ge=1, le=4096)
     maximum_bytes: int = Field(default=64 * 1024 * 1024, strict=True, ge=1, le=256 * 1024 * 1024)
     maximum_record_bytes: int = Field(
-        default=8 * 1024 * 1024, strict=True, ge=1, le=8 * 1024 * 1024
+        default=8 * 1024 * 1024, strict=True, ge=1, le=16 * 1024 * 1024
     )
 
     @model_validator(mode="after")
@@ -58,6 +58,8 @@ class CaptureConfiguration(ContractModel):
         maximum_response_bytes: Response buffer ceiling, defaulting to 3,670,016 bytes.
         ttl_seconds: Unsettled request lifetime, defaulting to 1800 seconds.
         settlement_required: Require hosted retention permission, true by default.
+        relay_metadata: Wait for an outer relay's caller-facing metadata, false by default.
+        truncate_request: Preserve the hosted bounded-copy policy for oversized inputs.
     """
 
     delivery: CaptureDeliveryLimits = Field(default_factory=CaptureDeliveryLimits)
@@ -66,11 +68,13 @@ class CaptureConfiguration(ContractModel):
         default=64 * 1024 * 1024, strict=True, ge=1, le=256 * 1024 * 1024
     )
     maximum_request_bytes: int = Field(
-        default=4 * 1024 * 1024, strict=True, ge=1, le=4 * 1024 * 1024
+        default=4 * 1024 * 1024, strict=True, ge=1, le=8 * 1024 * 1024
     )
     maximum_response_bytes: int = Field(default=3_670_016, strict=True, ge=1, le=4 * 1024 * 1024)
     ttl_seconds: int = Field(default=1800, strict=True, ge=1, le=3600)
     settlement_required: bool = True
+    relay_metadata: bool = False
+    truncate_request: bool = False
 
     @model_validator(mode="after")
     def _validate_pending_budget(self) -> CaptureConfiguration:
@@ -205,6 +209,7 @@ class CaptureRecord(ContractModel):
         metrics: Winning-attempt observations only when response retention permits them.
         gemini_thought_parts: Ordered provider summary and signature evidence, not full CoT.
         gemini_thought_parts_source_json: Exact exceptional parts, otherwise None.
+        transport: Optional outer-relay headers, timing and redacted wire input.
     """
 
     schema_version: Literal[1]
@@ -220,6 +225,7 @@ class CaptureRecord(ContractModel):
     metrics: CaptureMetrics | None
     gemini_thought_parts: tuple[JsonObject, ...]
     gemini_thought_parts_source_json: str | None
+    transport: JsonObject | None = None
 
 
 class CaptureController:

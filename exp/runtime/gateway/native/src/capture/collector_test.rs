@@ -36,6 +36,8 @@ fn config() -> Configuration {
         maximum_response_bytes: 4096,
         ttl_seconds: 30,
         settlement_required: true,
+        relay_metadata: false,
+        truncate_request: false,
     }
 }
 
@@ -74,6 +76,14 @@ fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) 
 fn drain(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Vec<Record> {
     assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
     receiver.try_iter().collect()
+}
+
+fn wait_for_handoffs(collector: &Collector) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while collector.handoff_bytes.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -162,14 +172,14 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 }
 
 #[test]
-fn hosted_checkpoint_is_durable_before_terminal_and_shares_effective_input() {
+fn hosted_checkpoint_is_queued_before_terminal_and_shares_effective_input() {
     let (collector, receiver) = collector(config());
     assert!(collector.begin(request("checkpoint")));
     collector.reasoning("checkpoint", "not yet eligible output");
     assert!(collector.checkpoint("checkpoint"));
     let prompt = receiver
-        .try_recv()
-        .expect("checkpoint returned before durable write");
+        .recv_timeout(Duration::from_secs(1))
+        .expect("queued checkpoint did not reach the destination");
     assert_eq!(prompt.request.request_id, "checkpoint");
     assert!(prompt.response.is_none());
     assert!(prompt.provider_reasoning.is_none());
@@ -445,9 +455,41 @@ fn pending_count_and_bytes_are_bounded_without_evicting_other_live_requests() {
     assert!(collector.begin(request("first")));
     assert!(!collector.begin(request("overflow")));
     collector.settle("first", true, false);
+    wait_for_handoffs(&collector);
     assert!(collector.begin(request("next")));
     collector.settle("next", false, false);
     assert_eq!(drain(&collector, receiver).len(), 1);
+}
+
+#[test]
+fn hosted_oversized_prompt_keeps_a_marked_copy_instead_of_rejecting_inference() {
+    let mut configuration = config();
+    configuration.truncate_request = true;
+    configuration.maximum_request_bytes = 8 * 1024 * 1024;
+    configuration.maximum_pending_bytes = 16 * 1024 * 1024;
+    let (collector, receiver) = collector(configuration);
+    let mut input = request("large");
+    input.context = Arc::new(json!({"schema_version":1,"request": {
+        "messages":[{"role":"system","content":"system prompt"},
+            {"role":"tool","tool_call_id":"call-1","content":"雪".repeat(22 * 1024 * 1024)}],
+        "tools":[{"name":"search","parameters":{"type":"object"}}]
+    }}));
+    assert!(collector.begin(input));
+    collector.settle("large", true, false);
+    let records = drain(&collector, receiver);
+    let context = &records[0].request.context;
+    assert_eq!(
+        context["request"]["messages"][0]["content"],
+        "system prompt"
+    );
+    assert_eq!(context["request"]["messages"][1]["tool_call_id"], "call-1");
+    let content = context["request"]["messages"][1]["content"]
+        .as_str()
+        .unwrap();
+    assert!(content.starts_with("雪") && content.contains("[truncated for capture:"));
+    assert!(content.len() < 4200);
+    assert_eq!(context["capture_limits"]["messages_truncated_strings"], 1);
+    assert_eq!(collector.counts()[4..], [0, 0]);
 }
 
 #[test]
@@ -514,8 +556,7 @@ fn shutdown_keeps_delivery_open_during_the_pending_map_handoff() {
         entry
     };
     assert!(!collector.close_until(Instant::now()));
-    assert!(collector.emit(entry.record, None));
-    drop(entry._admission);
+    assert!(collector.emit(entry.record, None, Some(entry._admission)));
     assert_eq!(drain(&collector, receiver).len(), 1);
     assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
 }
@@ -547,7 +588,7 @@ impl Sink for PausedSink {
 }
 
 #[test]
-fn checkpoint_backpressure_does_not_expire_the_terminal_response_owner() {
+fn queued_prompt_does_not_wait_for_storage_or_release_the_terminal_response_owner() {
     let (entered, started) = mpsc::channel();
     let (records, receiver) = mpsc::channel();
     let released = Arc::new(AtomicBool::new(false));
@@ -563,18 +604,14 @@ fn checkpoint_backpressure_does_not_expire_the_terminal_response_owner() {
         .unwrap(),
     );
     assert!(collector.begin(request("slow-checkpoint")));
-    let writer = collector.clone();
-    let thread = std::thread::spawn(move || writer.checkpoint("slow-checkpoint"));
+    assert!(collector.checkpoint("slow-checkpoint"));
     let waiting = started.recv_timeout(Duration::from_secs(2)).is_ok();
     let retained = {
-        let mut pending = collector.pending.lock().unwrap();
-        pending.entries.get_mut("slow-checkpoint").unwrap().expires = Instant::now();
-        expire_pending(&mut pending, &collector.skipped);
+        let pending = collector.pending.lock().unwrap();
         pending.entries.contains_key("slow-checkpoint")
     };
     released.store(true, Ordering::Release);
-    let acknowledged = thread.join().unwrap();
-    assert!(waiting && retained && acknowledged);
+    assert!(waiting && retained);
     collector.settle("slow-checkpoint", true, true);
     assert!(collector.finish("slow-checkpoint", Some(response()), None));
     let records = drain(&collector, receiver);
@@ -636,6 +673,7 @@ fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
             // must not strand a native retry worker or leak a test thread.
             released.store(true, Ordering::Release);
             thread.join().unwrap();
+            wait_for_handoffs(&collector);
             assert!(reached_destination, "mode={mode} bytes={bytes_bound}");
             assert!(!admitted_while_stalled, "mode={mode} bytes={bytes_bound}");
             assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);

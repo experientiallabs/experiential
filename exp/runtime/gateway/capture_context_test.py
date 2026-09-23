@@ -192,6 +192,33 @@ def test_excluded_provider_carriers_are_retained_separately() -> None:
     assert provider["provider_thinking_config"] == {"type": "enabled", "budget_tokens": 32}
 
 
+def test_capture_retains_hosted_effective_settings_without_changing_serving_input() -> None:
+    """Capture keeps the old hosted envelope's excluded, nonempty request settings."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+    ).request.model_copy(
+        update={
+            "provider_thinking_config": {"type": "enabled", "budget_tokens": 32},
+            "diagnostics": {"trace": True},
+            "speed": "fast",
+            "provider_beta_tokens": ("interleaved-thinking",),
+            "ignored_parameters": ("seed",),
+            "idempotency_key": "not-captured",
+        }
+    )
+    before = request.model_dump_json()
+    context = capture_context_document(request)
+    assert context["provider_internal"] == {
+        "provider_thinking_config": {"type": "enabled", "budget_tokens": 32},
+        "diagnostics": {"trace": True},
+        "speed": "fast",
+        "provider_beta_tokens": ["interleaved-thinking"],
+        "ignored_parameters": ["seed"],
+    }
+    assert "not-captured" not in json.dumps(context)
+    assert request.model_dump_json() == before
+
+
 def test_capture_context_is_storable_and_omits_transport_replay_key() -> None:
     """Normalization touches the stored copy, not the served prompt or opaque key."""
     request = decode_chat(

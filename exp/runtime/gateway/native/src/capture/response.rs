@@ -41,6 +41,7 @@ impl Drop for BodyCharge {
 /// Retain original wire bytes until the single destination worker needs JSON.
 /// The response permit covers queued, blocked and actively decoded bodies alike.
 pub(super) struct WireResponse {
+    pub(super) relay: Option<super::relay::Relay>,
     bytes: Vec<u8>,
     sse: bool,
     status: u16,
@@ -52,7 +53,12 @@ pub(super) struct WireResponse {
 
 impl WireResponse {
     pub(super) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.bytes.capacity()
+        std::mem::size_of::<Self>()
+            + self.bytes.capacity()
+            + self
+                .relay
+                .as_ref()
+                .map_or(0, super::relay::Relay::heap_bytes)
     }
 
     pub(super) fn decode(self) -> Option<CapturedResponse> {
@@ -160,6 +166,7 @@ impl Tap {
         }
         self.finished = true;
         let wire = WireResponse {
+            relay: None,
             bytes: std::mem::take(&mut self.bytes),
             sse: self.sse,
             status: self.status,
