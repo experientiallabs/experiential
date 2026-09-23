@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::budget::{self, json_bytes, optional_string_bytes, string_bytes};
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// Authority-derived tenancy; none of these values comes from a caller's metadata.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -139,9 +139,11 @@ pub(crate) struct Record<R = Response> {
     /// Exact completed tool calls, escaped once so JSONB cannot alter their text.
     pub provider_tool_calls_json: Option<String>,
     pub deployment_id: Option<String>,
+    pub canonical_model_id: Option<String>,
     pub metrics: Option<super::metrics::Metrics>,
     /// Provider parts in order; `thought: true` text is a summary, never full CoT.
     pub gemini_thought_parts: Vec<Arc<Value>>,
+    pub gemini_thought_parts_truncated: Option<bool>,
     pub gemini_thought_parts_source_json: Option<String>,
     pub captured_at: f64,
 }
@@ -208,7 +210,7 @@ impl<R: Serialize> Serialize for Record<R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let reasoning = self.durable_reasoning().map_err(S::Error::custom)?;
         let (parts, parts_source) = self.durable_gemini_parts();
-        let mut record = serializer.serialize_struct("Record", 11)?;
+        let mut record = serializer.serialize_struct("Record", 13)?;
         record.serialize_field("schema_version", &self.schema_version)?;
         record.serialize_field("request", &self.request)?;
         record.serialize_field("response", &self.response)?;
@@ -216,8 +218,13 @@ impl<R: Serialize> Serialize for Record<R> {
         record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
         record.serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
         record.serialize_field("deployment_id", &self.deployment_id)?;
+        record.serialize_field("canonical_model_id", &self.canonical_model_id)?;
         record.serialize_field("metrics", &self.metrics)?;
         record.serialize_field("gemini_thought_parts", &parts)?;
+        record.serialize_field(
+            "gemini_thought_parts_truncated",
+            &self.gemini_thought_parts_truncated,
+        )?;
         record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
         record.serialize_field("captured_at", &self.captured_at)?;
         record.end()
@@ -240,6 +247,10 @@ impl<R: Serialize> Record<R> {
             || self
                 .request
                 .model_id
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty() || value.len() > 512)
+            || self
+                .canonical_model_id
                 .as_ref()
                 .is_some_and(|value| value.trim().is_empty() || value.len() > 512)
             || self
@@ -283,6 +294,7 @@ impl Record {
                 .as_ref()
                 .map_or(0, String::capacity)
             + self.deployment_id.as_ref().map_or(0, String::capacity)
+            + self.canonical_model_id.as_ref().map_or(0, String::capacity)
             + self.gemini_thought_parts.capacity() * std::mem::size_of::<Arc<Value>>()
             + self
                 .gemini_thought_parts

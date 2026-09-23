@@ -33,8 +33,6 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
 /// again after streamed deltas, matching the Python bounded aggregator.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
-        Event::GeminiThoughtPart(part) => crate::dialects::records_retained_bytes(part)
-            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()
@@ -243,7 +241,7 @@ impl UpstreamRelay {
     }
 
     #[cfg(test)]
-    fn from_stream(
+    pub(crate) fn from_stream(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
         first_token_deadline: Instant,
@@ -286,7 +284,15 @@ impl UpstreamRelay {
     }
 
     pub(crate) fn set_observation(&mut self, observation: crate::settlement::Observation) {
+        self.normalizer.meter_gemini(observation.clone());
         self.observation = Some(observation);
+    }
+
+    pub(crate) fn set_gemini_capture(
+        &mut self,
+        observer: Option<crate::capture::reasoning::GeminiObserver>,
+    ) {
+        self.normalizer.capture_gemini(observer);
     }
 
     pub(crate) fn set_capture_reasoning(&mut self, observer: crate::capture::reasoning::Observer) {
@@ -300,20 +306,44 @@ impl UpstreamRelay {
         self.eof = true;
         // Drain only already decoded events through effective stop/tool rules.
         // This never polls the provider and retains a stop-adjusted terminal.
-        while self.guard_next_pending() {}
-        if let Some(observation) = &self.observation {
+        let mut drain_failure = None;
+        loop {
+            match self.guard_next_pending() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(failure) => {
+                    self.pending.clear();
+                    drain_failure = Some(failure);
+                    break;
+                }
+            }
+        }
+        if let Some(observation) = self.observation.take() {
             for event in &self.ready {
                 // queue_events already recorded the newest meter, folded
                 // across dials. A raw buffered report can be older or partial.
+                // Detach after observing once; ready events remain available to drain.
                 if !matches!(event, Event::Usage(_)) {
                     observation.record(event);
                 }
                 observation.record_effective_terminal(event);
             }
         }
+        if let Some(failure) = drain_failure {
+            // A conversion failure found only while closing is not a provider
+            // terminal or a complete usage meter. Keep it typed for any drain
+            // consumer without changing the guard's cancellation provenance.
+            self.ready.push_back(Event::Failed(failure));
+        }
     }
 
     fn queue_events(&mut self, events: Vec<Event>) {
+        if self.normalizer.take_gemini_progress() {
+            self.last_progress_at = Some(Instant::now());
+            if self.committed {
+                self.stall_bound_armed = false;
+            }
+        }
         if let Some(observation) = &self.observation {
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
@@ -484,9 +514,9 @@ impl UpstreamRelay {
 
     /// Move one normalized event through the stop-sequence guard (if any)
     /// onto the ready queue.
-    fn guard_next_pending(&mut self) -> bool {
+    fn guard_next_pending(&mut self) -> Result<bool, Failure> {
         let Some(mut event) = self.pending.pop_front() else {
-            return false;
+            return Ok(false);
         };
         if let (Some(provider), Event::Failed(failure)) =
             (self.customer_managed_provider.as_deref(), &event)
@@ -510,21 +540,21 @@ impl UpstreamRelay {
         // the caller's tools, so it never counts toward one-call-per-turn
         // serialization and never reaches the Codex inversion or the caller.
         let Some(mut event) = self.tool_search.filter(event) else {
-            return true;
+            return Ok(true);
         };
         if let Some(serializer) = self.tool_serializer.as_mut() {
             let Some(kept) = serializer.filter(event) else {
-                return true;
+                return Ok(true);
             };
             event = kept;
         }
-        for event in self.native_tool_inverter.filter(event) {
+        for event in self.native_tool_inverter.filter(event)? {
             match self.stop_guard.as_mut() {
                 Some(guard) => self.ready.extend(guard.filter(event)),
                 None => self.ready.push_back(event),
             }
         }
-        true
+        Ok(true)
     }
 
     /// Route an abnormal stream termination through the normalizer's recovery.
@@ -577,7 +607,7 @@ impl UpstreamRelay {
                 }
                 return Ok(Some(event));
             }
-            if self.guard_next_pending() {
+            if self.guard_next_pending()? {
                 continue;
             }
             if self.eof {

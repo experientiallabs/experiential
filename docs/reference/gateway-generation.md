@@ -117,17 +117,29 @@ facts.
 
 ## Connection loss
 
-Unkeyed Chat and Messages streams observe receiver closure while awaiting the same provider
-read. Closing the response drops the upstream transport before waiting for settlement.
+Unkeyed Chat, Messages, and Responses streams observe receiver closure while awaiting the same
+provider read. Closing the response drops the upstream transport before waiting for settlement.
 Periodic SSE comments keep a publicly silent stream active without restarting provider reads,
 changing first-token measurements, or extending provider/request deadlines.
+
+Responses WebSockets also observe close during request startup and buffered response collection.
+Follow-up requests remain sequential in a bounded FIFO, at most eight pending frames and 64 MiB
+combined. Overflow closes the connection and cancels active generation rather than dispatching
+queued requests. Pings are answered while provider output is quiet; socket writes remain within
+the request deadline. The transport's existing individual frame/message limits are unchanged.
+
+A synchronous control-plane admission callback cannot be interrupted mid-transaction. If a
+Responses WebSocket client leaves during that callback, no provider generation starts afterward;
+an accepted request whose result arrives after cancellation is cleaned up by the existing
+periodic deadline-plus-grace sweep.
 
 Closing a transport is not proof that every provider stops its own compute immediately.
 Observed usage remains billable according to the host's policy. Cancellation must never erase
 usage already parsed or override a provider terminal already observed. The settlement guard
 retains these facts across cancellation of the owning task and delivers one decided outcome.
 
-Keyed Chat owners retain their bounded replay contract after their subscriber leaves. A retry
+Keyed Chat and HTTP Responses owners retain their bounded replay contract after their
+subscriber leaves, while their captured response remains replayable. A retry
 joins or retrieves the same operation rather than dispatching a second generation. Heartbeat
 comments are not retained as replay content. Requests without an operation key are distinct
 submissions even when their prompts match; the gateway does not deduplicate unrelated callers
@@ -137,17 +149,25 @@ Some providers supply usage only at the end. A dispatched request canceled befor
 terminal is observed carries the internal `usage_incomplete_due_to_disconnect` accounting signal
 even when partial counts are known, together with the generated text observed so far
 (`streamed_output`: visible text and tool arguments in one leg, reasoning in the other, bounded
-with an overflow character count). When the provider had accepted the request (`opened`), the
-accounting registry completes the meter with the gateway's own tokenizer: the counted prompt fills
+with an overflow character count). Each repaired generation owns a separate reservation and
+settlement; its fresh meter cannot erase the prior attempt's observed or unresolved cost. When the
+provider had accepted the request (`opened`), the accounting registry completes the meter with the gateway's own tokenizer: the counted prompt fills
 a missing input total, the observed deltas fill a missing output total (reasoning folded in as an
 output subset), an observed leg is kept when it is at least the estimate, an unreported cache-read leg is
-estimated at the organization's recent cached share of input on that rung (the same settled-meter
-EWMA the cache-priority term reads; zero without a live sample), and cache-write legs stay unknown
-unless the provider reported an input total. The terminal then carries the internal
+estimated at the organization's recent cached share of input on the actual attempt's rung (the
+same observed-meter EWMA the cache-priority term reads; zero without a live sample). That fraction
+is frozen per attempt for concurrent or retained settlement retries. Imputed reads cannot overlap
+provider-reported cache writes or erase their unknown TTL cost. Reported cache legs remain intact
+even when the input total is missing; the estimated total is raised to contain those disjoint
+read/write subsets. An unreported read stays unknown when observed writes leave no room. The terminal then carries the internal
 `usage_estimated` marker and settles at the estimated cost with `usage_source = estimated`,
 releasing the rest of the reserved bound; the local gateway's monthly allocation charges the same
-figure. A disconnect the provider never answered (not opened), or one on a DECISIONS request,
-keeps the conservative policy: the full reserved bound consumes local budget, the provider cost
+figure. Known gateway web/tool-search counts survive an absent provider meter and remain
+request-level charges on the finalizing settlement only. Estimated usage cannot establish cache
+warmth or recovery success. Private Gemini thought text reaches the bounded attempt meter even
+with capture disabled; signatures are not tokens and no private metering event enters public output
+or refusal buffers. A disconnect the provider never answered (not opened), malformed or missing
+evidence, image output, or a DECISIONS request keeps the conservative policy: the full reserved bound consumes local budget, the provider cost
 stays unknown, observed partial counts remain available, and hosted accounting retains unresolved
 authorization separately from settled spend. An observed terminal with missing usage retains the
 host's unknown-terminal policy; neither marker broadens it. Stopping generation is not evidence
@@ -163,8 +183,9 @@ generations cannot acquire a known total by adding a known count to an unknown o
 ## Verification boundaries
 
 Regression coverage exercises the actual native normalizers, encoders, and served loopback
-HTTP sockets. It checks partial tools, quiet disconnects, upstream close before settlement,
-terminal precedence, parsed usage preservation, keyed replay, and heartbeat deadline behavior.
+HTTP and WebSocket connections. It checks partial tools, quiet and pre-output disconnects,
+upstream close before settlement, terminal precedence, parsed usage preservation, keyed replay,
+heartbeat deadline behavior, and bounded sequential WebSocket requests.
 These tests do not establish a real provider's cancellation guarantee. A hosted rollout also
 requires exact-version provider and ledger verification in its authorized environment.
 

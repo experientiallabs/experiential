@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.core import files as atomic_files
 from exp.common.core.files import write_bytes_atomic, write_text_atomic
 
 
@@ -23,6 +24,58 @@ def _fail_fsync(monkeypatch: pytest.MonkeyPatch, message: str = "disk full") -> 
         raise OSError(message)
 
     monkeypatch.setattr(os, "fsync", _boom)
+
+
+def test_nonwindows_replace_failure_never_uses_windows_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The open-target repair is not a generic retry or non-atomic alternate writer."""
+    if os.name == "nt":
+        pytest.skip("This test pins the non-Windows branch")
+    path = tmp_path / "state.json"
+    path.write_bytes(b"old")
+
+    def refuse(self: Path, destination: Path) -> Path:
+        """Refuse publication before any destination mutation."""
+        raise PermissionError("access denied")
+
+    def unexpected(staging: Path, destination: Path) -> None:
+        """Fail if an unrelated platform reaches the Windows-only replacement path."""
+        pytest.fail("non-Windows replacement must not call a Windows backend")
+
+    monkeypatch.setattr(Path, "replace", refuse)
+    monkeypatch.setattr(atomic_files, "_windows_replace_open_target", unexpected)
+    with pytest.raises(PermissionError, match="access denied"):
+        write_bytes_atomic(path, b"new")
+    assert path.read_bytes() == b"old"
+    assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_failed_staging_cleanup_does_not_mask_publication_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secondary cleanup failure keeps the primary write error and reports the leftover."""
+    path = tmp_path / "state.json"
+    path.write_bytes(b"old")
+    real_unlink = Path.unlink
+
+    def refuse_replace(self: Path, destination: Path) -> Path:
+        """Refuse before publication, independently of the cleanup result."""
+        raise OSError("primary publication failure")
+
+    def refuse_cleanup(self: Path, *, missing_ok: bool = False) -> None:
+        """Expose the secondary cleanup fault without mutating the destination."""
+        raise OSError("secondary cleanup failure")
+
+    monkeypatch.setattr(Path, "replace", refuse_replace)
+    monkeypatch.setattr(Path, "unlink", refuse_cleanup)
+    try:
+        with pytest.raises(OSError, match="primary publication failure"):
+            write_bytes_atomic(path, b"new")
+        assert path.read_bytes() == b"old"
+    finally:
+        for staging in tmp_path.glob("*.partial"):
+            real_unlink(staging)
 
 
 def test_write_text_atomic_writes_the_file_and_creates_its_parent(tmp_path: Path) -> None:

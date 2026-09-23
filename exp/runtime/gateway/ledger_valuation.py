@@ -11,7 +11,15 @@ from __future__ import annotations
 
 import sqlite3
 
-from exp.runtime.gateway.contracts import GatewayEvent, GatewayUsage
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayUsage,
+)
+from exp.runtime.gateway.ledger_errors import GatewayLedgerError
 
 MAXIMUM_NANO_USD = 9_223_372_036_854_775_807
 """Largest nano-USD amount the signed 64-bit ledger columns (SQLite INTEGER,
@@ -110,41 +118,84 @@ def estimated_cost_nano_usd(
     return require_representable_nano_usd((numerator + 500_000) // 1_000_000, what="attempt cost")
 
 
-def settle_pricing(
+def terminal_values(
+    terminal_event: GatewayEvent | None,
+    failure: GatewayFailure | None,
+) -> tuple[str, str | None, str | None, GatewayUsage | None]:
+    """Normalize one finish call to state, failure class, message, and usage.
+
+    The failure message is the provider's own sanitized explanation
+    (``provider_detail``); it is present only for a client-error rejection and
+    is the same bounded, credential-free sentence the caller already receives.
+    """
+    event_failure = None if terminal_event is None else terminal_event.failure
+    normalized = failure or event_failure
+    if terminal_event is None and normalized is None:
+        raise GatewayLedgerError("attempt finish needs a terminal event or failure")
+    if terminal_event is not None and terminal_event.kind not in {
+        GatewayEventKind.COMPLETED,
+        GatewayEventKind.INCOMPLETE,
+        GatewayEventKind.FAILED,
+    }:
+        raise GatewayLedgerError("attempt finish event must be terminal")
+    if normalized is not None:
+        state = (
+            "cancelled" if normalized.failure_class == GatewayFailureClass.CANCELLED else "failed"
+        )
+        return (
+            state,
+            normalized.failure_class.value,
+            normalized.provider_detail,
+            (None if terminal_event is None else terminal_event.usage),
+        )
+    assert terminal_event is not None
+    return terminal_event.kind.value, None, None, terminal_event.usage
+
+
+def observed_usage_cost(
     row: sqlite3.Row,
     usage: GatewayUsage | None,
     terminal_event: GatewayEvent | None,
-    *,
-    prefix: str,
-) -> tuple[int | None, int | None, str]:
-    """Price one settlement: ``(cost, budget_settlement, usage_source)``.
-
-    Partial disconnect usage remains evidence, not a final provider cost: its
-    counts are preserved while the conservative reserved bound is consumed
-    and the cost stays unknown. When the accounting registry completed that
-    meter with the gateway's own tokenizer (``usage_estimated``), the estimate
-    prices the work the provider billed, settles that figure and releases the
-    rest of the bound, labelled ``estimated``. Every other settlement prices
-    its observed usage, or consumes the bound when no cost can be derived.
-
-    Args:
-        row: Attempt row containing the frozen schedule and reserved bound.
-        usage: The usage the settlement carries, if any.
-        terminal_event: The terminal event, carrying the disconnect markers.
-        prefix: Column namespace of the frozen schedule.
-
-    Returns:
-        The attributed cost (or None), the budget settlement, and the label.
-    """
-    estimated = terminal_event is not None and terminal_event.usage_estimated
+) -> int | None:
+    """Price provider or explicitly estimated usage; unestimated disconnects remain unknown."""
+    threshold = optional_int(row["long_context_threshold_tokens"])
+    long_context = (
+        threshold is not None
+        and usage is not None
+        and usage.input_tokens is not None
+        and usage.input_tokens >= threshold
+    )
+    prefix = "long_context_" if long_context else ""
     partial = (
         terminal_event is not None
         and terminal_event.usage_incomplete_due_to_disconnect
-        and not estimated
+        and not terminal_event.usage_estimated
     )
-    cost = None if partial else frozen_usage_cost(row, usage, prefix=prefix)
+    return None if partial else frozen_usage_cost(row, usage, prefix=prefix)
+
+
+def budget_settlement_nano_usd(
+    row: sqlite3.Row,
+    cost: int | None,
+    usage: GatewayUsage | None,
+    terminal_event: GatewayEvent | None,
+) -> int | None:
+    """Project the conservative settlement while retaining unmetered decision liability."""
     budget_settlement = cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
-    return cost, budget_settlement, usage_source_label(usage, estimated=estimated)
+    if row["api_surface"] == GatewayApiSurface.DECISIONS.value and cost is None:
+        # An unmetered decision can still have executed upstream. Keep the
+        # reservation held without inventing usage or a settled charge.
+        # Only a witnessed HTTP rejection proves that this hold can release.
+        rejected = (
+            terminal_event is not None
+            and terminal_event.kind is GatewayEventKind.FAILED
+            and terminal_event.decision_provider_rejected
+            and usage is None
+        )
+        budget_settlement = 0 if rejected else None
+    if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
+        raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
+    return budget_settlement
 
 
 def usage_source_label(usage: GatewayUsage | None, *, estimated: bool) -> str:

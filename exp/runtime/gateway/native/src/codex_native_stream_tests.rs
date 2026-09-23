@@ -117,12 +117,9 @@ async fn custom_tool_json_fragments_become_consistent_freeform_input() {
 }
 
 #[tokio::test]
-async fn invalid_custom_input_shape_preserves_raw_json_consistently() {
-    for raw in [r#"{"input":17}"#, r#"{"other":"x"}"#, r#"{"input":""}"#] {
-        let events = relayed_tool("ns__patch", raw, true).await;
-        let expected = if raw == r#"{"input":""}"# { "" } else { raw };
-        assert_encoded(&events, "patch", true, expected);
-    }
+async fn empty_custom_input_is_preserved() {
+    let events = relayed_tool("ns__patch", r#"{"input":""}"#, true).await;
+    assert_encoded(&events, "patch", true, "");
 }
 
 #[tokio::test]

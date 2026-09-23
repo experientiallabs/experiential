@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
-from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
+from exp.common.models.catalog import (
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayTokenPrices,
+)
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.runtime.gateway.attempt_costs import maximum_attempt_cost_nano_usd
+from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScope, BudgetScopeKind
+from exp.runtime.gateway.budgets_test import _accepted_chain, _activate_chain, _authority, _Clock
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -18,6 +29,9 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
+from exp.runtime.gateway.model_plan_test import catalog as staged_catalog
+from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.native_rungs import (
     ZDR_CONSTRAINT_CAPABILITY,
     RungDispatch,
@@ -127,8 +141,151 @@ def _dispatch(
         client,
         provider_request=request,
         public_request=request,
-        authorization=_AUTHORIZATION,
+        authorization=route.snapshot.authorization,
     )
+
+
+@pytest.mark.parametrize("customer_managed", [False, True])
+@pytest.mark.parametrize("ttl", ["5m", "1h"])
+@pytest.mark.parametrize("deployment_id", ["a1", "b1"])
+@pytest.mark.parametrize("hour_rate", [None, 6_000_000])
+def test_server_tool_ttl_reaches_root_and_child_pricing_and_dispatch(
+    customer_managed: bool, ttl: str, deployment_id: str, hour_rate: int | None
+) -> None:
+    """Both stages retain server-tool TTL while reservation prices its applicable write rate."""
+    catalog = staged_catalog()
+    auth = _AUTHORIZATION.model_copy(update={"target": DirectTarget(pool_id="pool-a")})
+    snapshot = model_execution_snapshot(catalog, auth, catalog.pools[0])
+    by_id = {
+        d.deployment_id: d.model_copy(
+            update={
+                "provider": "anthropic",
+                "gateway": GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming=True, reports_cache_creation_input_tokens=True
+                    ),
+                    prices=GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=15_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_750_000,
+                        cache_creation_1h_input_nano_usd_per_million_tokens=hour_rate,
+                    ),
+                ),
+            }
+        )
+        for d in catalog.deployments
+    }
+    route = GatewayRoute(
+        snapshot=snapshot,
+        deployment=by_id["a1"],
+        fallback_deployments=(by_id["b1"], by_id["a2"]),
+        route_reason="model_chain",
+    )
+    request = decode_messages(
+        {
+            "model": "public-model",
+            "max_tokens": 32,
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "cache_control": {"type": "ephemeral", "ttl": ttl},
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).request
+    profile = replace(_profile("anthropic_messages"), billing_customer_managed=customer_managed)
+
+    def dispatch() -> RungDispatch:
+        """Drive the real per-rung serializer and final frozen dispatch boundary."""
+        return build_rung_dispatch(
+            route,
+            by_id[deployment_id],
+            profile,
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=auth,
+        )
+
+    # Serialization preserves a supported TTL. Reservation, not the serializer,
+    # owns missing-price handling and the premium ceiling on current main.
+    cost = maximum_attempt_cost_nano_usd(request, by_id[deployment_id])
+    input_rate = hour_rate if ttl == "1h" else 3_750_000
+    assert cost == (
+        None
+        if input_rate is None
+        else (worst_case_input_tokens(request) * input_rate + 32 * 15_000_000 + 999_999)
+        // 1_000_000
+    )
+    result = dispatch()
+    assert result.wire_entry["exact_model_id"] == ("a" if deployment_id == "a1" else "b")
+    payload = result.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["tools"] == list(request.provider_server_tools)
+
+
+@pytest.mark.parametrize("caller_required", [False, True])
+def test_stage_projection_preserves_zdr_host_constraints_and_child_identity(
+    caller_required: bool,
+) -> None:
+    """A narrowed child retains per-organization host constraints independently of caller demand."""
+    catalog = staged_catalog()
+    auth = _AUTHORIZATION.model_copy(
+        update={"target": DirectTarget(pool_id="pool-a"), "zdr_requested": caller_required}
+    )
+    snapshot = model_execution_snapshot(catalog, auth, catalog.pools[0]).model_copy(
+        update={
+            "zdr_constrained_deployment_ids": ("b1",),
+        }
+    )
+    by_id = {d.deployment_id: d for d in catalog.deployments}
+    child = by_id["b1"].model_copy(
+        update={
+            "provider": "openrouter",
+            "capabilities": ModelCapabilities(maximum_output_tokens=128_000),
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+            ),
+        }
+    )
+    route = GatewayRoute(
+        snapshot=snapshot,
+        deployment=by_id["a1"],
+        fallback_deployments=(child, by_id["a2"]),
+        route_reason="direct",
+    )
+    narrowed = select_route_deployments(route, (1, 2))
+    assert narrowed.snapshot.authorization.zdr_requested is caller_required
+    assert narrowed.snapshot.zdr_constrained_deployment_ids == ("b1",)
+    assert "zdr_constrained_deployment_ids" in narrowed.snapshot.model_fields_set
+    assert narrowed.snapshot.stage_for_depth(0).ancestry == ("a", "b")
+    assert project_stage_selection(narrowed.snapshot, (0,)).zdr_constrained_deployment_ids == (
+        "b1",
+    )
+    dispatch = _dispatch(narrowed, child, {"zdr": False, "data_collection": "allow"})
+    assert dispatch.wire_entry["exact_model_id"] == "b"
+    assert dispatch.wire_entry["zdr_constrained"] is True
+    payload = dispatch.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["provider"] == {"zdr": True, "data_collection": "deny"}
+    with pytest.raises(ProviderCapabilityError) as refused:
+        _dispatch(narrowed, child, dialect="openai_responses")
+    assert refused.value.capability == ZDR_CONSTRAINT_CAPABILITY
+    ordinary = narrowed.model_copy(
+        update={
+            "snapshot": narrowed.snapshot.model_copy(
+                update={
+                    "authorization": auth.model_copy(
+                        update={"organization_id": "other-org", "zdr_requested": False}
+                    ),
+                    "zdr_constrained_deployment_ids": (),
+                }
+            )
+        }
+    )
+    assert _dispatch(ordinary, child).wire_entry["zdr_constrained"] is False
 
 
 def test_a_flagged_openrouter_rung_dispatches_constrained_with_the_metadata_header() -> None:
@@ -335,6 +492,76 @@ def test_bare_enabled_thinking_with_no_room_is_refused_not_dropped(maximum: int)
         )
     assert caught.value.param == "thinking.budget_tokens"
     assert request.provider_thinking_config == {"type": "enabled"}
+
+
+@pytest.mark.parametrize("destination", ["primary", "child"])
+@pytest.mark.parametrize("hour_rate", [None, 6_000_000])
+def test_server_tool_hour_cost_cannot_bypass_root_reservation(
+    tmp_path: Path, destination: str, hour_rate: int | None
+) -> None:
+    """Actual root authority rejects unknown or premium child writes before opening an attempt."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).request
+    source = next(item for item in catalog.deployments if item.deployment_id == destination)
+    deployment = source.model_copy(
+        update={
+            "gateway": source.gateway.model_copy(
+                update={
+                    "capabilities": source.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    ),
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=15_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_750_000,
+                        cache_creation_1h_input_nano_usd_per_million_tokens=hour_rate,
+                    ),
+                }
+            )
+        }
+    )
+    five_minute_ceiling = (
+        worst_case_input_tokens(request) * 3_750_000
+        + worst_case_output_tokens(request, deployment) * 15_000_000
+        + 999_999
+    ) // 1_000_000
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool"),
+        limit_nano_usd=five_minute_ceiling,
+        strict_unknown_cost=True,
+    )
+    cost = maximum_attempt_cost_nano_usd(request, deployment)
+    assert cost is None if hour_rate is None else cost is not None and cost > five_minute_ceiling
+    with pytest.raises(BudgetReservationRejected) as rejected:
+        ledger.start_attempt(
+            snapshot=snapshot,
+            deployment=deployment,
+            attempt_ordinal=0,
+            route_depth=snapshot.deployment_ids.index(destination),
+            maximum_cost_nano_usd=cost,
+        )
+    assert rejected.value.binding is not None
+    assert rejected.value.binding.application == ("shared" if destination == "primary" else "root")
+    with ledger._connect() as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
 
 def test_every_anthropic_fallback_freezes_us_constraint_before_dispatch() -> None:

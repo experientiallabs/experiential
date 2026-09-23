@@ -139,8 +139,6 @@ impl ProviderAssistantMessagePhase {
 /// One ordered provider-neutral stream event.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// Capture-only Gemini part. Thought text is a summary; signatures are opaque.
-    GeminiThoughtPart(std::sync::Arc<Value>),
     TextDelta(String),
     /// One complete generated image, encoded as a validated inline data URL.
     Image(String),
@@ -355,15 +353,6 @@ impl Event {
             return true;
         }
         match self {
-            Event::GeminiThoughtPart(part) => {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-                    || part
-                        .get("thoughtSignature")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-            }
             Event::ThinkingSignature { signature, .. } => !signature.is_empty(),
             Event::RedactedThinking { data, .. } => !data.is_empty(),
             Event::EncryptedReasoning {
@@ -411,9 +400,6 @@ impl Event {
 /// the failure class and safe message for terminal failures.
 pub fn simplified_event(event: &Event) -> Value {
     match event {
-        Event::GeminiThoughtPart(part) => {
-            serde_json::json!({"kind": "gemini_thought_part", "part": part})
-        }
         Event::Image(url) => serde_json::json!({"kind": "image", "url": url}),
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),

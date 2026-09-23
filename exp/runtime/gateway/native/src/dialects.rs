@@ -421,6 +421,9 @@ pub struct Normalizer {
     // provider supplies no tool index; assignment order mirrors the python
     // mapper's local counter.
     gemini_tool_index: u32,
+    gemini_capture: Option<crate::capture::reasoning::GeminiObserver>,
+    gemini_meter: Option<crate::settlement::Observation>,
+    gemini_progress: bool,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
     // Caller-known label words (the dispatched model id) exempt from the
@@ -482,6 +485,9 @@ impl Normalizer {
             openai_usage: crate::events::OpenAiUsageAccumulator::default(),
             finish_reason: None,
             gemini_tool_index: 0,
+            gemini_capture: None,
+            gemini_meter: None,
+            gemini_progress: false,
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
@@ -629,17 +635,6 @@ impl Normalizer {
     /// Whether a terminal event already ended the stream.
     pub fn saw_terminal(&self) -> bool {
         self.terminal
-    }
-
-    /// Fail if the stream ended without ever producing a terminal event.
-    pub fn stream_ended(&self) -> Result<(), Failure> {
-        if self.terminal {
-            return Ok(());
-        }
-        Err(Failure::new(
-            FailureClass::MalformedResponse,
-            "provider stream ended without a terminal event",
-        ))
     }
 
     /// Recover Gemini content after a transport, frame, or decoder failure.

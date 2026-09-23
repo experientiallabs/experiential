@@ -192,6 +192,7 @@ def require_reservation_replay(
     """
     record = reservation_record(row, organization_id=request.organization_id)
     authorization = request.snapshot.authorization
+    stage = request.snapshot.stage_for_depth(request.route_depth)
     prices = request.deployment.gateway.prices
     expected = (
         authorization.request_id,
@@ -202,8 +203,8 @@ def require_reservation_replay(
         authorization.canonical_request_sha256,
         authorization.caller_operation_sha256,
         authorization.catalog_sha256,
-        request.snapshot.pool_id,
-        request.snapshot.exact_model_id,
+        stage.pool_id,
+        stage.exact_model_id,
         request.deployment.deployment_id,
         request.deployment.provider,
         request.deployment.billing_source,

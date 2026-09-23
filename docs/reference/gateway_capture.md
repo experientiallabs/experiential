@@ -36,15 +36,39 @@ inference. No session is guessed from a prompt, cache key, user or request ID.
 Other transport headers are never included in the capture document.
 
 The synchronous `write_record(str)` destination runs on a dedicated Rust-owned
-worker. Validate its input with `CaptureRecord.model_validate_json`. Schema version
-1 includes the authenticated scope, effective request, optional response, model and
-deployment provenance, and capture timestamp. The selected model is null for an
-accepted request that failed before routing. A successful exchange emits one complete
-record after both output completion and permission. A prompt-only permission emits
-only the prompt. This avoids a delayed prompt update overwriting a full response.
-A hosted collector
-does not enqueue content until terminal eligibility permits it, so queue overload
-cannot lose a BYOK deletion behind an already queued prompt.
+worker. New sinks validate schema2 with `CaptureRecord.model_validate_json`.
+For persisted schema1 or schema2 documents, use `read_capture_record_json` from
+`exp.runtime.gateway.native_capture`: it validates the selected version strictly
+and upgrades schema1 with unknown `canonical_model_id=None`. The direct schema2
+validator intentionally rejects schema1, and old strict schema1 consumers cannot
+read schema2; update consumers together with the exact engine/native pair.
+Unknown fields and versions remain errors. The effective request's `model_id`
+retains its selected root identity. Record-level `canonical_model_id` names the
+actual semantic winner, separately from the root and alongside `deployment_id`.
+Both destination fields share the same output/permission retention boundary and
+remain absent before that boundary. An accepted request that fails before routing
+has no selected root model; a legacy record never gains an inferred winner.
+
+A hosted, host-funded winner checkpoints its prompt before committed output becomes
+client-visible. This preliminary schema2 record has no response, actual winner,
+deployment, metrics or Gemini truncation assertion. The terminal update supplies
+permitted response evidence and provenance later. BYOK winners do not checkpoint;
+local collectors retain their completed-exchange flow. Destinations must recheck live
+consent and merge updates idempotently, never allowing a late prompt-only update to
+erase a stored response. Terminal denial alone cannot retract an earlier durable
+checkpoint; the destination owns that live privacy enforcement. This is a required
+hosted consumer behavior, not an append-only one-record-per-request contract.
+
+An accepted checkpoint and any terminal update racing it retain the same request's
+admission count and byte charge through their acknowledgements. Waiting updates use
+the existing destination worker, with no thread or blocking task per request. The
+request awaits a cancellable receipt bounded by its original deadline; cancellation
+closes the provider transport and settles the attempt without waiting for storage.
+The accepted capture jobs remain bounded and retryable after the caller leaves.
+A close timeout reports unfinished capture rather than purging accepted content.
+No-capture requests and local SQLite collection do not enter this checkpoint path.
+The native request envelope defaults to 4 MiB; `CaptureController` no longer accepts
+a separate `maximum_request_bytes` argument. Configure that bound on the collector.
 
 Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
 JSON bodies and ordered SSE data payloads retain unknown fields. The observation
@@ -61,6 +85,12 @@ only an opaque continuation. Private provider reasoning is not decrypted for
 capture. Capture permission never grants permission to expose hidden reasoning.
 Reasoning is optional for every provider, including open models. Its absence never
 rejects capture or inference; preserve returned evidence without inventing it.
+Gemini thought parts use only the registered capture record's bounded evidence budget,
+not inference output or refusal buffers. With capture disabled they are not retained.
+`gemini_thought_parts_truncated=true` marks omitted over-budget evidence while inference
+continues without an extra provider attempt. False means no truncation was observed;
+null means unknown or not permitted, including schema1 reads. The marker is removed
+with response-only evidence when retention denies that response.
 `provider_tool_calls_json` retains completed calls as escaped JSON, including exact
 argument text even when Messages presents the arguments as a parsed input object.
 Chat tool turns on exposure-enabled routes return plaintext without appending
@@ -93,6 +123,11 @@ incorrect receipt count acknowledge nothing. Failed members retain the exact sam
 prepared string object; acknowledged members are released independently.
 Once preparation succeeds, the redundant decoded record tree is released before
 preparing the next member. Its admission charge remains until acknowledgement.
+A preparation failure stops further decoding and batch gathering until that record
+can prepare. It retains the sole decoded response workspace across retries; later
+accepted records stay compact and charged in the queue. Already-prepared neighbors
+still receive independent acknowledgements. This does not promise progress past an
+unpreparable record or count the separately bounded decoded workspace as queue bytes.
 
 Batches gather only already queued work, with no fill delay, up to 64 records.
 Gathering stops after reaching a soft 1 MiB encoded-byte target; its final record

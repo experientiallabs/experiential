@@ -12,13 +12,12 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Protocol
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, stable_id
+from exp.common.core.artifacts import ContractModel
 from exp.common.models import ModelRequest
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
-    is_foreign_snapshot,
 )
 from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import (
@@ -31,6 +30,16 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
+from exp.runtime.gateway.model_plan import (
+    _CatalogView,
+    _index_catalogs,
+    model_execution_snapshot,
+    project_stage_selection,
+    stage_start_authorized,
+)
+from exp.runtime.gateway.project_episode_identity import (
+    project_episode_identity as project_episode_identity,
+)
 from exp.runtime.gateway.request_policy import RequestedRouteId
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -115,14 +124,21 @@ class GatewayRoute(ContractModel):
 class RouteResolver(Protocol):
     """Structural contract for the gateway's authorized route resolver.
 
-    ``CatalogRouteResolver`` is the engine's implementation; a platform wrapper
-    that composes or delegates to it annotates itself against this Protocol so
-    ``ty`` statically catches a missing or drifted resolution method instead of
-    surfacing it at runtime. It captures ONLY the public resolution seam — the
-    three ways an authorization becomes a frozen :class:`GatewayRoute`; the
-    catalog-swap, metadata, and lifecycle methods are implementation detail and
-    deliberately excluded so a wrapper need not re-expose them.
+    Platform wrappers can delegate to ``CatalogRouteResolver`` and annotate
+    themselves against this protocol to catch missing or drifted methods.
+    The seam includes selected-root classification before serving authorization
+    and the three ways authority becomes a frozen :class:`GatewayRoute`.
+    Catalog-swap, listing metadata, and lifecycle methods remain private.
     """
+
+    def requires_model_chain_authority(self, authorization: AuthorizationSnapshot) -> bool:
+        """Classify the selected root in its exact revision before acceptance or replay.
+
+        Wrappers must delegate classification to their catalog authority and
+        propagate invalid or missing catalog errors. This result identifies
+        required host enforcement; it does not itself grant serving permission.
+        """
+        ...
 
     def resolve_direct(self, authorization: AuthorizationSnapshot) -> GatewayRoute:
         """Resolve one direct-target authorization without event-loop work."""
@@ -145,15 +161,6 @@ class RouteResolver(Protocol):
     ) -> GatewayRoute:
         """Resolve one project target from a caller thread without an event loop."""
         ...
-
-
-@dataclass(frozen=True)
-class _CatalogView:
-    """One revision-scoped catalog plus its indexed pools and deployments."""
-
-    catalog: NormalizedGatewayCatalog
-    pools: Mapping[str, ExactModelPool]
-    deployments: Mapping[str, ExactModelDeployment]
 
 
 class CatalogRouteResolver:
@@ -360,6 +367,19 @@ class CatalogRouteResolver:
             fallback_reason=selection.fallback_reason,
         )
 
+    def requires_model_chain_authority(self, authorization: AuthorizationSnapshot) -> bool:
+        """Classify the exact selected root, not unrelated models in the shared catalog."""
+        view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
+        if view is None:
+            raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+        if isinstance(authorization.target, ProjectTarget):
+            if authorization.target.catalog_sha256 != authorization.catalog_sha256:
+                raise GatewayRoutingError(
+                    "project target catalog differs from authorized authority"
+                )
+            return False
+        return view.catalog.requires_model_chain_authority(pool_id=authorization.target.pool_id)
+
     def resolve_direct(self, authorization: AuthorizationSnapshot) -> GatewayRoute:
         """Resolve one direct-target authorization without event-loop work.
 
@@ -399,12 +419,10 @@ class CatalogRouteResolver:
     ) -> GatewayRoute:
         """Resolve one untrusted carrier hint only inside current alias authority.
 
-        The ``deployment_id`` MUST be a CANONICAL pool member of the authorized
-        alias revision: pool membership is checked against ``pool.deployment_ids``,
-        which names canonicals only, so a BYOK or org-variant deployment id will
-        NOT resolve here. Mapping a variant back to its canonical is the CALLER
-        resolver's responsibility; this method receives an already-canonical id
-        and fails closed on anything the current authority's pools do not name.
+        Hints must name a canonical deployment in the authorized revision's
+        reachable pools. BYOK and organization variant IDs do not resolve here:
+        the caller must first map them to canonical IDs. Catalog membership
+        never substitutes for explicit authority to start on a child model.
 
         Args:
             authorization: Frozen authenticated alias revision and target.
@@ -412,26 +430,35 @@ class CatalogRouteResolver:
                 continuation, resolved only within the authorized revision.
 
         Returns:
-            The pool's ordered ladder with the hinted deployment dispatched
-            first and ``reasoning_pinned_deployment_id`` naming it. The pool's
-            remaining certified deployments follow in pool order as failover
-            fallbacks: each ``requires_reasoning_strip`` because only the
-            issuing rung's credential can unseal the request's active reasoning,
-            so a failover-eligible operational failure on the pinned rung
-            (throttle, provider quota, unavailability, transport) continues on
-            them without the sealed blocks instead of surfacing after one
-            attempt. A single-deployment pool yields no fallbacks.
+            The issuing rung first, followed by its permitted forward suffix.
+            Other rungs require reasoning stripping: only the issuer can unseal
+            the active reasoning. Eligible operational failures may continue
+            without it; a singleton has no fallback. Child starts require the
+            host's explicit root funding and policy authorization.
 
         Raises:
-            GatewayRoutingError: The snapshot is inactive, the id is not an
-                unambiguous canonical pool member, or its identity is invalid.
+            GatewayRoutingError: Snapshot, membership, identity, or child-start
+                authority is invalid.
         """
         view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
         if view is None:
             raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
         target = authorization.target
         if isinstance(target, DirectTarget):
-            pools = (self._pool(view, target.pool_id),)
+            root_pool = self._pool(view, target.pool_id)
+            plan = model_execution_snapshot(
+                view.catalog, authorization, root_pool, chains=view.chains, pools=view.pools
+            )
+            if deployment_id not in plan.deployment_ids:
+                raise GatewayRoutingError(
+                    "reasoning carrier deployment is not reachable in current authority"
+                )
+            stage = plan.stage_for_depth(plan.deployment_ids.index(deployment_id))
+            if not stage_start_authorized(plan, stage):
+                raise GatewayRoutingError(
+                    "descendant reasoning start requires explicit authorization"
+                )
+            pools = (self._pool(view, stage.pool_id),)
         else:
             if target.catalog_sha256 != authorization.catalog_sha256:
                 raise GatewayRoutingError(
@@ -451,26 +478,25 @@ class CatalogRouteResolver:
         deployment = view.deployments.get(deployment_id)
         if deployment is None or deployment.exact_model_id != pool.exact_model_id:
             raise GatewayRoutingError("reasoning carrier deployment identity is invalid")
-        # The pool's normal ladder minus the issuing rung, in pool order, so a
-        # failover past the pin walks the same rungs a fresh request would.
-        fallbacks: list[ExactModelDeployment] = []
-        for fallback_id in pool.deployment_ids:
-            if fallback_id == deployment_id:
-                continue
-            fallback = view.deployments.get(fallback_id)
-            if fallback is None or fallback.exact_model_id != pool.exact_model_id:
-                raise GatewayRoutingError("frozen pool deployment identity is invalid")
-            fallbacks.append(fallback)
+        if not isinstance(target, DirectTarget):
+            plan = model_execution_snapshot(
+                view.catalog, authorization, pool, chains=view.chains, pools=view.pools
+            )
+        pinned_depth = plan.deployment_ids.index(deployment_id)
+        if plan.model_stages:
+            # A pin may lead its own segment, never resurrect preceding ancestors.
+            pinned_stage = plan.stage_for_depth(pinned_depth).stage_index
+            eligible = tuple(
+                i
+                for i in range(len(plan.deployment_ids))
+                if plan.stage_for_depth(i).stage_index >= pinned_stage and i != pinned_depth
+            )
+        else:
+            eligible = tuple(i for i in range(len(plan.deployment_ids)) if i != pinned_depth)
+        snapshot = project_stage_selection(plan, (pinned_depth, *eligible))
+        fallbacks = [view.deployments[d] for d in snapshot.deployment_ids[1:]]
         return GatewayRoute(
-            snapshot=ExecutionSnapshot(
-                authorization=authorization,
-                exact_model_id=pool.exact_model_id,
-                pool_id=pool.pool_id,
-                deployment_ids=(deployment_id, *(item.deployment_id for item in fallbacks)),
-                failover_mode=pool.failover_mode,
-                throttle_cache_threshold=pool.throttle_cache_threshold,
-                throttle_redial=pool.throttle_redial,
-            ),
+            snapshot=snapshot,
             deployment=deployment,
             fallback_deployments=tuple(fallbacks),
             route_reason=REASONING_CONTINUATION_ROUTE_REASON,
@@ -541,82 +567,28 @@ class CatalogRouteResolver:
         fallback_reason: str | None,
     ) -> GatewayRoute:
         """Build one ordered execution route from a certified exact-model pool."""
+        try:
+            snapshot = model_execution_snapshot(
+                view.catalog, authorization, pool, chains=view.chains, pools=view.pools
+            )
+        except ValueError as exc:
+            raise GatewayRoutingError(str(exc)) from exc
         deployments: list[ExactModelDeployment] = []
-        for deployment_id in pool.deployment_ids:
+        for depth, deployment_id in enumerate(snapshot.deployment_ids):
             deployment = view.deployments.get(deployment_id)
-            if deployment is None or deployment.exact_model_id != pool.exact_model_id:
+            if (
+                deployment is None
+                or deployment.exact_model_id != snapshot.stage_for_depth(depth).exact_model_id
+            ):
                 raise GatewayRoutingError("frozen pool deployment identity is invalid")
             deployments.append(deployment)
         return GatewayRoute(
-            snapshot=ExecutionSnapshot(
-                authorization=authorization,
-                exact_model_id=pool.exact_model_id,
-                pool_id=pool.pool_id,
-                deployment_ids=pool.deployment_ids,
-                failover_mode=pool.failover_mode,
-                throttle_cache_threshold=pool.throttle_cache_threshold,
-                throttle_redial=pool.throttle_redial,
-            ),
+            snapshot=snapshot,
             deployment=deployments[0],
             fallback_deployments=tuple(deployments[1:]),
             route_reason=route_reason,
             fallback_reason=fallback_reason,
         )
-
-
-def _index_catalogs(
-    catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
-) -> dict[tuple[str, str], _CatalogView]:
-    """Index digest-verified catalogs by alias revision and catalog digest.
-
-    The pinned ``catalog_sha256`` stays the identity/attribution key for every
-    revision. A same-version catalog must reproduce it exactly, so a mismatch is
-    corruption and still raises. A cross-version snapshot (served through the
-    hydration reader's tolerant path during a rolling deploy) is expected not to
-    reproduce it; that catalog is indexed under its pinned digest without the
-    byte-exact check, so a roll never hard-fails route resolution.
-
-    Args:
-        catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
-
-    Returns:
-        Fully built revision-scoped catalog views.
-
-    Raises:
-        ValueError: A same-version catalog does not match its declared digest.
-    """
-    indexed: dict[tuple[str, str], _CatalogView] = {}
-    # A repoint mints every alias key against ONE immutable catalog object
-    # (hundreds of keys per snapshot in production), and identity_sha256
-    # re-hashes the whole multi-megabyte document, so the digest is computed
-    # once per distinct object and compared per key; the frozen view is built
-    # and shared once per object too. Per-key hashing made one state build
-    # re-hash the same 6.5 MB catalog 732 times (~35 s of a ~51 s build).
-    # Object ids are stable here because ``catalogs`` keeps every catalog
-    # alive for the whole loop.
-    identity_by_object: dict[int, str] = {}
-    view_by_object: dict[int, _CatalogView] = {}
-    for key, catalog in catalogs.items():
-        revision_id, catalog_sha256 = key
-        if not is_foreign_snapshot(catalog):
-            identity = identity_by_object.get(id(catalog))
-            if identity is None:
-                identity = catalog.identity_sha256()
-                identity_by_object[id(catalog)] = identity
-            if identity != catalog_sha256:
-                raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
-        view = view_by_object.get(id(catalog))
-        if view is None:
-            view = _CatalogView(
-                catalog=catalog,
-                pools={pool.pool_id: pool for pool in catalog.pools},
-                deployments={
-                    deployment.deployment_id: deployment for deployment in catalog.deployments
-                },
-            )
-            view_by_object[id(catalog)] = view
-        indexed[key] = view
-    return indexed
 
 
 @dataclass(frozen=True)
@@ -968,26 +940,3 @@ def _consume_abandoned_selection[SelectionT](wrapped: asyncio.Future[SelectionT]
     """Retrieve a detached selection outcome so late failures are not logged as leaks."""
     if not wrapped.cancelled():
         wrapped.exception()
-
-
-def project_episode_identity(
-    namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
-) -> str:
-    """Encode tenant-scoped episode components without delimiter collisions.
-
-    Args:
-        namespace: Organization, identity, alias revision, and caller episode key.
-
-    Returns:
-        Stable content-addressed identity with explicit component boundaries.
-    """
-    organization_id, identity_id, alias_revision_id, episode_key = namespace
-    return stable_id(
-        "gateway-project-episode",
-        {
-            "organization_id": organization_id,
-            "identity_id": identity_id,
-            "alias_revision_id": alias_revision_id,
-            "episode_key": episode_key,
-        },
-    )

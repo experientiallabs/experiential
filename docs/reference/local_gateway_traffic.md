@@ -90,6 +90,16 @@ post-guardrail expanded messages, provider-significant context and public respon
 Transport authorization and resolved provider secrets are never copied. Prompt
 content itself can contain sensitive information and is not automatically redacted.
 
+The SQLite payload uses the strict `CapturedExchange` schema1 envelope, not the
+native hosted `CaptureRecord` schema2 envelope. Its existing open
+`request.exp_capture_output` map carries `canonical_model_id` and nullable
+`gemini_thought_parts_truncated` alongside response evidence. `provenance.model_id`
+remains the selected root, never the fallback winner. The gateway ingestion consumer
+validates the optional winner and truncation types, exposes the actual canonical
+model separately in trace context, and leaves historical missing facts unknown.
+Native schema1/2 archives use the separate explicit `read_capture_record_json`
+reader; local SQLite payloads are not passed through that reader.
+
 The reader exposes observed assistant/tool-call/result sequences and retains the
 original request/response context. A model completion is not proof of task success.
 Missing context or unsupported output is excluded with a reason, not repaired.

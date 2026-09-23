@@ -747,7 +747,7 @@ def _assert_persistent_primary_failure_fails_over_to_the_second_deployment(
     twice (its bounded cap) before failover; the terminal attempt completes
     on route depth one and the response carries the winning deployment's
     output and route headers. The two operational failures open the primary's
-    health circuit, which the streaming scenario below observes.
+    health circuit; other tests must establish their own circuit preconditions.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -794,10 +794,13 @@ def _assert_streaming_request_skips_the_open_primary_circuit(
 def _assert_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None:
     """Every accepted request settles: no open attempts, matched totals.
 
-    Runs last in the scenario chain, so it sees
-    the traffic of every scenario above plus its own success probe, which the
-    still-open primary circuit routes to the fallback in one dispatch.
+    Runs last in the scenario chain, so it sees the traffic of every scenario
+    above plus its own success probe, which the still-open primary circuit
+    routes to the fallback in one dispatch. The probe adds exactly one request
+    and attempt; aggregate terminal attempts match the durable closed count.
     """
+    before = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
+    before_attempts = sum(int(count["attempts"]) for count in before["totals"]["terminal_counts"])
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
         headers={"authorization": f"Bearer {engine.raw_key}"},
@@ -806,17 +809,23 @@ def _assert_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> N
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
+    rows = _attempt_rows(engine, response.headers["x-request-id"])
+    assert rows == [(0, 1, "completed")]
+    assert report["totals"]["requests"] == before["totals"]["requests"] + 1
     # Eight scenario requests, the integer-timestamp scenario's two, the
     # output-less continuation scenario's four (two first turns and their two
     # continuations), and this probe.
     assert report["totals"]["requests"] == 15
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
+        (total_requests,) = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
         (open_attempts,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
+    assert total_requests == report["totals"]["requests"] == 15
     assert open_attempts == 0
+    assert terminal_attempts == total_attempts == before_attempts + 1
     # Fifteen single-dispatch requests plus the five extra physical attempts
     # the redial, empty-completion, and failover scenarios spend.
     assert terminal_attempts == total_attempts == 20

@@ -99,6 +99,197 @@ impl Sink for HeldSink {
     }
 }
 
+#[test]
+fn failed_node_heavy_wire_preparation_owns_only_one_decoded_workspace() {
+    use crate::capture::delivery::Delivery;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    struct RecoveringBatch {
+        seen: Arc<Mutex<HashMap<String, (usize, usize)>>>,
+        writes: mpsc::Sender<Vec<String>>,
+        first_write: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        recover: Arc<AtomicBool>,
+        retried_first: bool,
+    }
+    impl Sink for RecoveringBatch {
+        type Prepared = String;
+
+        fn preparation_bytes(maximum: usize) -> usize {
+            (maximum + 1024 * 1024) * 5 + 64 * 256
+        }
+
+        fn batch_records(&self) -> usize {
+            64
+        }
+
+        fn batch_bytes(&self) -> usize {
+            1024 * 1024
+        }
+
+        fn prepared_bytes(&self, value: &String) -> usize {
+            value.len()
+        }
+
+        fn prepare(&self, record: &Record, maximum: usize) -> Result<String, ()> {
+            let id = &record.request.request_id;
+            if id != "good" {
+                let Some(CapturedResponse::Json { body, .. }) = &record.response else {
+                    panic!("actual WireResponse must decode before preparation")
+                };
+                let nodes = body["nodes"].as_array().unwrap();
+                assert_eq!(nodes.len(), 16384);
+                assert!(nodes.iter().all(|node| node == &json!(0)));
+                assert!(
+                    record.encode(maximum).is_none(),
+                    "genuine encoded record overflow"
+                );
+                let mut seen = self.seen.lock().unwrap();
+                let entry = seen
+                    .entry(id.clone())
+                    .or_insert((nodes.as_ptr() as usize, 0));
+                assert_eq!(
+                    entry.0,
+                    nodes.as_ptr() as usize,
+                    "retry replaced accepted data"
+                );
+                entry.1 += 1;
+                if !self.recover.load(Ordering::Acquire) {
+                    return Err(());
+                }
+                // A recovered test destination acknowledges a deliberate policy
+                // exclusion only after rechecking every retained input element.
+            }
+            Ok(id.clone())
+        }
+
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            unreachable!("batch destination")
+        }
+
+        fn write_batch(&mut self, records: &[&String]) -> Vec<bool> {
+            if !self.retried_first {
+                self.retried_first = true;
+                self.first_write.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                return vec![false; records.len()];
+            }
+            self.writes
+                .send(records.iter().map(|value| (*value).clone()).collect())
+                .unwrap();
+            vec![true; records.len()]
+        }
+    }
+
+    let (body_owner, _) = collector(65536);
+    let seen = Arc::new(Mutex::new(HashMap::new()));
+    let recover = Arc::new(AtomicBool::new(false));
+    let (written, writes) = mpsc::channel();
+    let (started, first_write) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let maximum_bytes = 8 * 1024 * 1024;
+    let delivery = Arc::new(
+        Delivery::new(
+            Limits {
+                maximum_records: 64,
+                maximum_bytes,
+                maximum_record_bytes: 4096,
+            },
+            RecoveringBatch {
+                seen: seen.clone(),
+                writes: written,
+                first_write: started,
+                release: held,
+                recover: recover.clone(),
+                retried_first: false,
+            },
+        )
+        .unwrap(),
+    );
+    let input = |id: String| -> Record {
+        serde_json::from_value(json!({
+            "schema_version":2,"request":{"request_id":id,
+                "scope":{"organization_id":"org","identity_id":"identity","application_id":"app"},
+                "protocol":"chat_completions","model_id":"root",
+                "context":{"schema_version":1,"request":{}}},
+            "response":null,"deployment_id":null,"metrics":null,"gemini_thought_parts":[],
+            "captured_at":1.0
+        }))
+        .unwrap()
+    };
+    let target = delivery.clone();
+    let mut producers = vec![std::thread::spawn(move || {
+        target.submit_wait(input("good".into()), None)
+    })];
+    first_write.recv_timeout(Duration::from_secs(2)).unwrap();
+    let wire = serde_json::to_vec(&json!({"nodes":vec![0;16384]})).unwrap();
+    for index in 0..16 {
+        let target = delivery.clone();
+        let response = WireResponse {
+            bytes: wire.clone(),
+            sse: false,
+            status: 200,
+            truncated: false,
+            disconnected: false,
+            maximum_bytes: 65536,
+            _charge: BodyCharge {
+                collector: body_owner.clone(),
+                bytes: 0,
+                _permit: None,
+            },
+        };
+        producers.push(std::thread::spawn(move || {
+            target.submit_wait(input(format!("heavy-{index}")), Some(response))
+        }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while delivery.counts()[0] != 17 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let queued = delivery.counts()[0];
+    release.send(()).unwrap();
+    let healthy_ack = writes.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while seen
+        .lock()
+        .unwrap()
+        .values()
+        .map(|(_, attempts)| attempts)
+        .sum::<usize>()
+        < 3
+        && Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let blocked_workspaces = seen.lock().unwrap().len();
+    let blocked_counts = delivery.counts();
+    let drained_while_failed = delivery.close_until(Instant::now());
+    recover.store(true, Ordering::Release);
+    for producer in producers {
+        assert!(producer.join().unwrap());
+    }
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(2)));
+    body_owner.settle("request", false, false);
+    assert!(body_owner.close_until(Instant::now() + Duration::from_secs(1)));
+    let remaining: Vec<_> = writes.try_iter().flatten().collect();
+    assert_eq!(queued, 17);
+    assert_eq!(healthy_ack, ["good"]);
+    assert_eq!(
+        blocked_workspaces, 1,
+        "failed batches retained multiple decoded workspaces"
+    );
+    assert_eq!(blocked_counts[0], 16);
+    assert!(blocked_counts[1] <= maximum_bytes as u64);
+    assert_eq!(blocked_counts[2], 1);
+    assert!(!drained_while_failed);
+    assert_eq!(seen.lock().unwrap().len(), 16);
+    assert_eq!(remaining.len(), 16);
+    assert_eq!(remaining.iter().collect::<HashSet<_>>().len(), 16);
+    assert_eq!(delivery.counts()[0..3], [0, 0, 17]);
+    assert_eq!(delivery.counts()[4], 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stalled_writer_backpressures_complete_responses_without_blocking_the_runtime() {
     for fail in [false, true] {

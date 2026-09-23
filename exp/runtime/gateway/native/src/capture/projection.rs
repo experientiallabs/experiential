@@ -193,7 +193,7 @@ mod tests {
 
     fn record(response: Value) -> Record {
         serde_json::from_value(json!({
-            "schema_version": 1, "request": {
+            "schema_version": super::super::record::SCHEMA_VERSION, "request": {
                 "request_id": "request", "scope": {"organization_id":"org",
                     "identity_id":"identity", "application_id":"app"},
                 "protocol":"responses", "model_id":"model",

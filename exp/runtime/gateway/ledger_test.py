@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +46,11 @@ from exp.runtime.gateway.ledger import (
     SQLiteAttemptLedger,
 )
 from exp.runtime.gateway.ledger_valuation import frozen_usage_cost
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
+from exp.runtime.gateway.native_execution import InflightRequest, rung_load_key
+from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
+from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 _CATALOG_DIGEST = "a" * 64
@@ -322,6 +328,159 @@ def test_estimated_disconnect_usage_settles_at_its_priced_cost(
     observed = ledger.usage(organization_id="org-one")[0]
     assert observed.known_estimated_cost_nano_usd == priced
     assert observed.unknown_cost_attempts == 0
+
+
+@pytest.mark.parametrize("retry", ["direct", "sweep"])
+@pytest.mark.parametrize("hour_tokens", [None, 0, 800])
+@pytest.mark.parametrize("reported_input", [True, False])
+def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry: str,
+    hour_tokens: int | None,
+    reported_input: bool,
+) -> None:
+    """Unknown write TTL keeps the full bound; known writes cannot become discounted reads."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=5_000,
+    )
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_nano_usd_per_million_tokens=2_000_000,
+                    cached_input_nano_usd_per_million_tokens=100_000,
+                    cache_creation_input_nano_usd_per_million_tokens=2_500_000,
+                    cache_creation_1h_input_nano_usd_per_million_tokens=4_000_000,
+                    output_nano_usd_per_million_tokens=1_000_000,
+                )
+            )
+        }
+    )
+    request = _request("disconnect with provider cache writes")
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    snapshot = _execution(authorization)
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=4_000,
+    )
+    accounting = NativeAttemptAccounting(ledger, recovery_host=RecoveryHostFake())
+    entry = InflightRequest(
+        authorization=authorization,
+        route=GatewayRoute(snapshot=snapshot, deployment=deployment, route_reason="direct"),
+        request=request,
+        deadline_monotonic=time.monotonic() + 30,
+        attempt_depths={attempt_id: 0},
+        active_attempt_id=attempt_id,
+    )
+    accounting.register(entry)
+    accounting.loads.record_settle(
+        rung_load_key(deployment),
+        authorization.organization_id,
+        cached_tokens=1_000,
+        input_tokens=1_000,
+    )
+
+    def reject_estimated_sample(
+        key: RungLoadKey, organization_id: str, *, cached_tokens: int, input_tokens: int
+    ) -> None:
+        """Estimated cache reads must never update the observed fairness/cache registry."""
+        pytest.fail("estimated settlement created observed cache evidence")
+
+    monkeypatch.setattr(accounting.loads, "record_settle", reject_estimated_sample)
+    payload = json.dumps(
+        {
+            "request_id": authorization.request_id,
+            "attempt_id": attempt_id,
+            "outcome": "failed",
+            "failure": {"failure_class": "cancelled", "safe_message": "cut"},
+            "usage": {
+                "input_tokens": 1_000 if reported_input else None,
+                "output_tokens": 1,
+                "cache_creation_input_tokens": 800,
+                "cache_creation_1h_input_tokens": hour_tokens,
+            },
+            "opened": True,
+            "dispatched": True,
+            "finalize": True,
+            "usage_incomplete_due_to_disconnect": True,
+            "streamed_output": {"text": "partial"},
+        }
+    )
+    if retry == "sweep":
+        with sqlite3.connect(store.database_path) as connection:
+            connection.execute(
+                "CREATE TRIGGER fail_once BEFORE UPDATE ON gateway_attempts "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic blocked write'); END"
+            )
+        with pytest.raises(NativeBridgeError):
+            accounting.settle(payload)
+        with sqlite3.connect(store.database_path) as connection:
+            connection.execute("DROP TRIGGER fail_once")
+        accounting.sweep_expired()
+    else:
+        accounting.settle(payload)
+    accounting.settle(payload)
+    cost = None if hour_tokens is None else (2_001 if hour_tokens == 0 else 3_201)
+    if cost is not None and reported_input:
+        cost += 20
+    settled = 4_000 if cost is None else cost
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT input_tokens, cached_input_tokens, cache_creation_input_tokens, "
+            "cache_creation_1h_input_tokens, usage_source, estimated_cost_nano_usd, "
+            "budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        assert row == (
+            1_000 if reported_input else 800,
+            200 if reported_input else None,
+            800,
+            hour_tokens,
+            "estimated",
+            cost,
+            settled,
+        )
+        assert connection.execute(
+            "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges"
+        ).fetchone() == (4_000, settled)
+    remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert remaining.charged_nano_usd == settled
+    assert remaining.remaining_nano_usd == 5_000 - settled
+    assert ledger.usage(organization_id="org-one")[0].unknown_cost_attempts == int(cost is None)
+    assert not entry.cache_recorded_attempts and not entry.recovery_recorded_attempts
+    assert not accounting.recovery._sessions
+    if cost is None:
+        second = store.authorize_request(
+            raw_key=key,
+            alias="coding",
+            request=request,
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        ledger.accept_request(authorization=second)
+        with pytest.raises(BudgetReservationRejected):
+            ledger.start_attempt(
+                snapshot=_execution(second),
+                deployment=deployment,
+                attempt_ordinal=0,
+                route_depth=0,
+                maximum_cost_nano_usd=1_001,
+            )
 
 
 @pytest.mark.parametrize(

@@ -387,7 +387,7 @@ impl Normalizer {
                         phase: None,
                     });
                     events.push(Event::ToolCallStarted {
-                        custom: false,
+                        custom: true,
                         index,
                         call_id,
                         name,

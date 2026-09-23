@@ -130,6 +130,55 @@ def test_gateway_capture_exports_only_current_turn_metrics(tmp_path: Path) -> No
     assert all(other.attributes["exp.source.time.synthetic"] for other in historical)
 
 
+@pytest.mark.parametrize("winner", ["worker", "child-model", None])
+@pytest.mark.parametrize("truncated", [True, False, None])
+def test_gateway_capture_preserves_root_winner_and_nullable_omission(
+    tmp_path: Path, winner: str | None, truncated: bool | None
+) -> None:
+    """Scoped persisted evidence never infers a winner or an absent truncation fact."""
+    experience = _experience()
+    output = {"canonical_model_id": winner, "gemini_thought_parts_truncated": truncated}
+    request = {**experience.request, "exp_capture_output": output}
+    path = tmp_path / "traffic.db"
+    _database(path, (experience.model_copy(update={"request": request}),))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues and len(result.traces) == 1
+    context = result.traces[0].initial_context
+    assert context["model_id"] == "worker"
+    assert context["canonical_model_id"] == winner
+    assert context["capture_output"] == output
+    assert load_gateway_capture(path, identity_id="another").traces == ()
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"canonical_model_id": 1},
+        {"canonical_model_id": " "},
+        {"canonical_model_id": "x" * 513},
+        {"gemini_thought_parts_truncated": 1},
+        {"gemini_thought_parts_truncated": "false"},
+    ],
+)
+def test_gateway_capture_rejects_untyped_winner_or_omission(
+    tmp_path: Path, output: dict[str, str | int]
+) -> None:
+    """Malformed optional evidence excludes the record instead of coercing its facts."""
+    experience = _experience()
+    path = tmp_path / "traffic.db"
+    _database(
+        path,
+        (
+            experience.model_copy(
+                update={"request": {**experience.request, "exp_capture_output": output}}
+            ),
+        ),
+    )
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.traces
+    assert len(result.issues) == 1
+
+
 def test_reopened_capture_preserves_tools_and_pairs_results_without_claiming_success(
     tmp_path: Path,
 ) -> None:
@@ -146,6 +195,9 @@ def test_reopened_capture_preserves_tools_and_pairs_results_without_claiming_suc
     assert trace.outcome is None
     assert trace.conversation_id is None
     assert trace.initial_context["identity_id"] == "developer"
+    assert trace.initial_context["model_id"] == "worker"
+    assert trace.initial_context["canonical_model_id"] is None
+    assert trace.initial_context["capture_output"] is None
     assert any(span.attributes.get("gen_ai.tool.message") == "Record A" for span in trace.spans)
     assert load_gateway_capture(path, identity_id="absent").traces == ()
 

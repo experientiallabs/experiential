@@ -93,7 +93,7 @@ fn locked_sqlite_and_lost_ack_retry_one_payload_without_losing_conversation() {
     let reader = Connection::open(&path).unwrap();
     reader.execute_batch("BEGIN IMMEDIATE").unwrap();
     let record: Record = serde_json::from_value(json!({
-        "schema_version":1,"request":{"request_id":"request",
+        "schema_version":super::super::record::SCHEMA_VERSION,"request":{"request_id":"request",
         "scope":{"organization_id":"org","identity_id":"user","application_id":"app"},
         "protocol":"responses","model_id":"model","context":{"schema_version":1,
         "session_id":"harness-episode", "request":{"messages":[

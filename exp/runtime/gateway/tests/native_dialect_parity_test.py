@@ -78,7 +78,6 @@ _GEMINI_RAW_ARGUMENTS = '{"city":"Zürich","count":2}'
 
 GEMINI_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
     {"kind": "text_delta", "text": "Hel"},
-    {"kind": "gemini_thought_part", "part": {"thought": True, "text": "hidden reasoning"}},
     {"kind": "text_delta", "text": "lo"},
     {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"},
     {"kind": "tool_arguments_delta", "index": 0, "text": _GEMINI_RAW_ARGUMENTS},

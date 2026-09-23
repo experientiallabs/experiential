@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import assert_never
 
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
@@ -9,6 +10,27 @@ from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayReques
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+
+
+def caller_operation_sha256(request: GatewayRequest) -> Sha256 | None:
+    """Hash an opted-in caller operation without retaining the raw identifier.
+
+    Only the standard ``Idempotency-Key`` names a retriable operation.
+    ``client_request_id`` is a caller correlation identity that real
+    sessions reuse across distinct sequential requests, so it never keys
+    duplicate detection.
+
+    Args:
+        request: Canonical gateway request.
+
+    Returns:
+        Namespaced caller-operation digest, or ``None`` for ordinary requests.
+    """
+    if request.idempotency_key is None:
+        return None
+    return hashlib.sha256(
+        f"gateway-caller-operation-v1\0{request.idempotency_key}".encode()
+    ).hexdigest()
 
 
 def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:

@@ -11,6 +11,7 @@ from urllib.request import urlopen
 import pytest
 from rich.console import Console
 
+from exp.cli.providers import experiential_cloud
 from exp.cli.providers.experiential_cloud import (
     CATALOG_PROVIDER,
     HOSTED_GATEWAY_API_KEY_ENV,
@@ -26,6 +27,17 @@ from exp.cli.providers.experiential_cloud import (
     hosted_platform_url,
 )
 from exp.common.models import ProviderConnection
+
+
+def test_raw_hidden_input_reports_unsupported_windows_before_opening_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Importable callback support does not pretend POSIX masked input works on Windows."""
+    monkeypatch.setattr(experiential_cloud.sys, "platform", "win32")
+    with pytest.raises(RuntimeError, match="POSIX terminal"):
+        experiential_cloud.read_masked_key_with_callback(
+            "Key: ", console=Console(file=io.StringIO()), wait_for_callback=lambda _: None
+        )
 
 
 @pytest.fixture

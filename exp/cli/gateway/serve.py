@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_ACTIVE_REQUESTS = 1024
 _console = Console(theme=EXP_THEME)
+_logger = logging.getLogger(__name__)
 _EXP_WORDMARK = "\n".join(
     (
         "███████╗██╗  ██╗██████╗ ",
@@ -264,86 +266,103 @@ def _run_gateway(
                         None if compatibility is None else frozenset({compatibility.alias})
                     ),
                 )
-                # The catalog build is per-alias fail-safe: a granted alias the
-                # native engine cannot serve is excluded (marked UNAVAILABLE and
-                # surfaced in the receipt below), so the worker binds and serves
-                # every other alias instead of refusing to start on one bad row.
-                # An empty servable set already fails loud in load_gateway_components.
-                # Loaded directly (rather than through native_server's own
-                # import) so this composition can wire the content-free
-                # metrics snapshot into the control plane before the process
-                # host ever starts.
-                exp_gateway_native = importlib.import_module("exp_gateway_native")
-                guardrails = load_guardrail_engine(root)
-                capture = local_capture_configuration(root, ghost=ghost)
-                capture_controller = None if check else open_local_capture(capture)
-                control_plane = NativeControlPlane(
-                    components,
-                    data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
-                    guardrails=guardrails,
-                    capture=capture_controller,
-                )
-                receipt = {
-                    "schema_version": 1,
-                    "operation": "gateway.check" if check else "gateway.run",
-                    "status": "ready",
-                    "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
-                    "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
-                    "reconciled_expired_requests": control_plane.reconciled_expired_requests,
-                    "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
-                    "launch_mode": "gateway" if compatibility is None else "project_alias",
-                    "traffic_capture": "enabled" if capture is not None else "disabled",
-                    "traffic_database": None if capture is None else str(capture.database_path),
-                    "unavailable_aliases": _unavailable_alias_entries(
-                        components.unavailable_aliases
-                    ),
-                }
-                if compatibility is not None:
-                    receipt.update(
-                        {
-                            "project_alias": compatibility.alias,
-                            "alias_revision_id": compatibility.alias_revision_id,
-                            "policy_id": compatibility.policy_id,
-                            "key_file": str(compatibility.key_file),
-                            "project_journal": "disabled",
-                            "gateway_accounting": "enabled",
-                        }
-                    )
-
-                def announce_ready() -> None:
-                    """Emit the ready receipt or banner for the live listener."""
-                    if json_output:
-                        typer.echo(json.dumps(receipt, separators=(",", ":")))
-                    else:
-                        _emit_gateway_ready(
-                            port=port,
-                            compatibility=compatibility,
-                            capture_enabled=capture is not None,
-                        )
-                        _emit_unavailable_aliases(components.unavailable_aliases)
-
-                if check:
-                    announce_ready()
-                    return
-
-                # Readiness is announced by the native server itself, from
-                # its bound-listener callback, so a launch that cannot own
-                # the port fails without ever printing a ready receipt.
+                capture_controller = None
                 try:
-                    serve_native_gateway(
-                        control_plane,
-                        host=_LOOPBACK_HOST,
-                        port=port,
-                        max_active_requests=max_active_requests,
-                        graceful_timeout_seconds=graceful_timeout,
-                        on_listening=announce_ready,
-                        capture=None if capture_controller is None else capture_controller.native,
+                    # The catalog build is per-alias fail-safe: a granted alias the
+                    # native engine cannot serve is excluded (marked UNAVAILABLE and
+                    # surfaced in the receipt below), so the worker binds and serves
+                    # every other alias instead of refusing to start on one bad row.
+                    # An empty servable set already fails loud in load_gateway_components.
+                    # Loaded directly (rather than through native_server's own
+                    # import) so this composition can wire the content-free
+                    # metrics snapshot into the control plane before the process
+                    # host ever starts.
+                    exp_gateway_native = importlib.import_module("exp_gateway_native")
+                    guardrails = load_guardrail_engine(root)
+                    capture = local_capture_configuration(root, ghost=ghost)
+                    capture_controller = None if check else open_local_capture(capture)
+                    control_plane = NativeControlPlane(
+                        components,
+                        data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
+                        guardrails=guardrails,
+                        capture=capture_controller,
                     )
-                except NativeGatewayServerError as exc:
-                    raise typer.BadParameter(str(exc)) from exc
+                    receipt = {
+                        "schema_version": 1,
+                        "operation": "gateway.check" if check else "gateway.run",
+                        "status": "ready",
+                        "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
+                        "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
+                        "reconciled_expired_requests": control_plane.reconciled_expired_requests,
+                        "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
+                        "launch_mode": "gateway" if compatibility is None else "project_alias",
+                        "traffic_capture": "enabled" if capture is not None else "disabled",
+                        "traffic_database": None if capture is None else str(capture.database_path),
+                        "unavailable_aliases": _unavailable_alias_entries(
+                            components.unavailable_aliases
+                        ),
+                    }
+                    if compatibility is not None:
+                        receipt.update(
+                            {
+                                "project_alias": compatibility.alias,
+                                "alias_revision_id": compatibility.alias_revision_id,
+                                "policy_id": compatibility.policy_id,
+                                "key_file": str(compatibility.key_file),
+                                "project_journal": "disabled",
+                                "gateway_accounting": "enabled",
+                            }
+                        )
+
+                    def announce_ready() -> None:
+                        """Emit the ready receipt or banner for the live listener."""
+                        if json_output:
+                            typer.echo(json.dumps(receipt, separators=(",", ":")))
+                        else:
+                            _emit_gateway_ready(
+                                port=port,
+                                compatibility=compatibility,
+                                capture_enabled=capture is not None,
+                            )
+                            _emit_unavailable_aliases(components.unavailable_aliases)
+
+                    if check:
+                        announce_ready()
+                        return
+
+                    # Readiness is announced by the native server itself, from
+                    # its bound-listener callback, so a launch that cannot own
+                    # the port fails without ever printing a ready receipt.
+                    try:
+                        serve_native_gateway(
+                            control_plane,
+                            host=_LOOPBACK_HOST,
+                            port=port,
+                            max_active_requests=max_active_requests,
+                            graceful_timeout_seconds=graceful_timeout,
+                            on_listening=announce_ready,
+                            capture=None
+                            if capture_controller is None
+                            else capture_controller.native,
+                        )
+                    except NativeGatewayServerError as exc:
+                        raise typer.BadParameter(str(exc)) from exc
                 finally:
-                    if capture_controller is not None:
-                        capture_controller.native.close(0)
+                    primary_error = sys.exception()
+                    try:
+                        try:
+                            components.write_ledger.close()
+                        finally:
+                            try:
+                                if components.write_ledger.stopped:
+                                    components.manager.close()
+                            finally:
+                                if capture_controller is not None:
+                                    capture_controller.native.close(0)
+                    except Exception:  # noqa: BLE001 - cleanup must not replace the startup error.
+                        if primary_error is None:
+                            raise
+                        _logger.warning("Gateway resource cleanup failed after a launch error")
     except typer.BadParameter:
         if setup is not None:
             _emit_setup_recovery(setup=setup)

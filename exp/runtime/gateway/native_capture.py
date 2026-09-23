@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Literal
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import Field, JsonValue, field_validator, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.capture_context import capture_context_document
@@ -190,7 +191,7 @@ class CaptureMetrics(ContractModel):
     usage_complete: bool
 
 
-class CaptureRecord(ContractModel):
+class CaptureRecordV1(ContractModel):
     """One idempotent update delivered to a local or hosted persistence adapter.
 
     Attributes:
@@ -220,6 +221,78 @@ class CaptureRecord(ContractModel):
     metrics: CaptureMetrics | None
     gemini_thought_parts: tuple[JsonObject, ...]
     gemini_thought_parts_source_json: str | None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _strict_version(cls, value: object) -> object:
+        """Reject booleans, strings and floats instead of coercing a persisted version."""
+        if type(value) is not int:
+            raise ValueError("capture record requires an integer schema version")
+        return value
+
+
+class CaptureRecord(ContractModel):
+    """Schema2 capture, keeping requested/root identity separate from the observed winner.
+
+    Attributes:
+        schema_version: Persisted record contract version, always integer2.
+        request: Authenticated root request; request.model_id is not rewritten on fallback.
+        response: Eligible observed output, otherwise None.
+        deployment_id: Actual winning deployment when output was attached, otherwise None.
+        canonical_model_id: Actual winning canonical model at the same retention boundary,
+            otherwise None. Never inferred from a root alias or migrated legacy record.
+        provider_reasoning: Permitted exposed reasoning, defaulting to None.
+        provider_reasoning_source_json: Exact exceptional reasoning, defaulting to None.
+        provider_tool_calls_json: Exact completed tool calls, defaulting to None.
+        captured_at: Admission timestamp as Unix seconds.
+        metrics: Winning-attempt observations only when retention permits them.
+        gemini_thought_parts: Ordered provider summary and signature evidence.
+        gemini_thought_parts_truncated: True when optional evidence exceeded its bound,
+            false when captured without observed truncation, or None when unknown or disallowed.
+        gemini_thought_parts_source_json: Exact exceptional parts, otherwise None.
+    """
+
+    schema_version: Literal[2]
+    request: CaptureRequest
+    response: (
+        Annotated[CaptureJsonResponse | CaptureSseResponse, Field(discriminator="kind")] | None
+    )
+    deployment_id: str | None
+    canonical_model_id: Identifier | None = None
+    provider_reasoning: str | None = None
+    provider_reasoning_source_json: str | None = None
+    provider_tool_calls_json: str | None = None
+    captured_at: float = Field(ge=0, allow_inf_nan=False)
+    metrics: CaptureMetrics | None
+    gemini_thought_parts: tuple[JsonObject, ...]
+    gemini_thought_parts_truncated: bool | None = Field(default=None, strict=True)
+    gemini_thought_parts_source_json: str | None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _strict_version(cls, value: object) -> object:
+        """Require exact integer2 rather than accepting bool, float, or string lookalikes."""
+        if type(value) is not int:
+            raise ValueError("capture record requires an integer schema version")
+        return value
+
+
+def read_capture_record_json(value: str) -> CaptureRecord:
+    """Read strict persisted schema1 or2 and return schema2 with unknown legacy winner.
+
+    Existing schema1 archives require this explicit reader. Direct
+    CaptureRecord.model_validate_json accepts only current schema2; old schema1
+    readers cannot consume schema2. Unknown fields and versions always fail.
+    """
+    payload = json.loads(value)
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int:
+        raise ValueError("capture record requires an integer schema version")
+    if payload["schema_version"] == 1:
+        previous = CaptureRecordV1.model_validate(payload)
+        payload = previous.model_dump(mode="json")
+        payload["schema_version"] = 2
+        payload["canonical_model_id"] = None
+    return CaptureRecord.model_validate(payload)
 
 
 class CaptureController:

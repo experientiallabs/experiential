@@ -220,6 +220,44 @@ def test_reserve_rung_slot_sheds_fresh_sessions_early_only_with_warm_standing_ab
     )
 
 
+def test_scoped_warmth_expires_at_reservation_and_never_bypasses_hard_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified placement expires during a queued request and cannot exempt physical capacity."""
+    loads = RungLoadRegistry()
+    sticky = StickySpillRegistry()
+    deployment = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=GatewayRungDispatchPolicy(
+            concurrency_bound=4, fresh_session_spill_fraction=0.5, sticky_spill_seconds=60
+        ),
+    )
+    entry = _entry(
+        (deployment,), failover_mode="maximize_cache_affinity", affinity_fingerprint=b"warm"
+    )
+    entry.recovery_scoped = True
+    entry.verified_warm_deployment_id = deployment.deployment_id
+    entry.verified_warm_until_monotonic = 10
+    sticky.bind(b"warm", deployment.deployment_id, ttl_seconds=60)
+    monkeypatch.setattr(native_rung_policy.time, "monotonic", lambda: 9)
+    for _ in range(3):
+        assert isinstance(
+            reserve_rung_slot(loads, sticky, entry, deployment, reserved_tokens=0, force=False),
+            str,
+        )
+    monkeypatch.setattr(native_rung_policy.time, "monotonic", lambda: 10)
+    expired = reserve_rung_slot(loads, sticky, entry, deployment, reserved_tokens=0, force=False)
+    assert isinstance(expired, RungShed) and expired.reason == "fresh_session_spill"
+    # Renewed exact evidence may occupy the fourth slot, but never the fifth.
+    entry.verified_warm_until_monotonic = 20
+    assert isinstance(
+        reserve_rung_slot(loads, sticky, entry, deployment, reserved_tokens=0, force=False), str
+    )
+    full = reserve_rung_slot(loads, sticky, entry, deployment, reserved_tokens=0, force=False)
+    assert isinstance(full, RungShed) and full.reason == "queue_bound"
+
+
 def test_failed_dispatch_candidate_reads_the_organizations_cache_on_the_failed_rung() -> None:
     """The disposition follows the requesting organization's EWMA on the throttled rung."""
     deployments = (

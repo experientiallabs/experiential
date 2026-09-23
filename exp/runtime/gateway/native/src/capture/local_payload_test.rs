@@ -3,7 +3,7 @@ use serde_json::json;
 
 fn record() -> Record {
     serde_json::from_value(json!({
-        "schema_version":1,"request":{"request_id":"request",
+        "schema_version":super::super::record::SCHEMA_VERSION,"request":{"request_id":"request",
             "scope":{"organization_id":"org","identity_id":"user","application_id":"app"},
             "protocol":"responses","model_id":"model",
             "context":{"schema_version":1,"request":{"messages":[
@@ -43,6 +43,8 @@ fn borrowed_payload_preserves_schema_content_sidecars_and_exact_limit() {
                     "provider_reasoning_source_json":"\"first\\u0000second雪\"",
                     "provider_tool_calls_json":record.provider_tool_calls_json,
                     "metrics":record.metrics,
+                    "canonical_model_id":null,
+                    "gemini_thought_parts_truncated":null,
                     "gemini_thought_parts":record.gemini_thought_parts,
                     "gemini_thought_parts_source_json":null,
                 },"previous_response_id":"parent"
@@ -60,6 +62,25 @@ fn borrowed_payload_preserves_schema_content_sidecars_and_exact_limit() {
         record.provider_reasoning.as_deref(),
         Some("first\0second雪")
     );
+}
+
+#[test]
+fn output_evidence_keeps_root_identity_winner_and_unknown_omission_separate() {
+    for winner in [None, Some("model"), Some("child-model")] {
+        for truncated in [None, Some(false), Some(true)] {
+            let mut record = record();
+            record.canonical_model_id = winner.map(str::to_owned);
+            record.gemini_thought_parts_truncated = truncated;
+            let response = super::super::projection::completed_response(&record).unwrap();
+            let payload = encode(&record, &response, "experience-id", 8192).unwrap();
+            let actual: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(actual["schema_version"], 1);
+            assert_eq!(actual["provenance"]["model_id"], "model");
+            let output = &actual["request"]["exp_capture_output"];
+            assert_eq!(output["canonical_model_id"], json!(winner));
+            assert_eq!(output["gemini_thought_parts_truncated"], json!(truncated));
+        }
+    }
 }
 
 #[test]

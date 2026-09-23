@@ -16,6 +16,81 @@ use super::ladder_tests::{
 use super::*;
 
 #[test]
+fn cancelled_repair_has_its_own_reservation_and_never_inherits_prior_meter() {
+    block_on(async {
+        use tokio::io::AsyncWriteExt;
+        for known_first in [false, true] {
+            for opened_second in [false, true] {
+                let harness = Harness::new();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+                let (started, received) = tokio::sync::oneshot::channel();
+                let provider = tokio::spawn(async move {
+                    let (mut first, _) = listener.accept().await.unwrap();
+                    super::ladder_tests::read_request_body(&mut first).await;
+                    let mut failed: Value =
+                        serde_json::from_str(RESPONSES_FAILED_ENCRYPTED_FRAME).unwrap();
+                    if known_first {
+                        failed["response"]["usage"] = json!({"input_tokens":13,"output_tokens":7});
+                    } else {
+                        failed["response"].as_object_mut().unwrap().remove("usage");
+                    }
+                    let body = format!("data: {failed}\n\n");
+                    first.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    first.shutdown().await.unwrap();
+                    let (mut second, _) = listener.accept().await.unwrap();
+                    super::ladder_tests::read_request_body(&mut second).await;
+                    if opened_second {
+                        second.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n: heartbeat\n\n").await.unwrap();
+                    }
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                });
+                let token = format!("rsn_separate_{known_first}_{opened_second}_hA==");
+                let route = [responses_wire("a", &url, &[&token])];
+                let mut running = Box::pin(harness.run(&route, None, Duration::from_secs(20)));
+                tokio::select! {
+                    _ = &mut running => panic!("second dial should still be waiting"),
+                    result = received => result.unwrap(),
+                }
+                tokio::select! {
+                    _ = &mut running => panic!("second dial should remain pending"),
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+                }
+                drop(running);
+                let until = std::time::Instant::now() + Duration::from_secs(2);
+                let story = loop {
+                    let story = harness.story().await;
+                    if story["settles"].as_array().unwrap().len() == 2 {
+                        break story;
+                    }
+                    assert!(std::time::Instant::now() < until);
+                    tokio::task::yield_now().await;
+                };
+                provider.abort();
+                let starts = story["starts"].as_array().unwrap();
+                let settles = story["settles"].as_array().unwrap();
+                assert_eq!(starts.len(), 2);
+                assert_eq!(starts[1]["reasoning_repair"], true);
+                assert_ne!(settles[0]["attempt_id"], settles[1]["attempt_id"]);
+                assert_eq!(settles[0]["finalize"], false);
+                if known_first {
+                    assert_eq!(settles[0]["usage"]["input_tokens"], 13);
+                    assert_eq!(settles[0]["usage"]["output_tokens"], 7);
+                } else {
+                    assert!(settles[0]["usage"]["input_tokens"].is_null());
+                    assert!(settles[0]["usage"]["output_tokens"].is_null());
+                }
+                assert!(settles[1]["usage"]["input_tokens"].is_null());
+                assert!(settles[1]["usage"]["output_tokens"].is_null());
+                assert_eq!(settles[1]["opened"], opened_second);
+                assert_eq!(settles[1]["usage_incomplete_due_to_disconnect"], true);
+            }
+        }
+    });
+}
+
+#[test]
 fn explicit_one_blocks_every_repair_and_operator_throttle_redial() {
     block_on(async {
         for per_route in [false, true] {

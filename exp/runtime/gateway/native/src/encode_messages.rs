@@ -384,7 +384,6 @@ impl MessagesSseEncoder {
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
-            | Event::GeminiThoughtPart(_)
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
             Event::ThinkingSignature { index, signature } => {

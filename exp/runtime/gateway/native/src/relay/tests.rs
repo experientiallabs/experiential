@@ -878,6 +878,37 @@ async fn a_semantic_event_the_waterfall_did_not_commit_leaves_the_bound_armed() 
 }
 
 #[tokio::test]
+async fn translated_custom_start_commits_before_deferred_wrapper_input() {
+    let frames = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"patch\",\"arguments\":\"\"}}]}}]}\n\n",
+    ))]).chain(stream::pending()).boxed();
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        Instant::now() + Duration::from_millis(80),
+    );
+    relay.set_native_tool_translation(NativeToolTranslation::from([(
+        "patch".into(),
+        ("patch".into(), None, true),
+    )]));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let started = Instant::now();
+    let event = relay
+        .next_event(deadline, Duration::from_millis(300), started)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, Event::ToolCallStarted { custom: true, .. }));
+    assert!(crate::waterfall::is_semantic(&event));
+    relay.commit();
+    let failure = relay
+        .next_event(deadline, Duration::from_millis(300), started)
+        .await
+        .expect_err("deferred custom input stalls only on the post-commit chunk bound");
+    assert_eq!(failure.failure_class, FailureClass::Transport);
+}
+
+#[tokio::test]
 async fn the_first_token_disarms_the_bound_and_the_chunk_timeout_takes_over() {
     // Keepalives, then a content token inside the bound: the token is yielded,
     // and a later stall is paced by the per-chunk timeout (a transport
@@ -922,5 +953,40 @@ async fn the_first_token_disarms_the_bound_and_the_chunk_timeout_takes_over() {
         failure.failure_class,
         FailureClass::Transport,
         "a post-token stall is the ordinary chunk stall, not a first-token failure"
+    );
+}
+
+#[test]
+fn separately_reserved_repair_cannot_inherit_prior_cache_write_ttl() {
+    let first = crate::settlement::Observation::default();
+    first.record(&Event::Usage(Usage {
+        input_tokens: Some(30),
+        output_tokens: Some(7),
+        cache_creation_input_tokens: Some(10),
+        cache_creation_1h_input_tokens: Some(4),
+        ..Usage::default()
+    }));
+    let next_attempt = crate::settlement::Observation::default();
+    next_attempt.record(&Event::Usage(Usage {
+        input_tokens: Some(20),
+        output_tokens: Some(3),
+        cache_creation_input_tokens: Some(20),
+        ..Usage::default()
+    }));
+    assert_eq!(
+        first
+            .snapshot()
+            .usage
+            .unwrap()
+            .cache_creation_1h_input_tokens,
+        Some(4)
+    );
+    assert_eq!(
+        next_attempt
+            .snapshot()
+            .usage
+            .unwrap()
+            .cache_creation_1h_input_tokens,
+        None
     );
 }

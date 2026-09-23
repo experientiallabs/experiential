@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import JsonValue
+from pydantic import JsonValue, StrictBool, TypeAdapter
 
 from exp.common.core.artifacts import JsonObject, SourceIdentity, sha256_json
 from exp.common.traces.ingest.chat_json import CHAT_JSON_SOURCE
@@ -18,11 +18,18 @@ from exp.runtime.gateway.capture_context import restore_capture_context
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.ingest.metrics import apply_gateway_metrics
 from exp.runtime.gateway.local_capture import GATEWAY_CAPTURE_APPLICATION
-from exp.runtime.gateway.local_capture_contracts import CapturedExchange, LocalCaptureScope
+from exp.runtime.gateway.local_capture_contracts import (
+    CapturedExchange,
+    Identifier,
+    LocalCaptureScope,
+)
 from exp.runtime.gateway.local_capture_store import LocalCaptureStore
 from exp.runtime.gateway.native_capture import CaptureMetrics
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_responses
+
+_CANONICAL_MODEL = TypeAdapter(Identifier | None)
+_THOUGHT_PARTS_TRUNCATED = TypeAdapter(StrictBool | None)
 
 
 def load_gateway_capture(
@@ -73,8 +80,12 @@ def _conversation(
 ) -> JsonObject:
     """Retain the full source exchange and expose observed messages and tool schemas."""
     output = experience.request.get("exp_capture_output")
-    if isinstance(output, dict) and output.get("metrics") is not None:
-        CaptureMetrics.model_validate(output["metrics"])
+    canonical_model = None
+    if isinstance(output, dict):
+        if output.get("metrics") is not None:
+            CaptureMetrics.model_validate(output["metrics"])
+        canonical_model = _CANONICAL_MODEL.validate_python(output.get("canonical_model_id"))
+        _THOUGHT_PARTS_TRUNCATED.validate_python(output.get("gemini_thought_parts_truncated"))
     context = experience.request.get("exp_context")
     if not isinstance(context, dict) or context.get("schema_version") != 1:
         raise ValueError("effective capture context is required")
@@ -128,6 +139,7 @@ def _conversation(
             "parent_response_id": experience.parent_response_id,
             "deployment_id": experience.provenance.deployment_id,
             "model_id": experience.provenance.model_id,
+            "canonical_model_id": canonical_model,
             "linked_response_ids": lineage,
             "missing_parent_response_id": missing_parent,
         },

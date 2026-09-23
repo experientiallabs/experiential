@@ -192,9 +192,16 @@ pub fn rejected_code(dialect: Dialect, body: &str) -> Option<String> {
             let error = value.get("error")?;
             let candidate = match dialect {
                 Dialect::GeminiGenerateContent => error.get("status").or_else(|| error.get("code")),
+                // Messages spend caps share the outer rate-limit type but cannot recover
+                // through backoff. Only the documented nested token overrides that type.
                 _ => error
-                    .get("code")
-                    .filter(|code| !code.is_null())
+                    .get("details")
+                    .and_then(|details| details.get("error_code"))
+                    .filter(|code| {
+                        error.get("type").and_then(Value::as_str) == Some("rate_limit_error")
+                            && code.as_str() == Some("enforced_spend_limit_reached")
+                    })
+                    .or_else(|| error.get("code").filter(|code| !code.is_null()))
                     .or_else(|| error.get("type")),
             }?;
             match candidate {
@@ -554,6 +561,44 @@ mod tests {
         assert_eq!(
             rejected_code(Dialect::BedrockConverseStream, r#"{"message": "x"}"#),
             None
+        );
+    }
+
+    /// The spend-cap override is exact, dialect-scoped and never accepts nested prose.
+    #[test]
+    fn anthropic_spend_cap_code_preserves_unknown_details_and_other_dialects() {
+        for nested in [
+            serde_json::json!("enforced_spend_limit_reached"),
+            serde_json::json!("unknown_limit"),
+            serde_json::json!("enforced_spend_limit_reached because org_private is exhausted"),
+            serde_json::json!("a".repeat(65)),
+            serde_json::json!(null),
+            serde_json::json!({"code": "enforced_spend_limit_reached"}),
+        ] {
+            let body = serde_json::json!({"error": {
+                "type": "rate_limit_error", "details": {"error_code": nested},
+            }})
+            .to_string();
+            assert_eq!(
+                rejected_code(Dialect::AnthropicMessages, &body).as_deref(),
+                Some(if nested.as_str() == Some("enforced_spend_limit_reached") {
+                    "enforced_spend_limit_reached"
+                } else {
+                    "rate_limit_error"
+                })
+            );
+            for dialect in [Dialect::OpenAiCompatible, Dialect::OpenAiResponses] {
+                assert_eq!(
+                    rejected_code(dialect, &body).as_deref(),
+                    Some("rate_limit_error")
+                );
+            }
+        }
+        let other_type = r#"{"error":{"type":"invalid_request_error",
+            "details":{"error_code":"enforced_spend_limit_reached"}}}"#;
+        assert_eq!(
+            rejected_code(Dialect::AnthropicMessages, other_type).as_deref(),
+            Some("invalid_request_error")
         );
     }
 

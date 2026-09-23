@@ -10,6 +10,13 @@ use crate::tool_search::annotate_tool_search_usage_details;
 use crate::web_search::annotate_usage_details;
 
 impl ResponsesSseEncoder {
+    /// How many tool-search rounds this response meters.
+    pub(crate) fn tool_search_requests(&self) -> u32 {
+        self.tool_search
+            .as_ref()
+            .map_or(0, |search| search.requests)
+    }
+
     /// Build one SDK-readable Responses envelope for the current lifecycle state.
     pub(super) fn response(&self, status: &str, failure: Option<&Failure>) -> Value {
         let include_content = status != "in_progress";

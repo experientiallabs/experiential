@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 fn record<R>(response: R) -> Record<R> {
     Record {
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
         request: Request {
             request_id: "request".into(),
             scope: Scope {
@@ -21,8 +21,10 @@ fn record<R>(response: R) -> Record<R> {
         provider_reasoning_source_json: None,
         provider_tool_calls_json: None,
         deployment_id: None,
+        canonical_model_id: None,
         metrics: None,
         gemini_thought_parts: Vec::new(),
+        gemini_thought_parts_truncated: None,
         gemini_thought_parts_source_json: None,
         captured_at: 1.0,
     }
@@ -50,6 +52,36 @@ fn structured_response_is_encoded_only_at_the_destination() {
     assert_eq!(body["text"], "雪");
     assert!(record.encode(first.len() - 1).is_none());
     assert_eq!(record.encode(first.len()).unwrap(), first);
+}
+
+#[test]
+fn versioned_record_rejects_unknown_fields_and_unrecognized_versions() {
+    let mut item = record(Response::Json {
+        status: 200,
+        body: json!({}),
+        source_json: None,
+    });
+    item.canonical_model_id = Some("child-model".into());
+    let encoded = item.encode(4096).unwrap();
+    let value: Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["canonical_model_id"], "child-model");
+    let mut unknown = value.clone();
+    unknown["unknown"] = json!(true);
+    assert!(serde_json::from_value::<Record>(unknown).is_err());
+    for version in [json!(true), json!(2.0), json!("2"), json!(null)] {
+        let mut malformed = value.clone();
+        malformed["schema_version"] = version;
+        assert!(serde_json::from_value::<Record>(malformed).is_err());
+    }
+    for version in [0, 1, 3] {
+        let mut stale = value.clone();
+        stale["schema_version"] = json!(version);
+        let decoded: Record = serde_json::from_value(stale).unwrap();
+        assert!(decoded.encode(4096).is_none());
+    }
+    assert_eq!(item.encode(encoded.len()).unwrap(), encoded);
+    assert!(item.encode(encoded.len() - 1).is_none());
 }
 
 #[test]

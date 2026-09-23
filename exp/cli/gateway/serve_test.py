@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -23,6 +25,10 @@ from exp.cli.app import app
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.gateway.setup import InteractiveSetupResult
 from exp.runtime.gateway.auth import IssuedVirtualKey
+from exp.runtime.gateway.lifecycle import load_gateway_components
+from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.native_server import NativeGatewayServerError
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 
@@ -156,6 +162,8 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        write_ledger=SimpleNamespace(close=mock.Mock(), stopped=True),
+        manager=SimpleNamespace(close=mock.Mock()),
     )
 
     def load_components(
@@ -250,6 +258,8 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     result = CliRunner().invoke(app, arguments)
 
     assert result.exit_code == 0, result.output
+    components.write_ledger.close.assert_called_once()
+    components.manager.close.assert_called_once()
     assert prepared == [("project-a", Path("/tmp/local-exp"), "policy-a")]
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
     assert served == [(control_planes[0], "127.0.0.1", 8123)]
@@ -300,6 +310,8 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        write_ledger=SimpleNamespace(close=mock.Mock(), stopped=True),
+        manager=SimpleNamespace(close=mock.Mock()),
     )
     monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
     monkeypatch.setattr(
@@ -340,6 +352,152 @@ def test_unbindable_port_fails_before_any_ready_receipt(
     assert result.exit_code == 2
     assert "bind" in result.output
     assert '"status":"ready"' not in result.output
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix owner-only capture file permissions")
+def test_capture_permission_rejections_close_real_startup_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated privacy refusals keep protected bytes unchanged and release writers and handles."""
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "test-only-never-dispatched")
+    manager, _key = _configured_gateway(tmp_path)
+    traffic = tmp_path / "gateway" / "traffic.db"
+    traffic.write_bytes(b"private-data-placeholder")
+    traffic.chmod(0o644)
+    observed = mock.Mock(wraps=load_gateway_components)
+    monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_gateway_components", observed)
+    # No provider or listener is allowed to start before this local privacy refusal.
+    serving = mock.Mock(side_effect=AssertionError("must not start native serving"))
+    monkeypatch.setattr("exp.runtime.gateway.native_server.serve_native_gateway", serving)
+    writer_threads = {
+        thread.ident for thread in threading.enumerate() if thread.name == "gateway-ledger-writer"
+    }
+    fd_root = Path("/dev/fd") if Path("/dev/fd").exists() else Path("/proc/self/fd")
+    settled_fds: list[int] = []
+    original_close = GatewayManagement.close
+    closed_managers: list[GatewayManagement] = []
+
+    def close_manager(value: GatewayManagement) -> None:
+        """Record and perform actual memo-owner cleanup without replacing its behavior."""
+        closed_managers.append(value)
+        original_close(value)
+
+    monkeypatch.setattr(GatewayManagement, "close", close_manager)
+    try:
+        for _ in range(4):
+            with pytest.raises(typer.BadParameter, match="owner-only file permissions"):
+                run_app.start_gateway(root=tmp_path, non_interactive=True, json_output=True)
+            assert {
+                thread.ident
+                for thread in threading.enumerate()
+                if thread.name == "gateway-ledger-writer"
+            } == writer_threads
+            assert traffic.read_bytes() == b"private-data-placeholder"
+            assert traffic.stat().st_mode & 0o777 == 0o644
+            settled_fds.append(len(tuple(fd_root.iterdir())))
+        assert observed.call_count == 4
+        assert len(closed_managers) == 4
+        assert len({id(value) for value in closed_managers}) == 4
+        assert max(settled_fds) <= settled_fds[0] + 1
+        serving.assert_not_called()
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    "stage", ["guardrails", "configuration", "capture", "control", "serve", "check", "normal"]
+)
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("writer_stopped", [False, True])
+def test_post_component_startup_always_closes_owned_resources_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    cleanup_fails: bool,
+    writer_stopped: bool,
+) -> None:
+    """All setup failures preserve their original error while every acquired owner is cleaned."""
+    manager, _key = _configured_gateway(tmp_path)
+    manager.close()
+    events: list[str] = []
+    startup_error = ValueError(f"startup {stage}")
+    cleanup_error = RuntimeError("cleanup failure")
+    ledger = SimpleNamespace(stopped=writer_stopped)
+
+    def close_ledger() -> None:
+        """Attempt drain first without claiming a timed-out writer has stopped."""
+        events.append("writer")
+        if cleanup_fails:
+            raise cleanup_error
+
+    ledger.close = mock.Mock(side_effect=close_ledger)
+    components = SimpleNamespace(
+        unavailable_aliases=(),
+        write_ledger=ledger,
+        manager=SimpleNamespace(close=mock.Mock(side_effect=lambda: events.append("manager"))),
+    )
+    capture = SimpleNamespace(
+        native=SimpleNamespace(
+            close=mock.Mock(side_effect=lambda _timeout: events.append("capture"))
+        )
+    )
+    plane = SimpleNamespace(reconciled_expired_requests=0, reconciled_unknown_attempts=0)
+    monkeypatch.setattr(
+        "exp.runtime.gateway.lifecycle.load_gateway_components", mock.Mock(return_value=components)
+    )
+    monkeypatch.setattr(
+        "exp.runtime.gateway.guardrails.config.load_guardrail_engine",
+        mock.Mock(side_effect=startup_error if stage == "guardrails" else None),
+    )
+    monkeypatch.setattr(
+        run_app,
+        "local_capture_configuration",
+        mock.Mock(
+            side_effect=startup_error if stage == "configuration" else None, return_value=None
+        ),
+    )
+    capture_open = mock.Mock(
+        side_effect=startup_error if stage == "capture" else None, return_value=capture
+    )
+    monkeypatch.setattr(run_app, "open_local_capture", capture_open)
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_bridge.NativeControlPlane",
+        mock.Mock(side_effect=startup_error if stage == "control" else None, return_value=plane),
+    )
+    serve_error = NativeGatewayServerError("startup serve")
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_server.serve_native_gateway",
+        mock.Mock(side_effect=serve_error if stage == "serve" else None),
+    )
+    if stage in {"check", "normal"}:
+        if cleanup_fails:
+            with pytest.raises(RuntimeError) as failure:
+                run_app.start_gateway(
+                    root=tmp_path, non_interactive=True, json_output=True, check=stage == "check"
+                )
+            assert failure.value is cleanup_error
+        else:
+            run_app.start_gateway(
+                root=tmp_path, non_interactive=True, json_output=True, check=stage == "check"
+            )
+    else:
+        with pytest.raises(typer.BadParameter, match=f"startup {stage}") as failure:
+            run_app.start_gateway(root=tmp_path, non_interactive=True, json_output=True)
+        if stage == "serve":
+            assert failure.value.__cause__ is serve_error
+    allocated = stage in {"control", "serve", "normal"}
+    assert events == ["writer"] + (["manager"] if writer_stopped else []) + (
+        ["capture"] if allocated else []
+    )
+    ledger.close.assert_called_once()
+    if writer_stopped:
+        components.manager.close.assert_called_once()
+    else:
+        components.manager.close.assert_not_called()
+    if allocated:
+        capture.native.close.assert_called_once_with(0)
+    else:
+        capture.native.close.assert_not_called()
 
 
 def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path: Path) -> None:

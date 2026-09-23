@@ -18,7 +18,7 @@ async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
         );
         guard.rebind(format!("attempt-{ordinal}"));
         guard.mark_opened();
-        guard.begin_dial_observation().record(&Event::Usage(Usage {
+        guard.capture_observation().record(&Event::Usage(Usage {
             input_tokens: Some(13),
             output_tokens: fresh,
             ..Usage::default()
@@ -67,7 +67,7 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
     );
     guard.rebind("attempt".into());
     guard.mark_dispatched();
-    let observation = guard.begin_dial_observation();
+    let observation = guard.capture_observation();
     observation.record(&Event::Usage(Usage {
         input_tokens: Some(19),
         output_tokens: Some(7),
@@ -108,13 +108,11 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
         if opened {
             cancelled.mark_opened();
         }
-        cancelled
-            .begin_dial_observation()
-            .record(&Event::Usage(Usage {
-                input_tokens: Some(19),
-                output_tokens: Some(0),
-                ..Usage::default()
-            }));
+        cancelled.capture_observation().record(&Event::Usage(Usage {
+            input_tokens: Some(19),
+            output_tokens: Some(0),
+            ..Usage::default()
+        }));
         assert!(cancelled.settle_cancelled(None, &[]).await);
         let latest: String = Python::attach(|py| {
             py.import("json")
@@ -145,7 +143,7 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
         Instant::now(),
     );
     guard.rebind("one".into());
-    let old = guard.begin_dial_observation();
+    let old = guard.capture_observation();
     old.record(&Event::TextDelta("first physical attempt".into()));
     old.record(&Event::Completed);
     guard.rebind("two".into());
@@ -174,7 +172,7 @@ async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal
         guard.rebind(name.into());
         guard.mark_dispatched();
         guard.mark_opened();
-        let observation = guard.begin_dial_observation();
+        let observation = guard.capture_observation();
         observation.record(&Event::ReasoningContentDelta {
             route_sha256: "route".into(),
             delta: "let me think".into(),

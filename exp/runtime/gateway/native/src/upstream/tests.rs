@@ -185,6 +185,16 @@ pub(super) async fn open_against_body(
     body: &'static str,
     model: &str,
 ) -> Failure {
+    open_against_body_dialect(status_line, body, model, Dialect::OpenAiCompatible).await
+}
+
+/// Exercise an actual HTTP rejection on the selected provider wire.
+async fn open_against_body_dialect(
+    status_line: &str,
+    body: &'static str,
+    model: &str,
+    dialect: Dialect,
+) -> Failure {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -212,7 +222,7 @@ pub(super) async fn open_against_body(
         &serde_json::json!({"model": model, "messages": []}),
         None,
         Duration::from_secs(5),
-        Dialect::OpenAiCompatible,
+        dialect,
     )
     .await
     .expect_err("a 4xx must classify as a failure")
@@ -580,6 +590,66 @@ async fn a_zai_429_is_quota_for_code_1113_and_a_throttle_otherwise() {
     )
     .await;
     assert_eq!(limit.failure_class, FailureClass::Throttled);
+}
+
+/// The documented Messages spend cap is permanent for this billing period, not a throttle.
+#[tokio::test]
+async fn anthropic_spend_cap_429_is_quota_without_relaying_provider_prose() {
+    // https://platform.claude.com/docs/en/api/rate-limits#reaching-your-spend-cap
+    let body = r#"{"type":"error","error":{"type":"rate_limit_error",
+        "message":"You have reached your API usage limits: your organization has crossed its monthly API usage threshold, set based on your organization's API tier. You will regain access on 2026-09-01 at 00:00 UTC.",
+        "details":{"error_code":"enforced_spend_limit_reached"}},
+        "request_id":"req_018EeWyXxfu5pfWkrYcMdjWG"}"#;
+    for dialect in [Dialect::AnthropicMessages, Dialect::OpenAiCompatible] {
+        let failure = open_against_body_dialect("429 Too Many Requests", body, "m", dialect).await;
+        assert_eq!(
+            failure.failure_class,
+            if dialect == Dialect::AnthropicMessages {
+                FailureClass::ProviderQuota
+            } else {
+                FailureClass::Throttled
+            }
+        );
+        assert!(failure.failover_eligible);
+        assert!(!failure.retryable_same_deployment);
+        assert_eq!(failure.retry_after_seconds, None);
+        assert!(failure.rejected_parameter.is_none());
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some(if dialect == Dialect::AnthropicMessages {
+                "http 429: enforced_spend_limit_reached"
+            } else {
+                "http 429: rate_limit_error"
+            })
+        );
+        assert!(!failure.public_error().message.contains("organization"));
+        assert!(!failure.public_error().message.contains("enforced_spend"));
+    }
+}
+
+/// Missing and unrecognized nested details do not turn ordinary throttles into quota failures.
+#[tokio::test]
+async fn anthropic_unknown_spend_details_preserve_rate_limits() {
+    for body in [
+        r#"{"error":{"type":"rate_limit_error","message":"retry later"}}"#,
+        r#"{"error":{"type":"rate_limit_error","details":{"error_code":"unknown_limit"}}}"#,
+        r#"{"error":{"type":"rate_limit_error","details":{"other":"enforced_spend_limit_reached"}}}"#,
+        r#"{"error":{"type":"rate_limit_error","details":{"error_code":{"code":"enforced_spend_limit_reached"}}}}"#,
+        r#"{"error":{"type":"rate_limit_error","message":"enforced_spend_limit_reached"}}"#,
+    ] {
+        let failure = open_against_body_dialect(
+            "429 Too Many Requests",
+            body,
+            "m",
+            Dialect::AnthropicMessages,
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::Throttled);
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("http 429: rate_limit_error")
+        );
+    }
 }
 
 #[test]

@@ -201,6 +201,7 @@ pub(crate) async fn chat(
 
     // Run the certified waterfall to its committed or terminal attempt.
     let context = WaterfallContext {
+        capture: state.capture.as_ref(),
         bridge: &state.bridge,
         http: &state.http,
         request_id: &admission.request_id,
@@ -223,7 +224,14 @@ pub(crate) async fn chat(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
-    won = checkpoint_winner(state.capture.as_ref(), &admission, &mut guard, won).await;
+    won = checkpoint_winner(
+        state.capture.as_ref(),
+        &admission,
+        &mut guard,
+        won,
+        deadline,
+    )
+    .await;
     observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let created_at = SystemTime::now()

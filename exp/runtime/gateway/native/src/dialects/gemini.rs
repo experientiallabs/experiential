@@ -7,6 +7,21 @@ use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
 impl Normalizer {
+    pub(crate) fn capture_gemini(
+        &mut self,
+        observer: Option<crate::capture::reasoning::GeminiObserver>,
+    ) {
+        self.gemini_capture = observer;
+    }
+
+    pub(crate) fn meter_gemini(&mut self, observation: crate::settlement::Observation) {
+        self.gemini_meter = Some(observation);
+    }
+
+    pub(crate) fn take_gemini_progress(&mut self) -> bool {
+        std::mem::take(&mut self.gemini_progress)
+    }
+
     /// Normalize one Gemini `streamGenerateContent` SSE frame: thought parts
     /// stay capture-only, whole function calls expand to start/arguments/completed,
     /// and the terminal candidate flushes the latest usage before its finish
@@ -104,14 +119,24 @@ impl Normalizer {
                     if part.get("thought") == Some(&Value::Bool(true))
                         || part.contains_key("thoughtSignature")
                     {
-                        let bytes = crate::dialects::records_retained_bytes(raw_part)
-                            .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
-                        self.reserve_summary_bytes(bytes.max(64))?;
-                        events.push(Event::GeminiThoughtPart(std::sync::Arc::new(
-                            raw_part.clone(),
-                        )));
+                        self.gemini_progress |= part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                            || part
+                                .get("thoughtSignature")
+                                .and_then(Value::as_str)
+                                .is_some_and(|signature| !signature.is_empty());
+                        if let Some(observer) = &self.gemini_capture {
+                            observer.observe(raw_part);
+                        }
                     }
                     if part.get("thought") == Some(&Value::Bool(true)) {
+                        if let (Some(observation), Some(text)) =
+                            (&self.gemini_meter, part.get("text").and_then(Value::as_str))
+                        {
+                            observation.record_gemini_reasoning(text);
+                        }
                         continue;
                     }
                     if let Some(call) = part.get("functionCall") {
@@ -285,12 +310,9 @@ mod gemini_tests {
         let chunk = sse(&json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]}));
         let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &[chunk.as_slice()]);
         assert!(failure.is_none());
-        let captured: Vec<_> = events
+        assert!(!events
             .iter()
-            .filter(|event| event["kind"] == "gemini_thought_part")
-            .map(|event| event["part"].clone())
-            .collect();
-        assert_eq!(captured, parts);
+            .any(|event| event["kind"] == "gemini_thought_part"));
         assert!(!events
             .iter()
             .any(|event| event["kind"] == "reasoning_content_delta"));
@@ -299,9 +321,6 @@ mod gemini_tests {
             .filter(|event| event["kind"] == "text_delta")
             .collect();
         assert_eq!(visible, vec![&json!({"kind":"text_delta","text":"answer"})]);
-        let private = Event::GeminiThoughtPart(std::sync::Arc::new(parts[0].clone()));
-        assert!(!private.is_output_token());
-        assert!(private.is_generation_progress());
     }
 
     #[test]
@@ -339,7 +358,6 @@ mod gemini_tests {
             events,
             vec![
                 json!({"kind": "text_delta", "text": "Hel"}),
-                json!({"kind": "gemini_thought_part", "part": {"thought":true,"text":"hidden reasoning"}}),
                 json!({"kind": "text_delta", "text": "lo"}),
                 json!({"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"}),
                 json!({"kind": "tool_arguments_delta", "index": 0, "text": raw_arguments}),
@@ -410,7 +428,6 @@ mod gemini_tests {
             events,
             vec![
                 json!({"kind": "text_delta", "text": "Sunlight scatters off air "}),
-                json!({"kind": "gemini_thought_part", "part": {"text":"molecules.","thoughtSignature":"CikB"}}),
                 json!({"kind": "text_delta", "text": "molecules."}),
                 json!({
                     "kind": "usage",

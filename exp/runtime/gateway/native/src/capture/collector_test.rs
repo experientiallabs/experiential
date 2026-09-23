@@ -88,10 +88,10 @@ fn winning_metrics_and_gemini_parts_survive_storage_without_public_reasoning() {
     collector.gemini_thought_part("measured", part.clone());
     {
         let pending = collector.pending.lock().unwrap();
-        assert!(Arc::ptr_eq(
+        assert_eq!(
             &part,
             &pending.entries["measured"].record.gemini_thought_parts[0]
-        ));
+        );
     }
     observation.record_first_token(Some(SystemTime::now()));
     observation.record(&Event::Usage(Usage {
@@ -142,6 +142,104 @@ fn denied_response_never_persists_gemini_parts_in_either_settlement_order() {
         assert!(records[0].gemini_thought_parts.is_empty());
         assert!(records[0].metrics.is_none());
     }
+}
+
+#[test]
+fn gemini_capture_generations_and_overflow_never_change_request_admission() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("generation")));
+    let first = collector.begin_capture_dial("generation", true).unwrap();
+    first.observe(&json!({"thought":true,"text":"losing"}));
+    let second = collector.begin_capture_dial("generation", true).unwrap();
+    first.observe(&json!({"thought":true,"text":"stale"}));
+    second.observe(&json!({"thought":true,"text":"winning"}));
+    {
+        let pending = collector.pending.lock().unwrap();
+        assert_eq!(
+            pending.entries["generation"]
+                .record
+                .gemini_thought_parts
+                .len(),
+            1
+        );
+        assert_eq!(
+            pending.entries["generation"].record.gemini_thought_parts[0]["text"],
+            "winning"
+        );
+    }
+    second.observe(&json!({"thought":true,"text":"x".repeat(5000)}));
+    {
+        let pending = collector.pending.lock().unwrap();
+        assert!(pending.entries["generation"]
+            .record
+            .gemini_thought_parts
+            .is_empty());
+        assert_eq!(
+            pending.entries["generation"]
+                .record
+                .gemini_thought_parts_truncated,
+            Some(true)
+        );
+        assert!(pending.bytes <= collector.config.maximum_pending_bytes);
+    }
+    collector.settle("generation", true, false);
+    second.observe(&json!({"thought":true,"text":"late"}));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].gemini_thought_parts.is_empty());
+    assert_eq!(records[0].gemini_thought_parts_truncated, None);
+}
+
+#[test]
+fn winner_provenance_follows_deployment_retention_in_both_settlement_orders() {
+    for before in [false, true] {
+        for keep_prompt in [false, true] {
+            for keep_response in [false, true] {
+                let (collector, receiver) = collector(config());
+                assert!(collector.begin(request("winner")));
+                collector.observe_winner_model("winner", "child-model");
+                collector.observe_winner_model("winner", "must-not-replace");
+                if before {
+                    collector.settle("winner", keep_prompt, keep_response);
+                }
+                collector.finish("winner", Some(response()), Some("child-deployment".into()));
+                if !before {
+                    collector.settle("winner", keep_prompt, keep_response);
+                }
+                let records = drain(&collector, receiver);
+                assert_eq!(records.len(), usize::from(keep_prompt));
+                if let Some(record) = records.first() {
+                    assert_eq!(record.request.model_id.as_deref(), Some("model"));
+                    let retained = !before || keep_response;
+                    assert_eq!(
+                        record.deployment_id.as_deref(),
+                        retained.then_some("child-deployment")
+                    );
+                    assert_eq!(
+                        record.canonical_model_id.as_deref(),
+                        retained.then_some("child-model")
+                    );
+                    assert_eq!(record.schema_version, 2);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn no_winner_or_missing_deployment_never_invents_canonical_capture_identity() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("no-winner")));
+    collector.settle("no-winner", true, false);
+    assert!(collector.begin(request("missing-deployment")));
+    collector.observe_winner_model("missing-deployment", "child-model");
+    collector.finish("missing-deployment", None, None);
+    collector.settle("missing-deployment", true, true);
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 2);
+    assert!(records
+        .iter()
+        .all(|record| record.canonical_model_id.is_none()));
 }
 
 #[test]
@@ -438,6 +536,128 @@ fn unscoped_unknown_duplicate_and_expired_content_is_not_persisted() {
 }
 
 #[test]
+fn blocked_handoff_keeps_admission_count_and_bytes_until_each_record_is_acknowledged() {
+    for byte_bound in [false, true] {
+        for fail_sink in [false, true] {
+            struct PausedSink {
+                entered: mpsc::Sender<()>,
+                release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+                records: mpsc::Sender<String>,
+                fail: bool,
+            }
+            impl Sink for PausedSink {
+                type Prepared = String;
+
+                fn preparation_bytes(maximum: usize) -> usize {
+                    maximum
+                }
+
+                fn prepare(&self, record: &Record, _maximum: usize) -> Result<String, ()> {
+                    Ok(record.request.request_id.clone())
+                }
+
+                fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
+                    self.entered.send(()).unwrap();
+                    let (lock, signal) = &*self.release;
+                    let ready = lock.lock().unwrap();
+                    let (ready, timeout) = signal
+                        .wait_timeout_while(ready, Duration::from_secs(5), |ready| !*ready)
+                        .unwrap();
+                    assert!(*ready && !timeout.timed_out());
+                    if std::mem::take(&mut self.fail) {
+                        Err(())
+                    } else {
+                        self.records.send(record.clone()).unwrap();
+                        Ok(())
+                    }
+                }
+            }
+            let (entered, started) = mpsc::channel();
+            let (records, written) = mpsc::channel();
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let mut configuration = config();
+            // Both the writing first record and waiting second retain admission now.
+            configuration.maximum_pending_records = if byte_bound { 4 } else { 2 };
+            configuration.maximum_pending_bytes = if byte_bound { 24000 } else { 32768 };
+            configuration.maximum_request_bytes = 16384;
+            configuration.delivery.maximum_records = 1;
+            configuration.delivery.maximum_bytes = 32768;
+            configuration.delivery.maximum_record_bytes = 16384;
+            let collector = Arc::new(
+                Collector::new(
+                    configuration,
+                    PausedSink {
+                        entered,
+                        release: release.clone(),
+                        records,
+                        fail: fail_sink,
+                    },
+                )
+                .unwrap(),
+            );
+            let large = |id: &str| {
+                let mut value = request(id);
+                value.context =
+                    Arc::new(json!({"schema_version":1,"request":{"prompt":"x".repeat(8192)}}));
+                value
+            };
+            assert!(collector.begin(large("first")));
+            let first = collector.clone();
+            let one = std::thread::spawn(move || first.settle("first", true, false));
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(collector.begin(large("second")));
+            let second = collector.clone();
+            let two = std::thread::spawn(move || second.settle("second", true, false));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let until = Instant::now() + Duration::from_secs(2);
+                while collector
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .contains_key("second")
+                    && Instant::now() < until
+                {
+                    std::thread::yield_now();
+                }
+                assert!(!collector
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .contains_key("second"));
+                assert!(
+                    !collector.begin(large("over-limit")),
+                    "blocked handoff lost its source capacity"
+                );
+                collector.settle("second", true, false);
+                assert!(!collector.close_until(Instant::now()));
+            }));
+            *release.0.lock().unwrap() = true;
+            release.1.notify_all();
+            one.join().unwrap();
+            two.join().unwrap();
+            // Clean up an unexpectedly admitted record before propagating a failed assertion.
+            collector.settle("over-limit", false, false);
+            assert!(collector.close_until(Instant::now() + Duration::from_secs(2)));
+            let mut ids: Vec<_> = written.try_iter().collect();
+            ids.sort();
+            assert_eq!(ids, ["first", "second"]);
+            assert_eq!(collector.counts()[0..2], [0, 0]);
+            assert_eq!(collector.counts()[2], 2);
+            assert_eq!(collector.counts()[3], u64::from(fail_sink));
+            assert_eq!(collector.counts()[4], 0);
+            assert_eq!(collector.pending.lock().unwrap().bytes, 0);
+            assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(collector.admissions.load(Ordering::Acquire), 0);
+            if let Err(error) = outcome {
+                std::panic::resume_unwind(error);
+            }
+        }
+    }
+}
+
+#[test]
 fn pending_count_and_bytes_are_bounded_without_evicting_other_live_requests() {
     let mut configuration = config();
     configuration.maximum_pending_records = 1;
@@ -511,6 +731,7 @@ fn shutdown_keeps_delivery_open_during_the_pending_map_handoff() {
         let mut pending = collector.pending.lock().unwrap();
         let entry = pending.entries.remove("handoff").unwrap();
         pending.bytes -= entry.bytes;
+        entry._admission.handoff(entry.bytes);
         entry
     };
     assert!(!collector.close_until(Instant::now()));
@@ -647,3 +868,6 @@ fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
         }
     }
 }
+
+#[path = "checkpoint_test.rs"]
+mod checkpoints;

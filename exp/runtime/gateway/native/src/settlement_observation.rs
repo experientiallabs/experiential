@@ -3,8 +3,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
-
 use crate::events::{Event, Usage};
 use crate::relay::track_event;
 
@@ -68,15 +66,6 @@ impl StreamedOutput {
                 &mut self.reasoning_overflow_chars,
                 delta,
             ),
-            Event::GeminiThoughtPart(part) => {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    Self::append(
-                        &mut self.reasoning,
-                        &mut self.reasoning_overflow_chars,
-                        text,
-                    );
-                }
-            }
             Event::Image(_) => self.images += 1,
             _ => {}
         }
@@ -117,17 +106,17 @@ impl Default for Observed {
 }
 
 impl Observation {
-    /// A repaired dial resets its meter but retains the physical attempt's start.
-    pub(crate) fn next_dial(&self) -> Self {
-        let previous = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self(Arc::new(Mutex::new(Observed {
-            started_at: previous.started_at,
-            started: previous.started,
-            ..Observed::default()
-        })))
+    /// Meter private Gemini thought text without retaining capture parts or emitting events.
+    pub(crate) fn record_gemini_reasoning(&self, text: &str) {
+        let mut observed = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if observed.terminal.is_none() {
+            let output = &mut observed.streamed_output;
+            StreamedOutput::append(
+                &mut output.reasoning,
+                &mut output.reasoning_overflow_chars,
+                text,
+            );
+        }
     }
 
     /// Remember normalized facts before public delivery can suspend or fail.

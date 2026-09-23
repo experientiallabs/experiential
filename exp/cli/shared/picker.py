@@ -15,8 +15,6 @@ from __future__ import annotations
 import os
 import select
 import sys
-import termios
-import tty
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +25,10 @@ from rich.console import Console
 from rich.markup import escape
 
 from exp.cli.shared.picker_view import PickerMode, PickerRow, picker_view
+
+if sys.platform != "win32":
+    import termios
+    import tty
 
 _BACK_WORDS = frozenset({"b", "back"})
 _CANCEL_WORDS = frozenset({"q", "quit", "cancel"})
@@ -473,6 +475,8 @@ def _terminal_key_reader(
     if read_key is not None:
         yield read_key
         return
+    if sys.platform == "win32":
+        raise RuntimeError("Raw keyboard selection requires a POSIX terminal")
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:

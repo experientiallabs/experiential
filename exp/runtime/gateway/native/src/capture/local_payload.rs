@@ -18,6 +18,8 @@ struct Output<'a> {
     provider_reasoning_source_json: Option<Cow<'a, str>>,
     provider_tool_calls_json: &'a Option<String>,
     metrics: &'a Option<super::metrics::Metrics>,
+    canonical_model_id: &'a Option<String>,
+    gemini_thought_parts_truncated: Option<bool>,
     gemini_thought_parts: Cow<'a, [Arc<Value>]>,
     gemini_thought_parts_source_json: Option<Cow<'a, str>>,
 }
@@ -85,6 +87,8 @@ pub(super) fn encode(
                 provider_reasoning_source_json: reasoning.source_json,
                 provider_tool_calls_json: &record.provider_tool_calls_json,
                 metrics: &record.metrics,
+                canonical_model_id: &record.canonical_model_id,
+                gemini_thought_parts_truncated: record.gemini_thought_parts_truncated,
                 gemini_thought_parts,
                 gemini_thought_parts_source_json,
             },

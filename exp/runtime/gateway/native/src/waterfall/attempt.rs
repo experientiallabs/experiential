@@ -107,7 +107,7 @@ pub(super) async fn run_attempt(
     // A repaired payload returns to the outer loop for its own reservation.
     // The refused dial's usage belongs to this attempt alone.
     {
-        let observation = guard.begin_dial_observation();
+        let observation = guard.capture_observation();
         let open_bound = open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline));
         guard.mark_dispatched();
         let response = match open_stream(
@@ -165,6 +165,9 @@ pub(super) async fn run_attempt(
         if wire.image_output {
             relay.allow_image_output();
         }
+        relay.set_gemini_capture(ctx.capture.and_then(|collector| {
+            collector.begin_capture_dial(ctx.request_id, dialect == Dialect::GeminiGenerateContent)
+        }));
         relay.set_observation(observation);
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_probability_output(ctx.chat_logprobs, &wire.upstream_payload);
@@ -228,9 +231,7 @@ pub(super) async fn run_attempt(
                 relay.private_progress();
                 continue;
             }
-            if matches!(event, Event::GeminiThoughtPart(_))
-                || crate::logprobs::withhold_before_commit(&event, refusal_failover)
-            {
+            if crate::logprobs::withhold_before_commit(&event, refusal_failover) {
                 let event_bytes = crate::relay::event_retained_bytes(&event);
                 if withheld_bytes.saturating_add(event_bytes) > MAXIMUM_WITHHELD_REFUSAL_BYTES
                     || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS

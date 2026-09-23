@@ -19,6 +19,13 @@ from exp.common.models import (
     GatewayEquivalenceCertification,
     GatewayTokenPrices,
     ModelCapabilities,
+    load_model_catalog,
+    write_model_catalog,
+)
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.catalog_authority import (
     upsert_certified_pool,
@@ -37,6 +44,10 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_decisions import _admit_accepted
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    chain_components,
+    publish_authored_chain_fixture,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.typesafe import TypeSafeClient
 
@@ -145,6 +156,49 @@ def _admit(control: NativeControlPlane, raw_key: str, body: JsonObject | None = 
             json.dumps({"raw_key": raw_key, "body": json.dumps(_body() if body is None else body)})
         )
     )
+
+
+def test_decisions_refuse_selected_model_chain_before_acceptance(tmp_path: Path) -> None:
+    """A host receipt cannot authorize unsupported decision semantics for a selected chain root."""
+    _control, key = _control_plane(tmp_path)
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    root = catalog.models["decision-0"]
+    assert root.gateway is not None
+    child = root.model_copy(
+        update={"gateway": root.gateway.model_copy(update={"exact_model_id": "other-decision"})}
+    )
+    chain = GatewayModelChain(
+        model_id="systemone-exact",
+        pool_id="decision-0",
+        revision="chain-test",
+        rungs=(
+            GatewayDeploymentRung(deployment_id="decision-0"),
+            GatewayModelReferenceRung(model_id="other-decision"),
+        ),
+    )
+    write_model_catalog(
+        tmp_path / "models.toml",
+        catalog.model_copy(
+            update={
+                "models": {**catalog.models, "decision-child": child},
+                "gateway_model_chains": {"systemone-exact": chain},
+            }
+        ),
+    )
+
+    publish_authored_chain_fixture(
+        tmp_path, alias_id="decisions", revision_id="revision-chain", pool_id="decision-0"
+    )
+    control = NativeControlPlane(
+        chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"})
+    )
+    with pytest.raises(NativeBridgeError) as error:
+        _admit(control, key)
+    assert _public_error(error.value)["code"] == "model_chain_authority_unavailable"
+    assert _rows(control) == []
+    ledger = cast(SQLiteAttemptLedger, control._components.ledger)
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
 
 def _rows(control: NativeControlPlane) -> list[tuple[str, str | None]]:

@@ -10,10 +10,21 @@
 //! parent stays under the hand-authored line budget.
 
 use super::{finish_open_tools_relay, Dialect, Normalizer};
-use crate::errors::Failure;
+use crate::errors::{Failure, FailureClass};
 use crate::events::{Event, ProviderOutputItemStatus};
 
 impl Normalizer {
+    /// Fail if the stream ended without ever producing a terminal event.
+    pub fn stream_ended(&self) -> Result<(), Failure> {
+        if self.terminal {
+            return Ok(());
+        }
+        Err(Failure::new(
+            FailureClass::MalformedResponse,
+            "provider stream ended without a terminal event",
+        ))
+    }
+
     /// Synthesize the terminal events for a stream that closed cleanly
     /// without an explicit terminal frame, or nothing when a terminal already
     /// ended the stream or nothing was served (the caller then fails it

@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json
+from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
@@ -37,6 +37,7 @@ from exp.common.models.gateway_catalog import (
     normalize_gateway_catalog,
     read_pinned_normalized_snapshot,
 )
+from exp.common.models.gateway_chains import GatewayDeploymentRung, GatewayModelChain
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.model import ModelCapabilities, ModelSnapshot
 
@@ -57,6 +58,69 @@ def _minimal_normalized() -> NormalizedGatewayCatalog:
     )
     pool = ExactModelPool(pool_id="dep-1", exact_model_id="exact-1", deployment_ids=("dep-1",))
     return NormalizedGatewayCatalog(deployments=(deployment,), pools=(pool,))
+
+
+class _PreChainSchema5(ContractModel):
+    """Frozen current-main top-level reader shape without model-chain execution."""
+
+    schema_version: int = Field(default=5, ge=1)
+    deployments: tuple[ExactModelDeployment, ...] = ()
+    pools: tuple[ExactModelPool, ...] = ()
+
+    def identity_sha256(self) -> Sha256:
+        """Reproduce the current-main default-excluding identity contract."""
+        return sha256_json(self.model_dump(mode="json", by_alias=True, exclude_defaults=True))
+
+
+class _PreChainSchema4(_PreChainSchema5):
+    """Older stable reader uses tolerant parsing for schema-five documents."""
+
+    schema_version: int = Field(default=4, ge=1)
+
+
+def _read_pre_chain(data: str, digest: str, *, schema: int) -> _PreChainSchema5:
+    """Exercise each old reader's same-schema digest check and foreign-schema bypass."""
+    parsed, _dropped = load_forward_compatible(
+        _PreChainSchema5 if schema == 5 else _PreChainSchema4, data
+    )
+    if parsed.schema_version == schema and parsed.identity_sha256() != digest:
+        raise CatalogSnapshotDigestError("catalog snapshot digest does not match pinned authority")
+    return parsed
+
+
+def test_empty_model_chains_preserve_current_main_schema5_identity() -> None:
+    """Empty chains preserve current-main identity and older serving compatibility."""
+    current = _minimal_normalized()
+    for explicit in (False, True):
+        document = current.model_dump(mode="json")
+        if not explicit:
+            document.pop("model_chains")
+        for schema in (4, 5):
+            loaded = _read_pre_chain(json.dumps(document), current.identity_sha256(), schema=schema)
+            assert loaded.deployments == current.deployments
+            assert loaded.pools == current.pools
+            if schema == 5:
+                assert loaded.identity_sha256() == current.identity_sha256()
+
+
+def test_populated_chains_require_a_feature_floor_not_only_schema5() -> None:
+    """Current-main refuses lost policy, but schema-four workers require the host fleet fence."""
+    plain = _minimal_normalized()
+    policy = GatewayModelChain(
+        model_id="exact-1",
+        pool_id="dep-1",
+        revision="explicit-policy",
+        available=False,
+        rungs=(GatewayDeploymentRung(deployment_id="dep-1"),),
+    )
+    current = plain.model_copy(update={"model_chains": (policy,)})
+    with pytest.raises(CatalogSnapshotDigestError):
+        _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=5)
+    # Schema four treats five as foreign and silently drops the unavailable
+    # policy. Publishing chains to that fleet is unsafe even though main uses five.
+    lost_policy = _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=4)
+    assert lost_policy.deployments == plain.deployments
+    assert "model_chains" not in type(lost_policy).model_fields
 
 
 def test_load_forward_compatible_drops_unknown_fields_and_reports_them() -> None:
@@ -362,7 +426,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     }
     assert fingerprint == {
         "schema_version": 5,
-        "normalized": ["deployments", "pools", "schema_version"],
+        "normalized": ["deployments", "model_chains", "pools", "schema_version"],
         "deployment": [
             "billing_source",
             "capabilities",

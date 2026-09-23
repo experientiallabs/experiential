@@ -58,7 +58,7 @@ class CaptureProvenance(ContractModel):
 
     Attributes:
         source_id: Native gateway request ID linking this record to its exchange.
-        model_id: Model selected for the completed provider attempt.
+        model_id: Selected root model; actual fallback winner is separate output evidence.
         deployment_id: Observed provider deployment ID, or None when unavailable.
     """
 

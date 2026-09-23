@@ -16,6 +16,7 @@ async fn run_probabilities(harness: &Harness, route: &[DeploymentWire]) -> (Won,
         Instant::now(),
     );
     let context = WaterfallContext {
+        capture: None,
         bridge: &harness.bridge,
         http: &harness.http,
         request_id: "probability-test",

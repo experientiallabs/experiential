@@ -16,6 +16,7 @@ from exp.runtime.gateway.ledger import (
     IdempotencyConflictError,
     IdempotencyReplayUnavailableError,
 )
+from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityError
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
@@ -118,6 +119,14 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
                     "or a smaller max_tokens value."
                 ),
             )
+        )
+    elif isinstance(exception, ModelChainAuthorityError):
+        error = OpenAIProtocolError(
+            status_code=503,
+            code="model_chain_authority_unavailable",
+            message="Model-chain serving requires current enforcing host authority. "
+            "Ask the operator to verify publication and rollback protections.",
+            error_type="api_error",
         )
     elif isinstance(exception, (GatewayRoutingError, GatewayStoreError)):
         error = OpenAIProtocolError(

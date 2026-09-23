@@ -107,13 +107,6 @@ impl ResponsesSseEncoder {
         self.tool_search = tool_search;
     }
 
-    /// How many tool-search rounds this response meters.
-    pub(super) fn tool_search_requests(&self) -> u32 {
-        self.tool_search
-            .as_ref()
-            .map_or(0, |search| search.requests)
-    }
-
     /// Cite the gateway-executed web search on the synthetic message and
     /// meter it on usage: `None` (no search) leaves every frame untouched.
     pub fn set_web_search(&mut self, web_search: Option<WebSearchAdmission>) {
@@ -332,7 +325,6 @@ impl ResponsesSseEncoder {
                     stable_public_id("rs", &format!("{}:thinking:{index}", self.response_id));
                 self.reasoning_summary_delta(*index, 0, &item_id, delta)
             }
-            Event::GeminiThoughtPart(_) => Ok(Vec::new()),
             Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
             Event::ReasoningContentDelta {
                 route_sha256,
@@ -872,7 +864,9 @@ impl ResponsesSseEncoder {
                     frames.extend(self.close_message(key, item_status));
                 }
                 OutputSlot::Tool(index) if !self.tools[&index].done => {
-                    let item_status = if self.provider_output_starts.contains_key(&index) {
+                    let item_status = if self.provider_output_starts.contains_key(&index)
+                        || self.tools[&index].custom
+                    {
                         fallback_status
                     } else {
                         ProviderOutputItemStatus::Completed

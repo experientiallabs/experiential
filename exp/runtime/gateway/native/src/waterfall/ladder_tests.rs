@@ -125,6 +125,8 @@ fn plane() -> Py<PyAny> {
 pub(super) enum Answer {
     /// A 429 with the optional stated wait.
     Throttle(Option<u32>),
+    /// A 429 carrying a documented provider spend-cap body without Retry-After.
+    SpendCap,
     /// A 400 carrying this exact JSON body.
     Rejected(&'static str),
     /// A 200 event stream carrying these SSE frames, then `[DONE]`.
@@ -141,6 +143,16 @@ pub(super) enum Answer {
 
 fn render(answer: &Answer) -> String {
     match answer {
+        Answer::SpendCap => {
+            let body = r#"{"type":"error","error":{"type":"rate_limit_error",
+                "message":"monthly spend cap reached",
+                "details":{"error_code":"enforced_spend_limit_reached"}}}"#;
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+        }
         Answer::Rejected(body) => format!(
             "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
              content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -262,6 +274,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
+        exact_model_id: "exact-model".to_string(),
         dialect: "openai_compatible".to_string(),
         url: url.to_string(),
         headers: HashMap::new(),
@@ -285,6 +298,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         time_to_first_byte_seconds_per_million_input_tokens: None,
         time_to_first_token_base_seconds: None,
         throttle_redial_budget,
+        throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
     }
@@ -441,6 +455,7 @@ impl Harness {
             Instant::now(),
         );
         let context = WaterfallContext {
+            capture: None,
             bridge: &self.bridge,
             http: &self.http,
             request_id: "request-throttle",
@@ -500,6 +515,64 @@ pub(super) async fn finish(mut guard: AttemptGuard, won: Won) -> Won {
         guard.settle("completed", None, &[], None, true).await;
     }
     won
+}
+
+#[test]
+fn stage_local_redial_schedule_is_consumed_without_a_root_schedule() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![Answer::Throttle(None), Answer::Stream(&[TEXT_FRAME])]).await;
+        let mut stage = wire("child", &rung.url, 1);
+        stage.exact_model_id = "child-model".to_string();
+        stage.throttle_redial = Some(SCHEDULE);
+        let (won, guard) = harness.run(&[stage], None, Duration::from_secs(10)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("stage-local redial must serve without a root schedule");
+        };
+        assert_eq!(committed.depth, 0);
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["throttle_backoff"], true);
+        assert_eq!(gaps(&rung).len(), 1);
+    });
+}
+
+/// A permanent spend cap advances an eligible same-model route without spending redials.
+#[test]
+fn anthropic_spend_cap_skips_backoff_and_serves_the_existing_successor() {
+    block_on(async {
+        let harness = Harness::new();
+        let capped = spawn_rung(vec![Answer::SpendCap; 3]).await;
+        let fallback = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let mut lead = wire("capped", &capped.url, 2);
+        lead.provider = "anthropic".into();
+        lead.dialect = "anthropic_messages".into();
+        let route = [lead, wire("fallback", &fallback.url, 0)];
+        assert_eq!(route[0].model_id, route[1].model_id);
+        let (won, guard) = harness
+            .run(&route, Some(SCHEDULE), Duration::from_secs(10))
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the eligible same-model successor must serve");
+        };
+        assert_eq!(committed.depth, 1);
+        assert_eq!(capped.accepted.lock().expect("lock").len(), 1);
+        assert_eq!(fallback.accepted.lock().expect("lock").len(), 1);
+        let story = harness.story().await;
+        assert_eq!(story["counts"], json!([1, 1]));
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["throttle_backoff"], false);
+        assert_eq!(starts[1]["failure"]["failure_class"], "provider_quota");
+        assert_eq!(starts[1]["failure"]["retryable_same_deployment"], false);
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 2);
+        assert_eq!(settles[0]["failure"]["failure_class"], "provider_quota");
+        assert_eq!(settles[0]["finalize"], false);
+        assert_eq!(settles[1]["outcome"], "completed");
+        assert_eq!(settles[1]["finalize"], true);
+    });
 }
 
 #[test]

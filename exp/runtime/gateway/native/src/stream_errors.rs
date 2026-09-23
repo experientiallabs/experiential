@@ -123,8 +123,8 @@ const QUOTA_CODES: &[&str] = &[
     "insufficient_credits",
     "billing_hard_limit_reached",
     "billing_not_active",
-    // Novita answers an unfunded account with HTTP 403 and this reason.
-    "not_enough_balance",
+    "enforced_spend_limit_reached", // Anthropic Messages monthly spend cap.
+    "not_enough_balance",           // Novita HTTP 403 for an unfunded account.
     "1113", // Z.ai: "Insufficient balance or no resource package", sent under HTTP 429
 ];
 const AUTHENTICATION_CODES: &[&str] = &[

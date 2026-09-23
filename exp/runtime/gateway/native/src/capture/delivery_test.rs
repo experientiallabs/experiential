@@ -56,7 +56,7 @@ fn limits() -> Limits {
 
 fn record(id: &str) -> Record {
     serde_json::from_value(serde_json::json!({
-        "schema_version":1,
+        "schema_version":super::super::record::SCHEMA_VERSION,
         "request": {"request_id":id,
             "scope":{"organization_id":"org","identity_id":"identity","application_id":"app"},
             "protocol":"chat_completions","model_id":null,
