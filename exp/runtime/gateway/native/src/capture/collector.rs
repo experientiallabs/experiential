@@ -78,6 +78,7 @@ struct Entry {
     wire: Option<WireResponse>,
     relay: Option<super::relay::Relay>,
     relay_attached: bool,
+    relay_required: bool,
     request_bytes: usize,
     expires: Instant,
     bytes: usize,
@@ -246,6 +247,7 @@ impl Collector {
                 wire: None,
                 relay: None,
                 relay_attached: false,
+                relay_required: self.config.relay_metadata,
                 request_bytes,
                 expires: Instant::now() + Duration::from_secs(self.config.ttl_seconds),
                 bytes,
@@ -389,7 +391,7 @@ impl Collector {
             return;
         }
         entry.response_allowed = true;
-        if !entry.output_finished || (self.config.relay_metadata && entry.relay.is_none()) {
+        if !entry.output_finished || (entry.relay_required && entry.relay.is_none()) {
             // The terminal update supplies output to the earlier prompt checkpoint.
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
@@ -461,7 +463,7 @@ impl Collector {
         };
         entry.output_finished = true;
         entry.bytes = entry.bytes.saturating_add(response_heap);
-        if entry.response_allowed && (!self.config.relay_metadata || entry.relay.is_some()) {
+        if entry.response_allowed && (!entry.relay_required || entry.relay.is_some()) {
             entry._admission.handoff(entry.bytes);
             drop(pending);
             self.emit_entry(entry)
@@ -492,6 +494,15 @@ impl Collector {
         }
         entry.relay_attached = true;
         true
+    }
+
+    /// Error responses without public correlation cannot be claimed by a front.
+    pub(crate) fn without_relay(&self, request_id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(request_id) {
+                entry.relay_required = false;
+            }
+        }
     }
 
     pub(super) fn finish_relay(&self, request_id: &str, relay: super::relay::Relay) -> bool {

@@ -115,3 +115,52 @@ def test_existing_credential_redaction_keeps_encoded_nonsecret_pairs() -> None:
         ["x-session-token", "<redacted>"],
         ["x-test", "ok"],
     ]
+
+
+def test_asgi_disconnect_after_terminal_send_is_not_a_client_abort() -> None:
+    """ASGI servers close the receive channel when the response body finishes."""
+    collector = _Collector(True)
+    front_receive: list[Callable[[], Awaitable[object]]] = []
+
+    async def receive() -> object:
+        return {"type": "http.disconnect"}
+
+    async def send(event: object) -> None:
+        if isinstance(event, dict) and event.get("type") == "http.response.body":
+            await front_receive[0]()
+
+    async def app(
+        scope: dict[str, object],
+        receive: Callable[[], Awaitable[object]],
+        send: Callable[[object], Awaitable[None]],
+    ) -> None:
+        front_receive.append(receive)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"x-request-id", b"request-original")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    relay = CaptureRelay(app, cast("CaptureCollector", collector), wire_capture=True)
+    asyncio.run(relay({"type": "http", "path": "/v1/chat/completions"}, receive, send))
+    assert collector.records[0][1]["relay_completed"] is True
+    assert collector.records[0][1]["client_disconnected"] is False
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        b"password",
+        b"x-password",
+        b"x-proxy-authorization",
+        b"x-custom-api-key",
+        b"x-credentials",
+        b"x-provider-auth",
+    ],
+)
+def test_custom_credential_headers_are_not_persisted(header: bytes) -> None:
+    """Credential-bearing header variants do not enter transport records."""
+    assert redact_headers([(header, b"private")]) == [[header.decode(), "<redacted>"]]

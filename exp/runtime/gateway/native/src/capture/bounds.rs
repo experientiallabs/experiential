@@ -114,4 +114,15 @@ pub(super) fn bound(request: &mut Request, maximum: usize) {
         let trimmed = trim_strings(context, maximum.saturating_sub(4096));
         context["context_truncated_strings"] = trimmed.into();
     }
+    if request.json_bytes() > maximum {
+        // The previous hosted writer omitted an oversized envelope rather than
+        // discard its prompt or reject serving. Preserve the same last resort
+        // for structural tool schemas with no large strings to shorten.
+        let context = Arc::make_mut(&mut request.context);
+        let messages = context["request"]["messages"].take();
+        let mut limits = context.get("capture_limits").cloned().unwrap_or(json!({}));
+        limits["request_envelope_dropped"] = Value::Bool(true);
+        *context = json!({"schema_version":1,"request":{"messages":messages},
+            "capture_limits":limits});
+    }
 }

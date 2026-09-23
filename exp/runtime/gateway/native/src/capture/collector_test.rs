@@ -493,6 +493,30 @@ fn hosted_oversized_prompt_keeps_a_marked_copy_instead_of_rejecting_inference() 
 }
 
 #[test]
+fn hosted_structural_envelope_overflow_does_not_discard_the_prompt() {
+    let mut configuration = config();
+    configuration.truncate_request = true;
+    let (collector, receiver) = collector(configuration);
+    let mut input = request("structural");
+    input.context = Arc::new(json!({"schema_version":1,"request": {
+        "messages":[{"role":"user","content":"keep this task"}],
+        "tools":[{"name":"lookup","parameters":{"enum":(0..10000).collect::<Vec<_>>()}}]
+    }}));
+    assert!(collector.begin(input));
+    collector.settle("structural", true, false);
+    let records = drain(&collector, receiver);
+    assert_eq!(
+        records[0].request.context["request"]["messages"][0]["content"],
+        "keep this task"
+    );
+    assert_eq!(
+        records[0].request.context["capture_limits"]["request_envelope_dropped"],
+        true
+    );
+    assert_eq!(collector.counts()[4..], [0, 0]);
+}
+
+#[test]
 fn local_capture_does_not_require_hosted_settlement() {
     let mut configuration = config();
     configuration.settlement_required = false;

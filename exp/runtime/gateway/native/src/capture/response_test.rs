@@ -29,6 +29,13 @@ impl Sink for MemorySink {
 }
 
 fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<Record>) {
+    collector_with_relay(maximum_response_bytes, false)
+}
+
+fn collector_with_relay(
+    maximum_response_bytes: usize,
+    relay_metadata: bool,
+) -> (Arc<Collector>, mpsc::Receiver<Record>) {
     let (sender, receiver) = mpsc::channel();
     let collector = Arc::new(
         Collector::new(
@@ -44,7 +51,7 @@ fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<R
                 maximum_response_bytes,
                 ttl_seconds: 30,
                 settlement_required: false,
-                relay_metadata: false,
+                relay_metadata,
                 truncate_request: false,
             },
             MemorySink(sender),
@@ -228,8 +235,7 @@ fn record(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Record {
 #[tokio::test]
 async fn relay_metadata_rendezvous_preserves_wire_and_does_not_duplicate_replays() {
     for metadata_first in [false, true] {
-        let (mut collector, receiver) = collector(4096);
-        Arc::get_mut(&mut collector).unwrap().config.relay_metadata = true;
+        let (collector, receiver) = collector_with_relay(4096, true);
         assert!(collector.claim_relay("request"));
         assert!(!collector.claim_relay("request"));
         assert!(!collector.claim_relay("unknown"));
@@ -250,7 +256,10 @@ async fn relay_metadata_rendezvous_preserves_wire_and_does_not_duplicate_replays
         let body = capture_response(
             Some(collector.clone()),
             "request",
-            Response::new(Body::from(r#"{"choices":[]}"#)),
+            Response::builder()
+                .header("x-request-id", "request")
+                .body(Body::from(r#"{"choices":[]}"#))
+                .unwrap(),
         )
         .into_body()
         .collect()
@@ -306,6 +315,28 @@ async fn json_capture_preserves_wire_bytes_and_normalizes_only_the_stored_copy()
         serde_json::from_str::<Value>(&source_json.unwrap()).unwrap(),
         serde_json::from_slice::<Value>(original).unwrap()
     );
+}
+
+#[tokio::test]
+async fn uncorrelated_provider_error_does_not_wait_for_unavailable_relay_metadata() {
+    let (collector, receiver) = collector_with_relay(4096, true);
+    let response = Response::builder()
+        .status(400)
+        .body(Body::from(r#"{"error":"provider rejected"}"#))
+        .unwrap();
+    let actual = capture_response(Some(collector.clone()), "request", response)
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&actual[..], br#"{"error":"provider rejected"}"#);
+    let record = record(&collector, receiver);
+    assert!(record.transport.is_none());
+    assert!(matches!(
+        record.response,
+        Some(CapturedResponse::Json { status: 400, .. })
+    ));
 }
 
 #[test]

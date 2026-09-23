@@ -201,6 +201,9 @@ pub(crate) fn capture_response(
     let Some(collector) = collector else {
         return response;
     };
+    if !response.headers().contains_key("x-request-id") {
+        collector.without_relay(request_id);
+    }
     let Some(discarded) = collector.attach(request_id) else {
         return response;
     };

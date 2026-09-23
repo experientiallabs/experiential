@@ -34,6 +34,10 @@ _HEADERS = frozenset(
         "api-key",
         "x-goog-api-key",
         "x-auth-token",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
     }
 )
 _QUERY = frozenset(
@@ -74,7 +78,20 @@ def redact_headers(headers: Sequence[tuple[bytes, bytes]]) -> list[list[str]]:
     result: list[list[str]] = []
     for name, value in headers:
         key = name.decode("latin-1").lower()
-        protected = key in _HEADERS or key.endswith(("-secret", "-token"))
+        protected = key in _HEADERS or key.endswith(
+            (
+                "-secret",
+                "-token",
+                "-password",
+                "-passwd",
+                "-credential",
+                "-credentials",
+                "-authorization",
+                "-authentication",
+                "-api-key",
+                "-auth",
+            )
+        )
         result.append([key, "<redacted>" if protected else value.decode("latin-1")])
     return result
 
@@ -202,7 +219,7 @@ class CaptureRelay:
         async def receiving() -> object:
             event = await receive()
             if isinstance(event, dict):
-                if event.get("type") == "http.disconnect":
+                if event.get("type") == "http.disconnect" and not observed.completed:
                     observed.disconnected = True
                 elif event.get("type") == "http.request" and observed.wire:
                     body = event.get("body", b"")
@@ -225,12 +242,25 @@ class CaptureRelay:
                     observed.request_id = request_id
                 else:
                     observed.chunks.clear()
-            await send(event)
+            terminal = (
+                isinstance(event, dict)
+                and event.get("type") == "http.response.body"
+                and not event.get("more_body", False)
+            )
+            if terminal:
+                # ASGI receive may return http.disconnect as soon as send
+                # completes the response, even on a healthy connection.
+                observed.completed = True
+            try:
+                await send(event)
+            except BaseException:
+                observed.completed = False
+                observed.disconnected = True
+                raise
             if isinstance(event, dict) and event.get("type") == "http.response.body":
                 body = event.get("body", b"")
                 if isinstance(body, bytes):
                     observed.delivered(body)
-                observed.completed = not event.get("more_body", False)
 
         try:
             await self.app(scope, receiving if self.wire_capture else receive, sending)
