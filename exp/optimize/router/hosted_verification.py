@@ -191,6 +191,7 @@ def _verify_grounded_build(
         or serving.index.included_lineage_ids != expected_all_lineages
         or fit.index.included_lineage_ids != expected_fit_lineages
         or serving.index.embedding_dimension != fit.index.embedding_dimension
+        or serving.index.embedding_chunk_bytes != fit.index.embedding_chunk_bytes
         or not _transitions_match_bindings(serving.transitions, binding_by_trace, fit_only=False)
         or not _transitions_match_bindings(fit.transitions, binding_by_trace, fit_only=True)
         or world.world_model_id != build.world_model.artifact_id
