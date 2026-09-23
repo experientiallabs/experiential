@@ -35,6 +35,13 @@ It does not promise that every billed output token appears as visible text or to
 
 ## Reasoning controls
 
+Gemini 3.8 Flash accepts `low`, `medium`, and `high` on both Google's Gemini API and
+native Vertex routes. The catalog's default is `medium`; explicit levels travel as
+`generationConfig.thinkingConfig.thinkingLevel`, not `thinkingBudget`. `minimal` is
+unsupported. This contract applies to the exact `gemini-3.8-flash` model, not unverified
+image variants or later generations. Sources: [Google Gemini 3.8 Flash](https://ai.google.dev/gemini-api/docs/latest-model)
+and [Vertex Gemini 3.8 Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-8-flash).
+
 Valid explicit thinking-off settings remain off. An unsupported off setting is a typed
 pre-dispatch refusal, not a request to use the model's default thinking behavior. Model
 families distinguish support for budgeted thinking from support for disabling thinking.

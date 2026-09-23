@@ -196,6 +196,78 @@ def test_gemini_thinking_levels_follow_exact_model_tables() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "gemini-3.8-flash",
+        "models/gemini-3.8-flash",
+        "publishers/google/models/gemini-3.8-flash",
+    ),
+)
+def test_gemini_38_flash_exact_native_reasoning_contract(model_id: str) -> None:
+    """Google and Vertex admit each documented level and default to medium."""
+    assert supported_reasoning_efforts(model_id, "gemini_thinking") == (
+        "low",
+        "medium",
+        "high",
+    )
+    assert default_reasoning_effort(model_id, "gemini_thinking") == "medium"
+    for effort in ("low", "medium", "high"):
+        assert gemini_thinking_level(model_id, effort) == effort
+    with pytest.raises(UnsupportedReasoningEffortError):
+        gemini_thinking_level(model_id, "minimal")
+
+
+def test_gemini_38_flash_openrouter_reasoning_matches_native() -> None:
+    """Relaying the same model must not be the only way to request low/medium."""
+    assert supported_reasoning_efforts("google/gemini-3.8-flash", "reasoning") == (
+        "low",
+        "medium",
+        "high",
+    )
+    assert default_reasoning_effort("google/gemini-3.8-flash", "reasoning") == "medium"
+
+
+@pytest.mark.parametrize("model_id", ("gemini-3.8-flash-image", "gemini-3.9-flash"))
+def test_gemini_38_contract_does_not_infer_support_for_unverified_variants(model_id: str) -> None:
+    """A new sibling or generation still needs its own verified capability truth."""
+    assert supported_reasoning_efforts(model_id, "gemini_thinking") == ("high",)
+
+
+@pytest.mark.parametrize(
+    "model_id", ("gemini-3.8-flash", "publishers/google/models/gemini-3.8-flash")
+)
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high"))
+def test_gemini_38_native_payload_preserves_levels(
+    model_id: str, effort: ReasoningEffort | None
+) -> None:
+    """Google and Vertex serialize native levels, never numeric thinking budgets."""
+    profile = GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://gemini.test",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="gemini_thinking",
+        reasoning_effort=default_reasoning_effort(model_id, "gemini_thinking"),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Say hello."),),
+        reasoning_effort=effort,
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+    assert public.reasoning_effort == effort
+    assert not public.ignored_parameters
+    payload = dialect_stream_payload(profile, provider)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    if effort is None:
+        # Omission stays omitted; Google's documented default is medium.
+        assert "thinkingConfig" not in generation
+    else:
+        assert generation["thinkingConfig"] == {"thinkingLevel": effort.upper()}
+
+
 def test_openai_reasoning_efforts_follow_exact_model_tables() -> None:
     """Every maintained OpenAI family receives only an accepted effort value."""
     with pytest.raises(UnsupportedReasoningEffortError):
