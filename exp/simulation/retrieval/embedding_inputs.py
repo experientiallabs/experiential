@@ -16,9 +16,10 @@ from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
 MAXIMUM_CHUNK_BYTES = 2_048
 # UTF-8 bytes conservatively bound text tokens. These batches remain below OpenAI's 300,000
-# total-token and 2,048-input limits, without guessing a tokenizer for other providers.
+# total-token and 2,048-input limits and Gemini's 100-input batch bound, without guessing
+# a tokenizer for other providers.
 MAXIMUM_BATCH_BYTES = 262_144
-MAXIMUM_BATCH_INPUTS = 128
+MAXIMUM_BATCH_INPUTS = 100
 
 
 @dataclass(frozen=True)
