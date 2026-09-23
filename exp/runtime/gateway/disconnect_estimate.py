@@ -161,32 +161,27 @@ def estimate_disconnect_usage(
     )
     if reasoning_tokens is not None and reasoning_tokens > output_tokens:
         output_tokens = reasoning_tokens
-    # Cache-write legs are subsets of a REPORTED input total; without one they
-    # cannot be squared with the estimated prompt count and stay unknown. A
-    # missing cache-READ leg is estimated at the organization's recent cached
-    # share on this rung; a reported one (Anthropic's message start, zero
-    # included) is kept as reported.
-    reported_input = observed is not None and observed.input_tokens is not None
-    cached_input_tokens = observed.cached_input_tokens if reported_input else None
-    # Reads and writes are disjoint subsets of the input total and settlement
-    # clamps reads FIRST, so an estimated read must leave room for every
-    # observed write: capping it at the total would displace reported
-    # cache-write liability (and an unknown-TTL write's unpriced status).
-    observed_writes = (observed.cache_creation_input_tokens or 0) if reported_input else 0
-    if cached_input_tokens is None and cached_fraction > 0 and input_tokens > observed_writes:
-        cached_input_tokens = min(
-            input_tokens - observed_writes, int(input_tokens * min(cached_fraction, 1.0))
-        )
+    # Every observed cache leg is kept as reported, whether or not the
+    # provider also reported the input total. When the total is estimated it
+    # is raised to hold the observed subsets, and an unreported read leg is
+    # estimated at the organization's recent cached share of input: reads
+    # and writes are disjoint input subsets and settlement clamps reads
+    # FIRST, so the estimate leaves room for every observed write (an
+    # unknown-TTL write's unpriced status included) instead of displacing it.
+    cached_input_tokens = None if observed is None else observed.cached_input_tokens
+    observed_writes = None if observed is None else observed.cache_creation_input_tokens
+    observed_1h_writes = None if observed is None else observed.cache_creation_1h_input_tokens
+    if observed is None or observed.input_tokens is None:
+        input_tokens = max(input_tokens, (cached_input_tokens or 0) + (observed_writes or 0))
+    room = input_tokens - (observed_writes or 0)
+    if cached_input_tokens is None and cached_fraction > 0 and room > 0:
+        cached_input_tokens = min(room, int(input_tokens * min(cached_fraction, 1.0)))
     usage = GatewayUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cached_input_tokens=cached_input_tokens,
-        cache_creation_input_tokens=(
-            observed.cache_creation_input_tokens if reported_input else None
-        ),
-        cache_creation_1h_input_tokens=(
-            observed.cache_creation_1h_input_tokens if reported_input else None
-        ),
+        cache_creation_input_tokens=observed_writes,
+        cache_creation_1h_input_tokens=observed_1h_writes,
         reasoning_tokens=reasoning_tokens,
         tool_names=() if observed is None else observed.tool_names,
         web_search_requests=0 if observed is None else observed.web_search_requests,

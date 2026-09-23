@@ -104,19 +104,66 @@ def test_observed_legs_win_unless_the_streamed_text_already_exceeds_them() -> No
     assert (kept.output_tokens, kept.reasoning_tokens) == (500, 200)
 
 
-def test_cache_legs_are_dropped_without_a_reported_input_total() -> None:
-    """A cache subset cannot be squared with an estimated prompt count."""
+def test_observed_cache_legs_survive_an_estimated_input_total() -> None:
+    """A partial report's cache subsets are kept and the estimated total is raised to hold them."""
+    request = _request()
+    counted = counted_input_tokens(request)
     observed = GatewayUsage(output_tokens=3, cached_input_tokens=50)
     usage = estimate_disconnect_usage(
         _disconnect(observed),
-        request=_request(),
+        request=request,
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         opened=True,
         streamed=StreamedOutput(),
     ).usage
     assert usage is not None
-    assert usage.cached_input_tokens is None
+    assert usage.cached_input_tokens == 50
+    assert usage.input_tokens == max(counted, 50)
     assert usage.output_tokens == 3
+    # Writes reported without an input total: kept, the estimated read
+    # leaves room for them, and an unknown TTL split keeps the cost unknown.
+    writes_only = GatewayUsage(output_tokens=2, cache_creation_input_tokens=counted + 100)
+    usage = estimate_disconnect_usage(
+        _disconnect(writes_only),
+        request=request,
+        surface=GatewayApiSurface.MESSAGES,
+        opened=True,
+        streamed=StreamedOutput(),
+        cached_fraction=0.9,
+    ).usage
+    assert usage is not None
+    assert usage.input_tokens == counted + 100
+    assert usage.cache_creation_input_tokens == counted + 100
+    assert usage.cache_creation_1h_input_tokens is None
+    assert usage.cached_input_tokens is None
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=3_000_000_000,
+            cached_input_rate=300_000_000,
+            cache_creation_input_rate=3_750_000_000,
+            cache_creation_1h_input_rate=None,
+            output_rate=15_000_000_000,
+            reasoning_rate=None,
+        )
+        is None
+    )
+    # Writes smaller than the counted prompt leave room: the estimated read
+    # fills only that room.
+    assert counted > 5
+    partial_writes = GatewayUsage(output_tokens=2, cache_creation_input_tokens=5)
+    usage = estimate_disconnect_usage(
+        _disconnect(partial_writes),
+        request=request,
+        surface=GatewayApiSurface.MESSAGES,
+        opened=True,
+        streamed=StreamedOutput(),
+        cached_fraction=0.9,
+    ).usage
+    assert usage is not None
+    assert usage.input_tokens == counted
+    assert usage.cache_creation_input_tokens == 5
+    assert usage.cached_input_tokens == min(counted - 5, int(counted * 0.9))
 
 
 @pytest.mark.parametrize(
