@@ -14,16 +14,21 @@ from exp.runtime.gateway.capture_relay import CaptureRelay, redact_headers, reda
 
 
 class _Collector:
+    """One-shot admission fake recording metadata and the delivery thread."""
+
     def __init__(self, allowed: bool) -> None:
+        """Configure the initial admission verdict and an empty receipt list."""
         self.allowed = allowed
         self.records: list[tuple[str, JsonObject, bytes, int]] = []
 
     def claim_relay(self, request_id: str) -> bool:
+        """Allow only the first eligible claim for the expected request."""
         assert request_id == "request-original"
         allowed, self.allowed = self.allowed, False
         return allowed
 
     def finish_relay(self, request_id: str, metadata_json: str, body: bytes) -> bool:
+        """Record the exact handed-off metadata, bytes and thread identity."""
         self.records.append((request_id, json.loads(metadata_json), body, threading.get_ident()))
         return True
 
@@ -54,9 +59,11 @@ def test_relay_is_transparent_bounded_redacted_and_off_loop(
     }
 
     async def receive() -> object:
+        """Return the unchanged synthetic request body."""
         return {"type": "http.request", "body": wire_body}
 
     async def send(event: object) -> None:
+        """Retain the exact outbound event object."""
         sent.append(event)
 
     async def app(
@@ -64,6 +71,7 @@ def test_relay_is_transparent_bounded_redacted_and_off_loop(
         receive: Callable[[], Awaitable[object]],
         send: Callable[[object], Awaitable[None]],
     ) -> None:
+        """Echo fixed response events after consuming one request body."""
         assert await receive() == {"type": "http.request", "body": wire_body}
         await send(started)
         await send(ended)
@@ -123,9 +131,11 @@ def test_asgi_disconnect_after_terminal_send_is_not_a_client_abort() -> None:
     front_receive: list[Callable[[], Awaitable[object]]] = []
 
     async def receive() -> object:
+        """Emulate the server closing its receive channel after terminal send."""
         return {"type": "http.disconnect"}
 
     async def send(event: object) -> None:
+        """Deliver the concurrent receive-channel close during terminal send."""
         if isinstance(event, dict) and event.get("type") == "http.response.body":
             await front_receive[0]()
 
@@ -134,6 +144,7 @@ def test_asgi_disconnect_after_terminal_send_is_not_a_client_abort() -> None:
         receive: Callable[[], Awaitable[object]],
         send: Callable[[object], Awaitable[None]],
     ) -> None:
+        """Complete the response without a real client disconnect."""
         front_receive.append(receive)
         await send(
             {

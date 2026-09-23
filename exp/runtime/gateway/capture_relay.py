@@ -66,10 +66,15 @@ _Send = Callable[[object], Awaitable[None]]
 
 
 class _App(Protocol):
-    async def __call__(self, scope: dict[str, object], receive: _Receive, send: _Send) -> None: ...
+    """Minimal ASGI application contract for a byte-transparent observer."""
+
+    async def __call__(self, scope: dict[str, object], receive: _Receive, send: _Send) -> None:
+        """Serve a scope through the supplied receive and send channels."""
+        ...
 
 
 def _headers(raw: object) -> tuple[tuple[bytes, bytes], ...]:
+    """Freeze ASGI header pairs without decoding or normalizing their values."""
     return tuple(cast("Sequence[tuple[bytes, bytes]]", raw or ()))
 
 
@@ -110,7 +115,10 @@ def redact_query(query: str) -> str:
 
 
 class _Observation:
+    """Bounded caller-facing facts retained for one in-flight request."""
+
     def __init__(self, scope: dict[str, object], wire: bool, maximum_bytes: int) -> None:
+        """Start the request clock and retain the configured wire-body limit."""
         self.scope = scope
         self.wire = wire
         self.maximum_bytes = maximum_bytes
@@ -130,6 +138,7 @@ class _Observation:
         self.disconnected = False
 
     def keep(self, body: bytes) -> None:
+        """Count all received bytes while retaining only a bounded prefix."""
         self.total += len(body)
         if not self.truncated:
             if self.retained + len(body) > self.maximum_bytes:
@@ -139,6 +148,7 @@ class _Observation:
                 self.retained += len(body)
 
     def delivered(self, body: bytes) -> None:
+        """Record first and last nonempty body delivery without copying content."""
         if not body:
             return
         now = datetime.now(UTC).isoformat()
@@ -217,6 +227,7 @@ class CaptureRelay:
         observed = _Observation(scope, self.wire_capture, self.wire_maximum_bytes)
 
         async def receiving() -> object:
+            """Observe request chunks and early disconnects without changing events."""
             event = await receive()
             if isinstance(event, dict):
                 if event.get("type") == "http.disconnect" and not observed.completed:
@@ -228,6 +239,7 @@ class CaptureRelay:
             return event
 
         async def sending(event: object) -> None:
+            """Correlate eligible responses and time successful caller delivery."""
             if isinstance(event, dict) and event.get("type") == "http.response.start":
                 observed.headers = _headers(event.get("headers"))
                 request_id = next(
