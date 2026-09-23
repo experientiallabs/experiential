@@ -233,6 +233,7 @@ def run_prepared_model_evaluation(
             snapshot=embedder.snapshot,
             maximum_attempts=attempts,
             input_usd_per_million_tokens=retrieval.input_usd_per_million_tokens,
+            maximum_input_tokens=embedder.capabilities.context_window_tokens,
         ),
     )
     report(progress, "Loading world model")
