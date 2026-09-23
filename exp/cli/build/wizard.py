@@ -29,7 +29,7 @@ from exp.cli.build.wizard_screens import (
 from exp.cli.build.wizard_screens import (
     select_workflow as _select_workflow,
 )
-from exp.cli.shared.consent import require_spend_consent
+from exp.cli.shared.consent import SpendBudget, require_spend_consent
 from exp.cli.shared.progress import progress_display
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -103,8 +103,8 @@ def run_build_wizard(
         judge: Optional judge alias override.
         embedder: Optional embedder alias override.
         top_k: Serving retrieval result limit.
-        maximum_build_cost_usd: Strict grounded-build provider ceiling.
-        maximum_router_cost_usd: Optional strict router ceiling, or automatic planning.
+        maximum_build_cost_usd: Embedding budget requiring confirmation when exceeded.
+        maximum_router_cost_usd: Optional router budget requiring confirmation when exceeded.
         providers: Repeatable provider names that skip the opening provider list.
         console: Interactive terminal for prompts and progress.
 
@@ -176,32 +176,18 @@ def run_build_wizard(
             candidate_plan.selection,
         )
         router_ceiling = cost_plan.required_provider_cost_usd
-        if (
-            maximum_router_cost_usd is not None
-            and maximum_router_cost_usd < cost_plan.required_provider_cost_usd
-        ):
-            raise ValueError(
-                f"router cap ${maximum_router_cost_usd:.2f} is below the exact required "
-                f"${cost_plan.required_provider_cost_usd:.2f}; increase "
-                "--max-router-cost-usd or omit it"
-            )
-    if (
-        not plan.build_reused
-        and plan.build_estimate_usd is not None
-        and plan.build_estimate_usd > maximum_build_cost_usd
-    ):
-        raise ValueError(
-            f"grounded build requires ${plan.build_estimate_usd:.2f}, above the configured "
-            f"${maximum_build_cost_usd:.2f} ceiling; increase --max-build-cost-usd"
-        )
     build_estimate = 0.0 if plan.build_reused else plan.build_estimate_usd
     total_estimate = None if build_estimate is None else math.fsum((build_estimate, router_ceiling))
+    budgets = [SpendBudget("embedding", build_estimate, maximum_build_cost_usd)]
+    if maximum_router_cost_usd is not None:
+        budgets.append(SpendBudget("router", router_ceiling, maximum_router_cost_usd))
     if (total_estimate is None or total_estimate > 0) and not require_spend_consent(
         console,
         root=root,
         yes=False,
         estimated_cost_usd=total_estimate,
         command=f"exp build {project}",
+        additional_budgets=budgets,
     ):
         console.print("Stopped before paid build or router work.")
         return
@@ -228,7 +214,7 @@ def run_build_wizard(
                 embedder_snapshot=embedder_snapshot,
                 top_k=top_k,
                 estimate=plan.build_estimate_usd,
-                maximum_build_cost_usd=maximum_build_cost_usd,
+                maximum_build_cost_usd=max(maximum_build_cost_usd, build_estimate or 0.0),
                 provider_spend_authorized=True,
                 progress=progress,
             )
@@ -425,6 +411,7 @@ def _run_selected_judge_calibration(
         yes=False,
         estimated_cost_usd=required,
         command=f"exp build {project}",
+        additional_budgets=(SpendBudget("router", required, router_ceiling),),
     ):
         return None, 0.0
     return recomputed, max(router_ceiling, required)
@@ -537,7 +524,7 @@ def _prepare_new_build(
         judge: Optional judge override.
         embedder: Optional embedder override.
         top_k: Serving retrieval result limit.
-        maximum_build_cost_usd: Strict embedding ceiling.
+        maximum_build_cost_usd: Embedding budget requiring confirmation when exceeded.
         code_revision: Installed producer revision.
         providers: Repeatable provider names that skip the opening provider list.
         setup_providers: Whether the providers workflow step may run interactive setup.

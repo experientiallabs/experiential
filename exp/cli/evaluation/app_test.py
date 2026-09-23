@@ -7,11 +7,13 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.cli.evaluation import flow
+from exp.cli.shared import consent
 from exp.cli.shared.picker import PickerResult
+from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_run
 from exp.optimize.evaluation.runs_test import _twenty_scenarios
-from exp.optimize.router.automatic.service_test import _REVISION
+from exp.optimize.router.automatic.service_test import _REVISION, _RuntimeCatalog
 
 
 def test_cli_review_and_resume_preserve_exact_preparation(tmp_path: Path) -> None:
@@ -94,3 +96,45 @@ def test_unbuilt_project_requires_build_before_setup(tmp_path: Path) -> None:
     assert result.exit_code != 0
     assert "exp build powerset" in result.output
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("answer", ["n", "y"])
+def test_eval_over_budget_can_decline_or_complete_the_saved_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """An over-budget eval keeps its prepared run on decline and can execute after approval."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(
+            models=("candidate-a", "candidate-b"),
+            options=ModelEvaluationOptions(maximum_steps=1),
+        ),
+        code_revision=_REVISION,
+    )
+    set_maximum_command_cost_usd(0.0, project.paths.root)
+    before = len(state.completion_calls), len(state.embedding_calls)
+    monkeypatch.setattr(flow, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(consent, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(flow, "_review", lambda *_args: True)
+    monkeypatch.setattr(flow, "_results", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        flow, "RuntimeModelCatalog", lambda catalog: _RuntimeCatalog(catalog, state)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["eval", "support", "--root", str(project.paths.root), "--resume", run.run_id],
+        input=f"{answer}\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "exceeds the $0.00 budget" in result.output
+    assert "Proceed anyway" in result.output
+    if answer == "y":
+        assert load_run(project, run.run_id).status == "completed"
+        assert len(state.completion_calls) > before[0]
+    else:
+        assert load_run(project, run.run_id).status == "prepared"
+        assert before == (len(state.completion_calls), len(state.embedding_calls))

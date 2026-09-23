@@ -21,16 +21,18 @@ The root surface is deliberately small:
 | `exp config gateway models [--json]` | List the aliases a live gateway grants to the presented key (caller view of `GET /v1/models`). | One HTTP request against the running gateway; no local state. |
 | `exp config gateway key check [--json]` | Validate one raw virtual key against a live gateway and print its granted aliases without storing the key. | One HTTP request against the running gateway; no local state. |
 | `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. `experiential-cloud` points at the hosted Platform gateway and reuses the credential from `exp login`; login already performs its provider/model synchronization. Setup also persists, replaces, or removes user-local provider keys. | Local `.exp/models.toml` plus optional records in the user-data credential file. |
-| `exp config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
+| `exp config budget [USD] --root ROOT` | Read or set the budget warning threshold for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
 | `exp config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
 
-`build`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
+`build`, `eval`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
 policy. An estimate at or below 50% of the budget runs automatically. A higher estimate
-up to the budget requires a clear terminal confirmation or `--yes`; an estimate above the budget
-warns and requires an explicit interactive override that defaults to no, and fails closed before
-credentials or provider clients when no terminal is available. Set the deterministic ceiling with
-`exp config budget USD --root ROOT`. `--yes` confirms only an in-budget invocation and never raises
-the ceiling. Exact completed replays report a zero-dollar estimate and do not prompt.
+requires a clear terminal confirmation or `--yes`. An estimate above the budget warns and offers
+"Proceed anyway?", defaulting to no. `--yes` also authorizes an over-budget estimate after the
+warning. Without a terminal or explicit consent, the command explains how to proceed and makes
+no provider calls. Set the warning budget with `exp config budget USD --root ROOT`. Build embedding
+and router budgets and the judge-calibration budget use the same warning and confirmation flow.
+Approval applies to this invocation; saved budgets stay unchanged. Exact completed replays report
+a zero-dollar estimate and do not prompt.
 
 Successful build, router, simulation, and SFT operations preserve anonymous aggregate PostHog
 product telemetry, which may send unless disabled. Gateway startup makes no provider call.

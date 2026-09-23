@@ -44,7 +44,7 @@ def evaluate(
         resume: Exact saved run ID; rejects configuration overrides.
         report: Completed run ID to inspect without dispatch.
         dry_run: Stop before credentials and provider calls.
-        yes: Confirm an in-budget quote.
+        yes: Confirm the quote, including any budget warning.
         non_interactive: Disable terminal questions.
     """
     # Defer the application graph at command dispatch, keeping config/help independent.

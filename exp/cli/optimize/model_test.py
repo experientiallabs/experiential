@@ -1298,11 +1298,11 @@ def test_schedule_ceiling_refuses_before_tinker_backend_construction(
     assert backend_calls == []
 
 
-def test_command_budget_rejects_sft_before_credentials_even_with_yes(
+def test_command_budget_requires_consent_before_sft_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shared ceiling rejects a priced schedule before Tinker construction.
+    """An unconfirmed command budget overrun stops before Tinker construction.
 
     Args:
         tmp_path: Pytest-owned project and settings directory.
@@ -1337,14 +1337,13 @@ def test_command_budget_rejects_sft_before_credentials_even_with_yes(
             configured.store.paths.project_id,
             "--root",
             str(configured.store.paths.root),
-            "--yes",
         ],
     )
 
     assert result.exit_code == 2
     flattened = _flat_cli_output(result.output)
-    assert "exceedstheconfiguredper-commandbudget" in flattened
-    assert "--yescannotoverride" in flattened
+    assert "exceedsthe$0.01budget" in flattened
+    assert "interactiveterminaltoproceed,oruse--yes" in flattened
     assert backend_calls == []
 
 

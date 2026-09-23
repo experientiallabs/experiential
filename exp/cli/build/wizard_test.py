@@ -752,16 +752,13 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     assert store.load_project().build is None
 
 
-def test_explicit_router_cap_below_required_fails_before_consent_or_paid_calls(
+@pytest.mark.parametrize("answer", ["n", "y"])
+def test_explicit_router_budget_overrun_offers_a_choice_before_paid_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    answer: str,
 ) -> None:
-    """An inadmissible explicit cap exits nonzero after discovery but before paid work.
-
-    Args:
-        tmp_path: Isolated current directory and EXP root.
-        monkeypatch: Pytest patch fixture installing deterministic provider seams.
-    """
+    """A small router budget offers a usable override, with zero paid calls on decline."""
     _default_trace_corpus(tmp_path)
     monkeypatch.chdir(tmp_path)
     state = _ProviderState()
@@ -778,20 +775,69 @@ def test_explicit_router_cap_below_required_fails_before_consent_or_paid_calls(
             "--max-router-cost-usd",
             "0.01",
         ],
-        input="1,2,5\ntraces.otel.jsonl\n2\n\n\n",
+        input=f"1,2,5\ntraces.otel.jsonl\n2\n\n\n{answer}\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
-    assert result.exit_code == 2
+    assert result.exit_code == 0, result.output
     printed = unstyle(result.output)
     flat = " ".join(printed.replace("│", " ").split())
-    assert "router cap $0.01 is below the exact required" in flat
-    assert "increase --max-router-cost-usd or omit it" in flat
-    assert "Authorize exp build support" not in printed
-    assert state.credential_resolutions == 0
-    assert state.embedding_calls == []
-    assert state.completion_calls == []
-    assert wizard.ProjectStore(root, "support").load_project().build is None
+    assert "warning router estimate" in flat
+    assert "exceeds the $0.01 budget" in flat
+    assert printed.count("Proceed anyway") == 1
+    if answer == "y":
+        assert state.embedding_calls and state.completion_calls
+        assert "Complete" in printed
+    else:
+        assert state.credential_resolutions == 0
+        assert state.embedding_calls == []
+        assert state.completion_calls == []
+        assert wizard.ProjectStore(root, "support").load_project().build is None
+
+
+@pytest.mark.parametrize("answer", ["n", "", "y"])
+def test_bare_build_budget_warning_can_continue_or_decline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """The Powerset-style build offers an override and retains the saved budget on either path."""
+    _default_trace_corpus(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / ".exp"
+    write_model_catalog(root / "models.toml", _catalog())
+    state = _ProviderState()
+    _install_integrated_runtime(monkeypatch, state)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 7.9447329)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support"],
+        input=f"\ntraces.otel.jsonl\n{answer}\n",
+        env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
+    )
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(unstyle(result.output).split())
+    assert "embedding estimate $7.95 exceeds the $5.00 budget" in output
+    assert output.count("Proceed anyway") == 1
+    store = wizard.ProjectStore(root, "support")
+    saved_budgets = store.load_project().budgets
+    assert saved_budgets is not None and float(saved_budgets.maximum_build_cost_usd) == 5.0
+    if answer == "y":
+        assert store.load_project().build is not None
+        assert state.embedding_calls and not state.completion_calls
+    else:
+        assert store.load_project().build is None
+        assert not state.embedding_calls and not state.completion_calls
+        # The same command can resume after a decline without changing project configuration.
+        resumed = _RUNNER.invoke(
+            app,
+            ["build", "support"],
+            input="\ntraces.otel.jsonl\ny\n",
+            env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
+        )
+        assert resumed.exit_code == 0, resumed.output
+        assert store.load_project().build is not None
+        assert state.embedding_calls and not state.completion_calls
 
 
 def test_explicit_router_cap_above_required_consents_only_to_exact_plan(

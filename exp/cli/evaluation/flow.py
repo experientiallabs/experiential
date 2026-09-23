@@ -73,7 +73,7 @@ def run_evaluation(
         resume: Exact saved run ID; rejects configuration overrides.
         report: Completed run ID to inspect without dispatch.
         dry_run: Stop before credentials and provider calls.
-        yes: Confirm an in-budget quote.
+        yes: Confirm the quote, including any budget warning.
         non_interactive: Disable terminal questions.
     """
     interactive = not non_interactive and can_prompt(_console)

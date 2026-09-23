@@ -63,7 +63,7 @@ uv run pytest -q
   and model identity; immutable import IDs and project associations are transactional and
   idempotent. Ingestion remains a common Python operation, not a separate CLI command.
   Build writes manifest-bound fit and held-out tasks plus
-  `proposals_pending` review state, builds both RAG indexes under a strict embedding-cost ceiling,
+  `proposals_pending` review state, builds both RAG indexes with cost-aware spend consent,
   and binds the grounded world model without a completion or judge call. Route each corpus
   through an explicit canonical source loader. The interactive wizard defaults to provider
   configuration and build preparation; router optimization requires an explicit selection.
@@ -145,8 +145,11 @@ uv run pytest -q
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
 - Every paid CLI command uses `exp.cli.shared.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
-  `.exp/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
-  higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
+  `.exp/settings.toml` is a per-command warning budget. Estimates at or below half run automatically;
+  higher estimates need explicit confirmation. An over-budget estimate must warn and offer a
+  default-no proceed choice instead of rejecting the command. `--yes` is explicit authorization
+  for the displayed estimate, including budget overruns. Component budgets use this same consent
+  path, and execution must honor the approved estimate without changing saved warning budgets.
 - Long-lived gateway serving is exempt from one-shot spend consent. Startup performs no provider
   call; every later request requires key-derived authority and content-free attempt accounting.
 - `exp optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
@@ -154,7 +157,7 @@ uv run pytest -q
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
   digest, and credential-reference digest without persisting any secret. A finite cap requires a
   conservative estimate for every exact scheduled batch before shared cost authorization;
-  `--yes` confirms only an in-budget estimate after those checks. Completed W13 artifacts are
+  `--yes` confirms the displayed estimate after those checks. Completed W13 artifacts are
   recursively verified before an opaque sampling handle is atomically registered in `models.toml`.
 - Changes to this composition seam require focused persisted-dataset, resume, budget, immutable
   pointer, drift, and catalog-provenance coverage. The seam composes a persisted dataset into an

@@ -10,7 +10,6 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from exp.cli.build.cost import over_ceiling_message
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import (
@@ -18,7 +17,7 @@ from exp.cli.providers.setup import (
     provider_setup_json_examples,
     run_provider_setup,
 )
-from exp.cli.shared.consent import can_prompt, require_spend_consent
+from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.progress import progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
@@ -123,19 +122,19 @@ def build(
         5.0,
         "--max-build-cost-usd",
         min=0.01,
-        help="Strict embedding spend ceiling in USD.",
+        help="Embedding budget in USD; ask before exceeding it.",
     ),
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm an in-budget estimate when the shared policy requires it.",
+        help="Confirm the estimate, including any budget warning.",
     ),
     maximum_router_cost_usd: float | None = typer.Option(
         None,
         "--max-router-cost-usd",
         min=0.01,
         help=(
-            "Optional automatic-router ceiling for the interactive build; omitted uses "
+            "Optional router warning budget for the interactive build; omitted uses "
             "the exact conservative schedule reservation."
         ),
     ),
@@ -154,7 +153,7 @@ def build(
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
-    The explicit command and configured build-cost ceiling authorize provider embedding calls.
+    Shared spend consent covers provider embedding calls and any configured budget overrun.
     Model setup runs first when required catalog state is absent and both terminal streams are
     interactive. The shared catalog commits before project creation. Noninteractive missing state
     fails before any project or artifact write. Configured builds compute and display a complete
@@ -171,9 +170,9 @@ def build(
         judge: Optional configured alias override for this project.
         embedder: Optional configured alias override for this project.
         top_k: Positive serving retrieval result limit.
-        maximum_build_cost_usd: Strict ceiling for provider embedding calls.
-        yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
-        maximum_router_cost_usd: Optional strict wizard router ceiling, or automatic planning.
+        maximum_build_cost_usd: Embedding budget requiring confirmation when exceeded.
+        yes: Explicit confirmation for the estimate, including any budget warning.
+        maximum_router_cost_usd: Optional router budget requiring confirmation when exceeded.
         dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
@@ -339,29 +338,17 @@ def build(
         if dry_run:
             _console.print("[green]dry run complete[/green] No provider calls or build selection.")
             return
-        if built is None:
-            if estimate is not None and estimate > maximum_build_cost_usd:
-                raise ValueError(
-                    over_ceiling_message(
-                        estimate=estimate,
-                        ceiling=maximum_build_cost_usd,
-                        project=project,
-                        trace_file=trace_file,
-                        source=source,
-                        root=root,
-                        world_model=world_model,
-                        judge=judge,
-                        embedder=embedder,
-                        top_k=top_k,
-                    )
-                )
+        remaining_estimate = 0.0 if reused else estimate
         if not require_spend_consent(
             _console,
             root=root,
             yes=yes,
-            estimated_cost_usd=estimate,
+            estimated_cost_usd=remaining_estimate,
             command=f"exp build {project} {trace_file}",
             non_interactive=no_interactive,
+            additional_budgets=(
+                SpendBudget("embedding", remaining_estimate, maximum_build_cost_usd),
+            ),
         ):
             return
         with progress_display(_console) as progress:
@@ -374,7 +361,7 @@ def build(
                 embedder_snapshot=embedder_snapshot,
                 top_k=top_k,
                 estimate=estimate,
-                maximum_build_cost_usd=maximum_build_cost_usd,
+                maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
                 provider_spend_authorized=True,
                 progress=progress,
             )
@@ -700,7 +687,7 @@ def _complete_grounded_build(
         embedder_snapshot: Exact provider-free embedder identity.
         top_k: Frozen retrieval result count.
         estimate: Conservative retry-inclusive embedding cost, or ``None`` when undefined.
-        maximum_build_cost_usd: Strict grounded-build provider ceiling.
+        maximum_build_cost_usd: Invocation ceiling covering the explicitly approved estimate.
         provider_spend_authorized: Whether new embedding calls are authorized.
         progress: Optional observer of embedding, RAG, and finalization stages.
 
@@ -937,7 +924,7 @@ def _render_preflight(
         )
     else:
         _console.print(f"  [dim]embedding[/dim]    at most ${estimate:.6f}")
-    _console.print(f"  [dim]ceiling[/dim]      ${ceiling:.6f}")
+    _console.print(f"  [dim]budget[/dim]       ${ceiling:.6f}")
 
 
 def _render_completed_build(
