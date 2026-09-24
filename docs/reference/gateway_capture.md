@@ -95,8 +95,10 @@ prepared string object; acknowledged members are released independently.
 Once preparation succeeds, the redundant decoded record tree is released before
 preparing the next member. Its admission charge remains until acknowledgement.
 
-The batched storage interface emits full schema-1 records and schema-2 completion
-updates. A completion references a previously queued checkpoint: its `request`
+By default, batched storage retains complete schema-1 records. A destination that
+supports incremental updates can explicitly set `completion_references=True` to
+receive schema-2 completions instead of repeating checkpointed request context.
+A completion references a previously queued checkpoint: its `request`
 contains `request_id`, `scope`, `protocol` and `model_id`, but no `context`.
 All response, reasoning, usage and transport fields remain intact. The destination
 must return `False` for a completion whose permitted prompt has not persisted yet,

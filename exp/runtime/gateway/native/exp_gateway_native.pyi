@@ -50,7 +50,10 @@ class CaptureCollector:
     def __init__(self, config_json: str, sink: Callable[[str], None]) -> None: ...
     @staticmethod
     def batched(
-        config_json: str, sink: Callable[[tuple[str, ...]], list[bool]]
+        config_json: str,
+        sink: Callable[[tuple[str, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
     ) -> CaptureCollector: ...
     @staticmethod
     def sqlite(config_json: str, local_json: str) -> CaptureCollector | None: ...

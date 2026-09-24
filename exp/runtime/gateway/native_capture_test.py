@@ -442,6 +442,8 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
     [
         "local",
         "hosted",
+        "hosted-batched",
+        "hosted-batched-references",
         "hosted-late",
         "hosted-byok",
         "hosted-checkpoint-failed",
@@ -454,6 +456,9 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
 ) -> None:
     """Collect Chat, Responses and Messages JSON/SSE through native HTTP, not a fixture tap."""
+    destination = policy
+    if policy.startswith("hosted-batched"):
+        policy = "hosted"
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
     _LoopbackProvider.calls = 0
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
@@ -472,7 +477,19 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
             else CaptureDeliveryLimits()
         ),
     )
-    collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
+
+    def write_batch(values: tuple[str, ...]) -> list[bool]:
+        records.extend(values)
+        return [True] * len(values)
+
+    if destination == "hosted-batched-references":
+        collector = native.CaptureCollector.batched(
+            configuration.model_dump_json(), write_batch, completion_references=True
+        )
+    elif destination == "hosted-batched":
+        collector = native.CaptureCollector.batched(configuration.model_dump_json(), write_batch)
+    else:
+        collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
     if policy == "full":
         assert collector.close(1)
 
@@ -601,7 +618,26 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     if policy in {"off", "broken", "full", "hosted-byok", "hosted-checkpoint-failed"}:
         assert records == []
         return
-    parsed = [CaptureRecord.model_validate_json(value) for value in records]
+    if destination == "hosted-batched-references":
+        updates = [json.loads(value) for value in records]
+        checkpoints = {
+            value["request"]["request_id"]: value["request"]
+            for value in updates
+            if value["schema_version"] == 1
+        }
+        completions = [value for value in updates if value["schema_version"] == 2]
+        assert len(checkpoints) == len(completions) == 6
+        for value in completions:
+            assert "context" not in value["request"]
+            request = checkpoints[value["request"]["request_id"]]
+            assert value["request"] == {
+                key: field for key, field in request.items() if key != "context"
+            }
+            value["request"] = request
+            value["schema_version"] = 1
+        parsed = [CaptureRecord.model_validate(value) for value in completions]
+    else:
+        parsed = [CaptureRecord.model_validate_json(value) for value in records]
     completed = [record for record in parsed if record.response is not None]
     assert len(completed) == 6
     assert sum(record.response.kind == "json" for record in completed if record.response) == 3

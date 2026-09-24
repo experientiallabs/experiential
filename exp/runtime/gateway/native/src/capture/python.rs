@@ -16,7 +16,10 @@ struct PythonSink(Py<PyAny>);
 const BATCH_RECORDS: usize = 64;
 const BATCH_BYTES: usize = 2 * 1024 * 1024;
 
-struct PythonBatchSink(Py<PyAny>);
+struct PythonBatchSink {
+    callback: Py<PyAny>,
+    completion_references: bool,
+}
 
 struct EncodedRecord {
     value: Py<PyAny>,
@@ -33,7 +36,12 @@ impl Sink for PythonBatchSink {
     }
 
     fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        let encoded = record.encode_update(maximum_bytes).ok_or(())?;
+        let encoded = if self.completion_references {
+            record.encode_update(maximum_bytes)
+        } else {
+            record.encode(maximum_bytes)
+        }
+        .ok_or(())?;
         let bytes = encoded.len();
         Python::try_attach(|py| {
             encoded.into_pyobject(py).map(|value| EncodedRecord {
@@ -74,7 +82,7 @@ impl Sink for PythonBatchSink {
             // A tuple of references: payloads are never joined, parsed or encoded
             // again for batching. The callback returns per-record durable acks.
             let records = PyTuple::new(py, prepared.iter().map(|p| p.value.bind(py))).ok()?;
-            self.0
+            self.callback
                 .bind(py)
                 .call1((records,))
                 .ok()?
@@ -129,21 +137,35 @@ pub struct CaptureCollector {
 
 #[pymethods]
 impl CaptureCollector {
-    /// Deliver bounded groups with per-update commit acknowledgements. Schema 1
-    /// carries a full record; schema 2 carries a completion without request.context
-    /// and must be retried until the matching prompt checkpoint exists in storage.
+    /// Deliver bounded groups with per-update commit acknowledgements. Default
+    /// records remain complete schema 1. Opt-in schema-2 completion references
+    /// require a destination that retries until the prompt checkpoint is durable.
     #[staticmethod]
-    fn batched(py: Python<'_>, config_json: &str, sink: Py<PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (config_json, sink, *, completion_references=false))]
+    fn batched(
+        py: Python<'_>,
+        config_json: &str,
+        sink: Py<PyAny>,
+        completion_references: bool,
+    ) -> PyResult<Self> {
         if !sink.bind(py).is_callable() {
             return Err(PyValueError::new_err("capture batch sink must be callable"));
         }
         let config: Configuration = serde_json::from_str(config_json)
             .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
-        py.detach(|| Collector::new(config, PythonBatchSink(sink)))
-            .map(|collector| Self {
-                inner: Arc::new(collector),
-            })
-            .map_err(PyValueError::new_err)
+        py.detach(|| {
+            Collector::new(
+                config,
+                PythonBatchSink {
+                    callback: sink,
+                    completion_references,
+                },
+            )
+        })
+        .map(|collector| Self {
+            inner: Arc::new(collector),
+        })
+        .map_err(PyValueError::new_err)
     }
 
     /// Use the same collector and delivery worker with a native local SQLite sink.
