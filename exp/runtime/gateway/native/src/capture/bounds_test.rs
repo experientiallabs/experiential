@@ -4,6 +4,13 @@ fn encoded_size(value: &Value) -> usize {
     serde_json::to_string(value).unwrap().len()
 }
 
+fn trim(value: &mut Value, maximum: usize) -> usize {
+    let original = json_bytes(value);
+    let (count, remaining) = trim_strings(value, maximum, original);
+    assert_eq!(remaining, encoded_size(value));
+    count
+}
+
 /// Independent encoded-size oracle for the specified prefix/marker policy.
 fn reference_trim(value: &mut Value, maximum: usize) -> usize {
     if encoded_size(value) <= maximum {
@@ -48,7 +55,7 @@ fn incremental_sizes_preserve_exact_truncation_policy() {
                 let mut actual = input.clone();
                 let mut expected = input.clone();
                 assert_eq!(
-                    trim_strings(&mut actual, maximum),
+                    trim(&mut actual, maximum),
                     reference_trim(&mut expected, maximum)
                 );
                 assert_eq!(actual, expected);
@@ -64,7 +71,7 @@ fn near_prefix_markers_can_increase_size_without_invalidating_accounting() {
     for maximum in [encoded_size(&input) - 1, 0] {
         let mut actual = input.clone();
         let mut expected = input.clone();
-        assert_eq!(trim_strings(&mut actual, maximum), 2);
+        assert_eq!(trim(&mut actual, maximum), 2);
         assert_eq!(reference_trim(&mut expected, maximum), 2);
         assert_eq!(actual, expected);
         assert!(encoded_size(&actual) > encoded_size(&input));
@@ -76,7 +83,7 @@ fn oversized_prompt_keeps_the_largest_prefix_that_fits_not_only_four_kib() {
     for unit in ["x", "雪😀"] {
         let text = unit.repeat(5 * 1024 * 1024 / unit.len());
         let mut value = json!([{"role": "user", "content": text}]);
-        assert_eq!(trim_strings(&mut value, COLUMN_BUDGET), 1);
+        assert_eq!(trim(&mut value, COLUMN_BUDGET), 1);
         let retained = value[0]["content"].as_str().unwrap();
         assert!(retained.len() > COLUMN_BUDGET - 128);
         assert!(retained.contains("[truncated for capture:"));
@@ -88,7 +95,7 @@ fn oversized_prompt_keeps_the_largest_prefix_that_fits_not_only_four_kib() {
 #[test]
 fn equally_sized_messages_have_deterministic_minimum_loss_ordering() {
     let mut value = json!(["a".repeat(10000), "b".repeat(10000), "c".repeat(10000)]);
-    assert_eq!(trim_strings(&mut value, 29500), 1);
+    assert_eq!(trim(&mut value, 29500), 1);
     assert!(value[0].as_str().unwrap().starts_with(&"a".repeat(9400)));
     assert_eq!(value[1], "b".repeat(10000));
     assert_eq!(value[2], "c".repeat(10000));

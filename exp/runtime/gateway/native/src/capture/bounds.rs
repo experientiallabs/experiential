@@ -31,11 +31,11 @@ fn string_leaves(value: &Value, path: &str, leaves: &mut Vec<(usize, String)>) {
     }
 }
 
-fn trim_strings(value: &mut Value, maximum: usize) -> usize {
+/// Return both changed-string count and exact final size, reusing the caller's size walk.
+fn trim_strings(value: &mut Value, maximum: usize, mut bytes: usize) -> (usize, usize) {
     let mut count = 0;
-    let mut bytes = json_bytes(value);
     if bytes <= maximum {
-        return 0;
+        return (0, bytes);
     }
     let mut leaves = Vec::new();
     string_leaves(value, "", &mut leaves);
@@ -69,7 +69,7 @@ fn trim_strings(value: &mut Value, maximum: usize) -> usize {
         bytes = bytes - original_bytes + string_bytes(text);
         count += 1;
     }
-    count
+    (count, bytes)
 }
 
 /// Alter only the freshly decoded capture tree, never the request being served.
@@ -91,9 +91,9 @@ pub(super) fn bound(request: &mut Request, maximum: usize) -> usize {
     if let Some(messages) = effective.get_mut("messages") {
         let original = json_bytes(messages);
         if original > COLUMN_BUDGET {
-            let strings = trim_strings(messages, COLUMN_BUDGET);
+            let (strings, remaining) = trim_strings(messages, COLUMN_BUDGET, original);
             let mut dropped = 0;
-            if json_bytes(messages) > COLUMN_BUDGET {
+            if remaining > COLUMN_BUDGET {
                 dropped = messages.as_array().map_or(0, Vec::len);
                 *messages = json!([{"role":"system", "truncated":true,
                     "content":format!("[{dropped} messages ({original} bytes) not captured: over the 4 MiB cap even with every string truncated]")}]);
@@ -128,13 +128,22 @@ pub(super) fn bound(request: &mut Request, maximum: usize) -> usize {
         }
         context["capture_limits"] = Value::Object(limits);
     }
-    if request.json_bytes() > maximum {
+    let size = request.json_bytes();
+    if size <= maximum {
+        return size;
+    }
+    {
         let context = Arc::make_mut(&mut request.context);
         context.as_object_mut().unwrap().remove("source_json");
-        let trimmed = trim_strings(context, maximum.saturating_sub(4096));
+        let original = json_bytes(context);
+        let (trimmed, _) = trim_strings(context, maximum.saturating_sub(4096), original);
         context["context_truncated_strings"] = trimmed.into();
     }
-    if request.json_bytes() > maximum {
+    let size = request.json_bytes();
+    if size <= maximum {
+        return size;
+    }
+    {
         // The previous hosted writer omitted an oversized envelope rather than
         // discard its prompt or reject serving. Preserve the same last resort
         // for structural tool schemas with no large strings to shorten.
@@ -145,17 +154,21 @@ pub(super) fn bound(request: &mut Request, maximum: usize) -> usize {
         *context = json!({"schema_version":1,"request":{"messages":messages},
             "capture_limits":limits});
     }
-    if request.json_bytes() > maximum {
+    let size = request.json_bytes();
+    if size <= maximum {
+        return size;
+    }
+    {
         // A configured request cap can be smaller than the column cap. Account
         // for the retained authority/envelope and truncation markers as well.
         let original = json_bytes(&request.context["request"]["messages"]);
-        let overhead = request.json_bytes().saturating_sub(original);
+        let overhead = size.saturating_sub(original);
         let message_budget = maximum.saturating_sub(overhead + 256);
         let context = Arc::make_mut(&mut request.context);
         let messages = &mut context["request"]["messages"];
-        let strings = trim_strings(messages, message_budget);
+        let (strings, remaining) = trim_strings(messages, message_budget, original);
         let mut dropped = 0;
-        if json_bytes(messages) > message_budget {
+        if remaining > message_budget {
             dropped = messages.as_array().map_or(0, Vec::len);
             *messages = json!([{"role":"system", "truncated":true,
                 "content":format!("[{dropped} messages ({original} bytes) not captured: over capture limit]")}]);
