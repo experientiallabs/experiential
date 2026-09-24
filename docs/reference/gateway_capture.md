@@ -86,6 +86,10 @@ hosted Python destination receives the same encoded string object on every retry
 storage retries do not decode the response or serialize the record again. Native destinations consume
 the structure directly. Request admission still crosses the Python/Rust boundary
 as JSON; exceptional lossless sidecars and raw tool-call strings also use JSON.
+The typed Python controller passes that JSON as immutable UTF-8 bytes through
+`begin_bytes`, without decoding it into a Python Unicode string and converting
+it back to UTF-8 at the native boundary. `begin(str)` remains available with the
+same validation and capture contract.
 
 Hosted destinations can opt into `CaptureCollector.batched(config_json, write_batch)`.
 Batching does not change acknowledgement semantics. A host that already owns an
@@ -109,6 +113,10 @@ booleans in the same order: `True` acknowledges durable storage or an intentiona
 privacy exclusion, and `False` retains that record for retry. Exceptions or an
 incorrect receipt count acknowledge nothing. Failed members retain the exact same
 prepared string object; acknowledged members are released independently.
+Destinations that accept UTF-8 can set `bytes_output=True` to receive immutable
+bytes instead of strings. This skips Unicode decoding and re-encoding at the
+storage boundary; the JSON, size limits and acknowledgement semantics are
+identical. Failed members retain the same bytes object across retries.
 Once preparation succeeds, the redundant decoded record tree is released before
 preparing the next member. Its admission charge remains until acknowledgement.
 

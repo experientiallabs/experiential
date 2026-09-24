@@ -123,6 +123,36 @@ def _request_json() -> str:
     )
 
 
+@pytest.mark.parametrize("suffix", ["a", "é", "雪", "😀"])
+def test_bytes_admission_preserves_text_contract_without_python_unicode_copy(suffix: str) -> None:
+    """The immutable-byte entry point stores exactly the same context as text admission."""
+    request = json.loads(_request_json())
+    request["context"]["request"]["messages"] = [{"role": "user", "content": "x" * 65536 + suffix}]
+    encoded = json.dumps(request, ensure_ascii=False)
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    assert collector.begin(encoded)
+    collector.settle("request", True, False)
+    assert collector.begin_bytes(encoded.encode("utf-8"))
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    assert len(records) == 2
+    assert all(json.loads(record)["request"] == request for record in records)
+    assert collector.counts() == (0, 0, 2, 0, 0, 0)
+
+
+def test_bytes_admission_rejects_invalid_utf8_and_mutable_buffers() -> None:
+    """Releasing the GIL never borrows a mutable buffer or admits invalid JSON bytes."""
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    assert not collector.begin_bytes(_request_json().encode().replace(b'"app"', b'"\xff"'))
+    with pytest.raises(TypeError):
+        collector.begin_bytes(bytearray(_request_json().encode()))
+    assert collector.close(1)
+    assert records == []
+    assert collector.counts() == (0, 0, 0, 0, 0, 1)
+
+
 def test_python_sink_runs_off_caller_thread_and_close_releases_gil() -> None:
     """A sink requiring Python can finish while the caller waits on the Rust drain."""
     records: list[str] = []
@@ -241,17 +271,20 @@ def test_python_sink_rechecks_policy_after_an_uncertain_commit() -> None:
     assert collector.counts() == (0, 0, 1, 1, 0, 0)
 
 
-def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members() -> None:
+@pytest.mark.parametrize("bytes_output", [False, True])
+def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members(
+    bytes_output: bool,
+) -> None:
     """One failed record cannot hold healthy peers; retries reuse prepared objects."""
     entered = threading.Event()
     release = threading.Event()
     recover = threading.Event()
     healthy = threading.Event()
-    batches: list[tuple[str, ...]] = []
+    batches: list[tuple[str | bytes, ...]] = []
     persisted: set[str] = set()
-    failed_strings: list[str] = []
+    failed_strings: list[str | bytes] = []
 
-    def write(records: tuple[str, ...]) -> list[bool]:
+    def write(records: tuple[str | bytes, ...]) -> list[bool]:
         """Keep one record unavailable while acknowledging all of its neighbors."""
         assert threading.current_thread() is not threading.main_thread()
         batches.append(records)
@@ -259,6 +292,7 @@ def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members(
         assert release.wait(5)
         outcomes = []
         for encoded in records:
+            assert isinstance(encoded, bytes if bytes_output else str)
             request_id = CaptureRecord.model_validate_json(encoded).request.request_id
             if request_id == "request-0":
                 failed_strings.append(encoded)
@@ -272,7 +306,13 @@ def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members(
             healthy.set()
         return outcomes
 
-    collector = native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    collector = (
+        native.CaptureCollector.batched(
+            CaptureConfiguration().model_dump_json(), write, bytes_output=True
+        )
+        if bytes_output
+        else native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    )
     threads = []
     for index in range(16):
         request_id = f"request-{index}"
@@ -303,11 +343,12 @@ def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members(
     assert collector.counts()[4:] == (0, 0)
 
 
-def test_batched_sink_invalid_acknowledgements_never_release_records() -> None:
+@pytest.mark.parametrize("bytes_output", [False, True])
+def test_batched_sink_invalid_acknowledgements_never_release_records(bytes_output: bool) -> None:
     """Exceptions and mismatched receipt counts retain the same prepared payload."""
-    seen: list[str] = []
+    seen: list[str | bytes] = []
 
-    def write(records: tuple[str, ...]) -> list[bool]:
+    def write(records: tuple[str | bytes, ...]) -> list[bool]:
         """Recover only after exercising both invalid callback outcomes."""
         seen.append(records[0])
         if len(seen) == 1:
@@ -316,7 +357,13 @@ def test_batched_sink_invalid_acknowledgements_never_release_records() -> None:
             return []
         return [True]
 
-    collector = native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    collector = (
+        native.CaptureCollector.batched(
+            CaptureConfiguration().model_dump_json(), write, bytes_output=True
+        )
+        if bytes_output
+        else native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    )
     assert collector.begin(_request_json())
     collector.settle("request", True, False)
     assert collector.close(1)
@@ -325,22 +372,30 @@ def test_batched_sink_invalid_acknowledgements_never_release_records() -> None:
 
 
 @pytest.mark.parametrize(("count", "size"), [(80, 0), (8, 600_000)])
-def test_batched_sink_bounds_count_and_bytes(count: int, size: int) -> None:
+@pytest.mark.parametrize("bytes_output", [False, True])
+def test_batched_sink_bounds_count_and_bytes(count: int, size: int, bytes_output: bool) -> None:
     """Queued work fills byte- and count-bounded batches without losing Unicode."""
     entered, release = threading.Event(), threading.Event()
-    batches: list[tuple[str, ...]] = []
+    batches: list[tuple[str | bytes, ...]] = []
 
-    def write(records: tuple[str, ...]) -> list[bool]:
+    def write(records: tuple[str | bytes, ...]) -> list[bool]:
         batches.append(records)
         entered.set()
         assert release.wait(5)
         assert len(records) <= 64
-        assert sum(len(record.encode()) for record in records) <= 10 * 1024 * 1024
+        sizes = [len(record.encode() if isinstance(record, str) else record) for record in records]
+        assert sum(sizes) <= 10 * 1024 * 1024
         if len(records) > 1:
-            assert sum(len(record.encode()) for record in records[:-1]) < 2 * 1024 * 1024
+            assert sum(sizes[:-1]) < 2 * 1024 * 1024
         return [True] * len(records)
 
-    collector = native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    collector = (
+        native.CaptureCollector.batched(
+            CaptureConfiguration().model_dump_json(), write, bytes_output=True
+        )
+        if bytes_output
+        else native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    )
     threads = []
     try:
         for index in range(count):
@@ -526,6 +581,7 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
         "hosted",
         "hosted-batched",
         "hosted-batched-references",
+        "hosted-batched-bytes-references",
         "hosted-late",
         "hosted-byok",
         "hosted-checkpoint-failed",
@@ -550,7 +606,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
     )
     components = load_gateway_components(tmp_path)
-    records: list[str] = []
+    records: list[str | bytes] = []
     configuration = CaptureConfiguration(
         settlement_required=policy.startswith("hosted"),
         asynchronous_delivery=policy.startswith("hosted"),
@@ -561,11 +617,18 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         ),
     )
 
-    def write_batch(values: tuple[str, ...]) -> list[bool]:
+    def write_batch(values: tuple[str | bytes, ...]) -> list[bool]:
         records.extend(values)
         return [True] * len(values)
 
-    if destination == "hosted-batched-references":
+    if destination == "hosted-batched-bytes-references":
+        collector = native.CaptureCollector.batched(
+            configuration.model_dump_json(),
+            write_batch,
+            completion_references=True,
+            bytes_output=True,
+        )
+    elif destination == "hosted-batched-references":
         collector = native.CaptureCollector.batched(
             configuration.model_dump_json(), write_batch, completion_references=True
         )
@@ -701,7 +764,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     if policy in {"off", "broken", "full", "hosted-byok", "hosted-checkpoint-failed"}:
         assert records == []
         return
-    if destination == "hosted-batched-references":
+    if destination in {"hosted-batched-references", "hosted-batched-bytes-references"}:
         updates = [json.loads(value) for value in records]
         checkpoints = {
             value["request"]["request_id"]: value["request"]
@@ -749,6 +812,9 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         assert record.metrics.usage is not None
         assert record.metrics.usage.input_tokens is not None
         assert record.metrics.usage.output_tokens is not None
-    assert "provider-secret" not in "".join(records)
-    assert raw_key not in "".join(records)
-    assert "do-not-capture-me" not in "".join(records)
+    encoded_records = "".join(
+        value.decode() if isinstance(value, bytes) else value for value in records
+    )
+    assert "provider-secret" not in encoded_records
+    assert raw_key not in encoded_records
+    assert "do-not-capture-me" not in encoded_records

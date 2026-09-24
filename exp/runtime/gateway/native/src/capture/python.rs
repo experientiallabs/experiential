@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBytes, PyTuple};
 
 use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
@@ -19,6 +19,7 @@ const BATCH_BYTES: usize = 2 * 1024 * 1024;
 struct PythonBatchSink {
     callback: Py<PyAny>,
     completion_references: bool,
+    bytes_output: bool,
 }
 
 struct EncodedRecord {
@@ -44,10 +45,12 @@ impl Sink for PythonBatchSink {
         .ok_or(())?;
         let bytes = encoded.len();
         Python::try_attach(|py| {
-            encoded.into_pyobject(py).map(|value| EncodedRecord {
-                value: value.into_any().unbind(),
-                bytes,
-            })
+            let value = if self.bytes_output {
+                PyBytes::new(py, encoded.as_bytes()).into_any().unbind()
+            } else {
+                encoded.into_pyobject(py)?.into_any().unbind()
+            };
+            Ok::<_, PyErr>(EncodedRecord { value, bytes })
         })
         .ok_or(())?
         .map_err(|_| ())
@@ -141,12 +144,13 @@ impl CaptureCollector {
     /// records remain complete schema 1. Opt-in schema-2 completion references
     /// require a destination that retries until the prompt checkpoint is durable.
     #[staticmethod]
-    #[pyo3(signature = (config_json, sink, *, completion_references=false))]
+    #[pyo3(signature = (config_json, sink, *, completion_references=false, bytes_output=false))]
     fn batched(
         py: Python<'_>,
         config_json: &str,
         sink: Py<PyAny>,
         completion_references: bool,
+        bytes_output: bool,
     ) -> PyResult<Self> {
         if !sink.bind(py).is_callable() {
             return Err(PyValueError::new_err("capture batch sink must be callable"));
@@ -159,6 +163,7 @@ impl CaptureCollector {
                 PythonBatchSink {
                     callback: sink,
                     completion_references,
+                    bytes_output,
                 },
             )
         })
@@ -216,6 +221,11 @@ impl CaptureCollector {
 
     /// Register effective input from authenticated admission, without writing content.
     fn begin(&self, py: Python<'_>, request_json: &str) -> bool {
+        self.begin_bytes(py, request_json.as_bytes())
+    }
+
+    /// Borrow immutable UTF-8 bytes without widening and re-encoding a Python string.
+    fn begin_bytes(&self, py: Python<'_>, request_json: &[u8]) -> bool {
         let collector = self.inner.clone();
         py.detach(|| {
             if !collector.config.truncate_request
@@ -223,7 +233,7 @@ impl CaptureCollector {
             {
                 return collector.skip();
             }
-            let Ok(request) = serde_json::from_str::<Request>(request_json) else {
+            let Ok(request) = serde_json::from_slice::<Request>(request_json) else {
                 return collector.skip();
             };
             collector.begin(request)

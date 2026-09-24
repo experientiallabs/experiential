@@ -281,7 +281,7 @@ class CaptureController:
             "model_id": model_id,
             "context": context,
         }
-        return self.native.begin(to_json(record, inf_nan_mode="null").decode("utf-8"))
+        return self.native.begin_bytes(to_json(record, inf_nan_mode="null"))
 
 
 def begin_capture(
