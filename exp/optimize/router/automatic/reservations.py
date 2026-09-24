@@ -406,7 +406,9 @@ def completion_reservation_from_catalog(
     """Create one completion reservation from exact capacity and pricing metadata.
 
     The hard per-request admission ceiling is the model's full context capacity after its
-    per-turn output budget. The trace-derived estimate prices the reservation only.
+    per-turn output budget. The trace-derived estimate prices the reservation only and cannot
+    exceed that physically admissible input size. A whole captured episode can contain many
+    requests, so its planning estimate is not evidence that an individual request overflows.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -439,10 +441,10 @@ def completion_reservation_from_catalog(
         )
         return None
     maximum_input_tokens = context - maximum_output_tokens
-    if estimated_input_tokens <= 0 or estimated_input_tokens > maximum_input_tokens:
+    if estimated_input_tokens <= 0:
         problems.append(
-            f"{label} alias {alias!r} cannot fit the estimated {estimated_input_tokens} input "
-            f"plus {maximum_output_tokens} output tokens inside its {context}-token context window"
+            f"{label} alias {alias!r} requires a positive input estimate; "
+            f"got {estimated_input_tokens}"
         )
         return None
     prices = (
@@ -466,7 +468,7 @@ def completion_reservation_from_catalog(
             maximum_attempts=maximum_attempts,
             maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
-            estimated_input_tokens=estimated_input_tokens,
+            estimated_input_tokens=min(estimated_input_tokens, maximum_input_tokens),
         )
     except ValueError as exc:
         problems.append(f"{label} alias {alias!r} reservation: {exc}")
