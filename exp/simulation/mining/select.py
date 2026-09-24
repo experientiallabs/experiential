@@ -431,13 +431,14 @@ def _assign_workload(
     clusters: dict[str, int],
     partition: Literal["fit", "held_out"],
 ) -> list[SelectedRepresentative]:
-    """Assign every candidate's full duplicate workload to its nearest selected task."""
+    """Keep each selected case's own mass and assign unselected cases by distance."""
     by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
     mass: dict[str, int] = dict.fromkeys(selected_ids, 0)
     for candidate in candidates:
         selected_id = min(
             selected_ids,
             key=lambda selected: (
+                selected != candidate.representative_trace_id,
                 -_cosine(candidate.vector, by_id[selected].vector),
                 selected,
             ),
