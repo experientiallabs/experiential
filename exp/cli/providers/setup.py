@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +93,7 @@ def run_provider_setup(
     console: Console,
     lister: ProviderModelLister | None = None,
     offer_recommended_defaults: bool = False,
+    validate_setup: Callable[[ProviderSetup], None] | None = None,
 ) -> ModelCatalog:
     """Collect a complete catalog update before one conflict-checked atomic write.
 
@@ -104,6 +105,7 @@ def run_provider_setup(
         console: Rich console used for prompts, summaries, and guidance.
         lister: Provider listing seam, injected by tests so no live request is made.
         offer_recommended_defaults: Whether verified discovery may fill every safe role at once.
+        validate_setup: Optional caller validation applied before any catalog write.
 
     Returns:
         The complete catalog committed after final confirmation.
@@ -111,6 +113,7 @@ def run_provider_setup(
     Raises:
         typer.BadParameter: Structured input is invalid or incomplete.
         typer.Abort: Interactive collection is cancelled or reaches EOF.
+        ValueError: Caller validation rejects the collected setup without saving it.
     """
     path = root / "models.toml"
     starting_digest = catalog_state_sha256(path)
@@ -124,6 +127,8 @@ def run_provider_setup(
             setup = _noninteractive_setup(options, existing=existing)
         except (EOFError, KeyboardInterrupt):
             raise typer.Abort() from None
+        if validate_setup is not None:
+            validate_setup(setup)
         return configure_provider_catalog(
             path,
             setup,
@@ -144,6 +149,8 @@ def run_provider_setup(
     )
     if result is None:
         raise typer.Abort()
+    if validate_setup is not None:
+        validate_setup(result.setup)
     return _commit(path, result, replace=replace, expected_state_sha256=starting_digest)
 
 

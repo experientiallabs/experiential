@@ -35,6 +35,7 @@ from exp.cli.shared.progress import progress_display
 from exp.common.core.money import exact_usd
 from exp.common.models import (
     ModelCatalog,
+    ProviderSetup,
     RoutedCandidateSnapshot,
     RouterCandidateSelection,
     catalog_state_sha256,
@@ -503,7 +504,9 @@ def _require_replay_role_overrides(
     )
     if mismatches:
         raise ValueError(
-            "role overrides differ from the selected completed build: " + ", ".join(mismatches)
+            "role overrides differ from the selected completed build: "
+            + ", ".join(mismatches)
+            + ". Build a new project to use different models."
         )
 
 
@@ -540,7 +543,18 @@ def _configure_build_providers(
     """
     store = ProjectStore(root, project)
     saved = store.load_project().models if store.paths.project_toml.exists() else None
-    catalog = provider_setup.run_provider_setup(
+
+    def validate_roles(setup: ProviderSetup) -> None:
+        """Reject incompatible project roles before writing the shared catalog."""
+        _require_replay_role_overrides(
+            root,
+            project,
+            world_model=setup.world_model,
+            judge=setup.judge,
+            embedder=setup.embedder,
+        )
+
+    return provider_setup.run_provider_setup(
         root,
         provider_setup.ProviderSetupOptions(
             providers=providers,
@@ -551,15 +565,8 @@ def _configure_build_providers(
         non_interactive=False,
         replace=False,
         console=console,
+        validate_setup=validate_roles,
     )
-    _require_replay_role_overrides(
-        root,
-        project,
-        world_model=catalog.roles.world_model,
-        judge=catalog.roles.judge,
-        embedder=catalog.roles.embedder,
-    )
-    return catalog
 
 
 def _prepare_new_build(

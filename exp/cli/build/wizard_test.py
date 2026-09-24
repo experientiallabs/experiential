@@ -511,6 +511,33 @@ def test_new_project_uses_models_chosen_from_an_existing_catalog(
     assert not state.completion_calls
 
 
+def test_completed_build_rejects_changed_roles_before_saving_shared_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected role selection preserves the shared catalog and completed paid work."""
+    _chat_export(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / ".exp"
+    write_model_catalog(root / "models.toml", _catalog())
+    state = _ProviderState()
+    _install_integrated_runtime(monkeypatch, state)
+    built = _RUNNER.invoke(app, ["build", "powerset"], input=f"\nresearch.jsonl\n{_SAVED_SETUP}y\n")
+    assert built.exit_code == 0, built.output
+    catalog_before = (root / "models.toml").read_bytes()
+    store = wizard.ProjectStore(root, "powerset")
+    project_before = store.paths.project_toml.read_bytes()
+    embedding_calls = tuple(state.embedding_calls)
+
+    result = _RUNNER.invoke(app, ["build", "powerset"], input="\n\n\n/candidate\n1\n\n\n\ny\n")
+
+    assert result.exit_code == 2, result.output
+    assert "role overrides differ" in unstyle(result.output)
+    assert (root / "models.toml").read_bytes() == catalog_before
+    assert store.paths.project_toml.read_bytes() == project_before
+    assert tuple(state.embedding_calls) == embedding_calls
+    assert not state.completion_calls
+
+
 def test_explicit_router_selection_builds_and_composes_provisional_router(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
