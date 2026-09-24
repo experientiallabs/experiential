@@ -105,7 +105,16 @@ from exp.runtime.openai_protocol.wire_models import (
 
 
 class _EmbeddingsRequest(_WireModel):
-    """Closed OpenAI embeddings profile with text and pre-tokenized inputs."""
+    """Closed OpenAI embeddings profile with text and pre-tokenized inputs.
+
+    Attributes:
+        model: Public model alias requested by the caller.
+        input: One text/token input or a homogeneous batch of either form.
+        dimensions: Optional positive vector width requested from the provider.
+        encoding_format: Optional float or base64 response encoding.
+        user: Optional gateway-only attribution, at most 1,024 characters.
+        stream: Literal false convenience, validated and omitted upstream.
+    """
 
     model: str = Field(min_length=1, max_length=256)
     input: str | EmbeddingTokenIds | EmbeddingInputs
