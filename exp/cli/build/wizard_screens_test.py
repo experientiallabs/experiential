@@ -113,11 +113,11 @@ def test_workflow_selection_defaults_and_explicit_steps(
     Args:
         monkeypatch: Pytest patch fixture supplying deterministic prompt answers.
     """
-    answers = iter(("1,2", "0,9", "2,3,4"))
+    answers = iter(("1", "0,9", "1,2,3"))
 
     def answer(_prompt: str, *, default: str, console: Console) -> str:
         """Verify the actual terminal default, then exercise explicit optional steps."""
-        assert default == "1,2"
+        assert default == "1"
         return next(answers)
 
     monkeypatch.setattr(screens.Prompt, "ask", answer)
@@ -126,14 +126,13 @@ def test_workflow_selection_defaults_and_explicit_steps(
     default_selection = screens.select_workflow(console=Console(file=output, force_terminal=False))
 
     assert default_selection == screens.WizardWorkflowSelection(
-        providers=True,
         build=True,
         judge_rubric=False,
         judge_calibration=False,
         router=False,
     )
     printed = unstyle(output.getvalue())
-    assert "providers" in printed
+    assert "providers" not in printed
     assert "judge rubric" in printed
     assert "judge calibration" in printed
     assert "router optimization" in printed
@@ -141,9 +140,8 @@ def test_workflow_selection_defaults_and_explicit_steps(
 
     output = StringIO()
     custom = screens.select_workflow(console=Console(file=output, force_terminal=False))
-    assert "enter step numbers between 1 and 5" in unstyle(output.getvalue())
+    assert "enter step numbers between 1 and 4" in unstyle(output.getvalue())
     assert custom == screens.WizardWorkflowSelection(
-        providers=False,
         build=True,
         judge_rubric=True,
         judge_calibration=True,

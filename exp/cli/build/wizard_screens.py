@@ -25,7 +25,6 @@ from exp.simulation.build import ProjectBuild
 class WizardWorkflowSelection:
     """Wizard steps explicitly selected before any provider or model question."""
 
-    providers: bool = True
     build: bool = True
     judge_rubric: bool = False
     judge_calibration: bool = False
@@ -33,7 +32,6 @@ class WizardWorkflowSelection:
 
 
 _WORKFLOW_STEPS: tuple[tuple[str, str, bool], ...] = (
-    ("providers", "connect providers and assign model roles", True),
     ("build", "import traces, mine scenarios and prepare the world model", True),
     ("judge rubric", "edit the judge rubric; off keeps the task-success default", False),
     ("judge calibration", "review and approve judge examples by hand", False),
@@ -87,11 +85,10 @@ def select_workflow(*, console: Console) -> WizardWorkflowSelection:
         ):
             chosen = {int(token) for token in tokens}
             return WizardWorkflowSelection(
-                providers=1 in chosen,
-                build=2 in chosen,
-                judge_rubric=3 in chosen,
-                judge_calibration=4 in chosen,
-                router=5 in chosen,
+                build=1 in chosen,
+                judge_rubric=2 in chosen,
+                judge_calibration=3 in chosen,
+                router=4 in chosen,
             )
         console.print(f"[red]error[/red] enter step numbers between 1 and {len(_WORKFLOW_STEPS)}")
 

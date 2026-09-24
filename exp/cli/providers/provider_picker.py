@@ -294,7 +294,7 @@ def select_providers(
                 detail="choose models and roles",
             ),
         )
-    preselected = list(session.providers)
+    preselected = list(session.providers) or ([_CONFIGURED_ONLY] if configured else [])
     while True:
         result = _select_provider_rows(
             console,

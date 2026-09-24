@@ -6,13 +6,11 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
-from io import StringIO
 from pathlib import Path
 
 import pytest
 from click import unstyle
 from pydantic import JsonValue
-from rich.console import Console
 from typer.testing import CliRunner
 
 import exp.cli.build.app as build_command
@@ -21,6 +19,7 @@ import exp.simulation.build as simulation_build
 from exp.cli.app import app
 from exp.cli.build.wizard import _prepare_new_build
 from exp.cli.providers.setup_test import _FakeLister as _SetupLister
+from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
@@ -387,12 +386,15 @@ def test_first_build_provider_flags_skip_the_opening_list(
     replay = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
+        input="\n" * 7 + "y\n",
     )
 
     assert replay.exit_code == 0, replay.output
     assert lister.requests == ["openai"]
     assert "Select the providers you want to use" not in unstyle(replay.output)
     assert "Model setup is required" not in unstyle(replay.output)
+    assert "Providers" in unstyle(replay.output)
+    assert "Models to configure" in unstyle(replay.output)
 
 
 def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path) -> None:
@@ -466,6 +468,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     replay = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
+        input="\n" * 7 + "y\n",
     )
 
     assert replay.exit_code == 0, replay.output
@@ -1530,7 +1533,7 @@ def test_wizard_preconsent_plan_persists_only_provider_free_unselected_evidence(
         maximum_build_cost_usd=5.0,
         code_revision="a" * 40,
         providers=(),
-        console=Console(file=StringIO(), force_terminal=False),
+        console=ScriptedConsole("\n" * 5 + "y\n"),
     )
 
     store = ProjectStore(root, "support")

@@ -20,6 +20,7 @@ from exp.cli.app import app
 from exp.cli.build.app_test import _otlp_export
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.providers.setup_test import _FakeLister
+from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.common.models import (
     BillingSource,
@@ -54,6 +55,11 @@ from exp.simulation.build import ProjectBuild
 
 _RUNNER = CliRunner()
 _REVISION = "a" * 40
+# Providers, model pool, world, judge, embedder, candidates, then save.
+_SAVED_SETUP = "\n" * 6 + "y\n"
+_SAVED_DISCOVERED_SETUP = "\n" * 10 + "y\n"
+# Pick the two known completion models and one embedder, then choose every role explicitly.
+_NEW_SETUP = "1,2,4\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n"
 
 
 def _compact_terminal_text(value: str) -> str:
@@ -350,7 +356,7 @@ def test_default_build_prepares_saved_scenarios_without_rollouts(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root), "--provider", "openai"],
-        input="\ntraces.otel.jsonl\n\ny\n",
+        input=f"\ntraces.otel.jsonl\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert result.exit_code == 0, result.output
@@ -383,7 +389,7 @@ def test_wizard_reports_rejected_evidence_without_a_traceback(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(tmp_path / ".exp"), "--provider", "openai"],
-        input="\ntraces.otel.jsonl\n\ny\n",
+        input=f"\ntraces.otel.jsonl\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -416,12 +422,17 @@ def test_bare_build_chat_export_completes_with_saved_provider_roles(
     result = _RUNNER.invoke(
         app,
         ["build", "powerset"],
-        input="\nresearch.jsonl\ny\n",
+        input=f"\nresearch.jsonl\n{_SAVED_SETUP}y\n",
         env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
     assert result.exit_code == 0, result.output
     assert "Format: chat-json" in unstyle(result.output)
+    assert "Providers" in unstyle(result.output)
+    assert "Models to configure" in unstyle(result.output)
+    assert "World model" in unstyle(result.output)
+    assert "Judge" in unstyle(result.output)
+    assert "Embedder" in unstyle(result.output)
     store = wizard.ProjectStore(root, "powerset")
     assert store.load_project().trace_source == "chat-json"
     selected = store.load_project().build
@@ -433,6 +444,71 @@ def test_bare_build_chat_export_completes_with_saved_provider_roles(
     assert restored.traces == traces.read_import(imports[0]).traces
     assert documentation in restored.traces[0].model_dump_json()
     assert state.embedding_calls and not state.completion_calls
+
+    embedding_calls = tuple(state.embedding_calls)
+    saved = wizard.load_model_catalog(root / "models.toml")
+    write_model_catalog(
+        root / "models.toml",
+        saved.model_copy(
+            update={"roles": saved.roles.model_copy(update={"world_model": "candidate"})}
+        ),
+    )
+    replay = _RUNNER.invoke(app, ["build", "powerset"], input=f"\n{_SAVED_SETUP}")
+    assert replay.exit_code == 0, replay.output
+    assert "Providers" in unstyle(replay.output)
+    assert "Models to configure" in unstyle(replay.output)
+    assert store.load_project().build == selected
+    replay_config = store.load_project()
+    assert replay_config.models is not None and replay_config.models.world_model == "world"
+    assert tuple(state.embedding_calls) == embedding_calls
+    assert not state.completion_calls
+
+
+@pytest.mark.parametrize("cancel_at", ["providers", "models"])
+def test_new_project_setup_can_cancel_without_changing_catalog_or_paid_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_at: str
+) -> None:
+    """An existing shared catalog never bypasses selection or commits a cancelled setup."""
+    _chat_export(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / ".exp"
+    write_model_catalog(root / "models.toml", _catalog())
+    before = (root / "models.toml").read_bytes()
+    state = _ProviderState()
+    lister = _install_integrated_runtime(monkeypatch, state)
+    answers = "q\n" if cancel_at == "providers" else "\nq\n"
+
+    result = _RUNNER.invoke(app, ["build", "new-project"], input=f"\nresearch.jsonl\n{answers}")
+
+    assert result.exit_code == 1
+    assert "Providers" in unstyle(result.output)
+    assert (root / "models.toml").read_bytes() == before
+    assert not wizard.ProjectStore(root, "new-project").paths.project_toml.exists()
+    assert not lister.requests and not state.embedding_calls and not state.completion_calls
+
+
+def test_new_project_uses_models_chosen_from_an_existing_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Choosing a different world model changes the new project, rather than being ignored."""
+    _chat_export(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / ".exp"
+    write_model_catalog(root / "models.toml", _catalog())
+    state = _ProviderState()
+    _install_integrated_runtime(monkeypatch, state)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "new-project"],
+        input="\nresearch.jsonl\n\n\n/candidate\n1\n\n\n\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    config = wizard.ProjectStore(root, "new-project").load_project()
+    assert config.models is not None and config.models.world_model == "candidate"
+    assert config.build is not None and state.embedding_calls
+    assert not state.completion_calls
 
 
 def test_explicit_router_selection_builds_and_composes_provisional_router(
@@ -455,7 +531,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root), "--provider", "openai"],
-        input="1,2,5\ntraces.otel.jsonl\n\ny\n",
+        input=f"1,4\ntraces.otel.jsonl\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -467,7 +543,8 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
     assert printed.index("judge rubric") < printed.index("Trace path")
     assert printed.count("Trace path") == 1
     assert "Format: otlp" in printed
-    assert printed.count("Use these recommended models?") == 1
+    assert printed.count("Models to configure") >= 1
+    assert "Use these recommended models?" not in printed
     assert printed.count("Authorize exp build support") == 1
     assert "Judge syllabus" in printed
     assert "Human calibration is optional" not in printed
@@ -654,7 +731,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
     successor = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="1,2,5\ny\n",
+        input=f"1,4\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert successor.exit_code == 0, successor.output
@@ -700,6 +777,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
             "--max-router-cost-usd",
             "0.01",
         ],
+        input=f"\n{_SAVED_DISCOVERED_SETUP}",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert replay.exit_code == 0, replay.output
@@ -732,7 +810,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="1,2,5\ntraces.otel.jsonl\n2\n\n\nn\n",
+        input=f"1,4\ntraces.otel.jsonl\n2\n\n{_NEW_SETUP}n\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -775,7 +853,7 @@ def test_explicit_router_budget_overrun_offers_a_choice_before_paid_calls(
             "--max-router-cost-usd",
             "0.01",
         ],
-        input=f"1,2,5\ntraces.otel.jsonl\n2\n\n\n{answer}\n",
+        input=f"1,4\ntraces.otel.jsonl\n2\n\n{_NEW_SETUP}{answer}\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -811,7 +889,7 @@ def test_bare_build_budget_warning_can_continue_or_decline(
     result = _RUNNER.invoke(
         app,
         ["build", "support"],
-        input=f"\ntraces.otel.jsonl\n{answer}\n",
+        input=f"\ntraces.otel.jsonl\n{_SAVED_SETUP}{answer}\n",
         env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -832,7 +910,7 @@ def test_bare_build_budget_warning_can_continue_or_decline(
         resumed = _RUNNER.invoke(
             app,
             ["build", "support"],
-            input="\ntraces.otel.jsonl\ny\n",
+            input=f"\ntraces.otel.jsonl\n{_SAVED_SETUP}y\n",
             env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
         )
         assert resumed.exit_code == 0, resumed.output
@@ -866,7 +944,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
             "--max-router-cost-usd",
             "5000",
         ],
-        input="1,2,5\ntraces.otel.jsonl\n2\n\n\ny\n",
+        input=f"1,4\ntraces.otel.jsonl\n2\n\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -956,7 +1034,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
     guided = _RUNNER.invoke(
         app,
         ["build", "guided", "--root", str(root)],
-        input=f"1,2,5\n{traces}\ny\n",
+        input=f"1,4\n{traces}\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert guided.exit_code == 0, guided.output
@@ -1050,7 +1128,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     first = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="1,2,5\ntraces.otel.jsonl\n2\n\n\ny\n",
+        input=f"1,4\ntraces.otel.jsonl\n2\n\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert first.exit_code == 1
@@ -1064,7 +1142,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     resumed = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="1,2,5\ny\n",
+        input=f"1,4\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -1117,7 +1195,7 @@ def test_approved_calibration_resume_builds_human_calibrated_successor(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(store.paths.root)],
-        input="1,2,5\ny\n",
+        input=f"1,4\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"FIXTURE_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -1325,13 +1403,14 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
         monkeypatch: Pytest patch fixture replacing state-machine boundaries.
     """
     catalog = _catalog()
+    write_model_catalog(tmp_path / "models.toml", catalog)
     authorizations: list[tuple[str, float]] = []
     provider_stages: list[str] = []
     monkeypatch.setattr(wizard, "_completed_replay", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         screens.Prompt,
         "ask",
-        lambda *_args, **_kwargs: "1,2,5",
+        lambda *_args, **_kwargs: "1,4",
     )
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))
     monkeypatch.setattr(wizard, "_ensure_router_defaults", lambda *_args, **_kwargs: catalog)
@@ -1378,7 +1457,7 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
         maximum_build_cost_usd=5.0,
         maximum_router_cost_usd=None,
         providers=(),
-        console=Console(file=StringIO(), force_terminal=False),
+        console=ScriptedConsole(_SAVED_SETUP),
     )
 
     assert len(authorizations) == 1
@@ -1388,15 +1467,15 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
     assert not (tmp_path / "projects").exists()
 
 
-def test_completed_replay_skips_every_prompt_and_provider_stage(
+def test_completed_replay_confirms_models_without_paid_provider_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exact completed replay prints identities with zero prompts or provider work.
+    """Exact completed replay asks for providers and models before reusing saved work.
 
     Args:
         tmp_path: Isolated EXP root.
-        monkeypatch: Pytest patch fixture forbidding all incomplete-stage boundaries.
+        monkeypatch: Pytest patch fixture forbidding paid and discovery boundaries.
     """
     replay = AutomaticRouterReplay(
         policy_id="policy-a",
@@ -1408,11 +1487,14 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
     monkeypatch.setattr(wizard, "_completed_replay", lambda *_args, **_kwargs: replay)
 
     def unexpected(*_args: object, **_kwargs: object) -> None:
-        """Fail if replay enters any interactive or provider-capable stage."""
-        raise AssertionError("completed replay entered an incomplete stage")
+        """Fail if confirmed replay enters a provider-capable stage."""
+        raise AssertionError("completed replay entered a provider-capable stage")
 
     catalog = _catalog()
-    monkeypatch.setattr(screens.Prompt, "ask", unexpected)
+    write_model_catalog(tmp_path / "models.toml", catalog)
+    lister = _FakeLister()
+    monkeypatch.setattr("exp.cli.providers.setup.HttpProviderModelLister", lambda: lister)
+    monkeypatch.setattr(wizard, "_wizard_cost_plan", unexpected)
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))
     monkeypatch.setattr(wizard, "_ensure_router_defaults", lambda *_args, **_kwargs: catalog)
     monkeypatch.setattr(
@@ -1420,7 +1502,7 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
         "_wizard_observed_candidate_aliases",
         lambda *_args: ("world",) * 5 + ("candidate",) * 5,
     )
-    output = StringIO()
+    console = ScriptedConsole(f"\n{_SAVED_SETUP}")
 
     wizard.run_build_wizard(
         "support",
@@ -1433,10 +1515,13 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
         maximum_build_cost_usd=5.0,
         maximum_router_cost_usd=None,
         providers=(),
-        console=Console(file=output, force_terminal=False),
+        console=console,
     )
 
-    printed = unstyle(output.getvalue())
+    printed = unstyle(console.output)
+    assert "Providers" in printed
+    assert "Models to configure" in printed
+    assert not lister.requests
     assert "reused every verified project artifact" in printed
     assert "Complete" in printed
     assert "policy-a" not in printed

@@ -253,7 +253,7 @@ def build(
         ProjectStore(root, project)
         catalog = _load_or_setup_catalog(
             root,
-            no_interactive=no_interactive,
+            no_interactive=no_interactive or dry_run,
             providers=tuple(provider or ()),
         )
         selected = _selected_roles(
@@ -381,7 +381,7 @@ def _load_or_setup_catalog(
     no_interactive: bool,
     providers: tuple[str, ...] = (),
 ) -> ModelCatalog:
-    """Load complete build roles or run inline setup only for a real terminal.
+    """Confirm provider and model choices at a terminal, or load them for automation.
 
     Args:
         root: Local EXP root containing the shared model catalog.
@@ -398,12 +398,10 @@ def _load_or_setup_catalog(
     path = root / "models.toml"
     catalog = load_model_catalog(path) if path.exists() else None
     missing = _missing_build_configuration(catalog)
-    if not missing:
-        assert catalog is not None
-        return catalog
     options = ProviderSetupOptions(providers=resolved_providers)
     if not no_interactive and can_prompt(_console):
-        _console.print(f"Model setup is required: {', '.join(missing)}.")
+        if missing:
+            _console.print(f"Model setup is required: {', '.join(missing)}.")
         return run_provider_setup(
             root,
             options,
@@ -411,6 +409,9 @@ def _load_or_setup_catalog(
             replace=False,
             console=_console,
         )
+    if not missing:
+        assert catalog is not None
+        return catalog
     connection_example, model_example = provider_setup_json_examples()
     raise ValueError(
         "model configuration is incomplete before build: "

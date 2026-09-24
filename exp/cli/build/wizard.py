@@ -29,6 +29,7 @@ from exp.cli.build.wizard_screens import (
 from exp.cli.build.wizard_screens import (
     select_workflow as _select_workflow,
 )
+from exp.cli.providers import setup as provider_setup
 from exp.cli.shared.consent import SpendBudget, require_spend_consent
 from exp.cli.shared.progress import progress_display
 from exp.common.core.money import exact_usd
@@ -126,10 +127,6 @@ def run_build_wizard(
         judge=judge,
         embedder=embedder,
     )
-    replay = _completed_replay(root, project, code_revision=code_revision)
-    if replay is not None:
-        _render_completed_replay(console=console)
-        return
     selection = _select_workflow(console=console)
     existing = _completed_build_plan(
         root,
@@ -157,11 +154,24 @@ def run_build_wizard(
             maximum_build_cost_usd=maximum_build_cost_usd,
             code_revision=code_revision,
             providers=providers,
-            setup_providers=selection.providers,
             console=console,
         )
     else:
-        plan = existing
+        catalog = _configure_build_providers(
+            root,
+            project,
+            providers=providers,
+            world_model=world_model,
+            judge=judge,
+            embedder=embedder,
+            console=console,
+        )
+        plan = replace(existing, catalog=catalog)
+        if not selection.judge_rubric and not selection.judge_calibration:
+            replay = _completed_replay(root, project, code_revision=code_revision)
+            if replay is not None:
+                _render_completed_replay(console=console)
+                return
     cost_plan: AutomaticRouterCostPlan | None = None
     router_ceiling = 0.0
     catalog = plan.catalog
@@ -497,6 +507,61 @@ def _require_replay_role_overrides(
         )
 
 
+def _configure_build_providers(
+    root: Path,
+    project: str,
+    *,
+    providers: tuple[str, ...],
+    world_model: str | None,
+    judge: str | None,
+    embedder: str | None,
+    console: Console,
+) -> ModelCatalog:
+    """Always present provider and model choices, defaulting to this project's roles.
+
+    Shared catalog roles are defaults for new projects. Existing projects retain their frozen
+    role identity, even when another project's setup changed the shared catalog defaults.
+    Confirming those same choices preserves completed artifacts and their paid-work reuse.
+
+    Args:
+        root: Local EXP root containing the shared model catalog.
+        project: Project whose saved role choices should be preselected.
+        providers: Explicit provider choices, or an empty tuple to open the provider picker.
+        world_model: Optional initial world-model choice.
+        judge: Optional initial judge choice.
+        embedder: Optional initial embedder choice.
+        console: Terminal used for all provider and model screens.
+
+    Returns:
+        The catalog saved after the operator confirms the chosen models and roles.
+
+    Raises:
+        ValueError: Confirmed roles conflict with an existing immutable build.
+    """
+    store = ProjectStore(root, project)
+    saved = store.load_project().models if store.paths.project_toml.exists() else None
+    catalog = provider_setup.run_provider_setup(
+        root,
+        provider_setup.ProviderSetupOptions(
+            providers=providers,
+            world_model=world_model or (saved.world_model if saved else None),
+            judge=judge or (saved.judge if saved else None),
+            embedder=embedder or (saved.embedder if saved else None),
+        ),
+        non_interactive=False,
+        replace=False,
+        console=console,
+    )
+    _require_replay_role_overrides(
+        root,
+        project,
+        world_model=catalog.roles.world_model,
+        judge=catalog.roles.judge,
+        embedder=catalog.roles.embedder,
+    )
+    return catalog
+
+
 def _prepare_new_build(
     project: str,
     *,
@@ -510,7 +575,6 @@ def _prepare_new_build(
     maximum_build_cost_usd: float,
     code_revision: str,
     providers: tuple[str, ...],
-    setup_providers: bool = True,
     console: Console,
 ) -> WizardBuildPlan:
     """Materialize deterministic build evidence and return a credential-free plan.
@@ -527,51 +591,37 @@ def _prepare_new_build(
         maximum_build_cost_usd: Embedding budget requiring confirmation when exceeded.
         code_revision: Installed producer revision.
         providers: Repeatable provider names that skip the opening provider list.
-        setup_providers: Whether the providers workflow step may run interactive setup.
         console: Interactive terminal.
 
     Returns:
         Complete provider-free plan with deterministic persisted evidence.
 
     Raises:
-        ValueError: Traces are invalid, or required roles are missing while the
-            providers step was not selected.
+        ValueError: Traces, confirmed model roles, or existing project settings are invalid.
     """
     from exp.cli.build.app import (
         _embedding_cost_ceiling,
-        _missing_build_configuration,
         _project_store,
         _reuse_completed_grounded_artifacts,
         _selected_roles,
         _validated_role_snapshots,
     )
-    from exp.cli.providers.setup import ProviderSetupOptions, run_provider_setup
 
     normalized = load_build_traces(project, root=root, path=trace_path, source=source)
-    catalog_path = root / "models.toml"
-    existing_catalog = load_model_catalog(catalog_path) if catalog_path.exists() else None
-    if _missing_build_configuration(existing_catalog):
-        if not setup_providers:
-            raise ValueError(
-                "the providers step was not selected but models.toml is missing required "
-                "roles; include the providers step or run exp config providers first"
-            )
-        catalog = run_provider_setup(
-            root,
-            ProviderSetupOptions(providers=providers),
-            non_interactive=False,
-            replace=False,
-            console=console,
-            offer_recommended_defaults=True,
-        )
-    else:
-        assert existing_catalog is not None
-        catalog = existing_catalog
-    selected = _selected_roles(
-        catalog,
+    catalog = _configure_build_providers(
+        root,
+        project,
+        providers=providers,
         world_model=world_model,
         judge=judge,
         embedder=embedder,
+        console=console,
+    )
+    selected = _selected_roles(
+        catalog,
+        world_model=None,
+        judge=None,
+        embedder=None,
     )
     runtime = RuntimeModelCatalog(catalog)
     world_snapshot, embedder_snapshot, embedder_capabilities = _validated_role_snapshots(

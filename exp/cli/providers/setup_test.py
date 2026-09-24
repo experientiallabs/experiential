@@ -1058,7 +1058,7 @@ def test_configured_models_are_reassignable_without_any_provider_request(
         ),
     )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    console = ScriptedConsole("1\n\nall\n\n1\n1\n1\n1,2\n\n1\ny\n")
+    console = ScriptedConsole("\nall\n\n1\n1\n1\n1,2\n\n1\ny\n")
 
     catalog = run_provider_setup(
         root,
@@ -1125,7 +1125,7 @@ def test_offline_roles_include_models_on_tinker_without_provider_requests(tmp_pa
             roles=ModelRoles(world_model="chat", judge="chat", embedder="embed"),
         ),
     )
-    console = ScriptedConsole("1\n\n\n1\n1\n1\n\ny\n")
+    console = ScriptedConsole("\n\n1\n1\n1\n\ny\n")
 
     catalog = run_provider_setup(
         root,
@@ -1177,7 +1177,7 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
         roles=ModelRoles(world_model="legacy", judge="legacy", embedder="embed"),
     )
     write_model_catalog(root / "models.toml", original)
-    console = ScriptedConsole("1\n\n\n\n\n\ny\n")
+    console = ScriptedConsole("\n\n\n\n\ny\n")
 
     saved = run_provider_setup(
         root,
@@ -1261,7 +1261,7 @@ def test_offline_setup_preserves_exact_unverified_router_roles_without_revalidat
         ProviderSetupOptions(),
         non_interactive=False,
         replace=False,
-        console=ScriptedConsole("1\n\n\n\n\n\n\n\n\ny\n"),
+        console=ScriptedConsole("\n\n\n\n\n\n\n\ny\n"),
         lister=_UnavailableLister(),
     )
 
