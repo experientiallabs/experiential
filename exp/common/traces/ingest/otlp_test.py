@@ -254,6 +254,18 @@ def test_normalizes_w3c_genai_trace_and_exp_outcome_extensions() -> None:
     assert trace.spans[1].parent_span_id == _CALL_SPAN_ID
 
 
+def test_otlp_decodes_negative_integer_attribute() -> None:
+    """A signed int64 decimal string remains a canonical integer attribute."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.append({"key": "test.offset", "value": {"intValue": "-1"}})
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].attributes["test.offset"] == -1
+
+
 def test_otlp_retains_a_declared_model_connection_digest() -> None:
     """An exporter can retain exact secret-free connection evidence without an endpoint URL."""
     payload = _payload()

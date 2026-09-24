@@ -45,6 +45,7 @@ GENAI_SEMANTIC_CONVENTION_VERSION = "1.37.0"
 
 _TRACE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SPAN_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+_SIGNED_DECIMAL_PATTERN = re.compile(r"^-?[0-9]+$")
 _MODEL_OPERATIONS = frozenset(
     {"chat", "text_completion", "generate_content", "invoke_agent", "embeddings"}
 )
@@ -738,6 +739,6 @@ def _integer(value: JsonValue | None, label: str) -> int:
         raise OtlpTraceFormatError(f"{label} must be an integer")
     if isinstance(value, int):
         return value
-    if isinstance(value, str) and value.isdecimal():
+    if isinstance(value, str) and _SIGNED_DECIMAL_PATTERN.fullmatch(value):
         return int(value)
     raise OtlpTraceFormatError(f"{label} must be an integer")
