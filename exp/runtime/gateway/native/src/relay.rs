@@ -301,7 +301,7 @@ impl UpstreamRelay {
         // Drain only already decoded events through effective stop/tool rules.
         // This never polls the provider and retains a stop-adjusted terminal.
         while self.guard_next_pending() {}
-        if let Some(observation) = &self.observation {
+        if let Some(observation) = self.observation.take() {
             for event in &self.ready {
                 // queue_events already recorded the newest meter, folded
                 // across dials. A raw buffered report can be older or partial.

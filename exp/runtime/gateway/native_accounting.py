@@ -57,6 +57,7 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
 from exp.runtime.gateway.native_rung_policy import (
+    bind_sticky_dispatch,
     failed_dispatch_candidate,
     reserve_rung_slot,
     shed_keeps_rung,
@@ -66,6 +67,7 @@ from exp.runtime.gateway.native_settlement import (
     all_routes_unavailable_failure,
     budget_quota_failure,
     budget_quota_protocol_error,
+    exhausted_attempt_payload,
     failure_from_boundary_payload,
     first_token_at_from_settlement,
     ledger_failure,
@@ -313,18 +315,39 @@ class NativeAttemptAccounting:
             return self._inflight.get(request_id)
 
     def start_attempt(self, argument: str) -> str:
-        """Reserve one physical dispatch immediately before network work.
+        """Reserve a dispatch while keeping concurrent abandonment discoverable.
 
-        Each callback carries the ordinal, prior depth, failure and dispatch reason.
-        Returns a durable attempt or finalized exhaustion; authority, deadline and
-        accounting refusals raise NativeBridgeError.
+        The request-local gate serializes physical reservations and cleanup,
+        never unrelated requests. Abandonment records intent without waiting
+        for ledger I/O; a late reservation is closed before any dispatch reply.
+        The native ordinal is revalidated under the gate by the selection path.
         """
+        request_id = str(json.loads(argument)["request_id"])
+        entry = self.entry(request_id)
+        if entry is None:
+            raise NativeBridgeError(internal_protocol_error())
+        try:
+            with entry.execution_lock:
+                result = self._start_attempt(argument)
+        finally:
+            with self._lock:
+                cancelled = entry.pending_abandon
+            if cancelled is not None:
+                self.abandon(json.dumps({"request_id": request_id}))
+        if cancelled is not None:
+            return exhausted_attempt_payload(cancelled)
+        return result
+
+    def _start_attempt(self, argument: str) -> str:
+        """Select and reserve one ordinal under its request-local execution gate."""
         data = json.loads(argument)
         request_id = str(data["request_id"])
         with self._lock:
             entry = self._inflight.get(request_id)
         if entry is None or int(data["attempt_ordinal"]) != entry.total_attempts:
             raise NativeBridgeError(internal_protocol_error())
+        if entry.pending_abandon is not None:
+            return exhausted_attempt_payload(entry.pending_abandon)
         route = entry.route
         keys = tuple(
             deployment_health_key(entry.authorization, deployment)
@@ -395,6 +418,20 @@ class NativeAttemptAccounting:
         # is computed once per ladder walk and shared with every candidate.
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
+            with self._lock:
+                active = self._inflight.get(request_id) is entry and entry.pending_abandon is None
+            if not active or time.monotonic() >= entry.deadline_monotonic:
+                if candidate is not None:
+                    self._health.release_probe(keys[candidate])
+                last_failure = GatewayFailure(
+                    failure_class=GatewayFailureClass.TIMEOUT
+                    if active
+                    else GatewayFailureClass.CANCELLED,
+                    safe_message="gateway execution deadline exceeded"
+                    if active
+                    else "gateway request was cancelled",
+                )
+                break
             if candidate is None:
                 if policy_sheds and last_failure is None and not forced_overflow:
                     candidate = (
@@ -534,7 +571,7 @@ class NativeAttemptAccounting:
                 self._count_throttle_disposition(disposition)
             elif throttle_backoff:
                 self._count_throttle_disposition(THROTTLE_BACKOFF)
-            self._bind_sticky_dispatch(entry, deployment)
+            bind_sticky_dispatch(self._sticky, entry, deployment)
             with self._lock:
                 if forced_overflow and not throttle_backoff:
                     self._rung_saturated_overflows += 1
@@ -563,63 +600,12 @@ class NativeAttemptAccounting:
                 if throttled_remaining is not None
                 else all_routes_unavailable_failure()
             )
-        self.finish_request_quietly(entry.authorization, ledger_failure(exhaustion))
+        if active:
+            self.finish_request_quietly(entry.authorization, ledger_failure(exhaustion))
         with self._lock:
-            self._inflight.pop(request_id, None)
-        failure_payload: JsonObject = {
-            "failure_class": exhaustion.failure_class.value,
-            "safe_message": exhaustion.safe_message,
-        }
-        if exhaustion.customer_owned:
-            # Echoed back so the data plane renders the caller's 400, not the
-            # house 502, from the failure that ended the ladder.
-            failure_payload["customer_owned"] = True
-        if exhaustion.rejected_parameter is not None:
-            failure_payload["rejected_parameter"] = exhaustion.rejected_parameter
-        if exhaustion.provider_detail is not None:
-            failure_payload["provider_detail"] = exhaustion.provider_detail
-        if exhaustion.refusal_reason is not None:
-            # Echoed back so an exhausted refusal ladder re-renders with its
-            # bounded category on the caller-facing 400.
-            failure_payload["refusal_reason"] = exhaustion.refusal_reason.value
-        if exhaustion.retry_after_seconds is not None:
-            failure_payload["retry_after_seconds"] = exhaustion.retry_after_seconds
-        return json.dumps(
-            {"exhausted": True, "failure": failure_payload},
-            separators=(",", ":"),
-        )
-
-    def _bind_sticky_dispatch(
-        self,
-        entry: InflightRequest,
-        deployment: ExactModelDeployment,
-    ) -> None:
-        """Record or refresh the conversation's binding to its serving rung.
-
-        Every dispatch on a ``maximize_cache_affinity`` pool records where the
-        conversation's provider cache is being built, with the serving rung's
-        authored ``sticky_spill_seconds`` as the lifetime: a spilled
-        conversation thereby stays on its spill target instead of bouncing
-        back to the higher-ranked rung the moment it stops shedding, and a
-        conversation on its preferred rung simply refreshes a no-op binding.
-        A rung authoring no lifetime records nothing.
-
-        Args:
-            entry: The owning in-flight request.
-            deployment: The rung about to receive the dispatch.
-        """
-        if entry.affinity_fingerprint is None:
-            return
-        if entry.route.snapshot.failover_mode != "maximize_cache_affinity":
-            return
-        policy = deployment.gateway.dispatch
-        if policy is None or policy.sticky_spill_seconds is None:
-            return
-        self._sticky.bind(
-            entry.affinity_fingerprint,
-            deployment.deployment_id,
-            ttl_seconds=float(policy.sticky_spill_seconds),
-        )
+            if entry.pending_abandon is None:
+                self._inflight.pop(request_id, None)
+        return exhausted_attempt_payload(exhaustion)
 
     def settle(self, argument: str) -> str:
         """Durably settle one previously reserved attempt exactly once.
@@ -723,29 +709,44 @@ class NativeAttemptAccounting:
             failure_class=GatewayFailureClass.CANCELLED,
             safe_message="gateway request was cancelled",
         )
-        try:
-            if entry.active_attempt_id is not None:
-                self._record_health(entry, entry.active_attempt_id, opened=False, failure=failure)
-                self._write_ledger.finish_attempt(
-                    attempt_id=entry.active_attempt_id,
-                    terminal_event=GatewayEvent(
-                        kind=GatewayEventKind.FAILED,
-                        sequence_number=0,
-                        failure=failure,
-                    ),
-                    failure=failure,
-                    finalize_request=True,
-                )
-            else:
-                self._write_ledger.finish_request(
-                    authorization=entry.authorization,
-                    failure=failure,
-                )
-        except Exception as exc:  # noqa: BLE001 - the data plane retries.
-            raise authority_error(exc) from exc
         with self._lock:
-            self._inflight.pop(request_id, None)
-        return "{}"
+            if self._inflight.get(request_id) is not entry:
+                return "{}"
+            if entry.pending_abandon is None:
+                entry.pending_abandon = failure
+            failure = entry.pending_abandon
+        if not entry.execution_lock.acquire(blocking=False):
+            return "{}"
+        try:
+            if self.entry(request_id) is not entry:
+                return "{}"
+            try:
+                if entry.active_attempt_id is not None:
+                    self._record_health(
+                        entry, entry.active_attempt_id, opened=False, failure=failure
+                    )
+                    self._write_ledger.finish_attempt(
+                        attempt_id=entry.active_attempt_id,
+                        terminal_event=GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=0,
+                            failure=failure,
+                        ),
+                        failure=failure,
+                        finalize_request=True,
+                    )
+                else:
+                    self._write_ledger.finish_request(
+                        authorization=entry.authorization,
+                        failure=failure,
+                    )
+            except Exception as exc:  # noqa: BLE001 - the data plane retries.
+                raise authority_error(exc) from exc
+            with self._lock:
+                self._inflight.pop(request_id, None)
+            return "{}"
+        finally:
+            entry.execution_lock.release()
 
     def finish_request_quietly(
         self,
@@ -890,7 +891,10 @@ class NativeAttemptAccounting:
                 (request_id, entry)
                 for request_id, entry in self._inflight.items()
                 if entry.pending_settlement is None
-                and entry.deadline_monotonic + _SWEEP_GRACE_SECONDS < now
+                and (
+                    entry.pending_abandon is not None
+                    or entry.deadline_monotonic + _SWEEP_GRACE_SECONDS < now
+                )
             ][:_SWEEP_BATCH]
         for request_id, entry in retained:
             settlement = entry.pending_settlement
@@ -909,38 +913,14 @@ class NativeAttemptAccounting:
                 with self._lock:
                     entry.pending_settlement = None
                     self._sweep_retained_replayed += 1
-        if not abandoned:
-            return
-        cancelled = GatewayFailure(
-            failure_class=GatewayFailureClass.CANCELLED,
-            safe_message="gateway request was abandoned before settlement",
-        )
-        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=cancelled)
         for request_id, entry in abandoned:
-            if entry.active_attempt_id is None:
-                # An accepted request with every attempt already settled (or
-                # none reserved) closes through its request row alone.
-                try:
-                    self._write_ledger.finish_request(
-                        authorization=entry.authorization,
-                        failure=cancelled,
-                    )
-                except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
-                    self._accounting_healthy = False
-                    continue
-                with self._lock:
-                    self._inflight.pop(request_id, None)
-                    self._sweep_abandoned_cancelled += 1
+            try:
+                self.abandon(json.dumps({"request_id": request_id}))
+            except NativeBridgeError:
+                self._accounting_healthy = False
                 continue
-            if self._settle_swept(
-                request_id,
-                entry,
-                attempt_id=entry.active_attempt_id,
-                terminal=terminal,
-                failure=cancelled,
-                finalize=True,
-            ):
-                with self._lock:
+            with self._lock:
+                if self._inflight.get(request_id) is not entry:
                     self._sweep_abandoned_cancelled += 1
 
     def _settle_swept(

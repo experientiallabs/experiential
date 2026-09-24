@@ -1,6 +1,6 @@
 """End-to-end image-generation tests against the served native engine.
 
-One shared native serving subprocess (the driver from ``native_messages_test``)
+A fresh native serving subprocess per test (the driver from ``native_messages_test``)
 serves a seeded root with a chat alias (``coding``) and an image alias
 (``painter``) on one OpenAI-compatible loopback connection whose
 ``/images/generations`` route answers base64 images with token usage. The
@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -112,9 +113,9 @@ class _ImagesUpstream(BaseHTTPRequestHandler):
         del format, args
 
 
-@pytest.fixture(scope="module", name="engine")
+@pytest.fixture(name="engine")
 def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
-    """Serve one shared native engine over a root with chat and image aliases."""
+    """Give each test fresh route health and accounting over chat and image aliases."""
     root = tmp_path_factory.mktemp("native-images-root")
     with _ImagesUpstream.payloads_lock:
         _ImagesUpstream.payloads.clear()
@@ -304,15 +305,15 @@ def test_provider_client_error_relays_the_parameter(engine: _ServingEngine) -> N
 
 
 @pytest.mark.parametrize(
-    ("prompt", "expected_fragment"),
+    ("prompt", "expected_fragment", "expected_attempts"),
     [
-        ("unbilled", "malformed response"),
-        ("short-count", "malformed response"),
-        ("server-error", "provider service failed"),
+        ("unbilled", "malformed response", 1),
+        ("short-count", "malformed response", 1),
+        ("server-error", "provider service failed", 2),
     ],
 )
 def test_unbillable_or_failing_provider_answers_fail_closed(
-    engine: _ServingEngine, prompt: str, expected_fragment: str
+    engine: _ServingEngine, prompt: str, expected_fragment: str, expected_attempts: int
 ) -> None:
     """No usage, a missing image, or a 5xx never hands the caller an unaccounted image."""
     failed_before = _terminal_attempts(engine.base, "failed")
@@ -320,4 +321,21 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
     assert response.status_code == 502, response.text
     assert response.json()["error"]["code"] == "all_routes_failed"
     assert expected_fragment in response.json()["error"]["message"]
-    assert _terminal_attempts(engine.base, "failed") == failed_before + 1
+    assert "data" not in response.json()
+    assert _terminal_attempts(engine.base, "failed") == failed_before + expected_attempts
+    with sqlite3.connect(engine.root / "gateway" / "gateway.db") as connection:
+        request_ids = connection.execute("SELECT request_id FROM gateway_requests").fetchall()
+        assert len(request_ids) == 1
+        attempts = connection.execute(
+            "SELECT attempt_id, attempt_ordinal, route_depth, state, failure_class "
+            "FROM gateway_attempts WHERE request_id = ? ORDER BY attempt_ordinal",
+            request_ids[0],
+        ).fetchall()
+    failure_class = "provider_internal" if prompt == "server-error" else "malformed_response"
+    assert len(attempts) == len({row[0] for row in attempts}) == expected_attempts
+    assert [row[1:] for row in attempts] == [
+        (ordinal, 0, "failed", failure_class) for ordinal in range(expected_attempts)
+    ]
+    with _ImagesUpstream.payloads_lock:
+        calls = list(_ImagesUpstream.payloads)
+    assert calls == [{"model": "painter-model-exact", "prompt": prompt, "n": 2}] * expected_attempts

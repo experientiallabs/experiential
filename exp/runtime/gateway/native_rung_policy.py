@@ -365,3 +365,36 @@ def throttle_redial_budgets(
         share = min(1.0, fraction / threshold)
         budgets.append(int(schedule.max_attempts * share))
     return tuple(budgets)
+
+
+def bind_sticky_dispatch(
+    sticky: StickySpillRegistry,
+    entry: InflightRequest,
+    deployment: ExactModelDeployment,
+) -> None:
+    """Record or refresh the conversation's binding to its serving rung.
+
+    Every dispatch on a ``maximize_cache_affinity`` pool records where the
+    conversation's provider cache is being built, with the serving rung's
+    authored ``sticky_spill_seconds`` as the lifetime: a spilled
+    conversation thereby stays on its spill target instead of bouncing
+    back to the higher-ranked rung the moment it stops shedding, and a
+    conversation on its preferred rung simply refreshes a no-op binding.
+    A rung authoring no lifetime records nothing.
+
+    Args:
+        entry: The owning in-flight request.
+        deployment: The rung about to receive the dispatch.
+    """
+    if entry.affinity_fingerprint is None:
+        return
+    if entry.route.snapshot.failover_mode != "maximize_cache_affinity":
+        return
+    policy = deployment.gateway.dispatch
+    if policy is None or policy.sticky_spill_seconds is None:
+        return
+    sticky.bind(
+        entry.affinity_fingerprint,
+        deployment.deployment_id,
+        ttl_seconds=float(policy.sticky_spill_seconds),
+    )
