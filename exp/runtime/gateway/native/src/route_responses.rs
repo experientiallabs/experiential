@@ -232,7 +232,14 @@ pub(crate) async fn responses(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
-    won = checkpoint_winner(state.capture.as_ref(), &admission, &mut guard, won).await;
+    won = checkpoint_winner(
+        state.capture.as_ref(),
+        &admission,
+        &mut guard,
+        won,
+        deadline,
+    )
+    .await;
     observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let created_at = SystemTime::now()
