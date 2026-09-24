@@ -550,8 +550,7 @@ class CaptureProxy:
         skipped = int(flow.metadata.get(_WEBSOCKET_SKIPPED, 0))
         if message.from_client and event.get("type") == "response.create":
             if skipped or (capture is None and len(self._captures) >= self._max_active_flows):
-                flow.metadata[_WEBSOCKET_SKIPPED] = skipped + 1
-                self.dropped_exchanges += 1
+                self._skip_websocket_request(flow)
                 self._diagnostic("capture_dropped: active request limit", flow.client_conn)
                 return
             if capture is None:
@@ -571,8 +570,7 @@ class CaptureProxy:
             if len(capture.websocket_requests) >= 8 or (
                 pending_bytes + len(message.content) > self._max_body_bytes
             ):
-                self.dropped_exchanges += 1
-                flow.metadata[_WEBSOCKET_SKIPPED] = skipped + 1
+                self._skip_websocket_request(flow)
                 return
             capture.websocket_requests.append(_WebsocketRequest(message.content, time.time_ns()))
             self._diagnostic("websocket_request_started", flow.client_conn)
@@ -623,6 +621,18 @@ class CaptureProxy:
                 else:
                     if skipped:
                         flow.metadata[_WEBSOCKET_SKIPPED] = skipped - 1
+
+    def _skip_websocket_request(self, flow: http.HTTPFlow) -> None:
+        """Drain an ambiguous response group without attributing skipped responses.
+
+        Once a request is skipped, created events cannot safely identify earlier
+        requests whose IDs have not arrived. Release the entire buffered group
+        and wait for all outstanding terminal events before collecting again.
+        """
+        capture = self._captures.pop(flow.id, None)
+        skipped = 1 + (len(capture.websocket_requests) if capture is not None else 0)
+        flow.metadata[_WEBSOCKET_SKIPPED] = int(flow.metadata.get(_WEBSOCKET_SKIPPED, 0)) + skipped
+        self.dropped_exchanges += skipped
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
         """Retain failed request evidence for calls interrupted before completion."""

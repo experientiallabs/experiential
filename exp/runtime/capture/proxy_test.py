@@ -1288,6 +1288,59 @@ def test_idle_websockets_do_not_exhaust_request_capture_capacity() -> None:
     assert proxy.dropped_exchanges == 2
 
 
+@pytest.mark.parametrize("skipped_first", [False, True])
+def test_overflowed_websocket_group_cannot_misattribute_responses(skipped_first: bool) -> None:
+    """Unknown response IDs across overflow drain without uploading mismatched pairs."""
+    captured: list[CapturedExchange] = []
+    first = json.dumps({"type": "response.create", "input": "first" * 16}).encode()
+    second = json.dumps({"type": "response.create", "input": "second" * 16}).encode()
+    proxy = CaptureProxy(
+        sink=lambda exchange: captured.append(exchange) is None,
+        domains=("chatgpt.com",),
+        max_body_bytes=max(len(first), len(second)) + 1,
+    )
+    flow = http.HTTPFlow(
+        connection.Client(
+            peername=("127.0.0.1", 1), sockname=("127.0.0.1", 443), sni="chatgpt.com"
+        ),
+        connection.Server(address=("chatgpt.com", 443)),
+    )
+    flow.request = http.Request.make(
+        "GET",
+        "https://chatgpt.com/backend-api/codex/responses",
+        headers={"Host": "chatgpt.com"},
+    )
+    asyncio.run(proxy.requestheaders(flow))
+    flow.response = http.Response.make(101)
+    proxy.responseheaders(flow)
+    flow.websocket = websocket.WebSocketData()
+
+    def send(from_client: bool, raw: bytes) -> None:
+        """Forward unchanged synthetic frames through production capture callbacks."""
+        assert flow.websocket is not None
+        message = websocket.WebSocketMessage(Opcode.TEXT, from_client, raw)
+        flow.websocket.messages.append(message)
+        proxy.websocket_message(flow)
+        assert message.content == raw and not message.dropped
+
+    send(True, first)
+    send(True, second)
+    assert not proxy._captures
+    assert proxy.dropped_exchanges == 2
+    for response_id in ("second", "first") if skipped_first else ("first", "second"):
+        for kind in ("response.created", "response.completed"):
+            send(False, json.dumps({"type": kind, "response": {"id": response_id}}).encode())
+        assert not captured
+    send(True, first)
+    for kind in ("response.created", "response.completed"):
+        send(False, json.dumps({"type": kind, "response": {"id": "fresh"}}).encode())
+    assert len(captured) == 1
+    assert captured[0].request == first
+    assert json.loads(captured[0].response)["id"] == "fresh"
+    assert not proxy._captures
+    assert proxy.dropped_exchanges == 2
+
+
 @pytest.mark.parametrize(
     "scenario",
     ["unmatched_host", "authority_mismatch", "unsupported_path", "large_request", "large_response"],
