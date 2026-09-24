@@ -35,6 +35,11 @@ pub(crate) trait Sink: Send + 'static {
         0
     }
 
+    /// Bound the oldest item's wait for a useful group without delaying serving.
+    fn batch_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
     fn prepared_bytes(&self, _prepared: &Self::Prepared) -> usize {
         0
     }
@@ -106,7 +111,7 @@ struct Prepared<P> {
     value: Option<P>,
 }
 
-/// Gather only already queued work, never delay an idle destination to fill a batch.
+/// Gather until a count, byte or oldest-item deadline is reached.
 /// Failed members keep their slot while acknowledged neighbors release theirs.
 fn run_worker<S: Sink>(
     receiver: mpsc::Receiver<Pending>,
@@ -135,6 +140,7 @@ fn run_worker<S: Sink>(
         counters
             .preparation_bytes
             .store(preparation_bytes, Ordering::Release);
+        let batch_deadline = Instant::now() + sink.batch_delay();
         let mut bytes = pending
             .iter()
             .filter_map(|p| p.value.as_ref())
@@ -174,7 +180,7 @@ fn run_worker<S: Sink>(
             if pending.len() >= sink.batch_records() || bytes >= sink.batch_bytes() {
                 break;
             }
-            match receiver.try_recv() {
+            match receiver.recv_timeout(batch_deadline.saturating_duration_since(Instant::now())) {
                 Ok(item) => pending.push(Prepared { item, value: None }),
                 Err(_) => break,
             }

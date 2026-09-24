@@ -244,7 +244,7 @@ def test_batched_sink_invalid_acknowledgements_never_release_records() -> None:
 
 @pytest.mark.parametrize(("count", "size"), [(80, 0), (8, 600_000)])
 def test_batched_sink_bounds_count_and_bytes(count: int, size: int) -> None:
-    """Queued work fills bounded batches without a timer or losing Unicode content."""
+    """Queued work fills byte- and count-bounded batches without losing Unicode."""
     entered, release = threading.Event(), threading.Event()
     batches: list[tuple[str, ...]] = []
 
@@ -253,9 +253,9 @@ def test_batched_sink_bounds_count_and_bytes(count: int, size: int) -> None:
         entered.set()
         assert release.wait(5)
         assert len(records) <= 64
-        assert sum(len(record.encode()) for record in records) <= 9 * 1024 * 1024
+        assert sum(len(record.encode()) for record in records) <= 10 * 1024 * 1024
         if len(records) > 1:
-            assert sum(len(record.encode()) for record in records[:-1]) < 1024 * 1024
+            assert sum(len(record.encode()) for record in records[:-1]) < 2 * 1024 * 1024
         return [True] * len(records)
 
     collector = native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)

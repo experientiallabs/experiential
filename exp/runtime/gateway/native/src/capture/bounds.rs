@@ -59,13 +59,19 @@ fn trim_strings(value: &mut Value, maximum: usize) -> usize {
 }
 
 /// Alter only the freshly decoded capture tree, never the request being served.
-pub(super) fn bound(request: &mut Request, maximum: usize) {
+pub(super) fn bound(request: &mut Request, maximum: usize) -> usize {
+    let original_bytes = request.json_bytes();
+    // Every component is smaller than the whole request. Ordinary requests need
+    // one size walk, not separate column walks and repeated envelope walks.
+    if original_bytes <= maximum.min(COLUMN_BUDGET) {
+        return original_bytes;
+    }
     if !request.context.get("request").is_some_and(Value::is_object) {
-        return;
+        return original_bytes;
     }
     let context = Arc::make_mut(&mut request.context);
     let Some(effective) = context.get_mut("request") else {
-        return;
+        return original_bytes;
     };
     let mut limits = serde_json::Map::new();
     if let Some(messages) = effective.get_mut("messages") {
@@ -146,4 +152,5 @@ pub(super) fn bound(request: &mut Request, maximum: usize) {
         limits["messages_truncated_strings"] = strings.into();
         limits["messages_dropped"] = dropped.into();
     }
+    request.json_bytes()
 }

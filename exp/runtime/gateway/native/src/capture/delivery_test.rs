@@ -348,3 +348,62 @@ fn limits_reject_zero_unbounded_and_incoherent_configuration() {
         assert!(bounds.validate().is_err());
     }
 }
+
+#[test]
+fn microbatch_waits_for_neighbors_but_flushes_on_count_deadline_and_close() {
+    struct BatchSink(mpsc::Sender<Vec<String>>, mpsc::Sender<()>);
+    impl Sink for BatchSink {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            self.1.send(()).unwrap();
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            unreachable!()
+        }
+        fn batch_records(&self) -> usize {
+            2
+        }
+        fn batch_bytes(&self) -> usize {
+            1024
+        }
+        fn batch_delay(&self) -> Duration {
+            Duration::from_millis(200)
+        }
+        fn prepared_bytes(&self, value: &String) -> usize {
+            value.len()
+        }
+        fn write_batch(&mut self, values: &[&String]) -> Vec<bool> {
+            self.0
+                .send(values.iter().map(|v| (*v).clone()).collect())
+                .unwrap();
+            vec![true; values.len()]
+        }
+    }
+    let (written, observed) = mpsc::channel();
+    let (prepared, ready) = mpsc::channel();
+    let delivery = Delivery::new(limits(), BatchSink(written, prepared)).unwrap();
+    assert!(delivery.submit(record("first")));
+    ready.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(observed.recv_timeout(Duration::from_millis(20)).is_err());
+    assert!(delivery.submit(record("second")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ["first", "second"]
+    );
+    assert!(delivery.submit(record("deadline")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ["deadline"]
+    );
+    assert!(delivery.submit(record("drain")));
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ["drain"]
+    );
+    assert_eq!(delivery.counts(), [0, 0, 4, 0, 0]);
+}

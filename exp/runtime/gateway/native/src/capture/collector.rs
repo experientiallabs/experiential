@@ -125,6 +125,10 @@ impl<S: Sink> Sink for MaintainedSink<S> {
         self.sink.batch_bytes()
     }
 
+    fn batch_delay(&self) -> Duration {
+        self.sink.batch_delay()
+    }
+
     fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
         self.sink.prepared_bytes(prepared)
     }
@@ -193,10 +197,13 @@ impl Collector {
 
     /// Admission is the sole authority for input. Duplicate ids never replace a record.
     pub(crate) fn begin(&self, mut request: Request) -> bool {
-        if self.config.truncate_request {
-            super::bounds::bound(&mut request, self.config.maximum_request_bytes);
-        }
+        let request_bytes = if self.config.truncate_request {
+            super::bounds::bound(&mut request, self.config.maximum_request_bytes)
+        } else {
+            request.json_bytes()
+        };
         let record = Record {
+            checkpointed: false,
             schema_version: SCHEMA_VERSION,
             request,
             response: None,
@@ -213,7 +220,6 @@ impl Collector {
                 .map(|duration| duration.as_secs_f64())
                 .unwrap_or(0.0),
         };
-        let request_bytes = record.request.json_bytes();
         if !record.valid() || request_bytes > self.config.maximum_request_bytes {
             return self.skip();
         }
@@ -338,6 +344,7 @@ impl Collector {
             };
             entry.checkpointing = true;
             Record {
+                checkpointed: false,
                 schema_version: SCHEMA_VERSION,
                 request: entry.record.request.clone(),
                 response: None,
@@ -356,6 +363,7 @@ impl Collector {
         if let Ok(mut pending) = self.pending.lock() {
             if let Some(entry) = pending.entries.get_mut(request_id) {
                 entry.checkpointing = false;
+                entry.record.checkpointed |= queued;
                 // Destination backpressure is not abandoned-request idle time.
                 entry.expires = Instant::now() + Duration::from_secs(self.config.ttl_seconds);
             }

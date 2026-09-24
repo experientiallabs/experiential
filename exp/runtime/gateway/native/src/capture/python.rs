@@ -14,7 +14,7 @@ use super::record::{Record, Request};
 struct PythonSink(Py<PyAny>);
 
 const BATCH_RECORDS: usize = 64;
-const BATCH_BYTES: usize = 1024 * 1024;
+const BATCH_BYTES: usize = 2 * 1024 * 1024;
 
 struct PythonBatchSink(Py<PyAny>);
 
@@ -33,7 +33,7 @@ impl Sink for PythonBatchSink {
     }
 
     fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        let encoded = record.encode(maximum_bytes).ok_or(())?;
+        let encoded = record.encode_update(maximum_bytes).ok_or(())?;
         let bytes = encoded.len();
         Python::try_attach(|py| {
             encoded.into_pyobject(py).map(|value| EncodedRecord {
@@ -59,6 +59,10 @@ impl Sink for PythonBatchSink {
 
     fn batch_bytes(&self) -> usize {
         BATCH_BYTES
+    }
+
+    fn batch_delay(&self) -> Duration {
+        Duration::from_millis(10)
     }
 
     fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
@@ -125,7 +129,9 @@ pub struct CaptureCollector {
 
 #[pymethods]
 impl CaptureCollector {
-    /// Deliver bounded groups of prepared JSON strings, with per-record acknowledgements.
+    /// Deliver bounded groups with per-update commit acknowledgements. Schema 1
+    /// carries a full record; schema 2 carries a completion without request.context
+    /// and must be retried until the matching prompt checkpoint exists in storage.
     #[staticmethod]
     fn batched(py: Python<'_>, config_json: &str, sink: Py<PyAny>) -> PyResult<Self> {
         if !sink.bind(py).is_callable() {

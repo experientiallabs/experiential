@@ -4,7 +4,8 @@ Experiential owns one Rust collector for authenticated request context, HTTP
 response capture, bounded lifecycle state and worker-owned delivery. Python
 prepares the effective request during admission and configures a destination.
 There is no Python callback per response chunk. Database work runs on the
-destination worker; eligible response completion waits for its acknowledgement.
+destination worker. Response completion hands off to the bounded queue; durable
+acknowledgement releases capture ownership without holding up normal inference.
 
 ```python
 from exp_gateway_native import CaptureCollector
@@ -42,9 +43,9 @@ deployment provenance, and capture timestamp. The selected model is null for an
 accepted request that failed before routing. A successful exchange emits one complete
 record after both output completion and permission. A prompt-only permission emits
 only the prompt. This avoids a delayed prompt update overwriting a full response.
-A hosted collector
-does not enqueue content until terminal eligibility permits it, so queue overload
-cannot lose a BYOK deletion behind an already queued prompt.
+A hosted collector can enqueue an early prompt checkpoint once the selected lane
+permits capture. Final settlement independently gates the response. The destination
+rechecks current privacy policy for every write, including delayed checkpoints.
 
 Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
 JSON bodies and ordered SSE data payloads retain unknown fields. The observation
@@ -94,9 +95,18 @@ prepared string object; acknowledged members are released independently.
 Once preparation succeeds, the redundant decoded record tree is released before
 preparing the next member. Its admission charge remains until acknowledgement.
 
-Batches gather only already queued work, with no fill delay, up to 64 records.
-Gathering stops after reaching a soft 1 MiB encoded-byte target; its final record
-may cross that target, so the hard bound is 1 MiB plus the configured record limit.
+The batched storage interface emits full schema-1 records and schema-2 completion
+updates. A completion references a previously queued checkpoint: its `request`
+contains `request_id`, `scope`, `protocol` and `model_id`, but no `context`.
+All response, reasoning, usage and transport fields remain intact. The destination
+must return `False` for a completion whose permitted prompt has not persisted yet,
+and acknowledge intentional privacy exclusions. Complete-record and local SQLite
+destinations retain the full schema-1 request/response contract.
+
+Batches gather up to 64 records or wait up to 10 milliseconds from the start of
+gathering. Gathering stops after reaching a soft 2 MiB encoded-byte target; its
+final record may cross that target, so the hard bound is 2 MiB plus the configured
+record limit. Shutdown flushes a partial batch without waiting to fill it.
 The batch destination reserves five times that combined bound plus 256 bytes per
 batch slot before queue admission. Rust rejects configurations without room for
 this reservation and one queued record. Persistent failures can fill the bounded
@@ -127,8 +137,8 @@ limits throughput to what the destination can persist.
 
 When capture is required but admission cannot register it, the gateway returns a
 sanitized `capture_unavailable` 503 before provider dispatch. Policy-disabled capture
-still serves normally. An eligible response does not finish successfully until its
-destination write succeeds. A destination error retains the current record and
+still serves normally. An eligible response waits for bounded queue capacity, not
+the database commit. A destination error retains the current record and
 its queue slot, and retries with exponential backoff from 25 milliseconds to one
 second. There is no retry-count expiry: a persistent outage backpressures capture
 instead of discarding accepted data. A malformed or oversized payload that cannot
