@@ -266,6 +266,37 @@ def test_otlp_decodes_negative_integer_attribute() -> None:
     assert result.traces[0].spans[0].attributes["test.offset"] == -1
 
 
+def test_negative_string_usage_is_an_otlp_trace_issue() -> None:
+    """Signed usage strings remain subject to nonnegative token-count bounds."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.extend(
+        (
+            _attribute("gen_ai.usage.input_tokens", -1),
+            _attribute("gen_ai.usage.output_tokens", 2),
+        )
+    )
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "gen_ai.usage.input_tokens must be nonnegative" in result.issues[0].message
+
+
+def test_oversized_negative_integer_is_an_otlp_trace_issue() -> None:
+    """An integer beyond the local conversion ceiling cannot abort ingestion."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.append({"key": "test.offset", "value": {"intValue": f"-{'9' * 10_000}"}})
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "OTLP intValue must be an integer" in result.issues[0].message
+
+
 def test_otlp_retains_a_declared_model_connection_digest() -> None:
     """An exporter can retain exact secret-free connection evidence without an endpoint URL."""
     payload = _payload()
