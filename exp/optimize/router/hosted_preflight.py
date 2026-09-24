@@ -259,6 +259,13 @@ def preflight_hosted(
     if len(snapshots) == len(required_aliases):
         project_catalog = ProjectModelCatalog(
             project_id=config.project_id,
+            world_model_reasoning_effort=active.roles.world_model_reasoning_effort,
+            judge_reasoning_effort=active.roles.judge_reasoning_effort,
+            candidate_reasoning_efforts={
+                alias: effort
+                for alias, effort in active.roles.candidate_reasoning_efforts.items()
+                if alias in setup.models.candidates
+            },
             models=tuple(
                 ProjectCatalogModel(
                     alias=alias,

@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.models import ModelCapabilities, ModelSnapshot
+from exp.common.models.model import ReasoningEffort
 from exp.common.project.manifests import artifact_input
 
 if TYPE_CHECKING:
@@ -50,6 +51,17 @@ class ProjectModelCatalog(ContractModel):
     schema_version: Literal[1] = 1
     project_id: ArtifactId
     models: Annotated[tuple[ProjectCatalogModel, ...], Field(min_length=1)]
+    world_model_reasoning_effort: ReasoningEffort | None = None
+    judge_reasoning_effort: ReasoningEffort | None = None
+    candidate_reasoning_efforts: dict[ArtifactId, ReasoningEffort] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _require_known_reasoning_aliases(self) -> ProjectModelCatalog:
+        """Bind candidate reasoning selections to the portable model snapshots."""
+        aliases = {item.alias for item in self.models}
+        if set(self.candidate_reasoning_efforts).difference(aliases):
+            raise ValueError("project reasoning efforts name unknown model aliases")
+        return self
 
     @field_validator("models")
     @classmethod

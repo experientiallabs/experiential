@@ -271,9 +271,11 @@ def find_persisted_automatic_router_replay(
             or execution.simulation_configuration_sha256
             != simulation_configuration_sha256(
                 config,
-                catalog,
                 agent_identity=execution.agent_factory_sha256,
                 candidate_aliases=aliases,
+                world_model_reasoning_effort=catalog.roles.world_model_reasoning_effort,
+                judge_reasoning_effort=catalog.roles.judge_reasoning_effort,
+                candidate_reasoning_efforts=catalog.roles.candidate_reasoning_efforts,
             )
         ):
             continue
