@@ -269,7 +269,7 @@ def test_empty_parent_span_id_marks_an_otlp_root() -> None:
 
 @pytest.mark.parametrize(
     ("parent", "message"),
-    [(" ", "non-empty text"), ("xyz", "W3C ID"), (42, "non-empty text")],
+    [(None, "non-empty text"), (" ", "non-empty text"), ("xyz", "W3C ID"), (42, "non-empty text")],
 )
 def test_invalid_parent_span_id_still_excludes_otlp_trace(parent: object, message: str) -> None:
     """Only the exact empty parent value is accepted as a root marker."""
