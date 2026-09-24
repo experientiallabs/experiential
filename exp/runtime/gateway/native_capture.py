@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, JsonValue, model_validator
+from pydantic_core import to_json
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.capture_context import capture_context_document
@@ -263,20 +264,21 @@ class CaptureController:
         }:
             return True
         context = capture_context_document(request, session_id=session_id)
-        record = CaptureRequest.model_validate(
-            {
-                "request_id": authorization.request_id,
-                "scope": {
-                    "organization_id": authorization.organization_id,
-                    "identity_id": authorization.identity_id,
-                    "application_id": application_id,
-                },
-                "protocol": request.surface.value,
-                "model_id": model_id,
-                "context": context,
-            }
-        )
-        return self.native.begin(record.model_dump_json())
+        # Authority and effective context are already typed. Serialize that
+        # projection once; the native admission boundary validates the envelope.
+        # Revalidating JsonObject here would copy every tool/schema container.
+        record: JsonObject = {
+            "request_id": authorization.request_id,
+            "scope": {
+                "organization_id": authorization.organization_id,
+                "identity_id": authorization.identity_id,
+                "application_id": application_id,
+            },
+            "protocol": request.surface.value,
+            "model_id": model_id,
+            "context": context,
+        }
+        return self.native.begin(to_json(record).decode("utf-8"))
 
 
 def begin_capture(

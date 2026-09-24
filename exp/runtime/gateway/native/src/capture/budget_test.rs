@@ -30,6 +30,21 @@ fn sizes_match_serde_without_an_encoded_buffer() {
 }
 
 #[test]
+fn string_sizes_match_encoding_for_every_control_and_unicode_boundary() {
+    // Exercise dense escaping as well as short tails and large ordinary text.
+    let controls: String = (0..=127).map(char::from).collect();
+    for text in ["", "a", "\\\"\n\t", "雪😀 café", controls.as_str()] {
+        for repeat in [1, 7, 64, 4096] {
+            let value = text.repeat(repeat);
+            assert_eq!(
+                string_bytes(&value),
+                serde_json::to_string(&value).unwrap().len()
+            );
+        }
+    }
+}
+
+#[test]
 fn node_heavy_trees_and_spare_vectors_are_charged() {
     let mut values = Vec::with_capacity(4096);
     values.push(Value::Null);

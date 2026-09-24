@@ -5,11 +5,13 @@ import sys
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.capture_context import capture_context_document
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_capture import (
@@ -17,6 +19,7 @@ from exp.runtime.gateway.native_capture import (
     CaptureController,
     CaptureDeliveryLimits,
     CaptureRecord,
+    CaptureRequest,
     CaptureSseResponse,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
@@ -27,8 +30,72 @@ from exp.runtime.gateway.tests.launch_test import (
     _unused_port,
     _wait_ready,
 )
+from exp.runtime.openai_protocol.requests import decode_chat
 
 native = pytest.importorskip("exp_gateway_native")
+
+
+@pytest.mark.parametrize("application", ["application", "", " ", "x" * 513])
+@pytest.mark.parametrize("content", ["hello 雪", "a\x00b\ud800", "x" * 65536])
+def test_controller_serializes_typed_context_once_and_native_validates_envelope(
+    application: str,
+    content: str,
+) -> None:
+    """No second Python schema walk; native authority checks still reject invalid scope."""
+    authorization = AuthorizationSnapshot(
+        request_id="request",
+        organization_id="org",
+        identity_id="identity",
+        virtual_key_id="key",
+        alias="coding",
+        alias_revision_id="revision",
+        target=DirectTarget(pool_id="pool"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="b" * 64,
+        deadline_monotonic=1.0,
+    )
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "system", "content": "instructions"},
+                {"role": "user", "content": content},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        }
+    ).request
+    context = capture_context_document(request, session_id="episode")
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    controller = CaptureController(collector, application_for=lambda _auth: application)
+    with patch.object(CaptureRequest, "model_validate", side_effect=AssertionError("revalidation")):
+        accepted = controller.begin(authorization, request, "model", session_id="episode")
+    if application == "application":
+        assert accepted
+        collector.settle("request", True, False)
+        assert collector.close(1)
+        record = CaptureRecord.model_validate_json(records[0])
+        assert record.request.context == context
+        assert record.request.scope.application_id == application
+        assert record.request.model_id == "model"
+        assert collector.counts() == (0, 0, 1, 0, 0, 0)
+    else:
+        assert not accepted
+        assert collector.close(1)
+        assert not records
+        assert collector.counts() == (0, 0, 0, 0, 0, 1)
 
 
 def _request_json() -> str:
