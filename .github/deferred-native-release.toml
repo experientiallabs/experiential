@@ -1,0 +1,4 @@
+# This unreleased reliability stack retains main's package versions.
+# Remove this publication block only with a separately reviewed version assignment.
+experiential = "0.7.113"
+exp-gateway-native = "0.3.103"
