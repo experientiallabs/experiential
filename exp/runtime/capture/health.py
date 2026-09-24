@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -83,14 +84,12 @@ async def _lookup(
             env={"PATH": "/usr/bin:/bin"},
         )
     except OSError:
-        if on_diagnostic is not None:
-            on_diagnostic(f"dns_check_failed: could not start resolver check · {host}")
+        _diagnose(on_diagnostic, f"dns_check_failed: could not start resolver check · {host}")
         return CaptureHealthFailure(host, "monitor")
     try:
         await asyncio.wait_for(process.wait(), timeout=_LOOKUP_TIMEOUT)
     except TimeoutError:
-        if on_diagnostic is not None:
-            on_diagnostic(f"dns_check_failed: timed out after {_LOOKUP_TIMEOUT:g}s · {host}")
+        _diagnose(on_diagnostic, f"dns_check_failed: timed out after {_LOOKUP_TIMEOUT:g}s · {host}")
         return CaptureHealthFailure(host, "dns")
     finally:
         if process.returncode is None:
@@ -101,6 +100,14 @@ async def _lookup(
             await process.wait()
     if process.returncode == 0:
         return None
-    if on_diagnostic is not None:
-        on_diagnostic(f"dns_check_failed: resolver exited with code {process.returncode} · {host}")
+    _diagnose(
+        on_diagnostic, f"dns_check_failed: resolver exited with code {process.returncode} · {host}"
+    )
     return CaptureHealthFailure(host, "dns")
+
+
+def _diagnose(callback: Callable[[str], None] | None, message: str) -> None:
+    """Keep optional terminal output from changing health results or resolver cleanup."""
+    if callback is not None:
+        with suppress(Exception):
+            callback(message)

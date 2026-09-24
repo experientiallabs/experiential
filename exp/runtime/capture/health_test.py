@@ -74,10 +74,28 @@ def test_launch_failure_reports_monitor_unavailability(monkeypatch: pytest.Monke
     assert diagnostics == ["dns_check_failed: could not start resolver check · chatgpt.com"]
 
 
+@pytest.mark.parametrize("launch_error", [False, True])
+def test_broken_diagnostics_preserve_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch, launch_error: bool
+) -> None:
+    """Terminal write errors cannot replace the monitor's DNS or launch failure result."""
+    process = Mock(spec=asyncio.subprocess.Process)
+    process.returncode = 1
+    process.wait = AsyncMock(return_value=1)
+    create = AsyncMock(side_effect=OSError() if launch_error else None, return_value=process)
+    monkeypatch.setattr(health.asyncio, "create_subprocess_exec", create)
+    diagnostic = Mock(side_effect=OSError("synthetic closed terminal"))
+    assert asyncio.run(CaptureHealth(("chatgpt.com",), on_diagnostic=diagnostic).check()) == (
+        CaptureHealthFailure("chatgpt.com", "monitor" if launch_error else "dns"),
+    )
+    diagnostic.assert_called_once()
+
+
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("host_count", [1, 3])
+@pytest.mark.parametrize("broken_diagnostics", [False, True])
 def test_stuck_resolver_process_is_killed_and_reaped(
-    monkeypatch: pytest.MonkeyPatch, cancelled: bool, host_count: int
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool, host_count: int, broken_diagnostics: bool
 ) -> None:
     """A real owned child cannot survive the probe's deadline or cancellation."""
     original_create = asyncio.create_subprocess_exec
@@ -85,6 +103,12 @@ def test_stuck_resolver_process_is_killed_and_reaped(
     domains = tuple(f"provider{index}.example.com" for index in range(host_count))
     diagnostics: list[str] = []
     monkeypatch.setattr(health, "_LOOKUP_TIMEOUT", 0.1 if not cancelled else 30)
+
+    def diagnostic(message: str) -> None:
+        """Represent a closed terminal without preventing cleanup of real resolver children."""
+        diagnostics.append(message)
+        if broken_diagnostics:
+            raise OSError("synthetic closed terminal")
 
     async def run() -> None:
         """Substitute a sleeping child so the test never uses DNS or system interception."""
@@ -111,7 +135,7 @@ def test_stuck_resolver_process_is_killed_and_reaped(
 
         monkeypatch.setattr(health.asyncio, "create_subprocess_exec", create)
         baseline = asyncio.all_tasks()
-        task = asyncio.create_task(CaptureHealth(domains, on_diagnostic=diagnostics.append).check())
+        task = asyncio.create_task(CaptureHealth(domains, on_diagnostic=diagnostic).check())
         await asyncio.wait_for(started.wait(), 3)
         if cancelled:
             task.cancel()
