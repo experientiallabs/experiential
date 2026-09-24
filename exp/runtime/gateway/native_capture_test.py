@@ -203,9 +203,14 @@ def test_default_admission_keeps_large_inputs_whole(content: str) -> None:
 
 
 @pytest.mark.parametrize("number", [2**64, 2**80 + 1, -(2**63) - 1, -(2**80) - 1])
-def test_admission_preserves_wide_numeric_tool_context_in_lossless_source(number: int) -> None:
+@pytest.mark.parametrize("null_source", [False, True])
+def test_admission_preserves_wide_numeric_tool_context_in_lossless_source(
+    number: int, null_source: bool
+) -> None:
     """Use the existing ingest restoration contract for out-of-range JSON integers."""
     request = json.loads(_request_json())
+    if null_source:
+        request["context"]["source_json"] = None
     request["context"]["request"]["tools"] = [{"name": "choose", "parameters": {"enum": [number]}}]
     expected = request["context"]
     records: list[str] = []
@@ -214,7 +219,9 @@ def test_admission_preserves_wide_numeric_tool_context_in_lossless_source(number
     collector.settle("request", True, False)
     assert collector.close(1)
     actual = CaptureRecord.model_validate_json(records[0]).request.context
-    assert restore_capture_context(actual) == expected
+    assert json.dumps(restore_capture_context(actual), sort_keys=True) == json.dumps(
+        expected, sort_keys=True
+    )
 
 
 def test_wide_number_in_invalid_context_fails_closed_without_panicking() -> None:

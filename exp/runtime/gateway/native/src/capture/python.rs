@@ -248,7 +248,10 @@ impl CaptureCollector {
             // original context only for exceptional numeric values, using the
             // same lossless sidecar consumed by capture ingestion. Do not change
             // the gateway's global number representation to repair capture.
-            if request.context.get("source_json").is_none()
+            if request
+                .context
+                .get("source_json")
+                .is_none_or(Value::is_null)
                 && super::response::contains_wide_number(&request.context)
             {
                 let Ok(source) = serde_json::from_slice::<ContextSource>(request_json) else {
