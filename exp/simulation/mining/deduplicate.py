@@ -59,12 +59,12 @@ class LeakageGroup:
 
 @dataclass(frozen=True)
 class DeduplicatedTrace:
-    """One real source trace representing a duplicate component during task selection.
+    """One real source trace representing identical requests during task selection.
 
     Args:
         representative_trace_id: Real trace selected as the duplicate-component medoid.
         lineage_group_id: Connected leakage group that owns every represented source trace.
-        source_trace_ids: Exact and semantic duplicate source traces represented by this exemplar.
+        source_trace_ids: Exact duplicate source traces represented by this exemplar.
         workload_mass: Number of source traces collapsed into this candidate.
         routing_descriptor: Request-visible descriptor used for clustering and router features.
         coverage_descriptor: Mining-only coverage facts aggregated across represented traces.
@@ -144,7 +144,10 @@ def analyze_duplicates(
     *,
     semantic_duplicate_threshold: float = DEFAULT_SEMANTIC_DUPLICATE_THRESHOLD,
 ) -> DuplicateAnalysis:
-    """Find duplicate edges, union leakage groups, and retain real representative candidates.
+    """Collapse exact requests and group related requests for leakage-safe partitioning.
+
+    Vector similarity joins partition lineages, not scenario identities. Similar requests can
+    name different companies, parameters, or starting states that must remain separate cases.
 
     Args:
         traces: Canonical traces in the same order as all companion sequences.
@@ -181,7 +184,8 @@ def analyze_duplicates(
         semantic_duplicate_threshold=semantic_duplicate_threshold,
     )
     for edge in edges:
-        trace_union.union(edge.left_trace_id, edge.right_trace_id)
+        if edge.kind == "exact":
+            trace_union.union(edge.left_trace_id, edge.right_trace_id)
         lineage_union.union(edge.left_lineage_group_id, edge.right_lineage_group_id)
     for assignment in assignments:
         lineage_union.add(assignment.lineage_group_id)

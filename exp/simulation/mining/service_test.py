@@ -15,7 +15,7 @@ from exp.common.project import ArtifactStore
 from exp.common.project.paths import ProjectPaths
 from exp.common.tasks import TaskSet, ToolSchema
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
-from exp.simulation.mining.descriptors import routing_descriptor
+from exp.simulation.mining.descriptors import HashingDescriptorEmbedder, routing_descriptor
 from exp.simulation.mining.lineage import assign_source_lineages
 from exp.simulation.mining.service import MiningSpec, mine_tasks, persist_task_set
 
@@ -315,6 +315,7 @@ def test_exact_duplicate_lineages_are_unioned_before_partition_and_keep_workload
 
 
 def test_semantic_duplicate_lineages_are_unioned_before_partition() -> None:
+    """Similar requests share a leakage boundary while retaining distinct scenarios."""
     first = _trace(1, task="Cancel a reservation", conversation_id="conversation-a")
     second = _trace(2, task="Please cancel this booking", conversation_id="conversation-b")
 
@@ -323,7 +324,59 @@ def test_semantic_duplicate_lineages_are_unioned_before_partition() -> None:
     assert len(result.analysis.edges) == 1
     assert result.analysis.edges[0].kind == "semantic"
     assert len(result.analysis.leakage_groups) == 1
-    assert result.analysis.candidates[0].source_trace_ids == ("trace-1", "trace-2")
+    assert [candidate.source_trace_ids for candidate in result.analysis.candidates] == [
+        ("trace-1",),
+        ("trace-2",),
+    ]
+    assert len(result.tasks) == 2
+    assert len({task.partition for task in result.tasks}) == 1
+
+
+@pytest.mark.parametrize("case_in_context", [False, True])
+def test_twenty_distinct_company_cases_survive_shared_instructions(
+    case_in_context: bool,
+) -> None:
+    """Shared prompt text cannot erase entity differences or hide an exact repeat."""
+    context: JsonObject = {"instructions": "Research the company using reliable sources. " * 200}
+    traces = tuple(
+        _trace(
+            index,
+            task="Research this company" if case_in_context else f"Research company {index}",
+        ).model_copy(
+            update={
+                "initial_context": {
+                    **context,
+                    **({"company": index} if case_in_context else {}),
+                }
+            }
+        )
+        for index in range(20)
+    )
+    repeat = traces[0].model_copy(
+        update={"trace_id": "trace-repeat", "conversation_id": "conversation-repeat"}
+    )
+    corpus = (*traces, repeat)
+
+    result = mine_tasks(corpus, embedder=HashingDescriptorEmbedder())
+    replay = mine_tasks(tuple(reversed(corpus)), embedder=HashingDescriptorEmbedder())
+
+    assert len(result.tasks) == 20
+    assert len(result.analysis.candidates) == 20
+    assert result.coverage.duplicate_trace_count == 1
+    assert any(edge.kind == "semantic" for edge in result.analysis.edges)
+    duplicated = next(task for task in result.tasks if "trace-repeat" in task.source_trace_ids)
+    assert duplicated.source_trace_ids == ("trace-0", "trace-repeat")
+    assert duplicated.workload_weight == pytest.approx(2 / 21)
+    assert sum(task.workload_weight for task in result.tasks) == pytest.approx(1)
+    assert {source for task in result.tasks for source in task.source_trace_ids} == {
+        trace.trace_id for trace in corpus
+    }
+    assert result.coverage.split_separation_verified
+    assert not set(result.partition.fit_lineage_group_ids).intersection(
+        result.partition.held_out_lineage_group_ids
+    )
+    assert result.tasks == replay.tasks
+    assert result.coverage == replay.coverage
 
 
 def test_source_lineages_use_conversation_then_stable_customer_time_buckets() -> None:
@@ -452,7 +505,8 @@ def test_cleanup_accepts_a_source_preserving_faked_proposal() -> None:
     assert result.cleanup_results[0][1].accepted
 
 
-def test_duplicate_coverage_retains_mixed_source_facet_mass() -> None:
+def test_similar_cases_retain_mixed_source_facet_mass_when_both_selected() -> None:
+    """Keeping two similar scenarios preserves each source's direct coverage."""
     first = _coverage_trace(
         1,
         domain="travel",
@@ -470,7 +524,7 @@ def test_duplicate_coverage_retains_mixed_source_facet_mass() -> None:
 
     result = mine_tasks(
         (first, second),
-        MiningSpec(fit_task_budget=1, held_out_task_budget=0),
+        MiningSpec(fit_task_budget=2, held_out_task_budget=0),
         embedder=SameVectorEmbedder(),
     )
 
@@ -481,7 +535,7 @@ def test_duplicate_coverage_retains_mixed_source_facet_mass() -> None:
         )
         for facet in result.coverage.facets
     }
-    assert len(result.analysis.candidates) == 1
+    assert len(result.analysis.candidates) == 2
     assert facet_mass[("tool", "lookup_reservation")] == (1, 1)
     assert facet_mass[("tool", "cancel_reservation")] == (1, 1)
     assert facet_mass[("domain", "travel")] == (1, 1)
@@ -490,6 +544,37 @@ def test_duplicate_coverage_retains_mixed_source_facet_mass() -> None:
     assert facet_mass[("outcome", "failure")] == (1, 1)
     assert facet_mass[("complexity", "short")] == (1, 1)
     assert facet_mass[("complexity", "long")] == (1, 1)
+
+
+def test_exact_duplicates_retain_each_source_outcome_and_tool_facet() -> None:
+    """Exact requests collapse while their different observed outcomes remain counted."""
+    first = _coverage_trace(
+        1, domain="travel", tool_name="lookup_reservation", outcome="success", span_count=1
+    )
+    second = _coverage_trace(
+        2, domain="travel", tool_name="cancel_reservation", outcome="failure", span_count=8
+    )
+    result = mine_tasks((first, second), embedder=SameVectorEmbedder())
+
+    assert len(result.analysis.candidates) == 1
+    assert result.tasks[0].source_trace_ids == ("trace-1", "trace-2")
+    facet_mass = {
+        (facet.dimension, facet.value): (
+            facet.input_workload_mass,
+            facet.directly_selected_workload_mass,
+        )
+        for facet in result.coverage.facets
+    }
+    assert facet_mass[("domain", "travel")] == (2, 2)
+    for facet in (
+        ("tool", "lookup_reservation"),
+        ("tool", "cancel_reservation"),
+        ("outcome", "success"),
+        ("outcome", "failure"),
+        ("complexity", "short"),
+        ("complexity", "long"),
+    ):
+        assert facet_mass[facet] == (1, 1)
 
 
 def test_persisted_task_set_reuses_the_w2_task_and_artifact_contracts(tmp_path: Path) -> None:
