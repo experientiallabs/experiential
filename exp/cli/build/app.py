@@ -229,8 +229,8 @@ def build(
         except ProviderTransportError as exc:
             _console.print(f"[red]error[/red] a provider request failed: {exc}")
             _console.print(
-                "Completed paid work is saved. Run exp build again to resume; finished "
-                "steps replay exactly without new spend."
+                "Completed embedding batches and finished steps are saved. Run exp build again "
+                "to resume; an interrupted request may be retried."
             )
             raise typer.Exit(code=1) from exc
         except SimulationContentionError as exc:

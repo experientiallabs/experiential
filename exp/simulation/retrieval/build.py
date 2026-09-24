@@ -44,6 +44,7 @@ from exp.simulation.retrieval.embedding import (
     default_rag_embedder,
     embed_rag_texts,
 )
+from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
 from exp.simulation.retrieval.embedding_inputs import embedding_chunk_bytes
 from exp.simulation.retrieval.transitions import extract_real_transitions
 
@@ -76,6 +77,9 @@ def persist_trace_rag(
 
     Trace count is not a product restriction. Roughly 100 to 1,000 traces is a useful common
     starting range, but one trace and corpora larger than 1,000 follow the same contract.
+    Completed embedding batches are checkpointed under the project runtime directory before
+    progress advances. A restarted build reuses them; an interrupted uncommitted request may
+    still be sent again.
 
     Args:
         store: Project-local immutable artifact store.
@@ -124,6 +128,9 @@ def persist_trace_rag(
         cache=embedding_cache,
         maximum_chunk_bytes=chunk_bytes,
         progress=progress,
+        checkpoint=RAGEmbeddingCheckpoint(
+            store.project_directory, binding.snapshot, maximum_chunk_bytes=chunk_bytes
+        ),
     )
     report(progress, "RAG")
     vectors = tuple(
