@@ -22,6 +22,8 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    provider_ssl_context,
+    transport_error_message,
 )
 
 
@@ -47,7 +49,7 @@ def _default_ssl_context() -> ssl.SSLContext:
     """
     global _shared_ssl_context  # noqa: PLW0603 - one lazily built process-wide context.
     if _shared_ssl_context is None:
-        _shared_ssl_context = httpx.create_ssl_context()
+        _shared_ssl_context = provider_ssl_context()
     return _shared_ssl_context
 
 
@@ -283,9 +285,9 @@ class HttpxAsyncJsonTransport:
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         return _decoded_response(response)
 
     async def post(
@@ -319,9 +321,9 @@ class HttpxAsyncJsonTransport:
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         return _decoded_response(response)
 
 

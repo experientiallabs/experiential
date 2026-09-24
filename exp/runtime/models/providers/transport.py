@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import ssl
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
 import httpx
+import truststore
 
 from exp.common.core.artifacts import JsonObject
 
@@ -170,7 +173,7 @@ class HttpxJsonTransport(JsonHttpTransport):
     """Production JSON transport backed by a caller-owned-or-default httpx client."""
 
     def __init__(self, client: httpx.Client | None = None) -> None:
-        self._client = client or httpx.Client()
+        self._client = client if client is not None else httpx.Client(verify=provider_ssl_context())
 
     def get(
         self,
@@ -195,9 +198,9 @@ class HttpxJsonTransport(JsonHttpTransport):
         try:
             response = self._client.get(url, headers=dict(headers), timeout=timeout_seconds)
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         return _decoded_response(response)
 
     def post(
@@ -230,10 +233,50 @@ class HttpxJsonTransport(JsonHttpTransport):
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         return _decoded_response(response)
+
+
+def provider_ssl_context() -> ssl.SSLContext:
+    """Verify provider TLS with native system trust, preserving explicit CA overrides.
+
+    Native trust can resolve intermediate certificates and system-managed roots absent from
+    static bundles. Explicit SSL_CERT_FILE or SSL_CERT_DIR settings retain HTTPX's selected
+    trust boundary. Caller-owned clients remain untouched; SSL is never patched globally.
+    """
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return httpx.create_ssl_context()
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def transport_error_message(error: httpx.TransportError) -> str:
+    """Describe network failure classes without exposing exception text, URLs, or headers."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return (
+                "provider TLS certificate verification failed; check system certificate trust "
+                "and SSL_CERT_FILE/SSL_CERT_DIR settings"
+            )
+        current = current.__cause__ or current.__context__
+    for error_type, message in (
+        (httpx.TimeoutException, "provider request timed out"),
+        (httpx.ConnectError, "provider connection failed (ConnectError)"),
+        (
+            httpx.RemoteProtocolError,
+            "provider connection closed unexpectedly (RemoteProtocolError)",
+        ),
+        (httpx.ReadError, "provider response could not be read (ReadError)"),
+        (httpx.WriteError, "provider request could not be sent (WriteError)"),
+        (httpx.ProxyError, "provider proxy connection failed (ProxyError)"),
+    ):
+        if isinstance(error, error_type):
+            return message
+    return "provider transport request failed"
 
 
 def _decoded_response(response: httpx.Response) -> JsonHttpResponse:

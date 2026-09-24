@@ -2,20 +2,89 @@
 
 from __future__ import annotations
 
+import ssl
+from pathlib import Path
+
+import httpx
 import pytest
+import truststore
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.models.providers.transport import (
+    HttpxJsonTransport,
     JsonHttpResponse,
     ProviderTransportError,
     RetryPolicy,
     ScriptedJsonTransport,
     classify_retry,
     get_json,
+    provider_ssl_context,
     run_with_retry,
 )
 
 _IMMEDIATE_RETRY = RetryPolicy(maximum_attempts=2, initial_delay_seconds=0, maximum_delay_seconds=0)
+
+
+def test_provider_tls_uses_system_trust_with_verification_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native trust never disables certificate or hostname verification."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    context = provider_ssl_context()
+    assert isinstance(context, truststore.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
+
+
+def test_provider_tls_does_not_ignore_an_explicit_ca_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken operator-selected trust boundary fails instead of silently using system roots."""
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing-ca.pem"))
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    with pytest.raises(FileNotFoundError):
+        provider_ssl_context()
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+@pytest.mark.parametrize("certificate_error", [False, True])
+def test_transport_names_network_failures_without_exposing_secrets(
+    method: str, certificate_error: bool
+) -> None:
+    """Both JSON request paths identify certificate failures without logging exception text."""
+    canary = "private-url-and-key-canary"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Raise a realistic HTTPX error chain with deliberately private exception text."""
+        error = httpx.ConnectError(canary, request=request)
+        if certificate_error:
+            raise error from ssl.SSLCertVerificationError(1, canary)
+        raise error
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        transport = HttpxJsonTransport(client)
+        with pytest.raises(ProviderTransportError) as caught:
+            if method == "get":
+                transport.get(
+                    "https://provider.test/v1/models",
+                    headers={"Authorization": "Bearer " + canary},
+                    timeout_seconds=1,
+                )
+            else:
+                transport.post(
+                    "https://provider.test/v1/embeddings",
+                    headers={"Authorization": "Bearer " + canary},
+                    payload={"input": canary},
+                    timeout_seconds=1,
+                )
+    message = str(caught.value)
+    assert canary not in message
+    assert (
+        "TLS certificate verification failed" in message
+        if certificate_error
+        else ("ConnectError" in message)
+    )
 
 
 def test_get_json_returns_the_first_success_body_for_one_attempt() -> None:

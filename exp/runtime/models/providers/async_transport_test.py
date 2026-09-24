@@ -231,3 +231,35 @@ def test_httpx_decode_failure_does_not_expose_body_or_headers() -> None:
     message = asyncio.run(scenario())
     assert canary not in message
     assert "header-canary" not in message
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_async_transport_names_connection_failures_without_exposing_secrets(method: str) -> None:
+    """Async JSON transport uses the same safe failure diagnostics as embedding requests."""
+    canary = "private-connection-canary"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Raise one connection failure whose original message must stay private."""
+        raise httpx.ConnectError(canary, request=request)
+
+    async def scenario() -> str:
+        """Exercise the actual async adapter with an injected failing network transport."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            transport = HttpxAsyncJsonTransport(client)
+            with pytest.raises(ProviderTransportError) as caught:
+                if method == "get":
+                    await transport.get(
+                        "https://provider.test/v1/models", headers={}, timeout_seconds=1
+                    )
+                else:
+                    await transport.post(
+                        "https://provider.test/v1/embeddings",
+                        headers={},
+                        payload={"input": canary},
+                        timeout_seconds=1,
+                    )
+            return str(caught.value)
+
+    message = asyncio.run(scenario())
+    assert "ConnectError" in message
+    assert canary not in message

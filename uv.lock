@@ -913,6 +913,7 @@ dependencies = [
     { name = "rich" },
     { name = "tiktoken" },
     { name = "tomli-w" },
+    { name = "truststore" },
     { name = "typer" },
     { name = "zstandard", marker = "python_full_version >= '3.13'" },
 ]
@@ -967,6 +968,7 @@ requires-dist = [
     { name = "tinker", marker = "extra == 'sft'", specifier = ">=0.23,<0.24" },
     { name = "tinker-cookbook", marker = "extra == 'sft'", specifier = ">=0.4.3,<0.5" },
     { name = "tomli-w", specifier = ">=1.0" },
+    { name = "truststore", specifier = ">=0.10,<0.11" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
     { name = "typer", specifier = ">=0.16" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=14,<16" },

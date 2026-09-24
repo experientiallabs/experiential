@@ -23,6 +23,7 @@ dependencies = [
     "cryptography>=42,<49; python_version >= '3.13'",
     "brotli>=1.2,<2; python_version >= '3.13'",
     "zstandard>=0.23,<1; python_version >= '3.13'",
+    "truststore>=0.10,<0.11",  # verified provider TLS through native system certificate stores
     # Security floor for HTTPX's async transport (CVE-2026-63374).
     "anyio>=4.14.2",
     "rich>=14.1",

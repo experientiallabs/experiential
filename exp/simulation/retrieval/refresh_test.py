@@ -1116,7 +1116,8 @@ def test_lineage_assignment_change_creates_a_distinct_refresh_and_index(tmp_path
         code_revision="test-revision",
     )
 
-    assert client.calls == 2
+    # Lineage changes index eligibility, while identical pure-text vectors remain reusable.
+    assert client.calls == 1
     assert fit_refresh.refresh.refresh_id != held_out_refresh.refresh.refresh_id
     assert fit_refresh.retrieval.index.rag_id != held_out_refresh.retrieval.index.rag_id
     assert {item.trace_id for item in fit_refresh.retrieval.transitions} == {

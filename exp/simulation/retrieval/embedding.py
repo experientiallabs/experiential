@@ -16,6 +16,7 @@ from exp.common.models import (
     ModelSnapshot,
 )
 from exp.common.progress import ProgressHook, report
+from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
 from exp.simulation.retrieval.embedding_inputs import (
     embedding_batches,
     embedding_chunk_bytes,
@@ -133,6 +134,7 @@ def embed_rag_texts(
     cache: RAGEmbeddingCache | None = None,
     maximum_chunk_bytes: int | None = None,
     progress: ProgressHook | None = None,
+    checkpoint: RAGEmbeddingCheckpoint | None = None,
 ) -> tuple[tuple[float, ...], ...]:
     """Embed shared key components once, then pool them with identical query semantics.
 
@@ -142,6 +144,7 @@ def embed_rag_texts(
         cache: Optional invocation-local cache shared across related index builds.
         maximum_chunk_bytes: Persisted index chunk bound, or the configured build bound.
         progress: Optional progress observer notified after each successful bounded batch.
+        checkpoint: Optional project-owned durable cache for index construction only.
 
     Returns:
         Equal-width finite unit vectors in input order.
@@ -160,14 +163,24 @@ def embed_rag_texts(
     active = cache or RAGEmbeddingCache(binding, maximum_chunk_bytes=chunk_bytes)
     if active.snapshot != binding.snapshot or active.maximum_chunk_bytes != chunk_bytes:
         raise ValueError("RAG embedding cache differs from the model or chunking identity")
+    if checkpoint is not None:
+        if checkpoint.snapshot != binding.snapshot or checkpoint.maximum_chunk_bytes != chunk_bytes:
+            raise ValueError("RAG embedding checkpoint differs from the model or chunking identity")
+        checkpoint.seed(
+            {text: active.vectors[text] for text in plan.texts if text in active.vectors}
+        )
+        saved = checkpoint.load(plan.texts)
+        _remember_batch(active, tuple(saved), tuple(saved.values()))
     missing = tuple(text for text in plan.texts if text not in active.vectors)
     completed = len(plan.texts) - len(missing)
     report(progress, "embeddings", completed=completed, total=len(plan.texts))
     for batch in embedding_batches(missing):
-        vectors = _embed_batch(binding, batch)
-        if active.vectors and len(next(iter(active.vectors.values()))) != len(vectors[0]):
-            raise ValueError("RAG embedder returned vectors with inconsistent dimensions")
-        active.vectors.update(zip(batch, vectors, strict=True))
+        vectors = (
+            _embed_batch(binding, batch)
+            if checkpoint is None
+            else checkpoint.get_or_embed(batch, lambda texts: _embed_batch(binding, texts))
+        )
+        _remember_batch(active, batch, vectors)
         completed += len(batch)
         report(progress, "embeddings", completed=completed, total=len(plan.texts))
     for components in plan.keys:
@@ -181,6 +194,15 @@ def embed_rag_texts(
         _pool(tuple(active.components[part] for part in components), tuple(1 for _ in components))
         for components in plan.keys
     )
+
+
+def _remember_batch(
+    cache: RAGEmbeddingCache, texts: Sequence[str], vectors: tuple[tuple[float, ...], ...]
+) -> None:
+    """Admit consistent dimensions from a provider or durable batch into invocation memory."""
+    if vectors and cache.vectors and len(next(iter(cache.vectors.values()))) != len(vectors[0]):
+        raise ValueError("RAG embedder returned vectors with inconsistent dimensions")
+    cache.vectors.update(zip(texts, vectors, strict=True))
 
 
 def _embed_batch(
