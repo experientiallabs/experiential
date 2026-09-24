@@ -3182,6 +3182,24 @@ def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     assert 'dist/*.whl "openai==3.0.0"' in workflow
 
 
+def test_capture_release_imports_cannot_modify_the_publish_artifact() -> None:
+    """Public Capture dependencies execute only against an isolated artifact copy."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text()
+    build, smoke = workflow.split("  build:\n", 1)[1].split("  capture-release-smoke:\n", 1)
+    smoke, publish = smoke.split("  publish:\n", 1)
+    assert "uv venv --python 3.12 /tmp/exp-wheel-smoke" in build
+    assert "import mitmproxy" not in build
+    assert "    needs: build\n" in smoke
+    assert "if: github.event_name == 'release' || inputs.publish == true" in smoke
+    assert "import mitmproxy, mitmproxy_rs" in smoke
+    assert "upload-artifact" not in smoke
+    assert "id-token: write" not in smoke
+    assert "contents: write" not in smoke
+    assert "    needs: [build, capture-release-smoke]\n" in publish
+    assert "name: python-dist" in smoke and "name: python-dist" in publish
+
+
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 

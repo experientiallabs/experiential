@@ -88,11 +88,19 @@ class _Body:
 
 @dataclass
 class _WebsocketRequest:
-    """One unstitched Responses request awaiting its protocol-level completion."""
+    """One unstitched Responses request awaiting its protocol-level completion.
+
+    Attributes:
+        body: Bounded original request frame.
+        started_ns: Request observation time in Unix nanoseconds.
+        response_id: Provider ID assigned by response.created, initially unknown.
+        stream_id: Named ordered lane, or None for the default lane.
+    """
 
     body: bytes
     started_ns: int
     response_id: str | None = None
+    stream_id: str | None = None
 
 
 @dataclass
@@ -537,7 +545,15 @@ class CaptureProxy:
             return
         capture = self._captures.get(flow.id)
         if len(message.content) > self._max_body_bytes:
-            self.dropped_exchanges += 1
+            # An unparsed frame may contain a request or terminal event. Its
+            # ownership is unknowable within the body cap, so never pair later
+            # responses on this socket with earlier buffered requests.
+            self._captures.pop(flow.id, None)
+            pending = len(capture.websocket_requests) if capture is not None else 0
+            self.dropped_exchanges += max(1, pending + int(message.from_client))
+            flow.metadata[_WEBSOCKET_CAPTURE] = False
+            flow.metadata.pop(_WEBSOCKET_SKIPPED, None)
+            self._diagnostic("capture_disabled: oversized WebSocket frame", flow.client_conn)
             return
         try:
             event = json.loads(message.content)
@@ -572,13 +588,29 @@ class CaptureProxy:
             ):
                 self._skip_websocket_request(flow)
                 return
-            capture.websocket_requests.append(_WebsocketRequest(message.content, time.time_ns()))
+            stream_id = event.get("stream_id")
+            capture.websocket_requests.append(
+                _WebsocketRequest(
+                    message.content,
+                    time.time_ns(),
+                    stream_id=stream_id if isinstance(stream_id, str) else None,
+                )
+            )
             self._diagnostic("websocket_request_started", flow.client_conn)
         elif not message.from_client:
+            if event.get("type") == "error":
+                # Request errors have no response object or reliable response ID.
+                # Discard ambiguous buffers and consume this terminal outcome.
+                self._skip_websocket_request(flow, new_request=False)
+                outstanding = int(flow.metadata.get(_WEBSOCKET_SKIPPED, 0))
+                flow.metadata[_WEBSOCKET_SKIPPED] = max(0, outstanding - 1)
+                return
             response = event.get("response")
             if not isinstance(response, dict):
                 return
             response_id = response.get("id")
+            if not isinstance(response_id, str):
+                return
             terminal = event.get("type") in {
                 "response.completed",
                 "response.failed",
@@ -588,17 +620,21 @@ class CaptureProxy:
                 if terminal and skipped:
                     flow.metadata[_WEBSOCKET_SKIPPED] = skipped - 1
                 return
+            stream_id = event.get("stream_id")
+            requests = [
+                request
+                for request in capture.websocket_requests
+                if request.stream_id == (stream_id if isinstance(stream_id, str) else None)
+            ]
             if event.get("type") == "response.created" and isinstance(response_id, str):
-                for request in capture.websocket_requests:
+                for request in requests:
                     if request.response_id is None:
                         request.response_id = response_id
                         break
             if terminal:
-                for request in capture.websocket_requests:
+                for request in requests:
                     if request.response_id == response_id or (
-                        request.response_id is None
-                        and len(capture.websocket_requests) == 1
-                        and not skipped
+                        request.response_id is None and len(requests) == 1 and not skipped
                     ):
                         capture.websocket_requests.remove(request)
                         if not capture.websocket_requests:
@@ -622,15 +658,19 @@ class CaptureProxy:
                     if skipped:
                         flow.metadata[_WEBSOCKET_SKIPPED] = skipped - 1
 
-    def _skip_websocket_request(self, flow: http.HTTPFlow) -> None:
+    def _skip_websocket_request(self, flow: http.HTTPFlow, *, new_request: bool = True) -> None:
         """Drain an ambiguous response group without attributing skipped responses.
 
         Once a request is skipped, created events cannot safely identify earlier
         requests whose IDs have not arrived. Release the entire buffered group
         and wait for all outstanding terminal events before collecting again.
+
+        Args:
+            flow: The upgraded flow whose capture ownership became ambiguous.
+            new_request: Whether this event adds one newly skipped client request.
         """
         capture = self._captures.pop(flow.id, None)
-        skipped = 1 + (len(capture.websocket_requests) if capture is not None else 0)
+        skipped = int(new_request) + (len(capture.websocket_requests) if capture is not None else 0)
         flow.metadata[_WEBSOCKET_SKIPPED] = int(flow.metadata.get(_WEBSOCKET_SKIPPED, 0)) + skipped
         self.dropped_exchanges += skipped
 

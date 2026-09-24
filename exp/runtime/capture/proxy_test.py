@@ -1289,7 +1289,10 @@ def test_idle_websockets_do_not_exhaust_request_capture_capacity() -> None:
 
 
 @pytest.mark.parametrize("skipped_first", [False, True])
-def test_overflowed_websocket_group_cannot_misattribute_responses(skipped_first: bool) -> None:
+@pytest.mark.parametrize("error_outcome", [False, True])
+def test_overflowed_websocket_group_cannot_misattribute_responses(
+    skipped_first: bool, error_outcome: bool
+) -> None:
     """Unknown response IDs across overflow drain without uploading mismatched pairs."""
     captured: list[CapturedExchange] = []
     first = json.dumps({"type": "response.create", "input": "first" * 16}).encode()
@@ -1328,6 +1331,9 @@ def test_overflowed_websocket_group_cannot_misattribute_responses(skipped_first:
     assert not proxy._captures
     assert proxy.dropped_exchanges == 2
     for response_id in ("second", "first") if skipped_first else ("first", "second"):
+        if response_id == "second" and error_outcome:
+            send(False, b'{"type":"error","status":400,"error":{"code":"invalid_request"}}')
+            continue
         for kind in ("response.created", "response.completed"):
             send(False, json.dumps({"type": kind, "response": {"id": response_id}}).encode())
         assert not captured
@@ -1339,6 +1345,97 @@ def test_overflowed_websocket_group_cannot_misattribute_responses(skipped_first:
     assert json.loads(captured[0].response)["id"] == "fresh"
     assert not proxy._captures
     assert proxy.dropped_exchanges == 2
+
+
+@pytest.mark.parametrize("from_client", [False, True])
+def test_oversized_websocket_frame_never_pairs_unknown_responses(from_client: bool) -> None:
+    """Unparsed oversized frames make only this socket ineligible for collection."""
+    captured: list[CapturedExchange] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: captured.append(exchange) is None,
+        domains=("chatgpt.com",),
+        max_body_bytes=160,
+    )
+    flow = http.HTTPFlow(
+        connection.Client(
+            peername=("127.0.0.1", 1), sockname=("127.0.0.1", 443), sni="chatgpt.com"
+        ),
+        connection.Server(address=("chatgpt.com", 443)),
+    )
+    flow.request = http.Request.make(
+        "GET", "https://chatgpt.com/responses", headers={"Host": "chatgpt.com"}
+    )
+    asyncio.run(proxy.requestheaders(flow))
+    flow.response = http.Response.make(101)
+    proxy.responseheaders(flow)
+    flow.websocket = websocket.WebSocketData()
+    frames = [
+        (True, b'{"type":"response.create","input":"first"}'),
+        (from_client, json.dumps({"type": "response.create", "input": "x" * 200}).encode()),
+        (False, b'{"type":"response.created","response":{"id":"oversized"}}'),
+        (False, b'{"type":"response.completed","response":{"id":"oversized"}}'),
+        (False, b'{"type":"response.completed","response":{"id":"first"}}'),
+        (True, b'{"type":"response.create","input":"later"}'),
+        (False, b'{"type":"response.completed","response":{"id":"later"}}'),
+    ]
+    for from_client, raw in frames:
+        message = websocket.WebSocketMessage(Opcode.TEXT, from_client, raw)
+        flow.websocket.messages.append(message)
+        proxy.websocket_message(flow)
+        assert message.content == raw and not message.dropped
+        assert not flow.websocket.messages
+    assert not proxy._captures
+    assert not captured
+
+
+@pytest.mark.parametrize("parallel_streams", [False, True])
+def test_websocket_response_ownership_survives_errors_and_parallel_lanes(
+    parallel_streams: bool,
+) -> None:
+    """Errors and interleaved named lanes cannot steal another request's response."""
+    captured: list[CapturedExchange] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: captured.append(exchange) is None, domains=("chatgpt.com",)
+    )
+    flow = http.HTTPFlow(
+        connection.Client(
+            peername=("127.0.0.1", 1), sockname=("127.0.0.1", 443), sni="chatgpt.com"
+        ),
+        connection.Server(address=("chatgpt.com", 443)),
+    )
+    flow.request = http.Request.make(
+        "GET", "https://chatgpt.com/responses", headers={"Host": "chatgpt.com"}
+    )
+    asyncio.run(proxy.requestheaders(flow))
+    flow.response = http.Response.make(101)
+    proxy.responseheaders(flow)
+    flow.websocket = websocket.WebSocketData()
+    frames = [
+        (True, b'{"type":"response.create","input":"failed"}'),
+        (False, b'{"type":"error","status":400,"error":{"code":"invalid_request"}}'),
+        (True, b'{"type":"response.create","input":"next"}'),
+        (False, b'{"type":"response.created","response":{"id":"next"}}'),
+        (False, b'{"type":"response.completed","response":{"id":"next"}}'),
+    ]
+    if parallel_streams:
+        frames = [
+            (True, b'{"type":"response.create","stream_id":"a","input":"first"}'),
+            (True, b'{"type":"response.create","stream_id":"b","input":"second"}'),
+            (False, b'{"type":"response.created","stream_id":"b","response":{"id":"second"}}'),
+            (False, b'{"type":"response.completed","stream_id":"b","response":{"id":"second"}}'),
+            (False, b'{"type":"response.created","stream_id":"a","response":{"id":"first"}}'),
+            (False, b'{"type":"response.completed","stream_id":"a","response":{"id":"first"}}'),
+        ]
+    for from_client, raw in frames:
+        message = websocket.WebSocketMessage(Opcode.TEXT, from_client, raw)
+        flow.websocket.messages.append(message)
+        proxy.websocket_message(flow)
+        assert message.content == raw and not message.dropped
+    assert not proxy._captures
+    assert proxy.dropped_exchanges == (0 if parallel_streams else 1)
+    expected = ["second", "first"] if parallel_streams else ["next"]
+    assert [json.loads(exchange.request)["input"] for exchange in captured] == expected
+    assert [json.loads(exchange.response)["id"] for exchange in captured] == expected
 
 
 @pytest.mark.parametrize(
