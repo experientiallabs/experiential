@@ -184,7 +184,17 @@ def run_evaluation(
 
 
 def _results(project: ProjectStore, run: EvaluationRun, *, interactive: bool) -> None:
-    """Choose the compact interactive report or a script-readable export receipt."""
+    """Choose the compact interactive report or a script-readable export receipt.
+
+    Args:
+        project: Local project containing the run's immutable evidence.
+        run: Saved evaluation whose results should be displayed and exported.
+        interactive: Whether to offer report browsing instead of an export receipt.
+
+    Raises:
+        OSError: Local report evidence cannot be read or exports cannot be written.
+        ValueError: Saved report evidence is missing or inconsistent.
+    """
     if interactive:
         inspect_report(_console, project, run)
     else:
@@ -194,7 +204,18 @@ def _results(project: ProjectStore, run: EvaluationRun, *, interactive: bool) ->
 
 
 def _project_screen(project: ProjectStore) -> str | None:
-    """Keep starting an evaluation separate from browsing saved results."""
+    """Keep starting an evaluation separate from browsing saved results.
+
+    Args:
+        project: Built project supplying scenarios and saved evaluation runs.
+
+    Returns:
+        A saved run ID, ``None`` for a new evaluation, or ``"exit"`` on cancellation.
+
+    Raises:
+        OSError: Saved project or run metadata cannot be read.
+        ValueError: The build or stored evaluation evidence is invalid.
+    """
     tasks = evaluation_tasks(project)
     while True:
         heading(_console, project.paths.project_id, f"{len(tasks)} scenarios")
@@ -226,7 +247,12 @@ def _project_screen(project: ProjectStore) -> str | None:
 
 
 def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
-    """Show the model matrix and costs in one short launch review."""
+    """Show the model matrix and costs in one short launch review.
+
+    Args:
+        project: Project supplying the display name.
+        run: Prepared evaluation supplying frozen models, repeats, and cost estimates.
+    """
     cost = run.prepared.cost
     setup = run.prepared.setup
     heading(_console, project.paths.project_id, "Review evaluation")
@@ -246,7 +272,16 @@ def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
 
 
 def _review(project: ProjectStore, run: EvaluationRun) -> bool:
-    """Require an explicit launch action, including when shared consent permits automatic spend."""
+    """Require an explicit launch action before requesting spend consent.
+
+    Args:
+        project: Project supplying the display name for review screens.
+        run: Prepared evaluation supplying the frozen per-stage cost breakdown.
+
+    Returns:
+        ``True`` only after Start evaluation; ``False`` after Back or cancellation.
+        Viewing cost details never authorizes a provider call.
+    """
     while True:
         choice = choose_one(
             _console,
@@ -280,7 +315,14 @@ def _review(project: ProjectStore, run: EvaluationRun) -> bool:
 
 
 def _compact_progress(progress: ProgressHook) -> ProgressHook:
-    """Keep durable detailed events intact while rendering only the stage and counts."""
+    """Keep durable detailed events intact while rendering only the stage and counts.
+
+    Args:
+        progress: Terminal progress sink receiving the compact event projection.
+
+    Returns:
+        Observer that forwards stage and counts without changing source events.
+    """
 
     def observe(event: ProgressEvent) -> None:
         """Forward a concise view of the engine's observed progress."""

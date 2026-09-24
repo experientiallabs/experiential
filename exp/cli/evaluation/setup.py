@@ -15,7 +15,22 @@ from exp.optimize.router.judging.artifacts import read_review_state
 def configure_evaluation(
     console: Console, project: ProjectStore, catalog: ModelCatalog, defaults: EvaluationDefaults
 ) -> EvaluationDefaults | None:
-    """Choose models, independent runs, and a judge without importing or building evidence."""
+    """Choose models, independent runs, and a judge without building evidence.
+
+    Args:
+        console: Terminal used for selection screens and prompts.
+        project: Previously built project supplying scenarios and judge provenance.
+        catalog: Configured model aliases and verified role capabilities.
+        defaults: Saved choices used to preselect models and execution settings.
+
+    Returns:
+        Confirmed choices for launch review, or ``None`` when the user cancels.
+        This function neither saves defaults nor dispatches provider calls.
+
+    Raises:
+        ValueError: The project is unbuilt, fewer than two completion models are
+            configured, saved judge evidence is invalid, or selected limits are invalid.
+    """
     config = project.load_project()
     if config.build is None or config.models is None:
         raise ValueError(f"run exp build {project.paths.project_id} before evaluating")
@@ -100,7 +115,20 @@ def configure_evaluation(
 def _settings(
     console: Console, project: str, options: ModelEvaluationOptions
 ) -> ModelEvaluationOptions:
-    """Edit advanced execution limits only when requested."""
+    """Edit advanced execution limits only when requested.
+
+    Args:
+        console: Terminal used for integer prompts.
+        project: Project name displayed in the screen heading.
+        options: Current settings supplying defaults for each editable limit.
+
+    Returns:
+        Validated settings with updated concurrency, step, and output-token limits.
+        Other settings retain their existing values.
+
+    Raises:
+        ValueError: An entered limit violates the evaluation option constraints.
+    """
     heading(console, project, "Execution settings")
     updates = {
         field: IntPrompt.ask(label, default=getattr(options, field), console=console)

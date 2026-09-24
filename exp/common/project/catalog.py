@@ -46,7 +46,17 @@ class ProjectCatalogModel(ContractModel):
 
 
 class ProjectModelCatalog(ContractModel):
-    """The exact credential-free model metadata selected by one Project."""
+    """The exact credential-free model metadata selected by one Project.
+
+    Attributes:
+        schema_version: Catalog payload schema, fixed at one.
+        project_id: Project owning the immutable model selection.
+        models: Nonempty model snapshots in unique alias order.
+        world_model_reasoning_effort: Explicit world-model override, or alias default.
+        judge_reasoning_effort: Explicit judge override, or alias default.
+        candidate_reasoning_efforts: Explicit overrides for included candidate aliases;
+            omitted aliases retain their capability-pinned effort.
+    """
 
     schema_version: Literal[1] = 1
     project_id: ArtifactId
@@ -57,7 +67,14 @@ class ProjectModelCatalog(ContractModel):
 
     @model_validator(mode="after")
     def _require_known_reasoning_aliases(self) -> ProjectModelCatalog:
-        """Bind candidate reasoning selections to the portable model snapshots."""
+        """Bind candidate reasoning selections to the portable model snapshots.
+
+        Returns:
+            The unchanged catalog after checking every reasoning alias.
+
+        Raises:
+            ValueError: A reasoning selection names a model absent from the catalog.
+        """
         aliases = {item.alias for item in self.models}
         if set(self.candidate_reasoning_efforts).difference(aliases):
             raise ValueError("project reasoning efforts name unknown model aliases")

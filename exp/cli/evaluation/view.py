@@ -12,7 +12,13 @@ from exp.optimize.evaluation.runs import EvaluationRun
 
 
 def heading(console: Console, project: str, subtitle: str) -> None:
-    """Replace the previous interactive screen with a short project heading."""
+    """Replace the previous interactive screen with a short project heading.
+
+    Args:
+        console: Output console, cleared only when attached to a terminal.
+        project: Project name rendered as literal text.
+        subtitle: Current screen label rendered beneath the project name.
+    """
     if console.is_terminal:
         console.clear()
     console.print(Text(f"\nexp eval · {project}", style="bold"))
@@ -21,7 +27,17 @@ def heading(console: Console, project: str, subtitle: str) -> None:
 
 
 def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -> None:
-    """Show a small measured-results table without paths or implementation identifiers."""
+    """Show measured quality, assistant cost, latency, and coverage caveats.
+
+    Args:
+        console: Output console receiving the summary table.
+        project: Project owning the saved report evidence.
+        run: Saved evaluation to render without provider calls.
+
+    Raises:
+        OSError: Report evidence cannot be read.
+        ValueError: The saved evidence is missing or inconsistent.
+    """
     evidence = load_report_evidence(project, run)
     report = evidence.report
     heading(console, project.paths.project_id, "Saved results")
@@ -54,7 +70,17 @@ def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -
 
 
 def inspect_report(console: Console, project: ProjectStore, run: EvaluationRun) -> None:
-    """Open the offline trace viewer or accounting details only when requested."""
+    """Open the offline trace viewer or accounting details only when requested.
+
+    Args:
+        console: Terminal used for the results menu and fallback browser path.
+        project: Project owning the evidence and local report exports.
+        run: Saved evaluation to inspect until Back or cancellation.
+
+    Raises:
+        OSError: Local evidence cannot be read or report files cannot be written.
+        ValueError: Saved report evidence is missing or inconsistent.
+    """
     _, html_path = export_report(project, run)
     while True:
         render_report(console, project, run)
@@ -79,7 +105,17 @@ def inspect_report(console: Console, project: ProjectStore, run: EvaluationRun) 
 
 
 def render_details(console: Console, project: ProjectStore, run: EvaluationRun) -> None:
-    """Expose full coverage, separate experiment spend, and portable artifact paths."""
+    """Expose full coverage, separate experiment spend, and portable artifact paths.
+
+    Args:
+        console: Output console receiving the detailed accounting and export paths.
+        project: Project owning the evidence and local report exports.
+        run: Saved evaluation supplying coverage and simulation/judge spend.
+
+    Raises:
+        OSError: Local evidence cannot be read or report files cannot be written.
+        ValueError: Saved report evidence is missing or inconsistent.
+    """
     evidence = load_report_evidence(project, run)
     heading(console, project.paths.project_id, "Result details")
     console.print(Text(f"Run: {run.run_id}"))
@@ -103,7 +139,16 @@ def render_details(console: Console, project: ProjectStore, run: EvaluationRun) 
 
 
 def _number(value: float | None, prefix: str, suffix: str = "") -> str:
-    """Format measurements without turning missing or small positive costs into zero."""
+    """Format measurements without turning missing or small positive costs into zero.
+
+    Args:
+        value: Measured value, or ``None`` when unavailable.
+        prefix: Unit or currency marker placed before the formatted value.
+        suffix: Optional unit marker placed after the formatted value.
+
+    Returns:
+        A unit-bearing value with sufficient precision, or ``"unavailable"``.
+    """
     if value is None:
         return "unavailable"
     precision = 6 if 0 < abs(value) < 0.001 else 4
@@ -114,7 +159,14 @@ def _number(value: float | None, prefix: str, suffix: str = "") -> str:
 
 
 def _duration(seconds: float | None) -> str:
-    """Show latency in readable units, preserving subsecond measurements."""
+    """Show latency in readable units, preserving subsecond measurements.
+
+    Args:
+        seconds: Measured latency in seconds, or ``None`` when unavailable.
+
+    Returns:
+        Milliseconds, seconds, or minutes with seconds, or ``"unavailable"``.
+    """
     if seconds is None:
         return "unavailable"
     if seconds == 0:
