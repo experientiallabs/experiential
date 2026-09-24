@@ -35,6 +35,8 @@ from exp.runtime.capture.watchdog import CaptureWatchdog
 
 logger = logging.getLogger(__name__)
 _MAX_TLS_BYPASSES = 128
+_WEBSOCKET_CAPTURE = "exp_capture_websocket"
+_WEBSOCKET_SKIPPED = "exp_capture_skipped_requests"
 CaptureBypassReason = Literal["certificate"]
 
 
@@ -444,8 +446,13 @@ class CaptureProxy:
         self._diagnostic(f"http_request: {protocol or 'unsupported endpoint'}", flow.client_conn)
         if protocol is None:
             return
+        if flow.request.method.upper() == "GET":
+            # An idle upgraded connection owns no request buffers or capture slot.
+            flow.metadata[_WEBSOCKET_CAPTURE] = True
+            return
         if len(self._captures) >= self._max_active_flows:
             self.dropped_exchanges += 1
+            self._diagnostic("capture_dropped: active request limit", flow.client_conn)
             return
         capture = _Capture(
             protocol=protocol,
@@ -472,6 +479,14 @@ class CaptureProxy:
         if flow.response is None:
             return
         flow.response.stream = True
+        if flow.metadata.get(_WEBSOCKET_CAPTURE) is True:
+            self._diagnostic(
+                "http_response: 101"
+                if flow.response.status_code == 101
+                else "websocket_upgrade_failed",
+                flow.client_conn,
+            )
+            return
         capture = self._captures.get(flow.id)
         if capture is not None:
             if capture.websocket and flow.response.status_code != 101:
@@ -514,10 +529,15 @@ class CaptureProxy:
             return
         message = websocket.messages[-1]
         websocket.messages.clear()
+        if (
+            flow.metadata.get(_WEBSOCKET_CAPTURE) is not True
+            or flow.response is None
+            or flow.response.status_code != 101
+        ):
+            return
         capture = self._captures.get(flow.id)
-        if capture is None or len(message.content) > self._max_body_bytes:
-            if capture is not None:
-                self.dropped_exchanges += 1
+        if len(message.content) > self._max_body_bytes:
+            self.dropped_exchanges += 1
             return
         try:
             event = json.loads(message.content)
@@ -527,12 +547,32 @@ class CaptureProxy:
             return
         if not isinstance(event.get("type"), str):
             return
+        skipped = int(flow.metadata.get(_WEBSOCKET_SKIPPED, 0))
         if message.from_client and event.get("type") == "response.create":
+            if skipped or (capture is None and len(self._captures) >= self._max_active_flows):
+                flow.metadata[_WEBSOCKET_SKIPPED] = skipped + 1
+                self.dropped_exchanges += 1
+                self._diagnostic("capture_dropped: active request limit", flow.client_conn)
+                return
+            if capture is None:
+                capture = _Capture(
+                    protocol="responses",
+                    host=(flow.client_conn.sni or "").lower().rstrip("."),
+                    path=flow.request.path.partition("?")[0],
+                    started_ns=time.time_ns(),
+                    request=_Body(self._max_body_bytes),
+                    response=_Body(self._max_body_bytes),
+                    request_encoding="",
+                    websocket=True,
+                    status=101,
+                )
+                self._captures[flow.id] = capture
             pending_bytes = sum(len(request.body) for request in capture.websocket_requests)
             if len(capture.websocket_requests) >= 8 or (
                 pending_bytes + len(message.content) > self._max_body_bytes
             ):
                 self.dropped_exchanges += 1
+                flow.metadata[_WEBSOCKET_SKIPPED] = skipped + 1
                 return
             capture.websocket_requests.append(_WebsocketRequest(message.content, time.time_ns()))
             self._diagnostic("websocket_request_started", flow.client_conn)
@@ -541,21 +581,30 @@ class CaptureProxy:
             if not isinstance(response, dict):
                 return
             response_id = response.get("id")
+            terminal = event.get("type") in {
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+            }
+            if capture is None:
+                if terminal and skipped:
+                    flow.metadata[_WEBSOCKET_SKIPPED] = skipped - 1
+                return
             if event.get("type") == "response.created" and isinstance(response_id, str):
                 for request in capture.websocket_requests:
                     if request.response_id is None:
                         request.response_id = response_id
                         break
-            if event.get("type") in {
-                "response.completed",
-                "response.failed",
-                "response.incomplete",
-            }:
+            if terminal:
                 for request in capture.websocket_requests:
                     if request.response_id == response_id or (
-                        request.response_id is None and len(capture.websocket_requests) == 1
+                        request.response_id is None
+                        and len(capture.websocket_requests) == 1
+                        and not skipped
                     ):
                         capture.websocket_requests.remove(request)
+                        if not capture.websocket_requests:
+                            self._captures.pop(flow.id, None)
                         self._diagnostic("websocket_request_completed", flow.client_conn)
                         self._submit(
                             CapturedExchange(
@@ -571,6 +620,9 @@ class CaptureProxy:
                             )
                         )
                         break
+                else:
+                    if skipped:
+                        flow.metadata[_WEBSOCKET_SKIPPED] = skipped - 1
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
         """Retain failed request evidence for calls interrupted before completion."""

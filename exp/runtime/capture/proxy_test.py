@@ -1207,6 +1207,87 @@ def test_websocket_capture_survives_handshake_bursts_and_safe_diagnostics(
     assert not any("secret" in event or "Bearer" in event for event in diagnostics)
 
 
+def test_idle_websockets_do_not_exhaust_request_capture_capacity() -> None:
+    """Many persistent idle connections share one bounded active-request slot."""
+    captured: list[CapturedExchange] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: captured.append(exchange) is None,
+        domains=("chatgpt.com",),
+        max_active_flows=1,
+    )
+    flows: list[http.HTTPFlow] = []
+    for index in range(20):
+        flow = http.HTTPFlow(
+            connection.Client(
+                peername=("127.0.0.1", index + 1),
+                sockname=("127.0.0.1", 443),
+                sni="chatgpt.com",
+            ),
+            connection.Server(address=("chatgpt.com", 443)),
+        )
+        flow.request = http.Request.make(
+            "GET",
+            "https://chatgpt.com/backend-api/codex/responses",
+            headers={"Host": "chatgpt.com", "Upgrade": "websocket"},
+        )
+        asyncio.run(proxy.requestheaders(flow))
+        proxy.request(flow)
+        flow.response = http.Response.make(101)
+        proxy.responseheaders(flow)
+        proxy.response(flow)
+        flow.websocket = websocket.WebSocketData()
+        flows.append(flow)
+    assert proxy.dropped_exchanges == 0
+    assert not proxy._captures
+
+    def send(flow: http.HTTPFlow, from_client: bool, event: dict[str, str]) -> None:
+        """Feed exact WebSocket bytes while asserting transparent forwarding."""
+        assert flow.websocket is not None
+        raw = json.dumps(event).encode()
+        message = websocket.WebSocketMessage(Opcode.TEXT, from_client, raw)
+        flow.websocket.messages.append(message)
+        proxy.websocket_message(flow)
+        assert message.content == raw and not message.dropped
+        assert not flow.websocket.messages
+
+    # A genuinely concurrent request still respects the existing capacity bound.
+    send(flows[0], True, {"type": "response.create", "model": "test", "input": "first"})
+    assert len(proxy._captures) == 1
+    send(flows[1], True, {"type": "response.create", "model": "test", "input": "overflow"})
+    assert proxy.dropped_exchanges == 1
+    proxy.websocket_end(flows[0])
+    assert not proxy._captures
+    # A skipped request must finish before this socket resumes capture, preventing
+    # its response from being attached to a later request when capacity returns.
+    send(flows[1], True, {"type": "response.create", "model": "test", "input": "also skipped"})
+    assert proxy.dropped_exchanges == 2
+    assert flows[1].websocket is not None
+    for _ in range(2):
+        flows[1].websocket.messages.append(
+            websocket.WebSocketMessage(
+                Opcode.TEXT,
+                False,
+                json.dumps({"type": "response.completed", "response": {"id": "skipped"}}).encode(),
+            )
+        )
+        proxy.websocket_message(flows[1])
+    for flow in flows[1:]:
+        send(flow, True, {"type": "response.create", "model": "test", "input": "next"})
+        assert len(proxy._captures) == 1
+        assert flow.websocket is not None
+        flow.websocket.messages.append(
+            websocket.WebSocketMessage(
+                Opcode.TEXT,
+                False,
+                json.dumps({"type": "response.completed", "response": {"id": "done"}}).encode(),
+            )
+        )
+        proxy.websocket_message(flow)
+        assert not proxy._captures
+    assert len(captured) == 20
+    assert proxy.dropped_exchanges == 2
+
+
 @pytest.mark.parametrize(
     "scenario",
     ["unmatched_host", "authority_mismatch", "unsupported_path", "large_request", "large_response"],
