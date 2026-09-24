@@ -76,7 +76,7 @@ pub(crate) enum Response {
     Json {
         status: u16,
         body: Value,
-        /// Escaped exact JSON when the query projection contains unstorable text.
+        /// Exact JSON when text or numeric values need a queryable projection.
         source_json: Option<String>,
     },
     Sse {

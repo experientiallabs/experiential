@@ -202,6 +202,32 @@ def test_default_admission_keeps_large_inputs_whole(content: str) -> None:
     assert persisted.request.context["request"] == request["context"]["request"]
 
 
+@pytest.mark.parametrize("number", [2**64, 2**80 + 1, -(2**63) - 1, -(2**80) - 1])
+def test_admission_preserves_wide_numeric_tool_context_in_lossless_source(number: int) -> None:
+    """Use the existing ingest restoration contract for out-of-range JSON integers."""
+    from exp.runtime.gateway.capture_context import restore_capture_context
+
+    request = json.loads(_request_json())
+    request["context"]["request"]["tools"] = [{"name": "choose", "parameters": {"enum": [number]}}]
+    expected = request["context"]
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    assert collector.begin_bytes(json.dumps(request).encode())
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    actual = CaptureRecord.model_validate_json(records[0]).request.context
+    assert restore_capture_context(actual) == expected
+
+
+def test_wide_number_in_invalid_context_fails_closed_without_panicking() -> None:
+    """A lossless sidecar cannot make a non-object context valid."""
+    request = json.loads(_request_json())
+    request["context"] = [2**80 + 1]
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), lambda _: None)
+    assert not collector.begin_bytes(json.dumps(request).encode())
+    assert collector.close(1)
+
+
 @pytest.mark.parametrize("asynchronous_delivery", [False, True])
 def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
     capfd: pytest.CaptureFixture[str],

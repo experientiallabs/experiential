@@ -13,6 +13,9 @@ pub(super) fn string_bytes(text: &str) -> usize {
         .bytes()
         .filter(|&byte| byte < 32 || byte == b'"' || byte == b'\\')
         .count();
+    if escaped == 0 {
+        return text.len().saturating_add(2);
+    }
     let long = text
         .bytes()
         .filter(|&byte| byte < 32 && !matches!(byte, b'\n' | b'\r' | b'\t' | 8 | 12))

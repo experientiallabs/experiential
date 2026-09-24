@@ -73,6 +73,11 @@ and responses include `source_json`, an escaped JSON string containing the exact
 source value alongside the normalized query projection. Consumers recover the
 request with `restore_capture_context`; response consumers decode `source_json`
 when present. Reasoning uses `provider_reasoning_source_json` for the same case.
+Native JSON numbers have a finite integer range. When a parsed value could have
+rounded an integer beyond that range, capture preserves its original JSON using
+the same `source_json` contract; wire requests use `body_source_json`. The source
+is authoritative for exact numeric values, while the ordinary fields remain the
+query projection. These sidecars do not change the inference representation.
 The escaped sidecars count toward all record limits. Oversize evidence is excluded,
 not silently advertised as lossless. Historical reasoning stays in captured input
 even when provider execution must omit it at a new user boundary.

@@ -6,12 +6,20 @@ use std::time::{Duration, Instant};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
+use serde::Deserialize;
+use serde_json::{value::RawValue, Value};
 
 use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
 use super::record::{Record, Request};
 
 struct PythonSink(Py<PyAny>);
+
+#[derive(Deserialize)]
+struct ContextSource<'a> {
+    #[serde(borrow)]
+    context: &'a RawValue,
+}
 
 const BATCH_RECORDS: usize = 64;
 const BATCH_BYTES: usize = 2 * 1024 * 1024;
@@ -233,9 +241,27 @@ impl CaptureCollector {
             {
                 return collector.skip();
             }
-            let Ok(request) = serde_json::from_slice::<Request>(request_json) else {
+            let Ok(mut request) = serde_json::from_slice::<Request>(request_json) else {
                 return collector.skip();
             };
+            // The ordinary JSON projection uses finite-width numbers. Keep the
+            // original context only for exceptional numeric values, using the
+            // same lossless sidecar consumed by capture ingestion. Do not change
+            // the gateway's global number representation to repair capture.
+            if request.context.get("source_json").is_none()
+                && super::response::contains_wide_number(&request.context)
+            {
+                let Ok(source) = serde_json::from_slice::<ContextSource>(request_json) else {
+                    return collector.skip();
+                };
+                let Some(context) = Arc::make_mut(&mut request.context).as_object_mut() else {
+                    return collector.skip();
+                };
+                context.insert(
+                    "source_json".into(),
+                    Value::String(source.context.get().to_owned()),
+                );
+            }
             collector.begin(request)
         })
     }

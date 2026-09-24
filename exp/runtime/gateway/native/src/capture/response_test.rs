@@ -235,6 +235,67 @@ fn record(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Record {
 }
 
 #[tokio::test]
+async fn numeric_sources_preserve_wide_integers_in_json_sse_and_wire() {
+    const SOURCE: &str =
+        r#"{"enum":[1208925819614629174706177,-9223372036854775809],"text":"a\u0000b"}"#;
+    for sse in [false, true] {
+        let (collector, receiver) = collector_with_relay(8192, true);
+        assert!(collector.claim_relay("request"));
+        assert!(collector.finish_relay(
+            "request",
+            super::super::relay::Relay {
+                metadata: serde_json::from_value(json!({
+                    "wire_request": {"method":"POST", "body_bytes":SOURCE.len()},
+                    "headers":[], "timing":{}, "relay_completed":true,
+                    "client_disconnected":false
+                }))
+                .unwrap(),
+                body: SOURCE.as_bytes().to_vec(),
+            }
+        ));
+        let content = if sse {
+            format!("data: {SOURCE}\n\ndata: [DONE]\n\n")
+        } else {
+            SOURCE.to_owned()
+        };
+        let response = capture_response(
+            Some(collector.clone()),
+            "request",
+            Response::builder()
+                .header(
+                    "content-type",
+                    if sse {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
+                .body(Body::from(content.clone()))
+                .unwrap(),
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            content.as_bytes()
+        );
+        let record = record(&collector, receiver);
+        assert_eq!(
+            record.transport.unwrap()["wire_request"]["body_source_json"],
+            SOURCE
+        );
+        let source = match record.response.unwrap() {
+            CapturedResponse::Json { source_json, .. } => source_json.unwrap(),
+            CapturedResponse::Sse { source_json, .. } => {
+                let frames: Vec<Box<RawValue>> =
+                    serde_json::from_str(&source_json.unwrap()).unwrap();
+                assert_eq!(frames.len(), 2);
+                frames[0].get().to_owned()
+            }
+        };
+        assert_eq!(source, SOURCE);
+    }
+}
+
+#[tokio::test]
 async fn relay_metadata_rendezvous_preserves_wire_and_does_not_duplicate_replays() {
     for metadata_first in [false, true] {
         let (collector, receiver) = collector_with_relay(4096, true);
@@ -406,6 +467,44 @@ async fn encoded_sse_budget_includes_lossless_sidecar_and_keeps_exact_prefix() {
     let restored: Vec<Value> = serde_json::from_str(&source_json.unwrap()).unwrap();
     assert_eq!(restored, vec![json!({"text":"first\0"})]);
     assert_eq!(frames, vec![json!({"text":"first\u{fffd}"})]);
+}
+
+#[tokio::test]
+async fn encoded_sse_budget_includes_wide_numeric_sources_and_keeps_exact_prefix() {
+    const SOURCE: &str = r#"{"value":1208925819614629174706177}"#;
+    let prefix = CapturedResponse::Sse {
+        status: 200,
+        frames: vec![serde_json::from_str(SOURCE).unwrap()],
+        truncated: true,
+        client_disconnected: false,
+        source_json: Some(format!("[{SOURCE}]")),
+    };
+    let limit = serde_json::to_string(&prefix).unwrap().len();
+    let (collector, receiver) = collector(limit);
+    let data = format!("data: {SOURCE}\n\ndata: {SOURCE}\n\ndata: {SOURCE}\n\n");
+    let response = Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(data.clone()))
+        .unwrap();
+    let actual = capture_response(Some(collector.clone()), "request", response)
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(actual.as_ref(), data.as_bytes());
+    let response = record(&collector, receiver).response.unwrap();
+    assert_eq!(serde_json::to_string(&response).unwrap().len(), limit);
+    let CapturedResponse::Sse {
+        source_json,
+        truncated,
+        ..
+    } = response
+    else {
+        panic!()
+    };
+    assert!(truncated);
+    assert_eq!(source_json.unwrap(), format!("[{SOURCE}]"));
 }
 
 #[tokio::test]

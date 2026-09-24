@@ -118,7 +118,7 @@ def _captured_provider_context(request: GatewayRequest) -> JsonObject | None:
 
 
 def restore_capture_context(context: JsonObject) -> JsonObject:
-    """Recover exact captured strings from the explicitly lossless JSON sidecar."""
+    """Recover exact captured values from the explicitly lossless JSON sidecar."""
     source = context.get("source_json")
     if source is None:
         return context

@@ -46,6 +46,12 @@ impl Relay {
             let (kind, body) = if self.body.is_empty() {
                 ("empty", Value::Null)
             } else if let Ok(body) = serde_json::from_slice::<Value>(&self.body) {
+                if super::response::contains_wide_number(&body) {
+                    wire.insert(
+                        "body_source_json".into(),
+                        Value::String(String::from_utf8(self.body).unwrap()),
+                    );
+                }
                 ("json", body)
             } else {
                 (
@@ -64,6 +70,7 @@ impl Relay {
         {
             if let Some(wire) = wire.as_mut().and_then(Value::as_object_mut) {
                 wire.insert("body".into(), Value::Null);
+                wire.remove("body_source_json");
                 wire.insert("body_kind".into(), Value::String("dropped".into()));
                 wire.insert("truncated".into(), Value::Bool(true));
             }
