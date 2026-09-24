@@ -29,7 +29,7 @@ def healthy_network(monkeypatch: pytest.MonkeyPatch) -> Mock:
         raise AssertionError("healthy monitor unexpectedly resumed")
 
     health.watch.side_effect = watch
-    monkeypatch.setattr(session, "CaptureHealth", lambda domains: health)
+    monkeypatch.setattr(session, "CaptureHealth", lambda domains, on_diagnostic=None: health)
     return health
 
 

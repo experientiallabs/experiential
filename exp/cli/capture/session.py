@@ -61,7 +61,7 @@ async def run_session(
     proxy = CaptureProxy(
         sink=uploader.submit, domains=domains, on_bypass=on_bypass, on_diagnostic=on_diagnostic
     )
-    health = CaptureHealth(domains)
+    health = CaptureHealth(domains, on_diagnostic=on_diagnostic)
     original_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     for sig in original_signals:
         loop.add_signal_handler(sig, stop.set)

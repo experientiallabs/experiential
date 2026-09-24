@@ -87,8 +87,8 @@ process identity is unavailable or the bounded app list is full, all apps pass t
 host, with the wider exclusion shown explicitly. No client verification or certificate pinning is
 disabled. Ambiguous handshake disconnects remain local to the failed connection and do not
 turn off capture for future requests. Native write failures also close only the affected connection.
-Verbose diagnostics include fixed TLS, request, and DNS-forwarding lifecycle categories and opaque
-connection IDs, without request
+Verbose diagnostics include fixed TLS, request, and DNS-forwarding lifecycle categories, opaque
+connection IDs, and DNS-check timeouts or resolver exit codes, without request
 content, authentication headers, URL queries, or raw error strings.
 If the native capture backend itself exits, Capture stops and reports that failure.
 

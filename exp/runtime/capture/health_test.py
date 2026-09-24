@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+from collections.abc import Callable
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -22,8 +23,9 @@ def test_monitor_requires_valid_bounded_provider_hosts(domains: tuple[str, ...])
 
 
 @pytest.mark.parametrize("returncode", [0, 1, -9])
+@pytest.mark.parametrize("verbose", [False, True])
 def test_lookup_uses_isolated_system_resolver_without_credentials_or_output(
-    monkeypatch: pytest.MonkeyPatch, returncode: int
+    monkeypatch: pytest.MonkeyPatch, returncode: int, verbose: bool
 ) -> None:
     """Success depends on resolver completion without opening an HTTP connection."""
     process = Mock(spec=asyncio.subprocess.Process)
@@ -32,7 +34,12 @@ def test_lookup_uses_isolated_system_resolver_without_credentials_or_output(
     create = AsyncMock(return_value=process)
     monkeypatch.setattr(health.asyncio, "create_subprocess_exec", create)
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-must-not-inherit")
-    result = asyncio.run(CaptureHealth(("chatgpt.com",)).check())
+    diagnostics: list[str] = []
+    result = asyncio.run(
+        CaptureHealth(
+            ("chatgpt.com",), on_diagnostic=diagnostics.append if verbose else None
+        ).check()
+    )
     assert result == (() if returncode == 0 else (CaptureHealthFailure("chatgpt.com", "dns"),))
     create.assert_awaited_once_with(
         sys.executable,
@@ -46,6 +53,11 @@ def test_lookup_uses_isolated_system_resolver_without_credentials_or_output(
         env={"PATH": "/usr/bin:/bin"},
     )
     process.kill.assert_not_called()
+    assert diagnostics == (
+        [f"dns_check_failed: resolver exited with code {returncode} · chatgpt.com"]
+        if verbose and returncode != 0
+        else []
+    )
 
 
 def test_launch_failure_reports_monitor_unavailability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -55,9 +67,11 @@ def test_launch_failure_reports_monitor_unavailability(monkeypatch: pytest.Monke
         "create_subprocess_exec",
         AsyncMock(side_effect=OSError("synthetic private launch detail")),
     )
-    assert asyncio.run(CaptureHealth(("chatgpt.com",)).check()) == (
-        CaptureHealthFailure("chatgpt.com", "monitor"),
-    )
+    diagnostics: list[str] = []
+    assert asyncio.run(
+        CaptureHealth(("chatgpt.com",), on_diagnostic=diagnostics.append).check()
+    ) == (CaptureHealthFailure("chatgpt.com", "monitor"),)
+    assert diagnostics == ["dns_check_failed: could not start resolver check · chatgpt.com"]
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -69,6 +83,7 @@ def test_stuck_resolver_process_is_killed_and_reaped(
     original_create = asyncio.create_subprocess_exec
     processes: list[asyncio.subprocess.Process] = []
     domains = tuple(f"provider{index}.example.com" for index in range(host_count))
+    diagnostics: list[str] = []
     monkeypatch.setattr(health, "_LOOKUP_TIMEOUT", 0.1 if not cancelled else 30)
 
     async def run() -> None:
@@ -96,7 +111,7 @@ def test_stuck_resolver_process_is_killed_and_reaped(
 
         monkeypatch.setattr(health.asyncio, "create_subprocess_exec", create)
         baseline = asyncio.all_tasks()
-        task = asyncio.create_task(CaptureHealth(domains).check())
+        task = asyncio.create_task(CaptureHealth(domains, on_diagnostic=diagnostics.append).check())
         await asyncio.wait_for(started.wait(), 3)
         if cancelled:
             task.cancel()
@@ -107,6 +122,11 @@ def test_stuck_resolver_process_is_killed_and_reaped(
                 CaptureHealthFailure(host, "dns") for host in domains
             )
         assert asyncio.all_tasks() == baseline
+        assert sorted(diagnostics) == (
+            []
+            if cancelled
+            else sorted(f"dns_check_failed: timed out after 0.1s · {host}" for host in domains)
+        )
 
     try:
         asyncio.run(run())
@@ -132,7 +152,9 @@ def test_check_runs_each_unique_host_concurrently_within_domain_limit(
         started: set[str] = set()
         all_started = asyncio.Event()
 
-        async def lookup(host: str) -> CaptureHealthFailure | None:
+        async def lookup(
+            host: str, on_diagnostic: Callable[[str], None] | None
+        ) -> CaptureHealthFailure | None:
             """Require all 31 unique targets to start without using an external resolver."""
             assert host not in started
             started.add(host)

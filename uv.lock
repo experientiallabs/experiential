@@ -847,7 +847,7 @@ source = { directory = "exp/runtime/gateway/native" }
 [[package]]
 name = "exp-mitmproxy"
 version = "12.2.3.post1"
-source = { git = "https://github.com/experientiallabs/mitmproxy?rev=86bc8ae59c1a9ee53bce353ff87a469d379cf720#86bc8ae59c1a9ee53bce353ff87a469d379cf720" }
+source = { git = "https://github.com/experientiallabs/mitmproxy?rev=c73f204eefe3a6ccc136c7fc72547fa0011be432#c73f204eefe3a6ccc136c7fc72547fa0011be432" }
 dependencies = [
     { name = "aioquic" },
     { name = "argon2-cffi" },
@@ -880,7 +880,7 @@ dependencies = [
 [[package]]
 name = "exp-mitmproxy-rs"
 version = "0.12.11.post1"
-source = { git = "https://github.com/experientiallabs/mitmproxy_rs?subdirectory=mitmproxy-rs&rev=c9c55057cb58fe13a22f6a420629df13c65bd365#c9c55057cb58fe13a22f6a420629df13c65bd365" }
+source = { git = "https://github.com/experientiallabs/mitmproxy_rs?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d#866da0a0aff1a8e57def4da6a941fca0c44dd98d" }
 dependencies = [
     { name = "mitmproxy-linux", marker = "sys_platform == 'linux'" },
     { name = "mitmproxy-macos", marker = "sys_platform == 'darwin'" },
@@ -945,8 +945,8 @@ requires-dist = [
     { name = "click", specifier = ">=8.2" },
     { name = "cryptography", marker = "python_full_version >= '3.13'", specifier = ">=42,<49" },
     { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
-    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy?rev=86bc8ae59c1a9ee53bce353ff87a469d379cf720" },
-    { name = "exp-mitmproxy-rs", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy_rs?subdirectory=mitmproxy-rs&rev=c9c55057cb58fe13a22f6a420629df13c65bd365" },
+    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy?rev=c73f204eefe3a6ccc136c7fc72547fa0011be432" },
+    { name = "exp-mitmproxy-rs", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy_rs?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
     { name = "filelock", specifier = ">=3.12" },
     { name = "google-auth", specifier = ">=2.35,<3" },

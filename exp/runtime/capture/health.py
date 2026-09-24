@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -26,14 +27,19 @@ class CaptureHealthFailure:
 class CaptureHealth:
     """Observe selected providers through the system resolver without sending HTTP requests."""
 
-    def __init__(self, domains: tuple[str, ...]) -> None:
+    def __init__(
+        self, domains: tuple[str, ...], *, on_diagnostic: Callable[[str], None] | None = None
+    ) -> None:
         """Keep the same validated, bounded host selection as Capture's traffic policy."""
         self._domains = validate_domains(domains)
+        self._on_diagnostic = on_diagnostic
 
     async def check(self) -> tuple[CaptureHealthFailure, ...]:
         """Return failed lookups from one concurrent, bounded check of all selected hosts."""
         async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(_lookup(host)) for host in self._domains]
+            tasks = [
+                group.create_task(_lookup(host, self._on_diagnostic)) for host in self._domains
+            ]
         return tuple(failure for task in tasks if (failure := task.result()) is not None)
 
     async def watch(self) -> CaptureHealthFailure:
@@ -54,7 +60,9 @@ class CaptureHealth:
                     return failure
 
 
-async def _lookup(host: str) -> CaptureHealthFailure | None:
+async def _lookup(
+    host: str, on_diagnostic: Callable[[str], None] | None
+) -> CaptureHealthFailure | None:
     """Bound native resolution in an owned process and reap it on timeout or cancellation.
 
     Python's native resolver can outlive cancellation in a worker thread. A small
@@ -75,10 +83,14 @@ async def _lookup(host: str) -> CaptureHealthFailure | None:
             env={"PATH": "/usr/bin:/bin"},
         )
     except OSError:
+        if on_diagnostic is not None:
+            on_diagnostic(f"dns_check_failed: could not start resolver check · {host}")
         return CaptureHealthFailure(host, "monitor")
     try:
         await asyncio.wait_for(process.wait(), timeout=_LOOKUP_TIMEOUT)
     except TimeoutError:
+        if on_diagnostic is not None:
+            on_diagnostic(f"dns_check_failed: timed out after {_LOOKUP_TIMEOUT:g}s · {host}")
         return CaptureHealthFailure(host, "dns")
     finally:
         if process.returncode is None:
@@ -87,4 +99,8 @@ async def _lookup(host: str) -> CaptureHealthFailure | None:
             except ProcessLookupError:
                 pass
             await process.wait()
-    return None if process.returncode == 0 else CaptureHealthFailure(host, "dns")
+    if process.returncode == 0:
+        return None
+    if on_diagnostic is not None:
+        on_diagnostic(f"dns_check_failed: resolver exited with code {process.returncode} · {host}")
+    return CaptureHealthFailure(host, "dns")
