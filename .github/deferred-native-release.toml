@@ -1,4 +1,0 @@
-# Native protocol fixes remain unreleased until a reviewed package-version bump.
-# The package workflow refuses publication while this marker exists.
-experiential = "0.7.115"
-exp-gateway-native = "0.3.103"
