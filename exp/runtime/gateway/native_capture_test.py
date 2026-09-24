@@ -10,7 +10,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from exp.runtime.gateway.capture_context import capture_context_document
+from exp.runtime.gateway.capture_context import capture_context_document, restore_capture_context
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
@@ -205,8 +205,6 @@ def test_default_admission_keeps_large_inputs_whole(content: str) -> None:
 @pytest.mark.parametrize("number", [2**64, 2**80 + 1, -(2**63) - 1, -(2**80) - 1])
 def test_admission_preserves_wide_numeric_tool_context_in_lossless_source(number: int) -> None:
     """Use the existing ingest restoration contract for out-of-range JSON integers."""
-    from exp.runtime.gateway.capture_context import restore_capture_context
-
     request = json.loads(_request_json())
     request["context"]["request"]["tools"] = [{"name": "choose", "parameters": {"enum": [number]}}]
     expected = request["context"]
