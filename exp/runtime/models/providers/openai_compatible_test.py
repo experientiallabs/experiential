@@ -309,6 +309,15 @@ def test_openai_embedding_request_carries_optional_dimensions_and_encoding() -> 
     }
 
 
+def test_openai_embedding_request_preserves_pretokenized_inputs() -> None:
+    """The provider wire receives exact numeric tokens, never decoded text or extra flags."""
+    assert openai_embedding_request("m", ((0, 42, 100257), (3,)), encoding_format="base64") == {
+        "model": "m",
+        "input": [[0, 42, 100257], [3]],
+        "encoding_format": "base64",
+    }
+
+
 def test_openai_embedding_response_raw_preserves_vectors_and_reads_usage() -> None:
     """The raw parser restores input order, keeps raw magnitude, and reads prompt tokens."""
     batch = openai_embedding_response_raw(

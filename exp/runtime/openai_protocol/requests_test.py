@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import cast
 
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models.content import (
@@ -2700,12 +2701,54 @@ def test_embeddings_decoder_rejects_unknown_and_streaming_fields() -> None:
     assert "stream" in rejection.value.detail.message
 
 
-def test_embeddings_decoder_rejects_token_array_input() -> None:
-    """Pre-tokenized id arrays pass official validation but this text surface rejects them."""
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [([0, 42, 100257], ((0, 42, 100257),)), ([[1, 2], [3]], ((1, 2), (3,)))],
+)
+def test_embeddings_decoder_accepts_token_inputs(
+    value: JsonValue, expected: tuple[tuple[int, ...], ...]
+) -> None:
+    """A flat token sequence is one input; a token batch retains its item order."""
+    decoded = decode_embeddings({"model": "m", "input": value})
+    assert decoded.request.inputs == expected
+    assert len(decoded.request.inputs) == len(expected)
+
+
+def test_embeddings_decoder_accepts_explicit_nonstreaming() -> None:
+    """An explicit false is equivalent to omitting stream, not a streaming request."""
+    ordinary = decode_embeddings({"model": "m", "input": [[1, 2], [3]]})
+    explicit = decode_embeddings({"model": "m", "input": [[1, 2], [3]], "stream": False})
+    assert explicit == ordinary
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_embeddings_decoder_rejects_nonboolean_stream(value: JsonValue) -> None:
+    """Only the JSON boolean false can spell the non-streaming compatibility option."""
     with pytest.raises(OpenAIProtocolError) as rejection:
-        decode_embeddings({"model": "m", "input": [1, 2, 3]})
+        decode_embeddings({"model": "m", "input": "hello", "stream": value})
     assert rejection.value.status_code == 400
-    assert "input" in (rejection.value.detail.param or "")
+    assert rejection.value.detail.param == "stream"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[True], [False, 2], [1.0], [-1], [[1], []], [[True]], [[1.5]], ["a", 1], ["a", [1]], [1, [2]]],
+)
+def test_embeddings_decoder_rejects_malformed_token_inputs(value: JsonValue) -> None:
+    """Token inputs never coerce booleans, floats, negative IDs, or heterogeneous batches."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": value})
+    assert rejection.value.status_code == 400
+    assert (rejection.value.detail.param or "").startswith("input")
+
+
+@pytest.mark.parametrize("field", ["temperature", "tools", "prompt_cache_key", "gateway", "typo"])
+def test_embeddings_decoder_retains_strict_unknown_fields(field: str) -> None:
+    """Accepting stream false does not make unrelated request fields silently disappear."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": "hello", field: False})
+    assert rejection.value.status_code == 400
+    assert rejection.value.detail.param == field
 
 
 def test_embeddings_decoder_rejects_empty_and_malformed_inputs() -> None:

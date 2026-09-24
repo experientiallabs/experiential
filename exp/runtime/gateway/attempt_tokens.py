@@ -157,8 +157,11 @@ def _prompt_counter(request: ServingRequest) -> _PromptCounter:
         case DecisionRequest():
             counter.fixed(request.input_token_reservation)
         case EmbeddingsRequest():
-            for text in request.inputs:
-                counter.text(text)
+            for item in request.inputs:
+                if isinstance(item, str):
+                    counter.text(item)
+                else:
+                    counter.fixed(len(item))
         case ImagesRequest():
             counter.text(request.prompt)
         case GatewayRequest():

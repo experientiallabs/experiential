@@ -9,7 +9,7 @@ from typing import cast
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ModelCapabilities
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -49,6 +49,24 @@ def _request_row(control: NativeControlPlane, request_id: str) -> tuple[str, str
         ).fetchone()
     assert row is not None
     return (str(row[0]), None if row[1] is None else str(row[1]))
+
+
+@pytest.mark.parametrize(
+    ("inputs", "batch"),
+    [([0, 42, 100257], [[0, 42, 100257]]), ([[1, 2], [3]], [[1, 2], [3]])],
+)
+def test_admit_keeps_token_ids_and_logical_input_count(
+    tmp_path: Path, inputs: JsonValue, batch: list[list[int]]
+) -> None:
+    """A flat token array admits one vector and stream false never reaches the provider."""
+    control, raw_key = _control_plane(tmp_path, embeddings=True)
+    admission = _admit(
+        control, raw_key, {"model": "coding", "input": inputs, "stream": False, "user": "tenant-7"}
+    )
+    assert admission["input_count"] == len(batch)
+    route = admission["route"]
+    assert isinstance(route, list) and len(route) == 1
+    assert route[0]["upstream_payload"] == {"model": "provider-model-exact", "input": batch}
 
 
 def test_admit_builds_the_openai_embeddings_wire_and_settles_input_only(tmp_path: Path) -> None:

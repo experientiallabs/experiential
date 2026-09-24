@@ -627,11 +627,21 @@ def test_retained_raw_arguments_are_not_counted_twice() -> None:
     assert once <= worst_case_input_tokens(verbatim) < once + 150
 
 
+def test_embeddings_token_ids_count_directly_with_reservation_headroom() -> None:
+    """Token magnitude and batch framing never become extra input tokens."""
+    request = EmbeddingsRequest(inputs=((0, 42, 100257), (999999,)))
+    assert counted_input_tokens(request) == 4
+    assert (
+        worst_case_input_tokens(request) == (4 * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
+    )
+
+
 def test_embeddings_and_image_prompts_count_their_text() -> None:
     """Non-completion surfaces estimate their text inputs with the same headroom."""
-    embeddings = EmbeddingsRequest(inputs=("hello world", "the quick brown fox " * 50))
+    texts = ("hello world", "the quick brown fox " * 50)
+    embeddings = EmbeddingsRequest(inputs=texts)
     estimate = worst_case_input_tokens(embeddings)
-    counted = len(reservation_encoder().encode_ordinary("\n".join(embeddings.inputs)))
+    counted = len(reservation_encoder().encode_ordinary("\n".join(texts)))
     assert counted <= estimate <= (counted * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
     assert estimate < len(canonical_json_bytes(embeddings)) // 2
 
