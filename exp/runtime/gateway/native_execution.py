@@ -12,6 +12,7 @@ boundary encoding; this module owns the frozen semantics.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
@@ -142,6 +143,8 @@ class InflightRequest:
     facts the terminal settlement consumes.
 
     Attributes:
+        execution_lock: Serializes reservation and abandonment for this request only.
+        pending_abandon: Terminal intent retained while a reservation is in flight.
         ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
             counts; semantic tool turns and reasoning-repair successors do not increment them.
         attempt_policy: Effective caller bounds, defaulting to the operator's retry mechanics.
@@ -171,6 +174,8 @@ class InflightRequest:
     # The exact settlement the data plane could not land; the sweep replays it
     # verbatim so a completed outcome and its usage are never downgraded.
     pending_settlement: JsonObject | None = None
+    execution_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    pending_abandon: GatewayFailure | None = None
     # Responses-only retention facts consumed by ``remember`` after a
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = None

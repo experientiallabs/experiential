@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime
 from typing import cast
@@ -3004,3 +3005,92 @@ class TestToolSearchRound:
         assert ledger.started[1]["route_depth"] == 0
         # Not a throttle redial: the throttle budget is untouched.
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("failed_cleanup", [False, True])
+def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_cleanup: bool,
+) -> None:
+    """A cancelled callback cannot orphan a reservation committed before its result returns."""
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    entry = _admit(
+        accounting,
+        (_deployment("lead", connection_sha256="b" * 64),),
+        request_id="late-reservation",
+        failover_mode="maximize_availability",
+    )
+    original = ledger.start_attempt
+    committed, release = threading.Event(), threading.Event()
+    results: list[JsonObject] = []
+    errors: list[BaseException] = []
+
+    def start() -> None:
+        """Enter actual accounting and wait after its durable reservation commits."""
+        try:
+            results.append(_start(accounting, ordinal=0, request_id="late-reservation"))
+        except BaseException as error:  # noqa: BLE001 - propagate the worker's failure.
+            errors.append(error)
+
+    def pause_after_commit(
+        *,
+        snapshot: ExecutionSnapshot,
+        deployment: ExactModelDeployment,
+        attempt_ordinal: int,
+        route_depth: int,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
+    ) -> str:
+        """Delay the existing typed ledger method without changing reservation semantics."""
+        result = original(
+            snapshot=snapshot,
+            deployment=deployment,
+            attempt_ordinal=attempt_ordinal,
+            route_depth=route_depth,
+            maximum_cost_nano_usd=maximum_cost_nano_usd,
+            reserved_input_tokens=reserved_input_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            route_reason=route_reason,
+            fallback_reason=fallback_reason,
+            dispatch_reason=dispatch_reason,
+            preferred_deployment=preferred_deployment,
+        )
+        committed.set()
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(ledger, "start_attempt", pause_after_commit)
+    worker = threading.Thread(target=start)
+    worker.start()
+    try:
+        assert committed.wait(5)
+        accounting.abandon(json.dumps({"request_id": "late-reservation"}))
+        assert accounting.entry("late-reservation") is entry
+        assert not ledger.finished_requests and not ledger.finished
+        if failed_cleanup:
+            ledger.fail_finishes = 1
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    if failed_cleanup:
+        assert len(errors) == 1 and isinstance(errors[0], NativeBridgeError)
+        assert not results and accounting.entry("late-reservation") is entry
+        assert entry.active_attempt_id is not None and not ledger.finished
+        accounting.sweep_expired()
+    else:
+        assert not errors and results and results[0].get("exhausted") is True
+    assert len(ledger.started) == len(ledger.finished) == 1
+    assert ledger.finished[0]["failure_class"] == "cancelled"
+    assert ledger.terminal_events[-1] is not None
+    assert ledger.terminal_events[-1].usage is None
+    assert accounting.entry("late-reservation") is None
+    accounting.sweep_expired()
+    assert len(ledger.finished) == 1
