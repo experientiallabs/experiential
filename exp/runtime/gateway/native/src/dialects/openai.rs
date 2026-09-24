@@ -837,6 +837,7 @@ impl Normalizer {
                     "openai_responses",
                     code.as_deref(),
                     message,
+                    None,
                 )));
             }
             "error" => {
@@ -876,6 +877,7 @@ impl Normalizer {
                     "openai_responses",
                     code.as_deref(),
                     message,
+                    None,
                 )));
             }
             other if is_openai_hosted_progress_event(other) => {

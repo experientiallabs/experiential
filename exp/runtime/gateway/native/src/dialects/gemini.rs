@@ -38,6 +38,7 @@ impl Normalizer {
                 "gemini_generate_content",
                 code,
                 message,
+                None,
             ))]);
         }
         if let Some(raw_usage) = payload.get("usageMetadata") {

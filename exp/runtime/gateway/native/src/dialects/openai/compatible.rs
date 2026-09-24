@@ -135,6 +135,7 @@ impl Normalizer {
         } else {
             None
         };
+        let raw_message = envelope.as_ref().and_then(|envelope| envelope.message);
         if envelope.is_some() {
             let (code, message) = match envelope {
                 Some(envelope) => {
@@ -155,6 +156,7 @@ impl Normalizer {
             return Ok(vec![Event::Failed(self.provider_stream_failure(
                 "openai_compatible",
                 code.as_deref(),
+                raw_message,
                 message.as_deref(),
             ))]);
         }

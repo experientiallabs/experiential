@@ -33,11 +33,26 @@ before it exhausts the model's input allowance.
 The selected ceiling includes all output the provider counts, which may include reasoning.
 It does not promise that every billed output token appears as visible text or tool arguments.
 
+## Responses input lifecycle markers
+
+Responses input messages with role `user`, `system`, or `developer` may include
+`status` without an output item ID, as in the official input-message contract.
+Their status does not create assistant replay identity. An assistant output
+message carrying `status` still requires its item ID; replay phase markers keep
+their existing identity requirement.
+
 ## Reasoning controls
 
 Valid explicit thinking-off settings remain off. An unsupported off setting is a typed
 pre-dispatch refusal, not a request to use the model's default thinking behavior. Model
 families distinguish support for budgeted thinking from support for disabling thinking.
+Claude Opus 5.5 always uses adaptive thinking, so an explicit `thinking.type: disabled`
+is rejected before dispatch at every effort level. Omit thinking or explicitly use adaptive
+thinking and choose an effort level instead. Opus 5 and older releases keep their own rules.
+Opus 5.5 also cannot force a tool selection: the existing capability policy uses `auto`
+only after all eligible routes decline the forced choice and discloses `tool_choice->auto`.
+This does not guarantee a tool call. See the provider's
+[Opus 5.5 contract](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
 
 An explicit effort cannot be coerced upward. If a route needs a supported spelling, only an
 admissible lower tier may be selected, with disclosure; a reasoning-capable route with no

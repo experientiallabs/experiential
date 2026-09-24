@@ -407,8 +407,8 @@ class _ResponseMessage(_Message):
 
     @model_validator(mode="after")
     def _require_output_identity_pair(self) -> _ResponseMessage:
-        """Bind echoed lifecycle markers to a present item identity."""
-        if self.status is not None and self.id is None:
+        """Bind output lifecycle markers without constraining official input status."""
+        if self.role == "assistant" and self.status is not None and self.id is None:
             raise ValueError("Responses output message status requires an item id")
         if self.phase is not None and self.id is None:
             raise ValueError("Responses output message phase requires output identity")

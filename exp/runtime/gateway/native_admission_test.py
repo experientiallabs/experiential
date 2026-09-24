@@ -1239,16 +1239,16 @@ _TOOL_CAPABLE = GatewayDeploymentMetadata(
 
 
 def _fable_and_shim_wires(
-    *, shim_model: str = "anthropic/claude-fable-5-1"
+    *, shim_model: str = "anthropic/claude-fable-5-1", native_model: str = "claude-fable-5-1"
 ) -> tuple[tuple[GatewayWireProfile, NativeWireClient], ...]:
-    """Pair a native fable-5-1 rung with an OpenAI-compatible aggregator rung."""
+    """Pair a native Messages rung with an OpenAI-compatible aggregator rung."""
     client = cast(NativeWireClient, object())
     return (
         (
             GatewayWireProfile(
                 dialect="anthropic_messages",
                 url="https://anthropic.test",
-                model_id="claude-fable-5-1",
+                model_id=native_model,
             ),
             client,
         ),
@@ -1316,18 +1316,17 @@ def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
         (GatewayApiSurface.MESSAGES, GatewayNamedToolChoice(name="lookup")),
     ),
 )
+@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5"))
 def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
-    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice, model_id: str
 ) -> None:
-    """An all-fable-5-1 route (production shape: ~45 requests in 6h failed
-    post-dispatch across all three surfaces) serves under ``auto`` and tells
-    the caller through ``ignored_parameters``."""
+    """A release rejecting forced tools uses the existing disclosed auto policy."""
     deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
     route = _mixed_route("maximize_availability", deployments, surface)
     accounting = _CoercionCounter()
     narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
-        _fable_and_shim_wires()[:1],
+        _fable_and_shim_wires(native_model=model_id)[:1],
         _forced_choice_request(surface, choice),
         accounting=cast(NativeAttemptAccounting, accounting),
         authorization=route.snapshot.authorization,

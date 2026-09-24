@@ -4271,6 +4271,39 @@ def test_oversized_plaintext_reasoning_names_limit_and_remedy() -> None:
     assert "Shorten" in error.value.detail.message
 
 
+@pytest.mark.parametrize("role", ("user", "system", "developer"))
+@pytest.mark.parametrize("status", ("completed", "in_progress", "incomplete"))
+def test_responses_input_status_does_not_require_output_identity(role: str, status: str) -> None:
+    """Official non-assistant input messages allow lifecycle status without an id."""
+    item: JsonObject = {
+        "type": "message",
+        "role": role,
+        "content": [{"type": "input_text", "text": "Follow this instruction."}],
+    }
+    plain = decode_responses({"model": "coding", "input": [item]})
+    with_status = decode_responses({"model": "coding", "input": [{**item, "status": status}]})
+    assert with_status.request == plain.request
+    assert with_status.request.messages[0].provider_item_id is None
+
+
+def test_responses_assistant_output_status_still_requires_identity() -> None:
+    """An output lifecycle marker does not become anonymous input history."""
+    with pytest.raises(OpenAIProtocolError, match="status requires an item id"):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "Done",
+                        "status": "completed",
+                    }
+                ],
+            }
+        )
+
+
 def test_responses_decoder_accepts_an_assistant_history_message_without_an_item_id() -> None:
     """A Chat-to-Responses bridge's assistant turn (typed parts, no id) decodes.
 
