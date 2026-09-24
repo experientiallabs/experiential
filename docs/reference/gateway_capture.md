@@ -39,12 +39,19 @@ The synchronous `write_record(str)` destination runs on a dedicated Rust-owned
 worker. Validate its input with `CaptureRecord.model_validate_json`. Schema version
 1 includes the authenticated scope, effective request, optional response, model and
 deployment provenance, and capture timestamp. The selected model is null for an
-accepted request that failed before routing. A successful exchange emits one complete
-record after both output completion and permission. A prompt-only permission emits
-only the prompt. This avoids a delayed prompt update overwriting a full response.
-A hosted collector
-does not enqueue content until terminal eligibility permits it, so queue overload
-cannot lose a BYOK deletion behind an already queued prompt.
+accepted request that failed before routing. A hosted, host-funded winner checkpoints
+its prompt before public output; permitted terminal output follows as an update with
+the same request identity. BYOK winners do not checkpoint. Destinations must recheck
+live consent and merge idempotently so a late prompt never replaces a response.
+Terminal denial alone cannot retract an earlier durable prompt; the destination owns
+that privacy enforcement. Local SQLite keeps its completed-exchange behavior.
+
+A checkpoint and a terminal update racing it share one admission count and retained
+byte charge through acknowledgement. Request cancellation or its original deadline
+can close the provider and settle without awaiting storage, while accepted capture
+jobs remain bounded on the existing destination worker. Successful public completion
+still requires durable acknowledgement. Close timeouts report unfinished work rather
+than purging it. The worker's idle cadence may add up to 100 ms to checkpoint wakeup.
 
 Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
 JSON bodies and ordered SSE data payloads retain unknown fields. The observation
@@ -93,6 +100,10 @@ incorrect receipt count acknowledge nothing. Failed members retain the exact sam
 prepared string object; acknowledged members are released independently.
 Once preparation succeeds, the redundant decoded record tree is released before
 preparing the next member. Its admission charge remains until acknowledgement.
+A preparation failure stops further decoding and gathering: that record retains the
+single decoded response workspace, while later queued records stay compact and charged.
+Already-prepared neighbors can acknowledge independently. This does not promise progress
+past an unpreparable record or include the separate decoded workspace in queue bytes.
 
 Batches gather only already queued work, with no fill delay, up to 64 records.
 Gathering stops after reaching a soft 1 MiB encoded-byte target; its final record
