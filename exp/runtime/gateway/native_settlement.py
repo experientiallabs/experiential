@@ -26,8 +26,10 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayRefusalReason,
+    GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.rate_limit_headers import (
     RateLimitObservation,
     rate_limit_observation_from_payload,
@@ -62,7 +64,31 @@ def all_routes_unavailable_failure() -> GatewayFailure:
     )
 
 
-def all_routes_throttled_failure(remaining_seconds: float) -> GatewayFailure:
+def pins_native_responses_route(request: ServingRequest) -> bool:
+    """Whether the request's own native Responses payload narrowed its route.
+
+    Native Responses tool declarations and echoed native items serve verbatim
+    only on a native Responses rung, so admission keeps those rungs alone. The
+    cause is read back off the request rather than recorded during admission:
+    the request is what the narrowing is decided from, so the answer cannot
+    disagree with the route that resulted.
+
+    Args:
+        request: The admitted request held for the inflight entry.
+
+    Returns:
+        True when native Responses tools or items pinned the route.
+    """
+    if not isinstance(request, GatewayRequest):
+        return False
+    return bool(request.provider_native_tools) or any(
+        message.provider_native_item is not None for message in request.messages
+    )
+
+
+def all_routes_throttled_failure(
+    remaining_seconds: float, *, native_responses_pinned: bool = False
+) -> GatewayFailure:
     """Return the throttle-window failure for a route the provider backed off.
 
     Every deployment sitting inside a provider throttle window is caller-facing
@@ -74,19 +100,36 @@ def all_routes_throttled_failure(remaining_seconds: float) -> GatewayFailure:
     ``retry_after_seconds`` so the Retry-After header a client honors never
     disagrees with the sentence it reads.
 
+    A request carrying native Responses tools or items is admissible only on
+    native Responses rungs, so the throttled set is that narrowed route rather
+    than the model's whole pool. Saying "all exact-model deployments" there
+    reads as a pool-wide outage while idle rungs are serving the same model,
+    which sends an operator looking for a provider incident and a caller into
+    a retry that cannot succeed sooner. The class and the retry window are the
+    same either way; only the sentence changes, so a reader can tell a
+    throttled pool from a request that pins itself to one rung.
+
     Args:
         remaining_seconds: Longest remaining throttle window across the route.
+        native_responses_pinned: Whether the request's own native Responses
+            tools or items narrowed the route to the native rungs.
 
     Returns:
         Sanitized throttled failure naming the retry window.
     """
     seconds = max(THROTTLED_RETRY_AFTER_SECONDS, math.ceil(remaining_seconds))
+    message = (
+        f"all exact-model deployments are inside a provider throttle window; retry in {seconds}s"
+    )
+    if native_responses_pinned:
+        message = (
+            "the only route that can carry this request's native Responses "
+            f"tools/items is inside a provider throttle window; retry in {seconds}s "
+            "(other routes of this model cannot serve native Responses items)"
+        )
     return GatewayFailure(
         failure_class=GatewayFailureClass.THROTTLED,
-        safe_message=(
-            "all exact-model deployments are inside a provider throttle window; "
-            f"retry in {seconds}s"
-        ),
+        safe_message=message,
         retry_after_seconds=seconds,
     )
 

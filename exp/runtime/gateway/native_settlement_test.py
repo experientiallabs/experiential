@@ -8,10 +8,14 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayMessage,
+    GatewayProviderNativeTool,
     GatewayRefusalReason,
+    GatewayRequest,
     GatewayUsage,
 )
 from exp.runtime.gateway.native_settlement import (
@@ -19,7 +23,9 @@ from exp.runtime.gateway.native_settlement import (
     StreamedOutput,
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
+    all_routes_throttled_failure,
     first_token_at_from_settlement,
+    pins_native_responses_route,
     settlement_rate_limit,
     streamed_output_from_settlement,
     terminal_from_settlement,
@@ -32,6 +38,7 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
 )
+from exp.runtime.openai_protocol.errors import THROTTLED_RETRY_AFTER_SECONDS
 
 
 @pytest.mark.parametrize(
@@ -731,3 +738,88 @@ def test_tool_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger
     assert tool_search_requests_kwarg(pre_tool_search, 2) == {}
     assert tool_search_requests_kwarg(named, 0) == {}
     assert tool_search_requests_kwarg(variadic, 0) == {}
+
+
+def test_throttled_pool_failure_names_every_deployment() -> None:
+    """An ordinary throttled pool keeps the sentence describing the whole pool."""
+    failure = all_routes_throttled_failure(42.0)
+
+    assert failure.failure_class is GatewayFailureClass.THROTTLED
+    assert failure.safe_message == (
+        "all exact-model deployments are inside a provider throttle window; retry in 42s"
+    )
+    assert failure.retry_after_seconds == 42
+
+
+def test_throttled_native_responses_failure_names_the_narrowed_route() -> None:
+    """A request pinned to the native rungs is told that, not that the pool is down.
+
+    The refusal a caller reads decides whether they wait or go looking for a
+    provider incident, and the pool-wide sentence sends them to the wrong one
+    while idle rungs serve the same model.
+    """
+    failure = all_routes_throttled_failure(42.0, native_responses_pinned=True)
+
+    assert failure.safe_message == (
+        "the only route that can carry this request's native Responses tools/items "
+        "is inside a provider throttle window; retry in 42s "
+        "(other routes of this model cannot serve native Responses items)"
+    )
+
+
+def test_both_throttled_sentences_carry_the_same_class_and_wait() -> None:
+    """Only the sentence changes: a client's Retry-After must not depend on it."""
+    pool = all_routes_throttled_failure(42.0)
+    pinned = all_routes_throttled_failure(42.0, native_responses_pinned=True)
+
+    assert pool.failure_class is pinned.failure_class
+    assert pool.retry_after_seconds == pinned.retry_after_seconds
+
+
+def test_throttled_wait_never_falls_below_the_default_backoff() -> None:
+    """A window already elapsed still asks for the floor, on either sentence."""
+    for pinned in (False, True):
+        failure = all_routes_throttled_failure(0.0, native_responses_pinned=pinned)
+        assert failure.retry_after_seconds == THROTTLED_RETRY_AFTER_SECONDS
+        assert f"retry in {THROTTLED_RETRY_AFTER_SECONDS}s" in failure.safe_message
+
+
+def _plain_chat_request() -> GatewayRequest:
+    """Build one ordinary chat request carrying nothing that narrows a route."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+    )
+
+
+def test_a_plain_request_does_not_read_as_pinned_to_native_responses() -> None:
+    """Nothing in an ordinary chat request narrows the route."""
+    assert not pins_native_responses_route(_plain_chat_request())
+
+
+def test_native_responses_tools_read_as_pinning_the_route() -> None:
+    """A native tool declaration serves only on a native rung, so it pins."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        provider_native_tools=(GatewayProviderNativeTool(index=0, tool={"type": "web_search"}),),
+    )
+
+    assert pins_native_responses_route(request)
+
+
+def test_an_echoed_native_item_reads_as_pinning_the_route() -> None:
+    """History pins too: a native item is replayed verbatim or not at all."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="hello"),
+            # A native item carries the whole message, so it stands alone.
+            GatewayMessage(
+                role="assistant",
+                provider_native_item={"type": "web_search_call", "id": "ws_1"},
+            ),
+        ),
+    )
+
+    assert pins_native_responses_route(request)
