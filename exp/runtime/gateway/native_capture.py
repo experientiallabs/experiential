@@ -59,6 +59,8 @@ class CaptureConfiguration(ContractModel):
         maximum_response_bytes: Response buffer ceiling, defaulting to 3,670,016 bytes.
         ttl_seconds: Unsettled request lifetime, defaulting to 1800 seconds.
         settlement_required: Require hosted retention permission, true by default.
+        asynchronous_delivery: Explicit hosted opt-in to queue acknowledgement instead
+            of waiting for durable storage, false by default. The host owns draining.
         relay_metadata: Wait for an outer relay's caller-facing metadata, false by default.
         truncate_request: Preserve the hosted bounded-copy policy for oversized inputs.
     """
@@ -74,6 +76,7 @@ class CaptureConfiguration(ContractModel):
     maximum_response_bytes: int = Field(default=3_670_016, strict=True, ge=1, le=4 * 1024 * 1024)
     ttl_seconds: int = Field(default=1800, strict=True, ge=1, le=3600)
     settlement_required: bool = True
+    asynchronous_delivery: bool = False
     relay_metadata: bool = False
     truncate_request: bool = False
 
@@ -278,7 +281,7 @@ class CaptureController:
             "model_id": model_id,
             "context": context,
         }
-        return self.native.begin(to_json(record).decode("utf-8"))
+        return self.native.begin(to_json(record, inf_nan_mode="null").decode("utf-8"))
 
 
 def begin_capture(

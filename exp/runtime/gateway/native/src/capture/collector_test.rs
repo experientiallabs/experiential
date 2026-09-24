@@ -38,6 +38,7 @@ fn config() -> Configuration {
         settlement_required: true,
         relay_metadata: false,
         truncate_request: false,
+        asynchronous_delivery: true,
     }
 }
 
@@ -467,6 +468,8 @@ fn hosted_oversized_prompt_keeps_a_marked_copy_instead_of_rejecting_inference() 
     configuration.truncate_request = true;
     configuration.maximum_request_bytes = 8 * 1024 * 1024;
     configuration.maximum_pending_bytes = 16 * 1024 * 1024;
+    configuration.delivery.maximum_record_bytes = 8 * 1024 * 1024;
+    configuration.delivery.maximum_bytes = 32 * 1024 * 1024;
     let (collector, receiver) = collector(configuration);
     let mut input = request("large");
     input.context = Arc::new(json!({"schema_version":1,"request": {
@@ -487,7 +490,7 @@ fn hosted_oversized_prompt_keeps_a_marked_copy_instead_of_rejecting_inference() 
         .as_str()
         .unwrap();
     assert!(content.starts_with("雪") && content.contains("[truncated for capture:"));
-    assert!(content.len() < 4200);
+    assert!(content.len() > 4_109_744 && content.len() < 4_110_000);
     assert_eq!(context["capture_limits"]["messages_truncated_strings"], 1);
     assert_eq!(collector.counts()[4..], [0, 0]);
 }
@@ -671,6 +674,60 @@ fn queued_prompt_does_not_wait_for_storage_or_release_the_terminal_response_owne
     assert!(records[0].response.is_none());
     assert!(records[1].response.is_some());
     assert_eq!(collector.counts()[4..], [0, 0]);
+}
+
+#[test]
+fn durable_acknowledgement_is_preserved_unless_host_explicitly_opts_out() {
+    for asynchronous in [false, true] {
+        for mode in ["local", "settlement", "checkpoint"] {
+            let local = mode == "local";
+            let mut configuration = config();
+            configuration.asynchronous_delivery = asynchronous;
+            configuration.settlement_required = !local;
+            let (entered, started) = mpsc::channel();
+            let (records, receiver) = mpsc::channel();
+            let (finished, returned) = mpsc::channel();
+            let released = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(
+                Collector::new(
+                    configuration,
+                    PausedSink {
+                        entered,
+                        released: released.clone(),
+                        records: MemorySink(records),
+                    },
+                )
+                .unwrap(),
+            );
+            assert!(collector.begin(request("acknowledgement")));
+            let writer = collector.clone();
+            let producer = std::thread::spawn(move || {
+                if local {
+                    assert!(writer.finish("acknowledgement", Some(response()), None));
+                } else if mode == "checkpoint" {
+                    assert!(writer.checkpoint("acknowledgement"));
+                } else {
+                    writer.settle("acknowledgement", true, false);
+                }
+                finished.send(()).unwrap();
+            });
+            let reached = started.recv_timeout(Duration::from_secs(2)).is_ok();
+            let early = returned.recv_timeout(Duration::from_millis(50)).is_ok();
+            let pending = collector.counts()[0];
+            released.store(true, Ordering::Release);
+            producer.join().unwrap();
+            if mode == "checkpoint" {
+                collector.settle("acknowledgement", false, false);
+            }
+            let records = drain(&collector, receiver);
+            assert!(reached);
+            assert_eq!(early, asynchronous);
+            assert_eq!(pending, 1);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].response.is_some(), local);
+            assert_eq!(collector.counts()[4..], [0, 0]);
+        }
+    }
 }
 
 #[test]

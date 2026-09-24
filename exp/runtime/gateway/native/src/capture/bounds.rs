@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::budget::json_bytes;
+use super::budget::{json_bytes, string_bytes};
 use super::record::Request;
 
 const COLUMN_BUDGET: usize = 4_110_000;
 const HEAD_BYTES: usize = 4096;
+const MARKER_ALLOWANCE: usize = 64;
 
 fn string_leaves(value: &Value, path: &str, leaves: &mut Vec<(usize, String)>) {
     match value {
@@ -32,20 +33,29 @@ fn string_leaves(value: &Value, path: &str, leaves: &mut Vec<(usize, String)>) {
 
 fn trim_strings(value: &mut Value, maximum: usize) -> usize {
     let mut count = 0;
-    if json_bytes(value) <= maximum {
+    let mut bytes = json_bytes(value);
+    if bytes <= maximum {
         return 0;
     }
     let mut leaves = Vec::new();
     string_leaves(value, "", &mut leaves);
-    leaves.sort_unstable_by_key(|leaf| std::cmp::Reverse(leaf.0));
+    leaves.sort_by_key(|leaf| std::cmp::Reverse(leaf.0));
     for (_, path) in leaves {
-        if json_bytes(value) <= maximum {
+        if bytes <= maximum {
             break;
         }
         let Some(Value::String(text)) = value.pointer_mut(&path) else {
             continue;
         };
-        let mut end = HEAD_BYTES;
+        let original_bytes = string_bytes(text);
+        // Match hosted capture's minimum-loss policy: keep as much of the
+        // largest string as fits, reserving room for its explicit marker.
+        // Equal-sized strings retain their original traversal order.
+        let mut end = text
+            .len()
+            .saturating_sub(bytes - maximum)
+            .saturating_sub(MARKER_ALLOWANCE)
+            .max(HEAD_BYTES);
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -53,6 +63,10 @@ fn trim_strings(value: &mut Value, maximum: usize) -> usize {
         text.truncate(end);
         text.push_str(&format!(" [truncated for capture: {removed} bytes]"));
         text.shrink_to_fit();
+        // Only this string changed. Preserve exact escaped sizing without
+        // rescanning every other message after each individual truncation.
+        // A barely over-prefix string can grow when its marker is added.
+        bytes = bytes - original_bytes + string_bytes(text);
         count += 1;
     }
     count
@@ -154,3 +168,7 @@ pub(super) fn bound(request: &mut Request, maximum: usize) -> usize {
     }
     request.json_bytes()
 }
+
+#[cfg(test)]
+#[path = "bounds_test.rs"]
+mod tests;

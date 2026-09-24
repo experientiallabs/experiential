@@ -134,6 +134,88 @@ fn preparation_failure_retains_input_for_retry_without_a_false_ack() {
 }
 
 #[test]
+fn failed_preparation_owns_the_single_workspace_until_recovery() {
+    struct Preparing {
+        recover: Arc<std::sync::atomic::AtomicBool>,
+        first: std::sync::atomic::AtomicBool,
+        resume: Mutex<mpsc::Receiver<()>>,
+        attempted: mpsc::Sender<String>,
+        persisted: mpsc::Sender<String>,
+    }
+    impl Sink for Preparing {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn batch_records(&self) -> usize {
+            2
+        }
+        fn batch_bytes(&self) -> usize {
+            1024
+        }
+        fn prepared_bytes(&self, value: &String) -> usize {
+            value.len()
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            let id = &record.request.request_id;
+            self.attempted.send(id.clone()).unwrap();
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }
+            if id == "failed" && !self.recover.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                Ok(id.clone())
+            }
+        }
+        fn write(&mut self, value: &String) -> Result<(), ()> {
+            self.persisted.send(value.clone()).map_err(|_| ())
+        }
+    }
+    let recover = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (resume, paused) = mpsc::channel();
+    let (attempted, observed) = mpsc::channel();
+    let (persisted, saved) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        Preparing {
+            recover: recover.clone(),
+            first: std::sync::atomic::AtomicBool::new(true),
+            resume: Mutex::new(paused),
+            attempted,
+            persisted,
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record("failed")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "failed"
+    );
+    assert!(delivery.submit(record("waiting")));
+    resume.send(()).unwrap();
+    let until = Instant::now() + Duration::from_millis(80);
+    let mut attempts = Vec::new();
+    while let Ok(id) = observed.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        attempts.push(id);
+    }
+    recover.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(2)));
+    assert!(!attempts.is_empty());
+    assert!(attempts.iter().all(|id| id == "failed"), "{attempts:?}");
+    let mut saved: Vec<_> = saved.try_iter().collect();
+    saved.sort();
+    assert_eq!(saved, ["failed", "waiting"]);
+    assert_eq!(delivery.counts()[0], 0);
+    assert_eq!(delivery.counts()[2], 2);
+    assert_eq!(delivery.counts()[4], 0);
+}
+
+#[test]
 fn saturated_destination_waits_without_losing_records_or_exceeding_queued_budget() {
     let (delivery, entered, resume) = paused(limits(), false);
     let delivery = Arc::new(delivery);

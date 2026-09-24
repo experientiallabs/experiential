@@ -53,6 +53,7 @@ fn collector_with_relay(
                 settlement_required: false,
                 relay_metadata,
                 truncate_request: false,
+                asynchronous_delivery: true,
             },
             MemorySink(sender),
         )
@@ -131,6 +132,7 @@ async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
                     settlement_required: false,
                     relay_metadata: false,
                     truncate_request: false,
+                    asynchronous_delivery: true,
                 },
                 HeldSink {
                     entered: Some(started),

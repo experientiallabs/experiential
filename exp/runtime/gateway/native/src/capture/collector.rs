@@ -27,6 +27,8 @@ pub(crate) struct Configuration {
     pub relay_metadata: bool,
     #[serde(default)]
     pub truncate_request: bool,
+    #[serde(default)]
+    pub asynchronous_delivery: bool,
 }
 
 impl Configuration {
@@ -324,7 +326,7 @@ impl Collector {
         }
     }
 
-    /// Queue a hosted prompt after the winning host-funded lane is frozen.
+    /// Capture a hosted prompt after the winning host-funded lane is frozen.
     /// The destination must recheck consent and merge this idempotent update
     /// without replacing a later response. Keep the shared request tree live
     /// until terminal settlement; no provider response belongs in this write.
@@ -359,16 +361,16 @@ impl Collector {
                 captured_at: entry.record.captured_at,
             }
         };
-        let queued = self.emit(record, None, None);
+        let acknowledged = self.emit(record, None, None);
         if let Ok(mut pending) = self.pending.lock() {
             if let Some(entry) = pending.entries.get_mut(request_id) {
                 entry.checkpointing = false;
-                entry.record.checkpointed |= queued;
+                entry.record.checkpointed |= acknowledged;
                 // Destination backpressure is not abandoned-request idle time.
                 entry.expires = Instant::now() + Duration::from_secs(self.config.ttl_seconds);
             }
         }
-        queued
+        acknowledged
     }
 
     /// Terminal policy controls response retention; the winning lane was frozen
@@ -556,7 +558,13 @@ impl Collector {
         wire: Option<WireResponse>,
         admission: Option<Admission>,
     ) -> bool {
-        let deliver = || self.delivery.submit_record(record, wire, admission);
+        let deliver = || {
+            if self.config.asynchronous_delivery {
+                self.delivery.submit_record(record, wire, admission)
+            } else {
+                self.delivery.submit_wait(record, wire, admission)
+            }
+        };
         // A blocked destination must not occupy a Tokio executor thread or a
         // collector lock. Python entrypoints already release the interpreter.
         if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {

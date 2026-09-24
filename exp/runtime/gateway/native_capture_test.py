@@ -37,9 +37,11 @@ native = pytest.importorskip("exp_gateway_native")
 
 @pytest.mark.parametrize("application", ["application", "", " ", "x" * 513])
 @pytest.mark.parametrize("content", ["hello 雪", "a\x00b\ud800", "x" * 65536])
+@pytest.mark.parametrize("number", [1.0, float("nan"), float("inf"), float("-inf")])
 def test_controller_serializes_typed_context_once_and_native_validates_envelope(
     application: str,
     content: str,
+    number: float,
 ) -> None:
     """No second Python schema walk; native authority checks still reject invalid scope."""
     authorization = AuthorizationSnapshot(
@@ -69,7 +71,7 @@ def test_controller_serializes_typed_context_once_and_native_validates_envelope(
                         "name": "lookup",
                         "parameters": {
                             "type": "object",
-                            "properties": {"query": {"type": "string"}},
+                            "properties": {"query": {"type": "number", "default": number}},
                         },
                     },
                 }
@@ -77,6 +79,16 @@ def test_controller_serializes_typed_context_once_and_native_validates_envelope(
         }
     ).request
     context = capture_context_document(request, session_id="episode")
+    expected = CaptureRequest.model_validate(
+        {
+            "request_id": "request",
+            "scope": {"organization_id": "org", "identity_id": "identity", "application_id": "app"},
+            "protocol": "chat_completions",
+            "model_id": "model",
+            "context": context,
+        }
+    )
+    expected_context = json.loads(expected.model_dump_json())["context"]
     records: list[str] = []
     collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
     controller = CaptureController(collector, application_for=lambda _auth: application)
@@ -87,7 +99,7 @@ def test_controller_serializes_typed_context_once_and_native_validates_envelope(
         collector.settle("request", True, False)
         assert collector.close(1)
         record = CaptureRecord.model_validate_json(records[0])
-        assert record.request.context == context
+        assert record.request.context == expected_context
         assert record.request.scope.application_id == application
         assert record.request.model_id == "model"
         assert collector.counts() == (0, 0, 1, 0, 0, 0)
@@ -160,8 +172,10 @@ def test_default_admission_keeps_large_inputs_whole(content: str) -> None:
     assert persisted.request.context["request"] == request["context"]["request"]
 
 
+@pytest.mark.parametrize("asynchronous_delivery", [False, True])
 def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
     capfd: pytest.CaptureFixture[str],
+    asynchronous_delivery: bool,
 ) -> None:
     """A failed destination retains its exact record until recovery, even during close."""
     attempted = threading.Event()
@@ -177,7 +191,8 @@ def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
             raise RuntimeError("private SQL parameter that must not be logged")
         persisted.append(record)
 
-    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), write)
+    config = CaptureConfiguration(asynchronous_delivery=asynchronous_delivery)
+    collector = native.CaptureCollector(config.model_dump_json(), write)
     assert collector.begin(_request_json())
     settlement = threading.Thread(target=collector.settle, args=("request", True, False))
     settlement.start()
@@ -189,7 +204,7 @@ def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
         assert successes == drops == skips == 0
         assert failures >= 1
         settlement.join(1)
-        assert not settlement.is_alive()
+        assert settlement.is_alive() is not asynchronous_delivery
     finally:
         recovering.set()
         settlement.join(3)
@@ -538,6 +553,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     records: list[str] = []
     configuration = CaptureConfiguration(
         settlement_required=policy.startswith("hosted"),
+        asynchronous_delivery=policy.startswith("hosted"),
         delivery=(
             CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=6400)
             if policy == "hosted-checkpoint-failed"

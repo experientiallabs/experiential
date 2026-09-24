@@ -102,6 +102,7 @@ struct Pending {
     wire: Option<WireResponse>,
     bytes: usize,
     counters: Arc<Counters>,
+    completed: Option<mpsc::SyncSender<bool>>,
     // Keep collector admission charged until the destination acknowledges.
     _admission: Option<Admission>,
 }
@@ -147,7 +148,7 @@ fn run_worker<S: Sink>(
             .map(|value| sink.prepared_bytes(value))
             .sum::<usize>();
         let mut index = 0;
-        loop {
+        'prepare_batch: loop {
             while index < pending.len() {
                 let entry = &mut pending[index];
                 if entry.value.is_none() && (bytes == 0 || bytes < sink.batch_bytes()) {
@@ -173,6 +174,10 @@ fn run_worker<S: Sink>(
                         entry.item.value = None;
                     } else {
                         counters.failed.fetch_add(1, Ordering::Relaxed);
+                        // A failed preparation still owns the one decoded
+                        // workspace. Leave later records compact and charged
+                        // until it recovers; prepared neighbors can still commit.
+                        break 'prepare_batch;
                     }
                 }
                 index += 1;
@@ -200,6 +205,9 @@ fn run_worker<S: Sink>(
             if persisted {
                 counters.persisted.fetch_add(1, Ordering::Relaxed);
                 acknowledged += 1;
+                if let Some(completed) = &entry.item.completed {
+                    let _ = completed.send(true);
+                }
             } else if entry.value.is_some() {
                 counters.failed.fetch_add(1, Ordering::Relaxed);
             }
@@ -282,7 +290,7 @@ impl Delivery {
     /// Wait for capacity; accepted records are never discarded to make room.
     #[cfg(test)]
     pub(crate) fn submit(&self, value: Record) -> bool {
-        self.enqueue(value, None, None)
+        self.enqueue(value, None, None, None)
     }
 
     /// Transfer ownership to the background writer, not to the database caller.
@@ -292,7 +300,18 @@ impl Delivery {
         wire: Option<WireResponse>,
         admission: Option<Admission>,
     ) -> bool {
-        self.enqueue(value, wire, admission)
+        self.enqueue(value, wire, admission, None)
+    }
+
+    /// Preserve the default collector contract: success means the sink acknowledged.
+    pub(super) fn submit_wait(
+        &self,
+        value: Record,
+        wire: Option<WireResponse>,
+        admission: Option<Admission>,
+    ) -> bool {
+        let (completed, outcome) = mpsc::sync_channel(1);
+        self.enqueue(value, wire, admission, Some(completed)) && outcome.recv().unwrap_or(false)
     }
 
     fn enqueue(
@@ -300,6 +319,7 @@ impl Delivery {
         value: Record,
         wire: Option<WireResponse>,
         admission: Option<Admission>,
+        completed: Option<mpsc::SyncSender<bool>>,
     ) -> bool {
         let bytes = value.heap_bytes() + wire.as_ref().map_or(0, WireResponse::heap_bytes);
         if bytes > self.maximum_queued_bytes {
@@ -337,6 +357,7 @@ impl Delivery {
             wire,
             bytes,
             counters: self.counters.clone(),
+            completed,
             _admission: admission,
         };
         if sender.send(item).is_err() {
