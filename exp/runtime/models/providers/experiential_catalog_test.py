@@ -71,11 +71,55 @@ def test_metadata_uses_the_default_route_not_provider_display_order() -> None:
     assert metadata["pricing"] == {
         "input_nano_usd_per_million_tokens": 200000000,
         "output_nano_usd_per_million_tokens": 1200000000,
-        "cached_input_nano_usd_per_million_tokens": None,
-        "cache_write_nano_usd_per_million_tokens": None,
+        "cached_input_nano_usd_per_million_tokens": 0,
+        "cache_write_nano_usd_per_million_tokens": 0,
     }
     entry["default_provider_ids"] = ["missing"]
     assert model_metadata(entry) is None
+
+
+@pytest.mark.parametrize("reporting", [True, False, None, "absent"])
+def test_cache_prices_follow_the_gateway_billing_lanes(reporting: bool | str | None) -> None:
+    """Inactive cache lanes are free; reported but unpriced usage remains unknown."""
+    capabilities: JsonObject = {}
+    if reporting != "absent":
+        capabilities = {
+            "reports_cached_input_tokens": reporting,
+            "reports_cache_creation_input_tokens": reporting,
+        }
+    result = model_metadata(
+        {
+            "model": {"slug": "chat", "output_modalities": ["text"]},
+            "providers": [{"id": "primary", "status": "active", "capabilities": capabilities}],
+            "default_provider_ids": ["primary"],
+        }
+    )
+    assert result is not None
+    expected = 0 if reporting is False or reporting == "absent" else None
+    assert result[1]["pricing"] == {
+        "input_nano_usd_per_million_tokens": None,
+        "output_nano_usd_per_million_tokens": None,
+        "cached_input_nano_usd_per_million_tokens": expected,
+        "cache_write_nano_usd_per_million_tokens": expected,
+    }
+
+
+def test_absent_capability_contract_does_not_invent_cache_prices() -> None:
+    """Without any published capability object even cache billing applicability is unknown."""
+    result = model_metadata(
+        {
+            "model": {"slug": "chat"},
+            "providers": [{"id": "primary", "status": "active"}],
+            "default_provider_ids": ["primary"],
+        }
+    )
+    assert result is not None
+    assert result[1]["pricing"] == {
+        "input_nano_usd_per_million_tokens": None,
+        "output_nano_usd_per_million_tokens": None,
+        "cached_input_nano_usd_per_million_tokens": None,
+        "cache_write_nano_usd_per_million_tokens": None,
+    }
 
 
 @pytest.mark.parametrize(

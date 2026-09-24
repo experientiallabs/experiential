@@ -425,6 +425,7 @@ def completion_reservation_from_catalog(
     """
     capabilities = catalog.models[alias].capabilities
     if capabilities is None:
+        problems.append(f"{label} alias {alias!r} has no capability or pricing metadata")
         return None
     context = capabilities.context_window_tokens
     if capabilities.maximum_output_tokens is not None:
@@ -454,6 +455,17 @@ def completion_reservation_from_catalog(
         capabilities.cache_write_cost_per_million_tokens_usd,
     )
     if any(value is None for value in prices):
+        missing = ", ".join(
+            name
+            for name, value in zip(
+                ("input", "output", "cached input", "cache write"), prices, strict=True
+            )
+            if value is None
+        )
+        problems.append(
+            f"{label} alias {alias!r} is missing {missing} prices; "
+            "refresh Cloud metadata with exp login or configure prices with exp config providers"
+        )
         return None
     input_price, output_price, cached_input_price, cache_write_price = prices
     assert input_price is not None and output_price is not None

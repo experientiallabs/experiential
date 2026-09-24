@@ -43,7 +43,9 @@ def model_metadata(entry: JsonObject) -> tuple[str, JsonObject] | None:
     """Read one logical model and its first published default route.
 
     A different deployment may advertise different prices or capabilities, so arbitrary
-    provider rows are never substituted for a missing default. Missing values stay missing.
+    provider rows are never substituted for a missing default. Missing prices stay unknown,
+    except for inactive cache billing lanes: the gateway's reporting flags default to false,
+    so those lanes contribute zero cost. Published prices always take precedence.
 
     Args:
         entry: One object from the Platform catalog's ``models`` array.
@@ -87,6 +89,14 @@ def model_metadata(entry: JsonObject) -> tuple[str, JsonObject] | None:
         f"{target}_nano_usd_per_million_tokens": route.get(f"{source}_nano_usd_per_million")
         for target, source in _PRICE_FIELDS
     }
+    if isinstance(route.get("capabilities"), dict):
+        for price, reporting in (
+            ("cached_input", "reports_cached_input_tokens"),
+            ("cache_write", "reports_cache_creation_input_tokens"),
+        ):
+            field = f"{price}_nano_usd_per_million_tokens"
+            if prices[field] is None and metadata.get(reporting, False) is False:
+                prices[field] = 0
     metadata["pricing"] = prices
     return slug, metadata
 

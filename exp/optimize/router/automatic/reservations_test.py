@@ -371,6 +371,35 @@ def test_completion_reservation_bounds_episode_estimates_to_request_capacity() -
     )
 
 
+def test_completion_reservation_identifies_missing_prices() -> None:
+    """A partial catalog reports the missing rate and recovery command instead of a blank error."""
+    catalog = _catalog()
+    capabilities = catalog.models["world"].capabilities
+    assert capabilities is not None
+    catalog.models["world"] = catalog.models["world"].model_copy(
+        update={
+            "capabilities": capabilities.model_copy(
+                update={"cache_write_cost_per_million_tokens_usd": None}
+            )
+        }
+    )
+    problems: list[str] = []
+    reservation = completion_reservation_from_catalog(
+        problems,
+        catalog=catalog,
+        alias="world",
+        model=_snapshot("world"),
+        label="world model",
+        maximum_attempts=3,
+        estimated_input_tokens=1000,
+        maximum_output_tokens=_OUTPUT_TOKENS,
+    )
+    assert reservation is None
+    assert len(problems) == 1
+    assert "world model alias 'world' is missing cache write prices" in problems[0]
+    assert "exp login" in problems[0]
+
+
 @pytest.mark.parametrize("estimate", [0, -1])
 def test_completion_reservation_rejects_nonpositive_estimates(estimate: int) -> None:
     """Bounding positive planning inputs must not hide malformed estimates."""
