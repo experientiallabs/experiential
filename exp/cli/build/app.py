@@ -10,13 +10,10 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
-from exp.cli.providers.setup import (
-    ProviderSetupOptions,
-    provider_setup_json_examples,
-    run_provider_setup,
-)
+from exp.cli.providers.setup import provider_setup_json_examples
 from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.progress import progress_display, qualified
@@ -251,16 +248,21 @@ def build(
     ):
         code_revision = installed_release_revision()
         ProjectStore(root, project)
+        interactive = not (no_interactive or dry_run) and can_prompt(_console)
         catalog = _load_or_setup_catalog(
             root,
-            no_interactive=no_interactive or dry_run,
+            project=project,
+            no_interactive=not interactive,
             providers=tuple(provider or ()),
-        )
-        selected = _selected_roles(
-            catalog,
             world_model=world_model,
             judge=judge,
             embedder=embedder,
+        )
+        selected = _selected_roles(
+            catalog,
+            world_model=None if interactive else world_model,
+            judge=None if interactive else judge,
+            embedder=None if interactive else embedder,
         )
         runtime_catalog = RuntimeModelCatalog(catalog)
         world_snapshot, embedder_snapshot, embedder_capabilities = _validated_role_snapshots(
@@ -378,15 +380,23 @@ def build(
 def _load_or_setup_catalog(
     root: Path,
     *,
+    project: str,
     no_interactive: bool,
     providers: tuple[str, ...] = (),
+    world_model: str | None = None,
+    judge: str | None = None,
+    embedder: str | None = None,
 ) -> ModelCatalog:
     """Confirm provider and model choices at a terminal, or load them for automation.
 
     Args:
         root: Local EXP root containing the shared model catalog.
+        project: Project whose saved role choices are the interactive defaults.
         no_interactive: Whether inline provider setup is forbidden.
         providers: Repeatable ``--provider`` values that skip the opening list.
+        world_model: Optional initial world-model choice.
+        judge: Optional initial judge choice.
+        embedder: Optional initial embedder choice.
 
     Returns:
         A complete model catalog with all required build roles.
@@ -398,15 +408,16 @@ def _load_or_setup_catalog(
     path = root / "models.toml"
     catalog = load_model_catalog(path) if path.exists() else None
     missing = _missing_build_configuration(catalog)
-    options = ProviderSetupOptions(providers=resolved_providers)
     if not no_interactive and can_prompt(_console):
         if missing:
             _console.print(f"Model setup is required: {', '.join(missing)}.")
-        return run_provider_setup(
+        return configure_build_providers(
             root,
-            options,
-            non_interactive=False,
-            replace=False,
+            project,
+            providers=resolved_providers,
+            world_model=world_model,
+            judge=judge,
+            embedder=embedder,
             console=_console,
         )
     if not missing:

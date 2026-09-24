@@ -436,13 +436,45 @@ def preflight_automatic_router(
         judge_reservation_cost_usd=judge_reservation_cost_usd,
         remaining_simulation_cost_usd=remaining_cost_usd,
         agent_factory_sha256=agent_identity,
-        simulation_configuration_sha256=sha256_json(
-            {
-                "version": "automatic-router-simulation-configuration-v1",
-                "agent_factory_sha256": agent_identity,
-                "redacted_field_names": list(config.redacted_field_names),
-            }
+        simulation_configuration_sha256=simulation_configuration_sha256(
+            config,
+            catalog,
+            agent_identity=agent_identity,
+            candidate_aliases=selection.candidates,
         ),
+    )
+
+
+def simulation_configuration_sha256(
+    config: ProjectConfig,
+    catalog: ModelCatalog,
+    *,
+    agent_identity: Sha256,
+    candidate_aliases: tuple[str, ...],
+) -> Sha256:
+    """Bind agent configuration and confirmed reasoning choices without pricing or I/O.
+
+    Args:
+        config: Frozen project configuration supplying redaction behavior.
+        catalog: Confirmed model catalog supplying role-specific reasoning choices.
+        agent_identity: Exact agent factory identity for the execution.
+        candidate_aliases: Selected router candidates, independent of picker ordering.
+
+    Returns:
+        Deterministic simulation identity used by execution and completed replay.
+    """
+    return sha256_json(
+        {
+            "version": "automatic-router-simulation-configuration-v2",
+            "agent_factory_sha256": agent_identity,
+            "redacted_field_names": list(config.redacted_field_names),
+            "world_model_reasoning_effort": catalog.roles.world_model_reasoning_effort,
+            "judge_reasoning_effort": catalog.roles.judge_reasoning_effort,
+            "candidate_reasoning_efforts": {
+                alias: catalog.roles.candidate_reasoning_efforts.get(alias)
+                for alias in sorted(candidate_aliases)
+            },
+        }
     )
 
 

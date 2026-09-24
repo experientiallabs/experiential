@@ -1271,7 +1271,7 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
         write_model_catalog(path / "models.toml", catalog)
         return catalog
 
-    monkeypatch.setattr("exp.cli.build.app.run_provider_setup", configure)
+    monkeypatch.setattr("exp.cli.providers.setup.run_provider_setup", configure)
 
     result = _RUNNER.invoke(
         app,

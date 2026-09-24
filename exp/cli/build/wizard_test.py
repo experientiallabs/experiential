@@ -487,8 +487,9 @@ def test_new_project_setup_can_cancel_without_changing_catalog_or_paid_work(
     assert not lister.requests and not state.embedding_calls and not state.completion_calls
 
 
+@pytest.mark.parametrize("explicit_trace", [False, True])
 def test_new_project_uses_models_chosen_from_an_existing_catalog(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_trace: bool
 ) -> None:
     """Choosing a different world model changes the new project, rather than being ignored."""
     _chat_export(tmp_path)
@@ -498,11 +499,14 @@ def test_new_project_uses_models_chosen_from_an_existing_catalog(
     state = _ProviderState()
     _install_integrated_runtime(monkeypatch, state)
 
-    result = _RUNNER.invoke(
-        app,
-        ["build", "new-project"],
-        input="\nresearch.jsonl\n\n\n/candidate\n1\n\n\n\ny\n",
-    )
+    arguments = ["build", "new-project"]
+    prefix = "\nresearch.jsonl\n"
+    if explicit_trace:
+        arguments.extend(
+            ["--traces", "research.jsonl", "--source", "chat-json", "--world-model", "world"]
+        )
+        prefix = ""
+    result = _RUNNER.invoke(app, arguments, input=f"{prefix}\n\n/candidate\n1\n\n\n\ny\n")
 
     assert result.exit_code == 0, result.output
     config = wizard.ProjectStore(root, "new-project").load_project()
