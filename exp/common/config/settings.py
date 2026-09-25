@@ -74,7 +74,11 @@ class GatewayResourceSettings(BaseModel):
 
 
 class ProjectSettings(BaseModel):
-    """Local telemetry preference and optional shared command-budget ceiling."""
+    """Local telemetry preference and optional shared command-budget ceiling.
+
+    Attributes:
+        gateway: Local snapshot resource limits, defaulting to bounded gateway settings.
+    """
 
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     commands: CommandBudgetSettings = Field(default_factory=CommandBudgetSettings)

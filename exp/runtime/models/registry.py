@@ -123,7 +123,12 @@ class _HttpClientFactory(Protocol):
 
 @dataclass(frozen=True)
 class ResolvedModel:
-    """One alias resolved to static identity, capabilities, and focused runtime clients."""
+    """One alias resolved to static identity, capabilities, and focused runtime clients.
+
+    Attributes:
+        credential_receipt: Private receipt resolved atomically with authentication, or None
+            when the credential source cannot establish recovery or cache evidence scope.
+    """
 
     alias: str
     snapshot: ModelSnapshot

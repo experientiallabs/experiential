@@ -5,7 +5,11 @@ use crate::encode_responses::{completed_responses_body, ResponsesEnvelope, Respo
 use futures_util::stream;
 use serde_json::{json, Value};
 
-async fn relayed_tool(name: &str, raw: &str, translate: bool) -> Vec<Event> {
+async fn relayed_tool_result(
+    name: &str,
+    raw: &str,
+    translate: bool,
+) -> (Vec<Event>, Result<(), Failure>) {
     let mut chunks = vec![json!({"choices": [{"delta": {"tool_calls": [{
         "index": 0, "id": "call-one", "type": "function",
         "function": {"name": name, "arguments": ""}
@@ -40,17 +44,27 @@ async fn relayed_tool(name: &str, raw: &str, translate: bool) -> Vec<Event> {
         ]));
     }
     let mut events = Vec::new();
-    while let Some(event) = relay
-        .next_event(deadline, Duration::from_secs(5), Instant::now())
-        .await
-        .unwrap()
-    {
-        let terminal = event.is_terminal();
-        events.push(event);
-        if terminal {
-            break;
+    loop {
+        match relay
+            .next_event(deadline, Duration::from_secs(5), Instant::now())
+            .await
+        {
+            Ok(Some(event)) => {
+                let terminal = event.is_terminal();
+                events.push(event);
+                if terminal {
+                    return (events, Ok(()));
+                }
+            }
+            Ok(None) => return (events, Ok(())),
+            Err(failure) => return (events, Err(failure)),
         }
     }
+}
+
+async fn relayed_tool(name: &str, raw: &str, translate: bool) -> Vec<Event> {
+    let (events, result) = relayed_tool_result(name, raw, translate).await;
+    result.unwrap();
     assert!(matches!(events.last(), Some(Event::Completed)));
     events
 }
@@ -117,12 +131,28 @@ async fn custom_tool_json_fragments_become_consistent_freeform_input() {
 }
 
 #[tokio::test]
-async fn invalid_custom_input_shape_preserves_raw_json_consistently() {
-    for raw in [r#"{"input":17}"#, r#"{"other":"x"}"#, r#"{"input":""}"#] {
-        let events = relayed_tool("ns__patch", raw, true).await;
-        let expected = if raw == r#"{"input":""}"# { "" } else { raw };
-        assert_encoded(&events, "patch", true, expected);
+async fn invalid_translated_custom_input_fails_after_committed_start() {
+    for raw in [r#"{"input":17}"#, r#"{"other":"x"}"#] {
+        let (events, result) = relayed_tool_result("ns__patch", raw, true).await;
+        let failure = result.unwrap_err();
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        assert!(!failure.retryable_same_deployment && !failure.failover_eligible);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallStarted { name, namespace: Some(namespace), custom: true, .. }
+                if name == "patch" && namespace == "ns"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::ToolArgumentsDelta { .. } | Event::ToolCallCompleted { .. } | Event::Completed
+        )));
     }
+}
+
+#[tokio::test]
+async fn empty_translated_custom_input_is_valid_on_both_encodings() {
+    let events = relayed_tool("ns__patch", r#"{"input":""}"#, true).await;
+    assert_encoded(&events, "patch", true, "");
 }
 
 #[tokio::test]

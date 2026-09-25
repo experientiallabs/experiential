@@ -104,7 +104,12 @@ async def abandoned_write_outcome[R](write: asyncio.Task[R]) -> R | None:
 
 @dataclass(frozen=True)
 class _PendingWrite:
-    """One queued ledger operation and the future resolved after durable commit."""
+    """One queued ledger operation and the future resolved after durable commit.
+
+    Attributes:
+        prepare: Optional pretransaction context retaining proof handles through the write;
+            None applies the queued operation directly.
+    """
 
     apply: Callable[[sqlite3.Connection], object]
     future: concurrent.futures.Future[object]

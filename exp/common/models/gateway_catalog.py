@@ -147,7 +147,11 @@ class ExactModelPool(ContractModel):
 
 
 class NormalizedGatewayCatalog(ContractModel):
-    """Immutable gateway deployment and singleton-pool view of one model catalog."""
+    """Immutable gateway deployment and singleton-pool view of one model catalog.
+
+    Attributes:
+        model_chains: Validated ordered canonical-model chains; empty for plain catalogs.
+    """
 
     schema_version: int = Field(default=SNAPSHOT_SCHEMA_VERSION, ge=1)
     deployments: tuple[ExactModelDeployment, ...] = ()

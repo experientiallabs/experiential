@@ -641,7 +641,12 @@ class GatewayDeploymentCapabilities(ContractModel):
 
 
 class GatewayDeploymentMetadata(ContractModel):
-    """Optional gateway-only metadata authored beside one existing model record."""
+    """Optional gateway-only metadata authored beside one existing model record.
+
+    Attributes:
+        cache_retention_seconds: Declared positive cache lifetime, at most one hour;
+            None supplies no plausible warmth claim.
+    """
 
     exact_model_id: ArtifactId | None = None
     capabilities: GatewayDeploymentCapabilities = Field(
@@ -652,7 +657,6 @@ class GatewayDeploymentMetadata(ContractModel):
     pricing_effective_at: AwareDatetime | None = None
     dispatch: GatewayRungDispatchPolicy | None = None
     cache_retention_seconds: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
-    """Conservative declared cache lifetime; unknown means no plausible warmth claim."""
 
 
 class ModelRecord(ContractModel):
@@ -735,7 +739,11 @@ and fails closed rather than being read as a future contract.
 
 
 class ModelCatalog(ContractModel):
-    """The local model aliases, connection metadata, and project role assignments."""
+    """The local model aliases, connection metadata, and project role assignments.
+
+    Attributes:
+        gateway_model_chains: Authored chains keyed by canonical model ID; empty by default.
+    """
 
     schema_version: int = Field(
         default=MODEL_CATALOG_SCHEMA_VERSION, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION

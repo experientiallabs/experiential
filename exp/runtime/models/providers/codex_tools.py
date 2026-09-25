@@ -446,6 +446,11 @@ def convert_native_history(
 def _convert_history_item(
     item: JsonObject, mapping: NativeToolMapping, tool_search_name: str
 ) -> tuple[GatewayMessage | None, str | None]:
+    """Translate one history item with the declaration's full-origin name allocation.
+
+    Return the provider message and optional omission disclosure, using the same custom
+    and namespace origin mapping as the declared tools.
+    """
     item_type = item.get("type")
     if item_type == "additional_tools":
         return None, "input.additional_tools->dropped(declared_inline)"

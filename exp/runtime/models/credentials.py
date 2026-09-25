@@ -30,7 +30,11 @@ class ModelCredentialError(ValueError):
 
 @dataclass(frozen=True, repr=False)
 class DispatchCredentialReceipt:
-    """Worker-private opaque identity returned with one exact credential binding."""
+    """Worker-private opaque identity returned with one exact credential binding.
+
+    Attributes:
+        binding_id: Immutable credential-generation receipt, never a secret or public identity.
+    """
 
     binding_id: UUID
 

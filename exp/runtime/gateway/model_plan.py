@@ -154,7 +154,14 @@ def project_stage_selection(
 
 @dataclass(frozen=True)
 class _CatalogView:
-    """One revision-scoped catalog with immutable chain, pool, and deployment indexes."""
+    """One revision-scoped catalog with immutable chain, pool, and deployment indexes.
+
+    Attributes:
+        catalog: Normalized catalog bound to the selected revision and digest.
+        chains: Immutable authored-chain index keyed by canonical model identity.
+        pools: Immutable exact-model pool index keyed by pool identity.
+        deployments: Immutable deployment index used to resolve stage leaves.
+    """
 
     catalog: NormalizedGatewayCatalog
     chains: Mapping[str, GatewayModelChain]

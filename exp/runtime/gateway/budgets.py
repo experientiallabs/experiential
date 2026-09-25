@@ -122,7 +122,15 @@ BudgetApplication = Literal["root", "destination", "shared"]
 
 
 class BudgetRefusalBinding(ContractModel):
-    """Exact request and budget scope selected by the atomic refusal decision."""
+    """Exact request and budget scope selected by the atomic refusal decision.
+
+    Attributes:
+        request_id: Logical request whose atomic reservation was refused.
+        organization_id: Tenant owning the refused request.
+        alias_revision_id: Exact authorized alias revision used by the reservation.
+        scope: Budget scope selected by the authoritative refusal.
+        application: Whether that scope applies to the root, destination, or shared request.
+    """
 
     request_id: str
     organization_id: str

@@ -156,6 +156,13 @@ class InflightRequest:
         ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
             counts; semantic tool turns and reasoning-repair successors do not increment them.
         attempt_policy: Effective caller bounds, defaulting to the operator's retry mechanics.
+        verified_warm_deployment_id: Exact scoped warm destination, or None without evidence.
+        verified_warm_until_monotonic: Admission's nonrenewable warmth expiry, initially zero.
+        recovery_scoped: Whether admission requires exact scoped evidence, default False.
+        recovery_bindings: Frozen private wire bindings by deployment, initially empty.
+        recovery_recorded_attempts: Attempts whose recovery effects already ran, initially empty.
+        recovery_reason: Optional content-free reason for the admitted recovery placement.
+        denied_destination_pools: Exactly bound destination-only budget refusals in this request.
     """
 
     authorization: AuthorizationSnapshot

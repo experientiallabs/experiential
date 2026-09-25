@@ -941,7 +941,12 @@ class AuthorizationSnapshot(ContractModel):
 
 
 class ExecutionSnapshot(ContractModel):
-    """Route-bound request plan created only after exact-model selection."""
+    """Route-bound request plan created only after exact-model selection.
+
+    Attributes:
+        model_stages: Frozen ordered stage segments; empty for an unstaged exact-model route.
+        traversal_events: Immutable expansion provenance, not mutable runtime visitation state.
+    """
 
     authorization: AuthorizationSnapshot
     exact_model_id: ExactModelId
