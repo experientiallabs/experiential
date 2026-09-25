@@ -153,7 +153,6 @@ jobs:
       # Exercise the supported SDK on real Windows; Linux/Darwin retain complete 3.13 Capture gates.
       UV_PYTHON: "3.12"
       EXP_TELEMETRY: "0"
-      XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
@@ -162,7 +161,9 @@ jobs:
         run: uv sync --extra dev
       - name: Verify real Windows snapshot authority
         # These tests use built-in fixtures only. The suite conftest owns Unix PTY fixtures;
-        # its provider-auth isolation is replaced by the empty job-local XDG_DATA_HOME above.
+        # its provider-auth isolation is replaced by the empty step-local XDG_DATA_HOME.
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth
         run: >-
           uv run pytest --noconftest -q -rs --junitxml=windows-snapshot-authority.xml
           exp/runtime/gateway/snapshot_file_windows_test.py
@@ -199,7 +200,7 @@ jobs:
           PY
       - name: Upload Windows authority test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-snapshot-authority
           path: windows-snapshot-authority.xml

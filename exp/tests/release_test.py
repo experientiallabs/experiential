@@ -3210,7 +3210,14 @@ def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture(
     assert "runs-on: windows-latest" in windows
     assert 'UV_PYTHON: "3.12"' in windows
     assert 'EXP_TELEMETRY: "0"' in windows
-    assert "XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth" in windows
+    job_configuration = windows.split("    steps:\n", 1)[0]
+    assert "runner." not in job_configuration, "runner context is unavailable before job routing"
+    test_step = windows.split("      - name: Verify real Windows snapshot authority\n", 1)[1]
+    test_step = test_step.split("      - name:", 1)[0]
+    assert (
+        "        env:\n          XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth"
+        in test_step
+    )
     assert "pytest --noconftest" in windows
     assert "exp/runtime/gateway/snapshot_file_windows_test.py" in windows
     assert "assert len(kernel) == 25" in windows
