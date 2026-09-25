@@ -184,6 +184,166 @@ fn unreconciled_cache_does_not_hide_later_consistent_primary_counts() {
 }
 
 #[test]
+fn pending_cache_does_not_hide_a_newer_valid_cache_subset() {
+    for order in [[0, 1], [1, 0]] {
+        for finish_at in 0..=2 {
+            for empty in [false, true] {
+                let reports = [
+                    json!({"cachedContentTokenCount":1000}),
+                    json!({"promptTokenCount":12,"candidatesTokenCount":5,"cachedContentTokenCount":6}),
+                ];
+                let mut frames = vec![text(), frame(json!({"usageMetadata":meter()}))];
+                for index in 0..=2 {
+                    if index == finish_at {
+                        frames.push(stop());
+                    }
+                    if index < 2 {
+                        frames.push(frame(json!({"usageMetadata":reports[order[index]]})));
+                    }
+                    if empty {
+                        frames.push(frame(json!({"usageMetadata":{}})));
+                    }
+                }
+                assert_usage(frames.clone(), Some((12, 5, 6)));
+                assert_usage(vec![frames.concat()], Some((12, 5, 6)));
+                frames.push(frame(json!({"usageMetadata":{"promptTokenCount":1200}})));
+                assert_usage(frames, Some((1200, 5, 1000)));
+            }
+        }
+    }
+}
+
+#[test]
+fn multiple_pending_subsets_reconcile_independently_in_either_order() {
+    for reports in [
+        vec![
+            json!({"cachedContentTokenCount":10}),
+            json!({"cachedContentTokenCount":1000}),
+        ],
+        vec![
+            json!({"cachedContentTokenCount":1000}),
+            json!({"cachedContentTokenCount":10}),
+        ],
+        vec![
+            json!({"promptTokenCount":8,"candidatesTokenCount":99,"cachedContentTokenCount":10}),
+            json!({"cachedContentTokenCount":1000}),
+        ],
+    ] {
+        let mut frames = vec![text(), frame(json!({"usageMetadata":meter()})), stop()];
+        for report in reports {
+            frames.push(frame(json!({"usageMetadata":report})));
+        }
+        frames.push(frame(json!({"usageMetadata":{"promptTokenCount":12}})));
+        assert_usage(frames.clone(), Some((12, 2, 10)));
+        assert_usage(vec![frames.concat()], Some((12, 2, 10)));
+        frames.push(frame(json!({"usageMetadata":{"promptTokenCount":1200}})));
+        assert_usage(frames, Some((1200, 2, 1000)));
+    }
+    for cache_first in [false, true] {
+        for cache in [6, 10] {
+            let mut reports = vec![
+                json!({"cachedContentTokenCount":cache}),
+                json!({"promptTokenCount":12}),
+            ];
+            if !cache_first {
+                reports.reverse();
+            }
+            let mut frames = vec![
+                text(),
+                frame(json!({"usageMetadata":meter()})),
+                stop(),
+                frame(json!({"usageMetadata":{"cachedContentTokenCount":1000}})),
+            ];
+            frames.extend(
+                reports
+                    .into_iter()
+                    .map(|report| frame(json!({"usageMetadata":report}))),
+            );
+            assert_usage(frames, Some((12, 2, cache)));
+        }
+    }
+}
+
+#[test]
+fn pending_cache_capacity_is_bounded_deduplicated_and_transactional() {
+    use crate::dialects::MAXIMUM_RETAINED_PROVIDER_ENTRIES;
+    let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+    for payload in [
+        json!({"usageMetadata":meter()}),
+        json!({"candidates":[{"finishReason":"STOP"}]}),
+    ] {
+        normalizer
+            .feed(&crate::sse::SseEvent {
+                event: None,
+                data: payload.to_string(),
+            })
+            .unwrap();
+    }
+    for cache in 10..10 + MAXIMUM_RETAINED_PROVIDER_ENTRIES as u64 {
+        normalizer
+            .observe_gemini_usage(&json!({"cachedContentTokenCount":cache}))
+            .unwrap();
+    }
+    // A duplicate at capacity is not an additional retained entry.
+    normalizer
+        .observe_gemini_usage(&json!({"cachedContentTokenCount":10}))
+        .unwrap();
+    let overflow = normalizer
+        .observe_gemini_usage(&json!({"candidatesTokenCount":99,"cachedContentTokenCount":5000}))
+        .unwrap_err();
+    assert!(overflow.safe_message.contains("pending cache"));
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens
+        ),
+        (Some(7), Some(2), Some(3))
+    );
+    // Reconciled entries free capacity, and the rejected report mutated no leg.
+    normalizer
+        .observe_gemini_usage(&json!({"promptTokenCount":12}))
+        .unwrap();
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens
+        ),
+        (Some(12), Some(2), Some(12))
+    );
+    normalizer
+        .observe_gemini_usage(&json!({"cachedContentTokenCount":5000}))
+        .unwrap();
+    let mut frames = vec![text(), frame(json!({"usageMetadata":meter()})), stop()];
+    frames.extend(
+        (10..11 + MAXIMUM_RETAINED_PROVIDER_ENTRIES as u64)
+            .map(|cache| frame(json!({"usageMetadata":{"cachedContentTokenCount":cache}}))),
+    );
+    assert_usage(frames, Some((7, 2, 3)));
+}
+
+#[test]
+fn empty_baseline_cannot_publish_output_before_pending_cache_reconciles() {
+    for empty_first in [false, true] {
+        let mut frames = vec![text(), stop()];
+        if empty_first {
+            frames.push(frame(json!({"usageMetadata":{}})));
+        }
+        frames.extend([
+            frame(json!({"usageMetadata":{"cachedContentTokenCount":3}})),
+            frame(json!({"usageMetadata":{"candidatesTokenCount":2,"thoughtsTokenCount":4}})),
+            frame(json!({"usageMetadata":{}})),
+        ]);
+        assert_usage(frames.clone(), empty_first.then_some((0, 0, 0)));
+        frames.push(frame(json!({"usageMetadata":{"promptTokenCount":7}})));
+        assert_usage(frames, Some((7, 6, 3)));
+    }
+}
+
+#[test]
 fn cache_only_first_report_waits_for_primary_counts_or_stays_unknown() {
     let partial = vec![
         text(),

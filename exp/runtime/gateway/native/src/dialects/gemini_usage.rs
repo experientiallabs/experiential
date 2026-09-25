@@ -1,10 +1,11 @@
 //! Gemini's declared finish freezes output before the transport finishes its meter.
 
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use serde_json::Value;
 
-use super::super::{malformed, Normalizer};
+use super::super::{malformed, Normalizer, MAXIMUM_RETAINED_PROVIDER_ENTRIES};
 use crate::errors::Failure;
 use crate::events::{bounded_ledger_sum, count_if_present, gemini_usage, Event, Usage};
 
@@ -15,7 +16,6 @@ struct MeterFields {
     input: u64,
     candidates: u64,
     thoughts: Option<u64>,
-    cache: u64,
 }
 
 #[derive(Default)]
@@ -23,6 +23,23 @@ pub(in crate::dialects) struct StreamState {
     pub(super) finish: Option<Event>,
     pub(super) finished_at: Option<Instant>,
     fields: MeterFields,
+    pending_cache: BTreeSet<u64>,
+}
+
+impl StreamState {
+    /// Check retained unresolved counts before any primary or cache state changes.
+    fn reserve_pending_cache(&self, cache: u64, input: u64) -> Result<(), Failure> {
+        if cache > input
+            && !self.pending_cache.contains(&cache)
+            && self.pending_cache.len() >= MAXIMUM_RETAINED_PROVIDER_ENTRIES
+            && self.pending_cache.range((input + 1)..).count() >= MAXIMUM_RETAINED_PROVIDER_ENTRIES
+        {
+            return Err(malformed(
+                "Gemini pending cache counts exceed the size limit",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Normalizer {
@@ -36,45 +53,53 @@ impl Normalizer {
                 .map_err(|message| malformed(&message))
         };
         let input = count("promptTokenCount")?;
-        let cache = count("cachedContentTokenCount")?;
+        let reported_cache = count("cachedContentTokenCount")?.unwrap_or(0);
         let candidates = count("candidatesTokenCount")?;
         let previous = self.gemini.fields;
-        let cache = previous.cache.max(cache.unwrap_or(0));
         // Two explicit counts in the same report contradict its own subset
         // relation. Retain cache evidence for reconciliation, but do not trust
         // that report's primary/output fields, even after an empty suffix.
-        if input.is_some_and(|input| parsed.cached_input_tokens.unwrap_or(0) > input) {
-            self.gemini.fields.cache = cache;
+        if input.is_some_and(|input| reported_cache > input) {
+            self.gemini.reserve_pending_cache(reported_cache, 0)?;
+            self.gemini.pending_cache.insert(reported_cache);
             return Ok(());
         }
         let fields = MeterFields {
             input: previous.input.max(input.unwrap_or(0)),
             candidates: previous.candidates.max(candidates.unwrap_or(0)),
             thoughts: previous.thoughts.max(parsed.reasoning_tokens),
-            cache,
         };
         let output = bounded_ledger_sum(
             &[fields.candidates, fields.thoughts.unwrap_or(0)],
             "Gemini output",
         )
         .map_err(|message| malformed(&message))?;
+        self.gemini
+            .reserve_pending_cache(reported_cache, fields.input)?;
         self.gemini.fields = fields;
-        // Sparse cache can arrive before prompt counts, including before any
-        // valid baseline. Keep all parsed legs pending rather than emitting an
-        // impossible zero-input meter or inventing input to cover the subset.
-        if fields.cache > fields.input && fields.input == 0 && self.usage.is_none() {
+        let mut cache = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.cached_input_tokens)
+            .unwrap_or(0);
+        // Promote actual observed subsets, never a clamped pending maximum.
+        // Removing reconciled entries bounds state to distinct unresolved counts.
+        while let Some(value) = self.gemini.pending_cache.first().copied() {
+            if value > fields.input {
+                break;
+            }
+            self.gemini.pending_cache.pop_first();
+            cache = cache.max(value);
+        }
+        if reported_cache <= fields.input {
+            cache = cache.max(reported_cache);
+        } else {
+            self.gemini.pending_cache.insert(reported_cache);
+        }
+        // An empty baseline is not evidence that pending output had zero input.
+        if fields.input == 0 && !self.gemini.pending_cache.is_empty() {
             return Ok(());
         }
-        let cache = if fields.cache <= fields.input {
-            fields.cache
-        } else {
-            // Pending cache never blocks newer primary evidence. Retain the
-            // last safe subset until enough input arrives to publish it.
-            self.usage
-                .as_ref()
-                .and_then(|usage| usage.cached_input_tokens)
-                .unwrap_or(0)
-        };
         self.usage = Some(Usage {
             input_tokens: Some(fields.input),
             output_tokens: Some(output),

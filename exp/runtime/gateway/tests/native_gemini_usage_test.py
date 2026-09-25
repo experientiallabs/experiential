@@ -92,7 +92,7 @@ def _chunks(placement: str) -> list[bytes]:
             frames = [text, usage, stop, {"usageMetadata": {"cachedContentTokenCount": 10}}]
             if placement == "reconciled-cache":
                 frames.extend([{"usageMetadata": {}}, {"usageMetadata": {"promptTokenCount": 12}}])
-        case "pending-cache-primary":
+        case "pending-cache-primary" | "pending-cache-valid" | "pending-cache-sparse-valid":
             frames = [
                 text,
                 usage,
@@ -100,6 +100,32 @@ def _chunks(placement: str) -> list[bytes]:
                 {"usageMetadata": {"cachedContentTokenCount": 1000}},
                 {"usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 5}},
             ]
+            if placement == "pending-cache-valid":
+                frames.append(
+                    {"usageMetadata": {"promptTokenCount": 12, "cachedContentTokenCount": 6}}
+                )
+            elif placement == "pending-cache-sparse-valid":
+                frames.append({"usageMetadata": {"cachedContentTokenCount": 6}})
+        case "empty-cache-output" | "empty-cache-output-reconciled":
+            frames = [
+                text,
+                stop,
+                {"usageMetadata": {}},
+                {"usageMetadata": {"cachedContentTokenCount": 3}},
+                {"usageMetadata": {"candidatesTokenCount": 2, "thoughtsTokenCount": 4}},
+                {"usageMetadata": {}},
+            ]
+            if placement == "empty-cache-output-reconciled":
+                frames.append({"usageMetadata": {"promptTokenCount": 7}})
+        case "multiple-pending-cache" | "multiple-pending-cache-reversed":
+            pending = [10, 1000]
+            if placement == "multiple-pending-cache-reversed":
+                pending.reverse()
+            frames = [text, usage, stop]
+            frames.extend(
+                {"usageMetadata": {"cachedContentTokenCount": count}} for count in pending
+            )
+            frames.append({"usageMetadata": {"promptTokenCount": 12}})
         case "cache-output-first":
             frames = [
                 text,
@@ -164,6 +190,12 @@ def _chunks(placement: str) -> list[bytes]:
         "bad-cache",
         "reconciled-cache",
         "pending-cache-primary",
+        "pending-cache-valid",
+        "pending-cache-sparse-valid",
+        "empty-cache-output",
+        "empty-cache-output-reconciled",
+        "multiple-pending-cache",
+        "multiple-pending-cache-reversed",
         "cache-output-first",
         "cache-only",
         "cache-first",
@@ -181,8 +213,14 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
     expected_meter = {
         "reconciled-cache": (12, 2, 10, 7_000),
         "pending-cache-primary": (12, 5, 3, 19_300),
+        "pending-cache-valid": (12, 5, 6, 16_600),
+        "pending-cache-sparse-valid": (12, 5, 6, 16_600),
+        "empty-cache-output-reconciled": (7, 6, 3, 16_300),
+        "multiple-pending-cache": (12, 2, 10, 7_000),
+        "multiple-pending-cache-reversed": (12, 2, 10, 7_000),
         "cache-output-first": (7, 6, 3, 16_300),
     }.get(placement, (7, 2, 3, 8_300))
+    unknown_meter = placement in {"none", "empty", "cache-only", "empty-cache-output"}
     requests: list[str] = []
     settlements: list[JsonObject] = []
 
@@ -269,7 +307,7 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
             assert result["choices"][0]["finish_reason"] == "stop"
             assert not result["choices"][0]["message"].get("tool_calls")
             usage = result.get("usage")
-        if placement not in {"none", "empty", "cache-only"}:
+        if not unknown_meter:
             assert usage is not None
             assert usage["prompt_tokens"] == expected_meter[0]
             assert usage["completion_tokens"] == expected_meter[1]
@@ -289,9 +327,7 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
         ).fetchall()
     # A present empty proto object normalizes to zero but the existing settlement
     # contract treats a finished all-zero meter as unknown, never free service.
-    expected = (
-        (None, None, None, None) if placement in {"none", "empty", "cache-only"} else expected_meter
-    )
+    expected = (None, None, None, None) if unknown_meter else expected_meter
     assert rows == [("completed", *expected)]
 
 

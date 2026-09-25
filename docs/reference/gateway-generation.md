@@ -189,19 +189,28 @@ Trailers and keepalives cannot renew it. EOF completes immediately, with no fixe
 A stalled transport can therefore add up to that allowance before the response finishes.
 Cancellation closes the upstream without waiting for more metadata. At the hard request deadline,
 public SSE delivery can close without a final client frame; settlement still preserves an already
-declared provider outcome and the meter observed so far.
+decoded provider outcome and the meter observed so far. This guarantee starts after the finish
+passes framing and normalization. The shared SSE decoder rejects an entire network batch on a
+framing error, so a finish earlier in that rejected batch is not yet a decoded outcome.
 
 Partial or empty suffixes cannot erase earlier counts. Prompt, candidate, thinking, and cache
 counts accumulate independently of the last publishable meter; withholding a cache subset does
-not discard output counts that arrive before input. Cumulative snapshots are never added together. A cache count greater than the accumulated input count stays pending, even when a
-consistent meter already exists. A later input report can make that pending cache count valid.
-Until then, newer consistent primary counts can advance the meter without publishing the pending
-cache count. A report that itself contradicts the subset relation cannot replace the last
-consistent meter; without one, unresolved cache-only usage stays unknown. An absent whole usage
-object remains unknown, and a finished all-zero report keeps the existing unknown-meter settlement
-policy. An interrupted or expired drain preserves the
-best consistent report, not a guarantee that the provider's final report was received. It does
-not trigger another generation to recover missing usage.
+not discard output counts that arrive before input. Cumulative snapshots are never added together.
+Cache counts greater than accumulated input stay pending, even when a consistent meter already
+exists. A later input report promotes the greatest actual observed cache count it covers, while
+larger counts remain pending. Smaller newly valid cache reports can therefore advance the meter
+independently of a larger pending count. Counts are never clamped to invent a subset. The set of
+distinct pending counts is bounded by the existing 4,096-entry provider-state limit; an overflow
+ends the drain with the already decoded outcome and last safe meter.
+
+Newer consistent primary counts can advance the meter without publishing pending cache counts.
+A report that itself contradicts the subset relation cannot replace the last consistent meter.
+Without reconciled input, pending nonzero cache evidence cannot authorize new output-only usage,
+even after an empty report; previously observed output legs remain pending until input arrives.
+An absent whole usage object stays unknown, and a finished all-zero report keeps the existing
+unknown-meter settlement policy. An interrupted or expired drain preserves the best consistent
+report, not a guarantee that the provider's final report was received. It does not trigger another
+generation to recover missing usage.
 
 This behavior applies to new requests. It does not reconstruct historical provider frames,
 attribute past missing meters to a particular cause, or authorize retrospective billing changes.
