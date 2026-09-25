@@ -164,8 +164,10 @@ def build_rung_dispatch(
         if carrier_scheme is None
         else reasoning_carrier_authority(
             authorization=authorization,
-            exact_model_id=route.snapshot.exact_model_id,
-            pool_id=route.snapshot.pool_id,
+            exact_model_id=deployment.exact_model_id,
+            pool_id=route.snapshot.stage_for_depth(
+                route.snapshot.deployment_ids.index(deployment.deployment_id)
+            ).pool_id,
             deployment=deployment,
             profile=profile,
             scheme=carrier_scheme,

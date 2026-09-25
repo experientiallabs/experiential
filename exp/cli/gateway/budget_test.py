@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import click
+import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
@@ -30,6 +31,18 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayManagement
+
+
+def test_budget_command_help_needs_no_private_gateway_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real CLI imports and renders budget help without creating SQLite or pepper files."""
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["config", "gateway", "budget", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "set" in result.output
+    assert "reconcile" in result.output
+    assert tuple(tmp_path.iterdir()) == ()
 
 
 def _snapshot_catalog() -> NormalizedGatewayCatalog:
@@ -84,6 +97,42 @@ def _configured(root: Path) -> GatewayManagement:
         catalog_sha256=digest,
     )
     return manager
+
+
+def test_budget_set_uses_existing_project_snapshot_resource_setting(tmp_path: Path) -> None:
+    """The CLI remedy changes the actual store limit without altering budget semantics."""
+    manager = _configured(tmp_path)
+    size = (manager.state_dir / "snapshot-one").stat().st_size
+    arguments = [
+        "config",
+        "gateway",
+        "budget",
+        "set",
+        "--period",
+        "2026-08",
+        "--scope",
+        "deployment",
+        "--alias",
+        "coding",
+        "--pool",
+        "pool-one",
+        "--deployment",
+        "azure-primary",
+        "--limit-nano-usd",
+        "100",
+        "--root",
+        str(tmp_path),
+        "--non-interactive",
+        "--json",
+    ]
+    settings = tmp_path / "settings.toml"
+    settings.write_text(f"[gateway]\nbudget_snapshot_max_bytes = {size - 1}\n")
+    blocked = CliRunner().invoke(app, arguments)
+    assert blocked.exit_code != 0 and "budget_snapshot_max_bytes" in blocked.output
+    settings.write_text(f"[gateway]\nbudget_snapshot_max_bytes = {size}\n")
+    allowed = CliRunner().invoke(app, arguments)
+    assert allowed.exit_code == 0, allowed.output
+    assert json.loads(allowed.stdout)["data"]["scope"]["deployment_id"] == "azure-primary"
 
 
 def test_noninteractive_budget_management_reports_integer_remaining(tmp_path: Path) -> None:

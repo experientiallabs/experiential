@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
-from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.health import (
+    DeploymentHealthKey,
+    DeploymentHealthRegistry,
+    health_failure_cause,
+)
 
 _KEY: DeploymentHealthKey = ("catalog", "deployment", "connection")
 
@@ -20,6 +24,50 @@ def _failure(failure_class: GatewayFailureClass) -> GatewayFailure:
         A minimal sanitized failure carrying only the class under test.
     """
     return GatewayFailure(failure_class=failure_class, safe_message="scripted failure")
+
+
+@pytest.mark.parametrize("failure_class", list(GatewayFailureClass))
+@pytest.mark.parametrize("customer_owned", [False, True])
+def test_shared_failure_categories_preserve_every_circuit_policy(
+    failure_class: GatewayFailureClass, customer_owned: bool
+) -> None:
+    """Every failure keeps its threshold, cooldown and refusal accounting semantics."""
+    operational = {
+        GatewayFailureClass.TRANSPORT,
+        GatewayFailureClass.TIMEOUT,
+        GatewayFailureClass.MALFORMED_RESPONSE,
+        GatewayFailureClass.PROVIDER_INTERNAL,
+    }
+    hard = {
+        GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        GatewayFailureClass.PROVIDER_NOT_FOUND,
+        GatewayFailureClass.PROVIDER_QUOTA,
+    }
+    expected = (
+        "transport"
+        if failure_class in operational
+        else "credential"
+        if failure_class in hard
+        else "throttle"
+        if failure_class == GatewayFailureClass.THROTTLED
+        else None
+    )
+    assert health_failure_cause(failure_class) == expected
+    now = [100.0]
+    registry = DeploymentHealthRegistry(
+        failure_threshold=2, open_seconds=30, throttle_seconds=20, clock=lambda: now[0]
+    )
+    failure = _failure(failure_class).model_copy(update={"customer_owned": customer_owned})
+    registry.failed(_KEY, failure)
+    assert registry.suppressed(_KEY) is (expected in ("credential", "throttle"))
+    registry.failed(_KEY, failure)
+    assert registry.suppressed(_KEY) is (expected is not None)
+    state = registry._states[_KEY]  # noqa: SLF001 - preserve refusal-only bookkeeping too.
+    assert state.refusal_count == (2 if failure_class == GatewayFailureClass.REFUSAL else 0)
+    now[0] += 21
+    assert registry.suppressed(_KEY) is (expected in ("credential", "transport"))
+    now[0] += 10
+    assert registry.claim(_KEY)
 
 
 def test_caller_invalid_request_bursts_never_open_the_circuit() -> None:

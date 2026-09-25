@@ -1,15 +1,77 @@
 """Tests for the pure ledger cost-attribution helpers."""
 
+import sqlite3
+
 import pytest
 
 from exp.common.models.catalog import MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
-from exp.runtime.gateway.contracts import GatewayUsage
+from exp.runtime.gateway.contracts import (
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayUsage,
+)
+from exp.runtime.gateway.ledger_errors import GatewayLedgerError
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
     NanoUsdOverflowError,
+    budget_settlement_nano_usd,
     estimated_cost_nano_usd,
     optional_int,
+    terminal_values,
 )
+
+
+@pytest.mark.parametrize(
+    ("surface", "cost", "reserved", "rejected", "expected"),
+    [
+        ("decisions", None, 100, False, None),
+        ("decisions", None, 100, True, 0),
+        ("chat_completions", None, 100, False, 100),
+        ("chat_completions", None, None, False, None),
+        ("decisions", 12, 100, False, 12),
+    ],
+)
+def test_budget_settlement_keeps_unknown_and_unmetered_liability(
+    surface: str,
+    cost: int | None,
+    reserved: int | None,
+    rejected: bool,
+    expected: int | None,
+) -> None:
+    """Pure settlement preserves conservative bounds and releases only proven decision rejection."""
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT ? AS api_surface, ? AS budget_reserved_nano_usd", (surface, reserved)
+        ).fetchone()
+        event = GatewayEvent(
+            kind=GatewayEventKind.FAILED,
+            sequence_number=0,
+            decision_provider_rejected=rejected,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.UNAVAILABLE, safe_message="unavailable"
+            ),
+        )
+        assert budget_settlement_nano_usd(row, cost, None, event) == expected
+        with pytest.raises(GatewayLedgerError, match="integer capacity"):
+            budget_settlement_nano_usd(row, MAXIMUM_NANO_USD + 1, None, None)
+    finally:
+        connection.close()
+
+
+def test_terminal_value_normalization_keeps_unknown_usage_and_sanitized_failure() -> None:
+    """The pure owner preserves terminal accounting without inventing observed usage."""
+    event = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0)
+    assert terminal_values(event, None) == ("completed", None, None, None)
+    cancelled = GatewayFailure(
+        failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled"
+    )
+    assert terminal_values(None, cancelled) == ("cancelled", "cancelled", None, None)
+    with pytest.raises(GatewayLedgerError, match="needs a terminal"):
+        terminal_values(None, None)
 
 
 def test_subset_tokens_price_at_their_own_rates() -> None:

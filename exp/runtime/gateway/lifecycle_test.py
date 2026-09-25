@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from dataclasses import replace
@@ -54,6 +55,11 @@ from exp.runtime.gateway.lifecycle import (
     load_gateway_components,
 )
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
+from exp.runtime.gateway.model_chain_authority import (
+    ChainOperation,
+    ModelChainAuthorityError,
+    SQLiteChainPreflight,
+)
 from exp.runtime.gateway.project_activation import ProjectActivation, ProjectActivationError
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models import RuntimeModelCatalog
@@ -818,6 +824,7 @@ def test_dead_pin_with_no_loadable_prior_stays_retryable_unavailable(tmp_path: P
 
 def test_concurrent_authorization_survives_pool_recertification_hot_swap(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Re-certifying one pool under load swaps it while untouched aliases keep serving."""
     root = tmp_path
@@ -896,14 +903,54 @@ def test_concurrent_authorization_survives_pool_recertification_hot_swap(
     )
     results: list[tuple[str, str]] = []
     failures: list[Exception] = []
+    refused: list[str] = []
+    witnessed: set[str] = set()
     results_lock = threading.Lock()
     warmed_up = threading.Event()
+    original_validate = SQLiteChainPreflight.validate
+
+    def observed_validate(
+        proof: SQLiteChainPreflight,
+        connection: sqlite3.Connection,
+        *,
+        request_id: str,
+        organization_id: str,
+        alias_revision_id: str,
+        operation: ChainOperation,
+    ) -> None:
+        """Witness actual revision drift before allowing only the real typed race refusal."""
+        current = connection.execute(
+            "SELECT active_revision_id FROM gateway_aliases WHERE organization_id=? AND alias_id=?",
+            (proof._rows[0][0], proof._rows[0][1]),
+        ).fetchone()
+        if current is not None and proof._rows[0][5] == "rev-chat-1" and current[0] == "rev-chat-2":
+            with results_lock:
+                witnessed.add(threading.current_thread().name)
+        original_validate(
+            proof,
+            connection,
+            request_id=request_id,
+            organization_id=organization_id,
+            alias_revision_id=alias_revision_id,
+            operation=operation,
+        )
+
+    monkeypatch.setattr(SQLiteChainPreflight, "validate", observed_validate)
 
     def worker(alias_name: str) -> None:
         """Authorize a bounded burst against one alias across the re-certification."""
         for _index in range(12):
+            with results_lock:
+                witnessed.discard(threading.current_thread().name)
             try:
                 revision = _authorize(components, issued.raw_key, alias_name)
+            except ModelChainAuthorityError as exc:
+                assert alias_name == "chat"
+                assert str(exc) == "local alias changed after preflight; retry the operation"
+                with results_lock:
+                    assert threading.current_thread().name in witnessed
+                    refused.append(alias_name)
+                continue
             except Exception as exc:  # noqa: BLE001 - concurrent failures are the assertion.
                 with results_lock:
                     failures.append(exc)
@@ -942,7 +989,12 @@ def test_concurrent_authorization_survives_pool_recertification_hot_swap(
         assert not item.is_alive()
 
     assert failures == []
-    assert len(results) == 48
+    assert len(results) + len(refused) == 48
+    assert sum(alias == "solo" for alias, _revision in results) == 12
+    assert _authorize(components, issued.raw_key, "chat") == "rev-chat-2"
+    with sqlite3.connect(manager.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
     chat_revisions = {revision for alias, revision in results if alias == "chat"}
     solo_revisions = {revision for alias, revision in results if alias == "solo"}
     assert chat_revisions <= {"rev-chat-1", "rev-chat-2"}

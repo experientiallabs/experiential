@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from typing import Literal, Protocol, overload
 
 __version__: str
+MODEL_STAGE_CONTRACT_VERSION: int
 
 class _ControlPlane(Protocol):
     """The callback surface the data plane requires (see NativeControlPlane)."""

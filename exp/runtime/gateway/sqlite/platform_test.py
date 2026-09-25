@@ -18,6 +18,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
+from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.runtime.gateway import (
     ActivateAliasRevisionCommand,
     AttemptAccountingAuthority,
@@ -31,6 +32,8 @@ from exp.runtime.gateway import (
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
+    GatewayFailure,
+    GatewayFailureClass,
     GatewayMessage,
     GatewayPlatform,
     GatewayRequest,
@@ -66,6 +69,10 @@ from exp.runtime.gateway.sqlite.store import (
     GatewayStoreError,
     OperationConflictError,
     OperationReplayUnavailableError,
+)
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    ChainAttemptLedger,
+    ChainControlStore,
 )
 
 _DIGEST = "a" * 64
@@ -871,6 +878,199 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
                     sequence_number=0,
                 ),
             )
+        )
+
+
+def test_child_stage_reservation_replays_without_replacing_root_authority(tmp_path: Path) -> None:
+    """A child attempt persists destination facts once and retains its tenant-owned root."""
+    platform = _platform(tmp_path)
+
+    platform.control = ChainControlStore(platform.database_path)
+    platform.attempts = ChainAttemptLedger(platform.database_path)
+    platform.control.create_identity(
+        organization_id="org-one",
+        identity_id="builders",
+        display_name="Builders",
+    )
+    platform.control.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="catalog-one",
+        catalog_sha256=_DIGEST,
+    )
+    platform.control.activate_alias_revision(
+        organization_id="org-one",
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="alias-revision-one",
+        target=DirectTarget(pool_id="coding-pool"),
+        snapshot_ref="catalog-one",
+        catalog_sha256=_DIGEST,
+    )
+    platform.control.grant_alias(
+        organization_id="org-one",
+        identity_id="builders",
+        alias_id="coding",
+    )
+    key = platform.control.issue_virtual_key(
+        organization_id="org-one",
+        identity_id="builders",
+        key_id="builders-key",
+    )
+    with platform.control._transaction() as connection:
+        connection.execute(
+            """CREATE TABLE test_chain_floors (organization_id TEXT, alias_id TEXT,
+            revision_id TEXT, digest TEXT, epoch INTEGER NOT NULL, catalog TEXT NOT NULL,
+            PRIMARY KEY(organization_id,alias_id))"""
+        )
+        connection.execute(
+            "INSERT INTO test_chain_floors VALUES(?,?,?,?,?,?)",
+            ("org-one", "coding", "alias-revision-one", _DIGEST, 1, "{}"),
+        )
+    authorization = platform.control.authorize_request(
+        raw_key=key.raw_key,
+        alias="coding",
+        request=GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="bounded request"),),
+            maximum_output_tokens=16,
+        ),
+        deadline_monotonic=10**9,
+    )
+    platform.attempts.accept_request(authorization=authorization)
+    snapshot = ExecutionSnapshot(
+        authorization=authorization,
+        exact_model_id="exact-coding",
+        pool_id="coding-pool",
+        deployment_ids=("deployment-one", "deployment-child"),
+        model_stages=(
+            ModelExecutionStage(
+                stage_index=0,
+                exact_model_id="exact-coding",
+                pool_id="coding-pool",
+                deployment_ids=("deployment-one",),
+            ),
+            ModelExecutionStage(
+                stage_index=1,
+                exact_model_id="exact-child",
+                pool_id="child-pool",
+                deployment_ids=("deployment-child",),
+                ancestry=("exact-coding",),
+            ),
+        ),
+    )
+    frozen_snapshot = snapshot.model_dump_json()
+    root_deployment = ExactModelDeployment(
+        deployment_id="deployment-one",
+        source_alias="deployment-one",
+        exact_model_id="exact-coding",
+        connection="openai",
+        provider="openai",
+        provider_model="gpt-test",
+        connection_sha256="b" * 64,
+        capabilities_sha256="c" * 64,
+        gateway=GatewayDeploymentMetadata(
+            prices=GatewayTokenPrices(
+                input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=1_000_000,
+            )
+        ),
+    )
+    root_request = AttemptReservationRequest(
+        organization_id="org-one",
+        snapshot=snapshot,
+        deployment=root_deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=100,
+    )
+    root = platform.reserve_attempt(root_request)
+    assert platform.reserve_attempt(root_request) == root
+    platform.settle_attempt(
+        AttemptSettlementRequest(
+            organization_id="org-one",
+            attempt_id=root.attempt_id,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.TRANSPORT,
+                safe_message="Root deployment unavailable",
+                failover_eligible=True,
+            ),
+            finalize_request=False,
+        )
+    )
+    child_request = AttemptReservationRequest(
+        organization_id="org-one",
+        snapshot=snapshot,
+        deployment=root_deployment.model_copy(
+            update={
+                "deployment_id": "deployment-child",
+                "source_alias": "deployment-child",
+                "exact_model_id": "exact-child",
+                "provider_model": "gpt-child",
+            }
+        ),
+        attempt_ordinal=1,
+        route_depth=1,
+        maximum_cost_nano_usd=100,
+    )
+    child = platform.reserve_attempt(child_request)
+    assert platform.reserve_attempt(child_request) == child
+    assert child.attempt_id != root.attempt_id
+    assert (root.pool_id, root.exact_model_id) == ("coding-pool", "exact-coding")
+    assert (child.pool_id, child.exact_model_id) == ("child-pool", "exact-child")
+    assert child.request_id == root.request_id == authorization.request_id
+    assert child.alias_id == root.alias_id == "coding"
+    assert child.alias_revision_id == root.alias_revision_id == authorization.alias_revision_id
+    assert child.catalog_sha256 == root.catalog_sha256 == _DIGEST
+    assert child.identity_id == root.identity_id == authorization.identity_id
+    assert child.organization_id == root.organization_id == "org-one"
+    assert snapshot.model_dump_json() == frozen_snapshot
+    assert child_request.snapshot.authorization == authorization
+
+    changed_authority = snapshot.model_copy(
+        update={"authorization": authorization.model_copy(update={"identity_id": "other"})}
+    )
+    with pytest.raises(ValueError, match="differs from durable accounting input"):
+        platform.reserve_attempt(child_request.model_copy(update={"snapshot": changed_authority}))
+    changed_tenant = snapshot.model_copy(
+        update={"authorization": authorization.model_copy(update={"organization_id": "org-two"})}
+    )
+    with pytest.raises(ValueError, match="authority differs from accepted request"):
+        platform.reserve_attempt(
+            AttemptReservationRequest(
+                organization_id="org-two",
+                snapshot=changed_tenant,
+                deployment=child_request.deployment,
+                attempt_ordinal=1,
+                route_depth=1,
+                maximum_cost_nano_usd=100,
+            )
+        )
+    settlement = platform.settle_attempt(
+        AttemptSettlementRequest(
+            organization_id="org-one",
+            attempt_id=child.attempt_id,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=0,
+                usage=GatewayUsage(input_tokens=10, output_tokens=5),
+            ),
+        )
+    )
+    assert settlement.reservation == child
+    assert settlement.settled_nano_usd == 15
+    assert platform.reserve_attempt(child_request) == child
+    with sqlite3.connect(platform.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (2,)
+        assert connection.execute(
+            "SELECT organization_id, identity_id, key_id, alias_id, alias_revision_id "
+            "FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone() == (
+            "org-one",
+            "builders",
+            "builders-key",
+            "coding",
+            "alias-revision-one",
         )
 
 

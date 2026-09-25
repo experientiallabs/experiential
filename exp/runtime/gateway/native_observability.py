@@ -230,4 +230,6 @@ class NativeObservabilityMixin:
             JSON object reporting the number of connections closed.
         """
         del argument
+        if isinstance(self._components.ledger, SQLiteAttemptLedger):
+            self._components.ledger.classification_memo.clear()
         return json.dumps({"closed_connections": close_idle_connections()}, separators=(",", ":"))

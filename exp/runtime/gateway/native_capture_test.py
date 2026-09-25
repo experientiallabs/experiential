@@ -1,15 +1,20 @@
 """Shared native capture contracts and real-socket serving isolation."""
 
 import json
+import socket
+import sqlite3
 import sys
 import threading
-from http.server import ThreadingHTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
+from websockets.sync.client import ClientConnection, connect
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.capture_context import capture_context_document, restore_capture_context
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -30,6 +35,7 @@ from exp.runtime.gateway.tests.launch_test import (
     _unused_port,
     _wait_ready,
 )
+from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk
 from exp.runtime.openai_protocol.requests import decode_chat
 
 native = pytest.importorskip("exp_gateway_native")
@@ -849,3 +855,214 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     assert "provider-secret" not in encoded_records
     assert raw_key not in encoded_records
     assert "do-not-capture-me" not in encoded_records
+
+
+@pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages", "responses-ws"])
+@pytest.mark.parametrize("ending", ["disconnect", "deadline"])
+@pytest.mark.parametrize("retention", ["discard", "prompt", "response"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_pending_checkpoint_does_not_pin_transport_or_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    ending: str,
+    retention: str,
+    asynchronous: bool,
+) -> None:
+    """A refused sink keeps capture ownership, not the request's transport or reserved attempt."""
+    provider_closed, write_attempted, allow_write, settled = (threading.Event() for _ in range(4))
+    calls: list[str] = []
+
+    class Provider(BaseHTTPRequestHandler):
+        """Keep a committed stream open until the gateway closes its physical socket."""
+
+        def do_POST(self) -> None:  # noqa: N802 - standard HTTP handler contract.
+            """Emit visible commitment repeatedly so transport closure is observable."""
+            self.rfile.read(int(self.headers["content-length"]))
+            calls.append(self.path)
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(_content_chunk("checkpoint-visible"))
+                    self.wfile.flush()
+                    time.sleep(0.01)
+            except OSError:
+                provider_closed.set()
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "checkpoint-test-only")
+    manager, raw_key = _configure_gateway(
+        tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
+    )
+    components = load_gateway_components(tmp_path)
+    records: list[str] = []
+
+    def persist(value: str) -> None:
+        """Refuse acknowledgement until the test has proven bounded request completion."""
+        write_attempted.set()
+        if not allow_write.is_set():
+            raise RuntimeError("synthetic destination unavailable")
+        CaptureRecord.model_validate_json(value)
+        records.append(value)
+
+    configuration = CaptureConfiguration(
+        asynchronous_delivery=asynchronous,
+        delivery=CaptureDeliveryLimits(maximum_records=1),
+    )
+    collector = native.CaptureCollector(configuration.model_dump_json(), persist)
+    if asynchronous:
+        # Queue-only mode advances after admission, so occupy its sole delivery slot
+        # to test a cancellable checkpoint capacity wait rather than an ordinary stream timeout.
+        assert collector.begin(_request_json())
+        collector.settle("request", True, False)
+        assert write_attempted.wait(2)
+    capture = CaptureController(collector, application_for=lambda _auth: "checkpoint-test")
+    control = NativeControlPlane(components, capture=capture, request_timeout_seconds=1.5)
+    admit, settle = control.admit, control.settle
+    settlements: list[JsonObject] = []
+
+    def funded_admit(argument: str) -> str:
+        """Mark only this loopback fixture host-funded, leaving exact admission facts intact."""
+        value = json.loads(admit(argument))
+        for wire in value["route"]:
+            wire["billing_customer_managed"] = False
+        return json.dumps(value)
+
+    def record_settlement(argument: str) -> str:
+        """Observe real durable completion then deny response capture without blocking the sink."""
+        result = settle(argument)
+        value = json.loads(argument)
+        settlements.append(value)
+        collector.settle(value["request_id"], retention != "discard", retention == "response")
+        settled.set()
+        return result
+
+    monkeypatch.setattr(control, "admit", funded_admit)
+    monkeypatch.setattr(control, "settle", record_settlement)
+    port, shutdown = _unused_port(), native.shutdown_handle()
+    errors: list[BaseException] = []
+
+    def serve() -> None:
+        """Serve with one permit so a blocked request owner cannot hide behind spare capacity."""
+        try:
+            serve_native_gateway(
+                control,
+                host="127.0.0.1",
+                port=port,
+                capture=collector,
+                shutdown=shutdown,
+                max_active_requests=1,
+                graceful_timeout_seconds=0.2,
+            )
+        except BaseException as error:  # noqa: BLE001 - propagate serving failures.
+            errors.append(error)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    client: socket.socket | None = None
+    ws: ClientConnection | None = None
+    try:
+        _wait_ready(port, worker)
+        payload: JsonObject = {"model": "coding", "stream": True}
+        if surface in {"responses", "responses-ws"}:
+            payload["input"] = "capture checkpoint"
+        else:
+            payload["messages"] = [{"role": "user", "content": "capture checkpoint"}]
+        if surface == "messages":
+            payload["max_tokens"] = 64
+        if surface == "responses-ws":
+            ws = connect(
+                f"ws://127.0.0.1:{port}/v1/responses",
+                additional_headers={"authorization": f"Bearer {raw_key}"},
+                close_timeout=0.2,
+            )
+            ws.send(json.dumps({"type": "response.create", **payload}))
+        else:
+            body = json.dumps(payload).encode()
+            client = socket.create_connection(("127.0.0.1", port), timeout=5)
+            client.sendall(
+                (
+                    f"POST /v1/{surface} HTTP/1.1\r\nHost: localhost\r\n"
+                    f"Authorization: Bearer {raw_key}\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+                ).encode()
+                + body
+            )
+        assert write_attempted.wait(3)
+        if asynchronous:
+            until = time.monotonic() + 2
+            while not calls and time.monotonic() < until:
+                time.sleep(0.01)
+            assert len(calls) == 1
+            if ws is not None:
+                with pytest.raises(TimeoutError):
+                    ws.recv(timeout=0.1)
+            else:
+                assert client is not None
+                client.settimeout(0.1)
+                with pytest.raises(TimeoutError):
+                    client.recv(1)
+            count, retained, *_ = collector.counts()
+            assert count == 1 and retained <= configuration.delivery.maximum_bytes
+        if ws is not None:
+            ws.send(json.dumps({"type": "response.create", "model": "coding", "input": "queued"}))
+        if ending == "disconnect":
+            if ws is not None:
+                ws.close()
+            else:
+                assert client is not None
+                client.shutdown(socket.SHUT_RDWR)
+                client.close()
+                client = None
+        assert provider_closed.wait(4), "capture acknowledgement pinned the upstream transport"
+        assert settled.wait(4), "capture acknowledgement pinned durable attempt settlement"
+        assert len(calls) == 1 and settlements
+        # Cancellation may interrupt a delivered callback and replay its identical decision.
+        assert all(value == settlements[0] for value in settlements)
+        assert settlements[0]["attempt_id"] and settlements[0]["opened"] is True
+        columns = (
+            "attempt_id, state, input_tokens, output_tokens, usage_source, "
+            "estimated_cost_nano_usd, budget_settled_nano_usd"
+        )
+        with sqlite3.connect(manager.database_path) as connection:
+            rows = connection.execute(f"SELECT {columns} FROM gateway_attempts").fetchall()
+        assert len(rows) == 1 and rows[0][:2] == (settlements[0]["attempt_id"], "cancelled")
+        assert rows[0][2] > 0 and rows[0][3] > 0 and rows[0][4] == "estimated"
+        assert not records
+        assert not collector.close(0) and not collector.close(0)
+        shutdown.request_shutdown()
+        worker.join(2)
+        assert not worker.is_alive(), "capture retry pinned runtime shutdown"
+        allow_write.set()
+        assert collector.close(3)
+        own_records = [
+            value
+            for value in records
+            if json.loads(value)["request"]["request_id"] == settlements[0]["request_id"]
+        ]
+        assert len(own_records) == (1 if retention == "discard" else 2)
+        assert len(records) == len(own_records) + int(asynchronous)
+        assert all(value == settlements[0] for value in settlements) and len(calls) == 1
+        with sqlite3.connect(manager.database_path) as connection:
+            assert connection.execute(f"SELECT {columns} FROM gateway_attempts").fetchall() == rows
+        saved = CaptureRecord.model_validate_json(own_records[0])
+        assert saved.schema_version == 1 and saved.response is None
+    finally:
+        allow_write.set()
+        if ws is not None:
+            ws.close()
+        if client is not None:
+            client.close()
+        shutdown.request_shutdown()
+        worker.join(5)
+        collector.close(3)
+        if components.write_ledger is not None:
+            components.write_ledger.close()
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(3)
+    assert not errors

@@ -10,6 +10,7 @@ results, and plans do not live here.
 | `usage.md` | CLI map for build, bounded optimize model, optimize router, run, config, login, and foreground macOS capture. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
+| `reference/model-chains.md` | Ordered cross-model stages, mandatory hosted authority, bounded recovery and unsupported local-chain serving. |
 | `reference/chat-logprobs.md` | Verified Chat probability admission, token records, and guardrail boundaries. |
 | `reference/responses-logprobs.md` | Native Responses probability selectors, lifecycle phases, and continuation behavior. |
 | `reference/gateway-request-policy.md` | Per-request retry bounds, backoff, opaque route selection, replay and physical-attempt accounting. |

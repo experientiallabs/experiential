@@ -41,6 +41,7 @@ from exp.runtime.gateway.guardrails.native import (
     enforce_native_output_segment,
     native_output_mode,
 )
+from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -108,6 +109,7 @@ from exp.runtime.gateway.native_reasoning import (
     strip_stale_reasoning_history,
     unseal_reasoning_history,
 )
+from exp.runtime.gateway.native_replay import replay_scope_payload
 from exp.runtime.gateway.native_request_policy import require_route_authority
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
@@ -125,6 +127,8 @@ from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
+from exp.runtime.gateway.recovery import RecoveryHost
+from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.request_policy import attempt_policy
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
@@ -145,11 +149,7 @@ from exp.runtime.openai_protocol.errors import (
     public_failure_error,
 )
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
-from exp.runtime.openai_protocol.state import (
-    BoundedContinuationStore,
-    ProtocolNamespace,
-    replay_key,
-)
+from exp.runtime.openai_protocol.state import BoundedContinuationStore
 
 _logger = logging.getLogger(__name__)
 
@@ -186,6 +186,7 @@ class NativeControlPlane(
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         cache_sample_gate: Callable[[str], bool] | None = None,
+        recovery_host: RecoveryHost | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
         capture: CaptureController | None = None,
@@ -247,12 +248,12 @@ class NativeControlPlane(
         self._guardrail_detectors = deterministic.compile_native_detectors(
             {} if guardrails is None else guardrails.deterministic_specifications
         )
-        # The accounting registry owns in-flight requests, per-dispatch
-        # reservations, deployment-health circuits, and the deadline sweep.
+        # Shared accounting owns reservations, health, recovery and deadline cleanup.
         self._accounting = NativeAttemptAccounting(
             self._write_ledger,
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
+            recovery_host=recovery_host,
             default_lane_bound=default_lane_bound,
         )
         # Every reservation tokenizes its prompt; build the packaged BPE now so
@@ -322,6 +323,7 @@ class NativeControlPlane(
                 app_title=optional_text(data.get("app_title")),
                 client_ip=optional_text(data.get("client_ip")),
             )
+            authorization = authorize_serving_model_chains(self._components, authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)
@@ -704,8 +706,24 @@ class NativeControlPlane(
                 ),
                 reserved_output_tokens_by_depth=tuple(output_bounds),
                 affinity_fingerprint=placement.fingerprint,
+                verified_warm_deployment_id=placement.verified_warm_deployment_id,
+                verified_warm_until_monotonic=placement.verified_warm_until_monotonic,
+                recovery_scoped=placement.recovery_scoped,
                 sticky_preferred=placement.sticky_preferred,
                 throttle_redial_budgets=redial_budgets,
+                recovery_reason=placement.recovery_reason,
+                recovery_bindings={
+                    deployment.deployment_id: binding
+                    for deployment, (profile, _) in zip(
+                        route.deployments, resolved_wires, strict=True
+                    )
+                    if (
+                        binding := validated_recovery_binding(
+                            deployment, profile, authorization.organization_id
+                        )
+                    )
+                    is not None
+                },
                 resolved_wires=None if tool_search_state is None else tuple(resolved_wires),
                 public_request=None if tool_search_state is None else public_request,
                 tool_search=tool_search_state,
@@ -878,6 +896,7 @@ class NativeControlPlane(
                 app_referer=optional_text(data.get("app_referer")),
                 app_title=optional_text(data.get("app_title")),
             )
+            authorization = authorize_serving_model_chains(self._components, authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
         if isinstance(authorization.target, DirectTarget):
@@ -888,34 +907,7 @@ class NativeControlPlane(
                 return _escalation(str(exc))
             except Exception:  # noqa: BLE001 - the owner's admission records this failure.
                 pass
-        key = replay_key(
-            namespace=ProtocolNamespace(
-                organization_id=authorization.organization_id,
-                identity_id=authorization.identity_id,
-                alias_revision_id=authorization.alias_revision_id,
-            ),
-            surface=request.surface,
-            caller_operation=caller_operation,
-            canonical_request_sha256=authorization.canonical_request_sha256,
-        )
-        if key is None:  # pragma: no cover - caller_operation is checked above.
-            raise NativeBridgeError(
-                OpenAIProtocolError(
-                    status_code=500,
-                    code="internal_error",
-                    message="The gateway request failed.",
-                    error_type="api_error",
-                )
-            )
-        scope: JsonObject = {
-            "organization_id": key.namespace.organization_id,
-            "identity_id": key.namespace.identity_id,
-            "alias_revision_id": key.namespace.alias_revision_id,
-            "surface": key.surface.value,
-            "caller_operation_sha256": key.caller_operation_sha256,
-            "canonical_request_sha256": key.canonical_request_sha256,
-        }
-        return json.dumps(scope, separators=(",", ":"))
+        return replay_scope_payload(authorization, request)
 
     def remember(self, argument: str) -> str:
         """Retain one finished Responses continuation within strict bounds.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -24,12 +24,21 @@ from exp.runtime.gateway.contracts import (
     ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
-    GatewayEventKind,
     GatewayFailure,
-    GatewayFailureClass,
-    GatewayUsage,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.ledger_errors import (
+    AttemptRejectedError as AttemptRejectedError,
+)
+from exp.runtime.gateway.ledger_errors import (
+    GatewayLedgerError as GatewayLedgerError,
+)
+from exp.runtime.gateway.ledger_errors import (
+    IdempotencyConflictError as IdempotencyConflictError,
+)
+from exp.runtime.gateway.ledger_errors import (
+    IdempotencyReplayUnavailableError as IdempotencyReplayUnavailableError,
+)
 from exp.runtime.gateway.ledger_usage import (
     BillingSourceUsage,
     IdentityUsage,
@@ -37,66 +46,27 @@ from exp.runtime.gateway.ledger_usage import (
     billing_source_usage_rows,
     identity_usage_rows,
 )
-from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int, settle_pricing
+from exp.runtime.gateway.ledger_valuation import (
+    budget_settlement_nano_usd,
+    frozen_usage_cost,
+    observed_usage_cost,
+    optional_int,
+    usage_source_label,
+)
+from exp.runtime.gateway.ledger_valuation import terminal_values as _terminal_values
+from exp.runtime.gateway.model_chain_authority import (
+    ChainOperation,
+    LocalSnapshotMemoOwner,
+    SnapshotClassificationMemo,
+    SQLiteChainPreflight,
+    prepare_sqlite_chain_authority,
+    serving_snapshot_limit,
+)
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 
-class GatewayLedgerError(ValueError):
-    """A request or attempt transition violates the content-free ledger contract."""
-
-
-class AttemptRejectedError(GatewayLedgerError):
-    """A typed pre-dispatch rejection raised by ``start_attempt``.
-
-    The rejected reservation wrote nothing durable, so the executor must not
-    latch accounting health, must not dispatch a provider, and must not advance
-    the fallback waterfall; the exception reaches the protocol boundary
-    unchanged so the rejection keeps its own public error shape. ``failure`` is
-    the sanitized failure that settles the already-accepted parent request.
-    """
-
-    def __init__(self, message: str, *, failure: GatewayFailure) -> None:
-        """Retain the internal message and the sanitized settlement failure.
-
-        Args:
-            message: Internal diagnostic message, never shown to callers.
-            failure: Sanitized failure persisted on the accepted request and,
-                absent a more specific boundary mapping, shown to the caller.
-        """
-        super().__init__(message)
-        self.failure = failure
-
-
-class IdempotencyConflictError(AttemptRejectedError):
-    """A caller operation key was reused with different canonical request content."""
-
-    def __init__(self, message: str) -> None:
-        """Retain the message with the canonical caller-error settlement shape."""
-        super().__init__(
-            message,
-            failure=GatewayFailure(
-                failure_class=GatewayFailureClass.INVALID_REQUEST,
-                safe_message="caller operation key was reused with different request content",
-            ),
-        )
-
-
-class IdempotencyReplayUnavailableError(AttemptRejectedError):
-    """A completed or accepted keyed request exists but its content cannot be replayed."""
-
-    def __init__(self, message: str) -> None:
-        """Retain the message with the canonical replay-loss settlement shape."""
-        super().__init__(
-            message,
-            failure=GatewayFailure(
-                failure_class=GatewayFailureClass.INTERNAL,
-                safe_message="completed keyed result is unavailable for durable replay",
-            ),
-        )
-
-
-class SQLiteAttemptLedger:
+class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
     """Durable content-free attempt ledger sharing the gateway control database."""
 
     def __init__(
@@ -105,6 +75,8 @@ class SQLiteAttemptLedger:
         *,
         clock: GatewayClock | None = None,
         busy_timeout_ms: int = 5_000,
+        serving_snapshot_max_bytes: int | None = None,
+        classification_memo: SnapshotClassificationMemo | None = None,
     ) -> None:
         """Initialize a ledger on an existing or new gateway database.
 
@@ -112,11 +84,53 @@ class SQLiteAttemptLedger:
             database_path: Shared gateway SQLite path.
             clock: Injectable wall and monotonic clock.
             busy_timeout_ms: Maximum SQLite lock wait.
+            serving_snapshot_max_bytes: Per-file serving bound, default 64 MiB; no settings lookup.
+            classification_memo: Borrowed composition memo; omitted creates a private close owner.
         """
+        self._bind_classification_memo(classification_memo)
+        self.serving_snapshot_max_bytes = serving_snapshot_limit(serving_snapshot_max_bytes)
         self.database_path = database_path
         self._clock = SystemGatewayClock() if clock is None else clock
         self._busy_timeout_ms = busy_timeout_ms
         initialize_database(database_path, busy_timeout_ms=busy_timeout_ms)
+
+    @contextmanager
+    def prepare_chain_authority(
+        self,
+        authorization: AuthorizationSnapshot,
+        operation: ChainOperation,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> Iterator[SQLiteChainPreflight | None]:
+        """Classify before BEGIN, borrowing the writer's connection when supplied."""
+        with (
+            self._connect() if connection is None else nullcontext(connection) as connection,
+            prepare_sqlite_chain_authority(
+                connection,
+                authorization.organization_id,
+                authorization.alias_revision_id,
+                request_id=authorization.request_id,
+                operation=operation,
+                maximum_bytes=self.serving_snapshot_max_bytes,
+                remaining_seconds=authorization.deadline_monotonic - self._clock.monotonic(),
+                classification_memo=self.classification_memo,
+            ) as proof,
+        ):
+            yield proof
+
+    def _require_chain_authority(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        authorization: AuthorizationSnapshot,
+        chain_preflight: SQLiteChainPreflight | None,
+        operation: ChainOperation,
+        staged: bool = False,
+    ) -> None:
+        """Require a live preflight and fence policy at the atomic write boundary."""
+        SQLiteChainPreflight.require_ledger(
+            connection, authorization, chain_preflight, operation, staged=staged
+        )
 
     @property
     def busy_timeout_ms(self) -> int:
@@ -133,25 +147,39 @@ class SQLiteAttemptLedger:
             IdempotencyConflictError: The caller operation exists for another request.
             IdempotencyReplayUnavailableError: The matching operation already exists.
         """
-        with self._transaction() as connection:
-            self.apply_accept_request(connection, authorization=authorization)
+        with (
+            self._connect() as connection,
+            self.prepare_chain_authority(authorization, "accept", connection=connection) as proof,
+            self._transaction(connection=connection),
+        ):
+            self.apply_accept_request(
+                connection, authorization=authorization, chain_preflight=proof
+            )
 
     def apply_accept_request(
         self,
         connection: sqlite3.Connection,
         *,
         authorization: AuthorizationSnapshot,
+        chain_preflight: SQLiteChainPreflight | None = None,
     ) -> None:
         """Run the acceptance write inside the caller's open write transaction.
 
         Args:
             connection: Open write transaction owned by the caller.
             authorization: Frozen authority and request identity.
+            chain_preflight: Exact live pre-BEGIN proof; missing or closed proof is refused.
 
         Raises:
             IdempotencyConflictError: The caller operation exists for another request.
             IdempotencyReplayUnavailableError: The matching operation already exists.
         """
+        self._require_chain_authority(
+            connection,
+            authorization=authorization,
+            chain_preflight=chain_preflight,
+            operation="accept",
+        )
         now = self._clock.now()
         remaining = max(0.0, authorization.deadline_monotonic - self._clock.monotonic())
         deadline_at = now + timedelta(seconds=remaining)
@@ -260,9 +288,16 @@ class SQLiteAttemptLedger:
         Returns:
             Stable new attempt ID.
         """
-        with self._transaction() as connection:
+        with (
+            self._connect() as connection,
+            self.prepare_chain_authority(
+                snapshot.authorization, "reserve", connection=connection
+            ) as proof,
+            self._transaction(connection=connection),
+        ):
             return self.apply_start_attempt(
                 connection,
+                chain_preflight=proof,
                 snapshot=snapshot,
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
@@ -280,6 +315,7 @@ class SQLiteAttemptLedger:
         self,
         connection: sqlite3.Connection,
         *,
+        chain_preflight: SQLiteChainPreflight | None = None,
         snapshot: ExecutionSnapshot,
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
@@ -296,6 +332,7 @@ class SQLiteAttemptLedger:
 
         Args:
             connection: Open write transaction owned by the caller.
+            chain_preflight: Exact live pre-BEGIN proof; missing or closed proof is refused.
             snapshot: Route-bound immutable request plan.
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
@@ -311,6 +348,13 @@ class SQLiteAttemptLedger:
         Returns:
             Stable new attempt ID.
         """
+        self._require_chain_authority(
+            connection,
+            authorization=snapshot.authorization,
+            staged=bool(snapshot.model_stages),
+            chain_preflight=chain_preflight,
+            operation="reserve",
+        )
         # The in-process SQLite mirror carries no promo / rate-limit token
         # columns, so the reservations are accepted for Protocol parity and
         # dropped here; the platform's Postgres ledger stores and counts them.
@@ -320,8 +364,14 @@ class SQLiteAttemptLedger:
                 raise GatewayLedgerError("route context must be a short display-safe code")
         if deployment.deployment_id not in snapshot.deployment_ids:
             raise GatewayLedgerError("attempt deployment is absent from the execution snapshot")
-        if deployment.exact_model_id != snapshot.exact_model_id:
-            raise GatewayLedgerError("attempt deployment changes the selected exact model")
+        stage = snapshot.stage_for_depth(route_depth)
+        if (
+            deployment.deployment_id != snapshot.deployment_ids[route_depth]
+            or deployment.deployment_id not in stage.deployment_ids
+        ):
+            raise GatewayLedgerError("attempt deployment differs from its authorized stage cursor")
+        if deployment.exact_model_id != stage.exact_model_id:
+            raise GatewayLedgerError("attempt deployment changes the selected stage exact model")
         if (
             preferred_deployment is not None
             and preferred_deployment.deployment_id == deployment.deployment_id
@@ -340,7 +390,7 @@ class SQLiteAttemptLedger:
         period_start = budget_period_start(current_budget_period(now))
         request = connection.execute(
             """
-            SELECT organization_id, identity_id, alias_id, terminal_state
+            SELECT organization_id, identity_id, alias_id, alias_revision_id, terminal_state
             FROM gateway_requests
             WHERE request_id = ?
             """,
@@ -348,7 +398,11 @@ class SQLiteAttemptLedger:
         ).fetchone()
         if request is None:
             raise GatewayLedgerError("attempt request was not durably accepted")
-        if str(request["organization_id"]) != snapshot.authorization.organization_id:
+        if (
+            str(request["organization_id"]) != snapshot.authorization.organization_id
+            or str(request["identity_id"]) != snapshot.authorization.identity_id
+            or str(request["alias_revision_id"]) != snapshot.authorization.alias_revision_id
+        ):
             raise GatewayLedgerError("attempt authority differs from accepted request")
         if request["terminal_state"] is not None:
             raise GatewayLedgerError("attempt request is already terminal")
@@ -385,8 +439,8 @@ class SQLiteAttemptLedger:
                 route_depth,
                 deployment.deployment_id,
                 deployment.provider,
-                snapshot.exact_model_id,
-                snapshot.pool_id,
+                stage.exact_model_id,
+                stage.pool_id,
                 snapshot.authorization.catalog_sha256,
                 deployment.billing_source.value,
                 deployment.gateway.pricing_source,
@@ -468,7 +522,10 @@ class SQLiteAttemptLedger:
             organization_id=snapshot.authorization.organization_id,
             identity_id=str(request["identity_id"]),
             alias_id=str(request["alias_id"]),
-            pool_id=snapshot.pool_id,
+            pool_id=stage.pool_id,
+            root_pool_id=snapshot.pool_id,
+            request_id=snapshot.authorization.request_id,
+            alias_revision_id=snapshot.authorization.alias_revision_id,
             deployment_id=deployment.deployment_id,
             attempt_id=attempt_id,
             period_start=period_start,
@@ -595,33 +652,11 @@ class SQLiteAttemptLedger:
             if current_state == state:
                 return
             raise GatewayLedgerError("attempt is already settled with another terminal state")
-        # Both published tier schedules reprice the WHOLE request once
-        # provider-reported input tokens reach the frozen threshold, so the
-        # tier's rates replace the base rates rather than composing with them.
-        threshold = optional_int(row["long_context_threshold_tokens"])
-        long_context = (
-            threshold is not None
-            and usage is not None
-            and usage.input_tokens is not None
-            and usage.input_tokens >= threshold
+        cost = observed_usage_cost(row, usage, terminal_event)
+        budget_settlement = budget_settlement_nano_usd(row, cost, usage, terminal_event)
+        usage_source = usage_source_label(
+            usage, estimated=terminal_event is not None and terminal_event.usage_estimated
         )
-        prefix = "long_context_" if long_context else ""
-        cost, budget_settlement, usage_source = settle_pricing(
-            row, usage, terminal_event, prefix=prefix
-        )
-        if row["api_surface"] == GatewayApiSurface.DECISIONS.value and cost is None:
-            # An unmetered decision can still have executed upstream. Keep the
-            # reservation held without inventing usage or a settled charge.
-            # Only a witnessed HTTP rejection proves that this hold can release.
-            rejected = (
-                terminal_event is not None
-                and terminal_event.kind is GatewayEventKind.FAILED
-                and terminal_event.decision_provider_rejected
-                and usage is None
-            )
-            budget_settlement = 0 if rejected else None
-        if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
-            raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
         # Price the same observed usage at the preferred rung's frozen base rates.
         # This is telemetry, not billing; missing rates remain unknown.
         counterfactual_cost = (
@@ -948,9 +983,11 @@ class SQLiteAttemptLedger:
             yield connection
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        """Run one explicit immediate transaction with rollback on failure."""
-        with self._connect() as connection:
+    def _transaction(
+        self, *, connection: sqlite3.Connection | None = None
+    ) -> Iterator[sqlite3.Connection]:
+        """Run an immediate transaction, optionally borrowing the preflight connection."""
+        with self._connect() if connection is None else nullcontext(connection) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 yield connection
@@ -959,37 +996,3 @@ class SQLiteAttemptLedger:
                 raise
             else:
                 connection.execute("COMMIT")
-
-
-def _terminal_values(
-    terminal_event: GatewayEvent | None,
-    failure: GatewayFailure | None,
-) -> tuple[str, str | None, str | None, GatewayUsage | None]:
-    """Normalize one finish call to state, failure class, message, and usage.
-
-    The failure message is the provider's own sanitized explanation
-    (``provider_detail``); it is present only for a client-error rejection and
-    is the same bounded, credential-free sentence the caller already receives.
-    """
-    event_failure = None if terminal_event is None else terminal_event.failure
-    normalized = failure or event_failure
-    if terminal_event is None and normalized is None:
-        raise GatewayLedgerError("attempt finish needs a terminal event or failure")
-    if terminal_event is not None and terminal_event.kind not in {
-        GatewayEventKind.COMPLETED,
-        GatewayEventKind.INCOMPLETE,
-        GatewayEventKind.FAILED,
-    }:
-        raise GatewayLedgerError("attempt finish event must be terminal")
-    if normalized is not None:
-        state = (
-            "cancelled" if normalized.failure_class == GatewayFailureClass.CANCELLED else "failed"
-        )
-        return (
-            state,
-            normalized.failure_class.value,
-            normalized.provider_detail,
-            (None if terminal_event is None else terminal_event.usage),
-        )
-    assert terminal_event is not None
-    return terminal_event.kind.value, None, None, terminal_event.usage

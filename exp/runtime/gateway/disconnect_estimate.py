@@ -23,6 +23,8 @@ from exp.runtime.gateway.native_settlement import (
     StreamedOutput,
     streamed_output_from_settlement,
     terminal_from_settlement,
+    tool_search_requests_from_settlement,
+    web_search_requests_from_settlement,
 )
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.rung_admission import RungLoadRegistry
@@ -39,6 +41,7 @@ def settled_terminal(
     data: JsonObject,
     entry: InflightRequest,
     *,
+    parsed: tuple[GatewayEvent, GatewayFailure | None] | None = None,
     loads: RungLoadRegistry | None = None,
 ) -> tuple[GatewayEvent, GatewayFailure | None]:
     """Build one in-flight request's terminal from its settlement, disconnect estimate applied.
@@ -51,14 +54,17 @@ def settled_terminal(
     Args:
         data: Parsed native settlement payload.
         entry: The owning in-flight request (its prompt and frozen surface).
+        parsed: Already validated terminal used to stamp receipt time before tokenization.
         loads: The rung load registry whose per-organization cached-fraction
-            EWMA (fed by this organization's own settled meters on the rung)
+            EWMA (fed by this organization's observed settled meters on the rung)
             fills an unreported cache leg; None prices the prompt fresh.
 
     Returns:
         The normalized terminal event and optional failure.
     """
-    terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
+    terminal, failure = parsed or terminal_from_settlement(
+        data, surface=entry.authorization.surface
+    )
     terminal = estimate_disconnect_usage(
         terminal,
         request=entry.request,
@@ -67,6 +73,17 @@ def settled_terminal(
         streamed=streamed_output_from_settlement(data),
         cached_fraction=_frozen_cached_fraction(data, loads, entry),
     )
+    if terminal.usage_estimated and terminal.usage is not None:
+        terminal = terminal.model_copy(
+            update={
+                "usage": terminal.usage.model_copy(
+                    update={
+                        "web_search_requests": web_search_requests_from_settlement(data),
+                        "tool_search_requests": tool_search_requests_from_settlement(data),
+                    }
+                )
+            }
+        )
     return terminal, failure
 
 
@@ -77,11 +94,13 @@ def _frozen_cached_fraction(
     attempt_id = data.get("attempt_id")
     if not isinstance(attempt_id, str):
         return 0.0
-    frozen = entry.estimated_cache_fractions.get(attempt_id)
-    if frozen is None:
-        frozen = _recent_cached_fraction(loads, entry, attempt_id)
-        entry.estimated_cache_fractions[attempt_id] = frozen
-    return frozen
+    with entry.execution_lock:
+        frozen = entry.estimated_cache_fractions.get(attempt_id)
+    if frozen is not None:
+        return frozen
+    observed = _recent_cached_fraction(loads, entry, attempt_id)
+    with entry.execution_lock:
+        return entry.estimated_cache_fractions.setdefault(attempt_id, observed)
 
 
 def _recent_cached_fraction(
@@ -113,8 +132,9 @@ def estimate_disconnect_usage(
     provider never answered has no billed work to estimate, a data plane that
     predates the evidence (or sent it malformed) leaves the meter unknown, and
     generated images are billed per image, so any image keeps the meter
-    unknown too. Decisions, embeddings, and image requests keep their own
-    contracts untouched.
+    unknown too. Each repair owns a separate reserved physical attempt, so
+    the estimate never includes or releases another attempt's liability.
+    Decisions, embeddings, and image requests keep their own contracts untouched.
 
     Args:
         terminal: The normalized cancelled terminal from the settlement.

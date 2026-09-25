@@ -235,8 +235,8 @@ def _process_reasoning_history(
             profile, _client = resolved[0]
             authority = reasoning_carrier_authority(
                 authorization=authorization,
-                exact_model_id=route.snapshot.exact_model_id,
-                pool_id=route.snapshot.pool_id,
+                exact_model_id=route.snapshot.stage_for_depth(0).exact_model_id,
+                pool_id=route.snapshot.stage_for_depth(0).pool_id,
                 deployment=route.deployment,
                 profile=profile,
                 scheme=scheme,

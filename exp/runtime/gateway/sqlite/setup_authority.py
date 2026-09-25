@@ -120,6 +120,7 @@ def configure_direct_alias_with_identity(
                 catalog_sha256=catalog_sha256,
                 now=now,
                 store_error=store._store_error,
+                maximum_bytes=store._serving_snapshot_max_bytes,
             )
             activate_alias_revision(
                 connection,
@@ -134,6 +135,7 @@ def configure_direct_alias_with_identity(
                 refusal_failover=False,
                 now=now,
                 store_error=store._store_error,
+                maximum_bytes=store._serving_snapshot_max_bytes,
             )
             connection.execute(
                 """

@@ -18,7 +18,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 use pyo3::prelude::*;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::PublicError;
 
@@ -28,6 +28,8 @@ struct Job {
     method: &'static str,
     argument: String,
     responder: oneshot::Sender<Result<String, PublicError>>,
+    // Cancellation of the awaiting request cannot release queued/running capacity.
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Bounded bridge to one Python `NativeControlPlane` instance.
@@ -74,9 +76,10 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
-        let _permit = self
+        let permit = self
             .permits
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| PublicError::internal())?;
         // Latency is measured from permit grant so it reflects the python
@@ -90,6 +93,7 @@ impl Bridge {
                         method,
                         argument,
                         responder,
+                        _permit: permit,
                     })
                     .is_ok(),
                 None => false,
@@ -222,6 +226,14 @@ class Plane:
         self.call_threads = set()
         self.closed_threads = []
         self.barrier = threading.Barrier(2, timeout=10.0)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def block(self, argument):
+        self.started.set()
+        if not self.release.wait(timeout=10.0):
+            raise RuntimeError("blocked callback was not released")
+        return argument
 
     def echo(self, argument):
         with self.lock:
@@ -307,6 +319,60 @@ class Plane:
         });
         assert_eq!(first.expect("first call succeeds"), "left");
         assert_eq!(second.expect("second call succeeds"), "right");
+    }
+
+    #[test]
+    fn cancelled_waiter_keeps_capacity_until_its_callback_finishes() {
+        let object = plane();
+        let observer = Python::attach(|py| object.clone_ref(py));
+        let bridge = Arc::new(Bridge::new(object, 1).expect("bridge starts"));
+        block_on(async {
+            let caller = bridge.clone();
+            let task = tokio::spawn(async move { caller.call("block", "first".into()).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let started = Python::attach(|py| {
+                        observer
+                            .bind(py)
+                            .getattr("started")
+                            .unwrap()
+                            .call_method0("is_set")
+                            .unwrap()
+                            .extract::<bool>()
+                            .unwrap()
+                    });
+                    if started {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("callback starts");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let free_while_running = bridge.permits.available_permits();
+            Python::attach(|py| {
+                observer
+                    .bind(py)
+                    .getattr("release")
+                    .unwrap()
+                    .call_method0("set")
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while bridge.permits.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completed callback releases capacity");
+            assert_eq!(
+                free_while_running, 0,
+                "the job, not its waiter, owns capacity"
+            );
+            assert_eq!(bridge.call("echo", "next".into()).await.unwrap(), "next");
+        });
     }
 
     #[test]

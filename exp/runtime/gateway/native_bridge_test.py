@@ -8,9 +8,13 @@ import logging
 import sqlite3
 import threading
 import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, cast
 from unittest import mock
+from uuid import uuid4
 
 import pytest
 
@@ -25,6 +29,11 @@ from exp.common.models.catalog import (
     GatewayRungDispatchPolicy,
     load_model_catalog,
     write_model_catalog,
+)
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.catalog_authority import (
@@ -41,6 +50,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
     LocalGatewayComponents,
@@ -56,12 +67,24 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_recovery import session_cache_key
+from exp.runtime.gateway.native_stage_admission_test import Host
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    chain_components,
+    publish_authored_chain_fixture,
+)
+from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
+from exp.runtime.models.credentials_test import AtomicEnvironment
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.instruction_turns import (
     HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
     SYSTEM_FOLD_DISCLOSURE,
 )
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -1047,6 +1070,218 @@ def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: P
     assert fallback_messages[2] == issuing_messages[2]
 
 
+def test_authenticated_child_reasoning_start_requires_fresh_host_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real child carrier does not authorize skipping root gates on the next request."""
+    manager, raw_key = _configured_pool_gateway(
+        tmp_path,
+        base_urls=("http://127.0.0.1:9/v1", "https://api.hunyuan.cloud.tencent.com/v1"),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ModelCapabilities(
+                supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+            ),
+        ),
+    )
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    models = dict(catalog.models)
+    beta = models["beta"]
+    assert beta.gateway is not None
+    models["beta"] = beta.model_copy(
+        update={"gateway": beta.gateway.model_copy(update={"exact_model_id": "child-exact"})}
+    )
+    chains = {
+        "model-revision-exact": GatewayModelChain(
+            model_id="model-revision-exact",
+            pool_id="alpha",
+            revision="root-chain",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="alpha"),
+                GatewayModelReferenceRung(model_id="child-exact"),
+            ),
+        ),
+        "child-exact": GatewayModelChain(
+            model_id="child-exact",
+            pool_id="beta",
+            revision="child-chain",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="beta"),
+                GatewayModelReferenceRung(model_id="model-revision-exact"),
+            ),
+        ),
+    }
+    write_model_catalog(
+        tmp_path / "models.toml",
+        catalog.model_copy(
+            update={
+                "models": models,
+                "gateway_pools": {},
+                "gateway_model_chains": chains,
+            }
+        ),
+    )
+    publish_authored_chain_fixture(tmp_path, revision_id="revision-child-carrier", pool_id="alpha")
+    components = chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-secret"})
+    control = NativeControlPlane(components)
+    initial = _admit(control, raw_key, _chat_body())
+    first = _start_first(control, initial)
+    assert first["route_depth"] == 0
+    failure = {
+        "failure_class": "provider_quota",
+        "safe_message": "account quota exhausted",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": failure,
+                "finalize": False,
+            }
+        )
+    )
+    child = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert child["route_depth"] == 1
+    wires = cast("list[JsonObject]", initial["route"])
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": 1,
+                    "route_sha256": wires[1]["hunyuan_reasoning_route_sha256"],
+                    "content": "authenticated child reasoning",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": child["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, body)
+    assert isinstance(refused.value.__cause__, GatewayRoutingError)
+    assert (
+        str(refused.value.__cause__) == "descendant reasoning start requires explicit authorization"
+    )
+    public_error = json.loads(refused.value.public_error_json)
+    assert public_error == {
+        "status_code": 400,
+        "code": "invalid_parameter",
+        "error_type": "invalid_request_error",
+        "param": "messages.reasoning_content",
+        "message": "'messages.reasoning_content' must be an authentic continuation for this route.",
+        "retry_after_seconds": None,
+    }
+    with sqlite3.connect(manager.database_path) as database:
+        assert database.execute("SELECT count(*) FROM gateway_requests").fetchone() == (1,)
+        assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (2,)
+        assert database.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
+        ).fetchone() == (0,)
+    host_store = components.store
+    original = host_store.authorize_request
+
+    def authorize_child_start(
+        *,
+        raw_key: str,
+        alias: str,
+        request: ServingRequest,
+        deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
+        client_ip: str | None = None,
+    ) -> AuthorizationSnapshot:
+        """Inject only this host's explicit preflight decision after ordinary authorization."""
+        authority = original(
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+            app_referer=app_referer,
+            app_title=app_title,
+            client_ip=client_ip,
+        )
+        assert authority.descendant_start_authorized is False
+        return authority.model_copy(update={"descendant_start_authorized": True})
+
+    monkeypatch.setattr(host_store, "authorize_request", authorize_child_start)
+    continued = _admit(control, raw_key, body)
+    continued_wires = cast("list[JsonObject]", continued["route"])
+    assert [wire["deployment_id"] for wire in continued_wires] == ["beta"]
+    assert "authenticated child reasoning" in json.dumps(continued_wires[0]["upstream_payload"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    started = _start_first(control, continued)
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    with sqlite3.connect(manager.database_path) as database:
+        assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (3,)
+        assert database.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
+        ).fetchone() == (0,)
+
+
 def _reasoning_failover_pool(
     root: Path,
     *,
@@ -1696,20 +1931,88 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
 
 
-def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
-    """An admitted request the data plane never settles is closed by the sweep."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=1.0)
-    with mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=100.0):
-        abandoned = _admit_started(control, raw_key, _chat_body())
+@pytest.mark.parametrize("setup_elapsed", [0.0, 60.0])
+def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
+    tmp_path: Path, setup_elapsed: float, request: pytest.FixtureRequest
+) -> None:
+    """Share one clock across authority, ledger and native deadlines, including late setup."""
+
+    class DeadlineClock:
+        """Advance both time domains together without changing shared system time or sleeping."""
+
+        elapsed = 0.0
+        epoch = datetime(2026, 9, 19, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            """Return the deterministic wall time paired with the current monotonic instant."""
+            return self.epoch + timedelta(seconds=self.elapsed)
+
+        def monotonic(self) -> float:
+            """Use a distinct epoch so any accidental system-clock comparison fails immediately."""
+            return 100.0 + self.elapsed
+
+    clock = DeadlineClock()
+    manager, raw_key = _configured_gateway(tmp_path)
+    loaded = load_gateway_components(
+        tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+    )
+    ledger = SQLiteAttemptLedger(manager.database_path, clock=clock)
+    writer = GroupCommitAttemptLedger(ledger)
+    request.addfinalizer(writer.close)
+    request.addfinalizer(loaded.write_ledger.close)
+    components = cast(
+        NativeGatewayComponents,
+        SimpleNamespace(
+            store=SQLiteGatewayStore(manager.database_path, clock=clock),
+            ledger=ledger,
+            write_ledger=writer,
+            routes=loaded.routes,
+            runtime_catalogs=loaded.runtime_catalogs,
+            organization_id=manager.organization_id,
+            reconciled_expired_requests=loaded.reconciled_expired_requests,
+            reconciled_unknown_attempts=loaded.reconciled_unknown_attempts,
+        ),
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=0.01)
+    native_time = mock.Mock(wraps=time)
+    native_time.monotonic.side_effect = clock.monotonic
+    # Only these module references are replaced. SQLite auth and settlement use
+    # their constructor clock; shared timer, health and group-commit time stays real.
     with (
-        mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=102.0),
+        mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
+        mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
     ):
+        clock.elapsed += setup_elapsed
+        abandoned = _admit_started(control, raw_key, _chat_body())
+        request_id = str(abandoned["request_id"])
+        entry = control._accounting.entry(request_id)  # noqa: SLF001
+        assert entry is not None and entry.active_attempt_id == abandoned["attempt_id"]
+        assert clock.monotonic() < entry.deadline_monotonic
+        clock.elapsed += 0.009
+        control._accounting.sweep_expired()  # noqa: SLF001
+        assert control._accounting.entry(request_id) is entry  # noqa: SLF001
+        clock.elapsed += 0.002 + setup_elapsed
+        assert clock.monotonic() > entry.deadline_monotonic
         second = _admit(control, raw_key, _chat_body())
-    assert control._accounting.entry(str(abandoned["request_id"])) is None  # noqa: SLF001
-    assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
-    report = json.loads(control.usage_json("{}"))
-    assert report["totals"]["requests"] == 2
+        assert control._accounting.entry(request_id) is None  # noqa: SLF001
+        assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
+        control._accounting.sweep_expired()  # noqa: SLF001
+        report = json.loads(control.usage_json("{}"))
+        assert report["totals"]["requests"] == 2
+        assert report["totals"]["terminal_counts"] == [{"state": "cancelled", "attempts": 1}]
+        metrics = control.metrics_snapshot()["control_plane"]
+        assert isinstance(metrics, dict)
+        assert metrics["sweep_abandoned_attempts_cancelled"] == 1
+        with sqlite3.connect(manager.database_path) as connection:
+            rows = connection.execute(
+                "SELECT accepted_at,deadline_at FROM gateway_requests ORDER BY accepted_at"
+            ).fetchall()
+        assert len(rows) == 2
+        for accepted_at, deadline_at in rows:
+            assert (datetime.fromisoformat(deadline_at) - datetime.fromisoformat(accepted_at)) == (
+                timedelta(milliseconds=10)
+            )
 
 
 @pytest.mark.parametrize(
@@ -2200,6 +2503,116 @@ def _pool_control_plane(
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
     return NativeControlPlane(components), raw_key
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("native_root", [False, True])
+def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
+    tmp_path: Path, staged: bool, native_root: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Actual admission freezes tool inversion alongside unchanged stage and replay authority."""
+
+    declared = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_streaming_tool_arguments=True
+    )
+    manager, raw_key = _configured_pool_gateway(tmp_path, gateway_capabilities=(declared, declared))
+    if staged:
+        catalog = load_model_catalog(tmp_path / "models.toml")
+        models = dict(catalog.models)
+        beta = models["beta"]
+        assert beta.gateway is not None
+        models["beta"] = beta.model_copy(
+            update={
+                "gateway": beta.gateway.model_copy(
+                    update={
+                        "exact_model_id": "child-exact",
+                        "capabilities": declared.model_copy(
+                            update={"failover_only_on": ("provider_internal",)}
+                        ),
+                    }
+                )
+            }
+        )
+        root = GatewayModelChain(
+            model_id="model-revision-exact",
+            pool_id="alpha",
+            revision="tools-stage",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="alpha"),
+                GatewayModelReferenceRung(model_id="child-exact"),
+            ),
+        )
+        write_model_catalog(
+            tmp_path / "models.toml",
+            catalog.model_copy(
+                update={
+                    "models": models,
+                    "gateway_pools": {},
+                    "gateway_model_chains": {root.model_id: root},
+                }
+            ),
+        )
+        publish_authored_chain_fixture(tmp_path, revision_id="tools-stage", pool_id="alpha")
+    original = OpenAICompatibleClient.gateway_wire_profile
+
+    def profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
+        """Give only the actual root fixture a native Responses dialect."""
+        resolved = original(client)
+        return (
+            replace(resolved, dialect="openai_responses")
+            if native_root and resolved.model_id == "alpha-model-exact"
+            else resolved
+        )
+
+    monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", profile)
+    components = (
+        chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+        if staged
+        else load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+    )
+    control = NativeControlPlane(components)
+    body: JsonObject = {
+        "model": "coding",
+        "input": "continue",
+        "stream": False,
+        "tools": [
+            {"type": "custom", "name": "apply_patch"},
+            {
+                "type": "namespace",
+                "name": "agents",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "close",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ],
+    }
+    canonical = decode_responses(body).request
+    digest = canonical_request_sha256(canonical)
+    admission = _admit(control, raw_key, json.dumps(body), surface="responses")
+    entry = control._accounting.entry(str(admission["request_id"]))
+    assert entry is not None
+    assert entry.authorization.canonical_request_sha256 == digest
+    assert canonical_request_sha256(canonical) == digest
+    assert canonical.native_tool_translation is None
+    wires = cast("list[JsonObject]", admission["route"])
+    assert [wire["deployment_id"] for wire in wires] == ["alpha", "beta"]
+    for wire in wires:
+        assert wire["native_tool_translation"] == {
+            "apply_patch": ["apply_patch", None, True],
+            "agents__close": ["close", "agents", False],
+        }
+        assert wire["exact_model_id"] == (
+            "child-exact" if staged and wire["deployment_id"] == "beta" else "model-revision-exact"
+        )
+        assert wire["failover_only_on"] == (
+            ["provider_internal"] if staged and wire["deployment_id"] == "beta" else None
+        )
+    assert bool(entry.route.snapshot.model_stages) is staged
+    assert _start_first(control, admission)["route_depth"] == 0
 
 
 def test_admit_returns_the_full_ordered_route_without_starting_attempts(
@@ -5762,7 +6175,9 @@ def test_internal_admission_failures_log_the_real_exception(
     assert fields["operation"] == "native_admit"
 
 
-def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, Path]:
+def _affinity_pool_control_plane(
+    root: Path, environment: dict[str, str] | None = None
+) -> tuple[NativeControlPlane, str, Path]:
     """Load the control plane over a pool opted into cache-affinity routing.
 
     Seeds the standard certified two-deployment pool, then authors the opt-in
@@ -5809,7 +6224,9 @@ def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, P
     )
     components = load_gateway_components(
         root,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        if environment is None
+        else environment,
     )
     return NativeControlPlane(components), raw_key, manager.database_path
 
@@ -5849,6 +6266,128 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
             (str(started["attempt_id"]),),
         ).fetchone()
     assert row == ("affinity", None)
+
+
+@pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])
+@pytest.mark.parametrize("known_region", [False, True], ids=["unknown-region", "known-region"])
+def test_bridge_carries_scoped_verified_warmth_to_registered_request(
+    tmp_path: Path, trial: bool, known_region: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real admission preserves proven warmth but unknown geography only serves normally."""
+
+    original_profile = OpenAICompatibleClient.gateway_wire_profile
+
+    def declared_profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
+        """Declare fixture topology without changing its actual endpoint or authentication."""
+        return replace(original_profile(client), operational_region="region")
+
+    if known_region:
+        monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", declared_profile)
+    environment = AtomicEnvironment(
+        CredentialResolution(
+            "provider-secret-canary", "environment", receipt=DispatchCredentialReceipt(uuid4())
+        )
+    )
+    control, raw_key, _database = _affinity_pool_control_plane(tmp_path, environment)
+    accounting = control._accounting  # noqa: SLF001 - inspect the native reservation boundary.
+    host = Host()
+    accounting.recovery_host = host
+    body = _chat_body()
+    initial = _admit(control, raw_key, body, client_request_id="warm-session")
+    original = accounting.entry(str(initial["request_id"]))
+    assert original is not None
+    key = session_cache_key(original)
+    assert key is not None
+    lead, fallback = original.route.deployments
+    if not known_region:
+        assert not original.recovery_bindings
+        # Even plausible cached history cannot prove this custom wire's region.
+        accounting.recovery.record_success(
+            key,
+            fallback.deployment_id,
+            host.scope_for(fallback, original.authorization.organization_id),
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+        admission = _admit(control, raw_key, body, client_request_id="warm-session")
+        entry = accounting.entry(str(admission["request_id"]))
+        assert entry is not None and entry.recovery_scoped
+        assert entry.route.deployments == original.route.deployments
+        assert not entry.recovery_bindings
+        assert entry.verified_warm_deployment_id is None and entry.recovery_reason is None
+        assert _start_first(control, admission)["route_depth"] == 0
+        return
+    assert all(
+        binding.scope.region_scope == "region" for binding in original.recovery_bindings.values()
+    )
+    for deployment in (lead, fallback) if trial else (fallback,):
+        accounting.recovery.record_success(
+            key,
+            deployment.deployment_id,
+            original.recovery_bindings[deployment.deployment_id].scope,
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+    if trial:
+        accounting.recovery.depart(
+            key,
+            lead.deployment_id,
+            original.recovery_bindings[lead.deployment_id].scope,
+            "local_capacity",
+            retry_after_seconds=0,
+        )
+        # Expire only the registry's local trial cooldown, not cache evidence.
+        accounting.recovery._clock = lambda: time.time() + 6  # noqa: SLF001
+    admission = _admit(control, raw_key, body, client_request_id="warm-session")
+    entry = accounting.entry(str(admission["request_id"]))
+    assert entry is not None and entry.recovery_scoped
+    expected = lead if trial else fallback
+    assert entry.route.deployment == expected
+    assert entry.verified_warm_deployment_id == expected.deployment_id
+    assert time.monotonic() < entry.verified_warm_until_monotonic
+    assert entry.recovery_reason == (
+        "recovered_preferred_route" if trial else "retained_warm_fallback"
+    )
+    assert accounting.sticky.size() == 0
+    started = _start_first(control, admission)
+    assert started["route_depth"] == 0
+    assert accounting.sticky.size() == 0
+
+
+def test_mutable_host_scope_without_atomic_credential_receipt_cannot_recover(
+    tmp_path: Path,
+) -> None:
+    """An uninstrumented environment serves normally but cannot borrow fabricated warmth."""
+    control, raw_key, _database = _affinity_pool_control_plane(tmp_path)
+    accounting = control._accounting
+    host = Host()
+    accounting.recovery_host = host
+    first = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
+    entry = accounting.entry(str(first["request_id"]))
+    assert entry is not None
+    assert not entry.recovery_bindings
+    key = session_cache_key(entry)
+    assert key is not None
+    fallback = entry.route.deployments[-1]
+    accounting.recovery.record_success(
+        key,
+        fallback.deployment_id,
+        host.scope_for(fallback, entry.authorization.organization_id),
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    second = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
+    next_entry = accounting.entry(str(second["request_id"]))
+    assert next_entry is not None
+    assert next_entry.route.deployment == entry.route.deployment
+    assert next_entry.verified_warm_deployment_id is None and next_entry.recovery_reason is None
+    assert _start_first(control, second)["route_depth"] == 0
 
 
 def test_foundry_deepseek_zero_argument_call_with_a_stray_empty_string_delta_completes() -> None:
