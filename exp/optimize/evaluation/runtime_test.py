@@ -1,6 +1,7 @@
 """Catalog-backed prepared evaluation through real simulator, LM judge and persisted reports."""
 
 import json
+import threading
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +23,7 @@ from exp.optimize.router.automatic.service_test import (
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
+from exp.simulation.engines.text import simulator
 
 
 @pytest.mark.parametrize("blank_worker", [False, True])
@@ -120,6 +122,60 @@ def test_unapproved_execution_precedes_credentials_and_writes(tmp_path: Path) ->
             code_revision=_REVISION,
         )
     assert before == (project.artifacts.list_ids(), state.credential_resolutions)
+
+
+def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parallel admission uses its request ledger and only retries the invalid cell."""
+    project, catalog, state, prepared = _prepare(tmp_path)
+    original_complete = _CompletionClient.complete
+    remaining_failure = [True]
+    lock = threading.Lock()
+
+    def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Reject one world-model transition, then allow its independent retry to finish."""
+        response = original_complete(client, request)
+        with lock:
+            if client._alias == "world" and remaining_failure[0]:
+                remaining_failure[0] = False
+                return response.model_copy(update={"output": AssistantAction(content="invalid")})
+        return response
+
+    def unexpected_rollout_scan(*args: object, **kwargs: object) -> float:
+        """Fail if per-request budgeting rereads the entire corpus to schedule a cell."""
+        pytest.fail("request-ledger admission must not reconcile every saved rollout")
+
+    monkeypatch.setattr(_CompletionClient, "complete", complete)
+    monkeypatch.setattr(simulator, "resolution_spend", unexpected_rollout_scan)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    budget = EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100)
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert not remaining_failure[0]
+    assert result.report.compared_cells == prepared.cost.scenario_count
+    assert all(row.quality == 1 for row in result.report.models)
+    workers = [alias for alias, _ in state.completion_calls if alias.startswith("candidate-")]
+    assert len(workers) == 7  # Six requested cells plus one infrastructure retry.
+    before = (len(state.completion_calls), len(state.embedding_calls))
+    replay = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert replay == result
+    assert before == (len(state.completion_calls), len(state.embedding_calls))
 
 
 def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(tmp_path: Path) -> None:

@@ -243,16 +243,18 @@ class WorldModelSimulator:
 
         observe_cells = cell_progress_reporter(self._progress, cells, completed)
         observe_cells()
-        workers = dispatch.worker_count(
-            spec,
-            pending,
-            self._completion_contract,
-            self._tasks,
-            resolution_spend(self._store, self._plan.cells, bindings, self._pins(resolution_input)),
-        )
-
         if self._request_budget is not None:
             workers = spec.maximum_concurrency
+        else:
+            workers = dispatch.worker_count(
+                spec,
+                pending,
+                self._completion_contract,
+                self._tasks,
+                resolution_spend(
+                    self._store, self._plan.cells, bindings, self._pins(resolution_input)
+                ),
+            )
 
         def execute(cell: EvaluationCell) -> RolloutArtifact:
             """Claim and persist a cell under the shared reservation ledger."""
@@ -575,8 +577,12 @@ class WorldModelSimulator:
                 binding_sha256=binding_digest(binding),
                 maximum_cost_usd=(None if self._request_budget else spec.maximum_cost_usd),
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
-                observed_spend_usd=lambda: resolution_spend(
-                    self._store, self._plan.cells, bindings, pins
+                # The request ledger owns spend admission for evals. Re-reading every
+                # rollout under this shared cell lock can starve sibling workers.
+                observed_spend_usd=lambda: (
+                    None
+                    if self._request_budget is not None
+                    else resolution_spend(self._store, self._plan.cells, bindings, pins)
                 ),
                 stop_on_overspend=spec.stop_on_overspend,
                 reservation_cost_usd=(

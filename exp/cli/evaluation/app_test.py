@@ -18,6 +18,11 @@ from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_r
 from exp.optimize.evaluation.runs_test import _twenty_scenarios
 from exp.optimize.router.automatic.service_test import _REVISION, _RuntimeCatalog
 from exp.runtime.models import RuntimeModelCatalog
+from exp.simulation.engines.text.leases import (
+    TextCellLeaseClaim,
+    TextCellLeaseState,
+    TextCellLeaseStore,
+)
 
 
 def test_cli_review_and_resume_preserve_exact_preparation(tmp_path: Path) -> None:
@@ -146,6 +151,53 @@ def test_execution_shows_progress_before_runtime_initialization(
         len(state.embedding_calls),
         state.credential_resolutions,
     )
+
+
+def test_cell_contention_pauses_with_resume_command_and_no_failed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An occupied cell leaves a resumable run instead of a traceback or failed rollout."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(models=("candidate-a", "candidate-b")),
+        code_revision=_REVISION,
+    )
+    monkeypatch.setattr(
+        flow, "RuntimeModelCatalog", lambda catalog: _RuntimeCatalog(catalog, state)
+    )
+    monkeypatch.setattr(
+        TextCellLeaseStore,
+        "acquire",
+        lambda *args, **kwargs: TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None),
+    )
+    before = len(state.completion_calls), len(state.embedding_calls)
+    rollouts_before = tuple(project.paths.project_directory.glob("artifacts/*/rollout.json"))
+    result = CliRunner().invoke(
+        app,
+        [
+            "eval",
+            "support",
+            "--root",
+            str(project.paths.root),
+            "--resume",
+            run.run_id,
+            "--yes",
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Paused" in result.output
+    assert "Completed work saved" in result.output
+    assert f"--resume {run.run_id}" in result.output
+    saved = load_run(project, run.run_id)
+    assert saved.status == "paused"
+    assert saved.report_id is None
+    assert (
+        tuple(project.paths.project_directory.glob("artifacts/*/rollout.json")) == rollouts_before
+    )
+    assert before == (len(state.completion_calls), len(state.embedding_calls))
 
 
 @pytest.mark.parametrize("answer", ["n", "y"])

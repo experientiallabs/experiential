@@ -36,6 +36,7 @@ from exp.optimize.evaluation.runs import (
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
+from exp.simulation.engines.text.errors import SimulationContentionError
 
 _console = Console(theme=EXP_THEME)
 
@@ -203,6 +204,12 @@ def run_evaluation(
                     return
                 yes = False
                 _console.print("Increase the spending limit to continue this evaluation.")
+            except SimulationContentionError:
+                _console.print("Paused: rollout state is busy. Completed work saved.")
+                _console.print(
+                    Text(f"Resume: exp eval {project} --root {root} --resume {run.run_id}")
+                )
+                return
             except KeyboardInterrupt:
                 _console.print(
                     f"Saved. Resume: exp eval {project} --root {root} --resume {run.run_id}",

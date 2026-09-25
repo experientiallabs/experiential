@@ -30,6 +30,7 @@ from exp.optimize.evaluation.service import ModelEvaluationResult
 from exp.optimize.router.judging.artifacts import read_review_state
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
+from exp.simulation.engines.text.errors import SimulationContentionError
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +340,14 @@ def execute_run(
                         "stage": "Spending limit reached",
                         "required_spending_limit_usd": exc.required_usd,
                     }
+                ),
+            )
+            raise
+        except SimulationContentionError:
+            save_run(
+                project,
+                active.model_copy(
+                    update={"status": "paused", "stage": "Waiting for rollout state"}
                 ),
             )
             raise
