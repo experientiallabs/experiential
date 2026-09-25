@@ -191,8 +191,9 @@ Cancellation closes the upstream without waiting for more metadata. At the hard 
 public SSE delivery can close without a final client frame; settlement still preserves an already
 declared provider outcome and the meter observed so far.
 
-Partial or empty suffixes cannot erase earlier counts, and cumulative snapshots are never added
-together. A cache count greater than the accumulated input count stays pending, even when a
+Partial or empty suffixes cannot erase earlier counts. Prompt, candidate, thinking, and cache
+counts accumulate independently of the last publishable meter; withholding a cache subset does
+not discard output counts that arrive before input. Cumulative snapshots are never added together. A cache count greater than the accumulated input count stays pending, even when a
 consistent meter already exists. A later input report can make that pending cache count valid.
 Until then, newer consistent primary counts can advance the meter without publishing the pending
 cache count. A report that itself contradicts the subset relation cannot replace the last

@@ -199,6 +199,121 @@ fn cache_only_first_report_waits_for_primary_counts_or_stays_unknown() {
 }
 
 #[test]
+fn pending_cache_preserves_output_legs_before_the_first_input_report() {
+    assert_usage(
+        vec![
+            text(),
+            stop(),
+            frame(json!({"usageMetadata":{"cachedContentTokenCount":3}})),
+            frame(json!({"usageMetadata":{"candidatesTokenCount":2,"thoughtsTokenCount":4}})),
+            frame(json!({"usageMetadata":{}})),
+            frame(json!({"usageMetadata":{"promptTokenCount":7}})),
+        ],
+        Some((7, 6, 3)),
+    );
+}
+
+#[test]
+fn explicitly_contradictory_snapshot_cannot_pollute_a_later_empty_suffix() {
+    for prior in [false, true] {
+        let mut frames = vec![text(), stop()];
+        if prior {
+            frames.push(frame(json!({"usageMetadata":meter()})));
+        }
+        frames.push(frame(json!({"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":40,"cachedContentTokenCount":500}})));
+        frames.push(frame(json!({"usageMetadata":{}})));
+        assert_usage(frames, prior.then_some((7, 2, 3)));
+    }
+}
+
+#[test]
+fn split_usage_fields_are_order_independent_across_finish_and_empty_frames() {
+    let fields = [
+        json!({"promptTokenCount":7}),
+        json!({"candidatesTokenCount":2}),
+        json!({"thoughtsTokenCount":4}),
+        json!({"cachedContentTokenCount":3}),
+    ];
+    let combined = json!({"promptTokenCount":7,"candidatesTokenCount":2,"thoughtsTokenCount":4,"cachedContentTokenCount":3});
+    let mut cases = 0;
+    for a in 0..4 {
+        for b in 0..4 {
+            for c in 0..4 {
+                for d in 0..4 {
+                    let order = [a, b, c, d];
+                    if (0..4).any(|i| (i + 1..4).any(|j| order[i] == order[j])) {
+                        continue;
+                    }
+                    for finish_at in 0..=4 {
+                        for prior in [false, true] {
+                            for empty in [false, true] {
+                                let mut normalizer =
+                                    Normalizer::new(Dialect::GeminiGenerateContent);
+                                let mut payloads = vec![
+                                    json!({"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}),
+                                ];
+                                if prior {
+                                    payloads.push(json!({"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"thoughtsTokenCount":1,"cachedContentTokenCount":1}}));
+                                }
+                                for index in 0..=4 {
+                                    if index == finish_at {
+                                        payloads
+                                            .push(json!({"candidates":[{"finishReason":"STOP"}]}));
+                                    }
+                                    if index < 4 {
+                                        payloads
+                                            .push(json!({"usageMetadata":fields[order[index]]}));
+                                    }
+                                    if empty {
+                                        payloads.push(json!({"usageMetadata":{}}));
+                                    }
+                                }
+                                let mut events = Vec::new();
+                                for payload in payloads {
+                                    events.extend(
+                                        normalizer
+                                            .feed(&crate::sse::SseEvent {
+                                                event: None,
+                                                data: payload.to_string(),
+                                            })
+                                            .unwrap(),
+                                    );
+                                    if let Some(usage) = normalizer.observed_usage() {
+                                        assert!(
+                                            usage.cached_input_tokens <= usage.input_tokens,
+                                            "invalid intermediate meter: {usage:?}"
+                                        );
+                                    }
+                                }
+                                events.extend(normalizer.on_stream_end().unwrap());
+                                let actual = events
+                                    .iter()
+                                    .find_map(|event| match event {
+                                        Event::Usage(usage) => {
+                                            Some(crate::events::simplified_event(&Event::Usage(
+                                                usage.clone(),
+                                            )))
+                                        }
+                                        _ => None,
+                                    })
+                                    .unwrap();
+                                let expected = crate::events::simplified_event(&Event::Usage(
+                                    crate::events::gemini_usage(&combined).unwrap(),
+                                ));
+                                assert_eq!(actual, expected, "order={order:?} finish={finish_at} prior={prior} empty={empty}");
+                                assert_eq!(events.iter().filter(|e| e.is_terminal()).count(), 1);
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 480);
+}
+
+#[test]
 fn malformed_or_partial_trailer_keeps_the_declared_finish_and_best_meter() {
     for tail in [
         b"data: {broken\n\n".to_vec(),

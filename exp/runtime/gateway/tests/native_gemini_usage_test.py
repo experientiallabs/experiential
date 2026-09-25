@@ -53,6 +53,7 @@ def _configure(root: Path) -> tuple[GatewayManagement, str]:
             input_nano_usd_per_million_tokens=1_000_000_000,
             cached_input_nano_usd_per_million_tokens=100_000_000,
             output_nano_usd_per_million_tokens=2_000_000_000,
+            reasoning_nano_usd_per_million_tokens=2_000_000_000,
         ),
         pricing_source="synthetic-test-prices",
         replace=False,
@@ -98,6 +99,15 @@ def _chunks(placement: str) -> list[bytes]:
                 stop,
                 {"usageMetadata": {"cachedContentTokenCount": 1000}},
                 {"usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 5}},
+            ]
+        case "cache-output-first":
+            frames = [
+                text,
+                stop,
+                {"usageMetadata": {"cachedContentTokenCount": 3}},
+                {"usageMetadata": {"candidatesTokenCount": 2, "thoughtsTokenCount": 4}},
+                {"usageMetadata": {}},
+                {"usageMetadata": {"promptTokenCount": 7}},
             ]
         case "cache-only" | "cache-first":
             frames = [text, stop, {"usageMetadata": {"cachedContentTokenCount": 3}}]
@@ -154,6 +164,7 @@ def _chunks(placement: str) -> list[bytes]:
         "bad-cache",
         "reconciled-cache",
         "pending-cache-primary",
+        "cache-output-first",
         "cache-only",
         "cache-first",
         "none",
@@ -170,6 +181,7 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
     expected_meter = {
         "reconciled-cache": (12, 2, 10, 7_000),
         "pending-cache-primary": (12, 5, 3, 19_300),
+        "cache-output-first": (7, 6, 3, 16_300),
     }.get(placement, (7, 2, 3, 8_300))
     requests: list[str] = []
     settlements: list[JsonObject] = []

@@ -6,64 +6,82 @@ use serde_json::Value;
 
 use super::super::{malformed, Normalizer};
 use crate::errors::Failure;
-use crate::events::{bounded_ledger_sum, count_if_present, gemini_usage, Event};
+use crate::events::{bounded_ledger_sum, count_if_present, gemini_usage, Event, Usage};
+
+/// Parsed cumulative evidence is independent of the last publishable meter.
+/// Missing protobuf scalar fields are zero defaults, never resets of evidence.
+#[derive(Clone, Copy, Default)]
+struct MeterFields {
+    input: u64,
+    candidates: u64,
+    thoughts: Option<u64>,
+    cache: u64,
+}
 
 #[derive(Default)]
 pub(in crate::dialects) struct StreamState {
     pub(super) finish: Option<Event>,
     pub(super) finished_at: Option<Instant>,
-    candidates: Option<u64>,
-    thoughts: Option<u64>,
-    pending_cache: Option<u64>,
+    fields: MeterFields,
 }
 
 impl Normalizer {
-    /// Parse cumulative legs before folding additive thoughts. Missing fields in
-    /// a later snapshot cannot erase an earlier count or its cache evidence.
+    /// Accumulate validated numeric fields before deciding whether their cache
+    /// subset is publishable. Withholding a meter never drops its output legs.
     pub(super) fn observe_gemini_usage(&mut self, raw: &Value) -> Result<(), Failure> {
-        let mut usage = gemini_usage(raw).map_err(|message| malformed(&message))?;
+        let parsed = gemini_usage(raw).map_err(|message| malformed(&message))?;
         let object = raw.as_object().expect("gemini_usage validated the object");
-        let candidates = self.gemini.candidates.max(
-            count_if_present(object, "candidatesTokenCount", "Gemini usageMetadata")
-                .map_err(|message| malformed(&message))?,
-        );
-        let thoughts = self.gemini.thoughts.max(usage.reasoning_tokens);
-        usage.output_tokens = Some(
-            bounded_ledger_sum(
-                &[candidates.unwrap_or(0), thoughts.unwrap_or(0)],
-                "Gemini output",
-            )
-            .map_err(|message| malformed(&message))?,
-        );
-        usage.reasoning_tokens = thoughts;
-        let mut accumulated = self.usage.clone().unwrap_or_default();
-        accumulated.merge_observed(&usage);
-        let pending_cache = self
-            .gemini
-            .pending_cache
-            .max(accumulated.cached_input_tokens);
-        if accumulated.cached_input_tokens > accumulated.input_tokens {
-            // The current report is contradictory, not merely waiting for an
-            // older cache subset. Preserve its cache evidence without exposing
-            // the invalid meter or accepting its other legs as a new baseline.
-            self.gemini.pending_cache = pending_cache;
+        let count = |key| {
+            count_if_present(object, key, "Gemini usageMetadata")
+                .map_err(|message| malformed(&message))
+        };
+        let input = count("promptTokenCount")?;
+        let cache = count("cachedContentTokenCount")?;
+        let candidates = count("candidatesTokenCount")?;
+        let previous = self.gemini.fields;
+        let cache = previous.cache.max(cache.unwrap_or(0));
+        // Two explicit counts in the same report contradict its own subset
+        // relation. Retain cache evidence for reconciliation, but do not trust
+        // that report's primary/output fields, even after an empty suffix.
+        if input.is_some_and(|input| parsed.cached_input_tokens.unwrap_or(0) > input) {
+            self.gemini.fields.cache = cache;
             return Ok(());
         }
-        if pending_cache <= accumulated.input_tokens {
-            accumulated.cached_input_tokens = pending_cache;
-            self.gemini.pending_cache = None;
-        } else {
-            // An older unresolved subset must not block newer consistent
-            // primary counts. Publish those now and retain only the subset
-            // until sufficient input evidence arrives, never fabricating input.
-            self.gemini.pending_cache = pending_cache;
-            if self.usage.is_none() && accumulated.input_tokens == Some(0) {
-                return Ok(());
-            }
+        let fields = MeterFields {
+            input: previous.input.max(input.unwrap_or(0)),
+            candidates: previous.candidates.max(candidates.unwrap_or(0)),
+            thoughts: previous.thoughts.max(parsed.reasoning_tokens),
+            cache,
+        };
+        let output = bounded_ledger_sum(
+            &[fields.candidates, fields.thoughts.unwrap_or(0)],
+            "Gemini output",
+        )
+        .map_err(|message| malformed(&message))?;
+        self.gemini.fields = fields;
+        // Sparse cache can arrive before prompt counts, including before any
+        // valid baseline. Keep all parsed legs pending rather than emitting an
+        // impossible zero-input meter or inventing input to cover the subset.
+        if fields.cache > fields.input && fields.input == 0 && self.usage.is_none() {
+            return Ok(());
         }
-        self.gemini.candidates = candidates;
-        self.gemini.thoughts = thoughts;
-        self.usage = Some(accumulated);
+        let cache = if fields.cache <= fields.input {
+            fields.cache
+        } else {
+            // Pending cache never blocks newer primary evidence. Retain the
+            // last safe subset until enough input arrives to publish it.
+            self.usage
+                .as_ref()
+                .and_then(|usage| usage.cached_input_tokens)
+                .unwrap_or(0)
+        };
+        self.usage = Some(Usage {
+            input_tokens: Some(fields.input),
+            output_tokens: Some(output),
+            cached_input_tokens: Some(cache),
+            reasoning_tokens: fields.thoughts,
+            ..Usage::default()
+        });
         Ok(())
     }
 
