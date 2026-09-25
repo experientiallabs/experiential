@@ -41,7 +41,11 @@ from exp.runtime.gateway.native_accounting import (
     NativeBridgeError,
 )
 from exp.runtime.gateway.native_components import SyncWriteLedger
-from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
+from exp.runtime.gateway.native_execution import (
+    InflightRequest,
+    deployment_health_key,
+    rung_load_key,
+)
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute
@@ -385,6 +389,56 @@ def test_disconnect_usage_evidence_survives_every_settlement_path(
         assert terminal.usage.input_tokens == 7
         assert terminal.usage.output_tokens == 3
     assert registry.entry(entry.authorization.request_id) is None
+    assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize("retry", ["direct", "sweep"])
+def test_opened_disconnect_estimates_cache_reads_from_the_organizations_settled_share(
+    retry: str,
+) -> None:
+    """The org's settled cached fraction fills the cache-read leg, frozen for an exact replay."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    registry._loads.record_settle(  # noqa: SLF001 - seeding the EWMA the settle path reads
+        rung_load_key(entry.route.deployments[0]),
+        entry.authorization.organization_id,
+        cached_tokens=900,
+        input_tokens=1_000,
+    )
+    encoded = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "failed",
+            "usage": None,
+            "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+            "finalize": True,
+            "opened": True,
+            "dispatched": True,
+            "usage_incomplete_due_to_disconnect": True,
+            "streamed_output": {"text": "partial", "reasoning": "", "images": 0},
+        }
+    )
+    if retry == "sweep":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        # The live signal moves before the sweep lands the retained payload.
+        registry._loads.record_settle(  # noqa: SLF001 - moving the EWMA the replay must ignore
+            rung_load_key(entry.route.deployments[0]),
+            entry.authorization.organization_id,
+            cached_tokens=0,
+            input_tokens=1_000_000,
+        )
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage_estimated is True
+    counted = counted_input_tokens(entry.request)
+    assert terminal.usage.input_tokens == counted
+    assert terminal.usage.cached_input_tokens == int(counted * 0.9)
     assert len(ledger.finished) == 1
 
 

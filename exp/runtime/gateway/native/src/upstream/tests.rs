@@ -180,10 +180,15 @@ async fn a_402_with_the_literal_tokenhub_body_classes_provider_quota() {
     );
 }
 
-pub(super) async fn open_against_body(
+pub(super) async fn open_against_body(status_line: &str, body: &str, model: &str) -> Failure {
+    open_dialect_against_body(status_line, body, model, Dialect::OpenAiCompatible).await
+}
+
+async fn open_dialect_against_body(
     status_line: &str,
-    body: &'static str,
+    body: &str,
     model: &str,
+    dialect: Dialect,
 ) -> Failure {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -191,6 +196,7 @@ pub(super) async fn open_against_body(
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let status_line = status_line.to_string();
+    let body = body.to_string();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let mut buffer = [0u8; 8192];
@@ -212,7 +218,7 @@ pub(super) async fn open_against_body(
         &serde_json::json!({"model": model, "messages": []}),
         None,
         Duration::from_secs(5),
-        Dialect::OpenAiCompatible,
+        dialect,
     )
     .await
     .expect_err("a 4xx must classify as a failure")
@@ -486,6 +492,176 @@ async fn an_aggregator_routing_gate_403_is_not_a_credential_failure() {
     assert!(failure.failover_eligible);
     assert!(!failure.retryable_same_deployment);
     assert!(failure.provider_detail.is_none());
+}
+
+#[test]
+fn gemini_relay_refusal_classifies_the_exact_403_envelope() {
+    assert_eq!(
+        crate::stream_errors::classify_stream_error(
+            Some("403"),
+            Some("Gemini blocked the request: PROHIBITED_CONTENT"),
+        ),
+        crate::stream_errors::StreamErrorKind::Refusal(crate::errors::RefusalReason::ContentPolicy),
+    );
+}
+
+#[test]
+fn gemini_relay_refusal_never_overrides_other_codes_or_incidental_text() {
+    use crate::stream_errors::{classify_stream_error, StreamErrorKind};
+    let message = Some("Gemini blocked the request: PROHIBITED_CONTENT");
+    for (code, expected) in [
+        ("401", StreamErrorKind::ProviderAuthentication),
+        ("permission_denied", StreamErrorKind::ProviderAuthentication),
+        (
+            "authentication_error",
+            StreamErrorKind::ProviderAuthentication,
+        ),
+        ("invalid_api_key", StreamErrorKind::ProviderAuthentication),
+        ("402", StreamErrorKind::ProviderQuota),
+        ("insufficient_quota", StreamErrorKind::ProviderQuota),
+        ("billing_hard_limit_reached", StreamErrorKind::ProviderQuota),
+        ("not_enough_balance", StreamErrorKind::ProviderQuota),
+        ("429", StreamErrorKind::Throttled),
+        ("rate_limit_exceeded", StreamErrorKind::Throttled),
+        ("404", StreamErrorKind::ProviderNotFound),
+    ] {
+        assert_eq!(
+            classify_stream_error(Some(code), message),
+            expected,
+            "{code}"
+        );
+    }
+    for message in [
+        "PROHIBITED_CONTENT",
+        "Forbidden",
+        "Gemini blocked the request: PROHIBITED_CONTENT_EXTRA",
+        "Gemini blocked the request: PROHIBITED_CONTENT; authentication failed",
+        "Gemini blocked the request: PROHIBITED_CONTENT due to billing",
+        "Gemini blocked the request: PROHIBITED_CONTENT due to rate limit",
+        "Prompt included Gemini blocked the request: PROHIBITED_CONTENT",
+        "\"Gemini blocked the request: PROHIBITED_CONTENT\"",
+        "Gemini blocked the request: UNKNOWN_REASON",
+    ] {
+        assert_eq!(
+            classify_stream_error(Some("403"), Some(message)),
+            StreamErrorKind::ProviderAuthentication,
+            "{message}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn gemini_relay_refusal_http_403_keeps_the_bounded_public_contract() {
+    for dialect in [Dialect::OpenAiCompatible, Dialect::OpenAiResponses] {
+        let failure = open_dialect_against_body(
+            "403 Forbidden",
+            r#"{"error":{"code":403,"message":"Gemini blocked the request: PROHIBITED_CONTENT"}}"#,
+            "google/gemini-test",
+            dialect,
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::Refusal);
+        assert_eq!(
+            failure.refusal_reason,
+            Some(crate::errors::RefusalReason::ContentPolicy)
+        );
+        assert!(!failure.retryable_same_deployment && !failure.failover_eligible);
+        assert!(failure.rejected_parameter.is_none());
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("Gemini blocked the request: PROHIBITED_CONTENT"),
+        );
+        let public = failure.public_error();
+        assert_eq!(public.status_code, 400);
+        assert_eq!(public.code, "refusal");
+        assert_eq!(public.error_type, "invalid_request_error");
+        assert_eq!(
+            public.json_body()["error"]["refusal_reason"],
+            "content_policy"
+        );
+        assert_eq!(
+            public.message,
+            "provider refused the request: content policy"
+        );
+        assert!(!public
+            .json_body()
+            .to_string()
+            .contains("PROHIBITED_CONTENT"));
+    }
+}
+
+#[tokio::test]
+async fn gemini_relay_refusal_http_does_not_read_quotes_echoes_or_conflicting_codes() {
+    let message = "Gemini blocked the request: PROHIBITED_CONTENT";
+    let mut cases = vec![
+        (
+            "401 Unauthorized",
+            serde_json::json!({"error": {"code": 403, "message": message}}),
+            FailureClass::ProviderAuthentication,
+        ),
+        (
+            "402 Payment Required",
+            serde_json::json!({"error": {"code": 403, "message": message}}),
+            FailureClass::ProviderQuota,
+        ),
+        (
+            "429 Too Many Requests",
+            serde_json::json!({"error": {"code": 403, "message": message}}),
+            FailureClass::Throttled,
+        ),
+        (
+            "403 Forbidden",
+            serde_json::json!({"error": {"code": "insufficient_quota", "message": message}}),
+            FailureClass::ProviderQuota,
+        ),
+        (
+            "403 Forbidden",
+            serde_json::json!({"error": {"code": "authentication_error", "message": message}}),
+            FailureClass::ProviderAuthentication,
+        ),
+        (
+            "403 Forbidden",
+            serde_json::json!({"error": {"code": "rate_limit_exceeded", "message": message}}),
+            FailureClass::ProviderAuthentication,
+        ),
+        (
+            "403 Forbidden",
+            serde_json::json!({"error": {"code": 403, "message": "Forbidden", "echo": message}, "prompt": message}),
+            FailureClass::ProviderAuthentication,
+        ),
+        (
+            "403 Forbidden",
+            serde_json::json!({"error": {"code": 403, "message": "Forbidden", "metadata": {"raw": message}}}),
+            FailureClass::ProviderAuthentication,
+        ),
+    ];
+    for incidental in [
+        format!("Prompt included {message}"),
+        format!("\"{message}\""),
+        format!("{message}; authentication failed"),
+        format!("{message} due to billing"),
+        format!("{message} due to rate limit"),
+        format!("{message}_EXTRA"),
+    ] {
+        cases.push((
+            "403 Forbidden",
+            serde_json::json!({"error": {"code": 403, "message": incidental}}),
+            FailureClass::ProviderAuthentication,
+        ));
+    }
+    for (status, body, expected) in cases {
+        for dialect in [Dialect::OpenAiCompatible, Dialect::OpenAiResponses] {
+            let failure =
+                open_dialect_against_body(status, &body.to_string(), "google/gemini-test", dialect)
+                    .await;
+            assert_eq!(
+                failure.failure_class, expected,
+                "{dialect:?} {status} {body}"
+            );
+            assert!(failure.failover_eligible && !failure.retryable_same_deployment);
+            assert!(failure.refusal_reason.is_none());
+        }
+    }
 }
 
 #[tokio::test]

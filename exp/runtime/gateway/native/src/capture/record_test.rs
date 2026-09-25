@@ -4,6 +4,7 @@ use std::cell::Cell;
 
 fn record<R>(response: R) -> Record<R> {
     Record {
+        checkpointed: false,
         schema_version: 1,
         request: Request {
             request_id: "request".into(),
@@ -17,6 +18,7 @@ fn record<R>(response: R) -> Record<R> {
             context: Arc::new(json!({"schema_version":1,"request":{"messages":[]}})),
         },
         response: Some(response),
+        transport: None,
         provider_reasoning: None,
         provider_reasoning_source_json: None,
         provider_tool_calls_json: None,
@@ -66,6 +68,27 @@ fn cloned_request_shares_content_and_charges_spare_capacity() {
     text.push('x');
     input.provider_reasoning = Some(text);
     assert!(input.heap_bytes() >= initial + 32768);
+}
+
+#[test]
+fn hosted_completion_references_checkpoint_without_encoding_prompt_again() {
+    let calls = Cell::new(0);
+    let mut item = record(SerializeOnce(&calls));
+    item.request.context = Arc::new(json!({"schema_version":1,"request":{
+        "messages":[{"role":"user","content":"x".repeat(512 * 1024)}],
+        "tools":[{"name":"search","parameters":{"type":"object"}}]
+    }}));
+    let full = item.encode_update(1024 * 1024).unwrap();
+    assert!(full.len() > 512 * 1024);
+    item.checkpointed = true;
+    let encoded = item.encode_update(4096).unwrap();
+    let value: Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["request"]["request_id"], "request");
+    assert!(value["request"].get("context").is_none());
+    assert_eq!(calls.get(), 2);
+    // Complete-record destinations retain the full input contract.
+    assert!(item.encode(1024 * 1024).unwrap().len() > 512 * 1024);
 }
 
 #[test]

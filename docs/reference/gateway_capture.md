@@ -4,7 +4,9 @@ Experiential owns one Rust collector for authenticated request context, HTTP
 response capture, bounded lifecycle state and worker-owned delivery. Python
 prepares the effective request during admission and configures a destination.
 There is no Python callback per response chunk. Database work runs on the
-destination worker; eligible response completion waits for its acknowledgement.
+destination worker. Response completion waits for durable acknowledgement by
+default. Hosts with an existing asynchronous lifecycle can explicitly opt into
+queued delivery; accepted content remains owned until storage acknowledges it.
 
 ```python
 from exp_gateway_native import CaptureCollector
@@ -42,9 +44,9 @@ deployment provenance, and capture timestamp. The selected model is null for an
 accepted request that failed before routing. A successful exchange emits one complete
 record after both output completion and permission. A prompt-only permission emits
 only the prompt. This avoids a delayed prompt update overwriting a full response.
-A hosted collector
-does not enqueue content until terminal eligibility permits it, so queue overload
-cannot lose a BYOK deletion behind an already queued prompt.
+A hosted collector can persist an early prompt checkpoint once the selected lane
+permits capture. Final settlement independently gates the response. The destination
+rechecks current privacy policy for every write, including delayed checkpoints.
 
 Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
 JSON bodies and ordered SSE data payloads retain unknown fields. The observation
@@ -71,6 +73,11 @@ and responses include `source_json`, an escaped JSON string containing the exact
 source value alongside the normalized query projection. Consumers recover the
 request with `restore_capture_context`; response consumers decode `source_json`
 when present. Reasoning uses `provider_reasoning_source_json` for the same case.
+Native JSON numbers have a finite integer range. When a parsed value could have
+rounded an integer beyond that range, capture preserves its original JSON using
+the same `source_json` contract; wire requests use `body_source_json`. The source
+is authoritative for exact numeric values, while the ordinary fields remain the
+query projection. These sidecars do not change the inference representation.
 The escaped sidecars count toward all record limits. Oversize evidence is excluded,
 not silently advertised as lossless. Historical reasoning stays in captured input
 even when provider execution must omit it at a new user boundary.
@@ -84,6 +91,59 @@ hosted Python destination receives the same encoded string object on every retry
 storage retries do not decode the response or serialize the record again. Native destinations consume
 the structure directly. Request admission still crosses the Python/Rust boundary
 as JSON; exceptional lossless sidecars and raw tool-call strings also use JSON.
+The typed Python controller passes that JSON as immutable UTF-8 bytes through
+`begin_bytes`, without decoding it into a Python Unicode string and converting
+it back to UTF-8 at the native boundary. `begin(str)` remains available with the
+same validation and capture contract.
+
+Hosted destinations can opt into `CaptureCollector.batched(config_json, write_batch)`.
+Batching does not change acknowledgement semantics. A host that already owns an
+asynchronous capture lifecycle, such as Platform, may explicitly configure
+`asynchronous_delivery=True`: checkpoint and terminal callbacks then return after
+bounded queue admission rather than durable storage. The host must monitor
+delivery failures and drain before closing its destination. Default and local
+collectors continue to wait for durable acknowledgement. Neither mode adds a
+process-crash recovery journal.
+
+`truncate_request=True` is a hosted bounded-copy policy, not a serving mutation.
+Oversized message content is trimmed largest-first, keeping as much text as fits
+and never cutting below its 4 KiB prefix solely to make space. Every cut carries
+an explicit byte-loss marker and capture-limit metadata. Equal-size candidates
+retain their traversal order. Running encoded-size accounting avoids rescanning
+the entire conversation for each cut. If even those prefixes cannot fit, the
+existing explicit omission marker applies; capture is not advertised as lossless
+outside its configured bounds. Local capture does not enable this policy by default.
+The callback receives a tuple of prepared JSON strings and must return a list of
+booleans in the same order: `True` acknowledges durable storage or an intentional
+privacy exclusion, and `False` retains that record for retry. Exceptions or an
+incorrect receipt count acknowledge nothing. Failed members retain the exact same
+prepared string object; acknowledged members are released independently.
+Destinations that accept UTF-8 can set `bytes_output=True` to receive immutable
+bytes instead of strings. This skips Unicode decoding and re-encoding at the
+storage boundary; the JSON, size limits and acknowledgement semantics are
+identical. Failed members retain the same bytes object across retries.
+Once preparation succeeds, the redundant decoded record tree is released before
+preparing the next member. Its admission charge remains until acknowledgement.
+
+By default, batched storage retains complete schema-1 records. A destination that
+supports incremental updates can explicitly set `completion_references=True` to
+receive schema-2 completions instead of repeating checkpointed request context.
+A completion references a previously queued checkpoint: its `request`
+contains `request_id`, `scope`, `protocol` and `model_id`, but no `context`.
+All response, reasoning, usage and transport fields remain intact. The destination
+must return `False` for a completion whose permitted prompt has not persisted yet,
+and acknowledge intentional privacy exclusions. Complete-record and local SQLite
+destinations retain the full schema-1 request/response contract.
+
+Batches gather up to 64 records or wait up to 10 milliseconds from the start of
+gathering. Gathering stops after reaching a soft 2 MiB encoded-byte target; its
+final record may cross that target, so the hard bound is 2 MiB plus the configured
+record limit. Shutdown flushes a partial batch without waiting to fill it.
+The batch destination reserves five times that combined bound plus 256 bytes per
+batch slot before queue admission. Rust rejects configurations without room for
+this reservation and one queued record. Persistent failures can fill the bounded
+batch or queue and backpressure new requests; batching does not promise unbounded
+progress around failed records or process-crash durability.
 
 Delivery limits bound record count, each final encoded payload and retained record
 memory, including a record currently held by a slow destination. One destination
@@ -109,12 +169,13 @@ limits throughput to what the destination can persist.
 
 When capture is required but admission cannot register it, the gateway returns a
 sanitized `capture_unavailable` 503 before provider dispatch. Policy-disabled capture
-still serves normally. An eligible response does not finish successfully until its
-destination write succeeds. A destination error retains the current record and
+still serves normally. An eligible response waits for durable acknowledgement
+unless its host explicitly enables asynchronous delivery. Both modes wait for
+bounded queue capacity. A destination error retains the current record and
 its queue slot, and retries with exponential backoff from 25 milliseconds to one
 second. There is no retry-count expiry: a persistent outage backpressures capture
 instead of discarding accepted data. A malformed or oversized payload that cannot
-be prepared still fails explicitly; raising a storage exception is never a way
+be prepared remains pending with a visible failure counter; raising a storage exception is never a way
 to skip a record. Destinations must be idempotent because a write may commit before
 its acknowledgement is lost. Returning normally also acknowledges an intentional
 exclusion by the destination's current consent or retention policy.

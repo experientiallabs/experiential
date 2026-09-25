@@ -206,20 +206,17 @@ impl Normalizer {
         self.request_words = words.into_iter().map(Into::into).collect();
     }
 
-    /// Build the provider-declared stream failure: classified by what the
-    /// provider said (a caller's over-long prompt is a 400 that relays the
-    /// sentence; a rate limit is a throttle; only a provider fault stays
-    /// `provider stream failed`), carrying its bounded detail, and emitting
-    /// the structured operator line naming it.
+    /// Classify a provider failure and retain bounded detail; exact relay verdicts
+    /// require the raw envelope sentence, never a metadata-derived replacement.
     fn provider_stream_failure(
         &self,
         dialect: &str,
         code: Option<&str>,
-        message: Option<&str>,
+        raw_message: Option<&str>,
+        relayed_message: Option<&str>,
     ) -> Failure {
         let words: Vec<&str> = self.request_words.iter().map(String::as_str).collect();
-        // A relay's decode-failure sentence embeds the upstream error it could
-        // not parse: classify and relay THAT (see rejection_shapes).
+        let message = relayed_message.or(raw_message);
         let unwrapped = message.and_then(crate::rejection_shapes::relayed_decode_failure);
         let (code, message): (Option<&str>, Option<&str>) = match &unwrapped {
             Some((upstream_code, upstream_sentence)) => (
@@ -232,7 +229,11 @@ impl Normalizer {
         if let Some(detail) = &detail {
             log_provider_declared_failure(dialect, detail);
         }
-        let kind = crate::stream_errors::classify_stream_error(code, message);
+        let kind = crate::stream_errors::classify_stream_error_with_raw_message(
+            code,
+            message,
+            raw_message,
+        );
         // A Responses relay that refuses replayed encrypted reasoning INSIDE
         // the stream (200, then `response.failed`) carries the same repair
         // mark as the pre-stream 4xx, so the waterfall can strip and re-dial.

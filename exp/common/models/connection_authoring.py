@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from exp.common.core.artifacts import validate_artifact_id
+from exp.common.core.files import resolve_write_target, write_bytes_atomic
 from exp.common.core.locks import file_write_lock
 from exp.common.models.catalog import (
     MODEL_CATALOG_SCHEMA_VERSION,
@@ -100,6 +101,7 @@ def sync_provider_models(
     models: Mapping[str, ModelRecord],
     protected_connections: Mapping[str, ConnectionConfig] | None = None,
     replace: bool = True,
+    on_commit: Callable[[], None] | None = None,
 ) -> ModelCatalog:
     """Atomically register one provider and its authenticated model identities.
 
@@ -113,6 +115,10 @@ def sync_provider_models(
         protected_connections: Active SQLite gateway connections keyed by connection name. A
             changed endpoint cannot replace one of these authorities during account sync.
         replace: Whether changed non-serving model metadata may be refreshed.
+        on_commit: Optional final persistence step called with the catalog write lock held.
+            It must leave its own state unchanged when raising and must not reacquire the
+            catalog lock. Ordinary callback exceptions restore the previous catalog before
+            propagating. This recovery does not provide crash atomicity across files.
 
     Returns:
         Complete catalog after the provider and model update.
@@ -120,6 +126,7 @@ def sync_provider_models(
     Raises:
         ProviderConnectionAuthoringError: Input is empty, inconsistent, or conflicts with
             protected serving state.
+        RuntimeError: The callback failed and the previous catalog could not be restored.
     """
     if not models:
         raise ProviderConnectionAuthoringError("provider model sync needs at least one model")
@@ -134,7 +141,8 @@ def sync_provider_models(
             "provider model records must reference the synchronized connection"
         )
     with file_write_lock(path, what="provider model synchronization"):
-        existing = load_model_catalog(path) if path.exists() else None
+        target = resolve_write_target(path)
+        existing = load_model_catalog(target) if target.exists() else None
         current_connections = dict(existing.connections) if existing is not None else {}
         current_models = dict(existing.models) if existing is not None else {}
         current = current_connections.get(connection.name)
@@ -185,5 +193,21 @@ def sync_provider_models(
             gateway_pools=existing.gateway_pools if existing is not None else {},
             roles=existing.roles if existing is not None else ModelRoles(),
         )
-        write_model_catalog(path, catalog)
+        previous_bytes = target.read_bytes() if on_commit is not None and target.exists() else None
+        write_model_catalog(target, catalog)
+        if on_commit is not None:
+            try:
+                on_commit()
+            except Exception:
+                try:
+                    if previous_bytes is None:
+                        target.unlink()
+                    else:
+                        write_bytes_atomic(target, previous_bytes)
+                except OSError:
+                    raise RuntimeError(
+                        "Provider model commit failed and the previous catalog could not be "
+                        "restored. Check models.toml and credential configuration before retrying."
+                    ) from None
+                raise
         return catalog

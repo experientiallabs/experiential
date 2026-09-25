@@ -26,8 +26,15 @@ It serves:
 - `POST /v1/embeddings` (the OpenAI Embeddings API: message-less and never streamed; served
   only by aliases whose catalog capabilities declare `supports_embeddings` on an OpenAI-wire
   connection, billed on the provider's reported `prompt_tokens` with no output leg, and
-  returned with the provider's exact vectors in `float` or `base64` form; an inbound
-  `Idempotency-Key` is ignored because the surface has no replay protocol)
+  returned with the provider's exact vectors in `float` or `base64` form. Input accepts a
+  nonempty string, a batch of nonempty strings, a nonempty integer token sequence, or a
+  batch of nonempty token sequences. A flat token sequence produces one vector; token IDs
+  are forwarded unchanged and must match the selected model's tokenizer. Boolean, fractional,
+  negative, mixed-shape, and empty token inputs are rejected. Omit `stream` or send the literal
+  `false`; `true` and unknown parameters are rejected, and `stream` is never forwarded.
+  Reservations count token IDs directly and retain normal headroom; settlement still uses
+  provider-reported input usage. There is no response cache, and an inbound `Idempotency-Key`
+  is ignored because the surface has no replay protocol)
 - `POST /v1/images/generations` (the OpenAI Images API, generations only: prompt in, images
   out, never streamed; served only by aliases whose catalog capabilities declare
   `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported

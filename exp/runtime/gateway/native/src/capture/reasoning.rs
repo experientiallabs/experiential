@@ -4,8 +4,49 @@ use std::sync::Arc;
 
 use super::collector::Collector;
 use crate::admission::Admission;
+use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
+use crate::settlement::AttemptGuard;
 use crate::waterfall::Won;
+
+/// Capture a hosted prompt before any committed output becomes client-visible.
+/// Losing lanes never checkpoint: a later BYOK winner must not inherit a
+/// host-funded lane's capture. Default collectors require durable acknowledgement;
+/// explicitly asynchronous hosts wait for queue admission. SQL remains the final
+/// live-consent authority.
+pub(crate) async fn checkpoint_winner(
+    collector: Option<&Arc<Collector>>,
+    admission: &Admission,
+    guard: &mut AttemptGuard,
+    won: Won,
+) -> Won {
+    let (Some(collector), Won::Committed(attempt)) = (collector, &won) else {
+        return won;
+    };
+    if admission.route.get(attempt.depth).is_some_and(|wire| {
+        wire.billing_customer_managed || collector.checkpoint(&admission.request_id)
+    }) {
+        return won;
+    }
+    // Dispatch has already reserved a physical attempt. Request-only abandon
+    // would disarm its drop backstop without closing that reservation.
+    let usage = attempt.usage.clone();
+    let tool_names = attempt.tool_names.clone();
+    drop(won);
+    guard
+        .settle(
+            "failed",
+            usage.as_ref(),
+            &tool_names,
+            Some(&Failure::new(
+                FailureClass::Internal,
+                "capture checkpoint failed",
+            )),
+            true,
+        )
+        .await;
+    Won::Failed(PublicError::internal())
+}
 
 pub(crate) struct Observer {
     collector: Arc<Collector>,

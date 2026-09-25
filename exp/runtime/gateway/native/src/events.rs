@@ -909,31 +909,6 @@ impl ToolAccumulator {
         }
     }
 
-    /// Append one streamed argument fragment, returning the part the caller
-    /// may see: everything up to and including the byte that closes the
-    /// argument object. Whatever follows that byte is withheld (never
-    /// emitted) and judged at completion, so the deltas a client receives
-    /// always concatenate to the completed call's bytes. Custom (freeform)
-    /// input is opaque text and passes through whole.
-    pub fn push_arguments(&mut self, fragment: &str) -> Option<String> {
-        if self.custom {
-            self.raw_arguments.push_str(fragment);
-            return Some(fragment.to_string());
-        }
-        match self.scan.feed(fragment) {
-            None => {
-                self.raw_arguments.push_str(fragment);
-                Some(fragment.to_string())
-            }
-            Some(closed_at) => {
-                let (value, tail) = fragment.split_at(closed_at);
-                self.raw_arguments.push_str(value);
-                self.withheld_tail.push_str(tail);
-                (!value.is_empty()).then(|| value.to_string())
-            }
-        }
-    }
-
     pub fn complete(&self) -> Result<CompletedToolCall, String> {
         if !self.custom {
             if !self.withheld_tail.is_empty() {
@@ -992,6 +967,7 @@ impl ToolAccumulator {
     }
 }
 
+mod tool_arguments;
 mod usage;
 pub use usage::*;
 

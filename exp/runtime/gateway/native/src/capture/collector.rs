@@ -23,13 +23,19 @@ pub(crate) struct Configuration {
     pub maximum_response_bytes: usize,
     pub ttl_seconds: u64,
     pub settlement_required: bool,
+    #[serde(default)]
+    pub relay_metadata: bool,
+    #[serde(default)]
+    pub truncate_request: bool,
+    #[serde(default)]
+    pub asynchronous_delivery: bool,
 }
 
 impl Configuration {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         self.delivery.validate()?;
         if !(1..=4096).contains(&self.maximum_pending_records)
-            || !(1..=1024 * 1024).contains(&self.maximum_request_bytes)
+            || !(1..=8 * 1024 * 1024).contains(&self.maximum_request_bytes)
             || !(1..=4 * 1024 * 1024).contains(&self.maximum_response_bytes)
             || self.maximum_pending_bytes < self.maximum_request_bytes
             || self.maximum_pending_bytes < self.maximum_response_bytes
@@ -43,7 +49,7 @@ impl Configuration {
 }
 
 /// Stay live through the pending-to-delivery handoff, including capacity waits.
-struct Admission {
+pub(super) struct Admission {
     count: Arc<AtomicUsize>,
     handoff_bytes: Arc<AtomicUsize>,
     retained_bytes: usize,
@@ -72,11 +78,15 @@ struct Entry {
     observation: Option<crate::settlement::Observation>,
     gemini_part_bytes: usize,
     wire: Option<WireResponse>,
+    relay: Option<super::relay::Relay>,
+    relay_attached: bool,
+    relay_required: bool,
     request_bytes: usize,
     expires: Instant,
     bytes: usize,
     attached: bool,
     output_finished: bool,
+    checkpointing: bool,
     response_allowed: bool,
     response_discarded: Arc<AtomicBool>,
 }
@@ -109,6 +119,26 @@ impl<S: Sink> Sink for MaintainedSink<S> {
         self.sink.write(prepared)
     }
 
+    fn batch_records(&self) -> usize {
+        self.sink.batch_records()
+    }
+
+    fn batch_bytes(&self) -> usize {
+        self.sink.batch_bytes()
+    }
+
+    fn batch_delay(&self) -> Duration {
+        self.sink.batch_delay()
+    }
+
+    fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
+        self.sink.prepared_bytes(prepared)
+    }
+
+    fn write_batch(&mut self, prepared: &[&Self::Prepared]) -> Vec<bool> {
+        self.sink.write_batch(prepared)
+    }
+
     fn take_maintenance_failures(&mut self) -> u64 {
         self.sink.take_maintenance_failures()
     }
@@ -124,7 +154,7 @@ impl<S: Sink> Sink for MaintainedSink<S> {
 fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
     let now = Instant::now();
     pending.entries.retain(|_, entry| {
-        if entry.expires <= now {
+        if entry.expires <= now && !entry.checkpointing {
             pending.bytes -= entry.bytes;
             skipped.fetch_add(1, Ordering::Relaxed);
             false
@@ -168,11 +198,18 @@ impl Collector {
     }
 
     /// Admission is the sole authority for input. Duplicate ids never replace a record.
-    pub(crate) fn begin(&self, request: Request) -> bool {
+    pub(crate) fn begin(&self, mut request: Request) -> bool {
+        let request_bytes = if self.config.truncate_request {
+            super::bounds::bound(&mut request, self.config.maximum_request_bytes)
+        } else {
+            request.json_bytes()
+        };
         let record = Record {
+            checkpointed: false,
             schema_version: SCHEMA_VERSION,
             request,
             response: None,
+            transport: None,
             provider_reasoning: None,
             provider_reasoning_source_json: None,
             provider_tool_calls_json: None,
@@ -185,7 +222,6 @@ impl Collector {
                 .map(|duration| duration.as_secs_f64())
                 .unwrap_or(0.0),
         };
-        let request_bytes = record.request.json_bytes();
         if !record.valid() || request_bytes > self.config.maximum_request_bytes {
             return self.skip();
         }
@@ -217,11 +253,15 @@ impl Collector {
                 observation: None,
                 gemini_part_bytes: 0,
                 wire: None,
+                relay: None,
+                relay_attached: false,
+                relay_required: self.config.relay_metadata,
                 request_bytes,
                 expires: Instant::now() + Duration::from_secs(self.config.ttl_seconds),
                 bytes,
                 attached: false,
                 output_finished: false,
+                checkpointing: false,
                 response_allowed: !self.config.settlement_required,
                 response_discarded: Arc::new(AtomicBool::new(false)),
             },
@@ -286,8 +326,55 @@ impl Collector {
         }
     }
 
-    /// Hosted terminal eligibility precedes durable content, so a dropped BYOK
-    /// discard can never leave a previously queued prompt behind.
+    /// Capture a hosted prompt after the winning host-funded lane is frozen.
+    /// The destination must recheck consent and merge this idempotent update
+    /// without replacing a later response. Keep the shared request tree live
+    /// until terminal settlement; no provider response belongs in this write.
+    pub(crate) fn checkpoint(&self, request_id: &str) -> bool {
+        // The local experience sink projects completed exchanges, not prompt
+        // records. It must never acknowledge a checkpoint it cannot persist.
+        if !self.config.settlement_required {
+            return true;
+        }
+        let record = {
+            let Ok(mut pending) = self.pending.lock() else {
+                return false;
+            };
+            let Some(entry) = pending.entries.get_mut(request_id) else {
+                // Capture-off, ZDR and declined identities have no admission.
+                return true;
+            };
+            entry.checkpointing = true;
+            Record {
+                checkpointed: false,
+                schema_version: SCHEMA_VERSION,
+                request: entry.record.request.clone(),
+                response: None,
+                transport: None,
+                provider_reasoning: None,
+                provider_reasoning_source_json: None,
+                provider_tool_calls_json: None,
+                deployment_id: None,
+                metrics: None,
+                gemini_thought_parts: Vec::new(),
+                gemini_thought_parts_source_json: None,
+                captured_at: entry.record.captured_at,
+            }
+        };
+        let acknowledged = self.emit(record, None, None);
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(request_id) {
+                entry.checkpointing = false;
+                entry.record.checkpointed |= acknowledged;
+                // Destination backpressure is not abandoned-request idle time.
+                entry.expires = Instant::now() + Duration::from_secs(self.config.ttl_seconds);
+            }
+        }
+        acknowledged
+    }
+
+    /// Terminal policy controls response retention; the winning lane was frozen
+    /// before any hosted prompt checkpoint. The sink rechecks live consent.
     pub(crate) fn settle(&self, request_id: &str, keep_prompt: bool, keep_response: bool) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
@@ -310,23 +397,23 @@ impl Collector {
             entry.record.gemini_thought_parts.clear();
             entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, None);
+            self.emit(entry.record, None, Some(entry._admission));
             return;
         }
         entry.response_allowed = true;
-        if !entry.output_finished {
-            // Emit once at response completion. A preliminary prompt write could
-            // otherwise overtake the response after releasing the pending lock.
+        if !entry.output_finished || (entry.relay_required && entry.relay.is_none()) {
+            // The terminal update supplies output to the earlier prompt checkpoint.
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
         } else {
             entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, entry.wire);
+            self.emit_entry(entry);
         }
     }
 
     /// Output may arrive before or after settlement; unpermitted output stays bounded.
+    #[cfg(test)]
     pub(crate) fn finish(
         &self,
         request_id: &str,
@@ -386,10 +473,10 @@ impl Collector {
         };
         entry.output_finished = true;
         entry.bytes = entry.bytes.saturating_add(response_heap);
-        if entry.response_allowed {
+        if entry.response_allowed && (!entry.relay_required || entry.relay.is_some()) {
             entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, entry.wire)
+            self.emit_entry(entry)
         } else if self.retained_bytes(&pending).saturating_add(entry.bytes)
             <= self.config.maximum_pending_bytes
         {
@@ -401,8 +488,83 @@ impl Collector {
         }
     }
 
-    fn emit(&self, record: Record, wire: Option<WireResponse>) -> bool {
-        let deliver = || self.delivery.submit_wait(record, wire);
+    /// Only one front relay may supply metadata for the original captured response.
+    pub(crate) fn claim_relay(&self, request_id: &str) -> bool {
+        if !self.config.relay_metadata {
+            return false;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        let Some(entry) = pending.entries.get_mut(request_id) else {
+            return false;
+        };
+        if entry.relay_attached {
+            return false;
+        }
+        entry.relay_attached = true;
+        true
+    }
+
+    /// Error responses without public correlation cannot be claimed by a front.
+    pub(crate) fn without_relay(&self, request_id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(request_id) {
+                entry.relay_required = false;
+            }
+        }
+    }
+
+    pub(super) fn finish_relay(&self, request_id: &str, relay: super::relay::Relay) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        let Some(mut entry) = pending.entries.remove(request_id) else {
+            return false;
+        };
+        pending.bytes -= entry.bytes;
+        if !entry.relay_attached || entry.relay.is_some() {
+            pending.bytes += entry.bytes;
+            pending.entries.insert(request_id.to_owned(), entry);
+            return false;
+        }
+        entry.bytes += relay.heap_bytes();
+        entry.relay = Some(relay);
+        if entry.output_finished && entry.response_allowed {
+            entry._admission.handoff(entry.bytes);
+            drop(pending);
+            self.emit_entry(entry)
+        } else if self.retained_bytes(&pending).saturating_add(entry.bytes)
+            <= self.config.maximum_pending_bytes
+        {
+            pending.bytes += entry.bytes;
+            pending.entries.insert(request_id.to_owned(), entry);
+            true
+        } else {
+            self.skip()
+        }
+    }
+
+    fn emit_entry(&self, mut entry: Entry) -> bool {
+        if let Some(wire) = entry.wire.as_mut() {
+            wire.relay = entry.relay.take();
+        }
+        self.emit(entry.record, entry.wire, Some(entry._admission))
+    }
+
+    fn emit(
+        &self,
+        record: Record,
+        wire: Option<WireResponse>,
+        admission: Option<Admission>,
+    ) -> bool {
+        let deliver = || {
+            if self.config.asynchronous_delivery {
+                self.delivery.submit_record(record, wire, admission)
+            } else {
+                self.delivery.submit_wait(record, wire, admission)
+            }
+        };
         // A blocked destination must not occupy a Tokio executor thread or a
         // collector lock. Python entrypoints already release the interpreter.
         if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {

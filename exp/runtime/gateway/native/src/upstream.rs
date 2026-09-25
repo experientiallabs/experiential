@@ -344,6 +344,31 @@ pub async fn open_stream(
                     .with_provider_detail(Some(format!("{}: {token}", status_detail(status))))
                     .with_rate_limit_facts(rate_limit.clone(), retry_after));
             }
+            // A compatible relay can put Gemini's content verdict under 403.
+            // Read only the raw error envelope, never sanitized or echoed text.
+            let refusal = body.as_deref().and_then(|body| {
+                if !matches!(
+                    dialect,
+                    Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+                ) {
+                    return None;
+                }
+                let value = crate::error_envelope::parse_error_document(body)?;
+                let envelope = crate::error_envelope::openai_family_envelope(&value)?;
+                let reason = crate::stream_errors::relayed_gemini_refusal(
+                    envelope.code.as_deref(),
+                    envelope.message,
+                )?;
+                let detail = envelope
+                    .message
+                    .and_then(|message| sanitized_detail(message, &[]));
+                Some((reason, detail))
+            });
+            if let Some((reason, detail)) = refusal {
+                return Err(Failure::refusal(reason)
+                    .with_provider_detail(detail)
+                    .with_rate_limit_facts(rate_limit.clone(), retry_after));
+            }
             return Err(failure);
         }
         // A client-error status whose body names a missing model is the

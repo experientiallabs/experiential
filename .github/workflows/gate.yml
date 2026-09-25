@@ -13,6 +13,9 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    env:
+      # Type-check and exercise the complete package, including the capture engine.
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -123,14 +126,38 @@ jobs:
           --ignore=exp/simulation/tests/comparison_evidence_test.py
           --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
 
+  sdk-python312:
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: exp/runtime/gateway/native
+      - name: Install the minimum-version SDK without capture engine dependencies
+        run: uv sync --extra dev
+      - name: SDK and Capture command help remain available
+        run: |
+          uv run exp --help
+          uv run exp capture --help
+          uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
+            exp/tests/release_test.py -k "not installed_wheel"
+
   w16-darwin-evidence:
     runs-on: macos-latest
+    env:
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
         run: uv sync --extra dev
+      - name: Capture selective TLS streaming and local redirector lifecycle
+        run: uv run pytest -q exp/runtime/capture exp/cli/capture
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}

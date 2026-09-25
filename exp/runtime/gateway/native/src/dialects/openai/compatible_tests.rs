@@ -285,6 +285,44 @@ fn compatible_missing_or_invalid_deltas_still_fail_without_valid_annotations() {
     }
 }
 
+#[test]
+fn gemini_relay_refusal_sse_ignores_quoted_messages_and_echoed_prompt_text() {
+    let message = "Gemini blocked the request: PROHIBITED_CONTENT";
+    for payload in [
+        json!({"error": {"code": 403, "message": format!("\"{message}\"")}}),
+        json!({"error": {"code": 403, "message": format!("Prompt included {message}")}}),
+        json!({"error": {"code": 403, "message": "Forbidden", "echo": message}, "prompt": message}),
+        json!({"error": {"code": 403, "message": "Forbidden", "metadata": {"raw": message}}}),
+        json!({"error": {"code": 403, "message": "Provider returned error", "metadata": {"raw": message}}}),
+        json!({"error": {"code": 403, "message": "Provider error", "metadata": {"raw": {"error": {"message": message}}}}}),
+        json!({"error": {"code": 403, "message": "Provider returned error", "metadata": {"raw": format!("  {message}  ")}}}),
+        json!({"error": {"code": 401, "message": message}}),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let events = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: payload.to_string(),
+            })
+            .unwrap();
+        let [Event::Failed(failure)] = events.as_slice() else {
+            panic!("expected one failure for {payload}");
+        };
+        assert_eq!(
+            failure.failure_class,
+            FailureClass::ProviderAuthentication,
+            "{payload}"
+        );
+    }
+    let (events, failure) = drain_stream_fixture(
+        Dialect::OpenAiCompatible,
+        &wire(&[text_frame(message), finish_frame("stop")], true),
+    );
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(events[0], json!({"kind": "text_delta", "text": message}));
+    assert_eq!(events.last(), Some(&json!({"kind": "completed"})));
+}
+
 /// An OpenAI-compatible lane that answers HTTP 200 with an error-shaped body
 /// (no `choices`) declares its failure in whichever envelope spelling it
 /// uses; each reaches the ledger with its sentence instead of dying as a

@@ -29,6 +29,13 @@ impl Sink for MemorySink {
 }
 
 fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<Record>) {
+    collector_with_relay(maximum_response_bytes, false)
+}
+
+fn collector_with_relay(
+    maximum_response_bytes: usize,
+    relay_metadata: bool,
+) -> (Arc<Collector>, mpsc::Receiver<Record>) {
     let (sender, receiver) = mpsc::channel();
     let collector = Arc::new(
         Collector::new(
@@ -44,6 +51,9 @@ fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<R
                 maximum_response_bytes,
                 ttl_seconds: 30,
                 settlement_required: false,
+                relay_metadata,
+                truncate_request: false,
+                asynchronous_delivery: true,
             },
             MemorySink(sender),
         )
@@ -100,7 +110,7 @@ impl Sink for HeldSink {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn stalled_writer_backpressures_complete_responses_without_blocking_the_runtime() {
+async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
     for fail in [false, true] {
         let (started, entered) = tokio::sync::oneshot::channel();
         let (resume, paused) = mpsc::channel();
@@ -120,6 +130,9 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                     maximum_response_bytes: 16384,
                     ttl_seconds: 30,
                     settlement_required: false,
+                    relay_metadata: false,
+                    truncate_request: false,
+                    asynchronous_delivery: true,
                 },
                 HeldSink {
                     entered: Some(started),
@@ -184,8 +197,8 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
         )
         .await
         .unwrap();
-        assert!(tasks.iter().all(|task| !task.is_finished()));
-        assert_eq!(&collector.counts()[3..], &[0, 0, 0]);
+        let completed = tasks.iter().filter(|task| task.is_finished()).count();
+        let failures = collector.counts()[3..].to_vec();
         resume.send(()).unwrap();
         for task in tasks {
             tokio::time::timeout(Duration::from_secs(2), task)
@@ -194,6 +207,10 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                 .unwrap();
         }
         assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+        // The first response leaves without waiting for storage, then the
+        // single-slot destination applies bounded backpressure to the rest.
+        assert_eq!(completed, 1);
+        assert_eq!(failures, [0, 0, 0]);
         let rows: Vec<_> = observed.try_iter().collect();
         assert_eq!(rows.len(), 8);
         assert!(rows
@@ -215,6 +232,123 @@ fn record(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Record {
     let records: Vec<Record> = receiver.try_iter().collect();
     assert_eq!(records.len(), 1);
     records.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn numeric_sources_preserve_wide_integers_in_json_sse_and_wire() {
+    const SOURCE: &str =
+        r#"{"enum":[1208925819614629174706177,-9223372036854775809],"text":"a\u0000b"}"#;
+    for sse in [false, true] {
+        let (collector, receiver) = collector_with_relay(8192, true);
+        assert!(collector.claim_relay("request"));
+        assert!(collector.finish_relay(
+            "request",
+            super::super::relay::Relay {
+                metadata: serde_json::from_value(json!({
+                    "wire_request": {"method":"POST", "body_bytes":SOURCE.len()},
+                    "headers":[], "timing":{}, "relay_completed":true,
+                    "client_disconnected":false
+                }))
+                .unwrap(),
+                body: SOURCE.as_bytes().to_vec(),
+            }
+        ));
+        let content = if sse {
+            format!("data: {SOURCE}\n\ndata: [DONE]\n\n")
+        } else {
+            SOURCE.to_owned()
+        };
+        let response = capture_response(
+            Some(collector.clone()),
+            "request",
+            Response::builder()
+                .header(
+                    "content-type",
+                    if sse {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
+                .body(Body::from(content.clone()))
+                .unwrap(),
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            content.as_bytes()
+        );
+        let record = record(&collector, receiver);
+        assert_eq!(
+            record.transport.unwrap()["wire_request"]["body_source_json"],
+            SOURCE
+        );
+        let source = match record.response.unwrap() {
+            CapturedResponse::Json { source_json, .. } => source_json.unwrap(),
+            CapturedResponse::Sse { source_json, .. } => {
+                let frames: Vec<Box<RawValue>> =
+                    serde_json::from_str(&source_json.unwrap()).unwrap();
+                assert_eq!(frames.len(), 2);
+                frames[0].get().to_owned()
+            }
+        };
+        assert_eq!(source, SOURCE);
+    }
+}
+
+#[tokio::test]
+async fn relay_metadata_rendezvous_preserves_wire_and_does_not_duplicate_replays() {
+    for metadata_first in [false, true] {
+        let (collector, receiver) = collector_with_relay(4096, true);
+        assert!(collector.claim_relay("request"));
+        assert!(!collector.claim_relay("request"));
+        assert!(!collector.claim_relay("unknown"));
+        let metadata = || super::super::relay::Relay {
+            metadata: serde_json::from_value(json!({
+                "wire_request": {"method":"POST", "path":"/v1/chat/completions",
+                    "headers":[["authorization","<redacted>"]], "body_bytes":14},
+                "headers":[["x-gateway-provider","Experiential Cloud"]],
+                "timing":{"total_ms":12.5},
+                "relay_completed":true,"client_disconnected":false
+            }))
+            .unwrap(),
+            body: br#"{"raw":"wire"}"#.to_vec(),
+        };
+        if metadata_first {
+            assert!(collector.finish_relay("request", metadata()));
+        }
+        let body = capture_response(
+            Some(collector.clone()),
+            "request",
+            Response::builder()
+                .header("x-request-id", "request")
+                .body(Body::from(r#"{"choices":[]}"#))
+                .unwrap(),
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        assert_eq!(&body[..], br#"{"choices":[]}"#);
+        if !metadata_first {
+            assert!(receiver.try_recv().is_err());
+            assert!(collector.finish_relay("request", metadata()));
+        }
+        let record = record(&collector, receiver);
+        assert_eq!(
+            record.transport.as_ref().unwrap()["wire_request"]["body"],
+            json!({"raw":"wire"})
+        );
+        assert_eq!(
+            record.transport.as_ref().unwrap()["timing"]["total_ms"],
+            12.5
+        );
+        assert!(matches!(
+            record.response,
+            Some(CapturedResponse::Json { .. })
+        ));
+        assert_eq!(collector.counts()[4..], [0, 0]);
+    }
 }
 
 #[tokio::test]
@@ -244,6 +378,28 @@ async fn json_capture_preserves_wire_bytes_and_normalizes_only_the_stored_copy()
         serde_json::from_str::<Value>(&source_json.unwrap()).unwrap(),
         serde_json::from_slice::<Value>(original).unwrap()
     );
+}
+
+#[tokio::test]
+async fn uncorrelated_provider_error_does_not_wait_for_unavailable_relay_metadata() {
+    let (collector, receiver) = collector_with_relay(4096, true);
+    let response = Response::builder()
+        .status(400)
+        .body(Body::from(r#"{"error":"provider rejected"}"#))
+        .unwrap();
+    let actual = capture_response(Some(collector.clone()), "request", response)
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&actual[..], br#"{"error":"provider rejected"}"#);
+    let record = record(&collector, receiver);
+    assert!(record.transport.is_none());
+    assert!(matches!(
+        record.response,
+        Some(CapturedResponse::Json { status: 400, .. })
+    ));
 }
 
 #[test]
@@ -311,6 +467,44 @@ async fn encoded_sse_budget_includes_lossless_sidecar_and_keeps_exact_prefix() {
     let restored: Vec<Value> = serde_json::from_str(&source_json.unwrap()).unwrap();
     assert_eq!(restored, vec![json!({"text":"first\0"})]);
     assert_eq!(frames, vec![json!({"text":"first\u{fffd}"})]);
+}
+
+#[tokio::test]
+async fn encoded_sse_budget_includes_wide_numeric_sources_and_keeps_exact_prefix() {
+    const SOURCE: &str = r#"{"value":1208925819614629174706177}"#;
+    let prefix = CapturedResponse::Sse {
+        status: 200,
+        frames: vec![serde_json::from_str(SOURCE).unwrap()],
+        truncated: true,
+        client_disconnected: false,
+        source_json: Some(format!("[{SOURCE}]")),
+    };
+    let limit = serde_json::to_string(&prefix).unwrap().len();
+    let (collector, receiver) = collector(limit);
+    let data = format!("data: {SOURCE}\n\ndata: {SOURCE}\n\ndata: {SOURCE}\n\n");
+    let response = Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(data.clone()))
+        .unwrap();
+    let actual = capture_response(Some(collector.clone()), "request", response)
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(actual.as_ref(), data.as_bytes());
+    let response = record(&collector, receiver).response.unwrap();
+    assert_eq!(serde_json::to_string(&response).unwrap().len(), limit);
+    let CapturedResponse::Sse {
+        source_json,
+        truncated,
+        ..
+    } = response
+    else {
+        panic!()
+    };
+    assert!(truncated);
+    assert_eq!(source_json.unwrap(), format!("[{SOURCE}]"));
 }
 
 #[tokio::test]
@@ -424,7 +618,7 @@ async fn oversized_stream_is_forwarded_in_full_but_capture_is_a_marked_prefix() 
 }
 
 #[tokio::test]
-async fn unregistered_requests_and_failed_responses_never_capture_response_content() {
+async fn unregistered_requests_are_excluded_but_admitted_errors_are_evidence() {
     let (collector, receiver) = collector(4096);
     let body = capture_response(
         Some(collector.clone()),
@@ -439,7 +633,7 @@ async fn unregistered_requests_and_failed_responses_never_capture_response_conte
     assert_eq!(body.as_ref(), b"not-captured");
     let failed = Response::builder()
         .status(429)
-        .body(Body::from("failure"))
+        .body(Body::from(r#"{"error":{"message":"provider throttled"}}"#))
         .unwrap();
     let body = capture_response(Some(collector.clone()), "request", failed)
         .into_body()
@@ -447,6 +641,14 @@ async fn unregistered_requests_and_failed_responses_never_capture_response_conte
         .await
         .unwrap()
         .to_bytes();
-    assert_eq!(body.as_ref(), b"failure");
-    assert!(record(&collector, receiver).response.is_none());
+    assert_eq!(
+        body.as_ref(),
+        br#"{"error":{"message":"provider throttled"}}"#
+    );
+    let Some(CapturedResponse::Json { status, body, .. }) = record(&collector, receiver).response
+    else {
+        panic!("admitted provider error was discarded");
+    };
+    assert_eq!(status, 429);
+    assert_eq!(body, json!({"error":{"message":"provider throttled"}}));
 }

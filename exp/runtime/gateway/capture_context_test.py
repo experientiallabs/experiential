@@ -6,7 +6,11 @@ from unittest.mock import patch
 import pytest
 
 from exp.runtime.anthropic_protocol.requests import decode_messages
-from exp.runtime.gateway.capture_context import capture_request_context, restore_capture_context
+from exp.runtime.gateway.capture_context import (
+    capture_context_document,
+    capture_request_context,
+    restore_capture_context,
+)
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.replay_identity import canonical_request_sha256, provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_chat
@@ -118,6 +122,17 @@ def test_storable_context_is_encoded_once_without_a_normalization_copy() -> None
     normalize.assert_not_called()
 
 
+def test_native_context_projection_never_serializes_ordinary_input() -> None:
+    """The native envelope owns sizing; no intermediate JSON copy precedes it."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "x" * 1_100_000 + "雪"}]}
+    ).request
+    with patch("exp.runtime.gateway.capture_context.json.dumps") as dumps:
+        context = capture_context_document(request)
+    dumps.assert_not_called()
+    assert context["request"] == request.model_dump(mode="json", exclude_none=True)
+
+
 def test_valid_surrogate_pair_and_literal_escape_do_not_need_a_second_encoding() -> None:
     """A fast-path candidate that normalizes unchanged retains the original size check."""
     request = decode_chat(
@@ -175,6 +190,33 @@ def test_excluded_provider_carriers_are_retained_separately() -> None:
     provider = context["provider_context"]
     assert isinstance(provider, dict)
     assert provider["provider_thinking_config"] == {"type": "enabled", "budget_tokens": 32}
+
+
+def test_capture_retains_hosted_effective_settings_without_changing_serving_input() -> None:
+    """Capture keeps the old hosted envelope's excluded, nonempty request settings."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+    ).request.model_copy(
+        update={
+            "provider_thinking_config": {"type": "enabled", "budget_tokens": 32},
+            "diagnostics": {"trace": True},
+            "speed": "fast",
+            "provider_beta_tokens": ("interleaved-thinking",),
+            "ignored_parameters": ("seed",),
+            "idempotency_key": "not-captured",
+        }
+    )
+    before = request.model_dump_json()
+    context = capture_context_document(request)
+    assert context["provider_internal"] == {
+        "provider_thinking_config": {"type": "enabled", "budget_tokens": 32},
+        "diagnostics": {"trace": True},
+        "speed": "fast",
+        "provider_beta_tokens": ["interleaved-thinking"],
+        "ignored_parameters": ["seed"],
+    }
+    assert "not-captured" not in json.dumps(context)
+    assert request.model_dump_json() == before
 
 
 def test_capture_context_is_storable_and_omits_transport_replay_key() -> None:

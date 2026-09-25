@@ -28,7 +28,11 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
     SealedReasoningContentBlock,
 )
-from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
+from exp.runtime.gateway.embeddings_contracts import (
+    EmbeddingInputs,
+    EmbeddingsRequest,
+    EmbeddingTokenIds,
+)
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
@@ -101,33 +105,56 @@ from exp.runtime.openai_protocol.wire_models import (
 
 
 class _EmbeddingsRequest(_WireModel):
-    """Closed gateway embeddings request profile.
+    """Closed OpenAI embeddings profile with text and pre-tokenized inputs.
 
-    ``input`` narrows the official OpenAI union to text only: the token-array
-    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
-    are rejected here with a field-specific 400, since this surface serves
-    visible text, not pre-tokenized ids.
+    Attributes:
+        model: Public model alias requested by the caller.
+        input: One text/token input or a homogeneous batch of either form.
+        dimensions: Optional positive vector width requested from the provider.
+        encoding_format: Optional float or base64 response encoding.
+        user: Optional gateway-only attribution, at most 1,024 characters.
+        stream: Literal false convenience, validated and omitted upstream.
     """
 
     model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[str, ...]
+    input: str | EmbeddingTokenIds | EmbeddingInputs
     dimensions: int | None = Field(default=None, gt=0)
     encoding_format: Literal["float", "base64"] | None = None
     user: str | None = Field(default=None, max_length=1024)
+    stream: Literal[False] = False
+
+    @field_validator("stream", mode="before")
+    @classmethod
+    def _require_nonstreaming(cls, value: JsonValue) -> Literal[False]:
+        """Accept only literal false, without coercing zero or string values."""
+        if value is not False:
+            raise ValueError("embeddings do not stream; omit stream or set it to false")
+        return False
 
     @field_validator("input")
     @classmethod
-    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
-        """Reject empty text, an empty array, or empty array members."""
+    def _require_nonempty_input(
+        cls, value: str | EmbeddingTokenIds | EmbeddingInputs
+    ) -> str | EmbeddingTokenIds | EmbeddingInputs:
+        """Reject empty texts or batches without treating token ID zero as empty."""
         if isinstance(value, str):
             if not value:
                 raise ValueError("input must not be an empty string")
             return value
         if not value:
             raise ValueError("input must not be an empty array")
-        if any(not text for text in value):
-            raise ValueError("input array must not contain empty strings")
+        if any(not item for item in value if not isinstance(item, int)):
+            raise ValueError("input array must not contain empty inputs")
         return value
+
+    def batch_inputs(self) -> EmbeddingInputs:
+        """Normalize one string or flat token sequence to one logical batch item."""
+        if isinstance(self.input, str):
+            return (self.input,)
+        if isinstance(self.input[0], int):
+            # The validated union is homogeneous; a flat sequence contains only token IDs.
+            return (cast(EmbeddingTokenIds, self.input),)
+        return cast(EmbeddingInputs, self.input)
 
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
@@ -350,12 +377,13 @@ def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     _validate_manifest(payload, EMBEDDINGS_MANIFEST)
-    _validate_official(_EMBEDDINGS_OFFICIAL, payload)
+    if payload.get("stream") is True:
+        raise unsupported_field("stream")
+    _validate_official(_EMBEDDINGS_OFFICIAL, payload, extension_fields={"stream"})
     request = _validate_wire(_EmbeddingsRequest, payload)
-    inputs = (request.input,) if isinstance(request.input, str) else request.input
     try:
         canonical = EmbeddingsRequest(
-            inputs=inputs,
+            inputs=request.batch_inputs(),
             dimensions=request.dimensions,
             encoding_format=request.encoding_format,
             user=request.user,

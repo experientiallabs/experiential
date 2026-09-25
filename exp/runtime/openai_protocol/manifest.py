@@ -338,6 +338,7 @@ EMBEDDINGS_MANIFEST = CompatibilityManifest(
                 "encoding_format",
             )
         ),
+        _field("stream", CompatibilityDisposition.IGNORED),
         # End-user attribution (OpenAI spec): accepted and recorded gateway-side,
         # never forwarded to the provider. The embeddings body carries no
         # safety_identifier / prompt_cache_key, so `user` is the only one.

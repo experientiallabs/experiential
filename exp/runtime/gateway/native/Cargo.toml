@@ -1,6 +1,6 @@
 [package]
 name = "exp-gateway-native"
-version = "0.3.101"
+version = "0.3.106"
 edition = "2021"
 description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
 license = "Apache-2.0"
@@ -31,7 +31,7 @@ futures-util = "0.3"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
 thiserror = "2"
 rusqlite = { version = "0.38", features = ["bundled"] }

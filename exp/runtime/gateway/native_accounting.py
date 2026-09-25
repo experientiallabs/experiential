@@ -653,7 +653,7 @@ class NativeAttemptAccounting:
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
-        terminal, failure = settled_terminal(data, entry)
+        terminal, failure = settled_terminal(data, entry, loads=self._loads)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
         upstream = upstream_provider_from_settlement(data)
@@ -896,7 +896,7 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = settled_terminal(settlement, entry)
+            terminal, failure = settled_terminal(settlement, entry, loads=self._loads)
             if self._settle_swept(
                 request_id,
                 entry,

@@ -136,7 +136,7 @@ jobs:
           path: native-dist
       - name: Smoke test the wheel
         run: |
-          uv venv /tmp/exp-wheel-smoke
+          uv venv --python 3.12 /tmp/exp-wheel-smoke
           uv pip install --python /tmp/exp-wheel-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
           cd /tmp
           /tmp/exp-wheel-smoke/bin/python - <<'PY'
@@ -190,6 +190,30 @@ jobs:
           name: python-dist
           path: dist/
 
+  capture-release-smoke:
+    if: github.event_name == 'release' || inputs.publish == true
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-dist-linux-x86_64
+          path: native-dist
+      - name: Require published Capture dependencies before release
+        # Test a downloaded copy after the publish artifact has been finalized.
+        # This job cannot replace that artifact and has no publishing credentials.
+        run: |
+          uv venv --python 3.13 /tmp/exp-capture-release-smoke
+          uv pip install --python /tmp/exp-capture-release-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
+          /tmp/exp-capture-release-smoke/bin/python -c "import mitmproxy, mitmproxy_rs"
+
   publish:
     if: >-
       github.event_name == 'release' ||
@@ -197,7 +221,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       inputs.source == 'latest-release' &&
       inputs.publish)
-    needs: build
+    needs: [build, capture-release-smoke]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

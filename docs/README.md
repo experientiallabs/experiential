@@ -7,7 +7,7 @@ results, and plans do not live here.
 
 | File | Purpose |
 |---|---|
-| `usage.md` | Locked CLI map for build, bounded optimize model, optimize router, run, and config. |
+| `usage.md` | CLI map for build, bounded optimize model, optimize router, run, config, login, and foreground macOS capture. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
 | `reference/chat-logprobs.md` | Verified Chat probability admission, token records, and guardrail boundaries. |

@@ -7,13 +7,23 @@ use serde_json::Value;
 
 /// UTF-8 compact JSON length, without constructing escaped strings.
 pub(super) fn string_bytes(text: &str) -> usize {
-    text.as_bytes().iter().fold(2usize, |size, byte| {
-        size.saturating_add(match byte {
-            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
-            0..=31 => 6,
-            _ => 1,
-        })
-    })
+    // Count escape overhead separately from the existing UTF-8 bytes. These
+    // reductions avoid a dependent saturating addition for every input byte.
+    let escaped = text
+        .bytes()
+        .filter(|&byte| byte < 32 || byte == b'"' || byte == b'\\')
+        .count();
+    if escaped == 0 {
+        return text.len().saturating_add(2);
+    }
+    let long = text
+        .bytes()
+        .filter(|&byte| byte < 32 && !matches!(byte, b'\n' | b'\r' | b'\t' | 8 | 12))
+        .count();
+    text.len()
+        .saturating_add(2)
+        .saturating_add(escaped)
+        .saturating_add(long.saturating_mul(4))
 }
 
 pub(super) fn optional_string_bytes(text: Option<&str>) -> usize {

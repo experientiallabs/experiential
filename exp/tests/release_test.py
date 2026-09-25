@@ -14,6 +14,7 @@ import sys
 import tarfile
 import termios
 import time
+import tomllib
 import zipfile
 from email.parser import Parser
 from pathlib import Path, PurePosixPath
@@ -43,7 +44,6 @@ FORBIDDEN_REQUIREMENTS = frozenset(
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
         "anyio",
-        "ijson",
         "boto3",
         "botocore",
         "click",
@@ -52,6 +52,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "google-auth",
         "google-re2",
         "httpx",
+        "ijson",
         "numpy",
         "openai",
         "posthog",
@@ -61,6 +62,9 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "tomli-w",
         "typer",
     }
+)
+REQUIRED_CAPTURE_REQUIREMENTS = frozenset(
+    {"brotli", "cryptography", "exp-mitmproxy", "exp-mitmproxy-rs", "zstandard"}
 )
 REQUIRED_WHEEL_MODULES = frozenset(
     {
@@ -244,6 +248,35 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
         for name, marker in _metadata_requirements(metadata)
         if not re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker)
     )
+
+
+def _assert_core_requirements(metadata: str) -> None:
+    """Check unconditional SDK dependencies and Python-gated Capture dependencies."""
+    _assert_allowed_requirements(metadata)
+    requirements: dict[str, str] = {}
+    for name, marker in _metadata_requirements(metadata):
+        if re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker):
+            continue
+        assert name not in requirements, f"duplicate core dependency: {name}"
+        requirements[name] = re.sub(r"\s+", "", marker).replace("'", '"')
+    assert frozenset(requirements) == REQUIRED_CORE_REQUIREMENTS | REQUIRED_CAPTURE_REQUIREMENTS
+    for name, marker in requirements.items():
+        expected = 'python_version>="3.13"' if name in REQUIRED_CAPTURE_REQUIREMENTS else ""
+        assert marker == expected, f"unexpected dependency marker for {name}: {marker!r}"
+
+
+def test_core_dependency_markers_preserve_sdk_python_312() -> None:
+    """Gate Capture's TLS dependencies without silently narrowing SDK compatibility."""
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
+    assert project["requires-python"] == ">=3.12"
+    metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
+    _assert_core_requirements(metadata)
+    _assert_core_requirements(metadata + "\n\nRequires-Dist: anthropic>=1.2")
+    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    for marker in ("", '; python_version >= "3.13"'):
+        with pytest.raises(AssertionError, match="forbidden release requirement"):
+            _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
 
 
 def _assert_current_archive_members(
@@ -3149,6 +3182,24 @@ def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     assert 'dist/*.whl "openai==3.0.0"' in workflow
 
 
+def test_capture_release_imports_cannot_modify_the_publish_artifact() -> None:
+    """Public Capture dependencies execute only against an isolated artifact copy."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text()
+    build, smoke = workflow.split("  build:\n", 1)[1].split("  capture-release-smoke:\n", 1)
+    smoke, publish = smoke.split("  publish:\n", 1)
+    assert "uv venv --python 3.12 /tmp/exp-wheel-smoke" in build
+    assert "import mitmproxy" not in build
+    assert "    needs: build\n" in smoke
+    assert "if: github.event_name == 'release' || inputs.publish == true" in smoke
+    assert "import mitmproxy, mitmproxy_rs" in smoke
+    assert "upload-artifact" not in smoke
+    assert "id-token: write" not in smoke
+    assert "contents: write" not in smoke
+    assert "    needs: [build, capture-release-smoke]\n" in publish
+    assert "name: python-dist" in smoke and "name: python-dist" in publish
+
+
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 
@@ -3192,6 +3243,17 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
         environment=environment,
     )
     installed_python = virtual_environment / "bin" / "python"
+    # Exercise the exact prerelease forks in the isolated installation. The publishing
+    # workflow separately requires their normal PyPI requirements to resolve on 3.13.
+    capture_sources: list[str] = []
+    if sys.version_info >= (3, 13):
+        project = tomllib.loads((repository / "pyproject.toml").read_text(encoding="utf-8"))
+        for name in ("exp-mitmproxy", "exp-mitmproxy-rs"):
+            source = project["tool"]["uv"]["sources"][name]
+            location = f"git+{source['git']}@{source['rev']}"
+            if "subdirectory" in source:
+                location += f"#subdirectory={source['subdirectory']}"
+            capture_sources.append(f"{name} @ {location}")
     _run_checked(
         [
             uv,
@@ -3200,6 +3262,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             "--python",
             str(installed_python),
             *(str(wheel) for wheel in wheels),
+            *capture_sources,
             "openai==3.0.0",
         ],
         cwd=execution,
@@ -3316,8 +3379,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        _assert_allowed_requirements(metadata)
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         names = tuple(
@@ -3328,8 +3390,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        _assert_allowed_requirements(metadata)
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:

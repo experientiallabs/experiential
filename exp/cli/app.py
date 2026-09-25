@@ -9,6 +9,7 @@ import typer
 
 from exp.cli.auth import login
 from exp.cli.build.app import build
+from exp.cli.capture.app import capture_app
 from exp.cli.config.app import config_app
 from exp.cli.evaluation.app import evaluate
 from exp.cli.gateway.home import default_gateway
@@ -27,6 +28,7 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 app.add_typer(config_app, name="config")
+app.add_typer(capture_app, name="capture")
 add_deferred_typer(
     app,
     name="optimize",

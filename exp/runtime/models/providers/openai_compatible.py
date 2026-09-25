@@ -189,16 +189,17 @@ def openai_compatible_request(
 
 def openai_embedding_request(
     model_id: str,
-    texts: Sequence[str],
+    texts: Sequence[str] | Sequence[Sequence[int]],
     *,
     dimensions: int | None = None,
     encoding_format: Literal["float", "base64"] | None = None,
 ) -> JsonObject:
-    """Convert ordered text into one OpenAI-compatible embedding request.
+    """Convert ordered text or token inputs into an OpenAI-compatible embedding request.
 
     Args:
         model_id: Served embedding model id.
-        texts: Ordered visible text values to embed.
+        texts: Homogeneous ordered text values or token sequences to embed. Token IDs
+            are passed unchanged and must use the served model's tokenizer.
         dimensions: Optional output dimensionality the caller requested. Omitted
             from the wire when absent so the provider's native width applies.
         encoding_format: Optional caller vector encoding. Omitted when absent so
@@ -207,7 +208,10 @@ def openai_embedding_request(
     Returns:
         The OpenAI-compatible ``/embeddings`` request body.
     """
-    request: JsonObject = {"model": model_id, "input": list(texts)}
+    request: JsonObject = {
+        "model": model_id,
+        "input": [item if isinstance(item, str) else list(item) for item in texts],
+    }
     if dimensions is not None:
         request["dimensions"] = dimensions
     if encoding_format is not None:

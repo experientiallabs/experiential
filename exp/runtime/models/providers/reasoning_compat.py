@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, cast
 
 from exp.common.models.known_models import canonical_model_id, known_model_metadata
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.models.providers.anthropic_tool_compat import matches_anthropic_release
 from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
@@ -176,14 +177,16 @@ _ANTHROPIC_ALWAYS_THINKING_FAMILIES = (
     "claude-mythos-5",
     "claude-mythos-preview",
 )
+# Opus 5.5 changes the off-switch contract without changing the whole generation.
+_ANTHROPIC_ALWAYS_THINKING_RELEASES = ("claude-opus-5-5",)
 
 
 def anthropic_adaptive_only_thinking(model_id: str) -> bool:
     """Return whether adaptive is the model's only enabled thinking mode.
 
     These families reject budgeted ``thinking.type.enabled``. That does not
-    imply that thinking cannot be disabled: Sonnet and Opus support an off
-    switch, with Opus 5 restricting it to effort high or below.
+    imply that thinking cannot be disabled: Sonnet and older Opus releases
+    support an off switch, while Opus 5.5 always reasons adaptively.
 
     Args:
         model_id: Exact Anthropic model identifier.
@@ -492,7 +495,7 @@ def shape_anthropic_thinking_config(
         )
     if adaptive_only and config_type == "enabled":
         # A bare enable requests thinking but specifies no numerical bound.
-        provider_updates["provider_thinking_config"] = {"type": "adaptive"}
+        provider_updates["provider_thinking_config"] = {**config, "type": "adaptive"}
         disclose("thinking.type->adaptive")
         _logger.warning(
             "translated a caller bare 'enabled' thinking config to adaptive; "
@@ -517,7 +520,7 @@ def shape_anthropic_thinking_config(
             normalized = _normalized_model(profile.model_id)
             always_thinks = any(
                 family in normalized for family in _ANTHROPIC_ALWAYS_THINKING_FAMILIES
-            )
+            ) or matches_anthropic_release(profile.model_id, _ANTHROPIC_ALWAYS_THINKING_RELEASES)
             effort = request.reasoning_effort
             if request.provider_output_config is not None:
                 effort = request.provider_output_config.get("effort", effort)

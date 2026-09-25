@@ -1,7 +1,7 @@
 """Type stubs for the exp_gateway_native extension module."""
 
 from collections.abc import Callable, Mapping
-from typing import Protocol
+from typing import Literal, Protocol, overload
 
 __version__: str
 
@@ -49,9 +49,30 @@ class CaptureCollector:
 
     def __init__(self, config_json: str, sink: Callable[[str], None]) -> None: ...
     @staticmethod
+    @overload
+    def batched(
+        config_json: str,
+        sink: Callable[[tuple[str, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
+        bytes_output: Literal[False] = False,
+    ) -> CaptureCollector: ...
+    @staticmethod
+    @overload
+    def batched(
+        config_json: str,
+        sink: Callable[[tuple[bytes, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
+        bytes_output: Literal[True],
+    ) -> CaptureCollector: ...
+    @staticmethod
     def sqlite(config_json: str, local_json: str) -> CaptureCollector | None: ...
     def begin(self, request_json: str) -> bool: ...
+    def begin_bytes(self, request_json: bytes) -> bool: ...
     def select_model(self, request_id: str, model_id: str) -> None: ...
+    def claim_relay(self, request_id: str) -> bool: ...
+    def finish_relay(self, request_id: str, metadata_json: str, body: bytes) -> bool: ...
     def settle(self, request_id: str, keep_prompt: bool, keep_response: bool) -> None: ...
     def close(self, timeout_seconds: float = 10.0) -> bool: ...
     def counts(self) -> tuple[int, int, int, int, int, int]: ...

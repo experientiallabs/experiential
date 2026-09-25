@@ -76,7 +76,7 @@ pub(crate) enum Response {
     Json {
         status: u16,
         body: Value,
-        /// Escaped exact JSON when the query projection contains unstorable text.
+        /// Exact JSON when text or numeric values need a queryable projection.
         source_json: Option<String>,
     },
     Sse {
@@ -130,9 +130,15 @@ impl Response {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Record<R = Response> {
+    /// Internal delivery dependency, never part of a complete capture record.
+    #[serde(skip)]
+    pub checkpointed: bool,
     pub schema_version: u32,
     pub request: Request,
     pub response: Option<R>,
+    /// Caller-facing headers, timing and optional redacted wire request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Value>,
     /// Provider-returned plaintext from an explicitly exposure-enabled winning rung.
     pub provider_reasoning: Option<String>,
     pub provider_reasoning_source_json: Option<String>,
@@ -206,12 +212,55 @@ impl<R> Record<R> {
 impl<R: Serialize> Serialize for Record<R> {
     /// Project only exceptional reasoning text; never clone the request or response.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_update(serializer, false)
+    }
+}
+
+struct CompletionUpdate<'a, R>(&'a Record<R>);
+
+impl<R: Serialize> Serialize for CompletionUpdate<'_, R> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize_update(serializer, true)
+    }
+}
+
+impl<R: Serialize> Record<R> {
+    fn serialize_update<S: Serializer>(
+        &self,
+        serializer: S,
+        completion: bool,
+    ) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Reference<'a> {
+            request_id: &'a str,
+            scope: &'a Scope,
+            protocol: Protocol,
+            model_id: &'a Option<String>,
+        }
         let reasoning = self.durable_reasoning().map_err(S::Error::custom)?;
         let (parts, parts_source) = self.durable_gemini_parts();
         let mut record = serializer.serialize_struct("Record", 11)?;
-        record.serialize_field("schema_version", &self.schema_version)?;
-        record.serialize_field("request", &self.request)?;
+        record.serialize_field(
+            "schema_version",
+            &if completion { 2 } else { self.schema_version },
+        )?;
+        if completion {
+            record.serialize_field(
+                "request",
+                &Reference {
+                    request_id: &self.request.request_id,
+                    scope: &self.request.scope,
+                    protocol: self.request.protocol,
+                    model_id: &self.request.model_id,
+                },
+            )?;
+        } else {
+            record.serialize_field("request", &self.request)?;
+        }
         record.serialize_field("response", &self.response)?;
+        if let Some(transport) = &self.transport {
+            record.serialize_field("transport", transport)?;
+        }
         record.serialize_field("provider_reasoning", &reasoning.text)?;
         record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
         record.serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
@@ -265,6 +314,18 @@ impl<R: Serialize> Record<R> {
             .then(|| budget::encode(self, maximum_bytes))
             .flatten()
     }
+
+    /// Hosted completion updates reference an already queued prompt checkpoint.
+    /// A destination must retry schema 2 until that prompt is durably present.
+    pub(crate) fn encode_update(&self, maximum_bytes: usize) -> Option<String> {
+        if self.checkpointed && self.response.is_some() {
+            self.valid()
+                .then(|| budget::encode(&CompletionUpdate(self), maximum_bytes))
+                .flatten()
+        } else {
+            self.encode(maximum_bytes)
+        }
+    }
 }
 
 impl Record {
@@ -273,6 +334,7 @@ impl Record {
         std::mem::size_of::<Self>()
             + self.request.heap_bytes()
             + self.response.as_ref().map_or(0, Response::heap_bytes)
+            + self.transport.as_ref().map_or(0, budget::heap_bytes)
             + self.provider_reasoning.as_ref().map_or(0, String::capacity)
             + self
                 .provider_reasoning_source_json

@@ -99,15 +99,14 @@ def _capability(exc_info: pytest.ExceptionInfo[ProviderCapabilityError]) -> str:
 
 
 @pytest.mark.parametrize("choice", ("required", GatewayNamedToolChoice(name="lookup")))
-def test_fable_5_1_declines_a_forced_tool_choice_before_dispatch(
-    choice: str | GatewayNamedToolChoice,
+@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5"))
+def test_model_declines_a_forced_tool_choice_before_dispatch(
+    choice: str | GatewayNamedToolChoice, model_id: str
 ) -> None:
-    """The release rejects ``any``/``tool`` by name (live 2026-09-05, with or
-    without a thinking config), so the rung declines at build time and route
-    admission can prefer another rung or relax to ``auto`` with disclosure."""
+    """Release-specific tool restrictions reach admission before provider dispatch."""
     with pytest.raises(ProviderCapabilityError) as raised:
         anthropic_messages_stream_payload(
-            "claude-fable-5-1",
+            model_id,
             _tool_request(tool_choice=choice),
             supports_reasoning=True,
             reasoning_effort="medium",
@@ -117,7 +116,7 @@ def test_fable_5_1_declines_a_forced_tool_choice_before_dispatch(
     # auto and none stay servable on the same model.
     for open_choice in ("auto", "none", None):
         payload = anthropic_messages_stream_payload(
-            "claude-fable-5-1",
+            model_id,
             _tool_request(tool_choice=open_choice),
             maximum_output_tokens=128_000,
         )

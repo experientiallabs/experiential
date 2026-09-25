@@ -1,5 +1,6 @@
 //! Shared content capture, independent of destination and hosted tenancy policy.
 
+mod bounds;
 pub(crate) mod budget;
 pub(crate) mod collector;
 pub(crate) mod delivery;
@@ -12,6 +13,7 @@ mod projection;
 pub(crate) mod python;
 pub(crate) mod reasoning;
 pub(crate) mod record;
+mod relay;
 pub(crate) mod response;
 
 /// Optional caller correlation, never authentication, routing or idempotency authority.

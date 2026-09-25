@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::body::{Body, HttpBody};
 use axum::response::Response;
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::collector::Collector;
@@ -41,6 +41,7 @@ impl Drop for BodyCharge {
 /// Retain original wire bytes until the single destination worker needs JSON.
 /// The response permit covers queued, blocked and actively decoded bodies alike.
 pub(super) struct WireResponse {
+    pub(super) relay: Option<super::relay::Relay>,
     bytes: Vec<u8>,
     sse: bool,
     status: u16,
@@ -52,16 +53,33 @@ pub(super) struct WireResponse {
 
 impl WireResponse {
     pub(super) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.bytes.capacity()
+        std::mem::size_of::<Self>()
+            + self.bytes.capacity()
+            + self
+                .relay
+                .as_ref()
+                .map_or(0, super::relay::Relay::heap_bytes)
     }
 
     pub(super) fn decode(self) -> Option<CapturedResponse> {
         if self.sse {
-            let mut frames = data_frames(&self.bytes);
+            let (mut frames, number_sources) = data_frames_with_sources(&self.bytes);
             let mut truncated = self.truncated;
             loop {
                 let mut frame_value = Value::Array(frames);
-                let source_json = lossless_projection(&mut frame_value);
+                let mut source_json = lossless_projection(&mut frame_value);
+                if !number_sources.is_empty() {
+                    let encoded = source_json
+                        .take()
+                        .unwrap_or_else(|| serde_json::to_string(&frame_value).unwrap());
+                    let mut raw: Vec<Box<RawValue>> = serde_json::from_str(&encoded).unwrap();
+                    for (index, source) in &number_sources {
+                        if let Some(frame) = raw.get_mut(*index) {
+                            *frame = RawValue::from_string(source.clone()).unwrap();
+                        }
+                    }
+                    source_json = Some(serde_json::to_string(&raw).unwrap());
+                }
                 let Value::Array(moved_frames) = frame_value else {
                     unreachable!()
                 };
@@ -97,7 +115,12 @@ impl WireResponse {
             serde_json::from_slice::<Value>(&self.bytes)
                 .ok()
                 .map(|mut body| {
-                    let source_json = lossless_projection(&mut body);
+                    let wide = contains_wide_number(&body);
+                    let mut source_json = lossless_projection(&mut body);
+                    if wide {
+                        // Successful JSON parsing already proved valid UTF-8.
+                        source_json = Some(String::from_utf8(self.bytes).unwrap());
+                    }
                     CapturedResponse::Json {
                         status: self.status,
                         body,
@@ -160,6 +183,7 @@ impl Tap {
         }
         self.finished = true;
         let wire = WireResponse {
+            relay: None,
             bytes: std::mem::take(&mut self.bytes),
             sse: self.sse,
             status: self.status,
@@ -194,13 +218,12 @@ pub(crate) fn capture_response(
     let Some(collector) = collector else {
         return response;
     };
+    if !response.headers().contains_key("x-request-id") {
+        collector.without_relay(request_id);
+    }
     let Some(discarded) = collector.attach(request_id) else {
         return response;
     };
-    if !response.status().is_success() {
-        collector.finish(request_id, None, None);
-        return response;
-    }
     let sse = response
         .headers()
         .get("content-type")
@@ -280,8 +303,14 @@ pub(crate) fn capture_response(
 }
 
 /// Only whole SSE events enter the record, including non-JSON data such as [DONE].
+#[cfg(test)]
 fn data_frames(bytes: &[u8]) -> Vec<Value> {
+    data_frames_with_sources(bytes).0
+}
+
+fn data_frames_with_sources(bytes: &[u8]) -> (Vec<Value>, Vec<(usize, String)>) {
     let mut frames = Vec::new();
+    let mut number_sources = Vec::new();
     let mut data: Vec<&[u8]> = Vec::new();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         if !line.ends_with(b"\n") {
@@ -295,6 +324,9 @@ fn data_frames(bytes: &[u8]) -> Vec<Value> {
                 let value = serde_json::from_slice(&payload).unwrap_or_else(|_| {
                     Value::String(String::from_utf8_lossy(&payload).into_owned())
                 });
+                if contains_wide_number(&value) {
+                    number_sources.push((frames.len(), String::from_utf8(payload).unwrap()));
+                }
                 frames.push(value);
                 data.clear();
             }
@@ -302,7 +334,22 @@ fn data_frames(bytes: &[u8]) -> Vec<Value> {
             data.push(payload.strip_prefix(b" ").unwrap_or(payload));
         }
     }
-    frames
+    (frames, number_sources)
+}
+
+/// Finite-width JSON can round integers beyond its signed/unsigned 64-bit range.
+/// A wide float may also trigger a sidecar; preserving its source is harmless.
+pub(super) fn contains_wide_number(value: &Value) -> bool {
+    match value {
+        Value::Number(number) if !number.is_i64() && !number.is_u64() => {
+            number.as_f64().is_some_and(|number| {
+                number >= 18_446_744_073_709_551_616.0 || number <= -9_223_372_036_854_775_808.0
+            })
+        }
+        Value::Array(values) => values.iter().any(contains_wide_number),
+        Value::Object(values) => values.values().any(contains_wide_number),
+        _ => false,
+    }
 }
 
 /// Preserve exact JSON text whenever storage requires a normalized projection.

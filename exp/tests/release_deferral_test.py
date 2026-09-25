@@ -96,7 +96,7 @@ def test_publishing_cannot_pass_with_a_deferred_native_release(
         "if: github.event_name == 'release' || inputs.publish == true"
         in step.split("      - name:", 1)[0]
     )
-    assert "    needs: build\n" in publish
+    assert "    needs: [build, capture-release-smoke]\n" in publish
     command = re.search(r"^        run: (.+)$", step, re.MULTILINE)
     assert command is not None
     if deferred:

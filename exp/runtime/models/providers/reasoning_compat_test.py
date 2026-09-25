@@ -100,7 +100,33 @@ def test_unsupported_thinking_off_is_never_coerced(
     assert request.provider_thinking_config == {"type": "disabled"}
 
 
-@pytest.mark.parametrize("model_id", ("claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"))
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "claude-opus-5-5",
+        "claude-opus-5.5",
+        "anthropic/claude-opus-5.5",
+        "anthropic.claude-opus-5-5-v1:0",
+        "claude-opus-5-5-20260924",
+        "claude-opus-5-5@20260924",
+        "us.anthropic.claude-opus-5-5-20260924-v1:0",
+    ),
+)
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high", "xhigh", "max"))
+def test_opus_55_never_disables_thinking(model_id: str, effort: ReasoningEffort | None) -> None:
+    """The always-adaptive point release refuses off without changing the request."""
+    test_unsupported_thinking_off_is_never_coerced(model_id, effort)
+
+
+@pytest.mark.parametrize("model_id", ("claude-opus-5-50", "claude-opus-5-5-1"))
+def test_opus_55_thinking_rule_does_not_claim_unknown_releases(model_id: str) -> None:
+    """An unverified point release never inherits the exact 5.5 off prohibition."""
+    test_valid_thinking_off_reaches_native_payload(model_id, "low")
+
+
+@pytest.mark.parametrize(
+    "model_id", ("claude-opus-5", "claude-opus-5-5", "claude-sonnet-5", "claude-fable-5-1")
+)
 def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None:
     """A catalog default does not opt an unspecified request into reasoning."""
     profile = _anthropic_profile(model_id)
@@ -130,6 +156,24 @@ def test_adaptive_only_models_refuse_explicit_numeric_thinking_budgets(model_id:
         route_generation_parameter_requests((profile,), request)
     assert error.value.param == "thinking.budget_tokens"
     assert coerce_generation_parameters((profile,), request) is None
+
+
+@pytest.mark.parametrize("display", ("summarized", "omitted", "updates"))
+@pytest.mark.parametrize("model_id", ("claude-opus-5-5", "claude-fable-5-1"))
+def test_bare_enabled_translation_preserves_display(model_id: str, display: str) -> None:
+    """Changing thinking mode preserves the caller's independent display control."""
+    profile = _anthropic_profile(model_id)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Solve this."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "enabled", "display": display},
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["thinking"] == {"type": "adaptive", "display": display}
+    assert public.ignored_parameters == ("thinking.type->adaptive",)
+    assert request.provider_thinking_config == {"type": "enabled", "display": display}
 
 
 def test_bare_enabled_defers_budget_until_per_rung_output_is_known() -> None:

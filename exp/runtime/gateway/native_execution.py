@@ -165,6 +165,9 @@ class InflightRequest:
     active_attempt_id: str | None = None
     # Every reserved attempt's route depth, for health recording at settle.
     attempt_depths: dict[str, int] = field(default_factory=dict)
+    # The cache fraction each disconnect estimate used, frozen at first use so
+    # the sweep's replay of a retained settlement reproduces the same meter.
+    estimated_cache_fractions: dict[str, float] = field(default_factory=dict)
     # The exact settlement the data plane could not land; the sweep replays it
     # verbatim so a completed outcome and its usage are never downgraded.
     pending_settlement: JsonObject | None = None

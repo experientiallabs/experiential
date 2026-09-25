@@ -9,6 +9,7 @@ The root surface is deliberately small:
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud, save the returned organization key, and synchronize account-visible models with the catalog's default-route capabilities and undiscounted prices. Known metadata is reused without capability or price questions. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
+| `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Import file or gateway traces, mine scenarios, and prepare world-model grounding; omitting traces opens the guided build. | Canonical imports in `gateway/traffic.db`, versioned scenarios, serving RAG, fit RAG and a grounded world model. |
@@ -23,6 +24,122 @@ The root surface is deliberately small:
 | `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. `experiential-cloud` points at the hosted Platform gateway and reuses the credential from `exp login`; login already performs its provider/model synchronization. Setup also persists, replaces, or removes user-local provider keys. | Local `.exp/models.toml` plus optional records in the user-data credential file. |
 | `exp config budget [USD] --root ROOT` | Read or set the budget warning threshold for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
 | `exp config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
+
+## Direct provider capture on macOS
+
+Capture is experimental. Live Codex capture and recovery from a crashed or frozen Capture
+process have been exercised on macOS; broader application and network compatibility still needs testing.
+
+Run `exp capture` in a terminal and leave it open while using your AI applications. It captures
+supported traffic across apps using `api.openai.com`, `chatgpt.com`, and `api.anthropic.com`,
+including Codex and Claude Code, without a provider picker or changing provider base URLs. Capture
+reuses the normal Experiential login, or opens the same login flow when no credential exists. The Capture
+tab under API Keys shows the run and its statistics for Platform administrators. A run represents
+one foreground Capture process, rather than one application conversation. No separate capture
+credential or background capture daemon is required.
+Only one Capture process can run per macOS user, including across different preview profiles.
+
+The terminal shows setup progress, live capture counts, and provider-reported input/output tokens.
+Token totals use K, M, B, and T with up to two decimals, such as 1.75M for 1,752,000 tokens.
+Totals include cached input; missing usage is marked partial or unavailable. Use
+`exp capture --verbose` (or `-v`) for timestamped TLS and request events, upload counters, provider
+hosts, and the public CA certificate path. Verbose receipts link each request to its saved trace
+and upload batch, with a hashed provider response ID, reported tokens, and separate completion
+and transport-error indicators. Upload acceptance does not confirm dashboard processing.
+Slow verbose output can drop diagnostic events, with a count when output resumes; trace storage
+and delivery continue independently.
+Approval requests and errors remain visible without verbose output. When macOS reports the
+extension awaiting approval, Capture opens Login Items & Extensions and continues once you enable
+Mitmproxy Redirector under Network Extensions.
+
+Capture requires Python 3.13 or newer. Other SDK and CLI commands continue to support Python 3.12.
+In a checkout, use `uv run --python 3.13 exp capture`. The pinned fork dependencies may require
+Rust for the first source build. The first run installs the bundled, signed
+Mitmproxy Redirector app at `/Applications/Mitmproxy Redirector.app`. Approve its Network Extension
+when macOS asks. Before login, Capture verifies the packaged app and extension signatures against
+mitmproxy's expected signing identity, verifies any installed copy it will reuse, and checks the
+supported macOS version and installation access. Identical installed app contents are reused
+across Python environments without replacing the app or requesting new setup approval.
+If your account cannot install or update the app
+in `/Applications`, ask your administrator for installation access, then retry as your normal user.
+
+Advanced users can repeat `--domain HOST` to replace the defaults with an exact set, for example
+`exp capture --domain api.openai.com`. The filter applies across applications. Only supported
+model request paths produce uploaded traces; authentication and unrelated web requests are
+forwarded without retaining their bodies.
+Captured traces include prompts, responses, and tool content. Incomplete or malformed structured
+tool arguments are replaced with a redaction marker. Credential headers are never
+copied into uploaded traces. This is separate from anonymous aggregate product telemetry.
+
+The first run creates a private local certificate authority with critical X.509 name constraints
+for exactly the selected provider hostnames and requests SSL trust for the current macOS user.
+The certificate excludes subdomains and IP addresses. Selecting both a parent hostname and one
+of its subdomains is rejected because those exact-host constraints would conflict. The native
+macOS and Chromium verifiers enforce the certificate constraints; hostname-specific macOS trust
+settings are not used because Chromium does not support them.
+
+Each provider-host set gets a separate CA under `capture/ca-constrained/<scope-hash>` in the same
+user-data directory that owns the saved login. `exp capture --verbose` prints its public
+`mitmproxy-ca-cert.pem` path. A client with its own trust store may need that public CA configured
+explicitly; certificate pinning is not bypassed. Never share the adjacent `mitmproxy-ca.pem`, which
+contains the private signing key. Existing unconstrained certificates are not reused or granted
+broader trust.
+
+If a client explicitly rejects the Capture certificate, its subsequent connections to that host
+pass through with the original certificate and are not captured for the rest of the run. Retry or
+reload the affected app after the first failed connection. Capture names the app and host, keeps
+partial coverage visible in the terminal, and continues capturing other apps and hosts. If native
+process identity is unavailable or the bounded app list is full, all apps pass through for that
+host, with the wider exclusion shown explicitly. No client verification or certificate pinning is
+disabled. Ambiguous handshake disconnects remain local to the failed connection and do not
+turn off capture for future requests. Native write failures also close only the affected connection.
+Verbose diagnostics include fixed TLS, request, and DNS-forwarding lifecycle categories, opaque
+connection IDs, and DNS-check timeouts or resolver exit codes, without request
+content, authentication headers, URL queries, or raw error strings.
+If the native capture backend itself exits, Capture stops and reports that failure.
+
+Capture quietly checks provider DNS before starting and every few seconds while running.
+Two consecutive failures for the same provider stop interception automatically. A final check
+reports whether DNS recovered; Capture does not restart itself or request additional permissions.
+The macOS DNS responder process is excluded from interception. DNS attributed to other apps can
+still traverse the redirector, so this guard detects resolver failures rather than guaranteeing
+uninterrupted application connections. It does not change DNS settings or reset system services.
+
+Interception starts only after an independent watchdog is ready. If the foreground process dies
+or its event loop stops sending heartbeats for 15 seconds, the watchdog disables interception
+and terminates a stalled owner. macOS UDP sockets remain open across idle periods until their
+application closes them or Capture stops. The pinned proxy forks provide that lifetime and
+cleanup behavior while retaining the original signed macOS extension.
+
+Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
+system-wide interception while the foreground backend is running. Ctrl+C ends that interception;
+Capture does not edit `/etc/hosts`, DNS settings, or system proxy settings. There is no reset
+command or separate Capture service to stop. The signed app and its macOS approval remain
+installed, and the local CA trust remains in the current user's trust store between runs.
+Existing intercepted connections may close when Capture stops. Restart an application if its
+existing connections prevent a new run from observing requests. Certificate-pinned apps and
+unsupported model protocols are not collected. UDP traffic, including QUIC/HTTP3 and DNS,
+passes through without inspection; model trace collection currently supports HTTPS over TCP.
+
+Upload failures do not stall model responses. The collector retains bounded private retry files
+under the origin-and-organization-specific `capture/spool` directory. The next capture run with
+the same endpoint and organization retries pending files using their original batch IDs.
+When capture capacity is exhausted, collection drops copies and reports the count while model
+traffic continues. The CLI distinguishes captured requests, uploaded batches, and pending batches;
+upload acceptance does not imply that cloud projection has finished.
+Each run pins the storage origin and organization path configured by Platform. Upload tickets
+pointing outside that destination are rejected. Platform remains the trusted recipient and
+control plane for captured content.
+
+For an unreleased Platform preview, set both `EXP_GATEWAY_URL` to the preview API `/v1` URL and
+`EXP_PLATFORM_URL` to its web origin before `exp login` and `exp capture`. Saved credentials are
+bound to their endpoint, so a production login is not silently sent to a preview. If the saved
+login belongs to another endpoint, Capture opens normal login for the configured environment;
+successful login replaces the saved CLI login. To keep a preview's login and catalog separate,
+set `XDG_DATA_HOME` to a dedicated preview data directory and pass a separate `--root` to Capture.
+Capture checks the cloud API before starting interception. Live Codex and Claude Code
+compatibility remains part of local acceptance; existing open connections may need to be
+restarted to enter capture.
 
 `build`, `eval`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
 policy. An estimate at or below 50% of the budget runs automatically. A higher estimate

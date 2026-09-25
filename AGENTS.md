@@ -30,14 +30,15 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `config`, `eval`, `login`, `optimize`, and `run`. An invocation without a
-  subcommand opens the default gateway home screen. `exp/cli/app_test.py` and the release tests
+- The root CLI command set is exact: `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`.
+  An invocation without a subcommand opens the default gateway home screen.
+  `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
 
 ## CLI package ownership
 
 - `exp/cli/app.py` owns root command composition only. Command implementations live in the
-  `build/`, `config/`, `evaluation/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
+  `build/`, `capture/`, `config/`, `evaluation/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
   default home screen live under `gateway/`.
 - `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
@@ -139,7 +140,8 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `config`, `eval`, `login`, `optimize`, and `run`. The optimize group is locked
+- The root CLI is locked to `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`. Capture runs
+  in the foreground with no management subcommands. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
@@ -166,6 +168,9 @@ uv run pytest -q
 
 ## Python
 
+- Use Python 3.13+ for whole-repository development and quality gates so Capture's conditional
+  dependencies are installed. Published SDK and Capture command help support remains Python 3.12;
+  CI checks that minimum separately.
 - Every Python file must have a module docstring.
 - Every class, function, and method uses a Google-style docstring, including private helpers,
   nested functions, and test helpers, so each callable states its contract locally. An absolutely

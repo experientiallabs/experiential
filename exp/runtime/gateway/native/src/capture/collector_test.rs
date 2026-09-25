@@ -36,6 +36,9 @@ fn config() -> Configuration {
         maximum_response_bytes: 4096,
         ttl_seconds: 30,
         settlement_required: true,
+        relay_metadata: false,
+        truncate_request: false,
+        asynchronous_delivery: true,
     }
 }
 
@@ -74,6 +77,14 @@ fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) 
 fn drain(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Vec<Record> {
     assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
     receiver.try_iter().collect()
+}
+
+fn wait_for_handoffs(collector: &Collector) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while collector.handoff_bytes.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -159,6 +170,51 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
     let records = drain(&collector, receiver);
     assert_eq!(records[0].request.model_id.as_deref(), Some("selected"));
     assert_eq!(records[1].request.model_id, None);
+}
+
+#[test]
+fn hosted_checkpoint_is_queued_before_terminal_and_shares_effective_input() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("checkpoint")));
+    collector.reasoning("checkpoint", "not yet eligible output");
+    assert!(collector.checkpoint("checkpoint"));
+    let prompt = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("queued checkpoint did not reach the destination");
+    assert_eq!(prompt.request.request_id, "checkpoint");
+    assert!(prompt.response.is_none());
+    assert!(prompt.provider_reasoning.is_none());
+    assert!(prompt.metrics.is_none());
+    {
+        let pending = collector.pending.lock().unwrap();
+        // The test sink encodes and decodes, but the collector still owns its input.
+        assert_eq!(
+            prompt.request.context,
+            pending.entries["checkpoint"].record.request.context
+        );
+    }
+    collector.settle("checkpoint", true, true);
+    assert!(collector.finish("checkpoint", Some(response()), None));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].response.is_some());
+    assert_eq!(records[0].request.context, prompt.request.context);
+    assert_eq!(records[0].captured_at, prompt.captured_at);
+}
+
+#[test]
+fn unregistered_and_local_requests_do_not_pretend_to_checkpoint() {
+    let (hosted, receiver) = collector(config());
+    assert!(hosted.checkpoint("capture-off"));
+    assert!(drain(&hosted, receiver).is_empty());
+    let mut configuration = config();
+    configuration.settlement_required = false;
+    let (local, receiver) = collector(configuration);
+    assert!(local.begin(request("local")));
+    assert!(local.checkpoint("local"));
+    assert!(receiver.try_recv().is_err());
+    assert!(local.finish("local", Some(response()), None));
+    assert_eq!(drain(&local, receiver).len(), 1);
 }
 
 #[test]
@@ -400,9 +456,95 @@ fn pending_count_and_bytes_are_bounded_without_evicting_other_live_requests() {
     assert!(collector.begin(request("first")));
     assert!(!collector.begin(request("overflow")));
     collector.settle("first", true, false);
+    wait_for_handoffs(&collector);
     assert!(collector.begin(request("next")));
     collector.settle("next", false, false);
     assert_eq!(drain(&collector, receiver).len(), 1);
+}
+
+#[test]
+fn hosted_oversized_prompt_keeps_a_marked_copy_instead_of_rejecting_inference() {
+    let mut configuration = config();
+    configuration.truncate_request = true;
+    configuration.maximum_request_bytes = 8 * 1024 * 1024;
+    configuration.maximum_pending_bytes = 16 * 1024 * 1024;
+    configuration.delivery.maximum_record_bytes = 8 * 1024 * 1024;
+    configuration.delivery.maximum_bytes = 32 * 1024 * 1024;
+    let (collector, receiver) = collector(configuration);
+    let mut input = request("large");
+    input.context = Arc::new(json!({"schema_version":1,"request": {
+        "messages":[{"role":"system","content":"system prompt"},
+            {"role":"tool","tool_call_id":"call-1","content":"雪".repeat(22 * 1024 * 1024)}],
+        "tools":[{"name":"search","parameters":{"type":"object"}}]
+    }}));
+    assert!(collector.begin(input));
+    collector.settle("large", true, false);
+    let records = drain(&collector, receiver);
+    let context = &records[0].request.context;
+    assert_eq!(
+        context["request"]["messages"][0]["content"],
+        "system prompt"
+    );
+    assert_eq!(context["request"]["messages"][1]["tool_call_id"], "call-1");
+    let content = context["request"]["messages"][1]["content"]
+        .as_str()
+        .unwrap();
+    assert!(content.starts_with("雪") && content.contains("[truncated for capture:"));
+    assert!(content.len() > 4_109_744 && content.len() < 4_110_000);
+    assert_eq!(context["capture_limits"]["messages_truncated_strings"], 1);
+    assert_eq!(collector.counts()[4..], [0, 0]);
+}
+
+#[test]
+fn hosted_structural_envelope_overflow_does_not_discard_the_prompt() {
+    let mut configuration = config();
+    configuration.truncate_request = true;
+    let (collector, receiver) = collector(configuration);
+    let mut input = request("structural");
+    input.context = Arc::new(json!({"schema_version":1,"request": {
+        "messages":[{"role":"user","content":"keep this task"}],
+        "tools":[{"name":"lookup","parameters":{"enum":(0..10000).collect::<Vec<_>>()}}]
+    }}));
+    assert!(collector.begin(input));
+    collector.settle("structural", true, false);
+    let records = drain(&collector, receiver);
+    assert_eq!(
+        records[0].request.context["request"]["messages"][0]["content"],
+        "keep this task"
+    );
+    assert_eq!(
+        records[0].request.context["capture_limits"]["request_envelope_dropped"],
+        true
+    );
+    assert_eq!(collector.counts()[4..], [0, 0]);
+}
+
+#[test]
+fn hosted_structural_messages_honor_the_configured_request_limit() {
+    for maximum in [1024, 4096, 8192, 65536] {
+        let mut configuration = config();
+        configuration.truncate_request = true;
+        configuration.maximum_request_bytes = maximum;
+        let (collector, receiver) = collector(configuration);
+        let mut input = request("many-messages");
+        // No individual string exceeds the 4096-byte truncation threshold.
+        // Also cover messages below the cap but above it with the envelope.
+        let content = "x".repeat(100);
+        let messages = vec![json!({"role":"user","content":content}); maximum / 128];
+        input.context = Arc::new(json!({"schema_version":1,"request": {
+            "messages":messages,"tools":[{"name":"search"}]
+        }}));
+        assert!(input.json_bytes() > maximum);
+        assert!(collector.begin(input));
+        collector.settle("many-messages", true, false);
+        let records = drain(&collector, receiver);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].request.json_bytes() <= maximum);
+        let limits = &records[0].request.context["capture_limits"];
+        assert_eq!(limits["messages_truncated"], true);
+        assert_eq!(limits["messages_dropped"], maximum / 128);
+        assert_eq!(collector.counts()[4..], [0, 0]);
+    }
 }
 
 #[test]
@@ -469,8 +611,7 @@ fn shutdown_keeps_delivery_open_during_the_pending_map_handoff() {
         entry
     };
     assert!(!collector.close_until(Instant::now()));
-    assert!(collector.emit(entry.record, None));
-    drop(entry._admission);
+    assert!(collector.emit(entry.record, None, Some(entry._admission)));
     assert_eq!(drain(&collector, receiver).len(), 1);
     assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
 }
@@ -498,6 +639,94 @@ impl Sink for PausedSink {
             return Err(());
         }
         self.records.write(record)
+    }
+}
+
+#[test]
+fn queued_prompt_does_not_wait_for_storage_or_release_the_terminal_response_owner() {
+    let (entered, started) = mpsc::channel();
+    let (records, receiver) = mpsc::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let collector = Arc::new(
+        Collector::new(
+            config(),
+            PausedSink {
+                entered,
+                released: released.clone(),
+                records: MemorySink(records),
+            },
+        )
+        .unwrap(),
+    );
+    assert!(collector.begin(request("slow-checkpoint")));
+    assert!(collector.checkpoint("slow-checkpoint"));
+    let waiting = started.recv_timeout(Duration::from_secs(2)).is_ok();
+    let retained = {
+        let pending = collector.pending.lock().unwrap();
+        pending.entries.contains_key("slow-checkpoint")
+    };
+    released.store(true, Ordering::Release);
+    assert!(waiting && retained);
+    collector.settle("slow-checkpoint", true, true);
+    assert!(collector.finish("slow-checkpoint", Some(response()), None));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 2);
+    assert!(records[0].response.is_none());
+    assert!(records[1].response.is_some());
+    assert_eq!(collector.counts()[4..], [0, 0]);
+}
+
+#[test]
+fn durable_acknowledgement_is_preserved_unless_host_explicitly_opts_out() {
+    for asynchronous in [false, true] {
+        for mode in ["local", "settlement", "checkpoint"] {
+            let local = mode == "local";
+            let mut configuration = config();
+            configuration.asynchronous_delivery = asynchronous;
+            configuration.settlement_required = !local;
+            let (entered, started) = mpsc::channel();
+            let (records, receiver) = mpsc::channel();
+            let (finished, returned) = mpsc::channel();
+            let released = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(
+                Collector::new(
+                    configuration,
+                    PausedSink {
+                        entered,
+                        released: released.clone(),
+                        records: MemorySink(records),
+                    },
+                )
+                .unwrap(),
+            );
+            assert!(collector.begin(request("acknowledgement")));
+            let writer = collector.clone();
+            let producer = std::thread::spawn(move || {
+                if local {
+                    assert!(writer.finish("acknowledgement", Some(response()), None));
+                } else if mode == "checkpoint" {
+                    assert!(writer.checkpoint("acknowledgement"));
+                } else {
+                    writer.settle("acknowledgement", true, false);
+                }
+                finished.send(()).unwrap();
+            });
+            let reached = started.recv_timeout(Duration::from_secs(2)).is_ok();
+            let early = returned.recv_timeout(Duration::from_millis(50)).is_ok();
+            let pending = collector.counts()[0];
+            released.store(true, Ordering::Release);
+            producer.join().unwrap();
+            if mode == "checkpoint" {
+                collector.settle("acknowledgement", false, false);
+            }
+            let records = drain(&collector, receiver);
+            assert!(reached);
+            assert_eq!(early, asynchronous);
+            assert_eq!(pending, 1);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].response.is_some(), local);
+            assert_eq!(collector.counts()[4..], [0, 0]);
+        }
     }
 }
 
@@ -553,6 +782,7 @@ fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
             // must not strand a native retry worker or leak a test thread.
             released.store(true, Ordering::Release);
             thread.join().unwrap();
+            wait_for_handoffs(&collector);
             assert!(reached_destination, "mode={mode} bytes={bytes_bound}");
             assert!(!admitted_while_stalled, "mode={mode} bytes={bytes_bound}");
             assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);

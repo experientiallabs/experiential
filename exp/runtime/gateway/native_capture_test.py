@@ -5,11 +5,13 @@ import sys
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.capture_context import capture_context_document, restore_capture_context
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_capture import (
@@ -17,6 +19,7 @@ from exp.runtime.gateway.native_capture import (
     CaptureController,
     CaptureDeliveryLimits,
     CaptureRecord,
+    CaptureRequest,
     CaptureSseResponse,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
@@ -27,8 +30,84 @@ from exp.runtime.gateway.tests.launch_test import (
     _unused_port,
     _wait_ready,
 )
+from exp.runtime.openai_protocol.requests import decode_chat
 
 native = pytest.importorskip("exp_gateway_native")
+
+
+@pytest.mark.parametrize("application", ["application", "", " ", "x" * 513])
+@pytest.mark.parametrize("content", ["hello 雪", "a\x00b\ud800", "x" * 65536])
+@pytest.mark.parametrize("number", [1.0, float("nan"), float("inf"), float("-inf")])
+def test_controller_serializes_typed_context_once_and_native_validates_envelope(
+    application: str,
+    content: str,
+    number: float,
+) -> None:
+    """No second Python schema walk; native authority checks still reject invalid scope."""
+    authorization = AuthorizationSnapshot(
+        request_id="request",
+        organization_id="org",
+        identity_id="identity",
+        virtual_key_id="key",
+        alias="coding",
+        alias_revision_id="revision",
+        target=DirectTarget(pool_id="pool"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="b" * 64,
+        deadline_monotonic=1.0,
+    )
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "system", "content": "instructions"},
+                {"role": "user", "content": content},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "number", "default": number}},
+                        },
+                    },
+                }
+            ],
+        }
+    ).request
+    context = capture_context_document(request, session_id="episode")
+    expected = CaptureRequest.model_validate(
+        {
+            "request_id": "request",
+            "scope": {"organization_id": "org", "identity_id": "identity", "application_id": "app"},
+            "protocol": "chat_completions",
+            "model_id": "model",
+            "context": context,
+        }
+    )
+    expected_context = json.loads(expected.model_dump_json())["context"]
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    controller = CaptureController(collector, application_for=lambda _auth: application)
+    with patch.object(CaptureRequest, "model_validate", side_effect=AssertionError("revalidation")):
+        accepted = controller.begin(authorization, request, "model", session_id="episode")
+    if application == "application":
+        assert accepted
+        collector.settle("request", True, False)
+        assert collector.close(1)
+        record = CaptureRecord.model_validate_json(records[0])
+        assert record.request.context == expected_context
+        assert record.request.scope.application_id == application
+        assert record.request.model_id == "model"
+        assert collector.counts() == (0, 0, 1, 0, 0, 0)
+    else:
+        assert not accepted
+        assert collector.close(1)
+        assert not records
+        assert collector.counts() == (0, 0, 0, 0, 0, 1)
 
 
 def _request_json() -> str:
@@ -42,6 +121,36 @@ def _request_json() -> str:
             "context": {"schema_version": 1, "request": {"messages": []}},
         }
     )
+
+
+@pytest.mark.parametrize("suffix", ["a", "é", "雪", "😀"])
+def test_bytes_admission_preserves_text_contract_without_python_unicode_copy(suffix: str) -> None:
+    """The immutable-byte entry point stores exactly the same context as text admission."""
+    request = json.loads(_request_json())
+    request["context"]["request"]["messages"] = [{"role": "user", "content": "x" * 65536 + suffix}]
+    encoded = json.dumps(request, ensure_ascii=False)
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    assert collector.begin(encoded)
+    collector.settle("request", True, False)
+    assert collector.begin_bytes(encoded.encode("utf-8"))
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    assert len(records) == 2
+    assert all(json.loads(record)["request"] == request for record in records)
+    assert collector.counts() == (0, 0, 2, 0, 0, 0)
+
+
+def test_bytes_admission_rejects_invalid_utf8_and_mutable_buffers() -> None:
+    """Releasing the GIL never borrows a mutable buffer or admits invalid JSON bytes."""
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    assert not collector.begin_bytes(_request_json().encode().replace(b'"app"', b'"\xff"'))
+    with pytest.raises(TypeError):
+        collector.begin_bytes(bytearray(_request_json().encode()))
+    assert collector.close(1)
+    assert records == []
+    assert collector.counts() == (0, 0, 0, 0, 0, 1)
 
 
 def test_python_sink_runs_off_caller_thread_and_close_releases_gil() -> None:
@@ -78,8 +187,56 @@ def test_close_timeout_preserves_accepted_content_for_later_host_settlement() ->
     assert collector.counts() == (0, 0, 1, 0, 0, 0)
 
 
+@pytest.mark.parametrize("content", ["x" * 1_100_000, "雪" * 400_000])
+def test_default_admission_keeps_large_inputs_whole(content: str) -> None:
+    """The former one-MiB cutoff and ASCII escaping must not discard valid prompts."""
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    request = json.loads(_request_json())
+    request["context"]["request"]["messages"] = [{"role": "user", "content": content}]
+    encoded = json.dumps(request, ensure_ascii=False)
+    assert collector.begin(encoded)
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    persisted = CaptureRecord.model_validate_json(records[0])
+    assert persisted.request.context["request"] == request["context"]["request"]
+
+
+@pytest.mark.parametrize("number", [2**64, 2**80 + 1, -(2**63) - 1, -(2**80) - 1])
+@pytest.mark.parametrize("null_source", [False, True])
+def test_admission_preserves_wide_numeric_tool_context_in_lossless_source(
+    number: int, null_source: bool
+) -> None:
+    """Use the existing ingest restoration contract for out-of-range JSON integers."""
+    request = json.loads(_request_json())
+    if null_source:
+        request["context"]["source_json"] = None
+    request["context"]["request"]["tools"] = [{"name": "choose", "parameters": {"enum": [number]}}]
+    expected = request["context"]
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    assert collector.begin_bytes(json.dumps(request).encode())
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    actual = CaptureRecord.model_validate_json(records[0]).request.context
+    assert json.dumps(restore_capture_context(actual), sort_keys=True) == json.dumps(
+        expected, sort_keys=True
+    )
+
+
+def test_wide_number_in_invalid_context_fails_closed_without_panicking() -> None:
+    """A lossless sidecar cannot make a non-object context valid."""
+    request = json.loads(_request_json())
+    request["context"] = [2**80 + 1]
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), lambda _: None)
+    assert not collector.begin_bytes(json.dumps(request).encode())
+    assert collector.close(1)
+
+
+@pytest.mark.parametrize("asynchronous_delivery", [False, True])
 def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
     capfd: pytest.CaptureFixture[str],
+    asynchronous_delivery: bool,
 ) -> None:
     """A failed destination retains its exact record until recovery, even during close."""
     attempted = threading.Event()
@@ -95,7 +252,8 @@ def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
             raise RuntimeError("private SQL parameter that must not be logged")
         persisted.append(record)
 
-    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), write)
+    config = CaptureConfiguration(asynchronous_delivery=asynchronous_delivery)
+    collector = native.CaptureCollector(config.model_dump_json(), write)
     assert collector.begin(_request_json())
     settlement = threading.Thread(target=collector.settle, args=("request", True, False))
     settlement.start()
@@ -106,7 +264,8 @@ def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
         assert pending == 1 and retained > 0
         assert successes == drops == skips == 0
         assert failures >= 1
-        assert settlement.is_alive()
+        settlement.join(1)
+        assert settlement.is_alive() is not asynchronous_delivery
     finally:
         recovering.set()
         settlement.join(3)
@@ -141,6 +300,175 @@ def test_python_sink_rechecks_policy_after_an_uncertain_commit() -> None:
     assert collector.close(1)
     assert attempts == 2 and not rows
     assert collector.counts() == (0, 0, 1, 1, 0, 0)
+
+
+@pytest.mark.parametrize("bytes_output", [False, True])
+def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members(
+    bytes_output: bool,
+) -> None:
+    """One failed record cannot hold healthy peers; retries reuse prepared objects."""
+    entered = threading.Event()
+    release = threading.Event()
+    recover = threading.Event()
+    healthy = threading.Event()
+    batches: list[tuple[str | bytes, ...]] = []
+    persisted: set[str] = set()
+    failed_strings: list[str | bytes] = []
+
+    def write(records: tuple[str | bytes, ...]) -> list[bool]:
+        """Keep one record unavailable while acknowledging all of its neighbors."""
+        assert threading.current_thread() is not threading.main_thread()
+        batches.append(records)
+        entered.set()
+        assert release.wait(5)
+        outcomes = []
+        for encoded in records:
+            assert isinstance(encoded, bytes if bytes_output else str)
+            request_id = CaptureRecord.model_validate_json(encoded).request.request_id
+            if request_id == "request-0":
+                failed_strings.append(encoded)
+                if not recover.is_set():
+                    outcomes.append(False)
+                    continue
+            assert request_id not in persisted
+            persisted.add(request_id)
+            outcomes.append(True)
+        if len(persisted) >= 15:
+            healthy.set()
+        return outcomes
+
+    collector = (
+        native.CaptureCollector.batched(
+            CaptureConfiguration().model_dump_json(), write, bytes_output=True
+        )
+        if bytes_output
+        else native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    )
+    threads = []
+    for index in range(16):
+        request_id = f"request-{index}"
+        assert collector.begin(_request_json().replace('"request"', json.dumps(request_id), 1))
+        thread = threading.Thread(target=collector.settle, args=(request_id, True, False))
+        thread.start()
+        threads.append(thread)
+        if index == 0:
+            assert entered.wait(3)
+    try:
+        assert not collector.close(0.01)
+        release.set()
+        assert healthy.wait(5)
+        assert "request-0" not in persisted
+        assert not collector.close(0.01)
+    finally:
+        release.set()
+        recover.set()
+        for thread in threads:
+            thread.join(5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert collector.close(3)
+    assert len(persisted) == 16
+    assert any(len(batch) > 1 for batch in batches)
+    assert len(failed_strings) > 1
+    assert all(encoded is failed_strings[0] for encoded in failed_strings)
+    assert collector.counts()[0:3] == (0, 0, 16)
+    assert collector.counts()[4:] == (0, 0)
+
+
+@pytest.mark.parametrize("bytes_output", [False, True])
+def test_batched_sink_invalid_acknowledgements_never_release_records(bytes_output: bool) -> None:
+    """Exceptions and mismatched receipt counts retain the same prepared payload."""
+    seen: list[str | bytes] = []
+
+    def write(records: tuple[str | bytes, ...]) -> list[bool]:
+        """Recover only after exercising both invalid callback outcomes."""
+        seen.append(records[0])
+        if len(seen) == 1:
+            raise RuntimeError("private destination error")
+        if len(seen) == 2:
+            return []
+        return [True]
+
+    collector = (
+        native.CaptureCollector.batched(
+            CaptureConfiguration().model_dump_json(), write, bytes_output=True
+        )
+        if bytes_output
+        else native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    )
+    assert collector.begin(_request_json())
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    assert len(seen) == 3 and all(encoded is seen[0] for encoded in seen)
+    assert collector.counts() == (0, 0, 1, 2, 0, 0)
+
+
+@pytest.mark.parametrize(("count", "size"), [(80, 0), (8, 600_000)])
+@pytest.mark.parametrize("bytes_output", [False, True])
+def test_batched_sink_bounds_count_and_bytes(count: int, size: int, bytes_output: bool) -> None:
+    """Queued work fills byte- and count-bounded batches without losing Unicode."""
+    entered, release = threading.Event(), threading.Event()
+    batches: list[tuple[str | bytes, ...]] = []
+
+    def write(records: tuple[str | bytes, ...]) -> list[bool]:
+        batches.append(records)
+        entered.set()
+        assert release.wait(5)
+        assert len(records) <= 64
+        sizes = [len(record.encode() if isinstance(record, str) else record) for record in records]
+        assert sum(sizes) <= 10 * 1024 * 1024
+        if len(records) > 1:
+            assert sum(sizes[:-1]) < 2 * 1024 * 1024
+        return [True] * len(records)
+
+    collector = (
+        native.CaptureCollector.batched(
+            CaptureConfiguration().model_dump_json(), write, bytes_output=True
+        )
+        if bytes_output
+        else native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    )
+    threads = []
+    try:
+        for index in range(count):
+            request = json.loads(_request_json())
+            request["request_id"] = f"bounded-{index}"
+            request["context"]["request"]["messages"] = [
+                {"role": "user", "content": "x" * size + "🌏"}
+            ]
+            assert collector.begin(json.dumps(request))
+            thread = threading.Thread(
+                target=collector.settle, args=(request["request_id"], True, False)
+            )
+            thread.start()
+            threads.append(thread)
+            if index == 0:
+                assert entered.wait(3)
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert collector.close(3)
+    assert sum(map(len, batches)) == count
+    assert any(len(batch) > 1 for batch in batches)
+    for batch in batches:
+        for encoded in batch:
+            assert json.loads(encoded)["request"]["context"]["request"]["messages"] == [
+                {"role": "user", "content": "x" * size + "🌏"}
+            ]
+    assert collector.counts() == (0, 0, count, 0, 0, 0)
+
+
+def test_batched_sink_rejects_insufficient_preparation_budget() -> None:
+    """A valid single-record budget may be too small for the batch reservation."""
+    config = CaptureConfiguration().model_dump(mode="json")
+    config["delivery"] = {
+        "maximum_records": 64,
+        "maximum_record_bytes": 1024,
+        "maximum_bytes": 6 * 1024 + 256,
+    }
+    with pytest.raises(ValueError, match="preparation"):
+        native.CaptureCollector.batched(json.dumps(config), lambda values: [True] * len(values))
 
 
 def test_python_and_rust_configuration_fail_closed() -> None:
@@ -277,11 +605,29 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
     assert "retained task" in records[0]
 
 
-@pytest.mark.parametrize("policy", ["local", "hosted", "hosted-late", "off", "broken", "full"])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "local",
+        "hosted",
+        "hosted-batched",
+        "hosted-batched-references",
+        "hosted-batched-bytes-references",
+        "hosted-late",
+        "hosted-byok",
+        "hosted-checkpoint-failed",
+        "off",
+        "broken",
+        "full",
+    ],
+)
 def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
 ) -> None:
     """Collect Chat, Responses and Messages JSON/SSE through native HTTP, not a fixture tap."""
+    destination = policy
+    if policy.startswith("hosted-batched"):
+        policy = "hosted"
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
     _LoopbackProvider.calls = 0
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
@@ -291,9 +637,36 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
     )
     components = load_gateway_components(tmp_path)
-    records: list[str] = []
-    configuration = CaptureConfiguration(settlement_required=policy in {"hosted", "hosted-late"})
-    collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
+    records: list[str | bytes] = []
+    configuration = CaptureConfiguration(
+        settlement_required=policy.startswith("hosted"),
+        asynchronous_delivery=policy.startswith("hosted"),
+        delivery=(
+            CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=6400)
+            if policy == "hosted-checkpoint-failed"
+            else CaptureDeliveryLimits()
+        ),
+    )
+
+    def write_batch(values: tuple[str | bytes, ...]) -> list[bool]:
+        records.extend(values)
+        return [True] * len(values)
+
+    if destination == "hosted-batched-bytes-references":
+        collector = native.CaptureCollector.batched(
+            configuration.model_dump_json(),
+            write_batch,
+            completion_references=True,
+            bytes_output=True,
+        )
+    elif destination == "hosted-batched-references":
+        collector = native.CaptureCollector.batched(
+            configuration.model_dump_json(), write_batch, completion_references=True
+        )
+    elif destination == "hosted-batched":
+        collector = native.CaptureCollector.batched(configuration.model_dump_json(), write_batch)
+    else:
+        collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
     if policy == "full":
         assert collector.close(1)
 
@@ -308,12 +681,37 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     port = _unused_port()
     shutdown = native.shutdown_handle()
     failures: list[BaseException] = []
+    control = NativeControlPlane(components, capture=capture)
+    admit = control.admit
+
+    def funding_admit(argument: str) -> str:
+        """Model a hosted-funded test lane; local provider fixtures otherwise use BYOK."""
+        result = json.loads(admit(argument))
+        if policy in {"hosted", "hosted-late", "hosted-checkpoint-failed"}:
+            for wire in result["route"]:
+                wire["billing_customer_managed"] = False
+        return json.dumps(result)
+
+    monkeypatch.setattr(control, "admit", funding_admit)
+    settlements: list[dict[str, object]] = []
+    settle = control.settle
+
+    def observed_settle(argument: str) -> str:
+        """Run real accounting and explicitly exclude a rejected capture in this test."""
+        result = settle(argument)
+        value = json.loads(argument)
+        settlements.append(value)
+        if policy == "hosted-checkpoint-failed":
+            collector.settle(value["request_id"], False, False)
+        return result
+
+    monkeypatch.setattr(control, "settle", observed_settle)
 
     def run() -> None:
         """Serve the real data plane and preserve startup failures for assertions."""
         try:
             serve_native_gateway(
-                NativeControlPlane(components, capture=capture),
+                control,
                 host="127.0.0.1",
                 port=port,
                 capture=collector,
@@ -330,10 +728,11 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         for surface in ("chat/completions", "responses", "messages"):
             for stream in (False, True):
                 payload: dict[str, object] = {"model": "coding", "stream": stream}
+                prompt = "capture task" * (400 if policy == "hosted-checkpoint-failed" else 1)
                 if surface == "responses":
-                    payload["input"] = "capture task"
+                    payload["input"] = prompt
                 else:
-                    payload["messages"] = [{"role": "user", "content": "capture task"}]
+                    payload["messages"] = [{"role": "user", "content": prompt}]
                 if surface == "messages":
                     payload["max_tokens"] = 128
                 response = httpx.post(
@@ -353,15 +752,32 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                     ) in response.text
                     assert "private policy" not in response.text
                     continue
+                if policy == "hosted-checkpoint-failed":
+                    assert response.status_code == 500, response.text
+                    assert "hello " not in response.text
+                    assert len(settlements) == _LoopbackProvider.calls
+                    assert settlements[-1]["attempt_id"]
+                    assert settlements[-1]["outcome"] == "failed"
+                    assert settlements[-1]["finalize"] is True
+                    assert settlements[-1]["opened"] is True
+                    continue
                 assert response.status_code == 200, response.text
                 assert "hello " in response.text and "world" in response.text
                 if policy == "hosted":
                     collector.settle(response.headers["x-request-id"], True, True)
                 elif policy == "hosted-late":
                     awaiting_settlement.append(response.headers["x-request-id"])
+                elif policy == "hosted-byok":
+                    assert not records, "BYOK must not checkpoint before its terminal verdict"
+                    collector.settle(response.headers["x-request-id"], False, False)
         if policy == "hosted-late":
             assert not collector.close(0)
-            assert not records
+            # Native output cannot precede durable prompt ownership. Terminal
+            # permission adds the response later without discarding the prompt.
+            checkpoints = [CaptureRecord.model_validate_json(value) for value in records]
+            assert len(checkpoints) == 6
+            assert all(record.response is None for record in checkpoints)
+            assert {record.request.request_id for record in checkpoints} == set(awaiting_settlement)
             assert collector.counts()[5] == 0
             for request_id in awaiting_settlement:
                 collector.settle(request_id, True, True)
@@ -376,10 +792,29 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     assert not worker.is_alive()
     assert collector.close(1)
     assert _LoopbackProvider.calls == (0 if policy in {"broken", "full"} else 6)
-    if policy in {"off", "broken", "full"}:
+    if policy in {"off", "broken", "full", "hosted-byok", "hosted-checkpoint-failed"}:
         assert records == []
         return
-    parsed = [CaptureRecord.model_validate_json(value) for value in records]
+    if destination in {"hosted-batched-references", "hosted-batched-bytes-references"}:
+        updates = [json.loads(value) for value in records]
+        checkpoints = {
+            value["request"]["request_id"]: value["request"]
+            for value in updates
+            if value["schema_version"] == 1
+        }
+        completions = [value for value in updates if value["schema_version"] == 2]
+        assert len(checkpoints) == len(completions) == 6
+        for value in completions:
+            assert "context" not in value["request"]
+            request = checkpoints[value["request"]["request_id"]]
+            assert value["request"] == {
+                key: field for key, field in request.items() if key != "context"
+            }
+            value["request"] = request
+            value["schema_version"] = 1
+        parsed = [CaptureRecord.model_validate(value) for value in completions]
+    else:
+        parsed = [CaptureRecord.model_validate_json(value) for value in records]
     completed = [record for record in parsed if record.response is not None]
     assert len(completed) == 6
     assert sum(record.response.kind == "json" for record in completed if record.response) == 3
@@ -408,6 +843,9 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         assert record.metrics.usage is not None
         assert record.metrics.usage.input_tokens is not None
         assert record.metrics.usage.output_tokens is not None
-    assert "provider-secret" not in "".join(records)
-    assert raw_key not in "".join(records)
-    assert "do-not-capture-me" not in "".join(records)
+    encoded_records = "".join(
+        value.decode() if isinstance(value, bytes) else value for value in records
+    )
+    assert "provider-secret" not in encoded_records
+    assert raw_key not in encoded_records
+    assert "do-not-capture-me" not in encoded_records
