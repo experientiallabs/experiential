@@ -12,6 +12,7 @@ from exp.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJu
 from exp.optimize.router.errors import JudgeDispatchExhaustedError
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
+from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.transport import ProviderTransportError
 
 
@@ -76,6 +77,8 @@ class DurableEvaluationJudge:
                     rubric_artifact_id=rubric_artifact_id,
                     calibration_artifact_id=calibration_artifact_id,
                 )
+        except ProviderParameterError as exc:
+            raise ValueError(f"judge request settings are invalid: {exc}") from exc
         except (ValueError, ProviderTransportError, ProviderDeadlineExceeded) as exc:
             dispatched = self._client.calls - calls_before
             if dispatched == 0:
@@ -93,6 +96,6 @@ class DurableEvaluationJudge:
                 missing -= 1
             costs.extend([self._reservation.absolute_maximum_call_cost_usd()] * missing)
             raise JudgeDispatchExhaustedError(
-                "judge dispatch did not produce usable scoring evidence",
+                f"judge dispatch did not produce usable scoring evidence ({type(exc).__name__})",
                 conservative_cost_usd=math.fsum(costs),
             ) from exc

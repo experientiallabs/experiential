@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -23,6 +24,7 @@ from exp.common.progress import ProgressEvent, ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.export import export_report
+from exp.optimize.evaluation.judging_resume import prepare_judging_revision
 from exp.optimize.evaluation.runs import (
     EvaluationRun,
     evaluation_tasks,
@@ -125,6 +127,16 @@ def run_evaluation(
             with progress_display(_console, single_line=True) as progress:
                 progress(ProgressEvent(stage="Loading saved evaluation"))
                 run = load_run(store, resume)
+                if run.status == "failed" and run.stage in {"judging", "judgments"}:
+                    pointer = prepare_judging_revision(
+                        store,
+                        run.prepared,
+                        catalog,
+                        previous=run.judging_revision,
+                        created_at=datetime.now(UTC),
+                        code_revision=installed_release_revision(),
+                    )
+                    run = run.model_copy(update={"judging_revision": pointer})
         else:
             aliases = (
                 tuple(value.strip() for value in models.split(",") if value.strip())
@@ -302,6 +314,8 @@ def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
     _console.print(
         Text(f"Judge: {run.prepared.judge_request.model.model_id} ({setup.judgment_status})")
     )
+    if run.judging_revision is not None:
+        _console.print("Retry judging with full model context. Saved rollouts are reused.")
     _console.print(
         f"\nEstimated ${cost.estimated_cost_usd:,.2f} · "
         f"Spending limit ${run.spending_limit_usd:,.2f}"
@@ -325,7 +339,7 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
             title="Ready",
             options=(
                 PickerOption(
-                    "start", "Resume evaluation" if run.status == "paused" else "Start evaluation"
+                    "start", "Resume evaluation" if run.status != "prepared" else "Start evaluation"
                 ),
                 PickerOption("limit", "Spending limit"),
                 PickerOption("cost", "Cost details"),

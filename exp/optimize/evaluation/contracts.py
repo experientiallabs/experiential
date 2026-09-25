@@ -117,11 +117,15 @@ class EvaluationServices:
         simulator_factory: Builds the selected simulation engine for one frozen plan.
         judge: Provider-bound, reservation-enforcing judge.
         plan_inputs: Additional immutable execution inputs, empty by default.
+        judging_protocol: Optional explicit fresh judging pass over saved rollouts.
+        judging_input: Immutable reviewed judging revision, independent of simulation identity.
     """
 
     simulator_factory: SimulatorFactory
     judge: EvaluationRuntimeJudge
     plan_inputs: tuple[ArtifactInput, ...] = ()
+    judging_protocol: EvaluationProtocol | None = None
+    judging_input: ArtifactInput | None = None
 
 
 class EvaluationRuntimeJudge(Judge, Protocol):

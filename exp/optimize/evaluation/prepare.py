@@ -65,7 +65,8 @@ class ModelEvaluationOptions(ContractModel):
         repeats: Positive independent repeats per scenario/model pair, default one.
         maximum_output_tokens: Optional per-call limit; omission uses published model limits
             or the rollout budget within the context window when no output limit is published.
-        maximum_judge_input_tokens: Positive judge context reservation, default 32,768.
+        maximum_judge_input_tokens: Optional input ceiling; omission uses the judge context
+            capacity minus its output reservation.
         maximum_judge_output_tokens: Positive judge output reservation, default 8,192.
         maximum_retrieval_query_tokens: Positive per-query embedding limit, default 32,768.
         seed: Reproducible scenario seed, default zero.
@@ -76,7 +77,7 @@ class ModelEvaluationOptions(ContractModel):
     maximum_concurrency: int = Field(default=8, ge=1)
     repeats: int = Field(default=1, ge=1)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
-    maximum_judge_input_tokens: int = Field(default=32_768, gt=0)
+    maximum_judge_input_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_output_tokens: int = Field(default=8_192, gt=0)
     maximum_retrieval_query_tokens: int = Field(default=32_768, gt=0)
     seed: int = 0

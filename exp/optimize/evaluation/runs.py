@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import Field, ValidationError
 
-from exp.common.core.artifacts import ContractModel, assert_secret_free, stable_id
+from exp.common.core.artifacts import ArtifactInput, ContractModel, assert_secret_free, stable_id
 from exp.common.core.files import write_text_atomic
 from exp.common.core.locks import file_write_lock
 from exp.common.models import ModelCatalog
@@ -63,6 +63,7 @@ class EvaluationRun(ContractModel):
         created_at: Preparation timestamp reused on exact resume.
         code_revision: Producer revision recorded with immutable evidence.
         prepared: Frozen model, task, judge, and cost bindings.
+        judging_revision: Optional explicit retry pass over unchanged saved rollouts.
         status: Current execution lifecycle state.
         spending_limit_usd: Planned total allowance, authorized only by explicit launch consent.
         required_spending_limit_usd: Minimum total allowance requested by a paused call.
@@ -80,6 +81,7 @@ class EvaluationRun(ContractModel):
     created_at: datetime
     code_revision: str
     prepared: PreparedModelEvaluation
+    judging_revision: ArtifactInput | None = None
     status: Literal["prepared", "running", "interrupted", "paused", "failed", "completed"] = (
         "prepared"
     )
@@ -330,6 +332,7 @@ def execute_run(
                 created_at=active.created_at,
                 code_revision=active.code_revision,
                 progress=observe,
+                judging_revision=active.judging_revision,
             )
         except SpendLimitReached as exc:
             save_run(

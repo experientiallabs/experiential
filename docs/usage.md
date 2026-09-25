@@ -332,6 +332,14 @@ calls. The quote and result exclude earlier trace mining and grounding costs; a 
 those separately before offering a complete trace-to-report price. Credit conversion, promotions,
 identity authorization and job persistence remain hosting responsibilities.
 
+Judges use their declared context capacity minus the output reservation. Full visible task and
+tool evidence is retained; a transcript that exceeds that capacity is excluded with an explicit
+admission reason. Judge requests preserve configured reasoning without adding sampling controls.
+If a run stops during judging, select it under Saved evaluations in `exp eval PROJECT`. The launch
+review offers a fresh judging pass over saved rollouts under the same spending limit. Successful
+scores are reused, earlier failed-attempt spend is retained, and the new judging recipe is recorded
+separately without editing the original run preparation or simulation artifacts.
+
 ## Gateway clients
 
 Official OpenAI SDK clients use the issued virtual key and loopback base URL:

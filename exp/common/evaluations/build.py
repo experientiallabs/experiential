@@ -52,6 +52,7 @@ def build_evaluation_dataset(
     pricing_snapshot_id: ArtifactId,
     protocols: Sequence[EvaluationProtocol],
     cell_evidence: Sequence[EvaluationCellEvidence],
+    additional_inputs: Sequence[ArtifactInput] = (),
     purposes: Sequence[Literal["fit", "held_out", "fidelity"]] = (
         "fit",
         "held_out",
@@ -68,6 +69,7 @@ def build_evaluation_dataset(
         pricing_snapshot_id: Exact pricing artifact already pinned by the plan.
         protocols: Frozen production, world-model, or sandbox evidence protocols.
         cell_evidence: One explicit execution assignment for every plan cell.
+        additional_inputs: Verified immutable execution evidence such as a new judging pass.
         created_at: Time the dataset is completed.
         code_revision: Exact EXP revision creating the dataset.
 
@@ -120,6 +122,10 @@ def build_evaluation_dataset(
         pricing_input,
         *calibration_inputs,
     ]
+    for pointer in additional_inputs:
+        if artifact_input(store.read(pointer.artifact_id).manifest) != pointer:
+            raise EvaluationEvidenceError("additional evaluation input has drifted")
+        verified_inputs.append(pointer)
     rows = tuple(
         _materialize_row(
             store,

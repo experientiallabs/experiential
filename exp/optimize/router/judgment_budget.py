@@ -624,6 +624,7 @@ def complete_cell_evidence(
         rollout = rollouts_by_id[rollout_id]
         if _rollout_failed(rollout):
             evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
+            _report_judgments()
             continue
         try:
             judgment = judgments_by_rollout.get(rollout_id)

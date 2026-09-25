@@ -18,6 +18,7 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuation import EvaluationRuntimeContract, validate_continuation
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices
 from exp.optimize.evaluation.judge import DurableEvaluationJudge
+from exp.optimize.evaluation.judging_resume import revised_judge_setup
 from exp.optimize.evaluation.planning import estimate_model_evaluation
 from exp.optimize.evaluation.prepare import PreparedModelEvaluation, read_evaluation_judge
 from exp.optimize.evaluation.service import ModelEvaluationResult, evaluate_models
@@ -44,6 +45,7 @@ def run_prepared_model_evaluation(
     created_at: datetime,
     code_revision: str,
     progress: ProgressHook | None = None,
+    judging_revision: ArtifactInput | None = None,
 ) -> ModelEvaluationResult:
     """Execute a prepared worker matrix within an explicitly approved request-level allowance.
 
@@ -57,6 +59,7 @@ def run_prepared_model_evaluation(
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.
         progress: Observer of real simulator and judge progress.
+        judging_revision: Explicit fresh judging pass; requires saved completed rollouts.
 
     Returns:
         Persisted model report and reconciled execution costs, with exact replay.
@@ -101,6 +104,12 @@ def run_prepared_model_evaluation(
     if not provider_spend_consented:
         raise ValueError(
             "evaluation requires explicit provider-spend consent after credit admission"
+        )
+    judge_request = prepared.judge_request
+    judging_protocol = None
+    if judging_revision is not None:
+        selected, judge_request, judging_protocol = revised_judge_setup(
+            project, prepared, judging_revision
         )
     report(progress, "Verifying built project")
     completed = completed_project_build(project)
@@ -194,11 +203,11 @@ def run_prepared_model_evaluation(
         BudgetedCompletion(
             judge_model.client,
             ledger,
-            prepared.judge_request,
+            judge_request,
             role="judge",
             served_model_id=judge_model.served_model_id,
         ),
-        reservation=prepared.judge_request,
+        reservation=judge_request,
         model=judge_model.snapshot,
         capabilities=judge_model.capabilities,
         maximum_attempts=attempts,
@@ -208,10 +217,10 @@ def run_prepared_model_evaluation(
     judge = AutomaticRouterJudge(
         bounded_judge,
         selected,
-        created_at=created_at,
-        code_revision=code_revision,
-        maximum_input_tokens=prepared.judge_request.maximum_input_tokens,
-        maximum_output_tokens=prepared.judge_request.maximum_output_tokens,
+        created_at=selected.created_at if judging_revision else created_at,
+        code_revision=selected.code_revision if judging_revision else code_revision,
+        maximum_input_tokens=judge_request.maximum_input_tokens,
+        maximum_output_tokens=judge_request.maximum_output_tokens,
         request_scope=ledger.scope,
     )
     report(progress, "Loading retrieval index")
@@ -235,6 +244,10 @@ def run_prepared_model_evaluation(
 
     def simulator_factory(project: ProjectStore, plan: EvaluationPlan) -> WorldModelSimulator:
         """Bind one fresh simulator to the exact persisted evaluation matrix."""
+        if judging_revision is not None:
+            raise ValueError(
+                "judging retry requires finished saved rollouts; resume simulation first"
+            )
         return WorldModelSimulator(
             store=project.artifacts,
             evaluation_plan=plan,
@@ -259,8 +272,10 @@ def run_prepared_model_evaluation(
         setup,
         services=EvaluationServices(
             simulator_factory,
-            DurableEvaluationJudge(judge, bounded_judge, prepared.judge_request, budget=ledger),
+            DurableEvaluationJudge(judge, bounded_judge, judge_request, budget=ledger),
             (runtime_input,),
+            judging_protocol=judging_protocol,
+            judging_input=judging_revision,
         ),
         # Semantic execution bounds stay frozen across allowance increases. The request
         # ledger enforces the smaller approved amount before every paid dispatch.
