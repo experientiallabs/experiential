@@ -88,6 +88,10 @@ class CaptureUploader:
         self._max_spool_bytes = max_spool_bytes
         self._transport = transport
         self._on_diagnostic = on_diagnostic
+        self._diagnostics: queue.Queue[str] = queue.Queue(maxsize=128)
+        self._diagnostics_done = threading.Event()
+        self._diagnostic_thread: threading.Thread | None = None
+        self._diagnostics_lost = 0
         self._queue: queue.Queue[CapturedExchange] = queue.Queue(maxsize=64)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -123,6 +127,11 @@ class CaptureUploader:
                 raise ValueError("capture spool must belong to the current user")
             directory.chmod(0o700)
         self._recover_temporary_files()
+        if self._on_diagnostic is not None:
+            self._diagnostic_thread = threading.Thread(
+                target=self._report_diagnostics, name="exp-capture-diagnostics", daemon=True
+            )
+            self._diagnostic_thread.start()
         self._thread = threading.Thread(target=self._work, name="exp-capture-upload", daemon=True)
         self._thread.start()
         self._delivery_thread = threading.Thread(
@@ -215,7 +224,11 @@ class CaptureUploader:
                 output_tokens=self._output_tokens,
                 usage_exchanges=self._usage_exchanges,
             )
-            return self._final_stats
+            final_stats = self._final_stats
+        self._diagnostics_done.set()
+        if self._diagnostic_thread is not None:
+            self._diagnostic_thread.join(max(deadline - time.monotonic(), 0.0))
+        return final_stats
 
     def _work(self) -> None:
         """Drain copied bodies to local storage independently of cloud availability."""
@@ -309,9 +322,28 @@ class CaptureUploader:
                 temporary.unlink(missing_ok=True)
 
     def _diagnostic(self, event: str) -> None:
-        """Keep optional diagnostic failures outside persistence and delivery outcomes."""
+        """Drop excess diagnostic messages rather than block capture storage or delivery."""
         if self._on_diagnostic is not None:
             try:
+                self._diagnostics.put_nowait(event)
+            except queue.Full:
+                with self._lock:
+                    self._diagnostics_lost += 1
+
+    def _report_diagnostics(self) -> None:
+        """Isolate slow or blocked output in one daemon with a bounded message queue."""
+        assert self._on_diagnostic is not None
+        while not self._diagnostics_done.is_set() or not self._diagnostics.empty():
+            try:
+                event = self._diagnostics.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            with self._lock:
+                lost = self._diagnostics_lost
+                self._diagnostics_lost = 0
+            try:
+                if lost:
+                    self._on_diagnostic(f"diagnostic_events_dropped: {lost}")
                 self._on_diagnostic(event)
             except Exception:  # noqa: BLE001 - Diagnostics must never drop a captured request.
                 pass

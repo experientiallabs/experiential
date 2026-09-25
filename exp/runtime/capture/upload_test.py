@@ -192,6 +192,72 @@ def test_capture_receipts_correlate_saved_evidence_without_exposing_content(
     assert span["status"] == {"code": 1}
 
 
+def test_blocked_verbose_reader_cannot_stop_storage_delivery_or_bounded_shutdown(
+    tmp_path: Path,
+) -> None:
+    """Fill the diagnostic queue while both data workers continue with a blocked output sink."""
+    blocked = threading.Event()
+    release = threading.Event()
+    run = str(uuid4())
+
+    def diagnostic(event: str) -> None:
+        """Block exactly like a full terminal pipe, independently of the uploader workers."""
+        blocked.set()
+        assert release.wait(10)
+
+    def platform(request: httpx.Request) -> httpx.Response:
+        """Accept immutable batches without introducing provider or network dependencies."""
+        if request.url.host == "storage.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("/batches/upload"):
+            ingest_id = str(uuid4())
+            return httpx.Response(
+                200,
+                json={
+                    "status": "pending",
+                    "ingest_id": ingest_id,
+                    "signed_url": _signed_url(ingest_id),
+                },
+            )
+        assert request.url.path.endswith("/finalize")
+        return httpx.Response(202)
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(platform),
+        on_diagnostic=diagnostic,
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(_usage_exchange())
+        assert blocked.wait(2)
+        _wait(lambda: uploader.stats.uploaded_batches == 1)
+        # More saved receipts than the diagnostic queue can hold must still persist.
+        for index in range(1, 140):
+            assert uploader.submit(_usage_exchange())
+            _wait(lambda expected=index + 1: uploader.stats.usage_exchanges == expected)
+        assert uploader.stats.uploaded_batches >= 2
+        started = time.monotonic()
+        stats = uploader.close(timeout=0.25)
+        assert time.monotonic() - started < 1
+        assert stats.captured_exchanges == 140
+        assert stats.dropped_exchanges == 0
+        assert stats.pending_batches + stats.uploaded_batches == 140
+        assert (stats.input_tokens, stats.output_tokens) == (420, 980)
+    finally:
+        release.set()
+        uploader.close()
+        if uploader._diagnostic_thread is not None:
+            uploader._diagnostic_thread.join(timeout=1)
+            assert not uploader._diagnostic_thread.is_alive()
+
+
 @pytest.mark.parametrize(
     "usage",
     [
