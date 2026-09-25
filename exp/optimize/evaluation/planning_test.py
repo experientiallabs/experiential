@@ -138,3 +138,29 @@ def test_expected_cost_tracks_repeats_not_unused_rollout_limits(tmp_path: Path) 
     assert repeated.estimated_cost_usd == pytest.approx(3 * quote.estimated_cost_usd)
     assert quote.measured_turns == 0
     assert quote.captured_turns == 6
+
+
+def test_cumulative_output_bound_keeps_unknown_retry_output_reserved(tmp_path: Path) -> None:
+    """The cumulative success budget does not erase potentially billed failed provider attempts."""
+    project, _, _, prepared = _prepare(tmp_path)
+    setup = prepared.setup.model_copy(
+        update={"maximum_steps": 100, "maximum_rollout_output_tokens": 1000}
+    )
+    quote = estimate_model_evaluation(project, setup, judge_request=prepared.judge_request)
+    assert setup.simulation_completion_input is not None
+    contract, _ = load_simulation_completion_contract(
+        project.artifacts, setup.simulation_completion_input.artifact_id
+    )
+    retry_output = (
+        sum(
+            100
+            * (item.request.maximum_attempts - 1)
+            * 1000
+            * item.request.output_usd_per_million_tokens
+            / 1_000_000
+            for item in contract.candidate_requests
+        )
+        * quote.scenario_count
+        * MAXIMUM_CELL_ATTEMPTS
+    )
+    assert quote.workers.maximum_cost_usd >= retry_output

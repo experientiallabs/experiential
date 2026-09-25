@@ -165,18 +165,23 @@ def estimate_model_evaluation(
         * setup.repeats
         * MAXIMUM_CELL_ATTEMPTS
         * math.fsum(
-            request.maximum_attempts
-            * (
-                setup.maximum_steps
+            (
+                request.maximum_attempts
+                * setup.maximum_steps
                 * request.maximum_input_tokens
                 * max(
                     request.input_usd_per_million_tokens,
                     request.cached_input_usd_per_million_tokens,
                     request.cache_write_usd_per_million_tokens,
                 )
-                + min(
-                    setup.maximum_steps * request.maximum_output_tokens,
-                    setup.maximum_rollout_output_tokens,
+                + (
+                    min(
+                        setup.maximum_steps * request.maximum_output_tokens,
+                        setup.maximum_rollout_output_tokens,
+                    )
+                    + setup.maximum_steps
+                    * (request.maximum_attempts - 1)
+                    * min(request.maximum_output_tokens, setup.maximum_rollout_output_tokens)
                 )
                 * request.output_usd_per_million_tokens
             )
