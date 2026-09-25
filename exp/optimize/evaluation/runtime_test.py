@@ -198,17 +198,17 @@ def test_prepared_runtime_is_public() -> None:
     assert exp.SpendLimitReached is SpendLimitReached
 
 
-def test_prepared_workers_and_world_accept_pinned_served_ids(
+def test_prepared_workers_world_and_judge_accept_pinned_served_ids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Provider aliases remain usable through the request ledger and simulator recorders."""
     project, catalog, state, prepared = _prepare(tmp_path)
     original_complete = _CompletionClient.complete
     original_resolve = _RuntimeCatalog.resolve
-    pinned = {"candidate-a", "world"}
+    pinned = {"candidate-a", "world", "judge"}
 
     def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
-        """Echo the configured served identity from worker and world responses."""
+        """Echo the configured served identity from worker, world and judge responses."""
         response = original_complete(client, request)
         if client._alias in pinned:
             return response.model_copy(

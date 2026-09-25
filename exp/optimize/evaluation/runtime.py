@@ -187,12 +187,19 @@ def run_prepared_model_evaluation(
         ),
     )
     bounded_judge = ReservedJudgeClient(
-        BudgetedCompletion(judge_model.client, ledger, prepared.judge_request, role="judge"),
+        BudgetedCompletion(
+            judge_model.client,
+            ledger,
+            prepared.judge_request,
+            role="judge",
+            served_model_id=judge_model.served_model_id,
+        ),
         reservation=prepared.judge_request,
         model=judge_model.snapshot,
         capabilities=judge_model.capabilities,
         maximum_attempts=attempts,
         maximum_provider_calls=quote.judgment_count * calls_per_rollout,
+        served_model_id=judge_model.served_model_id,
     )
     judge = AutomaticRouterJudge(
         bounded_judge,
