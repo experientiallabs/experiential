@@ -312,12 +312,13 @@ def reconcile_completion_economics(
 ) -> OperationEconomics:
     """Derive a conservative retry-inclusive charge from response economics.
 
-    A successful response exposes usage for its completed attempt but provider adapters do not
-    expose whether earlier retry attempts were billed. The derived charge therefore prices the
-    successful usage exactly under the frozen mutually exclusive rates and reserves, for every
-    possible earlier attempt, the observed request input at the highest input rate plus the full
-    reserved output budget. Earlier attempts of the same call sent the same request, so the
-    observed input size bounds them without charging the context-sized admission ceiling. A
+    A successful response exposes usage for its completed attempt. When the adapter reports
+    its actual attempt count, unused retry allowance is released. Otherwise every permitted
+    attempt remains possible. The charge prices successful usage under mutually exclusive
+    rates and reserves, for each earlier attempt whose billing is unresolved, observed request
+    input at the highest input rate plus the full reserved output budget. Earlier attempts
+    sent the same request, so observed input size bounds them without charging the context
+    ceiling. A
     provider cost measurement has no retry-coverage marker, so it is treated as successful-attempt
     evidence and never as proof that earlier attempts were free.
 
@@ -397,20 +398,17 @@ def reconcile_completion_economics(
         )
         + reservation.maximum_output_tokens * reservation.output_usd_per_million_tokens
     ) / 1_000_000
-    retry_inclusive_cost = (
-        successful_cost + (reservation.maximum_attempts - 1) * maximum_attempt_cost
-    )
+    attempts = economics.provider_attempts or reservation.maximum_attempts
+    if attempts > reservation.maximum_attempts:
+        raise ValueError("observed provider attempts exceed the request reservation")
+    retry_inclusive_cost = successful_cost + (attempts - 1) * maximum_attempt_cost
     derived_cost = max(
         retry_inclusive_cost,
         measured.value if measured is not None else 0.0,
     )
     if derived_cost > reservation.absolute_maximum_call_cost_usd():
         raise ValueError("derived completion spend exceeds its request reservation")
-    if (
-        measured is not None
-        and reservation.maximum_attempts == 1
-        and measured.value >= successful_cost
-    ):
+    if measured is not None and attempts == 1 and measured.value >= successful_cost:
         return economics
     return economics.model_copy(
         update={"cost_usd": NumericMeasurement(value=derived_cost, provenance="estimated")}

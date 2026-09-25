@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from exp.common.core.artifacts import ContractModel, assert_secret_free, stable_id
 from exp.common.core.files import write_text_atomic
@@ -27,6 +29,13 @@ from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.evaluation.service import ModelEvaluationResult
 from exp.optimize.router.judging.artifacts import read_review_state
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.budget import SpendLimitReached
+
+logger = logging.getLogger(__name__)
+
+
+class EvaluationPreparationOutdated(ValueError):
+    """A saved plan needs fresh cost preparation before another paid dispatch."""
 
 
 class EvaluationDefaults(ContractModel):
@@ -54,6 +63,8 @@ class EvaluationRun(ContractModel):
         code_revision: Producer revision recorded with immutable evidence.
         prepared: Frozen model, task, judge, and cost bindings.
         status: Current execution lifecycle state.
+        spending_limit_usd: Planned total allowance, authorized only by explicit launch consent.
+        required_spending_limit_usd: Minimum total allowance requested by a paused call.
         stage: Most recent engine progress stage.
         completed: Completed units in that stage, when available.
         total: Planned units in that stage, when available.
@@ -68,7 +79,11 @@ class EvaluationRun(ContractModel):
     created_at: datetime
     code_revision: str
     prepared: PreparedModelEvaluation
-    status: Literal["prepared", "running", "interrupted", "failed", "completed"] = "prepared"
+    status: Literal["prepared", "running", "interrupted", "paused", "failed", "completed"] = (
+        "prepared"
+    )
+    spending_limit_usd: float = Field(gt=0, allow_inf_nan=False)
+    required_spending_limit_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     stage: str = "prepared"
     completed: int | None = None
     total: int | None = None
@@ -204,7 +219,11 @@ def prepare_run(
         progress=progress,
     )
     run = EvaluationRun(
-        run_id=run_id, created_at=created_at, code_revision=code_revision, prepared=prepared
+        run_id=run_id,
+        created_at=created_at,
+        code_revision=code_revision,
+        prepared=prepared,
+        spending_limit_usd=max(5.0, math.ceil(prepared.cost.estimated_cost_usd * 200) / 100),
     )
     report(progress, "Saving evaluation")
     save_run(project, run)
@@ -221,9 +240,23 @@ def save_run(project: ProjectStore, run: EvaluationRun) -> None:
 
 def load_run(project: ProjectStore, run_id: str) -> EvaluationRun:
     """Load one exact saved run and reject mismatched directory identities."""
-    run = EvaluationRun.model_validate_json(
-        (run_directory(project, run_id) / "run.json").read_bytes()
-    )
+    try:
+        run = EvaluationRun.model_validate_json(
+            (run_directory(project, run_id) / "run.json").read_bytes()
+        )
+    except ValidationError as exc:
+        new_fields = {
+            ("spending_limit_usd",),
+            ("prepared", "cost", "captured_turns"),
+            ("prepared", "cost", "measured_turns"),
+            ("prepared", "cost", "estimate_basis"),
+        }
+        if all(error["type"] == "missing" and error["loc"] in new_fields for error in exc.errors()):
+            raise EvaluationPreparationOutdated(
+                "saved evaluation needs a new cost plan; choose New evaluation in exp eval. "
+                "The existing build is ready to reuse."
+            ) from None
+        raise
     if run.run_id != run_id or run.prepared.setup.run_id != run_id:
         raise ValueError("evaluation run identity differs from its directory")
     return run
@@ -232,7 +265,17 @@ def load_run(project: ProjectStore, run_id: str) -> EvaluationRun:
 def list_runs(project: ProjectStore) -> tuple[EvaluationRun, ...]:
     """List saved runs newest first without constructing provider clients."""
     root = project.paths.runtime_directory / "evaluations"
-    runs = [load_run(project, path.parent.name) for path in root.glob("*/run.json")]
+    runs = []
+    outdated = 0
+    for path in root.glob("*/run.json"):
+        try:
+            runs.append(load_run(project, path.parent.name))
+        except EvaluationPreparationOutdated:
+            outdated += 1
+    if outdated:
+        logger.warning(
+            "%d saved evaluation(s) need a new preparation; choose New evaluation", outdated
+        )
     return tuple(sorted(runs, key=lambda item: item.created_at, reverse=True))
 
 
@@ -250,7 +293,7 @@ def execute_run(
         project: Owner of the run and immutable evidence.
         run: Exact prepared run selected for execution.
         catalog: Runtime catalog constructed only after cost consent.
-        provider_spend_consented: Authorization for the frozen full run quote.
+        provider_spend_consented: Authorization for the reviewed run spending limit.
         progress: Optional terminal or application observer.
 
     Returns:
@@ -279,7 +322,7 @@ def execute_run(
                 active.prepared,
                 catalog,
                 budget=EvaluationBudget(
-                    maximum_cost_usd=active.prepared.cost.maximum_cost_usd,
+                    maximum_cost_usd=active.spending_limit_usd,
                     maximum_judgments=active.prepared.cost.judgment_count,
                 ),
                 provider_spend_consented=True,
@@ -287,6 +330,18 @@ def execute_run(
                 code_revision=active.code_revision,
                 progress=observe,
             )
+        except SpendLimitReached as exc:
+            save_run(
+                project,
+                active.model_copy(
+                    update={
+                        "status": "paused",
+                        "stage": "Spending limit reached",
+                        "required_spending_limit_usd": exc.required_usd,
+                    }
+                ),
+            )
+            raise
         except BaseException as exc:
             save_run(
                 project,

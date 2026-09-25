@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+import exp
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.prepare_test import _prepare
@@ -18,6 +19,7 @@ from exp.optimize.router.automatic.service_test import (
     _RuntimeCatalog,
 )
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.budget import SpendLimitReached
 
 
 @pytest.mark.parametrize("blank_worker", [False, True])
@@ -90,30 +92,55 @@ def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
     assert before == (len(state.completion_calls), len(state.embedding_calls))
 
 
-@pytest.mark.parametrize("consent, funded", [(False, True), (True, False)])
-def test_consent_and_full_credit_ceiling_precede_credentials_and_writes(
-    tmp_path: Path,
-    consent: bool,
-    funded: bool,
-) -> None:
-    """Underfunded or unapproved execution never creates a runtime client or artifact."""
+def test_unapproved_execution_precedes_credentials_and_writes(tmp_path: Path) -> None:
+    """No provider client or artifact is created before explicit spend consent."""
     project, catalog, state, prepared = _prepare(tmp_path)
     before = (project.artifacts.list_ids(), state.credential_resolutions)
-    budget = EvaluationBudget(
-        maximum_cost_usd=prepared.cost.maximum_cost_usd * (1 if funded else 0.5),
-        maximum_judgments=prepared.cost.judgment_count,
-    )
-    with pytest.raises(ValueError, match="consent|reserved quote"):
+    with pytest.raises(ValueError, match="consent"):
         run_prepared_model_evaluation(
             project,
             prepared,
             cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
-            budget=budget,
-            provider_spend_consented=consent,
+            budget=EvaluationBudget(maximum_cost_usd=1, maximum_judgments=100),
+            provider_spend_consented=False,
             created_at=_TIME,
             code_revision=_REVISION,
         )
     assert before == (project.artifacts.list_ids(), state.credential_resolutions)
+
+
+def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(tmp_path: Path) -> None:
+    """An allowance far below the theoretical bound pauses, then replays a paid prefix for free."""
+
+    project, catalog, state, prepared = _prepare(tmp_path)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    with pytest.raises(SpendLimitReached):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=EvaluationBudget(maximum_cost_usd=0.2, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    workers = [alias for alias, _ in state.completion_calls if alias.startswith("candidate")]
+    assert workers
+    assert not any(
+        project.artifacts.read(i).manifest.artifact_type == "model-evaluation-report"
+        for i in project.artifacts.list_ids()
+    )
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert result.report.compared_cells == prepared.cost.scenario_count
+    assert sum(alias.startswith("candidate") for alias, _ in state.completion_calls) == 6
 
 
 @pytest.mark.parametrize("drift", ["quote", "agent", "redaction", "worker"])
@@ -165,6 +192,6 @@ def test_runtime_refuses_changed_accepted_inputs_before_provider_dispatch(
 
 def test_prepared_runtime_is_public() -> None:
     """Hosting uses the public engine API instead of copying its runtime construction."""
-    import exp
 
     assert exp.run_prepared_model_evaluation is run_prepared_model_evaluation
+    assert exp.SpendLimitReached is SpendLimitReached

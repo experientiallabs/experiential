@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 from exp.common.judging import Judgment
 from exp.common.models import CompletionCostReservation, ModelSnapshot
 from exp.common.project import ProjectStore
 from exp.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJudgeClient
 from exp.optimize.router.errors import JudgeDispatchExhaustedError
+from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 
@@ -21,11 +23,14 @@ class DurableEvaluationJudge:
         delegate: AutomaticRouterJudge,
         client: ReservedJudgeClient,
         reservation: CompletionCostReservation,
+        *,
+        budget: RequestBudget | None = None,
     ) -> None:
         """Bind the canonical judge to the same reservation-enforcing provider client."""
         self._delegate = delegate
         self._client = client
         self._reservation = reservation
+        self._budget = budget
 
     @property
     def model(self) -> ModelSnapshot:
@@ -59,12 +64,18 @@ class DurableEvaluationJudge:
         calls_before = self._client.calls
         economics_before = len(self._client.economics)
         try:
-            return self._delegate.judge_persisted(
-                store,
-                rollout_artifact_id=rollout_artifact_id,
-                rubric_artifact_id=rubric_artifact_id,
-                calibration_artifact_id=calibration_artifact_id,
+            context = (
+                self._budget.scope(f"judge:{rollout_artifact_id}")
+                if self._budget
+                else nullcontext()
             )
+            with context:
+                return self._delegate.judge_persisted(
+                    store,
+                    rollout_artifact_id=rollout_artifact_id,
+                    rubric_artifact_id=rubric_artifact_id,
+                    calibration_artifact_id=calibration_artifact_id,
+                )
         except (ValueError, ProviderTransportError, ProviderDeadlineExceeded) as exc:
             dispatched = self._client.calls - calls_before
             if dispatched == 0:

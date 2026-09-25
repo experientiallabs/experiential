@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from exp.common.core.artifacts import (
@@ -20,10 +21,12 @@ from exp.optimize.evaluation.judge import DurableEvaluationJudge
 from exp.optimize.evaluation.planning import estimate_model_evaluation
 from exp.optimize.evaluation.prepare import PreparedModelEvaluation, read_evaluation_judge
 from exp.optimize.evaluation.service import ModelEvaluationResult, evaluate_models
+from exp.optimize.evaluation.spending import BudgetedCompletion, BudgetedEmbedding
 from exp.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJudgeClient
 from exp.optimize.router.evaluation.build import completed_project_build
 from exp.runtime.agents import agent_factory_sha256, preflight_agent_factory, resolve_agent_factory
 from exp.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.engines.text import WorldModelSimulator
 from exp.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
@@ -42,13 +45,14 @@ def run_prepared_model_evaluation(
     code_revision: str,
     progress: ProgressHook | None = None,
 ) -> ModelEvaluationResult:
-    """Execute a prepared worker matrix after host admission of its complete bounded quote.
+    """Execute a prepared worker matrix within an explicitly approved request-level allowance.
 
     Args:
         project: Owner of the completed scenario, world-model and judge evidence.
         prepared: Exact engine preparation whose quote the user accepted.
         catalog: Runtime catalog holding transient provider credential references.
-        budget: Host-authorized provider ceiling and judgment count.
+        budget: Approved total provider allowance and judgment count. Raising only the
+            allowance resumes the same plan and replays completed provider responses for free.
         provider_spend_consented: Explicit consent after the host's atomic credit reservation.
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.
@@ -58,6 +62,7 @@ def run_prepared_model_evaluation(
         Persisted model report and reconciled execution costs, with exact replay.
 
     Raises:
+        SpendLimitReached: The next request cannot fit; saved calls remain exactly resumable.
         ValueError: Consent, quote admission, identities, configuration or artifacts drift.
     """
     validate_continuation(project, prepared)
@@ -77,11 +82,8 @@ def run_prepared_model_evaluation(
     )
     if quote != prepared.cost:
         raise ValueError("evaluation quote changed; prepare and approve a new estimate")
-    if (
-        budget.maximum_cost_usd < quote.maximum_cost_usd
-        or budget.maximum_judgments < quote.judgment_count
-    ):
-        raise ValueError("authorized evaluation budget cannot cover the complete reserved quote")
+    if budget.maximum_judgments < quote.judgment_count:
+        raise ValueError("authorized evaluation judgment count is too small")
     config = project.load_project()
     prompt = config.system.system_prompt if config.system else None
     if (
@@ -149,8 +151,41 @@ def run_prepared_model_evaluation(
         )
     if retrieval.maximum_attempts != attempts:
         raise ValueError("retrieval retry policy changed; prepare again")
+    ledger_identity = stable_id(
+        "evaluation-requests",
+        {
+            "prepared": prepared.model_dump(mode="json"),
+            "code_revision": code_revision,
+        },
+    )
+    ledger = RequestBudget(
+        project.paths.runtime_directory / "evaluation-requests" / ledger_identity,
+        identity=ledger_identity,
+        maximum_cost_usd=budget.maximum_cost_usd,
+    )
+    candidates = {
+        item.candidate_alias: replace(
+            candidates[item.candidate_alias],
+            client=BudgetedCompletion(
+                candidates[item.candidate_alias].client,
+                ledger,
+                item.request,
+                role=f"assistant:{item.candidate_alias}",
+            ),
+        )
+        for item in completion.candidate_requests
+    }
+    world = replace(
+        world,
+        client=BudgetedCompletion(
+            world.client,
+            ledger,
+            completion.world_model_request,
+            role="world",
+        ),
+    )
     bounded_judge = ReservedJudgeClient(
-        judge_model.client,
+        BudgetedCompletion(judge_model.client, ledger, prepared.judge_request, role="judge"),
         reservation=prepared.judge_request,
         model=judge_model.snapshot,
         capabilities=judge_model.capabilities,
@@ -169,7 +204,7 @@ def run_prepared_model_evaluation(
         project.artifacts,
         completed.fit_rag,
         embedder=RAGEmbedderBinding(
-            client=embedder.embedding_client,
+            client=BudgetedEmbedding(embedder.embedding_client, ledger, retrieval),
             snapshot=embedder.snapshot,
             maximum_attempts=attempts,
             input_usd_per_million_tokens=retrieval.input_usd_per_million_tokens,
@@ -198,6 +233,7 @@ def run_prepared_model_evaluation(
             completion_contract_input=completion_input,
             redacted_field_names=prepared.redacted_field_names,
             progress=progress,
+            request_budget=ledger,
         )
 
     runtime_input = _persist_runtime_contract(project, prepared, created_at, code_revision)
@@ -206,10 +242,12 @@ def run_prepared_model_evaluation(
         setup,
         services=EvaluationServices(
             simulator_factory,
-            DurableEvaluationJudge(judge, bounded_judge, prepared.judge_request),
+            DurableEvaluationJudge(judge, bounded_judge, prepared.judge_request, budget=ledger),
             (runtime_input,),
         ),
-        budget=budget,
+        # Semantic execution bounds stay frozen across allowance increases. The request
+        # ledger enforces the smaller approved amount before every paid dispatch.
+        budget=budget.model_copy(update={"maximum_cost_usd": max(quote.maximum_cost_usd, 1e-12)}),
         created_at=created_at,
         code_revision=code_revision,
         progress=progress,

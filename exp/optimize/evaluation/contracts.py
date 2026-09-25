@@ -70,12 +70,13 @@ class EvaluationBudget(ContractModel):
 
 
 class EvaluationExecutionContract(ArtifactEnvelope):
-    """Hash-bound execution settings and authorization included in the evaluation identity.
+    """Hash-bound execution ceilings included in the evaluation identity.
 
     Attributes:
         contract_id: Content-derived execution identity.
         setup: Frozen model, environment and judge inputs.
-        budget: Authorized finite execution ceilings.
+        budget: Frozen finite execution ceilings. Catalog-backed execution also enforces
+            the separately approved request allowance in its durable spending ledger.
     """
 
     contract_id: ArtifactId

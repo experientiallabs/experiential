@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.prompt import FloatPrompt
 from rich.table import Table
 from rich.text import Text
 
@@ -30,8 +32,10 @@ from exp.optimize.evaluation.runs import (
     load_run,
     prepare_run,
     save_defaults,
+    save_run,
 )
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.budget import SpendLimitReached
 
 _console = Console(theme=EXP_THEME)
 
@@ -159,33 +163,51 @@ def run_evaluation(
             _console.print("Prepared without provider calls. Resume with:")
             _console.print(f"exp eval {project} --root {root} --resume {run.run_id}", markup=False)
             return
-        if interactive and not yes and not _review(store, run):
-            return
-        if not require_spend_consent(
-            _console,
-            root=root,
-            yes=yes,
-            estimated_cost_usd=run.prepared.cost.maximum_cost_usd,
-            command=f"exp eval {project} --resume {run.run_id}",
-            non_interactive=not interactive,
-        ):
-            return
-        heading(_console, project, "Running evaluation · Ctrl-C to pause")
-        try:
-            with progress_display(_console, single_line=True) as progress:
-                execute_run(
-                    store,
-                    run,
-                    RuntimeModelCatalog(catalog),
-                    provider_spend_consented=True,
-                    progress=_compact_progress(progress),
+        while True:
+            if interactive and not yes:
+                selected_run = _review(store, run)
+                if selected_run is None:
+                    return
+                run = selected_run
+            if not require_spend_consent(
+                _console,
+                root=root,
+                yes=yes,
+                estimated_cost_usd=run.spending_limit_usd,
+                command=f"exp eval {project} --resume {run.run_id}",
+                non_interactive=not interactive,
+            ):
+                return
+            save_run(store, run)
+            heading(_console, project, "Running evaluation · Ctrl-C to pause")
+            try:
+                with progress_display(_console, single_line=True) as progress:
+                    execute_run(
+                        store,
+                        run,
+                        RuntimeModelCatalog(catalog),
+                        provider_spend_consented=True,
+                        progress=_compact_progress(progress),
+                    )
+                break
+            except SpendLimitReached as exc:
+                run = load_run(store, run.run_id)
+                _console.print(
+                    f"Paused at the ${exc.limit_usd:,.2f} spending limit. Completed calls saved."
                 )
-        except KeyboardInterrupt:
-            _console.print(
-                f"Saved. Resume: exp eval {project} --root {root} --resume {run.run_id}",
-                markup=False,
-            )
-            raise typer.Exit(130) from None
+                if not interactive:
+                    _console.print(
+                        Text(f"Resume: exp eval {project} --root {root} --resume {run.run_id}")
+                    )
+                    return
+                yes = False
+                _console.print("Increase the spending limit to continue this evaluation.")
+            except KeyboardInterrupt:
+                _console.print(
+                    f"Saved. Resume: exp eval {project} --root {root} --resume {run.run_id}",
+                    markup=False,
+                )
+                raise typer.Exit(130) from None
         finished = load_run(store, run.run_id)
         _results(store, finished, interactive=interactive)
 
@@ -273,11 +295,12 @@ def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
         Text(f"Judge: {run.prepared.judge_request.model.model_id} ({setup.judgment_status})")
     )
     _console.print(
-        f"\nEstimated ${cost.estimated_cost_usd:,.2f} · Maximum ${cost.maximum_cost_usd:,.2f}"
+        f"\nEstimated ${cost.estimated_cost_usd:,.2f} · "
+        f"Spending limit ${run.spending_limit_usd:,.2f}"
     )
 
 
-def _review(project: ProjectStore, run: EvaluationRun) -> bool:
+def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
     """Require an explicit launch action before requesting spend consent.
 
     Args:
@@ -285,25 +308,47 @@ def _review(project: ProjectStore, run: EvaluationRun) -> bool:
         run: Prepared evaluation supplying the frozen per-stage cost breakdown.
 
     Returns:
-        ``True`` only after Start evaluation; ``False`` after Back or cancellation.
-        Viewing cost details never authorizes a provider call.
+        Reviewed run only after Start evaluation; None after Back or cancellation.
+        Cost details and spending-limit edits never authorize a provider call.
     """
     while True:
         choice = choose_one(
             _console,
             title="Ready",
             options=(
-                PickerOption("start", "Start evaluation"),
+                PickerOption(
+                    "start", "Resume evaluation" if run.status == "paused" else "Start evaluation"
+                ),
+                PickerOption("limit", "Spending limit"),
                 PickerOption("cost", "Cost details"),
                 PickerOption("back", "Back"),
             ),
         )
         if not choice.values or choice.values[0] == "back":
-            return False
+            return None
         if choice.values[0] == "start":
-            return True
+            if (
+                run.required_spending_limit_usd
+                and run.spending_limit_usd < run.required_spending_limit_usd
+            ):
+                _console.print("Increase the spending limit before resuming.")
+                continue
+            return run
+        if choice.values[0] == "limit":
+            suggested = max(run.spending_limit_usd, run.required_spending_limit_usd or 0)
+            limit = FloatPrompt.ask(
+                "Total spending limit ($)",
+                console=_console,
+                default=math.ceil(suggested * 100) / 100,
+            )
+            if not math.isfinite(limit) or limit <= 0:
+                _console.print("Enter a positive dollar amount.")
+                continue
+            run = run.model_copy(update={"spending_limit_usd": limit})
+            _preflight(project, run)
+            continue
         heading(_console, project.paths.project_id, "Cost details")
-        table = Table("Stage", "Estimate", "Maximum", box=None)
+        table = Table("Stage", "Estimate", box=None)
         for label, component in (
             ("Assistant", run.prepared.cost.workers),
             ("World model", run.prepared.cost.simulation),
@@ -313,9 +358,14 @@ def _review(project: ProjectStore, run: EvaluationRun) -> bool:
             table.add_row(
                 label,
                 f"${component.estimated_cost_usd:,.4f}",
-                f"${component.maximum_cost_usd:,.4f}",
             )
         _console.print(table)
+        _console.print(Text(run.prepared.cost.estimate_basis), style="dim")
+        _console.print(
+            f"Captured turns with measured tokens: {run.prepared.cost.measured_turns:g} / "
+            f"{run.prepared.cost.captured_turns:g}. Pauses before exceeding the spending limit.",
+            style="dim",
+        )
 
 
 def _compact_progress(progress: ProgressHook) -> ProgressHook:

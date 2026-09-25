@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,7 @@ from exp.common.rollouts import (
 from exp.runtime.agents import AgentRuntime
 from exp.runtime.agents.factory import is_builtin_chat_factory
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.budget import RequestBudget, SpendLimitReached
 from exp.simulation.engines.clock import timestamp, utc_now
 from exp.simulation.engines.text import dispatch
 from exp.simulation.engines.text.artifact_set import persist_artifact_set
@@ -115,23 +117,6 @@ class WorldModelSimulator:
     persists one immutable rollout per selected cell, never exposes a mutable world-model session,
     sends no tools to the world model, and records candidate economics apart from simulator cost.
 
-    Args:
-        store: Immutable local artifact store receiving specifications and rollout artifacts.
-        evaluation_plan: Frozen plan whose explicit simulated cells may be selected.
-        evaluation_plan_input: Verified persisted-plan manifest reference.
-        task_set_input: Verified full immutable task-set manifest reference.
-        fit_rag_input: Exact completed fit-only RAG manifest reference.
-        fit_retriever: Read-only retriever bound to ``fit_rag_input`` and its exact embedder.
-        candidate_models: Independently resolved candidate models keyed by plan alias.
-        world_models: Independently resolved world-model providers keyed by local alias.
-        grounded_world_models: Artifact-bound fit-only executors keyed by world-model alias.
-        agent_factory: Creates an isolated customer-agent runtime for each episode worker.
-        completion_contract_input: Optional exact automatic-simulation reservation artifact.
-        redacted_field_names: Project-configured labels removed before evidence persists.
-        clock: Time source for artifact and span timestamps.
-        monotonic: Monotonic time source for orchestration latency measurements.
-        token_counter: Optional full-request preflight counter. The default never truncates input.
-        progress: Optional observer of exact per-cell completion counts.
     """
 
     def __init__(
@@ -153,6 +138,7 @@ class WorldModelSimulator:
         monotonic: Callable[[], float] = time.monotonic,
         token_counter: TokenCounter | None = None,
         progress: ProgressHook | None = None,
+        request_budget: RequestBudget | None = None,
     ) -> None:
         """Bind one immutable plan and all explicit runtime dependencies.
 
@@ -173,6 +159,7 @@ class WorldModelSimulator:
             monotonic: Duration source, injectable for deterministic tests.
             token_counter: Full-request counter used before each provider call.
             progress: Optional observer of exact per-cell completion counts.
+            request_budget: Optional shared request admission and replay ledger.
 
         Raises:
             SimulationConfigurationError: The supplied plan input does not name this plan.
@@ -202,6 +189,7 @@ class WorldModelSimulator:
         self._monotonic = monotonic
         self._token_counter = token_counter or Utf8UpperBoundTokenCounter()
         self._progress = progress
+        self._request_budget = request_budget
         self._rollout_builder = GroundedRolloutBuilder(
             plan_input=self._plan_input,
             task_set_input=self._task_set_input,
@@ -262,6 +250,9 @@ class WorldModelSimulator:
             self._tasks,
             resolution_spend(self._store, self._plan.cells, bindings, self._pins(resolution_input)),
         )
+
+        if self._request_budget is not None:
+            workers = spec.maximum_concurrency
 
         def execute(cell: EvaluationCell) -> RolloutArtifact:
             """Claim and persist a cell under the shared reservation ledger."""
@@ -582,7 +573,7 @@ class WorldModelSimulator:
                 simulation_id=spec.simulation_id,
                 rollout_id=rollout_id,
                 binding_sha256=binding_digest(binding),
-                maximum_cost_usd=spec.maximum_cost_usd,
+                maximum_cost_usd=(None if self._request_budget else spec.maximum_cost_usd),
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
                 observed_spend_usd=lambda: resolution_spend(
                     self._store, self._plan.cells, bindings, pins
@@ -595,7 +586,7 @@ class WorldModelSimulator:
                         self._completion_contract,
                         has_tools=bool(self._tasks[cell.task_id].tools),
                     )
-                    if parallel_admission
+                    if parallel_admission and self._request_budget is None
                     else None
                 ),
             )
@@ -637,19 +628,30 @@ class WorldModelSimulator:
             maximum_cell_cost_usd = claim.lease.reserved_cost_usd or (
                 (spec.maximum_cost_usd or 0.0) - observed_spend
             )
-            rollout = self._execute_cell(
-                spec,
-                cell,
-                world_model,
-                grounded_world_model,
-                binding,
-                resolution_input,
-                maximum_cell_cost_usd=maximum_cell_cost_usd,
-                attempt=attempt,
+            context = (
+                self._request_budget.scope(f"{binding_digest(binding)}:{attempt}")
+                if self._request_budget is not None
+                else nullcontext()
             )
+            with context:
+                rollout = self._execute_cell(
+                    spec,
+                    cell,
+                    world_model,
+                    grounded_world_model,
+                    binding,
+                    resolution_input,
+                    maximum_cell_cost_usd=maximum_cell_cost_usd,
+                    attempt=attempt,
+                )
             persisted = self._persist_rollout(
                 rollout, cell, binding, resolution_input, attempt=attempt
             )
+        except SpendLimitReached:
+            # No request was dispatched at this boundary. Completed provider responses
+            # are fsync-backed in the request ledger and replay on the next launch.
+            self._leases.release(claim.lease)
+            raise
         except BaseException:
             raise
         self._leases.release(claim.lease)

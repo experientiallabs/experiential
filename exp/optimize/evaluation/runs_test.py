@@ -19,6 +19,7 @@ from exp.optimize.evaluation.runs import (
     list_runs,
     load_run,
     prepare_run,
+    save_run,
 )
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
@@ -81,6 +82,9 @@ def test_twenty_scenarios_repeats_persist_report_and_exact_resume(tmp_path: Path
     assert {event.total for event in tools_progress} == {20}
     assert run.prepared.cost.judgment_count == 80
     assert run.prepared.cost.scenario_count == 20
+    run = run.model_copy(update={"spending_limit_usd": 100.0})
+
+    save_run(project, run)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
     result = execute_run(project, run, runtime, provider_spend_consented=True)
     saved = load_run(project, run.run_id)
@@ -104,6 +108,8 @@ def test_twenty_scenarios_repeats_persist_report_and_exact_resume(tmp_path: Path
     assert before == (len(state.completion_calls), len(state.embedding_calls))
     fresh = prepare_run(project, catalog, defaults, code_revision=_REVISION)
     assert fresh.run_id != saved.run_id
+    fresh = fresh.model_copy(update={"spending_limit_usd": 100.0})
+    save_run(project, fresh)
     rerun = execute_run(project, fresh, runtime, provider_spend_consented=True)
     assert rerun.simulation_spec.simulation_id != result.simulation_spec.simulation_id
     assert len(state.completion_calls) > before[0]
@@ -140,6 +146,9 @@ def test_interrupted_parallel_run_resumes_without_repeating_paid_cells(tmp_path:
         ),
         code_revision=_REVISION,
     )
+    run = run.model_copy(update={"spending_limit_usd": 100.0})
+
+    save_run(project, run)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
 
     def interrupt(event: ProgressEvent) -> None:

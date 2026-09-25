@@ -392,3 +392,27 @@ def _model() -> ModelSnapshot:
         capabilities_sha256="a" * 64,
         connection_sha256="b" * 64,
     )
+
+
+@pytest.mark.parametrize("attempts", [1, 2, 3])
+def test_observed_attempts_release_unused_retry_allowance(attempts: int) -> None:
+    """An ordinary successful call does not incur phantom charges for unused retries."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=1,
+        cache_write_usd_per_million_tokens=1,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    cost = reconcile_completion_economics(
+        reservation,
+        OperationEconomics(
+            provider_attempts=attempts,
+            usage=Usage(input_tokens=100, output_tokens=10),
+        ),
+    ).cost_usd
+    assert cost is not None
+    assert cost.value == pytest.approx(0.00014 + (attempts - 1) * 0.0021)

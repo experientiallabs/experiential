@@ -23,6 +23,7 @@ from exp.optimize.evaluation.runs import (
     load_run,
     prepare_run,
     run_directory,
+    save_run,
 )
 from exp.optimize.evaluation.runs_test import _twenty_scenarios
 from exp.optimize.router.automatic.service_test import _REVISION, _RuntimeCatalog
@@ -63,6 +64,8 @@ def test_compact_results_and_explicit_report_opening(
         ),
         code_revision=_REVISION,
     )
+    run = run.model_copy(update={"spending_limit_usd": 100.0})
+    save_run(project, run)
     execute_run(
         project,
         run,

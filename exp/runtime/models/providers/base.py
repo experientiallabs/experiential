@@ -528,8 +528,12 @@ class ProviderHttpClient(abc.ABC):
         }
         request_headers["Idempotency-Key"] = idempotency_key or f"exp-{uuid4().hex}"
 
+        attempts = 0
+
         async def attempt(timeout_seconds: float) -> ModelResponse:
             """Send and parse one provider attempt under its remaining time bound."""
+            nonlocal attempts
+            attempts += 1
             started_at = time.monotonic()
             response = await self._transport.post(
                 url,
@@ -547,12 +551,17 @@ class ProviderHttpClient(abc.ABC):
                 latency_seconds=time.monotonic() - started_at,
             )
 
-        return await run_with_retry_async(
+        result = await run_with_retry_async(
             attempt,
             policy=self._retry_policy,
             deadline=request_deadline,
             attempt_timeout_seconds=completion_timeout,
             classify=_classify_complete_retry,
+        )
+        return result.model_copy(
+            update={
+                "economics": result.economics.model_copy(update={"provider_attempts": attempts})
+            }
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:

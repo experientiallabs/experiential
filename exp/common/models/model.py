@@ -106,8 +106,16 @@ class NumericMeasurement(ContractModel):
 
 
 class OperationEconomics(ContractModel):
-    """Usage, cost, and latency observed for one isolated operation."""
+    """Usage, cost, and latency observed for one isolated operation.
 
+    Attributes:
+        provider_attempts: Observed dispatch attempts, or None when not reported.
+        usage: Successful-response token accounting, when available.
+        cost_usd: Observed or conservatively estimated provider charge.
+        latency_seconds: Observed or estimated operation duration.
+    """
+
+    provider_attempts: int | None = Field(default=None, ge=1)
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None

@@ -11,7 +11,7 @@ from exp.cli.shared import consent
 from exp.cli.shared.picker import PickerResult
 from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
-from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_run
+from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_run, save_run
 from exp.optimize.evaluation.runs_test import _twenty_scenarios
 from exp.optimize.router.automatic.service_test import _REVISION, _RuntimeCatalog
 
@@ -43,6 +43,8 @@ def test_cli_review_and_resume_preserve_exact_preparation(tmp_path: Path) -> Non
     )
     assert result.exit_code == 0, result.output
     assert "20 scenarios" in result.output
+    assert "Spending limit $5.00" in result.output
+    assert "Maximum $" not in result.output
     assert (
         "Models:" in result.output and "World model" in result.output and "Judge" in result.output
     )
@@ -113,11 +115,13 @@ def test_eval_over_budget_can_decline_or_complete_the_saved_run(
         ),
         code_revision=_REVISION,
     )
+    run = run.model_copy(update={"spending_limit_usd": 100.0})
+    save_run(project, run)
     set_maximum_command_cost_usd(0.0, project.paths.root)
     before = len(state.completion_calls), len(state.embedding_calls)
     monkeypatch.setattr(flow, "can_prompt", lambda _console: True)
     monkeypatch.setattr(consent, "can_prompt", lambda _console: True)
-    monkeypatch.setattr(flow, "_review", lambda *_args: True)
+    monkeypatch.setattr(flow, "_review", lambda _project, run: run)
     monkeypatch.setattr(flow, "_results", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         flow, "RuntimeModelCatalog", lambda catalog: _RuntimeCatalog(catalog, state)
@@ -138,3 +142,46 @@ def test_eval_over_budget_can_decline_or_complete_the_saved_run(
     else:
         assert load_run(project, run.run_id).status == "prepared"
         assert before == (len(state.completion_calls), len(state.embedding_calls))
+
+
+def test_cli_spending_pause_is_saved_without_report_or_invalid_rollouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public command pauses rather than converting an allowance boundary into a failure."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(
+            models=("candidate-a", "candidate-b"),
+            options=ModelEvaluationOptions(maximum_steps=1),
+        ),
+        code_revision=_REVISION,
+    )
+    run = run.model_copy(update={"spending_limit_usd": 0.2})
+    save_run(project, run)
+    monkeypatch.setattr(
+        flow, "RuntimeModelCatalog", lambda catalog: _RuntimeCatalog(catalog, state)
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "eval",
+            "support",
+            "--root",
+            str(project.paths.root),
+            "--resume",
+            run.run_id,
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Paused at the $0.20 spending limit" in result.output
+    assert "Completed calls saved" in result.output
+    saved = load_run(project, run.run_id)
+    assert saved.status == "paused"
+    assert saved.report_id is None
+    assert saved.required_spending_limit_usd is not None
+    assert saved.required_spending_limit_usd > saved.spending_limit_usd
