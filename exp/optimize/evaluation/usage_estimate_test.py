@@ -1,10 +1,13 @@
 """Captured request identities and measured usage determine expected workload."""
 
+import pytest
+
 from exp.common.models import Usage
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.usage_estimate import model_turns, task_usage, token_estimate
 from exp.optimize.router.automatic.service_test import _trace
 from exp.optimize.router.composition_test import _completion_reservation
+from exp.simulation.retrieval.tests.retrieval_test import _tool_trace
 
 
 def test_parallel_tool_spans_count_one_original_request() -> None:
@@ -105,3 +108,56 @@ def test_vendor_tool_arguments_count_without_full_output_messages() -> None:
     assert usage.judge_input > usage.assistant_output
     assert usage.turns == 1
     assert usage.measured_turns == 0
+
+
+@pytest.mark.parametrize("call_ids", [True, False])
+def test_otlp_observations_use_canonical_pairing_for_arbitrary_span_names(call_ids: bool) -> None:
+    """Distinct results pair once by ID or tool-name order and enter later request estimates."""
+    first, second = (_tool_trace(with_result=True, index=index) for index in (1, 2))
+    spans = first.spans + second.spans
+    if not call_ids:
+        spans = tuple(
+            span.model_copy(
+                update={
+                    "attributes": {
+                        key: value
+                        for key, value in span.attributes.items()
+                        if key != "gen_ai.tool.call.id"
+                    }
+                }
+            )
+            for span in spans
+        )
+    trace = first.model_copy(update={"spans": spans})
+    task = TaskCase(
+        task_id="case",
+        lineage_group_id="lineage",
+        partition="fit",
+        instruction=trace.task,
+        source_trace_ids=(trace.trace_id,),
+        workload_weight=1,
+    )
+    baseline = task_usage(
+        task, (trace,), (), top_k=2, maximum_steps=100, maximum_query_tokens=32_768
+    )
+    spans = tuple(
+        span.model_copy(
+            update={
+                "attributes": {
+                    **span.attributes,
+                    "gen_ai.tool.message": "x" * (8_000 if index == 1 else 4_000),
+                }
+            }
+        )
+        if index in (1, 3)
+        else span
+        for index, span in enumerate(spans)
+    )
+    trace = trace.model_copy(update={"spans": spans})
+    usage = task_usage(task, (trace,), (), top_k=2, maximum_steps=100, maximum_query_tokens=32_768)
+    first_increase = 2_000 - token_estimate("account found")
+    total_increase = 3_000 - 2 * token_estimate("account found")
+    assert usage.turns == 2
+    assert usage.world_output - baseline.world_output == total_increase
+    assert usage.judge_input - baseline.judge_input == total_increase
+    assert usage.assistant_input - baseline.assistant_input == first_increase

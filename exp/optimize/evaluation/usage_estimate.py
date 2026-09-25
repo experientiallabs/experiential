@@ -12,7 +12,8 @@ from exp.common.models import CompletionCostReservation
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace, TraceSpan
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_SYSTEM_PROMPT
-from exp.simulation.retrieval.contracts import RAGTransition
+from exp.simulation.retrieval.contracts import RAGLineageBinding, RAGTransition
+from exp.simulation.retrieval.transitions import extract_real_transitions
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,13 @@ def model_turns(trace: Trace) -> tuple[tuple[TraceSpan, ...], ...]:
         }:
             continue
         if span.model is None and not any(
-            key in span.attributes for key in ("gen_ai.output.messages", "gen_ai.completion")
+            key in span.attributes
+            for key in (
+                "gen_ai.output.messages",
+                "gen_ai.completion",
+                "gen_ai.tool.name",
+                "gen_ai.tool.call.arguments",
+            )
         ):
             continue
         source_id = span.attributes.get("exp.source.span.id")
@@ -126,6 +133,21 @@ def task_usage(
             "tools": [tool.model_dump(mode="json") for tool in task.tools],
         }
     )
+    observations = {
+        (item.trace_id, item.action_span_id): item.observation.content
+        for item in extract_real_transitions(
+            traces,
+            tuple(
+                RAGLineageBinding(
+                    trace_id=trace.trace_id,
+                    lineage_id=task.lineage_group_id,
+                    partition=task.partition,
+                )
+                for trace in traces
+            ),
+            included_partitions=frozenset({task.partition}),
+        )
+    }
     episodes = []
     for trace in traces:
         groups = model_turns(trace)[:maximum_steps]
@@ -145,14 +167,15 @@ def task_usage(
             if usage is not None:
                 measured += 1
                 input_tokens, output_tokens = usage.input_tokens, usage.output_tokens
-            calls = {span.attributes.get("gen_ai.tool.call.id") for span in group} - {None}
-            observations = [
-                span.attributes.get("gen_ai.tool.message")
-                for span in trace.spans
-                if span.name == "agent.tool_call"
-                and span.attributes.get("gen_ai.tool.call.id") in calls
-            ]
-            observation_tokens = sum(token_estimate(item) for item in observations)
+            calls = {
+                span.attributes.get("gen_ai.tool.call.id") or span.span_id
+                for span in group
+                if span.attributes.get("gen_ai.tool.name") is not None
+                or span.attributes.get("gen_ai.tool.call.id") is not None
+            }
+            observation_tokens = sum(
+                token_estimate(observations.get((trace.trace_id, span.span_id))) for span in group
+            )
             # One world response per assistant turn, including all parallel tool results.
             query_count = len(calls) or int(output_tokens > 0)
             queries += query_count * min(
