@@ -340,13 +340,19 @@ class CaptureUploader:
                 continue
             with self._lock:
                 lost = self._diagnostics_lost
-                self._diagnostics_lost = 0
-            try:
-                if lost:
+            if lost:
+                try:
                     self._on_diagnostic(f"diagnostic_events_dropped: {lost}")
+                except Exception:  # noqa: BLE001 - Preserve the count until output recovers.
+                    pass
+                else:
+                    with self._lock:
+                        self._diagnostics_lost -= lost
+            try:
                 self._on_diagnostic(event)
             except Exception:  # noqa: BLE001 - Diagnostics must never drop a captured request.
-                pass
+                with self._lock:
+                    self._diagnostics_lost += 1
 
     def _recover_temporary_files(self) -> None:
         """Adopt bounded complete sanitized temps and remove incomplete crash leftovers."""

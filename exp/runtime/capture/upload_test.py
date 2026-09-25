@@ -192,18 +192,27 @@ def test_capture_receipts_correlate_saved_evidence_without_exposing_content(
     assert span["status"] == {"code": 1}
 
 
+@pytest.mark.parametrize("fail_after_unblocking", [False, True])
 def test_blocked_verbose_reader_cannot_stop_storage_delivery_or_bounded_shutdown(
     tmp_path: Path,
+    fail_after_unblocking: bool,
 ) -> None:
     """Fill the diagnostic queue while both data workers continue with a blocked output sink."""
     blocked = threading.Event()
     release = threading.Event()
     run = str(uuid4())
+    diagnostics: list[str] = []
+    failures: set[str] = set()
 
     def diagnostic(event: str) -> None:
         """Block exactly like a full terminal pipe, independently of the uploader workers."""
         blocked.set()
         assert release.wait(10)
+        kind = "notice" if event.startswith("diagnostic_events_dropped:") else "receipt"
+        if fail_after_unblocking and kind not in failures:
+            failures.add(kind)
+            raise OSError("synthetic output failure")
+        diagnostics.append(event)
 
     def platform(request: httpx.Request) -> httpx.Response:
         """Accept immutable batches without introducing provider or network dependencies."""
@@ -256,6 +265,15 @@ def test_blocked_verbose_reader_cannot_stop_storage_delivery_or_bounded_shutdown
         if uploader._diagnostic_thread is not None:
             uploader._diagnostic_thread.join(timeout=1)
             assert not uploader._diagnostic_thread.is_alive()
+    lost = sum(
+        int(event.split(": ", 1)[1])
+        for event in diagnostics
+        if event.startswith("diagnostic_events_dropped:")
+    )
+    receipts = sum(event.startswith(("capture_saved", "upload_accepted")) for event in diagnostics)
+    assert lost > 0
+    assert receipts + lost == stats.captured_exchanges + stats.uploaded_batches
+    assert failures == ({"notice", "receipt"} if fail_after_unblocking else set())
 
 
 @pytest.mark.parametrize(
