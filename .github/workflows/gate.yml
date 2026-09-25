@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# PR revisions supersede older work. Other events use a unique run ID and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
