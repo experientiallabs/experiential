@@ -133,7 +133,19 @@ def prepare_judging_revision(
 def read_judging_revision(
     project: ProjectStore, prepared: PreparedModelEvaluation, pointer: ArtifactInput
 ) -> EvaluationJudgingRevision:
-    """Verify an immutable judging pass against its exact original evaluation."""
+    """Verify an immutable judging pass against its exact original evaluation.
+
+    Args:
+        project: Owner of the original preparation and retained judge setup artifacts.
+        prepared: Frozen original model, protocol, and pricing settings.
+        pointer: Exact reviewed judging revision to load.
+
+    Returns:
+        Verified revision whose rubric, prompt, model, and prices remain unchanged.
+
+    Raises:
+        ValueError: A pointer, semantic pin, or evaluation identity differs.
+    """
     stored = project.artifacts.read(pointer.artifact_id)
     if (
         stored.manifest.artifact_type != "evaluation-judging-revision"
@@ -165,7 +177,16 @@ def read_judging_revision(
 def revised_judge_setup(
     project: ProjectStore, prepared: PreparedModelEvaluation, pointer: ArtifactInput
 ) -> tuple[JudgeSetupArtifact, CompletionCostReservation, EvaluationProtocol]:
-    """Bind fresh request and exclusion identities while retaining verified prior judgments."""
+    """Bind fresh request and exclusion identities while retaining verified prior judgments.
+
+    Args:
+        project: Owner of the saved judging pass.
+        prepared: Original immutable evaluation preparation.
+        pointer: Reviewed judging revision independent of the simulation recipe.
+
+    Returns:
+        Exact setup, expanded input reservation, and fresh judgment protocol identity.
+    """
     revision = read_judging_revision(project, prepared, pointer)
     selected = read_evaluation_judge(project, revision.setup)
     protocol = prepared.setup.simulation_protocol.model_copy(

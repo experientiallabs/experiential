@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -119,6 +120,8 @@ class EvaluationServices:
         plan_inputs: Additional immutable execution inputs, empty by default.
         judging_protocol: Optional explicit fresh judging pass over saved rollouts.
         judging_input: Immutable reviewed judging revision, independent of simulation identity.
+        spending_limit_usd: Optional request-ledger allowance, independent of plan identity.
+        judge_spend: Optional authoritative request-ledger reconciliation for saved rollouts.
     """
 
     simulator_factory: SimulatorFactory
@@ -126,6 +129,8 @@ class EvaluationServices:
     plan_inputs: tuple[ArtifactInput, ...] = ()
     judging_protocol: EvaluationProtocol | None = None
     judging_input: ArtifactInput | None = None
+    spending_limit_usd: float | None = None
+    judge_spend: Callable[[tuple[str, ...]], float] | None = None
 
 
 class EvaluationRuntimeJudge(Judge, Protocol):

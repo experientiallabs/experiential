@@ -213,18 +213,8 @@ class TemplateJudgeClient:
         Returns:
             Provider response after model dispatch or exact probe replay.
         """
-        probe_id = stable_id(
-            "manual-judge-probe",
-            {
-                "setup": self._setup_input.model_dump(mode="json"),
-                "rollout": self._rollout_input.model_dump(mode="json"),
-                "reference": (
-                    self._reference_input.model_dump(mode="json")
-                    if self._reference_input is not None
-                    else None
-                ),
-                "order": order,
-            },
+        probe_id = judge_probe_id(
+            self._setup_input, self._rollout_input, self._reference_input, order
         )
         saved = _read_probe_if_present(self._store, probe_id)
         if saved is not None:
@@ -470,6 +460,24 @@ def pairwise_citation_evidence_from_probes(
     if rollout.rollout_id == reference.rollout_id:
         raise ManualJudgeError("pairwise citations require distinct rollouts")
     return tuple((dimension_id, (), ()) for dimension_id in first_by_id)
+
+
+def judge_probe_id(
+    setup: ArtifactInput,
+    rollout: ArtifactInput,
+    reference: ArtifactInput | None,
+    order: Literal["single", "forward", "reverse"],
+) -> str:
+    """Identify one exact provider probe, including probes interrupted before artifact storage."""
+    return stable_id(
+        "manual-judge-probe",
+        {
+            "setup": setup.model_dump(mode="json"),
+            "rollout": rollout.model_dump(mode="json"),
+            "reference": reference.model_dump(mode="json") if reference is not None else None,
+            "order": order,
+        },
+    )
 
 
 def _read_probe_if_present(store: ProjectStore, probe_id: str) -> JudgeProtocolProbeArtifact | None:

@@ -338,7 +338,9 @@ admission reason. Judge requests preserve configured reasoning without adding sa
 If a run stops during judging, select it under Saved evaluations in `exp eval PROJECT`. The launch
 review offers a fresh judging pass over saved rollouts under the same spending limit. Successful
 scores are reused, earlier failed-attempt spend is retained, and the new judging recipe is recorded
-separately without editing the original run preparation or simulation artifacts.
+separately without editing the original run preparation or simulation artifacts. Request-ledger
+charges include responses whose later probe or judgment write failed. The approved spending limit
+governs recovery accounting independently of the original theoretical simulation ceiling.
 
 ## Gateway clients
 

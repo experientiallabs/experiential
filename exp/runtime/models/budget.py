@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -108,6 +108,37 @@ class RequestBudget:
         """Return completed charges plus conservative reservations for unknown dispatches."""
         with self._connect() as db:
             return float(db.execute("SELECT COALESCE(SUM(charge), 0) FROM requests").fetchone()[0])
+
+    def accounted_requests(self, coordinates: Sequence[tuple[str, str, int]]) -> float:
+        """Sum distinct saved charges for exact scope, role, and ordinal coordinates.
+
+        Unknown dispatches retain their full admission charge. Coordinates without a saved
+        dispatch contribute nothing. Reading several scopes never repeats a provider call.
+
+        Args:
+            coordinates: Exact logical request scopes, roles, and zero-based ordinals.
+
+        Returns:
+            Total retained USD charge across the distinct matching request rows.
+        """
+        keys = sorted(
+            {
+                sha256_json({"scope": scope, "role": role, "ordinal": ordinal})
+                for scope, role, ordinal in coordinates
+            }
+        )
+        charges = []
+        with self._connect() as db:
+            for offset in range(0, len(keys), 500):
+                batch = keys[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                charges.extend(
+                    row[0]
+                    for row in db.execute(
+                        f"SELECT charge FROM requests WHERE key IN ({placeholders})", batch
+                    )
+                )
+        return math.fsum(charges)
 
     def call[ResultT](
         self,

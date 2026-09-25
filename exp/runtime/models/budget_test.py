@@ -111,3 +111,32 @@ def test_changed_request_at_same_coordinate_fails_before_dispatch(tmp_path: Path
             decode=str,
             charge=lambda r: 1,
         )
+
+
+def test_selected_request_charges_include_unknowns_without_counting_other_roles(
+    tmp_path: Path,
+) -> None:
+    """Explicit coordinates recover paid or unresolved calls without inspecting their responses."""
+    budget = RequestBudget(tmp_path, identity="roles", maximum_cost_usd=10)
+    _call(budget, key="worker", calls=[], maximum=3)
+    _call(budget, key="probe", calls=[], maximum=2)
+    assert budget.accounted_requests((("probe", "assistant", 0), ("probe", "assistant", 0))) == 2
+    assert budget.accounted_requests((("probe", "judge", 0),)) == 0
+    assert budget.accounted_requests(()) == 0
+
+    def fail() -> str:
+        """Leave a reserved request without a returned response."""
+        raise TimeoutError
+
+    with budget.scope("interrupted-probe"), pytest.raises(TimeoutError):
+        budget.call(
+            role="judge",
+            fingerprint="x",
+            maximum_cost_usd=1,
+            operation=fail,
+            encode=str,
+            decode=str,
+            charge=lambda response: 0,
+        )
+    assert budget.accounted_requests((("interrupted-probe", "judge", 0),)) == 1
+    assert budget.accounted_usd == 6

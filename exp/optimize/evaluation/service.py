@@ -99,6 +99,13 @@ def evaluate_models(
     Raises:
         ValueError: Inputs drift, historical cells are supplied, or evidence/budget gates fail.
     """
+    spending_limit = (
+        budget.maximum_cost_usd
+        if services.spending_limit_usd is None
+        else services.spending_limit_usd
+    )
+    if not math.isfinite(spending_limit) or spending_limit <= 0:
+        raise ValueError("evaluation spending limit must be finite and positive")
     if (services.judging_protocol is None) != (services.judging_input is None):
         raise ValueError("a judging revision requires both its protocol and immutable input")
     if services.judging_protocol is not None and (
@@ -170,7 +177,7 @@ def evaluate_models(
     simulation_cost = verified_simulation_spend(
         project, simulated, setup.simulation_completion_input
     )
-    if simulation_cost > budget.maximum_cost_usd:
+    if simulation_cost > spending_limit:
         raise ValueError("simulation exceeded the authorized budget before judging")
     report(progress, "judging")
     judging_setup = setup
@@ -182,9 +189,11 @@ def evaluate_models(
         protocol = services.judging_protocol
         judging_setup = setup.model_copy(update={"simulation_protocol": protocol})
         judge_inputs = (services.judging_input,)
-        prior_judge_cost = _prior_judging_cost(
-            project, plan_input, simulated.artifact_ids, protocol
-        )
+        if services.judge_spend is None:
+            prior_judge_cost = _prior_judging_cost(
+                project, plan_input, simulated.artifact_ids, protocol
+            )
+    authoritative_judge_spend = services.judge_spend
     evidence, _, judge_cost = complete_cell_evidence(
         project,
         plan_input,
@@ -194,13 +203,18 @@ def evaluate_models(
         EvaluationJudge(calibration.rubric_id, calibration.calibration_id),
         services.judge,
         budget.maximum_judgments,
-        remaining_cost_usd=budget.maximum_cost_usd - simulation_cost - prior_judge_cost,
+        remaining_cost_usd=spending_limit - simulation_cost - prior_judge_cost,
         stop_on_overspend=True,
         spend_ceiling_crossed=_reject_overspend,
+        reconciled_spend=(
+            (lambda: authoritative_judge_spend(simulated.artifact_ids))
+            if authoritative_judge_spend is not None
+            else None
+        ),
         progress=progress,
     )
     judge_cost = math.fsum((judge_cost, prior_judge_cost))
-    if math.fsum((simulation_cost, judge_cost)) > budget.maximum_cost_usd:
+    if math.fsum((simulation_cost, judge_cost)) > spending_limit:
         raise ValueError("reconciled evaluation spend exceeds its authorized ceiling")
     dataset = build_evaluation_dataset(
         project.artifacts,

@@ -19,6 +19,7 @@ from exp.optimize.evaluation.continuation import EvaluationRuntimeContract, vali
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices
 from exp.optimize.evaluation.judge import DurableEvaluationJudge
 from exp.optimize.evaluation.judging_resume import revised_judge_setup
+from exp.optimize.evaluation.judging_spend import judge_request_coordinates
 from exp.optimize.evaluation.planning import estimate_model_evaluation
 from exp.optimize.evaluation.prepare import PreparedModelEvaluation, read_evaluation_judge
 from exp.optimize.evaluation.service import ModelEvaluationResult, evaluate_models
@@ -265,6 +266,16 @@ def run_prepared_model_evaluation(
             request_budget=ledger,
         )
 
+    coordinates_by_rollouts: dict[tuple[str, ...], tuple[tuple[str, str, int], ...]] = {}
+
+    def judge_spend(rollout_ids: tuple[str, ...]) -> float:
+        """Reconcile every paid judge response and unknown attempt across the reviewed lineage."""
+        if rollout_ids not in coordinates_by_rollouts:
+            coordinates_by_rollouts[rollout_ids] = judge_request_coordinates(
+                project, prepared, judging_revision, rollout_ids
+            )
+        return ledger.accounted_requests(coordinates_by_rollouts[rollout_ids])
+
     report(progress, "Freezing execution plan")
     runtime_input = _persist_runtime_contract(project, prepared, created_at, code_revision)
     return evaluate_models(
@@ -276,6 +287,8 @@ def run_prepared_model_evaluation(
             (runtime_input,),
             judging_protocol=judging_protocol,
             judging_input=judging_revision,
+            spending_limit_usd=budget.maximum_cost_usd,
+            judge_spend=judge_spend,
         ),
         # Semantic execution bounds stay frozen across allowance increases. The request
         # ledger enforces the smaller approved amount before every paid dispatch.
