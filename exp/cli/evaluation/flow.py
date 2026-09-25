@@ -117,7 +117,9 @@ def run_evaluation(
                     return
         catalog = load_model_catalog(store.model_catalog_path)
         if resume is not None:
-            run = load_run(store, resume)
+            with progress_display(_console, single_line=True) as progress:
+                progress(ProgressEvent(stage="Loading saved evaluation"))
+                run = load_run(store, resume)
         else:
             aliases = (
                 tuple(value.strip() for value in models.split(",") if value.strip())
@@ -143,10 +145,15 @@ def run_evaluation(
                 )
                 if selected_defaults is None:
                     return
-            run = prepare_run(
-                store, catalog, selected_defaults, code_revision=installed_release_revision()
-            )
-            save_defaults(store, selected_defaults)
+            with progress_display(_console, single_line=True) as progress:
+                run = prepare_run(
+                    store,
+                    catalog,
+                    selected_defaults,
+                    code_revision=installed_release_revision(),
+                    progress=progress,
+                )
+                save_defaults(store, selected_defaults)
         _preflight(store, run)
         if dry_run:
             _console.print("Prepared without provider calls. Resume with:")
@@ -217,8 +224,8 @@ def _project_screen(project: ProjectStore) -> str | None:
         ValueError: The build or stored evaluation evidence is invalid.
     """
     tasks = evaluation_tasks(project)
+    heading(_console, project.paths.project_id, f"{len(tasks)} scenarios")
     while True:
-        heading(_console, project.paths.project_id, f"{len(tasks)} scenarios")
         choices = [PickerOption("new", "New evaluation")]
         runs = list_runs(project)
         if runs:
@@ -229,7 +236,6 @@ def _project_screen(project: ProjectStore) -> str | None:
             return "exit"
         if choice.values[0] == "new":
             return None
-        heading(_console, project.paths.project_id, "Saved evaluations")
         selected = choose_one(
             _console,
             title="Saved evaluations",
@@ -310,8 +316,6 @@ def _review(project: ProjectStore, run: EvaluationRun) -> bool:
                 f"${component.maximum_cost_usd:,.4f}",
             )
         _console.print(table)
-        _console.input("\nEnter to return ")
-        _preflight(project, run)
 
 
 def _compact_progress(progress: ProgressHook) -> ProgressHook:

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.models import ModelCatalog
+from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.prepare import (
     ModelEvaluationOptions,
@@ -109,6 +110,7 @@ def test_prepare_defaults_to_binary_task_success_without_calibration_calls(tmp_p
 
     project, catalog, state = _completed_project(tmp_path)
     before = (len(state.completion_calls), state.credential_resolutions)
+    progress: list[ProgressEvent] = []
     prepared = exp.prepare_model_evaluation(
         project,
         catalog,
@@ -117,9 +119,18 @@ def test_prepare_defaults_to_binary_task_success_without_calibration_calls(tmp_p
         options=exp.ModelEvaluationOptions(maximum_steps=1),
         created_at=_TIME,
         code_revision=_REVISION,
+        progress=progress.append,
     )
     assert prepared.setup.judgment_status == "provisional"
     assert before == (len(state.completion_calls), state.credential_resolutions)
+    assert progress[0].stage == "Verifying built project"
+    assert progress[-1].stage == "Calculating evaluation quote"
+    assert [event.completed for event in progress if event.stage == "Estimating model costs"] == [
+        0,
+        1,
+        2,
+        3,
+    ]
 
 
 def test_rollout_defaults_and_large_explicit_limits() -> None:
@@ -174,3 +185,47 @@ def test_heterogeneous_capacities_use_model_specific_input_estimates(
     assert large.maximum_output_tokens == 128_000
     assert small.planning_input_tokens() < small.maximum_input_tokens
     assert large.planning_input_tokens() - small.planning_input_tokens() == 128_000 - 4_096
+
+
+@pytest.mark.parametrize("context", [64_000, 1_310_720])
+def test_unpublished_output_limit_uses_rollout_budget_without_changing_metadata(
+    tmp_path: Path, context: int
+) -> None:
+    """Missing provider output metadata does not prevent a finite context-bounded evaluation."""
+    project, catalog, state, initial = _prepare(tmp_path)
+    record = catalog.models["candidate-b"]
+    assert record.capabilities is not None
+    catalog.models["candidate-b"] = record.model_copy(
+        update={
+            "capabilities": record.capabilities.model_copy(
+                update={"maximum_output_tokens": None, "context_window_tokens": context}
+            )
+        }
+    )
+    before = len(state.completion_calls), state.credential_resolutions
+    prepared = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        judge_setup=initial.judge_setup,
+        calibration_id=initial.setup.simulation_protocol.judge_calibration_id,
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(),
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    pointer = prepared.setup.simulation_completion_input
+    assert pointer is not None
+    contract, _ = load_simulation_completion_contract(project.artifacts, pointer.artifact_id)
+    request = next(
+        item.request
+        for item in contract.candidate_requests
+        if item.candidate_alias == "candidate-b"
+    )
+    assert request.maximum_output_tokens == min(1_000_000, context)
+    assert request.maximum_input_tokens == context
+    assert prepared.setup.maximum_steps == 100
+    assert prepared.setup.maximum_rollout_output_tokens == 1_000_000
+    capabilities = catalog.models["candidate-b"].capabilities
+    assert capabilities is not None and capabilities.maximum_output_tokens is None
+    assert before == (len(state.completion_calls), state.credential_resolutions)

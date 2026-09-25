@@ -12,6 +12,7 @@ from exp.common.models import (
     BillingSource,
     CandidateTokenPrice,
     CompletionCostReservation,
+    ModelCapabilities,
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
@@ -20,6 +21,7 @@ from exp.common.models import (
     completion_request_cost_usd,
     persist_pricing_snapshot,
     reconcile_completion_economics,
+    verify_completion_reservation,
 )
 from exp.common.project import ProjectConfig, ProjectStore
 
@@ -78,6 +80,45 @@ def test_completion_reservation_covers_cache_write_output_and_retries() -> None:
     )
 
     assert reservation.estimated_maximum_call_cost_usd == pytest.approx(0.012)
+
+
+def test_unpublished_output_reservation_still_checks_context_prices_and_known_limits() -> None:
+    """An unknown provider cap permits finite request bounds but never weakens other checks."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=1_000,
+    )
+    capabilities = ModelCapabilities(
+        supports_completions=True,
+        context_window_tokens=1_000,
+        input_cost_per_million_tokens_usd=1,
+        output_cost_per_million_tokens_usd=4,
+        cached_input_cost_per_million_tokens_usd=0.5,
+        cache_write_cost_per_million_tokens_usd=2,
+    )
+    verify_completion_reservation(
+        reservation, model=_model(), capabilities=capabilities, maximum_attempts=3
+    )
+    for updates, message in (
+        ({"context_window_tokens": 999}, "context capacity"),
+        ({"context_window_tokens": None}, "context capacity"),
+        ({"context_window_tokens": 2_000, "maximum_output_tokens": 999}, "output capacity"),
+        ({"input_cost_per_million_tokens_usd": None}, "pricing is incomplete"),
+        ({"input_cost_per_million_tokens_usd": 2}, "pricing differs"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            verify_completion_reservation(
+                reservation,
+                model=_model(),
+                capabilities=capabilities.model_copy(update=updates),
+                maximum_attempts=3,
+            )
 
 
 def test_completion_reservation_prices_from_the_realistic_input_estimate() -> None:

@@ -72,9 +72,10 @@ def test_compact_results_and_explicit_report_opening(
     run = load_run(project, run.run_id)
     before = len(state.completion_calls), len(state.embedding_calls)
     stream = StringIO()
-    console = Console(file=stream, width=80)
+    console = Console(file=stream, width=80, force_terminal=True, record=True)
     render_report(console, project, run)
-    compact = stream.getvalue()
+    assert "\x1b[2J" not in stream.getvalue() and "\x1b[H" not in stream.getvalue()
+    compact = console.export_text(clear=False)
     assert "Saved results" in compact and "20 scenarios" in compact
     assert "$0.000016" in compact
     assert run.run_id not in compact and str(tmp_path) not in compact
@@ -85,10 +86,19 @@ def test_compact_results_and_explicit_report_opening(
     assert run.run_id in stream.getvalue()
     assert "Experiment spend" in stream.getvalue()
     assert "HTML:" in stream.getvalue() and "JSON:" in stream.getvalue()
-    actions = iter((PickerResult(values=("open",)), PickerResult(values=("back",))))
+    stream.seek(0)
+    stream.truncate()
+    actions = iter(
+        (
+            PickerResult(values=("details",)),
+            PickerResult(values=("open",)),
+            PickerResult(values=("back",)),
+        )
+    )
     monkeypatch.setattr(view, "choose_one", lambda *args, **kwargs: next(actions))
     opened: list[str] = []
     monkeypatch.setattr(view.typer, "launch", lambda url: opened.append(url) or 0)
     inspect_report(console, project, run)
+    assert stream.getvalue().count("Saved results") == 1
     assert opened == [(run_directory(project, run.run_id) / "report.html").as_uri()]
     assert before == (len(state.completion_calls), len(state.embedding_calls))

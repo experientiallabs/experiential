@@ -42,7 +42,6 @@ def configure_evaluation(
     }
     if len(candidates) < 2:
         raise ValueError("configure at least two completion models with exp config providers")
-    heading(console, name, "New evaluation · models")
     chosen = choose_many(
         console,
         title="Models",
@@ -55,7 +54,6 @@ def configure_evaluation(
     )
     if not chosen.values:
         return None
-    heading(console, name, "New evaluation · runs")
     repeats = IntPrompt.ask("Runs per scenario", default=defaults.options.repeats, console=console)
     selected = read_review_state(project)
     pointer = (
@@ -64,7 +62,6 @@ def configure_evaluation(
     project_judge = (
         read_evaluation_judge(project, pointer).judge_alias if pointer else config.models.judge
     )
-    heading(console, name, "New evaluation · judge")
     judge = choose_one(
         console,
         title="Judge",
@@ -85,7 +82,6 @@ def configure_evaluation(
         {**defaults.options.model_dump(), "repeats": repeats}
     )
     while True:
-        heading(console, name, "New evaluation · settings")
         console.print(
             f"Runs per scenario: {options.repeats} · "
             f"Parallel rollouts: {options.maximum_concurrency}"

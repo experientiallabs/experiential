@@ -12,18 +12,16 @@ from exp.optimize.evaluation.runs import EvaluationRun
 
 
 def heading(console: Console, project: str, subtitle: str) -> None:
-    """Replace the previous interactive screen with a short project heading.
+    """Append a compact project heading while preserving terminal history.
 
     Args:
-        console: Output console, cleared only when attached to a terminal.
+        console: Output console receiving the heading in normal scrollback.
         project: Project name rendered as literal text.
-        subtitle: Current screen label rendered beneath the project name.
+        subtitle: Current stage label rendered beside the project name.
     """
-    if console.is_terminal:
-        console.clear()
-    console.print(Text(f"\nexp eval · {project}", style="bold"))
-    console.print(Text(subtitle, style="dim"))
-    console.print()
+    title = Text(f"\nexp eval · {project}", style="bold")
+    title.append(f" · {subtitle}", style="dim")
+    console.print(title)
 
 
 def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -> None:
@@ -82,8 +80,8 @@ def inspect_report(console: Console, project: ProjectStore, run: EvaluationRun) 
         ValueError: Saved report evidence is missing or inconsistent.
     """
     _, html_path = export_report(project, run)
+    render_report(console, project, run)
     while True:
-        render_report(console, project, run)
         choice = choose_one(
             console,
             title="Results",
@@ -98,10 +96,8 @@ def inspect_report(console: Console, project: ProjectStore, run: EvaluationRun) 
         if choice.values[0] == "open":
             if typer.launch(html_path.resolve().as_uri()) != 0:
                 console.print(Text(f"Open in your browser: {html_path}"))
-                console.input("Enter to return ")
         else:
             render_details(console, project, run)
-            console.input("\nEnter to return ")
 
 
 def render_details(console: Console, project: ProjectStore, run: EvaluationRun) -> None:

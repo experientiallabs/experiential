@@ -25,6 +25,7 @@ from exp.common.models import (
     persist_pricing_snapshot,
     serves_role,
 )
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationSetup
@@ -62,7 +63,8 @@ class ModelEvaluationOptions(ContractModel):
         maximum_rollout_output_tokens: Total generation ceiling, default one million tokens.
         maximum_concurrency: Positive simultaneous-rollout limit, default eight.
         repeats: Positive independent repeats per scenario/model pair, default one.
-        maximum_output_tokens: Optional positive per-call limit; omission uses model capabilities.
+        maximum_output_tokens: Optional per-call limit; omission uses published model limits
+            or the rollout budget within the context window when no output limit is published.
         maximum_judge_input_tokens: Positive judge context reservation, default 32,768.
         maximum_judge_output_tokens: Positive judge output reservation, default 8,192.
         maximum_retrieval_query_tokens: Positive per-query embedding limit, default 32,768.
@@ -155,6 +157,7 @@ def prepare_model_evaluation(
     options: ModelEvaluationOptions,
     created_at: datetime,
     code_revision: str,
+    progress: ProgressHook | None = None,
 ) -> PreparedModelEvaluation:
     """Freeze a completed project's worker matrix and estimate it without provider calls.
 
@@ -171,6 +174,7 @@ def prepare_model_evaluation(
         options: Bounded execution controls.
         created_at: Timestamp for newly persisted immutable pricing/contracts.
         code_revision: Exact engine producer revision.
+        progress: Optional observer of verification, cost estimation, and artifact stages.
 
     Returns:
         Frozen setup and prepared-project quote suitable for credit admission by a host.
@@ -180,9 +184,11 @@ def prepare_model_evaluation(
     """
     if len(worker_aliases) < 2 or len(set(worker_aliases)) != len(worker_aliases):
         raise ValueError("select at least two distinct worker models")
+    report(progress, "Verifying built project")
     completed = completed_project_build(project)
     if (judge_setup is None) != (calibration_id is None):
         raise ValueError("supply both judge setup and calibration, or omit both for task success")
+    report(progress, "Preparing judge")
     if judge_setup is None:
         default = prepare_hosted_provisional_judge(
             project,
@@ -228,11 +234,13 @@ def prepare_model_evaluation(
     judge_model, judge_caps = static.snapshot(selected.judge_alias)
     if judge_model != selected.judge_model:
         raise ValueError("judge catalog changed; prepare a new judge setup")
+    report(progress, "Loading world model")
     world = load_grounded_world_model_artifact(project.artifacts, completed.world_model)
     world_snapshot, _ = static.snapshot(world.model_alias)
     if world_snapshot != world.model:
         raise ValueError("simulation catalog changed; build a new grounded project")
     embedder, _ = static.snapshot(embedder_alias)
+    report(progress, "Loading retrieval index")
     fit = load_rag_index(project.artifacts, completed.fit_rag.artifact_id)
     if artifact_input(fit.manifest) != completed.fit_rag or fit.index.embedder != embedder:
         raise ValueError("selected embedder differs from the completed fit RAG")
@@ -240,26 +248,27 @@ def prepare_model_evaluation(
         RoutedCandidateSnapshot(alias=alias, model=static.snapshot(alias)[0])
         for alias in sorted(worker_aliases)
     )
-    capacities = {
-        alias: static.snapshot(alias)[1].maximum_output_tokens
-        for alias in (*worker_aliases, world.model_alias)
-    }
-    if any(value is None for value in capacities.values()):
-        raise ValueError("evaluation requires declared worker and world-model output capacities")
-    maximum_output_tokens = options.maximum_output_tokens or max(
-        value for value in capacities.values() if value is not None
-    )
+    output_budgets: dict[str, int] = {}
+    for alias in (*worker_aliases, world.model_alias):
+        capabilities = static.snapshot(alias)[1]
+        if capabilities.context_window_tokens is None:
+            raise ValueError(f"context window is missing for {alias}; refresh model metadata")
+        output_budgets[alias] = capabilities.maximum_output_tokens or min(
+            options.maximum_rollout_output_tokens, capabilities.context_window_tokens
+        )
+    maximum_output_tokens = options.maximum_output_tokens or max(output_budgets.values())
+    report(progress, "Loading traces for cost estimates")
     traces = load_trace_dataset(project.artifacts, completed.trace_dataset.artifact_id).traces
-    input_estimates = {
-        alias: simulation_input_token_estimate(
+    input_estimates: dict[str, int | None] = {}
+    report(progress, "Estimating model costs", completed=0, total=len(output_budgets))
+    for index, (alias, output_budget) in enumerate(output_budgets.items(), start=1):
+        input_estimates[alias] = simulation_input_token_estimate(
             traces,
             retrieved_transition_count=world.top_k,
             maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-            maximum_output_tokens=min(maximum_output_tokens, capacity),
+            maximum_output_tokens=min(maximum_output_tokens, output_budget),
         )
-        for alias, capacity in capacities.items()
-        if capacity is not None
-    }
+        report(progress, "Estimating model costs", completed=index, total=len(output_budgets))
     if any(value is None for value in input_estimates.values()):
         raise ValueError("evaluation requires captured source traces for a cost estimate")
     attempts = RetryPolicy().maximum_attempts
@@ -299,6 +308,7 @@ def prepare_model_evaluation(
         maximum_model_calls=options.maximum_steps,
         system_prompt=config.system.system_prompt if config.system else None,
     )
+    report(progress, "Freezing evaluation settings")
     pricing = persist_pricing_snapshot(
         project.artifacts,
         tuple(
@@ -392,6 +402,7 @@ def prepare_model_evaluation(
         maximum_concurrency=options.maximum_concurrency,
         repeats=options.repeats,
     )
+    report(progress, "Calculating evaluation quote")
     cost = estimate_model_evaluation(
         project,
         setup,

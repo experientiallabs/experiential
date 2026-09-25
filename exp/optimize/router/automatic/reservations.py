@@ -409,6 +409,8 @@ def completion_reservation_from_catalog(
     per-turn output budget. The trace-derived estimate prices the reservation only and cannot
     exceed that physically admissible input size. A whole captured episode can contain many
     requests, so its planning estimate is not evidence that an individual request overflows.
+    Without a published output limit, input and output are independently bounded by context;
+    simulation fits the requested output budget around the full input before dispatch.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -428,20 +430,21 @@ def completion_reservation_from_catalog(
         problems.append(f"{label} alias {alias!r} has no capability or pricing metadata")
         return None
     context = capabilities.context_window_tokens
-    if capabilities.maximum_output_tokens is not None:
-        maximum_output_tokens = min(maximum_output_tokens, capabilities.maximum_output_tokens)
-    if (
-        context is None
-        or capabilities.maximum_output_tokens is None
-        or maximum_output_tokens > capabilities.maximum_output_tokens
-        or maximum_output_tokens >= context
-    ):
-        problems.append(
-            f"{label} alias {alias!r} cannot reserve {maximum_output_tokens} output tokens "
-            "inside its explicit capacity"
-        )
+    if context is None:
+        problems.append(f"{label} alias {alias!r} has no context-window metadata")
         return None
-    maximum_input_tokens = context - maximum_output_tokens
+    if capabilities.maximum_output_tokens is None:
+        maximum_output_tokens = min(maximum_output_tokens, context)
+        maximum_input_tokens = context
+    else:
+        maximum_output_tokens = min(maximum_output_tokens, capabilities.maximum_output_tokens)
+        if maximum_output_tokens >= context:
+            problems.append(
+                f"{label} alias {alias!r} cannot reserve {maximum_output_tokens} output tokens "
+                "inside its explicit capacity"
+            )
+            return None
+        maximum_input_tokens = context - maximum_output_tokens
     if estimated_input_tokens <= 0:
         problems.append(
             f"{label} alias {alias!r} requires a positive input estimate; "

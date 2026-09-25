@@ -61,7 +61,7 @@ from exp.simulation.engines.text.prompt import (
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.redaction import redact_json
-from exp.simulation.engines.text.tokens import TokenCounter
+from exp.simulation.engines.text.tokens import TokenCounter, bound_unpublished_output
 from exp.simulation.retrieval import RAGQuery
 from exp.simulation.retrieval.transitions import render_rag_key
 
@@ -350,6 +350,9 @@ class RecordingCandidateClient:
                 self._candidate.capabilities.maximum_output_tokens or self._maximum_output_tokens,
             ),
         )
+        candidate_request = bound_unpublished_output(
+            candidate_request, self._candidate.capabilities, self._token_counter
+        )
         _preflight_context(
             self._candidate.alias,
             self._candidate.capabilities,
@@ -464,6 +467,12 @@ class RecordingCandidateClient:
             reserved_cost_usd=0.0,
         )
         self._clear_unknown_dispatch()
+        prepared = replace(
+            prepared,
+            request=bound_unpublished_output(
+                prepared.request, self._world_model.capabilities, self._token_counter
+            ),
+        )
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,
@@ -871,14 +880,10 @@ def _preflight_context(
             f"model alias {alias!r} has no explicit output budget",
             phase="output_budget",
         )
-    if capabilities.maximum_output_tokens is None:
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.UNSUPPORTED,
-            f"model alias {alias!r} does not report an output limit for safe text simulation",
-            phase="model_capabilities",
-        )
-    if capabilities.maximum_output_tokens < budget:
+    if (
+        capabilities.maximum_output_tokens is not None
+        and capabilities.maximum_output_tokens < budget
+    ):
         raise _text_failure(
             StopReason.FAILURE,
             FailureCode.UNSUPPORTED,

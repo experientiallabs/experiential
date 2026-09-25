@@ -433,7 +433,7 @@ def verify_completion_reservation(
         maximum_attempts: Active provider retry ceiling.
 
     Raises:
-        ValueError: Model, pricing, capacity, or retry metadata drifted or is unknown.
+        ValueError: Model, pricing, context, or retry metadata drifted or is unknown.
     """
     expected_prices = (
         capabilities.input_cost_per_million_tokens_usd,
@@ -456,15 +456,21 @@ def verify_completion_reservation(
         raise ValueError("completion reservation pricing differs from the active catalog")
     if reservation.maximum_attempts != maximum_attempts:
         raise ValueError("completion reservation retry bound differs from the active client")
+    # Without a separate provider output limit, these are independent conservative ceilings.
+    # The simulator bounds each full request's combined input/output size before dispatch.
+    reserved_context = (
+        max(reservation.maximum_input_tokens, reservation.maximum_output_tokens)
+        if capabilities.maximum_output_tokens is None
+        else reservation.maximum_input_tokens + reservation.maximum_output_tokens
+    )
     if (
         capabilities.context_window_tokens is None
-        or reservation.maximum_input_tokens + reservation.maximum_output_tokens
-        > capabilities.context_window_tokens
+        or reserved_context > capabilities.context_window_tokens
     ):
         raise ValueError("completion reservation exceeds the active context capacity")
     if (
-        capabilities.maximum_output_tokens is None
-        or reservation.maximum_output_tokens > capabilities.maximum_output_tokens
+        capabilities.maximum_output_tokens is not None
+        and reservation.maximum_output_tokens > capabilities.maximum_output_tokens
     ):
         raise ValueError("completion reservation exceeds the active output capacity")
 

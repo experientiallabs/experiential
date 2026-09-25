@@ -2,7 +2,7 @@
 
 from typing import Protocol, runtime_checkable
 
-from exp.common.models import ModelRequest
+from exp.common.models import ModelCapabilities, ModelRequest
 
 
 @runtime_checkable
@@ -35,3 +35,35 @@ class Utf8UpperBoundTokenCounter:
         """
         rendered = request.model_dump_json(exclude_none=False)
         return len(rendered.encode("utf-8")) + 4 * len(request.messages)
+
+
+def bound_unpublished_output(
+    request: ModelRequest, capabilities: ModelCapabilities, token_counter: TokenCounter
+) -> ModelRequest:
+    """Fit an explicit output budget into context when no separate limit is published.
+
+    The catalog's unknown output capability stays unknown. Only this request's token budget
+    is bounded by the remaining context; messages and tools are never shortened. Invalid or
+    overflowing inputs remain unchanged for the normal preflight error before dispatch.
+
+    Args:
+        request: Full request with its configured output budget.
+        capabilities: Exact model metadata, including its known context window.
+        token_counter: Conservative counter covering the complete request.
+
+    Returns:
+        Request with its output budget bounded by available context, or the unchanged request.
+    """
+    if (
+        capabilities.maximum_output_tokens is not None
+        or capabilities.context_window_tokens is None
+        or request.maximum_output_tokens is None
+    ):
+        return request
+    input_tokens = token_counter.count(request)
+    remaining = capabilities.context_window_tokens - input_tokens
+    if input_tokens < 0 or remaining <= 0:
+        return request
+    return request.model_copy(
+        update={"maximum_output_tokens": min(request.maximum_output_tokens, remaining)}
+    )

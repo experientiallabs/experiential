@@ -12,7 +12,7 @@ from exp.common.core.artifacts import ContractModel, assert_secret_free, stable_
 from exp.common.core.files import write_text_atomic
 from exp.common.core.locks import file_write_lock
 from exp.common.models import ModelCatalog
-from exp.common.progress import ProgressEvent, ProgressHook
+from exp.common.progress import ProgressEvent, ProgressHook, report
 from exp.common.project import ProjectStore
 from exp.common.project.paths import validate_local_id
 from exp.common.tasks import TaskCase, load_task_set
@@ -123,6 +123,7 @@ def prepare_run(
     *,
     code_revision: str,
     continuation_of: str | None = None,
+    progress: ProgressHook | None = None,
 ) -> EvaluationRun:
     """Freeze a reproducible scenario/model/repeat matrix without provider calls.
 
@@ -132,10 +133,12 @@ def prepare_run(
         defaults: Selected models, budgets, repeat count, and required scenario coverage.
         code_revision: Exact producer revision.
         continuation_of: Optional completed incomplete matrix whose budgets will be increased.
+        progress: Optional observer of scenario validation and preparation stages.
 
     Returns:
         A saved prepared run, ready for review and spend consent.
     """
+    report(progress, "Loading scenarios")
     tasks = evaluation_tasks(project)
     if len(tasks) < defaults.minimum_scenarios:
         raise ValueError(
@@ -153,9 +156,11 @@ def prepare_run(
     if config.models is None:
         raise ValueError("project model roles are missing; configure ingestion first")
     assert config.build is not None
+    report(progress, "Loading captured traces")
     traces = load_trace_dataset(project.artifacts, config.build.trace_dataset.artifact_id).traces
     by_id = {trace.trace_id: trace for trace in traces}
-    for task in tasks:
+    report(progress, "Checking tool schemas", completed=0, total=len(tasks))
+    for index, task in enumerate(tasks, start=1):
         available = {tool.name for tool in task.tools}
         for trace_id in task.source_trace_ids:
             for span in by_id[trace_id].spans:
@@ -165,6 +170,8 @@ def prepare_run(
                         f"scenario {task.task_id} calls {name!r} without its tool definition; "
                         "add the original tool schema to the trace export and ingest again"
                     )
+        report(progress, "Checking tool schemas", completed=index, total=len(tasks))
+    report(progress, "Loading judge settings")
     selected = read_review_state(project)
     setup = selected.setup if selected else None
     calibration = (
@@ -194,10 +201,12 @@ def prepare_run(
         continuation_of=continuation_of,
         created_at=created_at,
         code_revision=code_revision,
+        progress=progress,
     )
     run = EvaluationRun(
         run_id=run_id, created_at=created_at, code_revision=code_revision, prepared=prepared
     )
+    report(progress, "Saving evaluation")
     save_run(project, run)
     return run
 

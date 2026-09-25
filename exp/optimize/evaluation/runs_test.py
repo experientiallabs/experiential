@@ -70,7 +70,15 @@ def test_twenty_scenarios_repeats_persist_report_and_exact_resume(tmp_path: Path
         models=("candidate-a", "candidate-b"),
         options=ModelEvaluationOptions(maximum_steps=1, repeats=2, maximum_concurrency=4),
     )
-    run = prepare_run(project, catalog, defaults, code_revision=_REVISION)
+    progress: list[ProgressEvent] = []
+    before_prepare = len(state.completion_calls), len(state.embedding_calls)
+    run = prepare_run(project, catalog, defaults, code_revision=_REVISION, progress=progress.append)
+    assert before_prepare == (len(state.completion_calls), len(state.embedding_calls))
+    assert progress[0].stage == "Loading scenarios"
+    assert progress[-1].stage == "Saving evaluation"
+    tools_progress = [event for event in progress if event.stage == "Checking tool schemas"]
+    assert [event.completed for event in tools_progress] == list(range(21))
+    assert {event.total for event in tools_progress} == {20}
     assert run.prepared.cost.judgment_count == 80
     assert run.prepared.cost.scenario_count == 20
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))

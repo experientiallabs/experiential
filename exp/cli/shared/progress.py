@@ -15,8 +15,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from time import monotonic
 
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.live import Live
+from rich.spinner import Spinner
 from rich.text import Text
 
 from exp.common.progress import ProgressEvent, ProgressHook
@@ -37,7 +38,12 @@ class ProgressDisplay:
         """
         self._console = console
         self._live = (
-            Live(console=console, auto_refresh=False, transient=True)
+            Live(
+                console=console,
+                auto_refresh=single_line,
+                refresh_per_second=4,
+                transient=True,
+            )
             if console.is_interactive
             else None
         )
@@ -87,16 +93,18 @@ class ProgressDisplay:
         self._current = event
         self._live.update(self._render(event), refresh=True)
 
-    def _render(self, event: ProgressEvent) -> Text:
+    def _render(self, event: ProgressEvent) -> RenderableType:
         """Compose the in-place line, with a bar and remaining-time estimate when countable.
 
         Args:
             event: Update being rendered on the live line.
 
         Returns:
-            The styled single-line rendering of the current stage.
+            The current stage, with an animated spinner for an uncounted single-line phase.
         """
         if event.completed is None or event.total is None or event.total == 0:
+            if self._single_line:
+                return Spinner("dots", text=Text(_label(event), style="cyan"))
             return Text(f"{_ROW_INDENT}> {_label(event)}", style="cyan")
         filled = min(_BAR_WIDTH, _BAR_WIDTH * event.completed // event.total)
         line = Text(f"{_ROW_INDENT}> {_name(event)} ", style="cyan")
