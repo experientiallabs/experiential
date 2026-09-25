@@ -91,7 +91,7 @@ def test_budgeted_completion_accepts_only_the_configured_served_identity(
 
 def test_pairwise_budget_resume_preserves_reverse_probe_identity(tmp_path: Path) -> None:
     """A saved forward probe does not shift the reverse request's durable budget coordinate."""
-    store = _built_store(tmp_path)
+    store = _built_store(tmp_path, paired=True)
     setup = commit_manual_judge_setup(
         store,
         prepare_manual_judge_setup(
