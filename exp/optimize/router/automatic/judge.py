@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactInput
@@ -156,6 +158,7 @@ class AutomaticRouterJudge:
         code_revision: str,
         maximum_input_tokens: int | None = None,
         maximum_output_tokens: int,
+        request_scope: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Bind the finalized manual setup and provider boundary.
 
@@ -166,6 +169,7 @@ class AutomaticRouterJudge:
             code_revision: Exact producer revision.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
             maximum_output_tokens: Approved per-call output-token reservation for dispatches.
+            request_scope: Optional durable request scope keyed by each finalized judge probe.
         """
         self._client = client
         self._setup = setup
@@ -173,6 +177,7 @@ class AutomaticRouterJudge:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._request_scope = request_scope
 
     @property
     def model(self) -> ModelSnapshot:
@@ -241,6 +246,7 @@ class AutomaticRouterJudge:
             code_revision=self._code_revision,
             maximum_input_tokens=self._maximum_input_tokens,
             maximum_output_tokens=self._maximum_output_tokens,
+            request_scope=self._request_scope,
         )
         return LMJudge(
             adapter,

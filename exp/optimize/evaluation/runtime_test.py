@@ -1,6 +1,7 @@
 """Catalog-backed prepared evaluation through real simulator, LM judge and persisted reports."""
 
 import json
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import cast
@@ -18,7 +19,7 @@ from exp.optimize.router.automatic.service_test import (
     _CompletionClient,
     _RuntimeCatalog,
 )
-from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
 
 
@@ -195,3 +196,47 @@ def test_prepared_runtime_is_public() -> None:
 
     assert exp.run_prepared_model_evaluation is run_prepared_model_evaluation
     assert exp.SpendLimitReached is SpendLimitReached
+
+
+def test_prepared_workers_and_world_accept_pinned_served_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider aliases remain usable through the request ledger and simulator recorders."""
+    project, catalog, state, prepared = _prepare(tmp_path)
+    original_complete = _CompletionClient.complete
+    original_resolve = _RuntimeCatalog.resolve
+    pinned = {"candidate-a", "world"}
+
+    def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Echo the configured served identity from worker and world responses."""
+        response = original_complete(client, request)
+        if client._alias in pinned:
+            return response.model_copy(
+                update={
+                    "model": response.model.model_copy(
+                        update={"model_id": f"served-{client._alias}"}
+                    )
+                }
+            )
+        return response
+
+    def resolve(
+        runtime: _RuntimeCatalog, alias: str, *, role: CatalogRoleName | None = None
+    ) -> ResolvedModel:
+        """Expose the same explicit served identity that a configured runtime catalog retains."""
+        result = original_resolve(runtime, alias, role=role)
+        return replace(result, served_model_id=f"served-{alias}") if alias in pinned else result
+
+    monkeypatch.setattr(_CompletionClient, "complete", complete)
+    monkeypatch.setattr(_RuntimeCatalog, "resolve", resolve)
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert result.report.compared_cells == prepared.cost.scenario_count
+    assert all(row.quality == 1 for row in result.report.models)

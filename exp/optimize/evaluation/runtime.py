@@ -171,6 +171,7 @@ def run_prepared_model_evaluation(
                 ledger,
                 item.request,
                 role=f"assistant:{item.candidate_alias}",
+                served_model_id=candidates[item.candidate_alias].served_model_id,
             ),
         )
         for item in completion.candidate_requests
@@ -182,6 +183,7 @@ def run_prepared_model_evaluation(
             ledger,
             completion.world_model_request,
             role="world",
+            served_model_id=world.served_model_id,
         ),
     )
     bounded_judge = ReservedJudgeClient(
@@ -199,6 +201,7 @@ def run_prepared_model_evaluation(
         code_revision=code_revision,
         maximum_input_tokens=prepared.judge_request.maximum_input_tokens,
         maximum_output_tokens=prepared.judge_request.maximum_output_tokens,
+        request_scope=ledger.scope,
     )
     retriever = load_fit_rag_retriever(
         project.artifacts,

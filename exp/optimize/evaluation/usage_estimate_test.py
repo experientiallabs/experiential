@@ -2,7 +2,7 @@
 
 from exp.common.models import Usage
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.usage_estimate import model_turns, task_usage
+from exp.optimize.evaluation.usage_estimate import model_turns, task_usage, token_estimate
 from exp.optimize.router.automatic.service_test import _trace
 from exp.optimize.router.composition_test import _completion_reservation
 
@@ -54,3 +54,54 @@ def test_identical_messages_without_source_identity_are_distinct_requests() -> N
         }
     )
     assert len(model_turns(trace)) == 2
+
+
+def test_vendor_tool_arguments_count_without_full_output_messages() -> None:
+    """Grouped normalized tool output contributes to assistant, world and judge estimates."""
+    trace = _trace(1, _completion_reservation("candidate").model)
+    first = trace.spans[0].model_copy(
+        update={
+            "usage": None,
+            "attributes": {
+                "exp.source.span.id": "request-1",
+                "gen_ai.tool.call.id": "search",
+                "gen_ai.tool.name": "search",
+                "gen_ai.tool.call.arguments": {"query": "x" * 8_000},
+            },
+        }
+    )
+    second = first.model_copy(
+        update={
+            "span_id": "other-call",
+            "attributes": {
+                **first.attributes,
+                "gen_ai.tool.call.id": "extract",
+                "gen_ai.tool.name": "extract",
+                "gen_ai.tool.call.arguments": '{"url":"https://example.com"}',
+            },
+        }
+    )
+    trace = trace.model_copy(update={"spans": (first, second)})
+    task = TaskCase(
+        task_id="case",
+        lineage_group_id="lineage",
+        partition="fit",
+        instruction=trace.task,
+        source_trace_ids=(trace.trace_id,),
+        workload_weight=1,
+    )
+    usage = task_usage(task, (trace,), (), top_k=2, maximum_steps=100, maximum_query_tokens=32_768)
+    assert usage.assistant_output == token_estimate(
+        {
+            "content": None,
+            "tool_calls": [
+                {"name": "search", "arguments": {"query": "x" * 8_000}},
+                {"name": "extract", "arguments": {"url": "https://example.com"}},
+            ],
+        }
+    )
+    assert usage.assistant_output > 2_000
+    assert usage.world_input > usage.assistant_output
+    assert usage.judge_input > usage.assistant_output
+    assert usage.turns == 1
+    assert usage.measured_turns == 0

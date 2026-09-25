@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import Literal, cast
 
@@ -104,6 +106,7 @@ class TemplateJudgeClient:
         code_revision: str,
         maximum_input_tokens: int | None = None,
         maximum_output_tokens: int,
+        request_scope: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Bind one target, optional same-task reference, and exact finalized contract.
 
@@ -121,6 +124,7 @@ class TemplateJudgeClient:
             code_revision: Exact producer revision for probe artifacts.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
             maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
+            request_scope: Optional durable request scope keyed by the exact probe identity.
 
         Raises:
             ManualJudgeError: Pairwise feedback lacks a distinct same-task reference, or the
@@ -150,6 +154,7 @@ class TemplateJudgeClient:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._request_scope = request_scope
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
         self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
@@ -236,16 +241,18 @@ class TemplateJudgeClient:
                 model=saved.model,
                 economics=saved.economics,
             )
-        response = self._client.complete(
-            _bounded_judge_request(
-                self._template,
-                self._rubric,
-                candidate_a,
-                candidate_b,
-                maximum_input_tokens=self._maximum_input_tokens,
-                maximum_output_tokens=self._maximum_output_tokens,
+        context = self._request_scope(probe_id) if self._request_scope else nullcontext()
+        with context:
+            response = self._client.complete(
+                _bounded_judge_request(
+                    self._template,
+                    self._rubric,
+                    candidate_a,
+                    candidate_b,
+                    maximum_input_tokens=self._maximum_input_tokens,
+                    maximum_output_tokens=self._maximum_output_tokens,
+                )
             )
-        )
         self._provider_calls_made += 1
         raw = _raw_response(response)
         inputs = tuple(

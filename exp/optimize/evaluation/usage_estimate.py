@@ -138,10 +138,9 @@ def task_usage(
             first = group[0]
             attrs = first.attributes
             messages = _decoded(attrs.get("gen_ai.input.messages"))
-            reply = _decoded(attrs.get("gen_ai.output.messages"))
             input_tokens = token_estimate(messages) if messages else task_size + transcript
             input_tokens += token_estimate([tool.model_dump(mode="json") for tool in task.tools])
-            output_tokens = token_estimate(reply or attrs.get("gen_ai.completion"))
+            output_tokens = _output_tokens(group)
             usage = next((span.usage for span in group if span.usage is not None), None)
             if usage is not None:
                 measured += 1
@@ -200,3 +199,22 @@ def expected_completion_cost(
         input_tokens * request.input_usd_per_million_tokens
         + output_tokens * request.output_usd_per_million_tokens
     ) / 1_000_000
+
+
+def _output_tokens(group: tuple[TraceSpan, ...]) -> int:
+    """Count one reply, reconstructing normalized tool calls when full messages are absent."""
+    attributes = group[0].attributes
+    messages = _decoded(attributes.get("gen_ai.output.messages"))
+    if messages:
+        return token_estimate(messages)
+    calls: dict[str, JsonValue] = {}
+    for span in group:
+        name = span.attributes.get("gen_ai.tool.name")
+        arguments = span.attributes.get("gen_ai.tool.call.arguments")
+        if name is not None or arguments is not None:
+            identity = str(span.attributes.get("gen_ai.tool.call.id") or span.span_id)
+            calls[identity] = {"name": name, "arguments": _decoded(arguments)}
+    completion = attributes.get("gen_ai.completion")
+    if not calls:
+        return token_estimate(completion)
+    return token_estimate({"content": completion, "tool_calls": list(calls.values())})

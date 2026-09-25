@@ -30,12 +30,18 @@ class BudgetedCompletion:
         reservation: CompletionCostReservation,
         *,
         role: str,
+        served_model_id: str | None = None,
     ) -> None:
         """Bind one role to its immutable prices and the evaluation-wide allowance."""
         self._client = client
         self._budget = budget
         self._reservation = reservation
         self._role = role
+        self._served_model = (
+            reservation.model.model_copy(update={"model_id": served_model_id})
+            if served_model_id is not None
+            else reservation.model
+        )
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Admit the exact pending request before dispatch, including all permitted retries.
@@ -62,13 +68,14 @@ class BudgetedCompletion:
             {
                 "request": request.model_dump(mode="json"),
                 "reservation": self._reservation.model_dump(mode="json"),
+                "served_model": self._served_model.model_dump(mode="json"),
             }
         )
 
         def dispatch() -> ModelResponse:
             """Retain the raw response; recorders independently reconcile its economics."""
             response = self._client.complete(request)
-            if response.model != self._reservation.model:
+            if response.model not in (self._reservation.model, self._served_model):
                 raise ValueError("provider response identity differs from the request reservation")
             return response
 
