@@ -1,5 +1,6 @@
 """Capture delivery retries safely while keeping cloud failures off inference."""
 
+import hashlib
 import json
 import os
 import threading
@@ -128,6 +129,67 @@ def test_provider_usage_reaches_live_and_final_capture_counts(
         final = uploader.close()
     assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (3, 7, 1)
     assert uploader.stats == uploader.close() == final
+
+
+@pytest.mark.parametrize("broken_diagnostic", [False, True])
+def test_capture_receipts_correlate_saved_evidence_without_exposing_content(
+    tmp_path: Path, broken_diagnostic: bool
+) -> None:
+    """Receipts expose only bounded identifiers and counts, and a closed terminal loses no data."""
+    run = str(uuid4())
+    diagnostics: list[str] = []
+    response_id = "resp_SYNTHETIC_PRIVATE_ID"
+    trace_id = uuid4().hex
+
+    def diagnostic(event: str) -> None:
+        """Simulate a terminal that receives one event but may fail to render it."""
+        diagnostics.append(event)
+        if broken_diagnostic:
+            raise OSError("SYNTHETIC_PRIVATE_ERROR")
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(lambda request: httpx.Response(503)),
+        on_diagnostic=diagnostic,
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(
+            replace(
+                _usage_exchange(),
+                response=json.dumps(
+                    {
+                        "id": response_id,
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 3, "output_tokens": 7},
+                    }
+                ).encode(),
+                failed=True,
+                trace_id=trace_id,
+            )
+        )
+        _wait(lambda: any("capture_saved" in event for event in diagnostics))
+    finally:
+        stats = uploader.close()
+    assert (stats.captured_exchanges, stats.pending_batches, stats.dropped_exchanges) == (1, 1, 0)
+    assert (stats.input_tokens, stats.output_tokens) == (3, 7)
+    saved = next(event for event in diagnostics if "capture_saved" in event)
+    assert f"trace {trace_id}" in saved
+    assert f"response {hashlib.sha256(response_id.encode()).hexdigest()[:16]}" in saved
+    assert "completed=True" in saved and "interrupted=False" in saved
+    assert "transport_error=True" in saved and "3 in / 7 out tokens" in saved
+    assert not any("SYNTHETIC_PRIVATE" in event or "secret" in event for event in diagnostics)
+    payload = json.loads(next((tmp_path / run).glob("*.json")).read_bytes())
+    span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    assert span["traceId"] == trace_id
+    assert span["status"] == {"code": 1}
 
 
 @pytest.mark.parametrize(

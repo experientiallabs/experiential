@@ -2,6 +2,7 @@
 
 import json
 import time
+import zlib
 from dataclasses import replace
 
 import brotli
@@ -273,6 +274,163 @@ def test_cancelled_sse_keeps_request_and_complete_events_without_inventing_usage
     assert "gen_ai.usage.input_tokens" not in attributes
     assert "partial" in str(attributes["exp.capture.response"])
     assert attributes["exp.capture.interrupted"] is True
+
+
+@pytest.mark.parametrize("streamed", [True, False])
+@pytest.mark.parametrize("completed", [True, False])
+def test_terminal_response_survives_later_transport_failure(
+    streamed: bool, completed: bool
+) -> None:
+    """A disconnect after provider completion cannot turn a finished model call into a failure."""
+    response = {
+        "id": "resp_test_completion",
+        "status": "completed" if completed else "incomplete",
+        "model": "test",
+        "output": [],
+        "usage": {"input_tokens": 23, "output_tokens": 17},
+    }
+    body = json.dumps(response).encode()
+    if streamed:
+        event = {"type": f"response.{response['status']}", "response": response}
+        body = b"data: " + json.dumps(event).encode() + b"\n\n"
+    exchange = _exchange(
+        response=body,
+        response_content_type="text/event-stream" if streamed else "application/json",
+        failed=True,
+    )
+    attributes = _attributes(exchange)
+    assert attributes["exp.capture.transport_error"] is True
+    assert attributes["exp.capture.interrupted"] is not completed
+    assert attributes["gen_ai.usage.input_tokens"] == 23
+    assert attributes["gen_ai.usage.output_tokens"] == 17
+    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096))["resourceSpans"][0][
+        "scopeSpans"
+    ][0]["spans"][0]
+    assert span["status"]["code"] == (1 if completed else 2)
+
+
+@pytest.mark.parametrize("protocol", ["chat", "messages"])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("provider_error", [False, True])
+def test_stream_completion_and_provider_errors_remain_separate_from_transport_errors(
+    protocol: str, completed: bool, provider_error: bool
+) -> None:
+    """Terminal SSE events survive late disconnects without masking actual provider failures."""
+    events: list[JsonObject]
+    if protocol == "messages":
+        events = [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 3}}},
+            {"type": "message_delta", "usage": {"output_tokens": 7}},
+        ]
+        if completed:
+            events.append({"type": "message_stop"})
+    else:
+        events = [{"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 7}}]
+    if provider_error:
+        events.append({"type": "error", "error": {"type": "overloaded_error"}})
+    body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+    if protocol == "chat" and completed:
+        body += b"data: [DONE]\n\n"
+    exchange = _exchange(
+        protocol=protocol, response=body, response_content_type="text/event-stream", failed=True
+    )
+    attributes = _attributes(exchange)
+    assert attributes["exp.capture.completed"] is completed
+    assert attributes["exp.capture.interrupted"] is not completed
+    assert attributes["gen_ai.usage.input_tokens"] == 3
+    assert attributes["gen_ai.usage.output_tokens"] == 7
+    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096))["resourceSpans"][0][
+        "scopeSpans"
+    ][0]["spans"][0]
+    assert span["status"]["code"] == (2 if provider_error or not completed else 1)
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br", "zstd"])
+@pytest.mark.parametrize("completed", [False, True])
+def test_interrupted_compressed_sse_retains_complete_events_without_compression_footer(
+    encoding: str, completed: bool
+) -> None:
+    """A missing compression footer must not discard already received model output or usage."""
+    body = b'data: {"type":"response.output_text.delta","delta":"retained text"}\n\n'
+    if completed:
+        body += b'data: {"type":"response.completed","response":{"output":[],'
+        body += b'"usage":{"input_tokens":3,"output_tokens":7}}}\n\n'
+    if encoding == "br":
+        brotli_compressor = brotli.Compressor()
+        compressed = brotli_compressor.process(body) + brotli_compressor.flush()
+    elif encoding == "zstd":
+        zstd_compressor = zstandard.ZstdCompressor().compressobj()
+        compressed = zstd_compressor.compress(body) + zstd_compressor.flush(
+            zstandard.COMPRESSOBJ_FLUSH_BLOCK
+        )
+    else:
+        compressor = zlib.compressobj(wbits=31 if encoding == "gzip" else 15)
+        compressed = compressor.compress(body) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    exchange = _exchange(
+        response=compressed,
+        response_encoding=encoding,
+        response_content_type="text/event-stream",
+        failed=True,
+    )
+    attributes = _attributes(exchange)
+    assert attributes["exp.capture.interrupted"] is not completed
+    assert attributes["exp.capture.completed"] is completed
+    if completed:
+        assert attributes["gen_ai.usage.input_tokens"] == 3
+        assert attributes["gen_ai.usage.output_tokens"] == 7
+    else:
+        assert "retained text" in str(attributes["exp.capture.response"])
+        assert "gen_ai.usage.input_tokens" not in attributes
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br"])
+@pytest.mark.parametrize("oversized", [False, True])
+def test_partial_compression_never_invents_a_terminal_event_or_bypasses_limits(
+    encoding: str, oversized: bool
+) -> None:
+    """Incomplete SSE records and excessive decompression cannot produce reported usage."""
+    body = b'data: {"type":"response.completed","response":{"usage":'
+    body += b'{"input_tokens":3,"output_tokens":7}}}'
+    if oversized:
+        body += b"\n\n:" + b"x" * 5000 + b"\n\n"
+    if encoding == "br":
+        brotli_compressor = brotli.Compressor()
+        compressed = brotli_compressor.process(body) + brotli_compressor.flush()
+    else:
+        compressor = zlib.compressobj(wbits=31 if encoding == "gzip" else 15)
+        compressed = compressor.compress(body) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    attributes = _attributes(
+        _exchange(
+            response=compressed,
+            response_encoding=encoding,
+            response_content_type="text/event-stream",
+            failed=True,
+        )
+    )
+    assert attributes["exp.capture.completed"] is False
+    assert attributes["exp.capture.interrupted"] is True
+    assert "gen_ai.usage.input_tokens" not in attributes
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br"])
+def test_complete_http_response_still_requires_a_complete_compression_frame(encoding: str) -> None:
+    """Partial decompression is restricted to transport-interrupted SSE captures."""
+    body = b'data: {"type":"response.completed","response":{"output":[]}}\n\n'
+    if encoding == "br":
+        brotli_compressor = brotli.Compressor()
+        compressed = brotli_compressor.process(body) + brotli_compressor.flush()
+    else:
+        compressor = zlib.compressobj(wbits=31 if encoding == "gzip" else 15)
+        compressed = compressor.compress(body) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    with pytest.raises(ValueError, match="incomplete"):
+        _attributes(
+            _exchange(
+                response=compressed,
+                response_encoding=encoding,
+                response_content_type="text/event-stream",
+                failed=False,
+            )
+        )
 
 
 def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
