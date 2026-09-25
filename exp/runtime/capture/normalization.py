@@ -15,7 +15,7 @@ import brotli
 import zstandard
 
 from exp.common.core.artifacts import JsonObject, JsonValue
-from exp.common.traces.ingest.capture import capture_metric_attributes, capture_usage_attributes
+from exp.common.traces.capture import capture_metric_attributes, capture_usage_attributes
 from exp.runtime.capture.metrics import observed_metrics
 
 CaptureProtocol = Literal["responses", "chat", "messages"]
@@ -133,16 +133,7 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
         attributes["exp.capture.response_id_hash"] = hashlib.sha256(
             response_id.encode()
         ).hexdigest()[:16]
-    terminal = (
-        completed
-        or response.get("status") in ("incomplete", "failed")
-        or (
-            bool(response)
-            and not exchange.failed
-            and "text/event-stream" not in exchange.response_content_type
-            and not response.get("capture_unparsed_response")
-        )
-    )
+    terminal = completed or response.get("status") in ("incomplete", "failed")
     metrics = observed_metrics(
         exchange.protocol,
         response,

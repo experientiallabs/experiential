@@ -1,6 +1,8 @@
 """Protocol normalization preserves evidence while removing transport credentials."""
 
 import json
+import subprocess
+import sys
 import threading
 import time
 import zlib
@@ -15,8 +17,7 @@ import pytest
 import zstandard
 
 from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
-from exp.common.traces.capture import CaptureMetrics
-from exp.common.traces.ingest.capture import capture_metric_attributes
+from exp.common.traces.capture import CaptureMetrics, capture_metric_attributes
 from exp.common.traces.ingest.otlp import normalize_otlp_payload
 from exp.runtime.capture.normalization import CapturedExchange, capture_protocol, normalize_exchange
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -85,7 +86,7 @@ def test_cache_write_usage_survives_the_platform_otlp_import_contract() -> None:
     """The cloud-normalized usage preserves the same subsets as gateway trace ingestion."""
     exchange = _exchange(
         protocol="messages",
-        response=b'{"usage":{"input_tokens":3,"output_tokens":7,'
+        response=b'{"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":7,'
         b'"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}',
     )
     result = normalize_otlp_payload(
@@ -902,3 +903,34 @@ def test_real_gateway_and_passive_capture_share_usage_fields(
         assert passive_metrics.duration_ms is not None
         assert passive_metrics.usage is not None
         assert raw_key not in json.dumps(passive)
+
+
+@pytest.mark.parametrize("protocol", ["responses", "chat", "messages"])
+def test_json_counts_without_provider_terminal_remain_uncertified(protocol: str) -> None:
+    """A successful HTTP exchange alone does not prove the provider finished inference."""
+    attributes = _attributes(_exchange(protocol=protocol))
+    assert attributes["gen_ai.usage.input_tokens"] == 3
+    assert attributes["gen_ai.usage.output_tokens"] == 7
+    raw = attributes["exp.capture.metrics"]
+    assert isinstance(raw, str)
+    metrics = CaptureMetrics.model_validate_json(raw)
+    assert not metrics.usage_complete
+    assert metrics.terminal_at is None
+    assert metrics.duration_ms is None
+
+
+def test_desktop_normalizer_does_not_import_vendor_ingesters() -> None:
+    """Check the real cold import path in a fresh interpreter, outside pytest's imports."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import exp.runtime.capture.normalization; "
+            "assert not any(name.startswith('exp.common.traces.ingest') for name in sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

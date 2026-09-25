@@ -6,8 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from exp.common.traces import Trace, TraceSpan
-from exp.common.traces.capture import CaptureMetrics
-from exp.common.traces.ingest.capture import capture_metric_attributes, capture_usage
+from exp.common.traces.capture import CaptureMetrics, capture_metric_attributes, capture_usage
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.common.traces.ingest.vendor_trace import SOURCE_SPAN_ATTRIBUTE
 

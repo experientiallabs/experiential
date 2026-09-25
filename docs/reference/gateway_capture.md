@@ -198,9 +198,8 @@ Unsettled hosted records remain pending until permission arrives or their TTL ex
 closing does not grant permission or purge them. Per-record size limits and explicit retention
 policies still apply; this overload guarantee does not mean unlimited retention.
 
-Gateway and desktop Capture share the response and measurement contracts in
-`exp.common.traces.capture` and the trace measurement projection in
-`exp.common.traces.ingest.capture`. Their exported traces use
+Gateway and desktop Capture share the response and measurement contracts and
+trace-field projection in `exp.common.traces.capture`. Their exported traces use
 `exp.capture.metrics` (JSON encoded `CaptureMetrics`) and
 `exp.capture.usage.complete`, together with the same `gen_ai.usage.*` fields for
 input, output, cache reads, cache creation, and reasoning. Cache and reasoning
