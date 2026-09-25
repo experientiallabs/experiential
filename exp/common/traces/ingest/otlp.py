@@ -569,12 +569,16 @@ def _usage(attributes: JsonObject) -> Usage | None:
     if input_tokens is None or output_tokens is None:
         raise OtlpTraceFormatError("GenAI usage needs both input and output token counts")
     cached = attributes.get("gen_ai.usage.cached_input_tokens")
+    cache_creation = attributes.get("gen_ai.usage.cache_creation_input_tokens")
     return Usage(
         input_tokens=_integer(input_tokens, "gen_ai.usage.input_tokens"),
         output_tokens=_integer(output_tokens, "gen_ai.usage.output_tokens"),
         cached_input_tokens=None
         if cached is None
         else _integer(cached, "gen_ai.usage.cached_input_tokens"),
+        cache_write_input_tokens=None
+        if cache_creation is None
+        else _integer(cache_creation, "gen_ai.usage.cache_creation_input_tokens"),
     )
 
 

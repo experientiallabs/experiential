@@ -198,6 +198,31 @@ Unsettled hosted records remain pending until permission arrives or their TTL ex
 closing does not grant permission or purge them. Per-record size limits and explicit retention
 policies still apply; this overload guarantee does not mean unlimited retention.
 
+Gateway and desktop Capture share the response and measurement contracts in
+`exp.common.traces.capture` and the trace measurement projection in
+`exp.common.traces.ingest.capture`. Their exported traces use
+`exp.capture.metrics` (JSON encoded `CaptureMetrics`) and
+`exp.capture.usage.complete`, together with the same `gen_ai.usage.*` fields for
+input, output, cache reads, cache creation, and reasoning. Cache and reasoning
+counts are subsets, not additional charges. Anthropic's separate cache input
+categories are added to its input total once. The OTLP importer retains cache
+creation in `TraceSpan.usage.cache_write_input_tokens`.
+
+An observer only supplies facts it can measure. Native gateway measurements
+describe the winning provider attempt; desktop measurements describe the observed
+exchange, use its wall-clock interval, and leave first-token timing unknown.
+Missing counts stay unknown. Desktop live totals include reported partial usage,
+with `usage_complete=false` when there is no terminal evidence. Gateway ingestion
+requires complete usage for an analyzed turn and assigns it to one output span,
+so parallel tool calls do not multiply the totals. Both retain the shared raw
+measurement document, including incomplete counts and optional cache details.
+
+Interception and persistence remain adapter responsibilities. The desktop adapter
+keeps its bounded queue, credential redaction, signed OTLP uploads and durable
+retry spool. Native gateway capture keeps its identity, consent, settlement and
+durable-acknowledgement lifecycle. Neither adapter grants the other's authority or
+changes inference behavior to make a capture write succeed.
+
 Destinations must enforce their own current consent, identity ownership, consent
 generation, retention and physical storage constraints at the durable write. Native
 admission policy is a performance gate, not a replacement for those checks. Capture

@@ -10,6 +10,7 @@ from pathlib import Path
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject, SourceIdentity, sha256_json
+from exp.common.traces.capture import CaptureMetrics
 from exp.common.traces.ingest.chat_json import CHAT_JSON_SOURCE
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 from exp.common.traces.ingest.sources import TraceSourceError
@@ -20,7 +21,6 @@ from exp.runtime.gateway.ingest.metrics import apply_gateway_metrics
 from exp.runtime.gateway.local_capture import GATEWAY_CAPTURE_APPLICATION
 from exp.runtime.gateway.local_capture_contracts import CapturedExchange, LocalCaptureScope
 from exp.runtime.gateway.local_capture_store import LocalCaptureStore
-from exp.runtime.gateway.native_capture import CaptureMetrics
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_responses
 

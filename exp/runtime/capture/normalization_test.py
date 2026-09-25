@@ -1,17 +1,38 @@
 """Protocol normalization preserves evidence while removing transport credentials."""
 
 import json
+import threading
 import time
 import zlib
 from dataclasses import replace
+from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import brotli
+import exp_gateway_native as native
+import httpx
 import pytest
 import zstandard
 
 from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
+from exp.common.traces.capture import CaptureMetrics
+from exp.common.traces.ingest.capture import capture_metric_attributes
 from exp.common.traces.ingest.otlp import normalize_otlp_payload
 from exp.runtime.capture.normalization import CapturedExchange, capture_protocol, normalize_exchange
+from exp.runtime.gateway.lifecycle import load_gateway_components
+from exp.runtime.gateway.native_bridge import NativeControlPlane
+from exp.runtime.gateway.native_capture import (
+    CaptureConfiguration,
+    CaptureController,
+    CaptureRecord,
+)
+from exp.runtime.gateway.native_server import serve_native_gateway
+from exp.runtime.gateway.tests.launch_test import (
+    _configure_gateway,
+    _LoopbackProvider,
+    _unused_port,
+    _wait_ready,
+)
 
 
 def _exchange(**changes: str | bytes | int | bool) -> CapturedExchange:
@@ -58,6 +79,31 @@ def test_known_usage_and_redacted_copies_normalize_through_existing_cloud_contra
     attributes = _attributes(_exchange(request=request))
     assert attributes["gen_ai.usage.input_tokens"] == 3
     assert attributes["gen_ai.usage.output_tokens"] == 7
+
+
+def test_cache_write_usage_survives_the_platform_otlp_import_contract() -> None:
+    """The cloud-normalized usage preserves the same subsets as gateway trace ingestion."""
+    exchange = _exchange(
+        protocol="messages",
+        response=b'{"usage":{"input_tokens":3,"output_tokens":7,'
+        b'"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}',
+    )
+    result = normalize_otlp_payload(
+        json.loads(normalize_exchange(exchange, max_body_bytes=4096)),
+        source=SourceIdentity(kind="otlp", source_id="synthetic-capture"),
+    )
+    assert not result.issues
+    span = result.traces[0].spans[0]
+    assert span.usage is not None
+    assert span.usage.input_tokens == 113
+    assert span.usage.output_tokens == 7
+    assert span.usage.cached_input_tokens == 100
+    assert span.usage.cache_write_input_tokens == 10
+    raw = span.attributes["exp.capture.metrics"]
+    assert isinstance(raw, str)
+    metrics = CaptureMetrics.model_validate_json(raw)
+    assert metrics.usage_complete
+    assert metrics.usage is not None and metrics.usage.input_tokens == span.usage.input_tokens
 
 
 @pytest.mark.parametrize("protocol", ["responses", "chat"])
@@ -756,3 +802,103 @@ def test_responses_and_messages_refusals_preserve_provider_evidence(
     assert attributes["exp.capture.refused"] is True
     payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
     assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2
+
+
+def test_real_gateway_and_passive_capture_share_usage_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Compare both observers on real JSON/SSE traffic without activating interception."""
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "synthetic-provider-key")
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+    _, raw_key = _configure_gateway(
+        tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
+    )
+    components = load_gateway_components(tmp_path)
+    records: list[str] = []
+    collector = native.CaptureCollector(
+        CaptureConfiguration(settlement_required=False).model_dump_json(), records.append
+    )
+    control = NativeControlPlane(
+        components,
+        capture=CaptureController(collector, application_for=lambda _: "capture-parity"),
+    )
+    port = _unused_port()
+    shutdown = native.shutdown_handle()
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        """Run an isolated gateway and retain startup failures for the test."""
+        try:
+            serve_native_gateway(
+                control, host="127.0.0.1", port=port, capture=collector, shutdown=shutdown
+            )
+        except BaseException as exc:  # noqa: BLE001 - reported after bounded cleanup.
+            failures.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    observed: dict[str, JsonObject] = {}
+    try:
+        _wait_ready(port, worker)
+        for surface in ("chat/completions", "responses", "messages"):
+            for streamed in (False, True):
+                request: JsonObject = {"model": "coding", "stream": streamed}
+                if surface == "responses":
+                    request["input"] = "Synthetic parity request"
+                else:
+                    request["messages"] = [{"role": "user", "content": "Synthetic parity request"}]
+                if surface == "messages":
+                    request["max_tokens"] = 128
+                if surface == "chat/completions" and streamed:
+                    request["stream_options"] = {"include_usage": True}
+                started = time.time_ns()
+                response = httpx.post(
+                    f"http://127.0.0.1:{port}/v1/{surface}",
+                    headers={"authorization": f"Bearer {raw_key}"},
+                    json=request,
+                    timeout=10,
+                )
+                assert response.status_code == 200, response.text
+                protocol = capture_protocol("POST", f"/v1/{surface}")
+                assert protocol is not None
+                observed[response.headers["x-request-id"]] = _attributes(
+                    CapturedExchange(
+                        protocol=protocol,
+                        host="127.0.0.1",
+                        path=f"/v1/{surface}",
+                        started_ns=started,
+                        ended_ns=time.time_ns(),
+                        request=json.dumps(request).encode(),
+                        response=response.content,
+                        status=response.status_code,
+                        response_content_type=response.headers["content-type"],
+                    )
+                )
+    finally:
+        shutdown.request_shutdown()
+        worker.join(timeout=10)
+        collector.close(2)
+        components.write_ledger.close()
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(timeout=5)
+    assert not failures and not worker.is_alive()
+    assert len(records) == len(observed) == 6
+    for encoded in records:
+        record = CaptureRecord.model_validate_json(encoded)
+        assert record.metrics is not None
+        gateway = capture_metric_attributes(record.metrics)
+        passive = observed[record.request.request_id]
+        assert passive["gen_ai.usage.input_tokens"] == gateway["gen_ai.usage.input_tokens"]
+        assert passive["gen_ai.usage.output_tokens"] == gateway["gen_ai.usage.output_tokens"]
+        metrics_json = passive["exp.capture.metrics"]
+        assert isinstance(metrics_json, str)
+        passive_metrics = CaptureMetrics.model_validate_json(metrics_json)
+        assert passive_metrics.usage_complete == record.metrics.usage_complete
+        assert passive_metrics.first_token_at is None
+        assert record.metrics.first_token_at is not None
+        assert passive_metrics.duration_ms is not None
+        assert passive_metrics.usage is not None
+        assert raw_key not in json.dumps(passive)

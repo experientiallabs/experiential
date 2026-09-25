@@ -4,9 +4,9 @@ from datetime import UTC, datetime
 
 from exp.common.core.artifacts import SourceIdentity
 from exp.common.traces import Trace, TraceSource, TraceSpan
+from exp.common.traces.capture import CaptureMetrics, CaptureUsage
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.runtime.gateway.ingest.metrics import apply_gateway_metrics
-from exp.runtime.gateway.native_capture import CaptureMetrics, CaptureUsage
 
 
 def _result(metrics: CaptureMetrics | None) -> TraceNormalizationResult:

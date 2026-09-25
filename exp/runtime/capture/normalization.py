@@ -8,13 +8,15 @@ import json
 import re
 import zlib
 from dataclasses import dataclass
-from typing import Literal, TypeGuard
+from typing import Literal
 from uuid import uuid4
 
 import brotli
 import zstandard
 
 from exp.common.core.artifacts import JsonObject, JsonValue
+from exp.common.traces.ingest.capture import capture_metric_attributes, capture_usage_attributes
+from exp.runtime.capture.metrics import observed_metrics
 
 CaptureProtocol = Literal["responses", "chat", "messages"]
 _SECRET_KEY = re.compile(
@@ -131,10 +133,25 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
         attributes["exp.capture.response_id_hash"] = hashlib.sha256(
             response_id.encode()
         ).hexdigest()[:16]
-    usage = response.get("usage")
-    if isinstance(usage, dict) and (counts := _usage_counts(exchange.protocol, usage)) is not None:
-        attributes["gen_ai.usage.input_tokens"] = counts[0]
-        attributes["gen_ai.usage.output_tokens"] = counts[1]
+    terminal = (
+        completed
+        or response.get("status") in ("incomplete", "failed")
+        or (
+            bool(response)
+            and not exchange.failed
+            and "text/event-stream" not in exchange.response_content_type
+            and not response.get("capture_unparsed_response")
+        )
+    )
+    metrics = observed_metrics(
+        exchange.protocol,
+        response,
+        started_ns=exchange.started_ns,
+        ended_ns=exchange.ended_ns,
+        terminal=terminal,
+    )
+    attributes.update(capture_metric_attributes(metrics))
+    attributes.update(capture_usage_attributes(metrics.usage))
     sanitized = _sanitize(attributes)
     assert isinstance(sanitized, dict)
     trace_id = exchange.trace_id or uuid4().hex
@@ -497,24 +514,3 @@ def _attribute(value: JsonValue) -> JsonObject:
     if isinstance(value, str):
         return {"stringValue": value}
     return {"stringValue": json.dumps(value, separators=(",", ":"), ensure_ascii=False)}
-
-
-def _usage_counts(protocol: CaptureProtocol, usage: JsonObject) -> tuple[int, int] | None:
-    """Return reported total input and output, including Anthropic's separate cache categories."""
-    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
-    output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-    if not _token_count(input_tokens) or not _token_count(output_tokens):
-        return None
-    if protocol == "messages":
-        # Cache creation details partition the creation total and must not be added again.
-        for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
-            cached = usage.get(key, 0)
-            if not _token_count(cached):
-                return None
-            input_tokens += cached
-    return input_tokens, output_tokens
-
-
-def _token_count(value: JsonValue) -> TypeGuard[int]:
-    """Accept known nonnegative token counts, rejecting bool and unknown values."""
-    return type(value) is int and value >= 0
