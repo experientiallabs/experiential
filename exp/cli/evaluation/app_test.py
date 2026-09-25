@@ -1,8 +1,10 @@
 """Command and terminal presentation regressions for evaluation workflows."""
 
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 from exp.cli.app import app
@@ -10,10 +12,12 @@ from exp.cli.evaluation import flow
 from exp.cli.shared import consent
 from exp.cli.shared.picker import PickerResult
 from exp.common.config.settings import set_maximum_command_cost_usd
+from exp.common.models import ModelCatalog
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_run, save_run
 from exp.optimize.evaluation.runs_test import _twenty_scenarios
 from exp.optimize.router.automatic.service_test import _REVISION, _RuntimeCatalog
+from exp.runtime.models import RuntimeModelCatalog
 
 
 def test_cli_review_and_resume_preserve_exact_preparation(tmp_path: Path) -> None:
@@ -98,6 +102,50 @@ def test_unbuilt_project_requires_build_before_setup(tmp_path: Path) -> None:
     assert result.exit_code != 0
     assert "exp build powerset" in result.output
     assert not list(tmp_path.iterdir())
+
+
+def test_execution_shows_progress_before_runtime_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pressing Start announces preparation before any potentially slow runtime setup."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(models=("candidate-a", "candidate-b")),
+        code_revision=_REVISION,
+    )
+    output = StringIO()
+    monkeypatch.setattr(flow, "_console", Console(file=output, width=100))
+    before = len(state.completion_calls), len(state.embedding_calls), state.credential_resolutions
+
+    def inspect_runtime(catalog: ModelCatalog) -> RuntimeModelCatalog:
+        """Stop before client construction after checking that progress is already visible."""
+        del catalog
+        assert "Preparing evaluation" in output.getvalue()
+        raise ValueError("stop before provider initialization")
+
+    monkeypatch.setattr(flow, "RuntimeModelCatalog", inspect_runtime)
+    result = CliRunner().invoke(
+        app,
+        [
+            "eval",
+            "support",
+            "--root",
+            str(project.paths.root),
+            "--resume",
+            run.run_id,
+            "--yes",
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "stop before provider initialization" in result.output
+    assert before == (
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    )
 
 
 @pytest.mark.parametrize("answer", ["n", "y"])

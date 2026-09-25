@@ -6,8 +6,9 @@ import io
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
-from exp.cli.shared.progress import progress_display, qualified
+from exp.cli.shared.progress import ProgressDisplay, progress_display, qualified
 from exp.common.progress import ProgressEvent
 
 
@@ -126,6 +127,36 @@ def test_single_line_failure_still_marks_the_active_stage_unfinished() -> None:
             observe(ProgressEvent(stage="fitting"))
             raise RuntimeError("boom")
     assert "[ ] fitting" in buffer.getvalue()
+
+
+def test_single_line_keeps_elapsed_time_live_between_completed_rollouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long provider request keeps the display moving without inventing completed work."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    now = [100.0]
+    monkeypatch.setattr("exp.cli.shared.progress.monotonic", lambda: now[0])
+    console, buffer = _plain_console(interactive=True)
+    display = ProgressDisplay(console, single_line=True)
+    assert display._live is not None
+    display._live.auto_refresh = False
+    display.start()
+    try:
+        display.observe(ProgressEvent(stage="Rollouts", completed=0, total=100))
+        assert "0/100" in Text.from_ansi(buffer.getvalue()).plain
+        previous_length = len(buffer.getvalue())
+        now[0] = 165.0
+        display._live.refresh()
+        current = Text.from_ansi(buffer.getvalue()[previous_length:]).plain
+        assert "0/100" in current
+        assert "1m05s elapsed" in current
+        assert "eta" not in current
+        display.observe(ProgressEvent(stage="Judging", completed=0, total=100))
+        assert "1m05s elapsed" in Text.from_ansi(buffer.getvalue()).plain
+    finally:
+        display.stop()
+    assert "\x1b[?1049h" not in buffer.getvalue()
+    assert "\x1b[?25h" in buffer.getvalue()
 
 
 def test_qualified_attaches_a_detail_and_preserves_counts() -> None:

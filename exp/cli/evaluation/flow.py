@@ -182,6 +182,7 @@ def run_evaluation(
             heading(_console, project, "Running evaluation · Ctrl-C to pause")
             try:
                 with progress_display(_console, single_line=True) as progress:
+                    progress(ProgressEvent(stage="Preparing evaluation"))
                     execute_run(
                         store,
                         run,
@@ -380,6 +381,15 @@ def _compact_progress(progress: ProgressHook) -> ProgressHook:
 
     def observe(event: ProgressEvent) -> None:
         """Forward a concise view of the engine's observed progress."""
-        progress(ProgressEvent(stage=event.stage, completed=event.completed, total=event.total))
+        stage = {
+            "preflight": "Checking evaluation",
+            "simulation": "Starting rollouts",
+            "evaluation cells": "Rollouts",
+            "judging": "Starting judging",
+            "judgments": "Judging",
+            "report": "Building report",
+            "completed": "Complete",
+        }.get(event.stage, event.stage)
+        progress(ProgressEvent(stage=stage, completed=event.completed, total=event.total))
 
     return observe

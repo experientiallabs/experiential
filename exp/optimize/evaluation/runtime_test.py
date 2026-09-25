@@ -10,6 +10,7 @@ import pytest
 
 import exp
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse
+from exp.common.progress import ProgressEvent
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
@@ -32,9 +33,12 @@ def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
     """Only provider transport is deterministic; all evaluation execution is production code."""
     project, catalog, state, prepared = _prepare(tmp_path)
     original_complete = _CompletionClient.complete
+    progress: list[ProgressEvent] = []
 
     def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
         """Keep blank worker replies in the scored cohort with a scripted failing judgment."""
+        assert progress[0].stage == "Verifying evaluation"
+        assert any(event.stage == "Loading retrieval index" for event in progress)
         response = original_complete(client, request)
         if blank_worker and client._alias.startswith("candidate-"):
             return response.model_copy(update={"output": AssistantAction(content="")})
@@ -68,7 +72,15 @@ def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
         provider_spend_consented=True,
         created_at=_TIME,
         code_revision=_REVISION,
+        progress=progress.append,
     )
+    stages = [event.stage for event in progress]
+    assert stages.index("Checking evaluation estimate") < stages.index("Loading retrieval index")
+    assert stages.index("Loading retrieval index") < stages.index("simulation")
+    assert "judging" in stages
+    cells = [event for event in progress if event.stage == "evaluation cells"]
+    assert cells[0].completed == 0
+    assert cells[-1].completed == cells[-1].total == 6
     assert result.report.compared_cells == prepared.cost.scenario_count
     assert all(row.quality == (0 if blank_worker else 1) for row in result.report.models)
     if blank_worker:

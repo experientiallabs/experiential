@@ -13,7 +13,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations import EvaluationPlan
 from exp.common.models import ModelSnapshot, verify_completion_reservation
-from exp.common.progress import ProgressHook
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuation import EvaluationRuntimeContract, validate_continuation
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices
@@ -65,6 +65,7 @@ def run_prepared_model_evaluation(
         SpendLimitReached: The next request cannot fit; saved calls remain exactly resumable.
         ValueError: Consent, quote admission, identities, configuration or artifacts drift.
     """
+    report(progress, "Verifying evaluation")
     validate_continuation(project, prepared)
     setup = prepared.setup
     selected = read_evaluation_judge(project, prepared.judge_setup)
@@ -74,6 +75,7 @@ def run_prepared_model_evaluation(
     ):
         raise ValueError("prepared judge differs from the evaluation; prepare again")
     calls_per_rollout = 2 if selected.prompt_template.response_shape == "pairwise" else 1
+    report(progress, "Checking evaluation estimate")
     quote = estimate_model_evaluation(
         project,
         setup,
@@ -100,6 +102,7 @@ def run_prepared_model_evaluation(
         raise ValueError(
             "evaluation requires explicit provider-spend consent after credit admission"
         )
+    report(progress, "Verifying built project")
     completed = completed_project_build(project)
     completion_input = setup.simulation_completion_input
     retrieval = setup.world_model_settings.query_embedding
@@ -124,6 +127,7 @@ def run_prepared_model_evaluation(
             raise ValueError(f"resolved evaluation model {alias!r} changed; prepare again")
         return resolved
 
+    report(progress, "Preparing model clients")
     candidates = {item.alias: resolve(item.alias, item.model) for item in setup.candidates}
     world = resolve(completion.world_model_alias, completion.world_model_request.model)
     judge_model = resolve(selected.judge_alias, selected.judge_model)
@@ -210,6 +214,7 @@ def run_prepared_model_evaluation(
         maximum_output_tokens=prepared.judge_request.maximum_output_tokens,
         request_scope=ledger.scope,
     )
+    report(progress, "Loading retrieval index")
     retriever = load_fit_rag_retriever(
         project.artifacts,
         completed.fit_rag,
@@ -220,6 +225,7 @@ def run_prepared_model_evaluation(
             input_usd_per_million_tokens=retrieval.input_usd_per_million_tokens,
         ),
     )
+    report(progress, "Loading world model")
     grounded = bind_fit_grounded_world_model(
         project.artifacts,
         completed.world_model,
@@ -246,6 +252,7 @@ def run_prepared_model_evaluation(
             request_budget=ledger,
         )
 
+    report(progress, "Freezing execution plan")
     runtime_input = _persist_runtime_contract(project, prepared, created_at, code_revision)
     return evaluate_models(
         project,
