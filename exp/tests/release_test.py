@@ -3219,7 +3219,20 @@ def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture(
         in test_step
     )
     assert "pytest --noconftest" in windows
-    assert "exp/runtime/gateway/snapshot_file_windows_test.py" in windows
+    selectors = tuple(
+        line.strip() for line in test_step.splitlines() if line.strip().startswith("exp/")
+    )
+    assert selectors == (
+        "exp/runtime/gateway/snapshot_file_windows_test.py",
+        "exp/runtime/gateway/snapshot_file_test.py::test_snapshot_resource_budget_is_a_strict_positive_integer",
+        "exp/runtime/gateway/snapshot_file_test.py::test_bounded_reader_accepts_limit_and_rejects_growth",
+        "exp/runtime/gateway/snapshot_file_test.py::test_growth_after_initial_stat_still_obeys_the_read_budget",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_resource_override_and_reachable_authority",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_refuses_unauthorized_targets",
+        "exp/runtime/gateway/budget_authority_test.py::test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch",
+        "exp/common/config/settings_test.py",
+    )
+    assert "exp/cli/" not in windows, "Windows authority proof does not import the Unix-only CLI"
     assert "assert len(kernel) == 25" in windows
     assert '("skipped", "failure", "error")' in windows
     for job in ("  gate:\n", "  w16-darwin-evidence:\n"):

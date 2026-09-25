@@ -162,6 +162,7 @@ jobs:
       - name: Verify real Windows snapshot authority
         # These tests use built-in fixtures only. The suite conftest owns Unix PTY fixtures;
         # its provider-auth isolation is replaced by the empty step-local XDG_DATA_HOME.
+        # CLI imports remain Unix-only; this job proves snapshot authority, not Windows CLI support.
         env:
           XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth
         run: >-
@@ -174,7 +175,6 @@ jobs:
           exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_refuses_unauthorized_targets
           exp/runtime/gateway/budget_authority_test.py::test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch
           exp/common/config/settings_test.py
-          exp/cli/gateway/budget_test.py::test_budget_command_help_needs_no_private_gateway_state
       - name: Require executed Windows kernel and graph cases
         shell: bash
         run: |
@@ -190,7 +190,6 @@ jobs:
               "test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch": 1,
               "test_snapshot_resource_budget_is_a_strict_positive_integer": 8,
               "test_gateway_resource_setting_survives_other_settings_updates": 1,
-              "test_budget_command_help_needs_no_private_gateway_state": 1,
           }
           for name, minimum in required.items():
               matching = [case for case in cases if case.get("name", "").split("[", 1)[0] == name]
