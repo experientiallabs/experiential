@@ -333,11 +333,11 @@ class CaptureUploader:
     def _report_diagnostics(self) -> None:
         """Isolate slow or blocked output in one daemon with a bounded message queue."""
         assert self._on_diagnostic is not None
-        while not self._diagnostics_done.is_set() or not self._diagnostics.empty():
+        while True:
             try:
                 event = self._diagnostics.get(timeout=0.1)
             except queue.Empty:
-                continue
+                event = None
             with self._lock:
                 lost = self._diagnostics_lost
             if lost:
@@ -348,6 +348,10 @@ class CaptureUploader:
                 else:
                     with self._lock:
                         self._diagnostics_lost -= lost
+            if event is None:
+                if self._diagnostics_done.is_set():
+                    return
+                continue
             try:
                 self._on_diagnostic(event)
             except Exception:  # noqa: BLE001 - Diagnostics must never drop a captured request.

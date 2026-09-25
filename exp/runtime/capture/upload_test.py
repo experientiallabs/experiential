@@ -276,6 +276,46 @@ def test_blocked_verbose_reader_cannot_stop_storage_delivery_or_bounded_shutdown
     assert failures == ({"notice", "receipt"} if fail_after_unblocking else set())
 
 
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_last_failed_receipt_reports_loss_without_another_request(
+    tmp_path: Path, shutdown: bool
+) -> None:
+    """Account for a final output failure during idle time and diagnostic shutdown."""
+    run = str(uuid4())
+    diagnostics: list[str] = []
+    reported = threading.Event()
+
+    def diagnostic(event: str) -> None:
+        """Recover immediately after rejecting the last receipt."""
+        if event == "capture_saved":
+            raise OSError("synthetic output failure")
+        diagnostics.append(event)
+        reported.set()
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        on_diagnostic=diagnostic,
+    )
+    uploader._diagnostic("capture_saved")
+    if shutdown:
+        uploader._diagnostics_done.set()
+    reporter = threading.Thread(target=uploader._report_diagnostics, daemon=True)
+    reporter.start()
+    try:
+        assert reported.wait(2)
+        assert diagnostics == ["diagnostic_events_dropped: 1"]
+    finally:
+        uploader._diagnostics_done.set()
+        reporter.join(timeout=1)
+    assert not reporter.is_alive()
+
+
 @pytest.mark.parametrize(
     "usage",
     [
