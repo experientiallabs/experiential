@@ -175,6 +175,33 @@ meaning; thinking tokens still contribute to billed output. An absent usage obje
 Cumulative reports from one generation are merged, not added. Costs from separate physical
 generations cannot acquire a known total by adding a known count to an unknown one.
 
+## Gemini usage trailers
+
+Native Gemini and Vertex Gemini routes use upstream `streamGenerateContent` SSE even when
+Chat callers request a non-streaming JSON response. A candidate's `finishReason` freezes its
+content and outcome, but the gateway continues reading metadata so `usageMetadata` can arrive
+before, alongside, or after that finish. Later text, tools, errors, and finish reasons cannot
+reopen or replace the declared answer. The final meter precedes one terminal settlement.
+
+This metadata-only drain has one absolute allowance: the selected connection's existing body-read
+timeout, measured from the decoded finish and capped by the request's remaining deadline.
+Trailers and keepalives cannot renew it. EOF completes immediately, with no fixed waiting period.
+A stalled transport can therefore add up to that allowance before the response finishes.
+Cancellation closes the upstream without waiting for more metadata. At the hard request deadline,
+public SSE delivery can close without a final client frame; settlement still preserves an already
+declared provider outcome and the meter observed so far.
+
+Partial or empty suffixes cannot erase earlier counts, and cumulative snapshots are never added
+together. A cache count greater than the accumulated input count cannot replace a consistent
+meter. An initially cache-only report is held until sufficient input evidence arrives; otherwise
+usage stays unknown. An absent whole usage object remains unknown, and a finished all-zero report
+keeps the existing unknown-meter settlement policy. An interrupted or expired drain preserves the
+best consistent report, not a guarantee that the provider's final report was received. It does
+not trigger another generation to recover missing usage.
+
+This behavior applies to new requests. It does not reconstruct historical provider frames,
+attribute past missing meters to a particular cause, or authorize retrospective billing changes.
+
 ## Verification boundaries
 
 Regression coverage exercises the actual native normalizers, encoders, and served loopback

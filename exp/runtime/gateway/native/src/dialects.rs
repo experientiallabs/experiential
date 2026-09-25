@@ -422,6 +422,7 @@ pub struct Normalizer {
     // provider supplies no tool index; assignment order mirrors the python
     // mapper's local counter.
     gemini_tool_index: u32,
+    gemini: gemini::StreamState,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
     // Caller-known label words (the dispatched model id) exempt from the
@@ -483,6 +484,7 @@ impl Normalizer {
             openai_usage: crate::events::OpenAiUsageAccumulator::default(),
             finish_reason: None,
             gemini_tool_index: 0,
+            gemini: gemini::StreamState::default(),
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
@@ -641,52 +643,6 @@ impl Normalizer {
             FailureClass::MalformedResponse,
             "provider stream ended without a terminal event",
         ))
-    }
-
-    /// Recover Gemini content after a transport, frame, or decoder failure.
-    /// `on_stream_end` covers a clean EOF without a terminal frame; this covers
-    /// abnormal ends where the failure would otherwise discard a partial answer.
-    ///
-    /// Scoped to Gemini: Gemini uniquely ends legitimate turns without a
-    /// terminal frame, so a break after content is far more likely a
-    /// truncated-but-usable answer than corruption. When content was already
-    /// emitted, synthesize an `Incomplete` terminal (folding last-seen usage)
-    /// so the caller receives the partial content with an early-termination
-    /// finish reason and a retryable settlement (`incomplete`, not `failed`),
-    /// and the delivered tokens still bill. Before any content there is nothing
-    /// to preserve, so reclassify the abnormal end as a retryable transport
-    /// failure (retry same deployment, then fail over) instead of a hard
-    /// malformed reject. Any non-Gemini dialect, or a stream already terminated,
-    /// keeps the original failure unchanged.
-    ///
-    /// Deliberate output limits and nonretryable validation failures remain errors:
-    /// recovery must not regenerate a rejected image or disguise it as partial output.
-    pub fn recover_abnormal_end(&mut self, failure: Failure) -> Result<Vec<Event>, Failure> {
-        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE
-            || (failure.failure_class == FailureClass::MalformedResponse
-                && !failure.retryable_same_deployment
-                && !failure.failover_eligible)
-        {
-            return Err(failure);
-        }
-        if self.terminal || self.dialect != Dialect::GeminiGenerateContent {
-            return Err(failure);
-        }
-        if !self.emitted_output {
-            return Err(Failure::new(
-                FailureClass::Transport,
-                "provider transport failed; retry the request",
-            )
-            .with_retry(true, true)
-            .with_provider_detail(failure.provider_detail));
-        }
-        let mut events = Vec::new();
-        if let Some(usage) = self.usage.take() {
-            events.push(Event::Usage(usage));
-        }
-        events.push(Event::Incomplete);
-        self.terminal = true;
-        Ok(events)
     }
 
     /// Feed one decoded SSE frame; a terminal event ends the stream.
