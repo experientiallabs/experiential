@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
@@ -80,15 +81,23 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
     """
     request = _object(_decode(exchange.request, exchange.request_encoding, max_body_bytes))
     try:
-        response_bytes = _decode(exchange.response, exchange.response_encoding, max_body_bytes)
+        response_bytes = _decode(
+            exchange.response,
+            exchange.response_encoding,
+            max_body_bytes,
+            allow_partial=exchange.failed and "text/event-stream" in exchange.response_content_type,
+        )
     except ValueError:
         if not exchange.failed:
             raise
         response_bytes = b""
-    response = _response(exchange.protocol, response_bytes, exchange.response_content_type)
+    response, completed = _response(
+        exchange.protocol, response_bytes, exchange.response_content_type
+    )
+    interrupted = exchange.failed and not completed
     refused = _refused(exchange.protocol, response)
     failed = (
-        exchange.failed
+        interrupted
         or refused
         or exchange.status >= 400
         or bool(response.get("error"))
@@ -113,9 +122,15 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
         "exp.capture.request": request,
         "exp.capture.response": response,
         "http.response.status_code": exchange.status,
-        "exp.capture.interrupted": exchange.failed,
+        "exp.capture.interrupted": interrupted,
+        "exp.capture.transport_error": exchange.failed,
+        "exp.capture.completed": completed,
         "exp.capture.refused": refused,
     }
+    if isinstance(response_id := response.get("id"), str) and response_id:
+        attributes["exp.capture.response_id_hash"] = hashlib.sha256(
+            response_id.encode()
+        ).hexdigest()[:16]
     usage = response.get("usage")
     if isinstance(usage, dict) and (counts := _usage_counts(exchange.protocol, usage)) is not None:
         attributes["gen_ai.usage.input_tokens"] = counts[0]
@@ -139,8 +154,13 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
     return json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def _decode(body: bytes, encoding: str, limit: int) -> bytes:
-    """Decode common HTTP content encodings without an unbounded inflate allocation."""
+def _decode(body: bytes, encoding: str, limit: int, *, allow_partial: bool = False) -> bytes:
+    """Bound decompression, retaining decoded SSE records after an interrupted response.
+
+    Missing gzip, deflate, or Brotli footers are tolerated only for interrupted
+    SSE replies. The SSE parser separately requires complete event records before
+    retaining any output or usage. Decompressed size limits always apply.
+    """
     if len(body) > limit:
         raise ValueError("capture exceeds the body limit")
     if encoding.lower().strip() in {"", "identity"}:
@@ -160,7 +180,7 @@ def _decode(body: bytes, encoding: str, limit: int) -> bytes:
             decoded = decoder_br.process(body, output_buffer_limit=limit + 1)
         except brotli.error as exc:
             raise ValueError("invalid compressed capture") from exc
-        if len(decoded) > limit or not decoder_br.is_finished():
+        if len(decoded) > limit or (not allow_partial and not decoder_br.is_finished()):
             raise ValueError("compressed capture exceeds its limit or is incomplete")
         return decoded
     if encoding.lower().strip() not in {"gzip", "deflate"}:
@@ -170,7 +190,7 @@ def _decode(body: bytes, encoding: str, limit: int) -> bytes:
         decoded = decoder.decompress(body, limit + 1)
     except zlib.error as exc:
         raise ValueError("invalid compressed capture") from exc
-    if len(decoded) > limit or decoder.unconsumed_tail or not decoder.eof:
+    if len(decoded) > limit or decoder.unconsumed_tail or (not allow_partial and not decoder.eof):
         raise ValueError("compressed capture exceeds its limit or is incomplete")
     return decoded
 
@@ -199,15 +219,16 @@ def _events(body: bytes) -> list[JsonObject]:
     return events
 
 
-def _response(protocol: CaptureProtocol, body: bytes, content_type: str) -> JsonObject:
-    """Recover terminal model output from JSON or a copied SSE stream."""
+def _response(protocol: CaptureProtocol, body: bytes, content_type: str) -> tuple[JsonObject, bool]:
+    """Recover model output and explicit completion evidence independently of transport closure."""
     if not body:
-        return {}
+        return {}, False
     if "text/event-stream" not in content_type:
         try:
-            return _object(body)
+            response = _object(body)
         except ValueError:
-            return {"capture_unparsed_response": True}
+            return {"capture_unparsed_response": True}, False
+        return response, _json_completed(protocol, response)
     events = _events(body)
     if protocol == "responses":
         for event in reversed(events):
@@ -219,11 +240,36 @@ def _response(protocol: CaptureProtocol, body: bytes, content_type: str) -> Json
                 "response.failed",
             }:
                 if isinstance(response, dict):
-                    return response
-        return {"capture_incomplete": True, "events": events}
+                    return response, kind == "response.completed"
+        return {"capture_incomplete": True, "events": events}, False
     if protocol == "messages":
-        return _anthropic_response(events)
-    return _chat_response(events)
+        return _anthropic_response(events), any(
+            event.get("type") == "message_stop" for event in events
+        )
+    done = any(
+        block.strip() == b"data: [DONE]"
+        for block in body.replace(b"\r\n", b"\n").split(b"\n\n")[:-1]
+    )
+    return _chat_response(events), done
+
+
+def _json_completed(protocol: CaptureProtocol, response: JsonObject) -> bool:
+    """Require a provider terminal field before treating a transport error as harmless."""
+    if protocol == "responses":
+        return response.get("status") == "completed"
+    if protocol == "messages":
+        return isinstance(response.get("stop_reason"), str) and bool(response["stop_reason"])
+    choices = response.get("choices")
+    return (
+        isinstance(choices, list)
+        and bool(choices)
+        and all(
+            isinstance(choice, dict)
+            and isinstance(choice.get("finish_reason"), str)
+            and bool(choice["finish_reason"])
+            for choice in choices
+        )
+    )
 
 
 def _anthropic_response(events: list[JsonObject]) -> JsonObject:

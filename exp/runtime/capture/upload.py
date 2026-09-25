@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
@@ -54,6 +55,7 @@ class CaptureUploader:
         max_queue_bytes: int = 32 * 1024 * 1024,
         max_spool_bytes: int = 64 * 1024 * 1024,
         transport: httpx.BaseTransport | None = None,
+        on_diagnostic: Callable[[str], None] | None = None,
     ) -> None:
         """Bind one organization and origin-scoped spool to authenticated delivery.
 
@@ -69,6 +71,7 @@ class CaptureUploader:
             max_queue_bytes: Maximum raw exchange bytes waiting for the worker.
             max_spool_bytes: Maximum sanitized files across runs in this spool's parent.
             transport: Optional HTTP transport for deterministic integration tests.
+            on_diagnostic: Optional content-free receipts emitted by background workers.
         """
         UUID(run_id)
         if min(max_body_bytes, max_queue_bytes, max_spool_bytes) < 1:
@@ -84,6 +87,11 @@ class CaptureUploader:
         self._max_queue_bytes = max_queue_bytes
         self._max_spool_bytes = max_spool_bytes
         self._transport = transport
+        self._on_diagnostic = on_diagnostic
+        self._diagnostics: queue.Queue[str] = queue.Queue(maxsize=128)
+        self._diagnostics_done = threading.Event()
+        self._diagnostic_thread: threading.Thread | None = None
+        self._diagnostics_lost = 0
         self._queue: queue.Queue[CapturedExchange] = queue.Queue(maxsize=64)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -119,6 +127,11 @@ class CaptureUploader:
                 raise ValueError("capture spool must belong to the current user")
             directory.chmod(0o700)
         self._recover_temporary_files()
+        if self._on_diagnostic is not None:
+            self._diagnostic_thread = threading.Thread(
+                target=self._report_diagnostics, name="exp-capture-diagnostics", daemon=True
+            )
+            self._diagnostic_thread.start()
         self._thread = threading.Thread(target=self._work, name="exp-capture-upload", daemon=True)
         self._thread.start()
         self._delivery_thread = threading.Thread(
@@ -211,7 +224,11 @@ class CaptureUploader:
                 output_tokens=self._output_tokens,
                 usage_exchanges=self._usage_exchanges,
             )
-            return self._final_stats
+            final_stats = self._final_stats
+        self._diagnostics_done.set()
+        if self._diagnostic_thread is not None:
+            self._diagnostic_thread.join(max(deadline - time.monotonic(), 0.0))
+        return final_stats
 
     def _work(self) -> None:
         """Drain copied bodies to local storage independently of cloud availability."""
@@ -229,6 +246,14 @@ class CaptureUploader:
                         self._dropped += 1
                         self._pending_exchanges -= 1
                         self._queued_bytes -= exchange.byte_count
+                trace = (
+                    exchange.trace_id
+                    if re.fullmatch(r"[0-9a-f]{32}", exchange.trace_id)
+                    else "unknown"
+                )
+                self._diagnostic(
+                    f"capture_dropped: normalization or local storage failed · trace {trace}"
+                )
             finally:
                 self._queue.task_done()
 
@@ -250,7 +275,7 @@ class CaptureUploader:
             return
         if len(payload) > _MAX_BATCH_BYTES:
             raise ValueError("normalized capture exceeds the cloud batch limit")
-        usage = _reported_usage(payload)
+        usage, receipt = _capture_receipt(payload)
         files = self._files()
         occupied = 0
         for path in files:
@@ -282,6 +307,7 @@ class CaptureUploader:
                     self._input_tokens += usage[0]
                     self._output_tokens += usage[1]
                     self._usage_exchanges += 1
+            self._diagnostic(f"capture_saved · batch {destination.stem} · {receipt}")
             try:
                 temporary.replace(destination)
             except OSError:
@@ -294,6 +320,43 @@ class CaptureUploader:
                 durable = temporary in self._durable_temps
             if not durable:
                 temporary.unlink(missing_ok=True)
+
+    def _diagnostic(self, event: str) -> None:
+        """Drop excess diagnostic messages rather than block capture storage or delivery."""
+        if self._on_diagnostic is not None:
+            try:
+                self._diagnostics.put_nowait(event)
+            except queue.Full:
+                with self._lock:
+                    self._diagnostics_lost += 1
+
+    def _report_diagnostics(self) -> None:
+        """Isolate slow or blocked output in one daemon with a bounded message queue."""
+        assert self._on_diagnostic is not None
+        while True:
+            try:
+                event = self._diagnostics.get(timeout=0.1)
+            except queue.Empty:
+                event = None
+            with self._lock:
+                lost = self._diagnostics_lost
+            if lost:
+                try:
+                    self._on_diagnostic(f"diagnostic_events_dropped: {lost}")
+                except Exception:  # noqa: BLE001 - Preserve the count until output recovers.
+                    pass
+                else:
+                    with self._lock:
+                        self._diagnostics_lost -= lost
+            if event is None:
+                if self._diagnostics_done.is_set():
+                    return
+                continue
+            try:
+                self._on_diagnostic(event)
+            except Exception:  # noqa: BLE001 - Diagnostics must never drop a captured request.
+                with self._lock:
+                    self._diagnostics_lost += 1
 
     def _recover_temporary_files(self) -> None:
         """Adopt bounded complete sanitized temps and remove incomplete crash leftovers."""
@@ -387,6 +450,7 @@ class CaptureUploader:
                     if not self._abandon.is_set():
                         self._errors += 1
                 self._retry_at[path] = now + 10.0
+                self._diagnostic(f"upload_deferred · batch {path.stem}")
                 logger.warning("Capture upload deferred; sanitized batch remains queued locally")
             else:
                 if not accepted:
@@ -400,6 +464,7 @@ class CaptureUploader:
                     self._pending_paths.discard(path)
                     self._accepted_cleanup = path
                     self._uploaded += 1
+                self._diagnostic(f"upload_accepted · batch {path.stem}")
                 self._cleanup_accepted(client, now)
             return
 
@@ -512,8 +577,8 @@ class CaptureUploader:
         return parsed
 
 
-def _reported_usage(payload: bytes) -> tuple[int, int] | None:
-    """Read a known input/output token pair from the freshly normalized request span.
+def _capture_receipt(payload: bytes) -> tuple[tuple[int, int] | None, str]:
+    """Read reported usage and content-free correlation fields from one normalized span.
 
     This reads the in-memory OTLP envelope once during persistence. Delivery and
     recovery never recount usage, so totals belong only to this foreground run.
@@ -522,13 +587,43 @@ def _reported_usage(payload: bytes) -> tuple[int, int] | None:
     span: JsonValue = json.loads(payload)
     for key in ("resourceSpans", "scopeSpans", "spans"):
         if not isinstance(span, dict):
-            return None
+            return None, "invalid capture receipt"
         children = span.get(key)
         if not isinstance(children, list) or len(children) != 1:
-            return None
+            return None, "invalid capture receipt"
         span = children[0]
     if not isinstance(span, dict) or not isinstance(attributes := span.get("attributes"), list):
-        return None
+        return None, "invalid capture receipt"
+    usage = _attribute_usage(attributes)
+    fields = {
+        item["key"]: item.get("value")
+        for item in attributes
+        if isinstance(item, dict) and isinstance(item.get("key"), str)
+    }
+    trace_id = span.get("traceId")
+    trace = (
+        trace_id
+        if isinstance(trace_id, str) and re.fullmatch(r"[0-9a-f]{32}", trace_id)
+        else "unknown"
+    )
+    response = fields.get("exp.capture.response_id_hash")
+    response_hash = response.get("stringValue") if isinstance(response, dict) else None
+    fingerprint = (
+        response_hash
+        if isinstance(response_hash, str) and re.fullmatch(r"[0-9a-f]{16}", response_hash)
+        else "unknown"
+    )
+    flags = " · ".join(
+        f"{name}={fields.get('exp.capture.' + name) == {'boolValue': True}}"
+        for name in ("completed", "interrupted", "transport_error")
+    )
+    outcome = "ok" if span.get("status") == {"code": 1} else "error"
+    tokens = f"{usage[0]} in / {usage[1]} out tokens" if usage is not None else "usage unknown"
+    return usage, f"trace {trace} · response {fingerprint} · {flags} · {outcome} · {tokens}"
+
+
+def _attribute_usage(attributes: list[JsonValue]) -> tuple[int, int] | None:
+    """Require exactly one valid nonnegative value for each reported token count."""
     keys = ("gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens")
     counts: dict[str, int] = {}
     for attribute in attributes:

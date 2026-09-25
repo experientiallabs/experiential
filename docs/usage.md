@@ -41,8 +41,13 @@ Only one Capture process can run per macOS user, including across different prev
 The terminal shows setup progress, live capture counts, and provider-reported input/output tokens.
 Token totals use K, M, B, and T with up to two decimals, such as 1.75M for 1,752,000 tokens.
 Totals include cached input; missing usage is marked partial or unavailable. Use
-`exp capture --verbose` (or `-v`) for timestamped TLS and request events, upload counters, provider hosts, and the public CA certificate
-path. Approval requests and errors remain visible without verbose output. When macOS reports the
+`exp capture --verbose` (or `-v`) for timestamped TLS and request events, upload counters, provider
+hosts, and the public CA certificate path. Verbose receipts link each request to its saved trace
+and upload batch, with a hashed provider response ID, reported tokens, and separate completion
+and transport-error indicators. Upload acceptance does not confirm dashboard processing.
+Slow verbose output can drop diagnostic events, with a count when output resumes; trace storage
+and delivery continue independently.
+Approval requests and errors remain visible without verbose output. When macOS reports the
 extension awaiting approval, Capture opens Login Items & Extensions and continues once you enable
 Mitmproxy Redirector under Network Extensions.
 

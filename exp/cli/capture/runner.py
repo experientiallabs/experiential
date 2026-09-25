@@ -114,6 +114,7 @@ async def _capture_authenticated(
             api_key=credentials.api_key,
             upload_origin=run.upload_origin,
             upload_path_prefix=run.upload_path_prefix,
+            on_diagnostic=display.diagnostic if verbose else None,
             spool_dir=data_dir
             / "spool"
             / origin_namespace

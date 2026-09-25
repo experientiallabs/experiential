@@ -4,6 +4,7 @@ import asyncio
 import json
 import socket
 import ssl
+import zlib
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -241,9 +242,18 @@ def _certificate(directory: Path, host: str) -> tuple[Path, Path, Path]:
     return certificate, key, directory / "upstream-ca-cert.pem"
 
 
-@pytest.mark.parametrize("valid_hostname", [True, False])
+@pytest.mark.parametrize(
+    "valid_hostname,truncated,encoding",
+    [
+        (True, False, "identity"),
+        (True, True, "identity"),
+        (True, False, "gzip"),
+        (True, True, "gzip"),
+        (False, False, "identity"),
+    ],
+)
 def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
-    tmp_path: Path, valid_hostname: bool, regular_proxy: None
+    tmp_path: Path, valid_hostname: bool, truncated: bool, encoding: str, regular_proxy: None
 ) -> None:
     """Drive actual TLS streaming and verify capture, delivery, and hostname checks."""
 
@@ -272,6 +282,12 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
             b'data: {"type":"response.completed","response":{"model":"test","output":[], '
             b'"usage":{"input_tokens":4,"output_tokens":2}}}\n\n'
         )
+        if encoding == "gzip":
+            compressor = zlib.compressobj(wbits=31)
+            first = compressor.compress(first) + compressor.flush(zlib.Z_SYNC_FLUSH)
+            last = compressor.compress(last) + compressor.flush(
+                zlib.Z_SYNC_FLUSH if truncated else zlib.Z_FINISH
+            )
         release = asyncio.Event()
 
         async def upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -285,8 +301,10 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
                 )
                 received.append(header + await reader.readexactly(length))
                 writer.write(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: "
-                    + str(len(first + last)).encode()
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                    + (b"Content-Encoding: gzip\r\n" if encoding == "gzip" else b"")
+                    + b"Content-Length: "
+                    + str(len(first + last) + (100 if truncated else 0)).encode()
                     + b"\r\nConnection: close\r\n\r\n"
                     + first
                 )
@@ -302,6 +320,7 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
         upstream_port = server.sockets[0].getsockname()[1]
         captured: list[CapturedExchange] = []
         projected: list[tuple[int, int]] = []
+        diagnostics: list[str] = []
         run_id, ingest_id = str(uuid4()), str(uuid4())
         upload_prefix = (
             "/storage/v1/object/upload/sign/artifacts/orgs/organization/telemetry-traces/otlp/"
@@ -312,8 +331,11 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
             if request.url.host == "storage.example":
                 assert "authorization" not in request.headers
                 assert b"Bearer secret" not in request.content
+                payload = json.loads(request.content)
+                recorded_span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+                assert recorded_span["status"] == {"code": 1}
                 normalized = normalize_otlp_payload(
-                    json.loads(request.content),
+                    payload,
                     source=SourceIdentity(kind="otlp", source_id="capture-integration"),
                 )
                 assert not normalized.issues
@@ -347,6 +369,7 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
             upload_origin="https://storage.example",
             upload_path_prefix=upload_prefix,
             transport=httpx.MockTransport(platform),
+            on_diagnostic=diagnostics.append,
         )
         if valid_hostname:
             uploader.start()
@@ -397,16 +420,32 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
                 assert received[0].endswith(request)
                 assert b"Host: api.openai.com\r\n" in received[0]
                 assert received[0].startswith(b"POST /v1/responses?beta=true ")
-                await asyncio.sleep(0.02)
+                deadline = asyncio.get_running_loop().time() + 3
+                while not captured:
+                    assert asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.01)
                 assert len(captured) == 1
                 assert captured[0].request == request
                 assert captured[0].response == first + last
                 assert captured[0].host == host
+                assert captured[0].failed is truncated
                 deadline = asyncio.get_running_loop().time() + 3
-                while uploader.stats.uploaded_batches != 1:
+                while uploader.stats.uploaded_batches != 1 or not any(
+                    "upload_accepted" in event for event in diagnostics
+                ):
                     assert asyncio.get_running_loop().time() < deadline
                     await asyncio.sleep(0.01)
                 assert projected == [(4, 2)]
+                assert any(
+                    "capture_saved" in event
+                    and f"trace {captured[0].trace_id}" in event
+                    and "completed=True" in event
+                    and "interrupted=False" in event
+                    and f"transport_error={truncated}" in event
+                    and "4 in / 2 out tokens" in event
+                    for event in diagnostics
+                )
+                assert any("upload_accepted" in event for event in diagnostics)
             else:
                 assert header.startswith(b"HTTP/1.1 502")
                 assert not received

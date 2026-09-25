@@ -1,5 +1,6 @@
 """Capture delivery retries safely while keeping cloud failures off inference."""
 
+import hashlib
 import json
 import os
 import threading
@@ -128,6 +129,191 @@ def test_provider_usage_reaches_live_and_final_capture_counts(
         final = uploader.close()
     assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (3, 7, 1)
     assert uploader.stats == uploader.close() == final
+
+
+@pytest.mark.parametrize("broken_diagnostic", [False, True])
+def test_capture_receipts_correlate_saved_evidence_without_exposing_content(
+    tmp_path: Path, broken_diagnostic: bool
+) -> None:
+    """Receipts expose only bounded identifiers and counts, and a closed terminal loses no data."""
+    run = str(uuid4())
+    diagnostics: list[str] = []
+    response_id = "resp_SYNTHETIC_PRIVATE_ID"
+    trace_id = uuid4().hex
+
+    def diagnostic(event: str) -> None:
+        """Simulate a terminal that receives one event but may fail to render it."""
+        diagnostics.append(event)
+        if broken_diagnostic:
+            raise OSError("SYNTHETIC_PRIVATE_ERROR")
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(lambda request: httpx.Response(503)),
+        on_diagnostic=diagnostic,
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(
+            replace(
+                _usage_exchange(),
+                response=json.dumps(
+                    {
+                        "id": response_id,
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 3, "output_tokens": 7},
+                    }
+                ).encode(),
+                failed=True,
+                trace_id=trace_id,
+            )
+        )
+        _wait(lambda: any("capture_saved" in event for event in diagnostics))
+    finally:
+        stats = uploader.close()
+    assert (stats.captured_exchanges, stats.pending_batches, stats.dropped_exchanges) == (1, 1, 0)
+    assert (stats.input_tokens, stats.output_tokens) == (3, 7)
+    saved = next(event for event in diagnostics if "capture_saved" in event)
+    assert f"trace {trace_id}" in saved
+    assert f"response {hashlib.sha256(response_id.encode()).hexdigest()[:16]}" in saved
+    assert "completed=True" in saved and "interrupted=False" in saved
+    assert "transport_error=True" in saved and "3 in / 7 out tokens" in saved
+    assert not any("SYNTHETIC_PRIVATE" in event or "secret" in event for event in diagnostics)
+    payload = json.loads(next((tmp_path / run).glob("*.json")).read_bytes())
+    span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    assert span["traceId"] == trace_id
+    assert span["status"] == {"code": 1}
+
+
+@pytest.mark.parametrize("fail_after_unblocking", [False, True])
+def test_blocked_verbose_reader_cannot_stop_storage_delivery_or_bounded_shutdown(
+    tmp_path: Path,
+    fail_after_unblocking: bool,
+) -> None:
+    """Fill the diagnostic queue while both data workers continue with a blocked output sink."""
+    blocked = threading.Event()
+    release = threading.Event()
+    run = str(uuid4())
+    diagnostics: list[str] = []
+    failures: set[str] = set()
+
+    def diagnostic(event: str) -> None:
+        """Block exactly like a full terminal pipe, independently of the uploader workers."""
+        blocked.set()
+        assert release.wait(10)
+        kind = "notice" if event.startswith("diagnostic_events_dropped:") else "receipt"
+        if fail_after_unblocking and kind not in failures:
+            failures.add(kind)
+            raise OSError("synthetic output failure")
+        diagnostics.append(event)
+
+    def platform(request: httpx.Request) -> httpx.Response:
+        """Accept immutable batches without introducing provider or network dependencies."""
+        if request.url.host == "storage.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("/batches/upload"):
+            ingest_id = str(uuid4())
+            return httpx.Response(
+                200,
+                json={
+                    "status": "pending",
+                    "ingest_id": ingest_id,
+                    "signed_url": _signed_url(ingest_id),
+                },
+            )
+        assert request.url.path.endswith("/finalize")
+        return httpx.Response(202)
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(platform),
+        on_diagnostic=diagnostic,
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(_usage_exchange())
+        assert blocked.wait(2)
+        _wait(lambda: uploader.stats.uploaded_batches == 1)
+        # More saved receipts than the diagnostic queue can hold must still persist.
+        for index in range(1, 140):
+            assert uploader.submit(_usage_exchange())
+            _wait(lambda expected=index + 1: uploader.stats.usage_exchanges == expected)
+        assert uploader.stats.uploaded_batches >= 2
+        started = time.monotonic()
+        stats = uploader.close(timeout=0.25)
+        assert time.monotonic() - started < 1
+        assert stats.captured_exchanges == 140
+        assert stats.dropped_exchanges == 0
+        assert stats.pending_batches + stats.uploaded_batches == 140
+        assert (stats.input_tokens, stats.output_tokens) == (420, 980)
+    finally:
+        release.set()
+        uploader.close()
+        if uploader._diagnostic_thread is not None:
+            uploader._diagnostic_thread.join(timeout=1)
+            assert not uploader._diagnostic_thread.is_alive()
+    lost = sum(
+        int(event.split(": ", 1)[1])
+        for event in diagnostics
+        if event.startswith("diagnostic_events_dropped:")
+    )
+    receipts = sum(event.startswith(("capture_saved", "upload_accepted")) for event in diagnostics)
+    assert lost > 0
+    assert receipts + lost == stats.captured_exchanges + stats.uploaded_batches
+    assert failures == ({"notice", "receipt"} if fail_after_unblocking else set())
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_last_failed_receipt_reports_loss_without_another_request(
+    tmp_path: Path, shutdown: bool
+) -> None:
+    """Account for a final output failure during idle time and diagnostic shutdown."""
+    run = str(uuid4())
+    diagnostics: list[str] = []
+    reported = threading.Event()
+
+    def diagnostic(event: str) -> None:
+        """Recover immediately after rejecting the last receipt."""
+        if event == "capture_saved":
+            raise OSError("synthetic output failure")
+        diagnostics.append(event)
+        reported.set()
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        on_diagnostic=diagnostic,
+    )
+    uploader._diagnostic("capture_saved")
+    if shutdown:
+        uploader._diagnostics_done.set()
+    reporter = threading.Thread(target=uploader._report_diagnostics, daemon=True)
+    reporter.start()
+    try:
+        assert reported.wait(2)
+        assert diagnostics == ["diagnostic_events_dropped: 1"]
+    finally:
+        uploader._diagnostics_done.set()
+        reporter.join(timeout=1)
+    assert not reporter.is_alive()
 
 
 @pytest.mark.parametrize(

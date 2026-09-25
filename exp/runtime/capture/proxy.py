@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import mitmproxy_rs
 from cryptography import x509
@@ -95,12 +96,14 @@ class _WebsocketRequest:
         started_ns: Request observation time in Unix nanoseconds.
         response_id: Provider ID assigned by response.created, initially unknown.
         stream_id: Named ordered lane, or None for the default lane.
+        trace_id: Locally generated identifier joining this request to its saved capture.
     """
 
     body: bytes
     started_ns: int
     response_id: str | None = None
     stream_id: str | None = None
+    trace_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 @dataclass
@@ -122,6 +125,7 @@ class _Capture:
     failed: bool = False
     websocket: bool = False
     websocket_requests: deque[_WebsocketRequest] = field(default_factory=deque)
+    trace_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 class CaptureProxy:
@@ -473,6 +477,7 @@ class CaptureProxy:
             websocket=flow.request.method.upper() == "GET",
         )
         self._captures[flow.id] = capture
+        self._diagnostic(f"capture_started · trace {capture.trace_id}", flow.client_conn)
         flow.request.stream = capture.request.tee
 
     def request(self, flow: http.HTTPFlow) -> None:
@@ -491,7 +496,7 @@ class CaptureProxy:
             self._diagnostic(
                 "http_response: 101"
                 if flow.response.status_code == 101
-                else "websocket_upgrade_failed",
+                else f"websocket_upgrade_failed: {flow.response.status_code}",
                 flow.client_conn,
             )
             return
@@ -499,7 +504,9 @@ class CaptureProxy:
         if capture is not None:
             if capture.websocket and flow.response.status_code != 101:
                 self._captures.pop(flow.id, None)
-                self._diagnostic("websocket_upgrade_failed", flow.client_conn)
+                self._diagnostic(
+                    f"websocket_upgrade_failed: {flow.response.status_code}", flow.client_conn
+                )
                 return
             capture.status = flow.response.status_code
             capture.response_encoding = flow.response.headers.get("content-encoding", "")
@@ -527,7 +534,7 @@ class CaptureProxy:
             capture.failed = True
             capture.request_done = True
             capture.response_done = True
-            self._diagnostic("http_flow_failed", flow.client_conn)
+            self._diagnostic(f"http_flow_failed · trace {capture.trace_id}", flow.client_conn)
             self._finish(flow.id, capture)
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
@@ -596,7 +603,10 @@ class CaptureProxy:
                     stream_id=stream_id if isinstance(stream_id, str) else None,
                 )
             )
-            self._diagnostic("websocket_request_started", flow.client_conn)
+            self._diagnostic(
+                f"websocket_request_started · trace {capture.websocket_requests[-1].trace_id}",
+                flow.client_conn,
+            )
         elif not message.from_client:
             if event.get("type") == "error":
                 # Request errors have no response object or reliable response ID.
@@ -639,7 +649,11 @@ class CaptureProxy:
                         capture.websocket_requests.remove(request)
                         if not capture.websocket_requests:
                             self._captures.pop(flow.id, None)
-                        self._diagnostic("websocket_request_completed", flow.client_conn)
+                        self._diagnostic(
+                            f"websocket_request_completed · trace {request.trace_id}"
+                            f" · {event['type']}",
+                            flow.client_conn,
+                        )
                         self._submit(
                             CapturedExchange(
                                 protocol="responses",
@@ -651,6 +665,7 @@ class CaptureProxy:
                                 response=json.dumps(response, separators=(",", ":")).encode(),
                                 status=200,
                                 failed=event.get("type") != "response.completed",
+                                trace_id=request.trace_id,
                             )
                         )
                         break
@@ -690,6 +705,7 @@ class CaptureProxy:
                         response=b"",
                         status=0,
                         failed=True,
+                        trace_id=request.trace_id,
                     )
                 )
 
@@ -715,6 +731,7 @@ class CaptureProxy:
                 response_encoding=capture.response_encoding,
                 response_content_type=capture.response_content_type,
                 failed=capture.failed,
+                trace_id=capture.trace_id,
             )
         )
 
