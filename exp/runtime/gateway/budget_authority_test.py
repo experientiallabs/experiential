@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes
-from exp.common.models.gateway_catalog import CatalogSnapshotDigestError, NormalizedGatewayCatalog
+from exp.common.models.gateway_catalog import (
+    CatalogSnapshotDigestError,
+    NormalizedGatewayCatalog,
+    normalize_gateway_catalog,
+)
+from exp.common.models.gateway_catalog_test import unavailable_child_catalog
 from exp.runtime.gateway import budget_authority as budgets_module
 from exp.runtime.gateway.budget_authority import (
     MAXIMUM_BUDGET_SNAPSHOT_BYTES,
@@ -18,6 +23,23 @@ from exp.runtime.gateway.budget_authority import (
 )
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind
 from exp.runtime.gateway.budgets_test import _activate_chain, _authority, _chain_catalog, _Clock
+
+
+def test_poolless_unavailable_child_cannot_authorize_a_budget_destination() -> None:
+    """Only emitted parent leaves are fundable; a tombstone creates no child budget scope."""
+    catalog = normalize_gateway_catalog(unavailable_child_catalog())
+    for deployment in ("a1", "a2"):
+        require_reachable_budget_target(catalog, "pool-a", "pool-a", deployment)
+    for pool, deployment in (
+        ("retired-b", None),
+        ("retired-b", "b1"),
+        ("pool-a", "b1"),
+        ("c1", "c1"),
+    ):
+        with pytest.raises(ValueError, match="not reachable"):
+            require_reachable_budget_target(catalog, "pool-a", pool, deployment)
+    with pytest.raises(ValueError, match="root pool is missing"):
+        require_reachable_budget_target(catalog, "retired-b", "retired-b", None)
 
 
 @pytest.mark.parametrize(

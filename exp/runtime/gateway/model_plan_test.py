@@ -7,7 +7,12 @@ from unittest.mock import patch
 import pytest
 
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
-from exp.common.models.gateway_catalog import ExactModelPool, NormalizedGatewayCatalog
+from exp.common.models.gateway_catalog import (
+    ExactModelPool,
+    NormalizedGatewayCatalog,
+    normalize_gateway_catalog,
+)
+from exp.common.models.gateway_catalog_test import unavailable_child_catalog
 from exp.common.models.gateway_chains import ModelStagePolicy
 from exp.common.models.gateway_chains_test import chain
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
@@ -35,7 +40,7 @@ from exp.runtime.gateway.native_rung_policy import (
     failed_dispatch_candidate,
     throttle_redial_budgets,
 )
-from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoutingError
 from exp.runtime.gateway.rung_admission import RungLoadRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
 
@@ -73,6 +78,38 @@ def catalog() -> NormalizedGatewayCatalog:
         ),
         model_chains=(chain("a", "a1", ">b", "a2"), chain("b", "b1", ">a")),
     )
+
+
+def test_unavailable_poolless_child_never_becomes_a_stage_or_root_route() -> None:
+    """A retired reference keeps parent placements and unrelated routing without child authority."""
+    normalized = normalize_gateway_catalog(unavailable_child_catalog())
+    authorization = _route().snapshot.authorization.model_copy(
+        update={
+            "catalog_sha256": normalized.identity_sha256(),
+            "target": DirectTarget(pool_id="pool-a"),
+        }
+    )
+    resolver = CatalogRouteResolver(
+        {(authorization.alias_revision_id, authorization.catalog_sha256): normalized}
+    )
+    route = resolver.resolve_direct(authorization)
+    assert tuple(d.deployment_id for d in route.deployments) == ("a1", "a2")
+    assert [s.deployment_ids for s in route.snapshot.model_stages] == [("a1",), ("a2",)]
+    assert all(
+        s.exact_model_id == "a" and s.pool_id == "pool-a" for s in route.snapshot.model_stages
+    )
+    assert route.snapshot.authorization == authorization
+    assert resolver.resolve_direct(
+        authorization.model_copy(
+            update={
+                "target": DirectTarget(pool_id="c1"),
+            }
+        )
+    ).snapshot.deployment_ids == ("c1",)
+    with pytest.raises(GatewayRoutingError, match="pool"):
+        resolver.resolve_direct(
+            authorization.model_copy(update={"target": DirectTarget(pool_id="retired-b")})
+        )
 
 
 @pytest.mark.parametrize("threshold", [None, 0.8])

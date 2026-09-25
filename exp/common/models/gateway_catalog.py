@@ -193,6 +193,8 @@ class NormalizedGatewayCatalog(ContractModel):
         pools = {pool.pool_id: pool for pool in self.pools}
         for chain in self.model_chains:
             pool = pools.get(chain.pool_id)
+            if pool is None and not chain.available and not chain.rungs:
+                continue
             if pool is None or pool.exact_model_id != chain.model_id:
                 raise ValueError("model chain must name its same-exact certified pool")
             for rung in chain.rungs:

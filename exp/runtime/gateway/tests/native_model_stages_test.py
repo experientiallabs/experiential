@@ -146,6 +146,7 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     child_cancel = getattr(request, "param", None) == "tool-child-cancel"
     child_collision = getattr(request, "param", None) == "tool-child-collision"
     first_token_stall = getattr(request, "param", None) == "first-token-stall"
+    unavailable_child = getattr(request, "param", None) == "unavailable-child"
     secondary_handler = _StageSecondaryUpstream
     if child_cancel or child_collision:
         secondary_handler = _ToolUpstream
@@ -177,6 +178,7 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     if (
         hasattr(request, "param")
         and not zdr_child
+        and not unavailable_child
         and not str(request.param).startswith("capture-")
     ):
         rule = (
@@ -216,8 +218,32 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
             "gateway_model_chains": {"model-revision-exact": chain},
         }
     )
+    pool_id = "alpha"
+    if unavailable_child:
+        parent = chain.model_copy(
+            update={
+                "pool_id": "coding",
+                "rungs": (
+                    GatewayDeploymentRung(deployment_id="alpha"),
+                    GatewayModelReferenceRung(model_id="retired-child"),
+                    GatewayDeploymentRung(deployment_id="beta"),
+                ),
+            }
+        )
+        retired = GatewayModelChain(
+            model_id="retired-child",
+            pool_id="absent-child-pool",
+            revision="retired",
+            available=False,
+        )
+        authored = catalog.model_copy(
+            update={
+                "gateway_model_chains": {parent.model_id: parent, retired.model_id: retired},
+            }
+        )
+        pool_id = "coding"
     write_model_catalog(tmp_path / "models.toml", authored)
-    publish_authored_chain_fixture(tmp_path, revision_id="revision-stage", pool_id="alpha")
+    publish_authored_chain_fixture(tmp_path, revision_id="revision-stage", pool_id=pool_id)
     driver = tmp_path / "driver.py"
     source = _DRIVER_SOURCE.replace(
         "from exp.runtime.gateway.lifecycle import load_gateway_components",
@@ -361,6 +387,39 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
                 server.shutdown()
                 server.server_close()
             assert process.returncode == 0, log_path.read_text()
+
+
+@pytest.mark.parametrize("engine", ["unavailable-child"], indirect=True)
+def test_unavailable_child_has_no_attempt_and_parent_suffix_still_serves(
+    engine: _ServingEngine,
+) -> None:
+    """Actual native dispatch skips the retired model without listing or funding a fake lane."""
+    headers = {"authorization": f"Bearer {engine.raw_key}"}
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers=headers,
+        json={"model": "coding", "messages": [{"role": "user", "content": "always-500"}]},
+        timeout=30,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-canonical-model"] == "model-revision-exact"
+    assert response.headers["x-gateway-deployment"] == "beta"
+    assert "from-secondary" in response.text
+    request_id = response.headers["x-request-id"]
+    with sqlite3.connect(engine.database_path) as db:
+        rows = db.execute(
+            "SELECT exact_model_id,pool_id,deployment_id,state FROM gateway_attempts "
+            "WHERE request_id=? ORDER BY attempt_ordinal",
+            (request_id,),
+        ).fetchall()
+    assert rows == [
+        ("model-revision-exact", "coding", "alpha", "failed"),
+        ("model-revision-exact", "coding", "alpha", "failed"),
+        ("model-revision-exact", "coding", "beta", "completed"),
+    ]
+    listed = httpx.get(f"{engine.base}/v1/models", headers=headers, timeout=10)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["data"]] == ["coding"]
 
 
 @pytest.mark.parametrize(

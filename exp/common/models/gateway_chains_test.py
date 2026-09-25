@@ -64,6 +64,38 @@ def test_bounds_are_explicit_errors_not_truncation() -> None:
     )
 
 
+@pytest.mark.parametrize("length", [16, 17])
+def test_unavailable_terminal_still_counts_toward_canonical_bound(length: int) -> None:
+    """An empty unavailable child is visited even though it cannot emit a physical stage."""
+    chains = {f"m{i}": chain(f"m{i}", f"d{i}", f">m{i + 1}") for i in range(length - 1)}
+    model = f"m{length - 1}"
+    chains[model] = GatewayModelChain(
+        model_id=model, pool_id="absent", revision="r", available=False
+    )
+    if length == 17:
+        with pytest.raises(ModelChainConfigurationError, match="16 canonical"):
+            expand_model_chain("m0", chains)
+    else:
+        result = expand_model_chain("m0", chains)
+        assert result.visited_model_ids == tuple(f"m{i}" for i in range(length))
+        assert result.events[-2].reason == "model_unavailable"
+        assert len(result.segments) == length - 1
+
+
+@pytest.mark.parametrize("direct_count", [255, 256])
+def test_unavailable_reference_still_spends_examined_rung_budget(direct_count: int) -> None:
+    """The reference itself counts even when its empty target contributes no leaves."""
+    root = chain("a", *(f"d{i}" for i in range(direct_count)), ">b")
+    child = GatewayModelChain(model_id="b", pool_id="absent", revision="r", available=False)
+    if direct_count == 256:
+        with pytest.raises(ModelChainConfigurationError, match="256"):
+            expand_model_chain("a", {"a": root, "b": child})
+    else:
+        result = expand_model_chain("a", {"a": root, "b": child})
+        assert result.examined_rungs == 256
+        assert result.visited_model_ids == ("a", "b")
+
+
 def test_invalid_chain_and_unavailable_override_fail_closed() -> None:
     """First actual rung and one-reference rules hold even before expansion."""
     with pytest.raises(ValueError, match="first"):

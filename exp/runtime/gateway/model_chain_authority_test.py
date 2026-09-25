@@ -31,6 +31,7 @@ from exp.common.models import (
     normalize_gateway_catalog,
     write_model_catalog,
 )
+from exp.common.models.gateway_catalog_test import unavailable_child_catalog
 from exp.common.models.gateway_chains import GatewayDeploymentRung, GatewayModelChain
 from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.catalog_authority import authored_snapshot_path, snapshot_current_catalog
@@ -733,6 +734,19 @@ def test_drafts_normalize_but_local_serving_publication_refuses_before_any_snaps
     with pytest.raises(ModelChainAuthorityError, match="publication"):
         snapshot_current_catalog(tmp_path)
     assert not expected.exists() and not expected.with_suffix(".models.json").exists()
+
+
+def test_poolless_unavailable_child_keeps_local_publication_denied(tmp_path: Path) -> None:
+    """Permitting a nonserving tombstone never enables local populated-chain serving."""
+    authored = unavailable_child_catalog()
+    normalized = normalize_gateway_catalog(authored)
+    write_model_catalog(tmp_path / "models.toml", authored)
+    with pytest.raises(ModelChainAuthorityError, match="publication"):
+        snapshot_current_catalog(tmp_path)
+    path = tmp_path / "pinned.json"
+    path.write_text(normalized.model_dump_json())
+    with pytest.raises(ModelChainAuthorityError, match="local"):
+        refuse_local_chain_snapshot(tmp_path, path.name)
 
 
 def test_configured_serving_limit_accepts_valid_direct_catalog_above_64_mib(
