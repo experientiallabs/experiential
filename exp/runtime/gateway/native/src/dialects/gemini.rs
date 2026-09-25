@@ -178,11 +178,9 @@ impl Normalizer {
             // finish token names the category (RECITATION, SPII, SAFETY), so
             // the caller sees which policy declined without any provider prose.
             "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII"
-            | "IMAGE_SAFETY" => {
-                Event::Failed(Failure::refusal(
-                    crate::stream_errors::refusal_reason(Some(&finish_reason), None),
-                ))
-            }
+            | "IMAGE_SAFETY" => Event::Failed(Failure::refusal(
+                crate::stream_errors::refusal_reason(Some(&finish_reason), None),
+            )),
             _ => Event::Failed(Failure::new(
                 FailureClass::ProviderInternal,
                 "provider ended the stream unexpectedly",

@@ -87,8 +87,18 @@ def _chunks(placement: str) -> list[bytes]:
             frames = [text, usage, stop]
         case "with":
             frames = [text, {**stop, **usage}]
-        case "bad-cache":
+        case "bad-cache" | "reconciled-cache":
             frames = [text, usage, stop, {"usageMetadata": {"cachedContentTokenCount": 10}}]
+            if placement == "reconciled-cache":
+                frames.extend([{"usageMetadata": {}}, {"usageMetadata": {"promptTokenCount": 12}}])
+        case "pending-cache-primary":
+            frames = [
+                text,
+                usage,
+                stop,
+                {"usageMetadata": {"cachedContentTokenCount": 1000}},
+                {"usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 5}},
+            ]
         case "cache-only" | "cache-first":
             frames = [text, stop, {"usageMetadata": {"cachedContentTokenCount": 3}}]
             if placement == "cache-first":
@@ -142,6 +152,8 @@ def _chunks(placement: str) -> list[bytes]:
         "later-chunk",
         "partial",
         "bad-cache",
+        "reconciled-cache",
+        "pending-cache-primary",
         "cache-only",
         "cache-first",
         "none",
@@ -155,6 +167,10 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
 ) -> None:
     """The real worker drains metadata without reopening content or making another attempt."""
     chunks = _chunks(placement)
+    expected_meter = {
+        "reconciled-cache": (12, 2, 10, 7_000),
+        "pending-cache-primary": (12, 5, 3, 19_300),
+    }.get(placement, (7, 2, 3, 8_300))
     requests: list[str] = []
     settlements: list[JsonObject] = []
 
@@ -243,9 +259,9 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
             usage = result.get("usage")
         if placement not in {"none", "empty", "cache-only"}:
             assert usage is not None
-            assert usage["prompt_tokens"] == 7
-            assert usage["completion_tokens"] == 2
-            assert usage["prompt_tokens_details"]["cached_tokens"] == 3
+            assert usage["prompt_tokens"] == expected_meter[0]
+            assert usage["completion_tokens"] == expected_meter[1]
+            assert usage["prompt_tokens_details"]["cached_tokens"] == expected_meter[2]
     finally:
         gateway.stop()
         upstream.shutdown()
@@ -262,9 +278,7 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
     # A present empty proto object normalizes to zero but the existing settlement
     # contract treats a finished all-zero meter as unknown, never free service.
     expected = (
-        (None, None, None, None)
-        if placement in {"none", "empty", "cache-only"}
-        else (7, 2, 3, 8_300)
+        (None, None, None, None) if placement in {"none", "empty", "cache-only"} else expected_meter
     )
     assert rows == [("completed", *expected)]
 

@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::super::{malformed, Normalizer};
 use crate::errors::Failure;
-use crate::events::{bounded_ledger_sum, count_if_present, gemini_usage, Event, Usage};
+use crate::events::{bounded_ledger_sum, count_if_present, gemini_usage, Event};
 
 #[derive(Default)]
 pub(in crate::dialects) struct StreamState {
@@ -14,7 +14,7 @@ pub(in crate::dialects) struct StreamState {
     pub(super) finished_at: Option<Instant>,
     candidates: Option<u64>,
     thoughts: Option<u64>,
-    pending: Option<Usage>,
+    pending_cache: Option<u64>,
 }
 
 impl Normalizer {
@@ -37,23 +37,30 @@ impl Normalizer {
         );
         usage.reasoning_tokens = thoughts;
         let mut accumulated = self.usage.clone().unwrap_or_default();
-        if let Some(pending) = &self.gemini.pending {
-            accumulated.merge_observed(pending);
-        }
         accumulated.merge_observed(&usage);
+        let pending_cache = self
+            .gemini
+            .pending_cache
+            .max(accumulated.cached_input_tokens);
         if accumulated.cached_input_tokens > accumulated.input_tokens {
-            // Never expose an impossible cache subset or manufacture prompt
-            // tokens to make it fit. Without a valid baseline, hold sparse
-            // evidence for a later primary report; otherwise reject only this
-            // contradictory update and keep the last consistent meter.
-            if self.usage.is_none() {
-                self.gemini.pending = Some(accumulated);
-                self.gemini.candidates = candidates;
-                self.gemini.thoughts = thoughts;
-            }
+            // The current report is contradictory, not merely waiting for an
+            // older cache subset. Preserve its cache evidence without exposing
+            // the invalid meter or accepting its other legs as a new baseline.
+            self.gemini.pending_cache = pending_cache;
             return Ok(());
         }
-        self.gemini.pending = None;
+        if pending_cache <= accumulated.input_tokens {
+            accumulated.cached_input_tokens = pending_cache;
+            self.gemini.pending_cache = None;
+        } else {
+            // An older unresolved subset must not block newer consistent
+            // primary counts. Publish those now and retain only the subset
+            // until sufficient input evidence arrives, never fabricating input.
+            self.gemini.pending_cache = pending_cache;
+            if self.usage.is_none() && accumulated.input_tokens == Some(0) {
+                return Ok(());
+            }
+        }
         self.gemini.candidates = candidates;
         self.gemini.thoughts = thoughts;
         self.usage = Some(accumulated);

@@ -192,10 +192,13 @@ public SSE delivery can close without a final client frame; settlement still pre
 declared provider outcome and the meter observed so far.
 
 Partial or empty suffixes cannot erase earlier counts, and cumulative snapshots are never added
-together. A cache count greater than the accumulated input count cannot replace a consistent
-meter. An initially cache-only report is held until sufficient input evidence arrives; otherwise
-usage stays unknown. An absent whole usage object remains unknown, and a finished all-zero report
-keeps the existing unknown-meter settlement policy. An interrupted or expired drain preserves the
+together. A cache count greater than the accumulated input count stays pending, even when a
+consistent meter already exists. A later input report can make that pending cache count valid.
+Until then, newer consistent primary counts can advance the meter without publishing the pending
+cache count. A report that itself contradicts the subset relation cannot replace the last
+consistent meter; without one, unresolved cache-only usage stays unknown. An absent whole usage
+object remains unknown, and a finished all-zero report keeps the existing unknown-meter settlement
+policy. An interrupted or expired drain preserves the
 best consistent report, not a guarantee that the provider's final report was received. It does
 not trigger another generation to recover missing usage.
 

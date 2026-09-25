@@ -134,6 +134,56 @@ fn impossible_cache_suffix_keeps_last_consistent_usage() {
 }
 
 #[test]
+fn oversized_cache_suffix_waits_for_later_input_even_with_a_valid_baseline() {
+    for later_input in [None, Some(12)] {
+        let mut frames = vec![
+            text(),
+            frame(json!({"usageMetadata":meter()})),
+            stop(),
+            frame(json!({"usageMetadata":{"cachedContentTokenCount":10}})),
+            frame(json!({"usageMetadata":{}})),
+        ];
+        if let Some(input) = later_input {
+            frames.push(frame(json!({"usageMetadata":{"promptTokenCount":input}})));
+        }
+        let expected = if later_input.is_some() {
+            (12, 2, 10)
+        } else {
+            (7, 2, 3)
+        };
+        assert_usage(frames.clone(), Some(expected));
+        assert_usage(vec![frames.concat()], Some(expected));
+    }
+}
+
+#[test]
+fn unreconciled_cache_does_not_hide_later_consistent_primary_counts() {
+    let mut frames = vec![
+        text(),
+        frame(json!({"usageMetadata":meter()})),
+        stop(),
+        frame(json!({"usageMetadata":{"cachedContentTokenCount":1000}})),
+        frame(json!({"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5}})),
+    ];
+    assert_usage(frames.clone(), Some((12, 5, 3)));
+    frames.push(frame(json!({"usageMetadata":{"promptTokenCount":1200}})));
+    assert_usage(frames, Some((1200, 5, 1000)));
+    // A newer frame that itself contradicts the subset relation does not
+    // authorize publishing its other counts as a consistent snapshot.
+    assert_usage(
+        vec![
+            text(),
+            frame(json!({"usageMetadata":meter()})),
+            stop(),
+            frame(
+                json!({"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5,"cachedContentTokenCount":1000}}),
+            ),
+        ],
+        Some((7, 2, 3)),
+    );
+}
+
+#[test]
 fn cache_only_first_report_waits_for_primary_counts_or_stays_unknown() {
     let partial = vec![
         text(),
