@@ -66,6 +66,45 @@ def test_pricing_snapshot_replay_reuses_original_materialization_time(tmp_path: 
     assert replay.created_at == created
 
 
+def test_pricing_snapshot_upgrade_preserves_prior_revision(tmp_path: Path) -> None:
+    """Identical prices from a new producer coexist with the original frozen snapshot."""
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    prices = (
+        CandidateTokenPrice(
+            candidate_alias="candidate-a",
+            input_usd_per_million_tokens=1,
+            output_usd_per_million_tokens=2,
+            cached_input_usd_per_million_tokens=0.5,
+            cache_write_usd_per_million_tokens=1.5,
+        ),
+    )
+    created = datetime(2026, 8, 13, tzinfo=UTC)
+    first = persist_pricing_snapshot(
+        project.artifacts, prices, created_at=created, code_revision="release-one"
+    )
+    original = project.artifacts.read_bytes(first.pricing_snapshot_id, "pricing.json")
+
+    upgraded = persist_pricing_snapshot(
+        project.artifacts,
+        prices,
+        created_at=created + timedelta(hours=1),
+        code_revision="release-two",
+    )
+    replay = persist_pricing_snapshot(
+        project.artifacts,
+        prices,
+        created_at=created + timedelta(hours=2),
+        code_revision="release-two",
+    )
+
+    assert upgraded.pricing_snapshot_id != first.pricing_snapshot_id
+    assert upgraded.code_revision == "release-two"
+    assert upgraded.candidate_prices == first.candidate_prices
+    assert replay == upgraded
+    assert project.artifacts.read_bytes(first.pricing_snapshot_id, "pricing.json") == original
+
+
 def test_completion_reservation_covers_cache_write_output_and_retries() -> None:
     """One call uses the highest total input rate plus output for every retry."""
     reservation = completion_cost_reservation(

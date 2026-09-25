@@ -104,6 +104,40 @@ def test_prepare_rejects_duplicate_workers_before_writes(tmp_path: Path) -> None
     assert project.artifacts.list_ids() == before
 
 
+def test_new_evaluation_after_upgrade_reuses_build_without_replaying_old_prices(
+    tmp_path: Path,
+) -> None:
+    """A release update can prepare the same models while preserving prior evidence."""
+    project, catalog, state, prepared = _prepare(tmp_path)
+    before = (len(state.embedding_calls), len(state.completion_calls), state.credential_resolutions)
+    build = project.load_project().build
+    old_pricing = project.artifacts.read_bytes(prepared.setup.pricing_snapshot_id, "pricing.json")
+
+    upgraded = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(maximum_steps=1),
+        created_at=_TIME,
+        code_revision="upgraded-release",
+    )
+
+    assert upgraded.setup.pricing_snapshot_id != prepared.setup.pricing_snapshot_id
+    assert upgraded.cost.estimated_cost_usd == prepared.cost.estimated_cost_usd
+    assert upgraded.judge_setup == prepared.judge_setup
+    assert project.load_project().build == build
+    assert (
+        project.artifacts.read_bytes(prepared.setup.pricing_snapshot_id, "pricing.json")
+        == old_pricing
+    )
+    assert before == (
+        len(state.embedding_calls),
+        len(state.completion_calls),
+        state.credential_resolutions,
+    )
+
+
 def test_prepare_defaults_to_binary_task_success_without_calibration_calls(tmp_path: Path) -> None:
     """An ordinary evaluation requires no manual calibration detour or private API."""
     import exp

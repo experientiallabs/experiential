@@ -521,7 +521,10 @@ def persist_pricing_snapshot(
     created_at: datetime,
     code_revision: str,
 ) -> PricingSnapshot:
-    """Persist or exactly replay one candidate pricing snapshot.
+    """Persist or exactly replay candidate prices scoped to their producer revision.
+
+    A new producer revision gets a distinct snapshot so prior evaluations retain their
+    original prices and provenance. Repeated preparation within that revision replays exactly.
 
     Args:
         store: Project-local immutable artifact store.
@@ -538,7 +541,8 @@ def persist_pricing_snapshot(
     pricing_snapshot_id = stable_id(
         "pricing",
         {
-            "version": "candidate-pricing-v1",
+            "version": "candidate-pricing-v2",
+            "code_revision": code_revision,
             "prices": [price.model_dump(mode="json") for price in prices],
         },
     )
