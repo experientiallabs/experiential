@@ -1,15 +1,21 @@
 """Adversarial durability tests for text simulation paid-cell claims."""
 
 import logging
+import threading
 import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from exp.common.core.locks import file_write_lock
+from exp.common.core.locks import FileLockTimeout, file_write_lock
 from exp.common.project import ArtifactStore, ProjectPaths
+from exp.simulation.engines.text import leases
 from exp.simulation.engines.text.leases import (
+    TextCellLeaseClaim,
     TextCellLeaseError,
     TextCellLeaseState,
     TextCellLeaseStatus,
@@ -18,6 +24,119 @@ from exp.simulation.engines.text.leases import (
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+
+
+def test_completed_rollout_release_timeout_defers_to_safe_reaping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cleanup lock timeout cannot discard a completed rollout or authorize replay."""
+    store = TextCellLeaseStore(tmp_path, clock=lambda: _TIME)
+
+    def acquire(*, completed: bool) -> TextCellLeaseClaim:
+        """Admit or reap the same exact cell without changing its durable identity."""
+        return store.acquire(
+            lease_id="lease-a",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id="rollout-a",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            observed_spend_usd=lambda: 0.0,
+            rollout_completed=lambda _: completed,
+        )
+
+    claim = acquire(completed=False)
+    assert claim.lease is not None
+
+    @contextmanager
+    def busy_lock(path: Path, *, what: str, timeout_s: float = 10.0) -> Iterator[None]:
+        """Hold cleanup behind another metadata writer after evidence is durable."""
+        raise FileLockTimeout("metadata writer is busy")
+        yield
+
+    with monkeypatch.context() as patch:
+        patch.setattr(leases, "file_write_lock", busy_lock)
+        with caplog.at_level(logging.WARNING):
+            store.release(claim.lease)
+    assert "after immutable rollout persistence" in caplog.text
+    assert (tmp_path / "simulation-leases" / "lease-a.json").is_file()
+    completed = acquire(completed=True)
+    assert completed.state == TextCellLeaseState.COMPLETED
+    assert not (tmp_path / "simulation-leases" / "lease-a.json").exists()
+
+
+@pytest.mark.parametrize("operation", ["release", "dispatch_intent"])
+def test_local_workers_queue_before_the_cross_process_admission_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Slow spend reconciliation cannot make local cleanup poll the cross-process lock."""
+    store = TextCellLeaseStore(tmp_path, clock=lambda: _TIME)
+
+    def acquire(suffix: str, spend: Callable[[], float]) -> TextCellLeaseClaim:
+        """Reserve one independent bounded cell under the shared ledger."""
+        return store.acquire(
+            lease_id=f"lease-{suffix}",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id=f"rollout-{suffix}",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            reservation_cost_usd=0.2,
+            stop_on_overspend=True,
+            rollout_completed=lambda _: False,
+            observed_spend_usd=spend,
+        )
+
+    first = acquire("a", lambda: 0.0)
+    assert first.lease is not None
+    reconciling = threading.Event()
+    finish_reconciliation = threading.Event()
+    release_started = threading.Event()
+    concurrent_file_lock = threading.Event()
+    active = threading.Lock()
+
+    @contextmanager
+    def observed_lock(path: Path, *, what: str, timeout_s: float = 10.0) -> Iterator[None]:
+        """Detect local contenders before taking the real durable lock."""
+        if not active.acquire(blocking=False):
+            concurrent_file_lock.set()
+            raise AssertionError("local metadata operations must queue before the file lock")
+        try:
+            with file_write_lock(path, what=what, timeout_s=timeout_s):
+                yield
+        finally:
+            active.release()
+
+    def slow_spend() -> float:
+        """Hold reconciliation until cleanup has begun waiting."""
+        reconciling.set()
+        assert finish_reconciliation.wait(timeout=5)
+        return 0.0
+
+    def update_owned_lease() -> None:
+        """Update an owned claim while another local worker reconciles spend."""
+        release_started.set()
+        assert first.lease is not None
+        if operation == "release":
+            store.release(first.lease)
+        else:
+            assert store.record_dispatch_intent(first.lease).dispatch_intent_recorded
+
+    monkeypatch.setattr(leases, "file_write_lock", observed_lock)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        admission = pool.submit(acquire, "b", slow_spend)
+        try:
+            assert reconciling.wait(timeout=5)
+            cleanup = pool.submit(update_owned_lease)
+            assert release_started.wait(timeout=5)
+            assert not concurrent_file_lock.wait(timeout=0.1)
+        finally:
+            finish_reconciliation.set()
+        assert admission.result(timeout=5).state == TextCellLeaseState.OWNED
+        cleanup.result(timeout=5)
+    assert (tmp_path / "simulation-leases" / "lease-a.json").exists() == (
+        operation == "dispatch_intent"
+    )
 
 
 def test_dispatch_intent_blocks_replay_until_rollout_is_durable(
@@ -207,8 +326,9 @@ def test_cancelled_paid_claim_wait_returns_retryable_contention_without_a_lease(
     assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
 
 
-def test_admission_lock_wait_obeys_the_same_finite_deadline(tmp_path: Path) -> None:
-    """A hung admission lock cannot bypass the lease acquisition deadline."""
+@pytest.mark.parametrize("local", [False, True])
+def test_admission_lock_wait_obeys_the_same_finite_deadline(tmp_path: Path, local: bool) -> None:
+    """A hung local or cross-process lock cannot bypass the lease acquisition deadline."""
     project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
     lease_directory = project.project_directory / "simulation-leases"
     lease_directory.mkdir(parents=True)
@@ -220,7 +340,11 @@ def test_admission_lock_wait_obeys_the_same_finite_deadline(tmp_path: Path) -> N
     )
 
     started = time.monotonic()
-    with file_write_lock(lease_directory / "admission", what="test admission holder"):
+    with (
+        store._admission_lock
+        if local
+        else file_write_lock(lease_directory / "admission", what="test admission holder")
+    ):
         blocked = store.acquire(
             lease_id="lease-a",
             resolution_id="resolution-a",
@@ -485,3 +609,36 @@ def test_stale_tombstone_rejects_symlink_swap_without_touching_victim(tmp_path: 
 
     assert victim.read_text(encoding="utf-8") == "do not overwrite"
     assert lease_path.is_symlink()
+
+
+def test_parallel_cell_reservations_share_but_never_duplicate_remaining_budget(
+    tmp_path: Path,
+) -> None:
+    """Two bounded attempts may overlap; a third cannot claim already reserved dollars."""
+    store = TextCellLeaseStore(
+        tmp_path, clock=lambda: _TIME, wait_timeout_seconds=0.001, poll_interval_seconds=0.001
+    )
+
+    def acquire(suffix: str) -> TextCellLeaseClaim:
+        """Request forty cents from a shared one-dollar ceiling."""
+        return store.acquire(
+            lease_id=f"lease-{suffix}",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id=f"rollout-{suffix}",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            reservation_cost_usd=0.4,
+            stop_on_overspend=True,
+            rollout_completed=lambda _: False,
+            observed_spend_usd=lambda: 0.1,
+        )
+
+    first, second = acquire("a"), acquire("b")
+    assert first.state == second.state == TextCellLeaseState.OWNED
+    assert first.lease is not None and second.lease is not None
+    assert first.lease.reserved_cost_usd == second.lease.reserved_cost_usd == 0.4
+    third = acquire("c")
+    assert third.state == TextCellLeaseState.CONTENDED
+    store.release(first.lease)
+    assert acquire("c").state == TextCellLeaseState.OWNED

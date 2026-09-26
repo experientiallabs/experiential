@@ -214,7 +214,6 @@ class LMJudge:
                         content=_render_judgment_request(rollout, rubric),
                     ),
                 ),
-                temperature=0.0,
                 maximum_output_tokens=self._maximum_output_tokens,
             )
         )

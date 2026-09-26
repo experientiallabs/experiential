@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -19,21 +20,23 @@ class EvaluationSetup(ContractModel):
     """Frozen worker, environment, judge and execution inputs independent of router fitting.
 
     Attributes:
-        candidates: Nonempty collection of frozen worker model identities.
-        observed_cells: Historical cells, empty for standalone model evaluation.
-        production_protocol: Build-bound production evidence protocol.
-        simulation_protocol: Shared worker simulation and judging protocol.
-        fit_rag_input: Immutable fit-only retrieval index.
-        pricing_snapshot_id: Frozen catalog prices used for the comparison.
-        judgment_status: Actual provisional or human-calibrated provenance.
-        world_model_settings: Grounded environment and retrieval configuration.
-        simulation_completion_input: Frozen request reservations, required for quoting.
-        agent_id: Selected runtime identity, from 1 through 256 characters.
-        seed: Reproducible simulation seed.
-        maximum_steps: Positive per-rollout step ceiling.
-        continuation_of: Exact parent specification, or None for a fresh evaluation.
-        maximum_rollout_output_tokens: Positive cumulative worker output cap, default 1,000,000.
-        maximum_concurrency: Positive ceiling on concurrently admitted rollouts.
+        candidates: Nonempty tuple of pinned worker identities.
+        observed_cells: Optional production evidence, empty by default.
+        production_protocol: Frozen interpretation of production evidence.
+        simulation_protocol: Frozen simulated-evaluation protocol.
+        fit_rag_input: Exact fit-only grounding artifact.
+        pricing_snapshot_id: Frozen catalog prices used for comparison.
+        judgment_status: Provisional or human-calibrated status of the selected judge.
+        world_model_settings: Environment model and retrieval settings.
+        simulation_completion_input: Optional immutable provider reservation contract.
+        agent_id: Nonempty identity of the rollout agent.
+        seed: Scenario randomization seed.
+        run_id: Optional execution namespace; distinct values collect independent evidence.
+        maximum_steps: Positive candidate-turn ceiling.
+        continuation_of: Optional parent evaluation retained during budget continuation.
+        maximum_rollout_output_tokens: Positive cumulative generation ceiling, default one million.
+        maximum_concurrency: Positive maximum number of simultaneous rollouts.
+        repeats: Independent runs per scenario/model pair, default one and separate from retries.
     """
 
     candidates: tuple[RoutedCandidateSnapshot, ...] = Field(min_length=1)
@@ -47,10 +50,12 @@ class EvaluationSetup(ContractModel):
     simulation_completion_input: ArtifactInput | None = None
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
+    run_id: str | None = Field(default=None, min_length=1, max_length=256)
     maximum_steps: int = Field(gt=0)
     continuation_of: ArtifactInput | None = None
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(gt=0)
+    repeats: int = Field(default=1, ge=1)
 
 
 class EvaluationBudget(ContractModel):
@@ -66,12 +71,13 @@ class EvaluationBudget(ContractModel):
 
 
 class EvaluationExecutionContract(ArtifactEnvelope):
-    """Hash-bound execution settings and authorization included in the evaluation identity.
+    """Hash-bound execution ceilings included in the evaluation identity.
 
     Attributes:
         contract_id: Content-derived execution identity.
         setup: Frozen model, environment and judge inputs.
-        budget: Authorized finite execution ceilings.
+        budget: Frozen finite execution ceilings. Catalog-backed execution also enforces
+            the separately approved request allowance in its durable spending ledger.
     """
 
     contract_id: ArtifactId
@@ -112,11 +118,19 @@ class EvaluationServices:
         simulator_factory: Builds the selected simulation engine for one frozen plan.
         judge: Provider-bound, reservation-enforcing judge.
         plan_inputs: Additional immutable execution inputs, empty by default.
+        judging_protocol: Optional explicit fresh judging pass over saved rollouts.
+        judging_input: Immutable reviewed judging revision, independent of simulation identity.
+        spending_limit_usd: Optional request-ledger allowance, independent of plan identity.
+        judge_spend: Optional authoritative request-ledger reconciliation for saved rollouts.
     """
 
     simulator_factory: SimulatorFactory
     judge: EvaluationRuntimeJudge
     plan_inputs: tuple[ArtifactInput, ...] = ()
+    judging_protocol: EvaluationProtocol | None = None
+    judging_input: ArtifactInput | None = None
+    spending_limit_usd: float | None = None
+    judge_spend: Callable[[tuple[str, ...]], float] | None = None
 
 
 class EvaluationRuntimeJudge(Judge, Protocol):

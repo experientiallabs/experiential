@@ -81,7 +81,7 @@ def _parse_transitions(rag_id: str, payload: bytes) -> tuple[RAGTransition, ...]
     try:
         return tuple(
             RAGTransition.model_validate_json(line)
-            for line in payload.decode("utf-8").splitlines()
+            for line in payload.decode("utf-8").split("\n")
             if line
         )
     except (UnicodeDecodeError, ValidationError, ValueError) as exc:
@@ -93,7 +93,7 @@ def _parse_vectors(rag_id: str, payload: bytes) -> tuple[RAGVector, ...]:
     try:
         return tuple(
             RAGVector.model_validate_json(line)
-            for line in payload.decode("utf-8").splitlines()
+            for line in payload.decode("utf-8").split("\n")
             if line
         )
     except (UnicodeDecodeError, ValidationError, ValueError) as exc:

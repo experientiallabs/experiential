@@ -41,6 +41,7 @@ class _AccountModelLister:
             provider="openai-compatible",
             api_key=self.api_key,
             base_url="https://api.preview.experientiallabs.ai/v1",
+            catalog="experiential",
         )
         return (
             DiscoveredModel(provider="openai-compatible", model="exp-chat"),

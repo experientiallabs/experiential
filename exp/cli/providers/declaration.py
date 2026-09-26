@@ -1,13 +1,11 @@
 """Operator-declared capability and price metadata for discovered model identities.
 
 Discovery may list an OpenAI-compatible identity before any capability or price is proven.
-This module collects only the minimum fields a selected build role needs, confirms published
-values when they exist, and never infers tools, structured output, token limits, or prices.
+This module collects only missing fields a selected build role needs, reuses published values,
+and never guesses tools, structured output, token limits, or prices.
 """
 
 from __future__ import annotations
-
-from typing import get_args
 
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt
@@ -20,6 +18,7 @@ from exp.cli.providers.provider_picker import (
     ask_price,
     ask_text,
 )
+from exp.cli.providers.reasoning import REASONING_DISPLAY_ORDER
 from exp.cli.shared.picker import PickerAction, PickerOption, choose_one
 from exp.common.models import (
     ModelCapabilities,
@@ -27,12 +26,13 @@ from exp.common.models import (
     ReasoningEffort,
     SetupRole,
     derive_model_alias,
+    resolve_discovered_model,
     served_roles,
     serves_role,
 )
 
 _NO_REASONING_EFFORT = "__unset_reasoning_effort__"
-_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
+_REASONING_EFFORTS = REASONING_DISPLAY_ORDER
 _COMPLETION_PRICE_FIELDS = (
     ("input_cost_per_million_tokens_usd", "Input cost per million tokens in USD"),
     ("output_cost_per_million_tokens_usd", "Output cost per million tokens in USD"),
@@ -66,7 +66,7 @@ def can_declare_role(item: AvailableModel, role: SetupRole) -> bool:
     Returns:
         ``True`` only for OpenAI-compatible identities that do not already prove the role.
     """
-    if item.provider != "openai-compatible":
+    if item.provider != "openai-compatible" or _role_denied(item, role):
         return False
     return item.capabilities is None or not serves_role(item.capabilities, role)
 
@@ -82,11 +82,23 @@ def eligible_for_role(item: AvailableModel, role: SetupRole) -> bool:
         ``True`` when verified metadata serves the role, the exact prior binding retains it,
         or the operator can declare the missing fields.
     """
-    return (
+    return not _role_denied(item, role) and (
         (item.capabilities is not None and serves_role(item.capabilities, role))
         or role in item.retainable_roles
         or can_declare_role(item, role)
     )
+
+
+def _role_denied(item: AvailableModel, role: SetupRole) -> bool:
+    """Reject roles whose required protocol is explicitly denied by published metadata."""
+    required = (
+        ("supports_embeddings",)
+        if role is SetupRole.EMBEDDER
+        else ("supports_completions", "supports_structured_output")
+        if role is SetupRole.JUDGE
+        else ("supports_completions",)
+    )
+    return any(_known_bool(item, field) is False for field in required)
 
 
 def merge_declared_models(
@@ -120,7 +132,7 @@ def declare_role_metadata(
 ) -> AvailableModel | None:
     """Collect the minimum operator-declared metadata one selected role requires.
 
-    Published values are confirmed. Missing required fields are asked. Advanced capabilities
+    Published values are reused. Missing required fields are asked. Advanced capabilities
     and prices that the role does not need stay unknown.
 
     Args:
@@ -135,10 +147,7 @@ def declare_role_metadata(
     Raises:
         SetupCancelled: The operator cancelled setup at a prompt.
     """
-    console.print(
-        f"[dim]{item.alias} has {UNKNOWN_METADATA_LABEL}. "
-        f"Declare the minimum {role.value.replace('_', ' ')} metadata to use it.[/dim]"
-    )
+    console.print(f"[dim]Missing {role.value.replace('_', ' ')} metadata for {item.alias}.[/dim]")
     try:
         capabilities = _capabilities_for_role(item, role, console=console)
     except _DeclarationRejected:
@@ -155,6 +164,7 @@ def declare_role_metadata(
         configured=item.configured,
         retainable_roles=item.retainable_roles,
         published=item.published,
+        supported_reasoning_efforts=item.supported_reasoning_efforts,
     )
 
 
@@ -276,7 +286,11 @@ def _capabilities_for_role(
         SetupCancelled: The operator cancelled setup.
         _DeclarationRejected: A required capability was declined.
     """
-    base = item.capabilities or ModelCapabilities()
+    base = item.capabilities or (
+        resolve_discovered_model(item.published).capabilities
+        if item.published is not None
+        else ModelCapabilities()
+    )
     updates: dict[str, bool | float | int | None] = {}
     if role is SetupRole.EMBEDDER:
         _require_flag(
@@ -333,7 +347,7 @@ def _require_flag(
     question: str,
     console: Console,
 ) -> None:
-    """Confirm a required boolean capability, using a published value as the default.
+    """Reuse a known capability and ask only when no source declares it.
 
     Args:
         item: Selected model.
@@ -346,9 +360,13 @@ def _require_flag(
         _DeclarationRejected: The operator declined the required capability.
     """
     published = _known_bool(item, field)
-    default = True if published is None else published
+    if published is True:
+        return
+    if published is False:
+        console.print(f"[yellow]This model does not support {question[9:-1].lower()}.[/yellow]")
+        raise _DeclarationRejected
     try:
-        accepted = Confirm.ask(question, default=default, console=console)
+        accepted = Confirm.ask(question, default=True, console=console)
     except (EOFError, KeyboardInterrupt) as exc:
         raise SetupCancelled from exc
     if not accepted:
@@ -363,7 +381,7 @@ def _require_price(
     label: str,
     console: Console,
 ) -> float:
-    """Confirm a published price or read an explicit nonnegative USD-per-million price.
+    """Reuse a known price or read an explicit nonnegative USD-per-million price.
 
     Args:
         item: Selected model.
@@ -372,22 +390,14 @@ def _require_price(
         console: Terminal used for the prompt.
 
     Returns:
-        The confirmed or newly declared price.
+        The published or newly declared price.
 
     Raises:
         SetupCancelled: The operator cancelled setup.
     """
     published = _known_price(item, field)
     if published is not None:
-        try:
-            if Confirm.ask(
-                f"Use published {label.casefold()} {published:g}?",
-                default=True,
-                console=console,
-            ):
-                return published
-        except (EOFError, KeyboardInterrupt) as exc:
-            raise SetupCancelled from exc
+        return published
     return ask_price(label, console=console)
 
 
@@ -398,7 +408,7 @@ def _require_positive_int(
     label: str,
     console: Console,
 ) -> int:
-    """Confirm a published positive limit or read a new one.
+    """Reuse a known positive limit or read a new one.
 
     Args:
         item: Selected model.
@@ -415,15 +425,7 @@ def _require_positive_int(
     """
     published = _known_positive_int(item, field)
     if published is not None:
-        try:
-            if Confirm.ask(
-                f"Use published {label.casefold()} {published}?",
-                default=True,
-                console=console,
-            ):
-                return published
-        except (EOFError, KeyboardInterrupt) as exc:
-            raise SetupCancelled from exc
+        return published
     try:
         value = IntPrompt.ask(label, console=console)
     except (EOFError, KeyboardInterrupt) as exc:
@@ -498,13 +500,17 @@ def _known_bool(item: AvailableModel, field: str) -> bool | None:
         value = getattr(item.published, field)
         if isinstance(value, bool):
             return value
-    if item.capabilities is None or item.pricing_source is not PricingSource.CONFIGURED:
+    if item.capabilities is None:
         return None
     value = getattr(item.capabilities, field)
     if value is True:
         return True
     declared_false = {"supports_completions", "supports_embeddings", "supports_tools"}
-    if field in declared_false and value is False:
+    if (
+        item.pricing_source is PricingSource.CONFIGURED
+        and field in declared_false
+        and value is False
+    ):
         return False
     return None
 

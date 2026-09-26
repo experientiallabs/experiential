@@ -19,7 +19,8 @@ from exp.common.core.artifacts import (
 from exp.common.evaluations.build import load_evaluation_dataset
 from exp.common.evaluations.dataset import EvaluationRow
 from exp.common.evaluations.evidence import EvaluationEvidenceError
-from exp.common.models import RoutedCandidateSnapshot
+from exp.common.evaluations.operating_cost import operating_row
+from exp.common.models import RoutedCandidateSnapshot, load_pricing_snapshot
 from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import load_task_set
 
@@ -108,6 +109,8 @@ def build_model_evaluation_report(
         row.purpose == "fidelity" or row.status == "observed" for row in dataset.rows
     ):
         raise EvaluationEvidenceError("model comparisons require fresh non-fidelity simulations")
+    pricing, _ = load_pricing_snapshot(store, dataset.manifest.protocols[0].pricing_snapshot_id)
+    prices = {price.candidate_alias: price for price in pricing.candidate_prices}
     indexed: dict[str, dict[tuple[str, int, str], EvaluationRow]] = {
         candidate.alias: {} for candidate in candidates
     }
@@ -115,7 +118,7 @@ def build_model_evaluation_report(
         key = (row.task_id, row.repeat, row.purpose)
         if key in indexed[row.candidate_alias]:
             raise EvaluationEvidenceError("model comparison repeats a worker/scenario coordinate")
-        indexed[row.candidate_alias][key] = row
+        indexed[row.candidate_alias][key] = operating_row(store, row, prices[row.candidate_alias])
     planned = set(indexed[candidates[0].alias])
     if not planned or any(set(rows) != planned for rows in indexed.values()):
         raise EvaluationEvidenceError("model comparison workers need identical planned scenarios")
@@ -137,7 +140,7 @@ def build_model_evaluation_report(
     report_id = stable_id(
         "model-report",
         {
-            "version": 1,
+            "version": 2,
             "evaluation": evaluation_input.model_dump(mode="json"),
             "tasks": task_input.model_dump(mode="json"),
             "code_revision": code_revision,

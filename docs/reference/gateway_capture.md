@@ -169,15 +169,17 @@ tree while encoding and persisting it. Separate bounds cover in-flight entry cou
 and request lifetime. Expiration runs on collector operations and once per second
 on an idle destination worker; a blocked destination delays idle maintenance but
 does not remove the memory caps. A response reserves its complete buffer allowance
-before reading any provider bytes. Saturated delivery waits for capacity rather
-than discarding records. Sustained storage pressure therefore increases latency and
-limits throughput to what the destination can persist.
+before reading any provider bytes. Synchronous delivery waits for capacity rather
+than discarding records. Asynchronous delivery retains the handoff under its
+existing admission charge instead. Sustained storage pressure can exhaust the
+separate admission or response-memory bounds in either mode.
 
 When capture is required but admission cannot register it, the gateway returns a
 sanitized `capture_unavailable` 503 before provider dispatch. Policy-disabled capture
 still serves normally. An eligible response waits for durable acknowledgement
-unless its host explicitly enables asynchronous delivery. Both modes wait for
-bounded queue capacity. A destination error retains the current record and
+unless its host explicitly enables asynchronous delivery. Asynchronous handoff
+does not wait for delivery-queue capacity; it does not remove admission or
+response-memory bounds. A destination error retains the current record and
 its queue slot, and retries with exponential backoff from 25 milliseconds to one
 second. There is no retry-count expiry: a persistent outage backpressures capture
 instead of discarding accepted data. A malformed or oversized payload that cannot

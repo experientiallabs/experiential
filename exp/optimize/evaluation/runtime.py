@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from exp.common.core.artifacts import (
@@ -12,18 +13,22 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations import EvaluationPlan
 from exp.common.models import ModelSnapshot, verify_completion_reservation
-from exp.common.progress import ProgressHook
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuation import EvaluationRuntimeContract, validate_continuation
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices
 from exp.optimize.evaluation.judge import DurableEvaluationJudge
+from exp.optimize.evaluation.judging_resume import revised_judge_setup
+from exp.optimize.evaluation.judging_spend import judge_request_coordinates
 from exp.optimize.evaluation.planning import estimate_model_evaluation
 from exp.optimize.evaluation.prepare import PreparedModelEvaluation, read_evaluation_judge
 from exp.optimize.evaluation.service import ModelEvaluationResult, evaluate_models
+from exp.optimize.evaluation.spending import BudgetedCompletion, BudgetedEmbedding
 from exp.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJudgeClient
 from exp.optimize.router.evaluation.build import completed_project_build
 from exp.runtime.agents import agent_factory_sha256, preflight_agent_factory, resolve_agent_factory
 from exp.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.engines.text import WorldModelSimulator
 from exp.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
@@ -41,25 +46,30 @@ def run_prepared_model_evaluation(
     created_at: datetime,
     code_revision: str,
     progress: ProgressHook | None = None,
+    judging_revision: ArtifactInput | None = None,
 ) -> ModelEvaluationResult:
-    """Execute a prepared worker matrix after host admission of its complete bounded quote.
+    """Execute a prepared worker matrix within an explicitly approved request-level allowance.
 
     Args:
         project: Owner of the completed scenario, world-model and judge evidence.
         prepared: Exact engine preparation whose quote the user accepted.
         catalog: Runtime catalog holding transient provider credential references.
-        budget: Host-authorized provider ceiling and judgment count.
+        budget: Approved total provider allowance and judgment count. Raising only the
+            allowance resumes the same plan and replays completed provider responses for free.
         provider_spend_consented: Explicit consent after the host's atomic credit reservation.
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.
         progress: Observer of real simulator and judge progress.
+        judging_revision: Explicit fresh judging pass; requires saved completed rollouts.
 
     Returns:
         Persisted model report and reconciled execution costs, with exact replay.
 
     Raises:
+        SpendLimitReached: The next request cannot fit; saved calls remain exactly resumable.
         ValueError: Consent, quote admission, identities, configuration or artifacts drift.
     """
+    report(progress, "Verifying evaluation")
     validate_continuation(project, prepared)
     setup = prepared.setup
     selected = read_evaluation_judge(project, prepared.judge_setup)
@@ -69,6 +79,7 @@ def run_prepared_model_evaluation(
     ):
         raise ValueError("prepared judge differs from the evaluation; prepare again")
     calls_per_rollout = 2 if selected.prompt_template.response_shape == "pairwise" else 1
+    report(progress, "Checking evaluation estimate")
     quote = estimate_model_evaluation(
         project,
         setup,
@@ -77,11 +88,8 @@ def run_prepared_model_evaluation(
     )
     if quote != prepared.cost:
         raise ValueError("evaluation quote changed; prepare and approve a new estimate")
-    if (
-        budget.maximum_cost_usd < quote.maximum_cost_usd
-        or budget.maximum_judgments < quote.judgment_count
-    ):
-        raise ValueError("authorized evaluation budget cannot cover the complete reserved quote")
+    if budget.maximum_judgments < quote.judgment_count:
+        raise ValueError("authorized evaluation judgment count is too small")
     config = project.load_project()
     prompt = config.system.system_prompt if config.system else None
     if (
@@ -98,6 +106,13 @@ def run_prepared_model_evaluation(
         raise ValueError(
             "evaluation requires explicit provider-spend consent after credit admission"
         )
+    judge_request = prepared.judge_request
+    judging_protocol = None
+    if judging_revision is not None:
+        selected, judge_request, judging_protocol = revised_judge_setup(
+            project, prepared, judging_revision
+        )
+    report(progress, "Verifying built project")
     completed = completed_project_build(project)
     completion_input = setup.simulation_completion_input
     retrieval = setup.world_model_settings.query_embedding
@@ -122,6 +137,7 @@ def run_prepared_model_evaluation(
             raise ValueError(f"resolved evaluation model {alias!r} changed; prepare again")
         return resolved
 
+    report(progress, "Preparing model clients")
     candidates = {item.alias: resolve(item.alias, item.model) for item in setup.candidates}
     world = resolve(completion.world_model_alias, completion.world_model_request.model)
     judge_model = resolve(selected.judge_alias, selected.judge_model)
@@ -149,32 +165,77 @@ def run_prepared_model_evaluation(
         )
     if retrieval.maximum_attempts != attempts:
         raise ValueError("retrieval retry policy changed; prepare again")
+    ledger_identity = stable_id(
+        "evaluation-requests",
+        {
+            "prepared": prepared.model_dump(mode="json"),
+            "code_revision": code_revision,
+        },
+    )
+    ledger = RequestBudget(
+        project.paths.runtime_directory / "evaluation-requests" / ledger_identity,
+        identity=ledger_identity,
+        maximum_cost_usd=budget.maximum_cost_usd,
+    )
+    candidates = {
+        item.candidate_alias: replace(
+            candidates[item.candidate_alias],
+            client=BudgetedCompletion(
+                candidates[item.candidate_alias].client,
+                ledger,
+                item.request,
+                role=f"assistant:{item.candidate_alias}",
+                served_model_id=candidates[item.candidate_alias].served_model_id,
+            ),
+        )
+        for item in completion.candidate_requests
+    }
+    world = replace(
+        world,
+        client=BudgetedCompletion(
+            world.client,
+            ledger,
+            completion.world_model_request,
+            role="world",
+            served_model_id=world.served_model_id,
+        ),
+    )
     bounded_judge = ReservedJudgeClient(
-        judge_model.client,
-        reservation=prepared.judge_request,
+        BudgetedCompletion(
+            judge_model.client,
+            ledger,
+            judge_request,
+            role="judge",
+            served_model_id=judge_model.served_model_id,
+        ),
+        reservation=judge_request,
         model=judge_model.snapshot,
         capabilities=judge_model.capabilities,
         maximum_attempts=attempts,
         maximum_provider_calls=quote.judgment_count * calls_per_rollout,
+        served_model_id=judge_model.served_model_id,
     )
     judge = AutomaticRouterJudge(
         bounded_judge,
         selected,
-        created_at=created_at,
-        code_revision=code_revision,
-        maximum_input_tokens=prepared.judge_request.maximum_input_tokens,
-        maximum_output_tokens=prepared.judge_request.maximum_output_tokens,
+        created_at=selected.created_at if judging_revision else created_at,
+        code_revision=selected.code_revision if judging_revision else code_revision,
+        maximum_input_tokens=judge_request.maximum_input_tokens,
+        maximum_output_tokens=judge_request.maximum_output_tokens,
+        request_scope=ledger.scope,
     )
+    report(progress, "Loading retrieval index")
     retriever = load_fit_rag_retriever(
         project.artifacts,
         completed.fit_rag,
         embedder=RAGEmbedderBinding(
-            client=embedder.embedding_client,
+            client=BudgetedEmbedding(embedder.embedding_client, ledger, retrieval),
             snapshot=embedder.snapshot,
             maximum_attempts=attempts,
             input_usd_per_million_tokens=retrieval.input_usd_per_million_tokens,
         ),
     )
+    report(progress, "Loading world model")
     grounded = bind_fit_grounded_world_model(
         project.artifacts,
         completed.world_model,
@@ -184,6 +245,10 @@ def run_prepared_model_evaluation(
 
     def simulator_factory(project: ProjectStore, plan: EvaluationPlan) -> WorldModelSimulator:
         """Bind one fresh simulator to the exact persisted evaluation matrix."""
+        if judging_revision is not None:
+            raise ValueError(
+                "judging retry requires finished saved rollouts; resume simulation first"
+            )
         return WorldModelSimulator(
             store=project.artifacts,
             evaluation_plan=plan,
@@ -198,18 +263,36 @@ def run_prepared_model_evaluation(
             completion_contract_input=completion_input,
             redacted_field_names=prepared.redacted_field_names,
             progress=progress,
+            request_budget=ledger,
         )
 
+    coordinates_by_rollouts: dict[tuple[str, ...], tuple[tuple[str, str, int], ...]] = {}
+
+    def judge_spend(rollout_ids: tuple[str, ...]) -> float:
+        """Reconcile every paid judge response and unknown attempt across the reviewed lineage."""
+        if rollout_ids not in coordinates_by_rollouts:
+            coordinates_by_rollouts[rollout_ids] = judge_request_coordinates(
+                project, prepared, judging_revision, rollout_ids
+            )
+        return ledger.accounted_requests(coordinates_by_rollouts[rollout_ids])
+
+    report(progress, "Freezing execution plan")
     runtime_input = _persist_runtime_contract(project, prepared, created_at, code_revision)
     return evaluate_models(
         project,
         setup,
         services=EvaluationServices(
             simulator_factory,
-            DurableEvaluationJudge(judge, bounded_judge, prepared.judge_request),
+            DurableEvaluationJudge(judge, bounded_judge, judge_request, budget=ledger),
             (runtime_input,),
+            judging_protocol=judging_protocol,
+            judging_input=judging_revision,
+            spending_limit_usd=budget.maximum_cost_usd,
+            judge_spend=judge_spend,
         ),
-        budget=budget,
+        # Semantic execution bounds stay frozen across allowance increases. The request
+        # ledger enforces the smaller approved amount before every paid dispatch.
+        budget=budget.model_copy(update={"maximum_cost_usd": max(quote.maximum_cost_usd, 1e-12)}),
         created_at=created_at,
         code_revision=code_revision,
         progress=progress,

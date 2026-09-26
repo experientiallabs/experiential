@@ -159,7 +159,16 @@ class GatewayEventKind(StrEnum):
 
 
 class GatewayEvent(ContractModel):
-    """One ordered provider-neutral stream event, including raw tool fragments."""
+    """One ordered provider-neutral stream event, including raw tool fragments.
+
+    Attributes:
+        choice_logprobs_delta: Optional typed Chat token probabilities for this event.
+        responses_output_index: Optional nonnegative Responses output-item index.
+        responses_item_id: Optional nonempty Responses item identity, at most 256 characters.
+        responses_content_index: Optional nonnegative index within one output item.
+        responses_logprobs_phase: Optional delta or completion phase for native probability records.
+        responses_logprobs_records: Optional ordered native probability objects, preserving content.
+    """
 
     kind: GatewayEventKind
     sequence_number: int = Field(ge=0)

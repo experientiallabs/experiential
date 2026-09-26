@@ -326,6 +326,43 @@ def test_top_level_budget_reaches_budget_capable_anthropic_models(model: str) ->
     assert "thinking_budget->translated(thinking.budget_tokens)" in public.ignored_parameters
 
 
+@pytest.mark.parametrize("nested", (False, True))
+def test_anthropic_numeric_budget_applies_reasoning_sampling_policy(nested: bool) -> None:
+    """Top-level and nested budgets enable thinking before temperature/top-p admission."""
+    control: JsonObject = (
+        {"thinking": {"type": "enabled", "budget_tokens": 2048}}
+        if nested
+        else {"thinking_budget": 2048}
+    )
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4096,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            **control,
+        }
+    ).request
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        model_id="claude-haiku-4-5",
+        url="https://api.anthropic.com/v1/messages",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+        supports_temperature=True,
+        supports_top_p=True,
+        sampling_requires_reasoning_none=True,
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+    assert provider.temperature is None and provider.top_p is None
+    assert "temperature->dropped(set_reasoning_effort_none)" in public.ignored_parameters
+    assert "top_p->dropped(set_reasoning_effort_none)" in public.ignored_parameters
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+    assert "temperature" not in payload and "top_p" not in payload
+
+
 @pytest.mark.parametrize("budget", (0, -1, 1024))
 def test_gemini_budget_sentinels_join_replay_identity(budget: int) -> None:
     """Explicit zero, dynamic thinking and a numerical target are distinct requests."""

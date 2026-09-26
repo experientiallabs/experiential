@@ -18,6 +18,10 @@ from exp.simulation.retrieval.store import LoadedRAGIndex, load_rag_index
 from exp.simulation.retrieval.transitions import render_rag_key
 
 
+class RAGQueryInputLimitError(ValueError):
+    """An eligible query needs more embedding input than its frozen reservation."""
+
+
 class TraceRAGRetriever:
     """Serve stable nearest real transitions without mutating the persisted corpus."""
 
@@ -95,6 +99,8 @@ class TraceRAGRetriever:
             raise ValueError("query-embedding reservation retry bound differs from the client")
         if reservation.input_usd_per_million_tokens != self.input_usd_per_million_tokens:
             raise ValueError("query-embedding reservation price differs from the active catalog")
+        if not self._has_eligible_transition(query):
+            return OperationEconomics(cost_usd=NumericMeasurement(value=0, provenance="estimated"))
         key_text = render_rag_key(
             task=query.task,
             initial_context=query.initial_context,
@@ -102,7 +108,9 @@ class TraceRAGRetriever:
         )
         input_tokens = len(key_text.encode("utf-8"))
         if input_tokens > reservation.maximum_input_tokens:
-            raise ValueError("canonical RAG query exceeds its reserved input-token ceiling")
+            raise RAGQueryInputLimitError(
+                "canonical RAG query exceeds its reserved input-token ceiling"
+            )
         maximum_input_tokens = input_tokens * reservation.maximum_attempts
         cost = maximum_input_tokens * reservation.input_usd_per_million_tokens / 1_000_000
         return OperationEconomics(cost_usd=NumericMeasurement(value=cost, provenance="estimated"))
@@ -120,6 +128,8 @@ class TraceRAGRetriever:
         Raises:
             ValueError: Query embedding dimensions differ from the frozen index.
         """
+        if not self._has_eligible_transition(query):
+            return ()
         key_text = render_rag_key(
             task=query.task,
             initial_context=query.initial_context,
@@ -143,6 +153,11 @@ class TraceRAGRetriever:
         candidates.sort(key=lambda match: (-match.score, match.transition.transition_id))
         limit = self._index.default_top_k if query.top_k is None else query.top_k
         return tuple(candidates[:limit])
+
+    def _has_eligible_transition(self, query: RAGQuery) -> bool:
+        """Check lineage eligibility before estimating or dispatching an embedding."""
+        excluded = set(query.excluded_lineage_ids)
+        return any(transition.lineage_id not in excluded for transition in self._transitions)
 
 
 def load_fit_rag_retriever(

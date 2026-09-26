@@ -11,11 +11,14 @@ from exp.common.judging import verify_persisted_calibration
 from exp.common.models import CompletionCostReservation
 from exp.common.project import ProjectStore
 from exp.common.tasks import load_task_set
+from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationSetup
+from exp.optimize.evaluation.usage_estimate import expected_completion_cost, task_usage
 from exp.optimize.router.evaluation.build import completed_project_build
 from exp.optimize.router.evaluation.setup import verify_router_evaluation_setup
 from exp.simulation.engines.text.grounding import maximum_query_reservation
 from exp.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
+from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.specs import load_simulation_completion_contract
 
 
@@ -49,6 +52,9 @@ class EvaluationCostPlan(ContractModel):
         judge: Judge-model estimates and maximum spend.
         estimated_cost_usd: Nonnegative finite sum of stage estimates.
         maximum_cost_usd: Nonnegative finite sum of stage ceilings.
+        captured_turns: Source-sized assistant turns per scenario matrix, before model repeats.
+        measured_turns: Those turns with recorded provider token counts.
+        estimate_basis: Human-readable assumptions for the expected workload.
     """
 
     quote_sha256: Sha256
@@ -61,6 +67,9 @@ class EvaluationCostPlan(ContractModel):
     judge: EvaluationCostComponent
     estimated_cost_usd: float = Field(ge=0, allow_inf_nan=False)
     maximum_cost_usd: float = Field(ge=0, allow_inf_nan=False)
+    captured_turns: float = Field(ge=0, allow_inf_nan=False)
+    measured_turns: float = Field(ge=0, allow_inf_nan=False)
+    estimate_basis: str
 
 
 def estimate_model_evaluation(
@@ -132,38 +141,148 @@ def estimate_model_evaluation(
         raise ValueError("evaluation estimates require an explicit query embedding reservation")
     count = len(tasks)
     workers = len(setup.candidates)
-    steps = count * setup.maximum_steps
-    worker_cost = _sum_completion(tuple(requests.values()), steps)
-    world_cost = _sum_completion((contract.world_model_request,), steps * workers)
+    traces = load_trace_dataset(project.artifacts, completed.trace_dataset.artifact_id).traces
+    by_id = {trace.trace_id: trace for trace in traces}
+    rag = load_rag_index(project.artifacts, setup.fit_rag_input.artifact_id)
+    usage = tuple(
+        task_usage(
+            task,
+            tuple(by_id[identity] for identity in task.source_trace_ids),
+            rag.transitions,
+            top_k=rag.index.default_top_k,
+            maximum_steps=setup.maximum_steps,
+            maximum_query_tokens=retrieval.maximum_input_tokens,
+        )
+        for task in tasks
+    )
+    worker_estimate = setup.repeats * math.fsum(
+        expected_completion_cost(request, item.assistant_input, item.assistant_output)
+        for request in requests.values()
+        for item in usage
+    )
+    worker_maximum = (
+        count
+        * setup.repeats
+        * MAXIMUM_CELL_ATTEMPTS
+        * math.fsum(
+            (
+                request.maximum_attempts
+                * setup.maximum_steps
+                * request.maximum_input_tokens
+                * max(
+                    request.input_usd_per_million_tokens,
+                    request.cached_input_usd_per_million_tokens,
+                    request.cache_write_usd_per_million_tokens,
+                )
+                + (
+                    min(
+                        setup.maximum_steps * request.maximum_output_tokens,
+                        setup.maximum_rollout_output_tokens,
+                    )
+                    + setup.maximum_steps
+                    * (request.maximum_attempts - 1)
+                    * min(request.maximum_output_tokens, setup.maximum_rollout_output_tokens)
+                )
+                * request.output_usd_per_million_tokens
+            )
+            / 1_000_000
+            for request in requests.values()
+        )
+    )
+    worker_cost = EvaluationCostComponent(
+        estimated_cost_usd=min(worker_estimate, worker_maximum),
+        maximum_cost_usd=worker_maximum,
+    )
+    world_maximum = (
+        count
+        * setup.repeats
+        * setup.maximum_steps
+        * workers
+        * MAXIMUM_CELL_ATTEMPTS
+        * contract.world_model_request.absolute_maximum_call_cost_usd()
+    )
+    world_cost = EvaluationCostComponent(
+        estimated_cost_usd=min(
+            world_maximum,
+            setup.repeats
+            * workers
+            * math.fsum(
+                expected_completion_cost(
+                    contract.world_model_request, item.world_input, item.world_output
+                )
+                for item in usage
+            ),
+        ),
+        maximum_cost_usd=world_maximum,
+    )
     retrieval_reservation = maximum_query_reservation(retrieval).cost_usd
     assert retrieval_reservation is not None
-    retrieval_cost = steps * workers * retrieval_reservation.value
-    # Generated tool calls consume output tokens, so the request output ceiling
-    # bounds retrieval count without an unrelated fixed tool-call limit.
     tool_tasks = sum(bool(task.tools) for task in tasks)
-    query_count = setup.maximum_steps * sum(
-        tool_tasks * request.maximum_output_tokens + count - tool_tasks
+    # Every tool action consumes generated tokens. The cumulative output budget applies
+    # once per rollout, not once per step; this bound never imposes a new tool-call limit.
+    query_count = setup.repeats * sum(
+        tool_tasks
+        * min(
+            setup.maximum_steps * request.maximum_output_tokens, setup.maximum_rollout_output_tokens
+        )
+        + (count - tool_tasks) * setup.maximum_steps
         for request in requests.values()
     )
+    retrieval_maximum = query_count * retrieval_reservation.value * MAXIMUM_CELL_ATTEMPTS
     retrieval_component = EvaluationCostComponent(
-        estimated_cost_usd=retrieval_cost,
-        maximum_cost_usd=query_count * retrieval_reservation.value * MAXIMUM_CELL_ATTEMPTS,
+        estimated_cost_usd=min(
+            retrieval_maximum,
+            setup.repeats
+            * workers
+            * math.fsum(
+                item.query_input * retrieval.input_usd_per_million_tokens / 1_000_000
+                for item in usage
+            ),
+        ),
+        maximum_cost_usd=retrieval_maximum,
     )
-    judge_count = count * workers
-    judge_component = _sum_completion(
-        (judge_request,), judge_count * judge_calls_per_rollout, cell_attempts=1
+    judge_count = count * workers * setup.repeats
+    judge_maximum = (
+        judge_count * judge_calls_per_rollout * judge_request.absolute_maximum_call_cost_usd()
+    )
+    judge_component = EvaluationCostComponent(
+        estimated_cost_usd=min(
+            judge_maximum,
+            workers
+            * setup.repeats
+            * judge_calls_per_rollout
+            * math.fsum(
+                expected_completion_cost(
+                    judge_request,
+                    min(item.judge_input, judge_request.maximum_input_tokens),
+                    min(512, judge_request.maximum_output_tokens),
+                )
+                for item in usage
+            ),
+        ),
+        maximum_cost_usd=judge_maximum,
     )
     components = (worker_cost, world_cost, retrieval_component, judge_component)
     return EvaluationCostPlan(
         quote_sha256=sha256_json(
             {
-                "version": 1,
+                "version": 2,
+                "trace_dataset": completed.trace_dataset.model_dump(mode="json"),
                 "task_set": completed.task_set.model_dump(mode="json"),
                 "calibration": calibration_input.model_dump(mode="json"),
                 "setup": setup.model_dump(mode="json"),
                 "judge_request": judge_request.model_dump(mode="json"),
                 "judge_calls_per_rollout": judge_calls_per_rollout,
             }
+        ),
+        captured_turns=math.fsum(item.turns for item in usage),
+        measured_turns=math.fsum(item.measured_turns for item in usage),
+        estimate_basis=(
+            "Captured requests and tool responses; missing usage uses approximately four "
+            "UTF-8 bytes/token. World prompts include average eligible RAG examples. "
+            "Judge assumes a transcript plus 1,024 framing tokens and 512 output tokens. "
+            "No assumed cache savings or retries. Future reasoning, world state and "
+            "model behavior may change usage."
         ),
         scenario_count=count,
         worker_count=workers,
@@ -174,20 +293,4 @@ def estimate_model_evaluation(
         judge=judge_component,
         estimated_cost_usd=math.fsum(item.estimated_cost_usd for item in components),
         maximum_cost_usd=math.fsum(item.maximum_cost_usd for item in components),
-    )
-
-
-def _sum_completion(
-    requests: tuple[CompletionCostReservation, ...],
-    calls: int,
-    *,
-    cell_attempts: int = MAXIMUM_CELL_ATTEMPTS,
-) -> EvaluationCostComponent:
-    """Use canonical cache-aware request pricing, distinguishing estimates from hard limits."""
-    return EvaluationCostComponent(
-        estimated_cost_usd=calls
-        * math.fsum(request.expected_maximum_call_cost_usd() for request in requests),
-        maximum_cost_usd=calls
-        * cell_attempts
-        * math.fsum(request.absolute_maximum_call_cost_usd() for request in requests),
     )

@@ -362,3 +362,22 @@ def test_forwards_tier_requires_a_card_and_a_tier_capable_dialect() -> None:
         dialect="anthropic_messages", url="https://byok.test", billing_customer_managed=True
     )
     assert byok_anthropic.forwards_tier("flex") is False
+
+
+@pytest.mark.parametrize("failures", [0, 1, 2])
+def test_success_reports_actual_provider_attempts(failures: int) -> None:
+    """Economics expose how many attempts actually happened, not the configured retry ceiling."""
+    transport = ScriptedJsonTransport(
+        [
+            *[JsonHttpResponse(status_code=503, body={}) for _ in range(failures)],
+            JsonHttpResponse(status_code=200, body={"answer": "ok"}),
+        ]
+    )
+    response = _client(transport).complete(
+        ModelRequest(
+            messages=(ModelMessage(role="user", content="hello"),),
+            maximum_output_tokens=100,
+        )
+    )
+    assert response.economics.provider_attempts == failures + 1
+    assert len(transport.requests) == failures + 1

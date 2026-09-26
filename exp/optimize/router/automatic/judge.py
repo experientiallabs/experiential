@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactInput
@@ -35,7 +37,7 @@ from exp.optimize.router.judging.contracts import (
 )
 from exp.optimize.router.judging.protocol import TemplateJudgeClient
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 class ReservedJudgeClient:
@@ -50,6 +52,7 @@ class ReservedJudgeClient:
         capabilities: ModelCapabilities,
         maximum_attempts: int,
         maximum_provider_calls: int,
+        served_model_id: str | None = None,
     ) -> None:
         """Validate active economics before exposing the provider client.
 
@@ -60,6 +63,7 @@ class ReservedJudgeClient:
             capabilities: Active explicit catalog declaration.
             maximum_attempts: Active client retry ceiling.
             maximum_provider_calls: Full scalar or counterbalanced provider-call ceiling.
+            served_model_id: Explicit catalog pin for an alternate provider-reported model ID.
 
         Raises:
             ValueError: Pricing, model, retries, capacity, or call ceiling is invalid.
@@ -74,6 +78,11 @@ class ReservedJudgeClient:
         )
         self._client = client
         self._reservation = reservation
+        self._served_model = (
+            model.model_copy(update={"model_id": served_model_id})
+            if served_model_id is not None
+            else model
+        )
         self._maximum_provider_calls = maximum_provider_calls
         self._calls = 0
         self._economics: list[OperationEconomics] = []
@@ -134,14 +143,15 @@ class ReservedJudgeClient:
                     output_tokens=output_tokens,
                 ),
             ) from exc
-        if response.model != self._reservation.model:
+        if response.model not in (self._reservation.model, self._served_model):
             raise ValueError("judge response model differs from its frozen reservation")
         economics = reconcile_completion_economics(
             self._reservation,
             response.economics,
         )
         self._economics.append(economics)
-        return response.model_copy(update={"economics": economics})
+        # The served pin is verified above; artifacts bind the finalized catalog identity.
+        return response.model_copy(update={"economics": economics, "model": self.model})
 
 
 class AutomaticRouterJudge:
@@ -156,6 +166,7 @@ class AutomaticRouterJudge:
         code_revision: str,
         maximum_input_tokens: int | None = None,
         maximum_output_tokens: int,
+        request_scope: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Bind the finalized manual setup and provider boundary.
 
@@ -166,6 +177,7 @@ class AutomaticRouterJudge:
             code_revision: Exact producer revision.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
             maximum_output_tokens: Approved per-call output-token reservation for dispatches.
+            request_scope: Optional durable request scope keyed by each finalized judge probe.
         """
         self._client = client
         self._setup = setup
@@ -173,6 +185,7 @@ class AutomaticRouterJudge:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._request_scope = request_scope
 
     @property
     def model(self) -> ModelSnapshot:
@@ -241,6 +254,7 @@ class AutomaticRouterJudge:
             code_revision=self._code_revision,
             maximum_input_tokens=self._maximum_input_tokens,
             maximum_output_tokens=self._maximum_output_tokens,
+            request_scope=self._request_scope,
         )
         return LMJudge(
             adapter,

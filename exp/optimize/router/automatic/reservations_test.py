@@ -346,8 +346,8 @@ def test_completion_reservation_prices_from_trace_estimate_and_admits_to_context
     )
 
 
-def test_completion_reservation_rejects_estimates_above_the_context_window() -> None:
-    """An input estimate that cannot fit the model context fails closed with a problem."""
+def test_completion_reservation_bounds_episode_estimates_to_request_capacity() -> None:
+    """A large historical episode cannot reject a model before seeing its actual requests."""
     problems: list[str] = []
 
     reservation = completion_reservation_from_catalog(
@@ -357,14 +357,66 @@ def test_completion_reservation_rejects_estimates_above_the_context_window() -> 
         model=_snapshot("world"),
         label="world model",
         maximum_attempts=3,
-        estimated_input_tokens=_LARGE_CONTEXT_TOKENS,
+        estimated_input_tokens=_LARGE_CONTEXT_TOKENS * 100,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
+    assert problems == []
+    assert reservation is not None
+    assert reservation.maximum_input_tokens == _LARGE_CONTEXT_TOKENS - _OUTPUT_TOKENS
+    assert reservation.estimated_input_tokens == reservation.maximum_input_tokens
+    assert reservation.maximum_output_tokens == _OUTPUT_TOKENS
+    assert (
+        reservation.estimated_maximum_call_cost_usd == reservation.absolute_maximum_call_cost_usd()
+    )
+
+
+def test_completion_reservation_identifies_missing_prices() -> None:
+    """A partial catalog reports the missing rate and recovery command instead of a blank error."""
+    catalog = _catalog()
+    capabilities = catalog.models["world"].capabilities
+    assert capabilities is not None
+    catalog.models["world"] = catalog.models["world"].model_copy(
+        update={
+            "capabilities": capabilities.model_copy(
+                update={"cache_write_cost_per_million_tokens_usd": None}
+            )
+        }
+    )
+    problems: list[str] = []
+    reservation = completion_reservation_from_catalog(
+        problems,
+        catalog=catalog,
+        alias="world",
+        model=_snapshot("world"),
+        label="world model",
+        maximum_attempts=3,
+        estimated_input_tokens=1000,
+        maximum_output_tokens=_OUTPUT_TOKENS,
+    )
+    assert reservation is None
+    assert len(problems) == 1
+    assert "world model alias 'world' is missing cache write prices" in problems[0]
+    assert "exp login" in problems[0]
+
+
+@pytest.mark.parametrize("estimate", [0, -1])
+def test_completion_reservation_rejects_nonpositive_estimates(estimate: int) -> None:
+    """Bounding positive planning inputs must not hide malformed estimates."""
+    problems: list[str] = []
+    reservation = completion_reservation_from_catalog(
+        problems,
+        catalog=_catalog(),
+        alias="world",
+        model=_snapshot("world"),
+        label="world model",
+        maximum_attempts=3,
+        estimated_input_tokens=estimate,
+        maximum_output_tokens=_OUTPUT_TOKENS,
+    )
     assert reservation is None
     assert problems == [
-        f"world model alias 'world' cannot fit the estimated {_LARGE_CONTEXT_TOKENS} input plus "
-        f"{_OUTPUT_TOKENS} output tokens inside its {_LARGE_CONTEXT_TOKENS}-token context window"
+        f"world model alias 'world' requires a positive input estimate; got {estimate}"
     ]
 
 

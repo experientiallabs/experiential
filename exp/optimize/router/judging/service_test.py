@@ -1351,7 +1351,10 @@ def test_pairwise_calibration_fails_before_labels_or_calls_without_same_task_pai
     assert store.artifacts.list_ids() == before_artifacts
 
 
-def test_interrupted_calibration_reuses_completed_probes_at_later_time(tmp_path: Path) -> None:
+@pytest.mark.parametrize("retry_revision", ["test-revision", "upgraded-revision"])
+def test_interrupted_calibration_reuses_completed_probes_at_later_time(
+    tmp_path: Path, retry_revision: str
+) -> None:
     """Retrying later reuses completed rows and dispatches only missing provider probes."""
     store = _built_store(tmp_path)
     _setup(store)
@@ -1409,7 +1412,7 @@ def test_interrupted_calibration_reuses_completed_probes_at_later_time(tmp_path:
         approve=False,
         accept_insufficient_labels=True,
         created_at=_TIME + timedelta(minutes=10),
-        code_revision="test-revision",
+        code_revision=retry_revision,
     )
 
     assert result.provider_calls_made == 2

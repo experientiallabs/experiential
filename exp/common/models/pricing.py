@@ -312,12 +312,13 @@ def reconcile_completion_economics(
 ) -> OperationEconomics:
     """Derive a conservative retry-inclusive charge from response economics.
 
-    A successful response exposes usage for its completed attempt but provider adapters do not
-    expose whether earlier retry attempts were billed. The derived charge therefore prices the
-    successful usage exactly under the frozen mutually exclusive rates and reserves, for every
-    possible earlier attempt, the observed request input at the highest input rate plus the full
-    reserved output budget. Earlier attempts of the same call sent the same request, so the
-    observed input size bounds them without charging the context-sized admission ceiling. A
+    A successful response exposes usage for its completed attempt. When the adapter reports
+    its actual attempt count, unused retry allowance is released. Otherwise every permitted
+    attempt remains possible. The charge prices successful usage under mutually exclusive
+    rates and reserves, for each earlier attempt whose billing is unresolved, observed request
+    input at the highest input rate plus the full reserved output budget. Earlier attempts
+    sent the same request, so observed input size bounds them without charging the context
+    ceiling. A
     provider cost measurement has no retry-coverage marker, so it is treated as successful-attempt
     evidence and never as proof that earlier attempts were free.
 
@@ -397,20 +398,17 @@ def reconcile_completion_economics(
         )
         + reservation.maximum_output_tokens * reservation.output_usd_per_million_tokens
     ) / 1_000_000
-    retry_inclusive_cost = (
-        successful_cost + (reservation.maximum_attempts - 1) * maximum_attempt_cost
-    )
+    attempts = economics.provider_attempts or reservation.maximum_attempts
+    if attempts > reservation.maximum_attempts:
+        raise ValueError("observed provider attempts exceed the request reservation")
+    retry_inclusive_cost = successful_cost + (attempts - 1) * maximum_attempt_cost
     derived_cost = max(
         retry_inclusive_cost,
         measured.value if measured is not None else 0.0,
     )
     if derived_cost > reservation.absolute_maximum_call_cost_usd():
         raise ValueError("derived completion spend exceeds its request reservation")
-    if (
-        measured is not None
-        and reservation.maximum_attempts == 1
-        and measured.value >= successful_cost
-    ):
+    if measured is not None and attempts == 1 and measured.value >= successful_cost:
         return economics
     return economics.model_copy(
         update={"cost_usd": NumericMeasurement(value=derived_cost, provenance="estimated")}
@@ -433,7 +431,7 @@ def verify_completion_reservation(
         maximum_attempts: Active provider retry ceiling.
 
     Raises:
-        ValueError: Model, pricing, capacity, or retry metadata drifted or is unknown.
+        ValueError: Model, pricing, context, or retry metadata drifted or is unknown.
     """
     expected_prices = (
         capabilities.input_cost_per_million_tokens_usd,
@@ -456,15 +454,21 @@ def verify_completion_reservation(
         raise ValueError("completion reservation pricing differs from the active catalog")
     if reservation.maximum_attempts != maximum_attempts:
         raise ValueError("completion reservation retry bound differs from the active client")
+    # Without a separate provider output limit, these are independent conservative ceilings.
+    # The simulator bounds each full request's combined input/output size before dispatch.
+    reserved_context = (
+        max(reservation.maximum_input_tokens, reservation.maximum_output_tokens)
+        if capabilities.maximum_output_tokens is None
+        else reservation.maximum_input_tokens + reservation.maximum_output_tokens
+    )
     if (
         capabilities.context_window_tokens is None
-        or reservation.maximum_input_tokens + reservation.maximum_output_tokens
-        > capabilities.context_window_tokens
+        or reserved_context > capabilities.context_window_tokens
     ):
         raise ValueError("completion reservation exceeds the active context capacity")
     if (
-        capabilities.maximum_output_tokens is None
-        or reservation.maximum_output_tokens > capabilities.maximum_output_tokens
+        capabilities.maximum_output_tokens is not None
+        and reservation.maximum_output_tokens > capabilities.maximum_output_tokens
     ):
         raise ValueError("completion reservation exceeds the active output capacity")
 
@@ -517,7 +521,10 @@ def persist_pricing_snapshot(
     created_at: datetime,
     code_revision: str,
 ) -> PricingSnapshot:
-    """Persist or exactly replay one candidate pricing snapshot.
+    """Persist or exactly replay candidate prices scoped to their producer revision.
+
+    A new producer revision gets a distinct snapshot so prior evaluations retain their
+    original prices and provenance. Repeated preparation within that revision replays exactly.
 
     Args:
         store: Project-local immutable artifact store.
@@ -534,7 +541,8 @@ def persist_pricing_snapshot(
     pricing_snapshot_id = stable_id(
         "pricing",
         {
-            "version": "candidate-pricing-v1",
+            "version": "candidate-pricing-v2",
+            "code_revision": code_revision,
             "prices": [price.model_dump(mode="json") for price in prices],
         },
     )

@@ -64,6 +64,7 @@ def validate_continuation(project: ProjectStore, prepared: PreparedModelEvaluati
         "maximum_rollout_output_tokens",
         "maximum_concurrency",
         "continuation_of",
+        "run_id",
     }
     if parent.setup.model_dump(exclude=mutable) != prepared.setup.model_dump(exclude=mutable):
         raise ValueError("continuation must retain worker, world, judge and reservation settings")

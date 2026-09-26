@@ -20,7 +20,7 @@ from exp.optimize.router.errors import (
 )
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.providers.openai import openai_responses_response
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 class _Client:

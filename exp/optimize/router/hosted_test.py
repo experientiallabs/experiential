@@ -79,6 +79,7 @@ from exp.optimize.router.hosted import (
 from exp.optimize.router.hosted import (
     restore_hosted_project_bundle as restore_project_bundle,
 )
+from exp.optimize.router.hosted_preflight import preflight_hosted
 from exp.optimize.router.hosted_spend import complete_component_entries
 from exp.optimize.router.spend import (
     ProviderSpendComponent,
@@ -99,12 +100,26 @@ from exp.simulation.retrieval import (
 from exp.simulation.world_model import persist_grounded_world_model
 
 
+@pytest.mark.parametrize("with_reasoning", [False, True])
 def test_hosted_workflow_runs_from_restored_bundle_and_replays_without_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    with_reasoning: bool,
 ) -> None:
     """Build, optimize, report, export, restore, and replay without fidelity or repeat calls."""
     prepared, catalog = _restored_prepared_project(tmp_path)
+    if with_reasoning:
+        catalog = catalog.model_copy(
+            update={
+                "roles": catalog.roles.model_copy(
+                    update={
+                        "world_model_reasoning_effort": "high",
+                        "judge_reasoning_effort": "medium",
+                        "candidate_reasoning_efforts": {"candidate-b": "low"},
+                    }
+                )
+            }
+        )
     state = _ProviderState()
     attempt_store = FileHostedAttemptAuthorityStore(tmp_path / "attempt-authority")
     authority = attempt_store.create()
@@ -289,6 +304,10 @@ def test_hosted_workflow_runs_from_restored_bundle_and_replays_without_dispatch(
     assert replay_state.embedding_calls == []
     assert replay_state.completion_calls == []
     assert attempt_store.unresolved(authority) is None
+    changed_roles = catalog.roles.model_copy(update={"judge_reasoning_effort": "high"})
+    changed_catalog = catalog.model_copy(update={"roles": changed_roles})
+    with pytest.raises(HostedRouterPreflightError, match="Project catalog differs"):
+        preflight_hosted(replay_store, _setup(), changed_catalog, _options())
 
 
 def test_hosted_workflow_preserves_mixed_billing_sources_without_private_aliases(

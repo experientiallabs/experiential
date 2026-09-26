@@ -204,6 +204,9 @@ class _Tool(AnthropicWireModel):
     ``eager_input_streaming`` conditionally). They forward verbatim on
     Anthropic rungs, which own their validity rules, and drop with
     disclosure elsewhere.
+
+    Attributes:
+        description: Optional verbatim tool instructions; bounded by the aggregate request limit.
     """
 
     name: str = Field(min_length=1, max_length=256)
