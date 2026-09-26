@@ -57,7 +57,7 @@ from exp.runtime.gateway.sqlite.migrations import connect_database
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_BATCH_SIZE = 128
-_BATCH_COLLECTION_WINDOW_SECONDS = 0.001
+_BATCH_COLLECTION_WINDOW_SECONDS = 0.00025
 _MAX_CHAIN_PREFLIGHT_WORKERS = 8
 
 _T = TypeVar("_T")
