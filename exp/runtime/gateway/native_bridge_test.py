@@ -1795,17 +1795,6 @@ def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None
     with pytest.raises(NativeBridgeError) as invalid_json:
         control.admit(json.dumps({"raw_key": raw_key, "body": "{not json"}))
     assert json.loads(invalid_json.value.public_error_json)["code"] == "invalid_json"
-    with pytest.raises(NativeBridgeError) as unauthenticated_invalid_json:
-        control.admit(
-            json.dumps(
-                {
-                    "raw_key": "exp_vk_invalid",
-                    "body": "{not json",
-                    "authenticate_before_body_decode": True,
-                }
-            )
-        )
-    assert json.loads(unauthenticated_invalid_json.value.public_error_json)["status_code"] == 401
     with pytest.raises(NativeBridgeError) as not_object:
         control.admit(json.dumps({"raw_key": raw_key, "body": "[1, 2]"}))
     assert json.loads(not_object.value.public_error_json)["code"] == "invalid_request"

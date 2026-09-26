@@ -14,6 +14,7 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
     Admission,
 };
+use crate::bridge::ChatAdmission;
 use crate::capture::reasoning::{checkpoint_winner, observe_winner};
 use crate::encode::{
     compact_json, completed_chat_body_with_carrier, completed_chat_body_with_ignored,
@@ -48,32 +49,25 @@ pub(crate) async fn chat(
         Ok(body) => body,
         Err(error) => return error_response(&error),
     };
+    let request_body_len = body.len();
 
     let raw_key = match bearer_key(&headers) {
         Ok(key) => key,
         Err(error) => return error_response(&error),
     };
     let idempotency_key = latin1_header(&headers, "idempotency-key");
-    if idempotency_key.is_some() {
+    let client_request_id = latin1_header(&headers, "x-client-request-id");
+    let body_text = if idempotency_key.is_some() {
         let authenticate = compact_json(&json!({"raw_key": raw_key}));
         if let Err(error) = state.bridge.call("authenticate", authenticate).await {
             return error_response(&error);
         }
-    }
-
-    let body_text = match String::from_utf8(body.to_vec()) {
-        Ok(text) => text,
-        Err(_) => {
-            // Preserve authentication-before-body-validation for invalid
-            // UTF-8 even when ordinary chat combines both control-plane steps.
-            if idempotency_key.is_none() {
-                let authenticate = compact_json(&json!({"raw_key": raw_key}));
-                if let Err(error) = state.bridge.call("authenticate", authenticate).await {
-                    return error_response(&error);
-                }
-            }
-            return error_response(&PublicError::invalid_json());
+        match String::from_utf8(body.to_vec()) {
+            Ok(text) => Some(text),
+            Err(_) => return error_response(&PublicError::invalid_json()),
         }
+    } else {
+        None
     };
 
     // Replay-keyed chat runs the python engine's exact idempotency protocol
@@ -85,9 +79,12 @@ pub(crate) async fn chat(
     // Only the standard Idempotency-Key opts into replay: callers reuse
     // x-client-request-id as a session correlation id across distinct
     // sequential requests, so it never keys an operation.
-    let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
-    if idempotency_key.is_some() {
+    if let Some(idempotency_key) = idempotency_key.as_ref() {
+        let body_text = match body_text.as_ref() {
+            Some(body_text) => body_text,
+            None => return error_response(&PublicError::internal()),
+        };
         let scope_argument = compact_json(&json!({
             "raw_key": raw_key,
             "body": body_text,
@@ -127,16 +124,29 @@ pub(crate) async fn chat(
         }
     }
 
-    let admit_argument = compact_json(&json!({
-        "raw_key": raw_key,
-        "body": body_text,
-        "authenticate_before_body_decode": idempotency_key.is_none(),
-        "idempotency_key": idempotency_key,
-        "client_request_id": client_request_id,
-        "client_ip": client_ip(&headers),
-        "capture_session_id": crate::capture::session_id(&headers),
-    }));
-    let admission_text = match state.bridge.call("admit", admit_argument).await {
+    let admission_result = if let Some(body_text) = body_text {
+        let admit_argument = compact_json(&json!({
+            "raw_key": raw_key,
+            "body": body_text,
+            "idempotency_key": idempotency_key,
+            "client_request_id": client_request_id,
+            "client_ip": client_ip(&headers),
+            "capture_session_id": crate::capture::session_id(&headers),
+        }));
+        state.bridge.call("admit", admit_argument).await
+    } else {
+        state
+            .bridge
+            .authenticate_then_admit_chat(ChatAdmission {
+                raw_key: raw_key.clone(),
+                body,
+                client_request_id: client_request_id.clone(),
+                client_ip: client_ip(&headers),
+                capture_session_id: crate::capture::session_id(&headers).map(str::to_owned),
+            })
+            .await
+    };
+    let admission_text = match admission_result {
         Ok(text) => text,
         Err(error) => {
             // A failed keyed admission abandons ownership so waiting
@@ -228,7 +238,7 @@ pub(crate) async fn chat(
         time_to_first_token: state.time_to_first_token,
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
-        approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        approximate_input_tokens: (request_body_len as f64) / 4.0,
         chat_logprobs: true,
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
