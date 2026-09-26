@@ -197,6 +197,7 @@ def estimate_model_evaluation(
         count
         * setup.repeats
         * setup.maximum_steps
+        * setup.world_model_settings.maximum_transition_attempts
         * workers
         * MAXIMUM_CELL_ATTEMPTS
         * contract.world_model_request.absolute_maximum_call_cost_usd()

@@ -15,6 +15,7 @@ from exp.common.progress import ProgressEvent
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
+from exp.optimize.evaluation.spending import BudgetedCompletion
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
     _TIME,
@@ -124,8 +125,9 @@ def test_unapproved_execution_precedes_credentials_and_writes(tmp_path: Path) ->
     assert before == (project.artifacts.list_ids(), state.credential_resolutions)
 
 
+@pytest.mark.parametrize("pause_on_correction", [False, True])
 def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pause_on_correction: bool
 ) -> None:
     """Parallel admission uses its request ledger and only retries the invalid cell."""
     project, catalog, state, prepared = _prepare(tmp_path)
@@ -148,8 +150,36 @@ def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
 
     monkeypatch.setattr(_CompletionClient, "complete", complete)
     monkeypatch.setattr(simulator, "resolution_spend", unexpected_rollout_scan)
+    original_budgeted = BudgetedCompletion.complete
+    paused = [False]
+
+    def budgeted_complete(client: BudgetedCompletion, request: ModelRequest) -> ModelResponse:
+        """Pause before a corrected simulator dispatch after the first reply is durably saved."""
+        correction = request.messages[-1].content or ""
+        if (
+            pause_on_correction
+            and not paused[0]
+            and correction.startswith("The previous simulator")
+        ):
+            paused[0] = True
+            raise SpendLimitReached(100, 1, 101)
+        return original_budgeted(client, request)
+
+    monkeypatch.setattr(BudgetedCompletion, "complete", budgeted_complete)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
     budget = EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100)
+    if pause_on_correction:
+        with pytest.raises(SpendLimitReached):
+            run_prepared_model_evaluation(
+                project,
+                prepared,
+                runtime,
+                budget=budget,
+                provider_spend_consented=True,
+                created_at=_TIME,
+                code_revision=_REVISION,
+            )
+        assert paused[0]
     result = run_prepared_model_evaluation(
         project,
         prepared,
@@ -163,7 +193,8 @@ def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
     assert result.report.compared_cells == prepared.cost.scenario_count
     assert all(row.quality == 1 for row in result.report.models)
     workers = [alias for alias, _ in state.completion_calls if alias.startswith("candidate-")]
-    assert len(workers) == 7  # Six requested cells plus one infrastructure retry.
+    assert len(workers) == 6  # Simulator-only retries preserve every candidate response.
+    assert sum(alias == "world" for alias, _ in state.completion_calls) == 7
     before = (len(state.completion_calls), len(state.embedding_calls))
     replay = run_prepared_model_evaluation(
         project,

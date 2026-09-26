@@ -577,8 +577,7 @@ class WorldModelSimulator:
                 binding_sha256=binding_digest(binding),
                 maximum_cost_usd=(None if self._request_budget else spec.maximum_cost_usd),
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
-                # The request ledger owns spend admission for evals. Re-reading every
-                # rollout under this shared cell lock can starve sibling workers.
+                # Ledger admission avoids starving siblings with corpus scans under this lock.
                 observed_spend_usd=lambda: (
                     None
                     if self._request_budget is not None
@@ -753,6 +752,7 @@ class WorldModelSimulator:
             maximum_rollout_output_tokens=spec.maximum_rollout_output_tokens,
             maximum_output_tokens=settings.maximum_output_tokens,
             world_model_json_object_output=settings.json_object_output,
+            maximum_transition_attempts=settings.maximum_transition_attempts,
             redacted_field_names=self._redacted_field_names,
             clock=self._clock,
             token_counter=self._token_counter,

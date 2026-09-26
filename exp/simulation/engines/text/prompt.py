@@ -193,6 +193,34 @@ def parse_world_model_transition(output: AssistantAction) -> TextWorldModelTrans
     return transition
 
 
+def retry_world_model_request(
+    request: ModelRequest, action: AssistantAction, reason: str
+) -> ModelRequest:
+    """Add private format feedback while retaining the exact original simulation evidence.
+
+    Args:
+        request: Original prepared request, without earlier correction messages.
+        action: Unchanged candidate action whose observations need a valid replacement.
+        reason: Content-free validation error from the pinned transition protocol.
+
+    Returns:
+        A complete replacement request without the rejected response or any judge feedback.
+    """
+    identities = json.dumps([call.call_id for call in action.tool_calls])
+    correction = ModelMessage(
+        role="user",
+        content=(
+            f"The previous simulator reply was invalid: {reason}. "
+            "Generate a complete replacement JSON transition using the original evidence. "
+            "Return exactly the required keys, with tool content encoded as JSON strings. "
+            f"The tool_results call_id values must be exactly {identities}, in that order. "
+            "For tool calls leave message empty and terminal false. For text actions return "
+            "a visible message or terminal true. Do not change the candidate action."
+        ),
+    )
+    return request.model_copy(update={"messages": (*request.messages, correction)})
+
+
 def validate_transition_action(
     transition: TextWorldModelTransition, action: AssistantAction
 ) -> None:
