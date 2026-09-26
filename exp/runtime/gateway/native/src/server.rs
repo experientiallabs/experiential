@@ -106,7 +106,7 @@ fn default_request_timeout_seconds() -> f64 {
 }
 
 fn default_callback_permits() -> usize {
-    4
+    8
 }
 
 fn default_native_usage_enabled() -> bool {

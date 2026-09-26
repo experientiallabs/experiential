@@ -288,10 +288,12 @@ def test_parse_args_keeps_ci_defaults() -> None:
     assert args.stream_requests == config.stream_measured_requests
     assert args.no_stream_ttft is False
     assert args.output_badge is None
+    assert args.output_diagnostics_json is None
 
 
 def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
     """The product gateway and mock are measured in one process-local report."""
+    diagnostics_path = tmp_path / "gateway-latency-diagnostics.json"
     report = run_latency_report(
         work_root=tmp_path,
         config=LatencyRunConfig(
@@ -305,6 +307,7 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
             timeout_s=10.0,
             measure_streaming_ttft=True,
         ),
+        output_diagnostics_json=diagnostics_path,
     )
     payload = json.loads(report.model_dump_json())
     assert payload["schema_name"] == SCHEMA_NAME
@@ -316,3 +319,51 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
     assert report.runner.gateway_engine == "rust"
     assert "raw_key" not in payload
     assert "EXP_LATENCY_MOCK_KEY" not in json.dumps(payload)
+    diagnostics = json.loads(diagnostics_path.read_text())
+    assert diagnostics["schema_name"] == "exp.gateway.latency_diagnostics"
+    gateway_metrics = diagnostics["gateway_metrics"]
+    assert set(gateway_metrics) == {
+        "time_to_first_byte_ms",
+        "request_duration_ms",
+        "permit_wait_ms",
+        "bridge_permit_wait_ms",
+        "bridge_call_ms",
+        "bridge_call_authenticate_ms",
+        "bridge_call_admit_ms",
+        "bridge_call_start_attempt_ms",
+        "bridge_call_settle_ms",
+        "bridge_call_other_ms",
+    }
+    assert gateway_metrics["bridge_call_ms"]["count"] > 0
+    assert gateway_metrics["bridge_call_authenticate_ms"]["count"] > 0
+    assert gateway_metrics["bridge_call_admit_ms"]["count"] > 0
+    assert gateway_metrics["bridge_call_start_attempt_ms"]["count"] > 0
+    assert gateway_metrics["bridge_call_settle_ms"]["count"] > 0
+    assert gateway_metrics["request_duration_ms"]["count"] > 0
+    assert gateway_metrics["bridge_permit_wait_ms"]["count"] > 0
+
+
+def test_diagnostics_write_failure_keeps_latency_report(tmp_path: Path) -> None:
+    """An unwritable optional sidecar warns without discarding measured results."""
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("file", encoding="utf-8")
+    config = LatencyRunConfig(
+        warmup_requests=0,
+        measured_requests=1,
+        concurrency=1,
+        repeats=1,
+        stream_warmup_requests=0,
+        stream_measured_requests=1,
+        stream_concurrency=1,
+        timeout_s=10.0,
+        measure_streaming_ttft=False,
+    )
+
+    with pytest.warns(RuntimeWarning, match="optional gateway latency diagnostics"):
+        report = run_latency_report(
+            work_root=tmp_path / "gateway-root",
+            config=config,
+            output_diagnostics_json=blocker / "gateway-latency-diagnostics.json",
+        )
+
+    assert report.representative_run.gateway.failures == 0

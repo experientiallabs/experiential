@@ -27,6 +27,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.ledger_chain_authority import prepare_ledger_chain_authority
 from exp.runtime.gateway.ledger_errors import (
     AttemptRejectedError as AttemptRejectedError,
 )
@@ -58,8 +59,8 @@ from exp.runtime.gateway.model_chain_authority import (
     ChainOperation,
     LocalSnapshotMemoOwner,
     SnapshotClassificationMemo,
+    SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
-    prepare_sqlite_chain_authority,
     serving_snapshot_limit,
 )
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
@@ -101,21 +102,19 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         operation: ChainOperation,
         *,
         connection: sqlite3.Connection | None = None,
+        observation: SQLiteChainAuthorityObservation | None = None,
     ) -> Iterator[SQLiteChainPreflight | None]:
-        """Classify before BEGIN, borrowing the writer's connection when supplied."""
-        with (
-            self._connect() if connection is None else nullcontext(connection) as connection,
-            prepare_sqlite_chain_authority(
-                connection,
-                authorization.organization_id,
-                authorization.alias_revision_id,
-                request_id=authorization.request_id,
-                operation=operation,
-                maximum_bytes=self.serving_snapshot_max_bytes,
-                remaining_seconds=authorization.deadline_monotonic - self._clock.monotonic(),
-                classification_memo=self.classification_memo,
-            ) as proof,
-        ):
+        """Classify before BEGIN from a writer read or its captured row observation."""
+        with prepare_ledger_chain_authority(
+            authorization,
+            operation,
+            connect=self._connect,
+            clock=self._clock,
+            serving_snapshot_max_bytes=self.serving_snapshot_max_bytes,
+            classification_memo=self.classification_memo,
+            connection=connection,
+            observation=observation,
+        ) as proof:
             yield proof
 
     def _require_chain_authority(

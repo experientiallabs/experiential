@@ -84,7 +84,13 @@ def _snapshot() -> JsonObject:
             "time_to_first_byte_ms": _histogram([2, 1] + [0] * 13, 120007.5, 4),
             "request_duration_ms": empty,
             "permit_wait_ms": empty,
+            "bridge_permit_wait_ms": empty,
             "bridge_call_ms": empty,
+            "bridge_call_authenticate_ms": empty,
+            "bridge_call_admit_ms": empty,
+            "bridge_call_start_attempt_ms": empty,
+            "bridge_call_settle_ms": empty,
+            "bridge_call_other_ms": empty,
         },
         "control_plane": _control_plane(),
     }
@@ -230,7 +236,28 @@ exp_gateway_time_to_first_byte_ms_count 4
         "exp_gateway_permit_wait_ms", "Milliseconds a request waited for an admission permit."
     )
     + _empty_histogram_lines(
+        "exp_gateway_bridge_permit_wait_ms",
+        "Milliseconds a bridge call waited for a Python callback worker.",
+    )
+    + _empty_histogram_lines(
         "exp_gateway_bridge_call_ms", "Milliseconds one control-plane bridge call took."
+    )
+    + _empty_histogram_lines(
+        "exp_gateway_bridge_call_authenticate_ms",
+        "Milliseconds spent in authenticate bridge calls.",
+    )
+    + _empty_histogram_lines(
+        "exp_gateway_bridge_call_admit_ms", "Milliseconds spent in admit bridge calls."
+    )
+    + _empty_histogram_lines(
+        "exp_gateway_bridge_call_start_attempt_ms",
+        "Milliseconds spent in start_attempt bridge calls.",
+    )
+    + _empty_histogram_lines(
+        "exp_gateway_bridge_call_settle_ms", "Milliseconds spent in settle bridge calls."
+    )
+    + _empty_histogram_lines(
+        "exp_gateway_bridge_call_other_ms", "Milliseconds spent in other bridge calls."
     )
     + _EXPECTED_CONTROL_PLANE
 )
@@ -277,7 +304,7 @@ def test_counters_end_in_total_and_histograms_close_at_inf() -> None:
         if not line.startswith("#") and line.rsplit(" ", 1)[0].endswith("_ms_count")
     }
     assert inf_counts == totals
-    assert len(inf_counts) == 4
+    assert len(inf_counts) == 10
 
 
 def test_a_torn_snapshot_still_renders_an_internally_consistent_histogram() -> None:

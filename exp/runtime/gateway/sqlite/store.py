@@ -5,7 +5,6 @@ from __future__ import annotations
 import hmac
 import sqlite3
 import time
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
@@ -36,7 +35,6 @@ from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.model_chain_authority import (
     LocalSnapshotMemoOwner,
     SnapshotClassificationMemo,
-    prepare_sqlite_chain_authority,
     refuse_sqlite_chain_snapshot,
     serving_snapshot_limit,
 )
@@ -53,6 +51,7 @@ from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionMutation,
 )
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
+from exp.runtime.gateway.sqlite.request_authority import authorize_sqlite_alias
 from exp.runtime.gateway.sqlite.setup_authority import (
     configure_direct_alias_with_identity,
 )
@@ -664,53 +663,19 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         """
         if deadline_monotonic <= self._clock.monotonic():
             raise GatewayStoreError("request deadline has already expired")
-        with self._transaction() as connection:
-            organization_id, identity_id, key_id = self._authenticate_in_transaction(
-                connection, raw_key
-            )
-            row = connection.execute(
-                """
-                SELECT a.alias_id, a.alias_name, a.active_revision_id,
-                       r.target_kind, r.pool_id, r.project_ref, r.activation_ref,
-                       r.catalog_sha256, r.refusal_failover
-                FROM identity_alias_grants AS g
-                JOIN identities AS i
-                  ON i.organization_id = g.organization_id AND i.identity_id = g.identity_id
-                JOIN gateway_aliases AS a
-                  ON a.organization_id = g.organization_id AND a.alias_id = g.alias_id
-                JOIN alias_revisions AS r
-                  ON r.organization_id = a.organization_id
-                 AND r.alias_id = a.alias_id
-                 AND r.revision_id = a.active_revision_id
-                WHERE g.organization_id = ? AND g.identity_id = ?
-                  AND a.alias_name = ? AND i.active = 1 AND a.active = 1
-                """,
-                (organization_id, identity_id, alias),
-            ).fetchone()
-        if row is None:
-            raise AliasNotGrantedError("requested model alias is not granted")
-        request_id = f"request-{uuid.uuid4().hex}"
-        with (
-            self._connect() as reader,
-            prepare_sqlite_chain_authority(
-                reader,
-                organization_id,
-                str(row["active_revision_id"]),
-                request_id=request_id,
-                operation="authorize",
-                maximum_bytes=self._serving_snapshot_max_bytes,
-                remaining_seconds=deadline_monotonic - self._clock.monotonic(),
-                classification_memo=self.classification_memo,
-            ) as proof,
-            self._transaction(connection=reader) as connection,
-        ):
-            proof.validate(
-                connection,
-                request_id=request_id,
-                organization_id=organization_id,
-                alias_revision_id=str(row["active_revision_id"]),
-                operation="authorize",
-            )
+
+        organization_id, identity_id, key_id, row, request_id, witness = authorize_sqlite_alias(
+            raw_key=raw_key,
+            alias=alias,
+            deadline_monotonic=deadline_monotonic,
+            clock=self._clock,
+            connect=self._connect,
+            transaction=self._transaction,
+            authenticate=self._authenticate_in_transaction,
+            classification_memo=self.classification_memo,
+            serving_snapshot_max_bytes=self._serving_snapshot_max_bytes,
+            alias_not_granted_error=AliasNotGrantedError,
+        )
         target: GatewayTarget
         if str(row["target_kind"]) == "direct":
             target = DirectTarget(pool_id=str(row["pool_id"]))
@@ -737,7 +702,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
                     )
             case _:  # pragma: no cover - exhaustive over the ServingRequest union.
                 assert_never(request)
-        return AuthorizationSnapshot(
+        authorization = AuthorizationSnapshot(
             request_id=request_id,
             organization_id=organization_id,
             identity_id=identity_id,
@@ -762,6 +727,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
             app_title=app_title,
             client_ip=client_ip,
         )
+        authorization._local_sqlite_chain_witness = witness
+        return authorization
 
     def authenticate_key(self, *, raw_key: str) -> None:
         """Validate one virtual key without loading grants or request content.
@@ -922,11 +889,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
 
     @contextmanager
     def _transaction(
-        self, *, connection: sqlite3.Connection | None = None
+        self, *, connection: sqlite3.Connection | None = None, immediate: bool = True
     ) -> Iterator[sqlite3.Connection]:
-        """Run an immediate transaction, optionally borrowing the preflight connection."""
+        """Run an immediate or read transaction, optionally borrowing a connection."""
         with self._connect() if connection is None else nullcontext(connection) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
                 yield connection
             except BaseException:

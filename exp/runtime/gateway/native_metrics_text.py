@@ -43,7 +43,25 @@ _HISTOGRAMS: tuple[tuple[str, str], ...] = (
     ("time_to_first_byte_ms", "Milliseconds from admission to the first upstream byte."),
     ("request_duration_ms", "Total milliseconds spent serving one request."),
     ("permit_wait_ms", "Milliseconds a request waited for an admission permit."),
+    (
+        "bridge_permit_wait_ms",
+        "Milliseconds a bridge call waited for a Python callback worker.",
+    ),
     ("bridge_call_ms", "Milliseconds one control-plane bridge call took."),
+    (
+        "bridge_call_authenticate_ms",
+        "Milliseconds spent in authenticate bridge calls.",
+    ),
+    ("bridge_call_admit_ms", "Milliseconds spent in admit bridge calls."),
+    (
+        "bridge_call_start_attempt_ms",
+        "Milliseconds spent in start_attempt bridge calls.",
+    ),
+    ("bridge_call_settle_ms", "Milliseconds spent in settle bridge calls."),
+    (
+        "bridge_call_other_ms",
+        "Milliseconds spent in other bridge calls.",
+    ),
 )
 
 _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (

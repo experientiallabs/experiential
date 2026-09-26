@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
+from pydantic import Field, PrivateAttr, StrictBool, StrictInt, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
@@ -26,7 +26,7 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
-from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
+from exp.runtime.gateway.model_chain_authority import ModelChainAuthority, SQLiteChainWitness
 from exp.runtime.gateway.reasoning_blocks import (
     EncryptedReasoningBlock as EncryptedReasoningBlock,
 )
@@ -896,8 +896,7 @@ class AuthorizationSnapshot(ContractModel):
     Attributes:
         model_chain_authority: Optional backend-issued binding, revalidated by
             the host at acceptance and every attempt reservation.
-        fair_share_weight: Organization weight in [1, 1,000,000], default 1,
-            used only on rungs authoring weighted fair-share admission.
+        fair_share_weight: Organization weight for opted-in fair-share rungs; default 1.
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
@@ -935,7 +934,7 @@ class AuthorizationSnapshot(ContractModel):
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
-    # Fair-share weights default to equal shares and apply only on opted-in rungs.
+    _local_sqlite_chain_witness: SQLiteChainWitness | None = PrivateAttr(default=None)
 
 
 class ExecutionSnapshot(ContractModel):

@@ -18,6 +18,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -30,9 +31,11 @@ from exp.common.core.artifacts import ContractModel, Sha256
 from exp.runtime.gateway.ledger_errors import AttemptRejectedError
 from exp.runtime.gateway.snapshot_file import (
     PreparedSnapshotFile,
+    SnapshotGeneration,
     SnapshotSizeError,
     prepare_snapshot_file,
     read_snapshot_bytes,
+    validate_snapshot_generation,
 )
 from exp.runtime.gateway.stream_contracts import GatewayFailure, GatewayFailureClass
 
@@ -337,6 +340,68 @@ def _preflight_timeout() -> AttemptRejectedError:
 _AuthorityRows = tuple[tuple[str | None, ...], ...]
 
 
+@dataclass(frozen=True)
+class SQLiteChainAuthorityObservation:
+    """Writer-thread database identity captured before parallel snapshot preparation.
+
+    Attributes:
+        database: Canonical main database path used by the writer.
+        rows: Exact requested and active revision rows observed before the transaction.
+    """
+
+    database: str
+    rows: _AuthorityRows
+
+
+@dataclass(frozen=True)
+class SQLiteChainWitness:
+    """Request-scoped proof facts reused only while their DB rows and paths still match.
+
+    Attributes:
+        database: Main database path that supplied the authority rows.
+        rows: Exact requested and active revision rows classified during authorization.
+        file_generations: Secure path identities for every inspected snapshot file.
+        maximum_bytes: Serving file limit used to classify those generations.
+    """
+
+    database: str
+    rows: _AuthorityRows
+    file_generations: tuple[tuple[str, SnapshotGeneration], ...]
+    maximum_bytes: int
+
+
+def observe_sqlite_chain_authority(
+    connection: sqlite3.Connection,
+    organization_id: str,
+    alias_revision_id: str,
+    *,
+    rows: _AuthorityRows | None = None,
+) -> SQLiteChainAuthorityObservation:
+    """Capture exact authority rows for a later transaction to revalidate.
+
+    Args:
+        connection: File-backed SQLite connection outside a transaction.
+        organization_id: Tenant owning the requested revision.
+        alias_revision_id: Immutable revision selected for the request.
+        rows: Exact rows already returned by the alias lookup, when available.
+
+    Returns:
+        Database identity and row values that a write transaction must revalidate.
+    """
+    if connection.in_transaction:
+        raise ModelChainAuthorityError(
+            "observe local chain authority before beginning a transaction"
+        )
+    return SQLiteChainAuthorityObservation(
+        _database_path(connection),
+        (
+            _chain_authority_rows(connection, organization_id, alias_revision_id)
+            if rows is None
+            else rows
+        ),
+    )
+
+
 class _PlainSnapshotPair:
     """Two classified file generations with at most two retained anti-reuse leaf descriptors."""
 
@@ -485,7 +550,7 @@ def _database_path(connection: sqlite3.Connection) -> str:
 
 
 class SQLiteChainPreflight:
-    """Operation-scoped classification with live secure handles, never durable permission.
+    """Operation-bound checks over a request-scoped database and snapshot witness.
 
     Attributes:
         files: At most four distinct requested/active normalized and authored file observations.
@@ -501,14 +566,33 @@ class SQLiteChainPreflight:
         operation: ChainOperation,
         files: tuple[PreparedSnapshotFile, ...],
         deadline: float,
+        *,
+        file_generations: tuple[tuple[str, SnapshotGeneration], ...] = (),
+        maximum_bytes: int = 0,
     ) -> None:
         """Bind exact operation identity and already classified, still-open path observations."""
         self._database = database
         self._rows = rows
         self._binding = (request_id, organization_id, alias_revision_id, operation)
         self.files = files
+        self._file_generations = file_generations
+        self._maximum_bytes = maximum_bytes
         self._deadline = deadline
         self._closed = False
+
+    def authority_witness(self) -> SQLiteChainWitness:
+        """Copy classified row and path generations for one in-memory request lifetime."""
+        if self._closed:
+            raise ModelChainAuthorityError("local chain preflight is closed")
+        generations = self._file_generations or tuple(
+            (prepared.relative_path, prepared.generation) for prepared in self.files
+        )
+        return SQLiteChainWitness(
+            self._database,
+            self._rows,
+            generations,
+            self._maximum_bytes,
+        )
 
     @staticmethod
     def require_ledger(
@@ -563,8 +647,13 @@ class SQLiteChainPreflight:
                 "local alias changed after preflight; retry the operation"
             )
         try:
-            for prepared in self.files:
-                prepared.validate_current()
+            if self.files:
+                for prepared in self.files:
+                    prepared.validate_current()
+            else:
+                root = Path(self._database).parent
+                for relative_path, generation in self._file_generations:
+                    validate_snapshot_generation(root, relative_path, generation)
         except (OSError, ValueError) as exc:
             raise ModelChainAuthorityError(
                 "serving snapshot changed after preflight; retry the operation"
@@ -573,7 +662,7 @@ class SQLiteChainPreflight:
 
 @contextmanager
 def prepare_sqlite_chain_authority(
-    connection: sqlite3.Connection,
+    connection: sqlite3.Connection | None,
     organization_id: str,
     alias_revision_id: str,
     *,
@@ -582,16 +671,30 @@ def prepare_sqlite_chain_authority(
     maximum_bytes: int,
     remaining_seconds: float,
     classification_memo: SnapshotClassificationMemo | None = None,
+    observation: SQLiteChainAuthorityObservation | None = None,
+    witness: SQLiteChainWitness | None = None,
 ) -> Iterator[SQLiteChainPreflight]:
     """Classify both catalog views before BEGIN and retain handles through commit or rollback."""
-    if connection.in_transaction:
-        raise ModelChainAuthorityError(
-            "prepare local chain authority before beginning a transaction"
-        )
-    database = _database_path(connection)
-    rows = _chain_authority_rows(connection, organization_id, alias_revision_id)
-    references = dict.fromkeys(
-        row[index] for row in rows for index in (4, 7) if row[index] is not None
+    if witness is not None:
+        if observation is not None or connection is not None:
+            raise ValueError("pass a chain witness without a separate database observation")
+        if witness.maximum_bytes != maximum_bytes:
+            raise ModelChainAuthorityError("local chain witness uses another serving file limit")
+        database, rows = witness.database, witness.rows
+    else:
+        if observation is None:
+            if connection is None:
+                raise ModelChainAuthorityError("local chain preflight has no database observation")
+            observation = observe_sqlite_chain_authority(
+                connection, organization_id, alias_revision_id
+            )
+        elif connection is not None:
+            raise ValueError("pass either a database connection or a captured chain observation")
+        database, rows = observation.database, observation.rows
+    references = (
+        ()
+        if witness is not None
+        else dict.fromkeys(row[index] for row in rows for index in (4, 7) if row[index] is not None)
     )
     if not math.isfinite(remaining_seconds) or not 0 < remaining_seconds <= threading.TIMEOUT_MAX:
         raise _preflight_timeout()
@@ -609,6 +712,7 @@ def prepare_sqlite_chain_authority(
                             str(source),
                             maximum_bytes,
                             read_content=False,
+                            defer_path_validation=True,
                         )
                     )
                     for source in (path, path.with_suffix(".models.json"))
@@ -663,6 +767,8 @@ def prepare_sqlite_chain_authority(
             operation,
             tuple(files),
             deadline,
+            file_generations=() if witness is None else witness.file_generations,
+            maximum_bytes=maximum_bytes,
         )
         try:
             yield proof

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -15,6 +16,7 @@ import pytest
 
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway import group_commit as group_commit_module
 from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -31,15 +33,17 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.group_commit import (
     GroupCommitAttemptLedger,
     SyncGroupCommitLedger,
+    _PendingWrite,
     abandoned_write_outcome,
 )
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
 from exp.runtime.gateway.model_chain_authority import (
     ChainOperation,
     ModelChainAuthorityError,
+    SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
 )
-from exp.runtime.gateway.snapshot_file import PreparedSnapshotFile
+from exp.runtime.gateway.snapshot_file import SnapshotGeneration
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 _CATALOG_DIGEST = "a" * 64
@@ -179,9 +183,10 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
         operation: ChainOperation,
         *,
         connection: sqlite3.Connection | None = None,
+        observation: SQLiteChainAuthorityObservation | None = None,
     ) -> Iterator[SQLiteChainPreflight | None]:
-        """Pause only outside the transaction and retain each real production proof."""
-        with original(auth, operation, connection=connection) as proof:
+        """Pause preparation outside the writer and retain each real production proof."""
+        with original(auth, operation, connection=connection, observation=observation) as proof:
             assert proof is not None
             proofs.append(proof)
             entered.set()
@@ -189,8 +194,9 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
                 assert release.wait(5)
             yield proof
 
-    def fail_fence(prepared: PreparedSnapshotFile) -> None:
+    def fail_fence(root: Path, relative_path: str, generation: SnapshotGeneration) -> None:
         """Refuse an actual apply fence after the real out-of-lock preparation completed."""
+        del root, relative_path, generation
         if entered.is_set():
             raise ValueError("controlled generation change")
 
@@ -209,7 +215,7 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
                     SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
             elif outcome == "refusal":
                 with (
-                    mock.patch.object(PreparedSnapshotFile, "validate_current", fail_fence),
+                    mock.patch.object(authority, "validate_snapshot_generation", fail_fence),
                     pytest.raises(ModelChainAuthorityError),
                 ):
                     SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
@@ -246,16 +252,21 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
 
 
 @pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("reuse_witness", [True, False])
 def test_group_preflight_reuses_the_writer_database_connection(
     tmp_path: Path,
     batch_size: int,
+    reuse_witness: bool,
 ) -> None:
-    """Prepared batch size never allocates cached or concurrently held reader connections."""
+    """Request witnesses skip observations while compatibility paths deduplicate them."""
     clock = FakeLedgerClock()
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     authorizations = [
         _authorize(store, clock, raw_key, f"request-{index}") for index in range(batch_size)
     ]
+    if not reuse_witness:
+        for authorization in authorizations:
+            authorization._local_sqlite_chain_witness = None
     entered, release = threading.Event(), threading.Event()
     grouped = GroupCommitAttemptLedger(core, max_batch_size=batch_size)
 
@@ -267,7 +278,15 @@ def test_group_preflight_reuses_the_writer_database_connection(
     blocker = grouped._enqueue(pause)
     assert entered.wait(5)
     try:
-        with mock.patch.object(core, "_connect", wraps=core._connect) as reader_checkouts:
+        original_observe = group_commit_module.observe_sqlite_chain_authority
+        with (
+            mock.patch.object(core, "_connect", wraps=core._connect) as reader_checkouts,
+            mock.patch.object(
+                group_commit_module,
+                "observe_sqlite_chain_authority",
+                wraps=original_observe,
+            ) as authority_observations,
+        ):
             writes = [
                 grouped._enqueue_chain(
                     auth,
@@ -283,13 +302,92 @@ def test_group_preflight_reuses_the_writer_database_connection(
             for write in writes:
                 write.result(timeout=5)
             assert reader_checkouts.call_count == 0
+            assert authority_observations.call_count == (0 if reuse_witness else 1)
     finally:
         release.set()
         grouped.close()
 
 
-def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:
-    """Every JSON classification can obtain another write lock because BEGIN has not started."""
+def test_group_chain_preflights_run_concurrently_before_begin(tmp_path: Path) -> None:
+    """A queued batch prepares its exact snapshot proofs in parallel before one write txn."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    (tmp_path / "snapshot-one").write_text("{}")
+    authorizations = [_authorize(store, clock, raw_key, f"parallel-{index}") for index in range(2)]
+    for authorization in authorizations:
+        authorization._local_sqlite_chain_witness = None
+    grouped = GroupCommitAttemptLedger(core, max_batch_size=3)
+    entered, release = threading.Event(), threading.Event()
+    barrier = threading.Barrier(2)
+    proof_threads: set[int] = set()
+    proofs: list[SQLiteChainPreflight] = []
+    original_prepare = core.prepare_chain_authority
+    original_commit = grouped._commit_batch
+
+    def pause(connection: sqlite3.Connection) -> None:
+        """Hold batch commit until both proof preparations are in the same queue batch."""
+        entered.set()
+        assert release.wait(5)
+
+    @contextmanager
+    def tracked(
+        authorization: AuthorizationSnapshot,
+        operation: ChainOperation,
+        *,
+        connection: sqlite3.Connection | None = None,
+        observation: SQLiteChainAuthorityObservation | None = None,
+    ) -> Iterator[SQLiteChainPreflight | None]:
+        """Wait for a peer preparation to prove neither runs on the serial writer."""
+        assert connection is None and observation is not None
+        with original_prepare(authorization, operation, observation=observation) as proof:
+            assert proof is not None
+            proofs.append(proof)
+            proof_threads.add(threading.get_ident())
+            barrier.wait(timeout=5)
+            yield proof
+
+    def check_prepared_batch(
+        connection: sqlite3.Connection,
+        batch: list[_PendingWrite],
+    ) -> None:
+        """Ensure both workers completed before the atomic write transaction begins."""
+        assert len(proofs) == 2
+        assert len(proof_threads) == 2
+        original_commit(connection, batch)
+
+    blocker = grouped._enqueue(pause)
+    assert entered.wait(5)
+    try:
+        with (
+            mock.patch.object(core, "prepare_chain_authority", tracked),
+            mock.patch.object(grouped, "_commit_batch", check_prepared_batch),
+        ):
+            writes = [
+                grouped._enqueue_chain(
+                    authorization,
+                    "accept",
+                    lambda connection, proof, authorization=authorization: (
+                        core.apply_accept_request(
+                            connection,
+                            authorization=authorization,
+                            chain_preflight=proof,
+                        )
+                    ),
+                )
+                for authorization in authorizations
+            ]
+            release.set()
+            blocker.result(timeout=5)
+            for write in writes:
+                write.result(timeout=5)
+    finally:
+        release.set()
+        grouped.close()
+    assert len(proofs) == 2 and all(proof._closed for proof in proofs)
+
+
+def test_group_writer_reuses_request_classification_witness(tmp_path: Path) -> None:
+    """Acceptance and reservation do not parse catalog bytes after request authorization."""
     clock = FakeLedgerClock()
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     (tmp_path / "snapshot-one").write_text("{}")
@@ -319,7 +417,7 @@ def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:
             )
     finally:
         grouped.close()
-    assert reads == 1  # Reservation reuses only the already classified, still-current plain pair.
+    assert reads == 0  # Request-scoped proof facts avoid repeated writer-side classification.
 
 
 def test_full_request_lifecycle_commits_durably_through_group_writer(tmp_path: Path) -> None:
@@ -422,6 +520,48 @@ def test_concurrent_writes_share_batches_and_all_become_durable(tmp_path: Path) 
     count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
     connection.close()
     assert int(count) == 64
+
+
+def test_writer_collects_an_arriving_write_before_committing(tmp_path: Path) -> None:
+    """A write arriving during the bounded collection window shares its durable commit."""
+    core = SQLiteAttemptLedger(tmp_path / "gateway.db")
+    first_item_taken = threading.Event()
+    queue_type = queue.SimpleQueue
+    batch_sizes: list[int] = []
+
+    class SignaledQueue(queue_type):
+        """Expose when the writer has received the first operation."""
+
+        def get(self, block: bool = True, timeout: float | None = None) -> object:
+            item = super().get(block=block, timeout=timeout)
+            if item is not None:
+                first_item_taken.set()
+            return item
+
+    with mock.patch.object(group_commit_module.queue, "SimpleQueue", SignaledQueue):
+        grouped = GroupCommitAttemptLedger(core, max_batch_size=2)
+    original_commit = grouped._commit_batch
+
+    def record_batch(connection: sqlite3.Connection, batch: list[_PendingWrite]) -> None:
+        """Record the commit size while preserving the real durable writer."""
+        batch_sizes.append(len(batch))
+        original_commit(connection, batch)
+
+    try:
+        with mock.patch.object(grouped, "_commit_batch", record_batch):
+            with mock.patch.object(group_commit_module, "_BATCH_COLLECTION_WINDOW_SECONDS", 0.05):
+                first = grouped._enqueue(
+                    lambda connection: connection.execute("SELECT 1").fetchone()
+                )
+                assert first_item_taken.wait(5)
+                second = grouped._enqueue(
+                    lambda connection: connection.execute("SELECT 2").fetchone()
+                )
+                first.result(timeout=5)
+                second.result(timeout=5)
+    finally:
+        grouped.close()
+    assert batch_sizes == [2]
 
 
 def test_cancelled_caller_keeps_writer_running_and_write_durable(tmp_path: Path) -> None:

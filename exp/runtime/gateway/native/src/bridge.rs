@@ -32,6 +32,27 @@ struct Job {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Record callback-pool wait time even when the waiting request is cancelled.
+struct BridgePermitWaitTimer<'a> {
+    started: std::time::Instant,
+    histogram: &'a crate::metrics::Histogram,
+}
+
+impl<'a> BridgePermitWaitTimer<'a> {
+    fn new(histogram: &'a crate::metrics::Histogram) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            histogram,
+        }
+    }
+}
+
+impl Drop for BridgePermitWaitTimer<'_> {
+    fn drop(&mut self) {
+        self.histogram.record(self.started.elapsed());
+    }
+}
+
 /// Bounded bridge to one Python `NativeControlPlane` instance.
 ///
 /// Dropping the bridge closes the job queue, waits for every worker to run
@@ -76,12 +97,15 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
+        let permit_wait_timer =
+            BridgePermitWaitTimer::new(&crate::metrics::METRICS.bridge_permit_wait_ms);
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| PublicError::internal())?;
+        drop(permit_wait_timer);
         // Latency is measured from permit grant so it reflects the python
         // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();
@@ -104,9 +128,7 @@ impl Bridge {
             return Err(PublicError::internal());
         }
         let outcome = outcome.await;
-        crate::metrics::METRICS
-            .bridge_call_ms
-            .record(call_started.elapsed());
+        crate::metrics::METRICS.record_bridge_call(method, call_started.elapsed());
         match outcome {
             Ok(result) => result,
             Err(_) => Err(PublicError::internal()),
@@ -373,6 +395,24 @@ class Plane:
             );
             assert_eq!(bridge.call("echo", "next".into()).await.unwrap(), "next");
         });
+    }
+
+    #[test]
+    fn cancelled_callback_permit_wait_is_recorded() {
+        let metrics = crate::metrics::Metrics::new();
+        let permits = Arc::new(Semaphore::new(0));
+        block_on(async {
+            let histogram = &metrics.bridge_permit_wait_ms;
+            let waiting_permits = permits.clone();
+            tokio::select! {
+                _result = async move {
+                    let _timer = BridgePermitWaitTimer::new(histogram);
+                    waiting_permits.acquire_owned().await
+                } => panic!("a closed-free empty semaphore must keep waiting"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+        });
+        assert_eq!(metrics.snapshot()["bridge_permit_wait_ms"]["count"], 1);
     }
 
     #[test]

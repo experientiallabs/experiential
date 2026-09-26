@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -963,6 +964,104 @@ def test_chain_preflight_fences_exact_database_and_file_changes(
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
 
 
+def test_hot_plain_preflight_fences_snapshot_paths_once_at_write_boundary(
+    tmp_path: Path,
+) -> None:
+    """Warm classification avoids the pre-write path walk but keeps the transaction fence."""
+    manager, raw_key = _configured_pool_gateway(tmp_path)
+    store = manager.store()
+    auth = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=decode_chat(json.loads(_chat_body())).request,
+        deadline_monotonic=time.monotonic() + 60,
+    )
+    ledger = SQLiteAttemptLedger(
+        manager.database_path,
+        classification_memo=manager.classification_memo,
+    )
+    checked_paths: list[str] = []
+    original = authority.validate_snapshot_generation
+
+    def count_checks(
+        root: Path, relative_path: str, generation: authority.SnapshotGeneration
+    ) -> None:
+        """Keep the production fence and count its operation-scoped invocations."""
+        checked_paths.append(relative_path)
+        original(root, relative_path, generation)
+
+    try:
+        with patch.object(authority, "validate_snapshot_generation", count_checks):
+            ledger.accept_request(authorization=auth)
+        # One normalized snapshot plus its model-chain sidecar, each fenced once
+        # inside the durable acceptance transaction.
+        assert len(checked_paths) == 2
+    finally:
+        manager.close()
+
+
+def test_hot_authorization_read_does_not_take_sqlite_writer_lock(tmp_path: Path) -> None:
+    """A fresh-key authority read lets unrelated SQLite writes proceed concurrently."""
+    manager, raw_key = _configured_pool_gateway(tmp_path)
+    store = manager.store()
+    request = decode_chat(json.loads(_chat_body())).request
+    deadline = time.monotonic() + 60
+    store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=deadline,
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+    results: list[AuthorizationSnapshot] = []
+    errors: list[BaseException] = []
+    original = store._authenticate_in_transaction
+
+    def pause_after_authentication(
+        connection: sqlite3.Connection, key: str
+    ) -> tuple[str, str, str]:
+        """Hold the authority read open while another connection requests a writer lock."""
+        result = original(connection, key)
+        entered.set()
+        if not release.wait(3):
+            raise TimeoutError("test did not release paused authorization")
+        return result
+
+    def authorize() -> None:
+        try:
+            results.append(
+                store.authorize_request(
+                    raw_key=raw_key,
+                    alias="coding",
+                    request=request,
+                    deadline_monotonic=deadline,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - relay worker failures to the test thread.
+            errors.append(exc)
+
+    worker = threading.Thread(target=authorize)
+    try:
+        with patch.object(store, "_authenticate_in_transaction", pause_after_authentication):
+            worker.start()
+            assert entered.wait(3)
+            with sqlite3.connect(manager.database_path, timeout=0.25) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("UPDATE gateway_aliases SET updated_at=updated_at")
+                writer.commit()
+            release.set()
+            worker.join(3)
+        assert not worker.is_alive()
+        assert not errors
+        assert len(results) == 1
+    finally:
+        release.set()
+        worker.join(3)
+        manager.close()
+
+
 def test_chain_preflight_rejects_missing_closed_wrong_request_and_wrong_operation(
     tmp_path: Path,
 ) -> None:
@@ -1007,7 +1106,7 @@ def test_chain_preflight_rejects_missing_closed_wrong_request_and_wrong_operatio
 
 
 def test_preflight_budget_exhaustion_is_timeout_and_releases_permit(tmp_path: Path) -> None:
-    """Waiting or finishing CPU work past the request budget cannot write or leak a permit."""
+    """Fallback classification past the request budget cannot write or leak a permit."""
     manager, raw_key = _configured_pool_gateway(tmp_path)
     store = manager.store()
     auth = store.authorize_request(
@@ -1020,6 +1119,7 @@ def test_preflight_budget_exhaustion_is_timeout_and_releases_permit(tmp_path: Pa
     assert authority._PREFLIGHT_PERMIT.acquire(timeout=1)
     try:
         expired = auth.model_copy(update={"deadline_monotonic": time.monotonic() + 0.01})
+        expired._local_sqlite_chain_witness = None
         with pytest.raises(AttemptRejectedError) as error:
             ledger.accept_request(authorization=expired)
         assert error.value.failure.failure_class == "timeout"
