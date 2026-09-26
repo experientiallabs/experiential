@@ -82,6 +82,7 @@ include = [
     "/exp",
     "/assets",
     "/docs/reference/gateway-architecture.md",
+    "/docs/reference/gateway-egress.md",
     "/docs/reference/gateway-request-policy.md",
     "/docs/release-scope.md",
     "/docs/usage.md",
