@@ -37,8 +37,8 @@ def test_authoring_after_default_judge_retains_the_original_build(tmp_path: Path
     assert plan.build.task_set == original.build.task_set
 
 
-def test_new_judge_package_gets_a_distinct_lineage_recipe(tmp_path: Path) -> None:
-    """New producer provenance cannot collide with a completed old split identity."""
+def test_new_judge_package_reuses_the_frozen_lineage_recipe(tmp_path: Path) -> None:
+    """A package update preserves unchanged splits and their producer provenance."""
     store = _built_store(tmp_path)
     setup = _setup(store)
     plan = prepare_manual_judge_calibration(store, sample_size=1)
@@ -47,6 +47,5 @@ def test_new_judge_package_gets_a_distinct_lineage_recipe(tmp_path: Path) -> Non
     )
     old = write_lineage_split(store, setup, plan, inputs, _TIME, "original")
     new = write_lineage_split(store, setup, plan, inputs, _TIME, "upgraded")
-    assert old.split_id != new.split_id
-    assert old.assignments == new.assignments
+    assert old == new
     assert store.artifacts.read(old.split_id).manifest.code_revision == "original"
