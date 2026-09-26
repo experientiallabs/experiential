@@ -468,6 +468,27 @@ class SnapshotClassificationMemo:
             self._entries.pop(key).close()
             return False
 
+    def cached_generations(
+        self, key: _MemoKey
+    ) -> tuple[tuple[SnapshotGeneration, ...], tuple[int | None, ...]] | None:
+        """Pin a cached plain pair while callers validate its paths without opening leaves."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or self._closed:
+                return None
+            anchors: list[int | None] = []
+            try:
+                for descriptor in entry.anchors:
+                    anchors.append(None if descriptor is None else os.dup(descriptor))
+            except OSError:
+                for descriptor in anchors:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                self._entries.pop(key).close()
+                return None
+            self._entries.move_to_end(key)
+            return entry.generations, tuple(anchors)
+
     def invalidate(self, key: _MemoKey) -> None:
         """Release obsolete anchors after a secure path cannot be opened or classified."""
         with self._lock:
@@ -584,7 +605,7 @@ class SQLiteChainPreflight:
         """Copy classified row and path generations for one in-memory request lifetime."""
         if self._closed:
             raise ModelChainAuthorityError("local chain preflight is closed")
-        generations = self._file_generations or tuple(
+        generations = self._file_generations + tuple(
             (prepared.relative_path, prepared.generation) for prepared in self.files
         )
         return SQLiteChainWitness(
@@ -647,13 +668,11 @@ class SQLiteChainPreflight:
                 "local alias changed after preflight; retry the operation"
             )
         try:
-            if self.files:
-                for prepared in self.files:
-                    prepared.validate_current()
-            else:
-                root = Path(self._database).parent
-                for relative_path, generation in self._file_generations:
-                    validate_snapshot_generation(root, relative_path, generation)
+            for prepared in self.files:
+                prepared.validate_current()
+            root = Path(self._database).parent
+            for relative_path, generation in self._file_generations:
+                validate_snapshot_generation(root, relative_path, generation)
         except (OSError, ValueError) as exc:
             raise ModelChainAuthorityError(
                 "serving snapshot changed after preflight; retry the operation"
@@ -700,24 +719,47 @@ def prepare_sqlite_chain_authority(
         raise _preflight_timeout()
     deadline = time.monotonic() + remaining_seconds
     files: list[PreparedSnapshotFile] = []
+    file_generations: list[tuple[str, SnapshotGeneration]] = []
     with ExitStack() as stack:
         try:
             for reference in references:
                 assert reference is not None
                 path = Path(reference)
+                sources = (str(path), str(path.with_suffix(".models.json")))
+                key = (database, reference, maximum_bytes)
+                cached = (
+                    None
+                    if classification_memo is None
+                    else classification_memo.cached_generations(key)
+                )
+                if cached is not None:
+                    assert classification_memo is not None
+                    generations, anchors = cached
+                    try:
+                        root = Path(database).parent
+                        for relative_path, generation in zip(sources, generations, strict=True):
+                            validate_snapshot_generation(root, relative_path, generation)
+                    except (OSError, ValueError):
+                        classification_memo.invalidate(key)
+                    else:
+                        file_generations.extend(zip(sources, generations, strict=True))
+                        continue
+                    finally:
+                        for descriptor in anchors:
+                            if descriptor is not None:
+                                os.close(descriptor)
                 pair = tuple(
                     stack.enter_context(
                         prepare_snapshot_file(
                             Path(database).parent,
-                            str(source),
+                            source,
                             maximum_bytes,
                             read_content=False,
                             defer_path_validation=True,
                         )
                     )
-                    for source in (path, path.with_suffix(".models.json"))
+                    for source in sources
                 )
-                key = (database, reference, maximum_bytes)
                 if classification_memo is None or not classification_memo.matches(key, pair):
                     with _preflight_budget(deadline - time.monotonic()):
                         if classification_memo is None or not classification_memo.matches(
@@ -767,7 +809,9 @@ def prepare_sqlite_chain_authority(
             operation,
             tuple(files),
             deadline,
-            file_generations=() if witness is None else witness.file_generations,
+            file_generations=(
+                tuple(file_generations) if witness is None else witness.file_generations
+            ),
             maximum_bytes=maximum_bytes,
         )
         try:
