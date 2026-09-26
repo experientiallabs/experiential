@@ -165,6 +165,8 @@ class _CacheFinish(_CacheBoundary):
         http_status: Optional observed HTTP status, without headers or body.
         name: Optional exact resource name, at most 1024 characters.
         expire_time: Optional absolute provider expiration, at most 64 characters.
+        create_time: Optional absolute provider creation time, at most 64 characters.
+            Invalid timestamp facts become None without inventing a billing interval.
         total_tokens: Optional positive provider measurement, bounded to int64.
     """
 
@@ -173,6 +175,7 @@ class _CacheFinish(_CacheBoundary):
     http_status: int | None = Field(default=None, ge=100, le=599)
     name: str | None = Field(default=None, max_length=1024)
     expire_time: str | None = Field(default=None, max_length=64)
+    create_time: str | None = Field(default=None, max_length=64)
     total_tokens: int | None = Field(default=None, ge=1, le=2**63 - 1)
 
 
@@ -212,14 +215,24 @@ def _encoded(payload: JsonObject) -> str:
     return json.dumps(payload, separators=(",", ":"))
 
 
-def _resource_expiration(value: str | None) -> float:
-    """Parse the provider's timezone-aware absolute expiration, never local time."""
+def _resource_timestamp(value: str | None) -> float:
+    """Parse a provider's timezone-aware absolute timestamp, never local time."""
     if value is None:
-        raise ValueError("cache creation omitted expiration")
+        raise ValueError("cache resource omitted timestamp")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("cache expiration needs a timezone")
+        raise ValueError("cache resource timestamp needs a timezone")
     return parsed.timestamp()
+
+
+def _with_creation_time(result: CacheResult, value: str | None) -> CacheResult:
+    """Attach only a valid provider interval; missing or unusable facts stay unknown."""
+    if value is None:
+        return result
+    try:
+        return replace(result, create_time=_resource_timestamp(value))
+    except (ValueError, OverflowError, OSError):
+        return result
 
 
 def _ready_payload(plan: GoogleCachePlan, claim: CacheReady) -> str:
@@ -367,7 +380,8 @@ class NativeExplicitCacheMixin:
                     or entry.active_attempt_id != attempt_id
                 ):
                     raise ValueError("cache operation differs from the selected attempt")
-                observed_at = time.time()
+                previous = state.observed_results.get(offer.operation_id)
+                observed_at = time.time() if previous is None else previous.observed_at
                 result = CacheResult(
                     operation_id=offer.operation_id,
                     outcome="unknown",
@@ -382,13 +396,14 @@ class NativeExplicitCacheMixin:
                             observed_at=observed_at,
                             resource_name=selected.name,
                             total_tokens=selected.total_tokens,
-                            expire_time=_resource_expiration(selected.expire_time),
+                            expire_time=_resource_timestamp(selected.expire_time),
                             http_status=selected.http_status,
                         )
                         binding.plan.apply(selected.name or "")
                         # Validation alone does not grant reuse after expiry;
                         # accounting can still record a late known resource.
                         validate_cache_result(offer, result)
+                        result = _with_creation_time(result, selected.create_time)
                     except ValueError:
                         result = CacheResult(
                             operation_id=offer.operation_id,
@@ -396,9 +411,7 @@ class NativeExplicitCacheMixin:
                             observed_at=observed_at,
                             http_status=selected.http_status,
                         )
-                previous = state.observed_results.get(offer.operation_id)
                 if previous is not None:
-                    result = replace(result, observed_at=previous.observed_at)
                     if result != previous:
                         raise ValueError("cache result changed after observation")
                 else:

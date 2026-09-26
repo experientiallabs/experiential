@@ -651,6 +651,36 @@ def test_malformed_acceptance_cannot_publish_ready_or_release_reservation() -> N
     assert host.reserved == offer.reservation_nano_usd
 
 
+@pytest.mark.parametrize("create_time", [None, 1000.25])
+def test_creation_time_is_optional_provider_reported_resource_interval(
+    create_time: float | None,
+) -> None:
+    """Ready resource usability does not imply a complete provider-reported billing interval."""
+    offer = _offer()
+    result = replace(_ready(offer), create_time=create_time)
+    assert validate_cache_result(offer, result) == result
+    assert result.create_time == create_time
+    assert asdict(result)["create_time"] == create_time
+    with pytest.raises(FrozenInstanceError):
+        result.create_time = 1000.5  # ty: ignore[invalid-assignment]
+
+
+@pytest.mark.parametrize("create_time", [0, -1, True, float("nan"), float("inf"), 1002])
+def test_invalid_known_creation_time_is_never_a_billing_fact(create_time: float) -> None:
+    """A known creation time must be positive, finite and no later than its observation."""
+    with pytest.raises(ValueError, match="create_time"):
+        replace(_ready(_offer()), create_time=create_time)
+
+
+def test_known_creation_time_requires_ordered_expiration() -> None:
+    """Creation facts require an expiration at or after creation, including expired resources."""
+    original = replace(_ready(_offer()), observed_at=1400)
+    for expiry in (None, 1000):
+        with pytest.raises(ValueError, match="create_time"):
+            replace(original, create_time=1001, expire_time=expiry)
+    assert replace(original, create_time=1300).create_time == 1300
+
+
 def test_result_recording_failure_keeps_pending_reservation() -> None:
     """Failure to persist acceptance grants no assumption that a reservation was released."""
 

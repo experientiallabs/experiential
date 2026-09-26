@@ -244,7 +244,15 @@ Cache creation happens only after route selection and generation reservation. Ru
 one cache-create HTTP request, using the selected endpoint's credentials, no redirects or retries,
 and the remaining request deadline. The request sends a fixed absolute expiration no more than
 five minutes away, not a sliding TTL. Response parsing is bounded to 64 KiB and exposes only the
-resource name, provider-measured token count, expiration and status to the host callback.
+resource name, provider-measured token count, expiration, optional creation time and status to the
+host callback. `CacheResult.create_time` carries Google's `createTime` as an absolute Unix timestamp,
+not a TTL or locally inferred start time. A known value is positive, finite and no later than the
+reported expiration or its observation; missing, malformed or future creation facts remain `None`.
+A valid resource can remain ready with `create_time=None`: readiness establishes usability, not
+billing completeness. A host whose published customer schedule requires creation time must retain
+its full hold until it has sufficient provider facts and may refuse accounting acknowledgement.
+The provider-reported resource interval is evidence, not an exact invoice formula or proof of
+provider billing granularity, garbage-collection timing or realized storage charges.
 
 The host owns durable cross-worker claims, customer allowance, credential-generation binding and
 resource-cost accounting. Its `claim` must commit the complete create-plus-storage reservation
@@ -252,6 +260,8 @@ before granting one creator. Ready resources are isolated by tenant, account gen
 project/location, model and exact prefix. A worker-local dictionary is not a durable implementation.
 Token storage is priced per million-token-hour, separately from generation/cache-write token legs;
 unknown rates are not zero, while an explicitly verified zero create-input rate is representable.
+The 300-second quote applies the host-authored customer schedule and bounds that authorized
+reservation; it does not establish an upper bound on every possible provider invoice adjustment.
 
 Creation timeouts, cancellations and malformed outcomes retain reserved exposure and never trigger
 blind resource recreation. Known but expired resource facts still reach accounting, but the resource

@@ -695,6 +695,111 @@ def test_malformed_provider_facts_record_unknown_and_keep_reservation(
     _assert_private(repr(result))
 
 
+@pytest.mark.parametrize("spelling", ["utc", "offset", "fraction"])
+def test_provider_creation_time_reaches_host_as_absolute_interval(
+    tmp_path: Path, clock: _Clock, spelling: str
+) -> None:
+    """The host receives the provider's optional absolute creation time, never offer time."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    creation = _prepare(control, admission)
+    created_at = clock.now + (0.125 if spelling == "fraction" else 1)
+    clock.now += 2
+    stamp = datetime.fromtimestamp(created_at, UTC).isoformat()
+    if spelling != "offset":
+        stamp = stamp.replace("+00:00", "Z")
+    argument = {**_finish_argument(admission, creation), "create_time": stamp}
+    assert _finish(control, argument)["state"] == "ready"
+    result = next(iter(host.results.values()))
+    assert result.create_time == created_at
+    assert result.expire_time == creation["expires_at"]
+    assert result.observed_at == clock.now and result.create_time != result.observed_at
+    clock.now += 1
+    assert _finish(control, argument)["state"] == "ready"
+    assert host.record_calls == 1
+    conflicting = {
+        **argument,
+        "create_time": datetime.fromtimestamp(created_at - 1, UTC).isoformat(),
+    }
+    with pytest.raises(NativeBridgeError):
+        _finish(control, conflicting)
+    assert host.record_calls == 1
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        None,
+        "not-a-timestamp",
+        "300s",
+        "2027-01-15T08:00:00",
+        "1970-01-01T00:00:00Z",
+        "9999-01-01T00:00:00Z",
+    ],
+)
+def test_missing_or_invalid_creation_time_is_unknown_fact_not_unknown_resource(
+    tmp_path: Path, clock: _Clock, stamp: str | None
+) -> None:
+    """An unusable optional creation timestamp neither erases ready facts nor invents billing."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    creation = _prepare(control, admission)
+    argument = {**_finish_argument(admission, creation), "create_time": stamp}
+    assert _finish(control, argument)["state"] == "ready"
+    result = next(iter(host.results.values()))
+    assert result.outcome == "ready" and result.create_time is None
+    assert result.resource_name == _RESOURCE and result.total_tokens == 1536
+    assert host.reserved == next(iter(host.offers.values())).reservation_nano_usd
+
+
+def test_future_creation_time_stays_unknown_on_identical_finish_retry(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """Clock advancement cannot promote a previously unusable fact in an identical observation."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    creation = _prepare(control, admission)
+    argument = {
+        **_finish_argument(admission, creation),
+        "create_time": datetime.fromtimestamp(clock.now + 1, UTC).isoformat(),
+    }
+    assert _finish(control, argument)["state"] == "ready"
+    first = next(iter(host.results.values()))
+    assert first.create_time is None
+    clock.now += 2
+    assert _finish(control, argument)["state"] == "ready"
+    assert next(iter(host.results.values())) == first
+    assert host.record_calls == 1
+
+
+def test_host_can_refuse_billing_without_provider_creation_time(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stricter hosted policy may retain its full hold and deny reuse of incomplete facts."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    creation = _prepare(control, admission)
+
+    def record(result: CacheResult) -> None:
+        """Refuse billing settlement when the optional provider interval is unavailable."""
+        assert result.outcome == "ready" and result.create_time is None
+        raise ValueError("provider creation time is needed for billing")
+
+    monkeypatch.setattr(host, "record", record)
+    with pytest.raises(NativeBridgeError):
+        _finish(control, _finish_argument(admission, creation))
+    assert host.results == {}
+    assert host.reserved == next(iter(host.offers.values())).reservation_nano_usd
+
+
 def test_late_complete_acceptance_is_accounted_but_never_reused(
     tmp_path: Path, clock: _Clock
 ) -> None:

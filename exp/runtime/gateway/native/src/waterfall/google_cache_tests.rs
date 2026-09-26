@@ -51,7 +51,10 @@ fn http() -> reqwest::Client {
 }
 
 pub(super) fn expiry() -> (f64, String) {
-    let epoch = epoch_now().floor() as u64 + 250;
+    timestamp(epoch_now().floor() as u64 + 250)
+}
+
+pub(super) fn timestamp(epoch: u64) -> (f64, String) {
     // httpdate owns calendar formatting; turn its UTC components into Google's spelling.
     let date = httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(epoch));
     let fields: Vec<&str> = date.split_whitespace().collect();
@@ -637,6 +640,49 @@ async fn provider_submillisecond_expiry_extension_records_unknown() {
     assert_eq!(task.await.unwrap().len(), 1);
     assert_eq!(host.calls()[1].1["outcome"], "unknown");
     assert!(host.calls()[1].1.get("expire_time").is_none());
+}
+
+#[tokio::test]
+async fn creation_time_is_optional_bounded_provider_evidence() {
+    let expires = expiry();
+    let known = timestamp(epoch_now().floor() as u64 - 1).1;
+    for (value, expected) in [
+        (None, None),
+        (Some(json!(known)), Some(known.clone())),
+        (Some(Value::Null), None),
+        (Some(json!(1234)), None),
+        (Some(json!("not-a-timestamp")), None),
+        (Some(json!("300s")), None),
+        (Some(json!("1970-01-01T00:00:00Z")), None),
+        (Some(json!("9999-01-01T00:00:00Z")), None),
+        (Some(json!(expires.1)), None),
+        (Some(json!("x".repeat(65))), None),
+    ] {
+        let mut created = response(&expires);
+        if let Some(value) = value {
+            created["createTime"] = value;
+        }
+        let (base, task) = server(vec![answer(200, &created.to_string())]).await;
+        let original = wire(&format!(
+            "{base}/v1beta/models/gemini-test:streamGenerateContent"
+        ));
+        let host = Host::new(vec![
+            claim(&format!("{base}/v1beta/cachedContents"), &expires),
+            ready("cachedContents/test-cache"),
+        ]);
+        assert!(execute_test(&original, &host, EndpointPolicy::Loopback)
+            .await
+            .unwrap()
+            .is_some());
+        let calls = host.calls();
+        let finish = &calls[1].1;
+        assert_eq!(finish["outcome"], "ready");
+        assert_eq!(
+            finish.get("create_time").and_then(Value::as_str),
+            expected.as_deref()
+        );
+        assert_eq!(task.await.unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

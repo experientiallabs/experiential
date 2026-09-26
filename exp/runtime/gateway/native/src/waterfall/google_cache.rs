@@ -53,6 +53,7 @@ struct CacheEndpoint {
 struct Created {
     name: String,
     expire_time: String,
+    create_time: Option<String>,
     total_tokens: u64,
 }
 
@@ -164,6 +165,9 @@ where
             if let Some(created) = &created {
                 finish["name"] = json!(created.name);
                 finish["expire_time"] = json!(created.expire_time);
+                if let Some(create_time) = &created.create_time {
+                    finish["create_time"] = json!(create_time);
+                }
                 finish["total_tokens"] = json!(created.total_tokens);
             }
             // No generation is permitted if this accounting acknowledgement fails.
@@ -461,16 +465,31 @@ async fn create(
     {
         return None;
     }
+    // Optional creation evidence does not decide resource usability. Never infer
+    // a missing or malformed timestamp from the offer, response arrival or TTL.
+    let observed_at = epoch_now();
+    let create_time = body
+        .get("createTime")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            expiry_epoch(value).is_some_and(|created| {
+                observed_at.is_finite()
+                    && created > 0.0
+                    && created <= actual_expiry
+                    && created <= observed_at
+            })
+        });
     // Expired resources still have known billable facts. The host records those
     // facts first and separately decides whether the resource can serve a generation.
     Some(Created {
         name: name.to_string(),
         expire_time: expire_time.to_string(),
+        create_time: create_time.map(str::to_owned),
         total_tokens,
     })
 }
 
-/// Parse the bounded UTC RFC3339 spelling used by Google's absolute expireTime.
+/// Parse bounded UTC RFC3339 timestamps used by Google's resource interval.
 fn expiry_epoch(value: &str) -> Option<f64> {
     if !value.is_ascii() || value.len() < 20 || value.len() > 35 {
         return None;

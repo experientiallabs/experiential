@@ -62,6 +62,9 @@ def assert_accounted(fixture, expected_claims):
     resource = "projects/123456789/locations/global/" + _RESOURCE if vertex else _RESOURCE
     assert result.outcome == "ready" and result.resource_name == resource
     assert result.total_tokens == 1536 and result.expire_time == offer.expires_at
+    assert result.create_time is not None
+    assert offer.requested_at - 2 <= result.create_time <= result.observed_at
+    assert result.create_time <= result.expire_time
     assert host.reserved == offer.reservation_nano_usd > 0
 
 
@@ -133,6 +136,7 @@ async fn loopback(resource: &'static str) -> (String, tokio::task::JoinHandle<Ve
                 json!({
                     "name": resource,
                     "expireTime": body["expireTime"],
+                    "createTime": tests::timestamp(epoch_now().floor() as u64).1,
                     "usageMetadata": {"totalTokenCount": 1536},
                     "private_provider_text": "must never cross the accounting bridge",
                 })

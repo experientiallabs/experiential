@@ -233,6 +233,10 @@ class CacheResult:
         expire_time: Optional absolute provider expiry, required for ready.
         http_status: Optional integer HTTP status, not sufficient by itself to
             prove a no-spend rejection. Transport failures carry None.
+        create_time: Optional provider-reported absolute Unix creation time, default
+            None when absent or unusable. A known value is finite and positive,
+            no later than expire_time or observed_at. This interval is resource
+            evidence, not an invoice formula or permission to release a hold.
     """
 
     operation_id: str
@@ -242,6 +246,7 @@ class CacheResult:
     total_tokens: int | None = None
     expire_time: float | None = None
     http_status: int | None = None
+    create_time: float | None = None
 
     def __post_init__(self) -> None:
         """Require typed observation facts without inventing missing provider evidence."""
@@ -255,6 +260,18 @@ class CacheResult:
             _integer(self.total_tokens, "total_tokens", minimum=1)
         if self.expire_time is not None:
             _timestamp(self.expire_time, "expire_time")
+        if self.create_time is not None:
+            _timestamp(self.create_time, "create_time")
+            if (
+                self.create_time <= 0
+                or self.expire_time is None
+                or self.create_time > self.expire_time
+                or self.create_time > self.observed_at
+            ):
+                raise ValueError(
+                    "create_time must be positive and no later than expiration or observation; "
+                    "retain unknown billing facts instead"
+                )
         if self.http_status is not None:
             _integer(self.http_status, "http_status", minimum=100)
             if self.http_status > 599:
@@ -310,6 +327,9 @@ class ExplicitCacheHost(Protocol):
         contradictory observations, and never overwrite a settled ready resource
         with an ambiguous retry. Rejected releases budget only with positive
         no-resource/no-spend evidence, not merely an HTTP error classification.
+        Ready describes resource usability, not complete billing evidence. A host
+        whose published schedule requires create_time must retain its full hold
+        when that optional provider fact is None, never substitute local time.
         """
         ...
 
@@ -512,6 +532,7 @@ def validate_cache_result(offer: CacheOffer, result: CacheResult) -> CacheResult
             result.resource_name is not None
             or result.total_tokens is not None
             or result.expire_time is not None
+            or result.create_time is not None
             or result.http_status is None
             or not 400 <= result.http_status < 500
             or result.http_status in {408, 409}
