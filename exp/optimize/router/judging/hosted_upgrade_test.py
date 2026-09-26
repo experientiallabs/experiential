@@ -5,8 +5,13 @@ from unittest.mock import patch
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project.project import ProjectHostedJudgeEvidence
-from exp.optimize.router.judging.service import prepare_manual_judge_setup
-from exp.optimize.router.judging.service_test import _TIME, _built_store, _catalog
+from exp.optimize.router.judging.artifacts import write_production_rollout
+from exp.optimize.router.judging.service import (
+    prepare_manual_judge_calibration,
+    prepare_manual_judge_setup,
+    write_lineage_split,
+)
+from exp.optimize.router.judging.service_test import _TIME, _built_store, _catalog, _setup
 
 
 def test_authoring_after_default_judge_retains_the_original_build(tmp_path: Path) -> None:
@@ -30,3 +35,18 @@ def test_authoring_after_default_judge_retains_the_original_build(tmp_path: Path
         )
     assert original.build is not None
     assert plan.build.task_set == original.build.task_set
+
+
+def test_new_judge_package_gets_a_distinct_lineage_recipe(tmp_path: Path) -> None:
+    """New producer provenance cannot collide with a completed old split identity."""
+    store = _built_store(tmp_path)
+    setup = _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=1)
+    inputs = (
+        write_production_rollout(store, setup, plan.tasks[0], plan.traces[0], _TIME, "original"),
+    )
+    old = write_lineage_split(store, setup, plan, inputs, _TIME, "original")
+    new = write_lineage_split(store, setup, plan, inputs, _TIME, "upgraded")
+    assert old.split_id != new.split_id
+    assert old.assignments == new.assignments
+    assert store.artifacts.read(old.split_id).manifest.code_revision == "original"

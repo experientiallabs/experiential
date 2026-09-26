@@ -880,6 +880,8 @@ def write_lineage_split(
     split_id = stable_id(
         "router-lineage-split",
         {
+            "setup_id": setup.setup_id,
+            "code_revision": code_revision,
             "task_set": setup.task_set.model_dump(mode="json"),
             "fit": list(fit),
             "held_out": list(held_out),

@@ -80,6 +80,7 @@ from exp.simulation.retrieval import (
     load_fit_rag_retriever,
     persist_trace_rag,
 )
+from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 from exp.simulation.retrieval.tests.retrieval_test import _persist_traces
 from exp.simulation.retrieval.transitions import render_rag_key
 from exp.simulation.specs import (
@@ -242,8 +243,6 @@ class _FitRetriever:
             initial_context=query.initial_context,
             action=query.action,
         )
-        from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
-
         if len(key_text.encode("utf-8")) > reservation.maximum_input_tokens:
             raise RAGQueryInputLimitError("query input ceiling")
         reserved_tokens = len(key_text.encode("utf-8")) * reservation.maximum_attempts

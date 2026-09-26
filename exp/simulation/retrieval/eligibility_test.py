@@ -6,7 +6,13 @@ from unittest.mock import patch
 import pytest
 
 from exp.common.models import EmbeddingCostReservation
-from exp.simulation.retrieval import RAGAction, RAGQuery, TraceRAGRetriever, persist_trace_rag
+from exp.simulation.retrieval import (
+    RAGAction,
+    RAGQuery,
+    TraceRAGRetriever,
+    load_rag_index,
+    persist_trace_rag,
+)
 from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 from exp.simulation.retrieval.tests.retrieval_test import (
     _CREATED_AT,
@@ -30,8 +36,6 @@ def test_excluded_corpus_skips_query_embedding_and_its_input_ceiling(tmp_path: P
         created_at=_CREATED_AT,
         code_revision="test",
     )
-    from exp.simulation.retrieval import load_rag_index
-
     retriever = TraceRAGRetriever(load_rag_index(store, loaded.index.rag_id), embedder=embedder)
     query = RAGQuery(
         task="long task " * 10_000,
