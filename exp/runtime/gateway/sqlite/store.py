@@ -6,7 +6,7 @@ import hmac
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from functools import partial
@@ -149,6 +149,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         self.database_path = database_path
         self._busy_timeout_ms = busy_timeout_ms
         self._preflight_authentication_lock = threading.Lock()
+        self._request_authority_timing_recorder: Callable[[str, float], None] | None = None
         self._clock = SystemGatewayClock() if clock is None else clock
         self._pepper = FingerprintPepperFile(
             pepper_path or database_path.with_name("gateway-key-pepper.json")
@@ -165,6 +166,12 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
     def busy_timeout_ms(self) -> int:
         """Return the configured SQLite lock-wait bound."""
         return self._busy_timeout_ms
+
+    def set_request_authority_timing_recorder(
+        self, recorder: Callable[[str, float], None] | None
+    ) -> None:
+        """Bind optional content-free hot-path diagnostics from the native bridge."""
+        self._request_authority_timing_recorder = recorder
 
     def create_organization(
         self,
@@ -685,6 +692,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
             classification_memo=self.classification_memo,
             serving_snapshot_max_bytes=self._serving_snapshot_max_bytes,
             alias_not_granted_error=AliasNotGrantedError,
+            timing_recorder=self._request_authority_timing_recorder,
         )
         target: GatewayTarget
         if str(row["target_kind"]) == "direct":

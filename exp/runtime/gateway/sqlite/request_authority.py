@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -30,6 +31,7 @@ def authorize_sqlite_alias(
     classification_memo: SnapshotClassificationMemo,
     serving_snapshot_max_bytes: int,
     alias_not_granted_error: type[Exception],
+    timing_recorder: Callable[[str, float], None] | None = None,
 ) -> tuple[str, str, str, sqlite3.Row, str, SQLiteChainWitness]:
     """Authenticate, resolve one alias and capture its classified request witness.
 
@@ -56,7 +58,11 @@ def authorize_sqlite_alias(
     ) -> tuple[str, str, str, sqlite3.Row | None]:
         """Authenticate and resolve the active row within one SQLite snapshot."""
         authenticate_key = authenticate_readonly if readonly else authenticate
+        authentication_started = time.monotonic()
         organization_id, identity_id, key_id = authenticate_key(connection, raw_key)
+        if timing_recorder is not None:
+            timing_recorder("sqlite_key_authentication_ms", authentication_started)
+        alias_lookup_started = time.monotonic()
         row = connection.execute(
             """
             SELECT a.alias_id, a.alias_name, a.active_revision_id,
@@ -87,36 +93,43 @@ def authorize_sqlite_alias(
             """,
             (organization_id, identity_id, alias),
         ).fetchone()
+        if timing_recorder is not None:
+            timing_recorder("sqlite_alias_lookup_ms", alias_lookup_started)
         return organization_id, identity_id, key_id, row
 
+    authority_transaction_started = time.monotonic()
     with connect() as reader:
         try:
-            # Fresh keys only read authority. Deferred mode avoids serializing
-            # concurrent admissions on SQLite's writer lock.
-            with transaction(
-                connection=reader,
-                immediate=False,
-                busy_timeout_ms=busy_timeout_ms,
-            ) as connection:
-                organization_id, identity_id, key_id, row = read_alias(connection)
-        except sqlite3.OperationalError as exc:
-            code = getattr(exc, "sqlite_errorcode", None)
-            if code is None or code & 0xFF not in (
-                sqlite3.SQLITE_BUSY,
-                sqlite3.SQLITE_LOCKED,
-            ):
-                raise
-            if reader.in_transaction:
-                reader.execute("ROLLBACK")
-            # A concurrent stale-key refresh can invalidate a deferred read's
-            # write upgrade. Re-read authority from a fresh snapshot without
-            # refreshing coarse last-used telemetry instead of waiting for a
-            # long writer timeout.
-            with transaction(connection=reader, immediate=False) as connection:
-                organization_id, identity_id, key_id, row = read_alias(
-                    connection,
-                    readonly=True,
-                )
+            try:
+                # Fresh keys only read authority. Deferred mode avoids serializing
+                # concurrent admissions on SQLite's writer lock.
+                with transaction(
+                    connection=reader,
+                    immediate=False,
+                    busy_timeout_ms=busy_timeout_ms,
+                ) as connection:
+                    organization_id, identity_id, key_id, row = read_alias(connection)
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if code is None or code & 0xFF not in (
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                ):
+                    raise
+                if reader.in_transaction:
+                    reader.execute("ROLLBACK")
+                # A concurrent stale-key refresh can invalidate a deferred read's
+                # write upgrade. Re-read authority from a fresh snapshot without
+                # refreshing coarse last-used telemetry instead of waiting for a
+                # long writer timeout.
+                with transaction(connection=reader, immediate=False) as connection:
+                    organization_id, identity_id, key_id, row = read_alias(
+                        connection,
+                        readonly=True,
+                    )
+        finally:
+            if timing_recorder is not None:
+                timing_recorder("sqlite_authority_transaction_ms", authority_transaction_started)
         if row is None:
             raise alias_not_granted_error("requested model alias is not granted")
 
@@ -134,23 +147,28 @@ def authorize_sqlite_alias(
                 "active_snapshot_ref",
             )
         )
-        observation = observe_sqlite_chain_authority(
-            reader,
-            organization_id,
-            alias_revision_id,
-            rows=(authority_row,),
-        )
-        request_id = f"request-{uuid.uuid4().hex}"
-        with prepare_sqlite_chain_authority(
-            None,
-            organization_id,
-            alias_revision_id,
-            request_id=request_id,
-            operation="authorize",
-            maximum_bytes=serving_snapshot_max_bytes,
-            remaining_seconds=deadline_monotonic - clock.monotonic(),
-            classification_memo=classification_memo,
-            observation=observation,
-        ) as proof:
-            witness = proof.authority_witness()
+        chain_snapshot_started = time.monotonic()
+        try:
+            observation = observe_sqlite_chain_authority(
+                reader,
+                organization_id,
+                alias_revision_id,
+                rows=(authority_row,),
+            )
+            request_id = f"request-{uuid.uuid4().hex}"
+            with prepare_sqlite_chain_authority(
+                None,
+                organization_id,
+                alias_revision_id,
+                request_id=request_id,
+                operation="authorize",
+                maximum_bytes=serving_snapshot_max_bytes,
+                remaining_seconds=deadline_monotonic - clock.monotonic(),
+                classification_memo=classification_memo,
+                observation=observation,
+            ) as proof:
+                witness = proof.authority_witness()
+        finally:
+            if timing_recorder is not None:
+                timing_recorder("sqlite_chain_snapshot_preparation_ms", chain_snapshot_started)
     return organization_id, identity_id, key_id, row, request_id, witness
