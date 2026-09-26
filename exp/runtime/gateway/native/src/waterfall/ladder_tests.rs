@@ -271,6 +271,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
+        exact_model_id: "fixture-model".into(),
         dialect: "openai_compatible".to_string(),
         url: url.to_string(),
         headers: HashMap::new(),
@@ -294,6 +295,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         time_to_first_byte_seconds_per_million_input_tokens: None,
         time_to_first_token_base_seconds: None,
         throttle_redial_budget,
+        throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
     }

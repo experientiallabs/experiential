@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use crate::errors::{Failure, FailureClass};
 use crate::events::Event;
 
 /// Provider-facing mangled name -> (origin name, origin namespace, is custom).
@@ -41,18 +42,18 @@ pub type NativeToolTranslation = HashMap<String, (String, Option<String>, bool)>
 ///
 /// The tool was presented to the model as a function with a single required
 /// `input` string, so a well-formed call is `{"input": "<freeform text>"}`.
-/// The freeform text is returned verbatim. Anything else (malformed JSON, a
-/// missing or non-string `input`) falls back to the raw argument text so a
-/// misbehaving model degrades to passing its bytes through rather than losing
-/// the call.
-fn unwrap_custom_input(raw_arguments: &str) -> String {
-    match serde_json::from_str::<Value>(raw_arguments) {
-        Ok(Value::Object(map)) => match map.get("input") {
-            Some(Value::String(input)) => input.clone(),
-            _ => raw_arguments.to_string(),
-        },
-        _ => raw_arguments.to_string(),
+/// The freeform text is returned verbatim. An invalid wrapper is a typed
+/// provider response failure, never a successful freeform call containing JSON.
+fn unwrap_custom_input(raw_arguments: &str) -> Result<String, Failure> {
+    if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(raw_arguments) {
+        if let Some(Value::String(input)) = map.remove("input") {
+            return Ok(input);
+        }
     }
+    Err(Failure::new(
+        FailureClass::MalformedResponse,
+        "translated custom tool requires an object with a string input",
+    ))
 }
 
 /// Rewrite one tool-call event in place using the translation map.
@@ -60,9 +61,12 @@ fn unwrap_custom_input(raw_arguments: &str) -> String {
 /// A no-op for every event that is not a tool call, and for any tool call
 /// whose (mangled) name is absent from the map. Both the started and completed
 /// events are rewritten identically so downstream consistency checks hold.
-pub fn invert_tool_event(event: &mut Event, translation: &NativeToolTranslation) {
+pub fn invert_tool_event(
+    event: &mut Event,
+    translation: &NativeToolTranslation,
+) -> Result<(), Failure> {
     if translation.is_empty() {
-        return;
+        return Ok(());
     }
     match event {
         Event::ToolCallStarted {
@@ -83,12 +87,13 @@ pub fn invert_tool_event(event: &mut Event, translation: &NativeToolTranslation)
                 call.namespace = origin_namespace.clone();
                 if *is_custom {
                     call.custom = true;
-                    call.raw_arguments = unwrap_custom_input(&call.raw_arguments);
+                    call.raw_arguments = unwrap_custom_input(&call.raw_arguments)?;
                 }
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Per-response translation state. Wrapped custom arguments cannot be emitted
@@ -102,7 +107,7 @@ pub struct NativeToolInverter {
 }
 
 impl NativeToolInverter {
-    pub fn filter(&mut self, mut event: Event) -> Vec<Event> {
+    pub fn filter(&mut self, mut event: Event) -> Result<Vec<Event>, Failure> {
         if let Event::ToolCallStarted { index, name, .. } = &event {
             if self.translation.get(name).is_some_and(|entry| entry.2) {
                 self.custom_calls.insert(*index);
@@ -110,22 +115,22 @@ impl NativeToolInverter {
         }
         if let Event::ToolArgumentsDelta { index, .. } = &event {
             if self.custom_calls.contains(index) {
-                return Vec::new();
+                return Ok(Vec::new());
             }
         }
-        invert_tool_event(&mut event, &self.translation);
+        invert_tool_event(&mut event, &self.translation)?;
         if let Event::ToolCallCompleted { index, call } = &event {
             if self.custom_calls.remove(index) {
-                return vec![
+                return Ok(vec![
                     Event::ToolArgumentsDelta {
                         index: *index,
                         delta: call.raw_arguments.clone(),
                     },
                     event,
-                ];
+                ]);
             }
         }
-        vec![event]
+        Ok(vec![event])
     }
 }
 
@@ -180,7 +185,7 @@ mod tests {
             namespace: None,
             caller: None,
         };
-        invert_tool_event(&mut event, &map);
+        invert_tool_event(&mut event, &map).unwrap();
         match event {
             Event::ToolCallStarted {
                 name, namespace, ..
@@ -196,7 +201,7 @@ mod tests {
     fn namespaced_completed_regains_name_and_namespace_and_stays_a_function() {
         let map = translation();
         let mut event = completed("multi_agent_v1__close_agent", "{\"id\":\"a\"}");
-        invert_tool_event(&mut event, &map);
+        invert_tool_event(&mut event, &map).unwrap();
         match event {
             Event::ToolCallCompleted { call, .. } => {
                 assert_eq!(call.name, "close_agent");
@@ -215,7 +220,7 @@ mod tests {
             "apply_patch",
             "{\"input\": \"*** Begin Patch\\n*** End Patch\"}",
         );
-        invert_tool_event(&mut event, &map);
+        invert_tool_event(&mut event, &map).unwrap();
         match event {
             Event::ToolCallCompleted { call, .. } => {
                 assert_eq!(call.name, "apply_patch");
@@ -227,16 +232,33 @@ mod tests {
     }
 
     #[test]
-    fn custom_completed_with_malformed_arguments_passes_bytes_through() {
-        let map = translation();
-        let mut event = completed("apply_patch", "not json at all");
-        invert_tool_event(&mut event, &map);
-        match event {
-            Event::ToolCallCompleted { call, .. } => {
-                assert!(call.custom);
-                assert_eq!(call.raw_arguments, "not json at all");
-            }
-            _ => panic!("expected ToolCallCompleted"),
+    fn custom_completed_with_invalid_wrapper_fails_without_exposing_wrapper_bytes() {
+        for raw in ["not json at all", "{}", "{\"input\":7}", "[]"] {
+            let mut inverter = NativeToolInverter {
+                translation: translation(),
+                ..Default::default()
+            };
+            let start = Event::ToolCallStarted {
+                index: 0,
+                call_id: "call-1".into(),
+                name: "apply_patch".into(),
+                namespace: None,
+                caller: None,
+                custom: false,
+            };
+            assert!(matches!(
+                &inverter.filter(start).unwrap()[0],
+                Event::ToolCallStarted { custom: true, .. }
+            ));
+            assert!(inverter
+                .filter(Event::ToolArgumentsDelta {
+                    index: 0,
+                    delta: raw.into()
+                })
+                .unwrap()
+                .is_empty());
+            let failure = inverter.filter(completed("apply_patch", raw)).unwrap_err();
+            assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
         }
     }
 
@@ -244,7 +266,7 @@ mod tests {
     fn unmapped_tool_call_is_untouched() {
         let map = translation();
         let mut event = completed("exec_command", "{\"cmd\":[\"ls\"]}");
-        invert_tool_event(&mut event, &map);
+        invert_tool_event(&mut event, &map).unwrap();
         match event {
             Event::ToolCallCompleted { call, .. } => {
                 assert_eq!(call.name, "exec_command");
@@ -259,7 +281,7 @@ mod tests {
     fn empty_translation_is_a_no_op() {
         let map = NativeToolTranslation::new();
         let mut event = completed("apply_patch", "{\"input\":\"x\"}");
-        invert_tool_event(&mut event, &map);
+        invert_tool_event(&mut event, &map).unwrap();
         match event {
             Event::ToolCallCompleted { call, .. } => {
                 assert_eq!(call.name, "apply_patch");

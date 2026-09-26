@@ -801,6 +801,11 @@ fn error_payload(error: &errors::PublicError) -> String {
     serde_json::to_string(error).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Contract 1 consumes each deployment's actual canonical model identity and
+/// stage-local throttle-redial schedule. Funding, authorization and recovery
+/// remain Python/host contracts; this marker makes no claims about those.
+const MODEL_STAGE_CONTRACT_VERSION: u32 = 1;
+
 /// The exp_gateway_native extension module.
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -819,5 +824,25 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(normalize_stream_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add("MODEL_STAGE_CONTRACT_VERSION", MODEL_STAGE_CONTRACT_VERSION)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+
+    #[test]
+    fn exports_compiled_model_stage_contract() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "exp_gateway_native").expect("module");
+            exp_gateway_native(&module).expect("register module");
+            let contract = module
+                .getattr("MODEL_STAGE_CONTRACT_VERSION")
+                .expect("compiled contract");
+            assert!(contract.is_exact_instance_of::<pyo3::types::PyInt>());
+            assert_eq!(contract.extract::<u32>().expect("integer contract"), 1);
+        });
+    }
 }

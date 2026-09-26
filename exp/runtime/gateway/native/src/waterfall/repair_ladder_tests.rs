@@ -217,6 +217,7 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
             DeploymentWire {
                 native_tool_translation: Default::default(),
                 throttle_redial_budget: 2,
+                throttle_redial: None,
                 ..responses_wire("a", &rung_a.url, &["rsn_a_remembered_repair_is_redialed_without_earning_the_refusal_again_hA=="])
             },
             responses_wire("b", &rung_b.url, &["rsn_a_remembered_repair_is_redialed_without_earning_the_refusal_again_hA=="]),

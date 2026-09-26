@@ -2,11 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes, sha256_json
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.decisions_contracts import ChoiceQuestion, DecisionRequest, NoulQuestion
-from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.gateway.replay_identity import caller_operation_sha256, canonical_request_sha256
+
+
+def test_caller_operation_uses_only_the_standard_opt_in_key() -> None:
+    """Correlation identifiers are not retry keys; the digest namespace stays byte-identical."""
+    plain = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+    )
+    assert caller_operation_sha256(plain) is None
+    keyed = plain.model_copy(update={"idempotency_key": "fixture-key"})
+    assert (
+        caller_operation_sha256(keyed)
+        == hashlib.sha256(b"gateway-caller-operation-v1\0fixture-key").hexdigest()
+    )
 
 
 def test_decision_identity_is_plain_canonical_json_independent_of_mapping_order() -> None:

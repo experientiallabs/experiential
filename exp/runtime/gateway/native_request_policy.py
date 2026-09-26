@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.errors import ProviderParameterError
 
@@ -36,12 +37,15 @@ def restrict_fallbacks(request: GatewayRequest, route: GatewayRoute) -> GatewayR
     routing = None if request.gateway is None else request.gateway.routing
     if routing is None or routing.allow_fallbacks:
         return route
-    lead = next(
-        item for item in route.deployments if item.gateway.capabilities.failover_only_on is None
+    index = next(
+        index
+        for index, item in enumerate(route.deployments)
+        if item.gateway.capabilities.failover_only_on is None
     )
+    lead = route.deployments[index]
     return route.model_copy(
         update={
-            "snapshot": route.snapshot.model_copy(update={"deployment_ids": (lead.deployment_id,)}),
+            "snapshot": project_stage_selection(route.snapshot, (index,)),
             "deployment": lead,
             "fallback_deployments": (),
         }

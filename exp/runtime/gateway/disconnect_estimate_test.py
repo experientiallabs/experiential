@@ -25,6 +25,7 @@ from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayEventKind
 
 
 def _request() -> GatewayRequest:
+    """Build one admitted text-completion request for deterministic tokenization."""
     return GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(
@@ -34,6 +35,7 @@ def _request() -> GatewayRequest:
 
 
 def _disconnect(usage: GatewayUsage | None = None) -> GatewayEvent:
+    """Build a trusted cancelled terminal with optional provider-observed usage."""
     return GatewayEvent(
         kind=GatewayEventKind.FAILED,
         sequence_number=0,
@@ -46,6 +48,7 @@ def _disconnect(usage: GatewayUsage | None = None) -> GatewayEvent:
 
 
 def _tokens(text: str) -> int:
+    """Count expected tokens with the same frozen reservation tokenizer."""
     return len(reservation_encoder().encode_ordinary(text))
 
 
@@ -201,6 +204,67 @@ def test_unreported_cache_reads_take_the_recent_cached_fraction(
     assert usage.cache_creation_input_tokens is None
 
 
+@pytest.mark.parametrize("hour_tokens", [None, 0, 800])
+@pytest.mark.parametrize("fraction", [0.1, 0.9, 1.0])
+@pytest.mark.parametrize("writes", [800, 1_200])
+@pytest.mark.parametrize("reported_read", [None, 0, 100])
+def test_estimated_reads_cannot_displace_provider_observed_writes(
+    hour_tokens: int | None, fraction: float, writes: int, reported_read: int | None
+) -> None:
+    """Only imputed reads use remaining input; provider read/write and TTL facts stay exact."""
+    observed = GatewayUsage(
+        input_tokens=1_000,
+        output_tokens=1,
+        cached_input_tokens=reported_read,
+        cache_creation_input_tokens=writes,
+        cache_creation_1h_input_tokens=hour_tokens,
+    )
+    terminal = estimate_disconnect_usage(
+        _disconnect(observed),
+        request=_request(),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=StreamedOutput(text="partial"),
+        cached_fraction=fraction,
+    )
+    assert terminal.usage_estimated and terminal.usage is not None
+    usage = terminal.usage
+    expected_read = (
+        reported_read
+        if reported_read is not None
+        else min(1_000 - writes, int(1_000 * fraction))
+        if writes < 1_000
+        else None
+    )
+    assert usage.cached_input_tokens == expected_read
+    assert usage.cache_creation_input_tokens == writes
+    assert usage.cache_creation_1h_input_tokens == hour_tokens
+
+
+def test_observed_cache_subsets_raise_missing_input_without_changing_their_values() -> None:
+    """Reported disjoint read/write subsets survive while the estimated total contains both."""
+    terminal = estimate_disconnect_usage(
+        _disconnect(
+            GatewayUsage(
+                output_tokens=1,
+                cached_input_tokens=7,
+                cache_creation_input_tokens=800,
+                cache_creation_1h_input_tokens=0,
+            )
+        ),
+        request=_request(),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=StreamedOutput(text="partial"),
+        cached_fraction=1.0,
+    )
+    assert terminal.usage is not None
+    assert terminal.usage.input_tokens == 807
+    assert terminal.usage.cached_input_tokens == 7
+    assert terminal.usage.cache_creation_input_tokens == 800
+    assert terminal.usage.cache_creation_1h_input_tokens == 0
+
+
 def test_estimated_cache_reads_never_displace_observed_cache_writes() -> None:
     """A read estimate leaves room for every reported write, so write liability survives pricing."""
     observed = GatewayUsage(input_tokens=1_000, output_tokens=1, cache_creation_input_tokens=300)
@@ -292,7 +356,12 @@ _PARTIAL = StreamedOutput(text="partial answer")
         # A data plane predating (or mis-sending) the evidence keeps unknown.
         (True, GatewayApiSurface.CHAT_COMPLETIONS, True, None),
         # Generated images are billed per image, never estimable from text.
-        (True, GatewayApiSurface.CHAT_COMPLETIONS, True, StreamedOutput(text="ok", images=1)),
+        (
+            True,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+            True,
+            StreamedOutput(text="ok", images=1),
+        ),
     ],
 )
 def test_unopened_decision_image_and_ordinary_settlements_are_left_alone(

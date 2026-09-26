@@ -13,7 +13,6 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.codex_tools import (
-    NativeToolMapping,
     convert_native_history,
     translate_native_tools,
 )
@@ -764,15 +763,16 @@ def route_generation_parameter_requests(
     # web_search/tool_search dropped with disclosure). The inverse mapping rides
     # on the provider request so the response path re-shapes tool calls back.
     native_history_present = any(
-        message.provider_native_item is not None for message in request.messages
+        message.provider_native_item is not None
+        or any(call.provider_namespace is not None for call in message.tool_calls)
+        for message in request.messages
     )
     if (request.provider_native_tools or native_history_present) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
-        native_mapping = NativeToolMapping()
+        translation = translate_native_tools(request)
+        native_mapping = translation.mapping
         if request.provider_native_tools:
-            translation = translate_native_tools(request)
-            native_mapping = translation.mapping
             provider_updates["tools"] = translation.tools
             provider_updates["provider_native_tools"] = ()
             for disclosure in translation.disclosures:

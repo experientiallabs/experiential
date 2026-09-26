@@ -23,7 +23,8 @@ import logging
 import queue
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeVar, cast
@@ -37,6 +38,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
 )
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.model_chain_authority import ChainOperation, SQLiteChainPreflight
 from exp.runtime.gateway.native_settlement import (
     tool_search_requests_kwarg,
     upstream_provider_kwarg,
@@ -102,10 +104,34 @@ async def abandoned_write_outcome[R](write: asyncio.Task[R]) -> R | None:
 
 @dataclass(frozen=True)
 class _PendingWrite:
-    """One queued ledger operation and the future resolved after durable commit."""
+    """One queued ledger operation and the future resolved after durable commit.
+
+    Attributes:
+        prepare: Optional pretransaction context retaining proof handles through the write;
+            None applies the queued operation directly.
+    """
 
     apply: Callable[[sqlite3.Connection], object]
     future: concurrent.futures.Future[object]
+    prepare: (
+        Callable[
+            [sqlite3.Connection], AbstractContextManager[Callable[[sqlite3.Connection], object]]
+        ]
+        | None
+    ) = None
+
+
+@contextmanager
+def _prepared_chain_write(
+    core: SQLiteAttemptLedger,
+    connection: sqlite3.Connection,
+    authorization: AuthorizationSnapshot,
+    operation: ChainOperation,
+    apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
+) -> Iterator[Callable[[sqlite3.Connection], object]]:
+    """Own a queued operation's proof on the writer, including after caller cancellation."""
+    with core.prepare_chain_authority(authorization, operation, connection=connection) as proof:
+        yield lambda connection: apply(connection, proof)
 
 
 class GroupCommitAttemptLedger:
@@ -163,9 +189,15 @@ class GroupCommitAttemptLedger:
         Args:
             authorization: Frozen authority and request identity.
         """
-        await self._submit(
-            lambda connection: self.core.apply_accept_request(
-                connection, authorization=authorization
+        await asyncio.shield(
+            asyncio.wrap_future(
+                self._enqueue_chain(
+                    authorization,
+                    "accept",
+                    lambda connection, proof: self.core.apply_accept_request(
+                        connection, authorization=authorization, chain_preflight=proof
+                    ),
+                )
             )
         )
 
@@ -200,21 +232,31 @@ class GroupCommitAttemptLedger:
         Returns:
             Stable new attempt ID.
         """
-        return await self._submit(
-            lambda connection: self.core.apply_start_attempt(
-                connection,
-                snapshot=snapshot,
-                deployment=deployment,
-                attempt_ordinal=attempt_ordinal,
-                route_depth=route_depth,
-                maximum_cost_nano_usd=maximum_cost_nano_usd,
-                reserved_input_tokens=reserved_input_tokens,
-                reserved_output_tokens=reserved_output_tokens,
-                route_reason=route_reason,
-                fallback_reason=fallback_reason,
-                dispatch_reason=dispatch_reason,
-                preferred_deployment=preferred_deployment,
-            )
+        return cast(
+            AttemptId,
+            await asyncio.shield(
+                asyncio.wrap_future(
+                    self._enqueue_chain(
+                        snapshot.authorization,
+                        "reserve",
+                        lambda connection, proof: self.core.apply_start_attempt(
+                            connection,
+                            chain_preflight=proof,
+                            snapshot=snapshot,
+                            deployment=deployment,
+                            attempt_ordinal=attempt_ordinal,
+                            route_depth=route_depth,
+                            maximum_cost_nano_usd=maximum_cost_nano_usd,
+                            reserved_input_tokens=reserved_input_tokens,
+                            reserved_output_tokens=reserved_output_tokens,
+                            route_reason=route_reason,
+                            fallback_reason=fallback_reason,
+                            dispatch_reason=dispatch_reason,
+                            preferred_deployment=preferred_deployment,
+                        ),
+                    )
+                )
+            ),
         )
 
     async def finish_attempt(
@@ -292,6 +334,11 @@ class GroupCommitAttemptLedger:
             )
         )
 
+    @property
+    def stopped(self) -> bool:
+        """Return whether the actual writer exited, not just whether new submissions are closed."""
+        return not self._thread.is_alive()
+
     async def flush(self) -> None:
         """Resolve after every previously enqueued operation is durably committed."""
         await self._submit(lambda connection: None)
@@ -338,7 +385,21 @@ class GroupCommitAttemptLedger:
                         break
                     batch.append(extra)
                 try:
-                    self._commit_batch(connection, batch)
+                    with ExitStack() as preparations:
+                        ready: list[_PendingWrite] = []
+                        for pending in batch:
+                            try:
+                                apply = (
+                                    pending.apply
+                                    if pending.prepare is None
+                                    else preparations.enter_context(pending.prepare(connection))
+                                )
+                            except Exception as exc:  # noqa: BLE001 - isolate each preflight failure.
+                                _resolve_exception(pending.future, exc)
+                            else:
+                                ready.append(_PendingWrite(apply, pending.future))
+                        if ready:
+                            self._commit_batch(connection, ready)
                 except Exception as exc:  # noqa: BLE001 - blocked callers receive the failure.
                     _logger.exception("gateway ledger batch failed outside its own transaction")
                     for pending in batch:
@@ -353,6 +414,7 @@ class GroupCommitAttemptLedger:
                             )
         finally:
             connection.close()
+            self.core.classification_memo.clear()
             self._fail_pending()
 
     def _fail_pending(self) -> None:
@@ -460,7 +522,29 @@ class GroupCommitAttemptLedger:
         """
         return await asyncio.shield(asyncio.wrap_future(self._enqueue(apply)))
 
-    def _enqueue(self, apply: Callable[[sqlite3.Connection], _T]) -> concurrent.futures.Future[_T]:
+    def _enqueue_chain(
+        self,
+        authorization: AuthorizationSnapshot,
+        operation: ChainOperation,
+        apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
+    ) -> concurrent.futures.Future[object]:
+        """Queue classification before BEGIN without giving callers ownership of live handles."""
+        return self._enqueue(
+            lambda connection: apply(connection, None),
+            prepare=lambda connection: _prepared_chain_write(
+                self.core, connection, authorization, operation, apply
+            ),
+        )
+
+    def _enqueue(
+        self,
+        apply: Callable[[sqlite3.Connection], _T],
+        *,
+        prepare: Callable[
+            [sqlite3.Connection], AbstractContextManager[Callable[[sqlite3.Connection], object]]
+        ]
+        | None = None,
+    ) -> concurrent.futures.Future[_T]:
         """Queue one operation for the writer thread and return its commit future.
 
         Args:
@@ -480,6 +564,7 @@ class GroupCommitAttemptLedger:
                 _PendingWrite(
                     apply=apply,
                     future=cast("concurrent.futures.Future[object]", future),
+                    prepare=prepare,
                 )
             )
         return future
@@ -519,11 +604,13 @@ class SyncGroupCommitLedger:
         Args:
             authorization: Frozen authority and request identity.
         """
-        self._writer.submit_blocking(
-            lambda connection: self._writer.core.apply_accept_request(
-                connection, authorization=authorization
-            )
-        )
+        self._writer._enqueue_chain(
+            authorization,
+            "accept",
+            lambda connection, proof: self._writer.core.apply_accept_request(
+                connection, authorization=authorization, chain_preflight=proof
+            ),
+        ).result()
 
     def start_attempt(
         self,
@@ -556,21 +643,27 @@ class SyncGroupCommitLedger:
         Returns:
             Stable new attempt ID.
         """
-        return self._writer.submit_blocking(
-            lambda connection: self._writer.core.apply_start_attempt(
-                connection,
-                snapshot=snapshot,
-                deployment=deployment,
-                attempt_ordinal=attempt_ordinal,
-                route_depth=route_depth,
-                maximum_cost_nano_usd=maximum_cost_nano_usd,
-                reserved_input_tokens=reserved_input_tokens,
-                reserved_output_tokens=reserved_output_tokens,
-                route_reason=route_reason,
-                fallback_reason=fallback_reason,
-                dispatch_reason=dispatch_reason,
-                preferred_deployment=preferred_deployment,
-            )
+        return cast(
+            AttemptId,
+            self._writer._enqueue_chain(
+                snapshot.authorization,
+                "reserve",
+                lambda connection, proof: self._writer.core.apply_start_attempt(
+                    connection,
+                    chain_preflight=proof,
+                    snapshot=snapshot,
+                    deployment=deployment,
+                    attempt_ordinal=attempt_ordinal,
+                    route_depth=route_depth,
+                    maximum_cost_nano_usd=maximum_cost_nano_usd,
+                    reserved_input_tokens=reserved_input_tokens,
+                    reserved_output_tokens=reserved_output_tokens,
+                    route_reason=route_reason,
+                    fallback_reason=fallback_reason,
+                    dispatch_reason=dispatch_reason,
+                    preferred_deployment=preferred_deployment,
+                ),
+            ).result(),
         )
 
     def finish_attempt(

@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager, contextmanager
 from exp.common.core.artifacts import Sha256
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, GatewayTarget, ProjectTarget
+from exp.runtime.gateway.model_chain_authority import refuse_sqlite_chain_snapshot
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
     bind_alias_provider_connections,
@@ -179,6 +180,80 @@ def reconcile_alias_activation(
     return tuple(row[index] for index in range(8)) == expected
 
 
+def reactivate_alias_revision(
+    *,
+    connect: ConnectionFactory,
+    organization_id: str,
+    alias_id: str,
+    revision_id: str,
+    maximum_bytes: int,
+) -> bool:
+    """Reactivate a disabled revision only with current local policy and provider bindings."""
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                """SELECT a.active, a.active_revision_id, r.snapshot_ref
+                FROM gateway_aliases a JOIN alias_revisions r
+                  ON r.organization_id=a.organization_id AND r.alias_id=a.alias_id
+                WHERE a.organization_id=? AND a.alias_id=? AND r.revision_id=?""",
+                (organization_id, alias_id, revision_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("alias revision cannot be reactivated")
+            refuse_sqlite_chain_snapshot(
+                connection, str(row["snapshot_ref"]), maximum_bytes=maximum_bytes
+            )
+            current_revision = str(row["active_revision_id"])
+            if bool(row["active"]):
+                if current_revision == revision_id:
+                    connection.rollback()
+                    return False
+                raise ValueError("alias activation advanced to another revision")
+            if current_revision != revision_id:
+                raise ValueError("disabled alias no longer points at the requested revision")
+            bindings = connection.execute(
+                """SELECT b.connection_id, b.connection_revision_id,
+                       b.connection_sha256, c.active, c.active_revision_id,
+                       r.connection_sha256 AS current_sha256
+                FROM alias_revision_provider_connections AS b
+                LEFT JOIN provider_connections AS c
+                  ON c.organization_id = b.organization_id
+                 AND c.connection_id = b.connection_id
+                LEFT JOIN provider_connection_revisions AS r
+                  ON r.organization_id = c.organization_id
+                 AND r.connection_id = c.connection_id
+                 AND r.revision_id = c.active_revision_id
+                WHERE b.organization_id = ? AND b.alias_id = ?
+                  AND b.alias_revision_id = ?""",
+                (organization_id, alias_id, revision_id),
+            ).fetchall()
+            for binding in bindings:
+                if (
+                    not bool(binding["active"])
+                    or str(binding["active_revision_id"]) != str(binding["connection_revision_id"])
+                    or str(binding["current_sha256"]) != str(binding["connection_sha256"])
+                ):
+                    raise ValueError(
+                        "alias revision provider bindings are no longer active and current"
+                    )
+            result = connection.execute(
+                """UPDATE gateway_aliases
+                SET active = 1, active_revision_id = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+                WHERE organization_id = ? AND alias_id = ? AND active = 0
+                  AND active_revision_id = ?""",
+                (revision_id, organization_id, alias_id, revision_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("alias revision cannot be reactivated")
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+
+
 def register_catalog_snapshot_in_transaction(
     connection: sqlite3.Connection,
     *,
@@ -187,6 +262,7 @@ def register_catalog_snapshot_in_transaction(
     catalog_sha256: Sha256,
     now: str,
     store_error: type[ValueError],
+    maximum_bytes: int,
 ) -> None:
     """Register one catalog snapshot idempotently inside a caller-owned transaction.
 
@@ -197,10 +273,12 @@ def register_catalog_snapshot_in_transaction(
         catalog_sha256: Normalized secret-free catalog digest.
         now: Canonical transaction timestamp.
         store_error: Gateway-specific error type for authority conflicts.
+        maximum_bytes: Frozen per-file serving classification bound.
 
     Raises:
         ValueError: The snapshot reference or digest was previously assigned differently.
     """
+    refuse_sqlite_chain_snapshot(connection, snapshot_ref, maximum_bytes=maximum_bytes)
     by_ref = connection.execute(
         """
         SELECT organization_id, catalog_sha256 FROM catalog_snapshot_refs
@@ -248,6 +326,7 @@ def activate_alias_revision_in_transaction(
     refusal_failover: bool,
     now: str,
     store_error: type[ValueError],
+    maximum_bytes: int,
 ) -> None:
     """Create and activate one immutable alias revision in an open transaction.
 
@@ -264,10 +343,12 @@ def activate_alias_revision_in_transaction(
         refusal_failover: Whether typed precommit refusals may advance.
         now: Canonical transaction timestamp.
         store_error: Gateway-specific error type for authority conflicts.
+        maximum_bytes: Frozen per-file serving classification bound.
 
     Raises:
         ValueError: The snapshot or alias invariants conflict.
     """
+    refuse_sqlite_chain_snapshot(connection, snapshot_ref, maximum_bytes=maximum_bytes)
     snapshot = connection.execute(
         """
         SELECT 1 FROM catalog_snapshot_refs

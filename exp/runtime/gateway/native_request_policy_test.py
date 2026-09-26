@@ -10,7 +10,17 @@ from unittest.mock import patch
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import GatewayDeploymentCapabilities, ModelCapabilities
+from exp.common.models import (
+    GatewayDeploymentCapabilities,
+    ModelCapabilities,
+    load_model_catalog,
+    write_model_catalog,
+)
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
+)
 from exp.runtime.gateway.affinity import affinity_fingerprint
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -24,6 +34,10 @@ from exp.runtime.gateway.native_request_policy import require_route_authority
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import sticky_first_order
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    chain_components,
+    publish_authored_chain_fixture,
+)
 from exp.runtime.gateway.web_search.backend import StaticWebSearchBackend, WebSearchBackend
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 from exp.runtime.gateway.web_search.plan import WebSearchPlan, plan_web_search
@@ -36,6 +50,109 @@ def _body(policy: JsonObject) -> str:
     return json.dumps(
         {"model": "coding", "messages": [{"role": "user", "content": "hi"}], "gateway": policy}
     )
+
+
+@pytest.mark.parametrize("no_fallback", [False, True])
+@pytest.mark.parametrize("attempt_cap", [1, 2])
+def test_request_policy_cannot_widen_staged_authority_or_physical_budget(
+    tmp_path: Path, no_fallback: bool, attempt_cap: int
+) -> None:
+    """Real admission and reservation intersect no-fallback and total caps with the model graph."""
+    manager, key = _configured_pool_gateway(tmp_path)
+    authored = load_model_catalog(tmp_path / "models.toml")
+    models = dict(authored.models)
+    child = models["beta"]
+    assert child.gateway is not None
+    models["beta"] = child.model_copy(
+        update={"gateway": child.gateway.model_copy(update={"exact_model_id": "child-model"})}
+    )
+    authored = authored.model_copy(
+        update={
+            "models": models,
+            "gateway_pools": {},
+            "gateway_model_chains": {
+                "model-revision-exact": GatewayModelChain(
+                    model_id="model-revision-exact",
+                    pool_id="alpha",
+                    revision="chain-policy",
+                    rungs=(
+                        GatewayDeploymentRung(deployment_id="alpha"),
+                        GatewayModelReferenceRung(model_id="child-model"),
+                    ),
+                )
+            },
+        }
+    )
+    write_model_catalog(tmp_path / "models.toml", authored)
+    publish_authored_chain_fixture(tmp_path, revision_id="chain-policy", pool_id="alpha")
+    components = chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
+    plane = NativeControlPlane(components)
+    try:
+        admitted = json.loads(
+            plane.admit(
+                json.dumps(
+                    {
+                        "raw_key": key,
+                        "body": _body(
+                            {
+                                "routing": {"allow_fallbacks": not no_fallback},
+                                "retry": {"max_total_attempts": attempt_cap},
+                            }
+                        ),
+                    }
+                )
+            )
+        )
+        assert [wire["deployment_id"] for wire in admitted["route"]] == (
+            ["alpha"] if no_fallback else ["alpha", "beta"]
+        )
+        first = json.loads(
+            plane.start_attempt(
+                json.dumps({"request_id": admitted["request_id"], "attempt_ordinal": 0})
+            )
+        )
+        assert first["route_depth"] == 0
+        failure = {
+            "failure_class": "provider_quota",
+            "safe_message": "quota",
+            "retryable_same_deployment": False,
+            "failover_eligible": True,
+        }
+        plane.settle(
+            json.dumps(
+                {
+                    "request_id": admitted["request_id"],
+                    "attempt_id": first["attempt_id"],
+                    "outcome": "failed",
+                    "failure": failure,
+                    "usage": None,
+                    "finalize": False,
+                }
+            )
+        )
+        successor = json.loads(
+            plane.start_attempt(
+                json.dumps(
+                    {
+                        "request_id": admitted["request_id"],
+                        "attempt_ordinal": 1,
+                        "current_depth": 0,
+                        "failure": failure,
+                    }
+                )
+            )
+        )
+        if no_fallback or attempt_cap == 1:
+            assert successor["exhausted"] is True
+        else:
+            assert successor["route_depth"] == 1
+            plane.abandon(json.dumps({"request_id": admitted["request_id"]}))
+        with sqlite3.connect(manager.database_path) as connection:
+            assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (
+                1 if no_fallback or attempt_cap == 1 else 2,
+            )
+    finally:
+        manager.close()
 
 
 def test_no_fallback_selects_unrestricted_wire_and_credentials(tmp_path: Path) -> None:

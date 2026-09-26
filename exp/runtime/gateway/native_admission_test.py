@@ -21,6 +21,7 @@ from exp.common.models.content import (
     VideoContentPart,
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -47,6 +48,7 @@ from exp.runtime.gateway.native_admission import (
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.gateway.native_execution import deployment_health_key
 from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
+from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -230,6 +232,42 @@ def test_cache_marked_requests_dispatch_marker_honoring_rungs_first() -> None:
         _marked_request(),
     )
     assert route.deployment.deployment_id == "shim"
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_staged_marker_ordering_is_owned_by_stage_scheduler(pinned: bool) -> None:
+    """Rank stage markers once, while preserving a live reasoning issuer."""
+    route = _mixed_route("maximize_cache")
+    stage = ModelExecutionStage(
+        stage_index=0,
+        exact_model_id=route.snapshot.exact_model_id,
+        pool_id=route.snapshot.pool_id,
+        deployment_ids=route.snapshot.deployment_ids,
+        failover_mode="maximize_cache",
+    )
+    route = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(update={"model_stages": (stage,)}),
+            "reasoning_pinned_deployment_id": "shim" if pinned else None,
+        }
+    )
+    wires = _wires()
+    request = _marked_request()
+    unchanged, unchanged_wires = _prefer_cache_capable_rungs(route, wires, request)
+    assert unchanged is route
+    assert unchanged_wires is wires
+    ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+        unchanged,
+        unchanged_wires,
+        request,
+        accounting=_affinity_accounting(),
+        authorization=route.snapshot.authorization,
+        continuation=None,
+    )
+    expected = ("shim", "native") if pinned else ("native", "shim")
+    assert ordered.snapshot.deployment_ids == expected
+    assert ordered.snapshot.model_stages[0].deployment_ids == expected
+    assert ordered_wires[0][0].dialect == ("openai_compatible" if pinned else "anthropic_messages")
 
 
 def test_reasoning_pin_holds_the_issuing_rung_first_only_while_it_survives() -> None:
@@ -575,6 +613,8 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
 
+        recovery_host = None
+
         recorded = 0
 
         def record_admission_coercions(self, count: int) -> None:
@@ -642,6 +682,8 @@ def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
 
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
+
+        recovery_host = None
 
         recorded = 0
 
@@ -714,6 +756,8 @@ def test_disabled_thinking_keeps_the_opus_rung_that_honors_it() -> None:
 
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
+
+        recovery_host = None
 
         recorded = 0
 
@@ -807,6 +851,8 @@ def _tool_screenshot_route_request(*, stream: bool) -> GatewayRequest:
 
 class _AdmissionCoercionCounter:
     """Count coercion recordings without a live ledger."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         self.recorded = 0
@@ -1035,7 +1081,7 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
     # House rung: billing_customer_managed False and no tier pricing, so it does
     # not forward service_tier.
     wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
-    accounting = cast(NativeAttemptAccounting, object())
+    accounting = cast(NativeAttemptAccounting, _CoercionCounter())
 
     for tier in ("flex", "priority"):
         request = GatewayRequest(
@@ -1118,7 +1164,7 @@ def test_tier_priced_host_lane_admits_the_named_tier() -> None:
         route,
         wires,
         request,
-        accounting=cast(NativeAttemptAccounting, object()),
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
         authorization=route.snapshot.authorization,
     )
     # The tier survives to the provider request on the tier-priced house lane.
@@ -1132,7 +1178,7 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
     (the customer pays the provider directly)."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
-    accounting = cast(NativeAttemptAccounting, object())
+    accounting = cast(NativeAttemptAccounting, _CoercionCounter())
     client = cast(NativeWireClient, object())
     streaming = GatewayDeploymentCapabilities(supports_streaming=True)
 
@@ -1218,6 +1264,8 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
 
 class _CoercionCounter:
     """Count coercion recordings without a live ledger."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         """Start at zero recorded coercions."""
@@ -1506,7 +1554,7 @@ def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> N
             _wires(),
             request,
             # Never reached: the refusal precedes every coercion or reservation.
-            accounting=cast(NativeAttemptAccounting, object()),
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
             authorization=route.snapshot.authorization,
         )
 
@@ -1589,12 +1637,15 @@ def _order(route: GatewayRoute) -> tuple[str, ...]:
 
 
 class _AffinityAccounting:
-    """Just the sticky and health registries affinity ordering reads."""
+    """The local registries read by direct and staged affinity ordering."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         """Compose fresh empty registries."""
         self.sticky = StickySpillRegistry()
         self.health = DeploymentHealthRegistry()
+        self.recovery = SessionRecoveryRegistry()
 
 
 def _affinity_accounting() -> NativeAttemptAccounting:

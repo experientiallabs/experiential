@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Literal, Protocol
 
 from exp.common.core.artifacts import JsonObject, sha256_json
@@ -14,10 +15,16 @@ from exp.common.models import (
     ModelCatalog,
     ModelClient,
     ModelSnapshot,
+    NormalizedGatewayCatalog,
     ReasoningEffort,
     known_model_metadata,
+    normalize_gateway_catalog,
 )
-from exp.runtime.models.credentials import read_connection_api_key
+from exp.runtime.models.credentials import (
+    DispatchCredentialReceipt,
+    read_connection_api_key,
+    read_connection_credential,
+)
 from exp.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.async_transport import (
@@ -116,7 +123,12 @@ class _HttpClientFactory(Protocol):
 
 @dataclass(frozen=True)
 class ResolvedModel:
-    """One alias resolved to static identity, capabilities, and focused runtime clients."""
+    """One alias resolved to static identity, capabilities, and focused runtime clients.
+
+    Attributes:
+        credential_receipt: Private receipt resolved atomically with authentication, or None
+            when the credential source cannot establish recovery or cache evidence scope.
+    """
 
     alias: str
     snapshot: ModelSnapshot
@@ -124,6 +136,7 @@ class ResolvedModel:
     client: ModelClient
     embedding_client: EmbeddingClient | None
     served_model_id: str | None = None
+    credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
 
 
 class RuntimeModelCatalog:
@@ -157,6 +170,15 @@ class RuntimeModelCatalog:
         self._tinker_sampler_factory = tinker_sampler_factory
         self._bedrock_runtime_factory = bedrock_runtime_factory
         self._vertex_token_provider_factory = vertex_token_provider_factory
+
+    def requires_model_chain_authority(self, *, pool_id: str) -> bool:
+        """Classify the selected authored root through exact normalized pool/model membership."""
+        return self._gateway_catalog.requires_model_chain_authority(pool_id=pool_id)
+
+    @cached_property
+    def _gateway_catalog(self) -> NormalizedGatewayCatalog:
+        """Normalize immutable authored serving membership once, without provider or file access."""
+        return normalize_gateway_catalog(self._catalog)
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Resolve static identity and exact capability evidence without provider access.
@@ -289,11 +311,10 @@ class RuntimeModelCatalog:
                 bedrock_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
             )
-        api_key = read_connection_api_key(
-            connection,
-            connection_id=record.connection,
-            environment=self._environment,
+        credential = read_connection_credential(
+            connection, connection_id=record.connection, environment=self._environment
         )
+        api_key = credential.value
         if provider == "vertex":
             if connection.base_url is None:
                 raise ModelConnectionError(
@@ -389,6 +410,7 @@ class RuntimeModelCatalog:
                 openai_client,
                 openai_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
+                credential_receipt=credential.receipt,
             )
         if provider == "azure":
             if connection.base_url is None or connection.api_version is None:
@@ -558,6 +580,7 @@ class RuntimeModelCatalog:
             http_client,
             embedding_client,
             served_model_id=record.served_model_id,
+            credential_receipt=credential.receipt,
         )
 
     def preflight(

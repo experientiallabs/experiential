@@ -24,7 +24,9 @@ from exp.common.models.gateway_catalog import (
     ExactModelPoolId,
     FailoverMode,
 )
+from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
+from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
 from exp.runtime.gateway.reasoning_blocks import (
     EncryptedReasoningBlock as EncryptedReasoningBlock,
 )
@@ -77,6 +79,15 @@ from exp.runtime.gateway.stream_contracts import (
 from exp.runtime.gateway.stream_contracts import (
     TokenLogprob as TokenLogprob,
 )
+from exp.runtime.gateway.tool_contracts import (
+    GatewayNamedToolChoice as GatewayNamedToolChoice,
+)
+from exp.runtime.gateway.tool_contracts import (
+    GatewayProviderNativeTool as GatewayProviderNativeTool,
+)
+from exp.runtime.gateway.tool_contracts import (
+    GatewayToolDefinition as GatewayToolDefinition,
+)
 from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch, gateway_tool_search_name
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
 
@@ -121,43 +132,6 @@ class GatewayApiSurface(StrEnum):
     DECISIONS = "decisions"
 
 
-class GatewayToolDefinition(ContractModel):
-    """A caller-defined function with exact schema and provider-owned carriers.
-
-    Attributes:
-        name: Function name, bounded to 256 characters.
-        description: Unbounded caller description; body and provider context limits apply.
-        parameters: The caller JSON Schema, unchanged.
-        strict: Whether the provider must enforce the schema.
-        cache_control: Validated caching hint, excluded from replay identity.
-        eager_input_streaming: Native Anthropic streaming selector.
-        defer_loading: Native deferred-loading selector; provider validates combinations.
-        allowed_callers: Native programmatic-tool caller allowlist.
-        input_examples: Provider-visible example inputs counted in reservation.
-
-    Native carriers join replay identity except caching hints, which change cost only.
-    """
-
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = None
-    parameters: JsonObject
-    strict: bool = False
-    cache_control: JsonObject | None = Field(default=None, exclude=True)
-    eager_input_streaming: bool | None = Field(default=None, exclude=True)
-    defer_loading: bool | None = Field(default=None, exclude=True)
-    allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
-    input_examples: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
-
-    def has_anthropic_tool_carriers(self) -> bool:
-        """Whether any Anthropic-native tool carrier is present on this tool."""
-        return (
-            self.eager_input_streaming is not None
-            or self.defer_loading is not None
-            or self.allowed_callers is not None
-            or self.input_examples is not None
-        )
-
-
 class StructuredTextFormat(ContractModel):
     """A strict structured-text output schema requested by the caller."""
 
@@ -165,24 +139,6 @@ class StructuredTextFormat(ContractModel):
     description: str | None = Field(default=None, max_length=65_536)
     json_schema: JsonObject
     strict: bool = True
-
-
-class GatewayProviderNativeTool(ContractModel):
-    """A provider-owned native Responses tool carried only on its own wire.
-
-    Attributes:
-        index: Caller tools-array position, preserving mixed declaration order.
-        tool: Shallowly validated declaration; provider owns the internal schema.
-    """
-
-    index: int = Field(ge=0)
-    tool: JsonObject
-
-
-class GatewayNamedToolChoice(ContractModel):
-    """A request to require one named caller-defined function."""
-
-    name: str = Field(min_length=1, max_length=256)
 
 
 class GatewayMessage(ContractModel):
@@ -940,6 +896,13 @@ class AuthorizationSnapshot(ContractModel):
     """Immutable authority and alias target frozen before learned model selection.
 
     Attributes:
+        model_chain_authority: Optional backend-issued binding, revalidated by
+            the host at acceptance and every attempt reservation.
+        fair_share_weight: Organization weight in [1, 1,000,000], default 1,
+            used only on rungs authoring weighted fair-share admission.
+        descendant_start_authorized: False unless the host proves root funding
+            and policy gates before allowing a request to start at a child.
+        zdr_requested: Caller demand for stricter ZDR filtering, default False.
         requested_route_id: Optional public selector, excluded from durable serialization.
     """
 
@@ -954,6 +917,7 @@ class AuthorizationSnapshot(ContractModel):
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
     caller_operation_sha256: Sha256 | None = None
+    model_chain_authority: ModelChainAuthority | None = None
     requested_route_id: RequestedRouteId | None = Field(default=None, exclude=True)
     refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)
@@ -971,14 +935,18 @@ class AuthorizationSnapshot(ContractModel):
     and never a credential; ``None`` when no trusted hop yields an address (an
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
-    # The request demanded ZDR routing (GatewayRequest.zdr_requested), carried
-    # here so every resolver entry point can tighten the org's posture filter.
+    descendant_start_authorized: bool = False
     zdr_requested: bool = False
     # Fair-share weights default to equal shares and apply only on opted-in rungs.
 
 
 class ExecutionSnapshot(ContractModel):
-    """Route-bound request plan created only after exact-model selection."""
+    """Route-bound request plan created only after exact-model selection.
+
+    Attributes:
+        model_stages: Frozen ordered stage segments; empty for an unstaged exact-model route.
+        traversal_events: Immutable expansion provenance, not mutable runtime visitation state.
+    """
 
     authorization: AuthorizationSnapshot
     exact_model_id: ExactModelId
@@ -996,3 +964,36 @@ class ExecutionSnapshot(ContractModel):
     # Rungs the host flagged for OpenRouter's per-request ZDR constraint; the
     # dispatch builder tightens each and fails closed on a wire that cannot.
     zdr_constrained_deployment_ids: tuple[DeploymentId, ...] = ()
+    model_stages: tuple[ModelExecutionStage, ...] = ()
+    traversal_events: tuple[ModelTraversalEvent, ...] = ()
+
+    @model_validator(mode="after")
+    def _require_stage_projection(self) -> ExecutionSnapshot:
+        """Require the ordered stage leaves to exactly cover the dispatch cursor."""
+        if (
+            self.model_stages
+            and tuple(d for s in self.model_stages for d in s.deployment_ids) != self.deployment_ids
+        ):
+            raise ValueError("execution stages must exactly cover ordered deployment_ids")
+        return self
+
+    def stage_for_depth(self, depth: int) -> ModelExecutionStage:
+        """Return the exact destination authority, never substitute the root model."""
+        if not 0 <= depth < len(self.deployment_ids):
+            raise ValueError("execution route depth is outside the authorized plan")
+        if not self.model_stages:
+            return ModelExecutionStage(
+                stage_index=0,
+                exact_model_id=self.exact_model_id,
+                pool_id=self.pool_id,
+                deployment_ids=self.deployment_ids,
+                failover_mode=self.failover_mode,
+                throttle_cache_threshold=self.throttle_cache_threshold,
+                throttle_redial=self.throttle_redial,
+            )
+        cursor = 0
+        for stage in self.model_stages:
+            cursor += len(stage.deployment_ids)
+            if depth < cursor:
+                return stage
+        raise ValueError("execution stage projection is incomplete")

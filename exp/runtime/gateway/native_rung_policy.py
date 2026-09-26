@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
+import time
+from collections.abc import Callable
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import GatewayEvent, GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -48,6 +51,7 @@ def reserve_rung_slot(
     *,
     reserved_tokens: int,
     force: bool,
+    rate_retry: bool = False,
 ) -> str | RungShed | None:
     """Reserve one policy-bounded slot on a rung, or report the shed.
 
@@ -58,8 +62,8 @@ def reserve_rung_slot(
         deployment: The claimed rung about to dispatch.
         reserved_tokens: Worst-case tokens this dispatch reserves, counted
             against the rung's token window when one is authored.
-        force: Admit past every policy limit because no other rung can
-            serve.
+        force: Admit past soft policy limits when overflow is explicitly allowed.
+        rate_retry: Skip only rate-window checks after scheduled backoff.
 
     Returns:
         An opaque reservation ticket, the shed disclosure, or ``None``
@@ -73,27 +77,34 @@ def reserve_rung_slot(
     )
     if not authored and loads.default_bound is None:
         return None
-    # An unauthored bound falls back to the worker's default lane share
-    # (exp.runtime.gateway.lane_saturation); an authored one replaces it.
+    # An unauthored bound falls back to the worker's default lane share.
     applies_default = policy is None or policy.concurrency_bound is None
     bound = loads.default_bound if applies_default else policy.concurrency_bound
-    # Warm standing: the request's affinity fingerprint holds a live sticky
-    # binding on THIS rung, so its provider cache lives here and the
-    # fresh-session early threshold does not apply to it. The early threshold
+    # Scoped routes carry admission-verified warmth for THIS rung. Ordinary
+    # direct affinity routes instead read their live conversation binding. Never
+    # let that unscoped binding stand in for tenant/prefix/credential evidence.
+    # Either warm standing bypasses only the fresh-session early threshold.
+    # The early threshold
     # only exists on affinity pools AND for requests that carry a fingerprint
     # (chat/Responses admission): a surface with no session concept
     # (embeddings, images) must never be classed fresh wholesale.
     fresh_fraction = (
         policy.fresh_session_spill_fraction
         if policy is not None
-        and entry.route.snapshot.failover_mode == "maximize_cache_affinity"
+        and entry.route.snapshot.stage_for_depth(
+            entry.route.snapshot.deployment_ids.index(deployment.deployment_id)
+        ).failover_mode
+        == "maximize_cache_affinity"
         and entry.affinity_fingerprint is not None
         else None
     )
     warm_session = True
     if fresh_fraction is not None and entry.affinity_fingerprint is not None:
-        warm_session = sticky.bound_deployment(entry.affinity_fingerprint) == (
-            deployment.deployment_id
+        warm_session = (
+            entry.verified_warm_deployment_id == deployment.deployment_id
+            and time.monotonic() < entry.verified_warm_until_monotonic
+            if entry.recovery_scoped
+            else sticky.bound_deployment(entry.affinity_fingerprint) == deployment.deployment_id
         )
     tokens_per_minute = None if policy is None else policy.tokens_per_minute
     result = loads.reserve(
@@ -109,6 +120,8 @@ def reserve_rung_slot(
         warm_session=warm_session,
         fresh_spill_fraction=fresh_fraction,
         force=force,
+        hard_bound=applies_default or (policy is not None and policy.saturation == "refuse"),
+        rate_retry=rate_retry,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
         result = dataclasses.replace(result, default_bound=True)
@@ -119,6 +132,26 @@ def reserve_rung_slot(
             result.learned_requests_per_minute,
         )
     return result
+
+
+def bind_sticky_dispatch(
+    sticky: StickySpillRegistry,
+    entry: InflightRequest,
+    deployment: ExactModelDeployment,
+) -> None:
+    """Refresh ordinary direct affinity placement, never scoped cache evidence."""
+    if entry.route.snapshot.model_stages or entry.affinity_fingerprint is None:
+        return
+    if entry.route.snapshot.failover_mode != "maximize_cache_affinity":
+        return
+    policy = deployment.gateway.dispatch
+    if policy is None or policy.sticky_spill_seconds is None:
+        return
+    sticky.bind(
+        entry.affinity_fingerprint,
+        deployment.deployment_id,
+        ttl_seconds=float(policy.sticky_spill_seconds),
+    )
 
 
 def failed_dispatch_candidate(
@@ -159,8 +192,9 @@ def failed_dispatch_candidate(
         (else ``None``).
     """
     route = entry.route
-    threshold = route.snapshot.throttle_cache_threshold
-    redial = route.snapshot.throttle_redial
+    stage = route.snapshot.stage_for_depth(current_depth)
+    threshold = stage.throttle_cache_threshold
+    redial = stage.throttle_redial
     deployment = route.deployments[current_depth]
     cached_fraction = loads.cached_fraction(
         rung_load_key(deployment), entry.authorization.organization_id
@@ -173,7 +207,7 @@ def failed_dispatch_candidate(
         attempt_counts=entry.ordinary_attempt_counts,
         total_attempts=entry.total_attempts,
         refusal_failover=entry.authorization.refusal_failover,
-        failover_mode=route.snapshot.failover_mode,
+        failover_mode=stage.failover_mode,
         throttle_cache_threshold=threshold,
         cached_fraction=cached_fraction,
         throttle_redial=redial,
@@ -344,18 +378,20 @@ def throttle_redial_budgets(
         One redial budget per route deployment, in route order.
     """
     snapshot = route.snapshot
-    schedule = snapshot.throttle_redial
-    if schedule is None:
-        return tuple(0 for _ in route.deployments)
-    threshold = snapshot.throttle_cache_threshold
-    if threshold is None or threshold <= 0:
-        return tuple(schedule.max_attempts for _ in route.deployments)
     last_depth = len(route.deployments) - 1
     pinned_deployment_id = route.reasoning_pinned_deployment_id
     budgets: list[int] = []
     for depth, deployment in enumerate(route.deployments):
+        stage = snapshot.stage_for_depth(depth)
+        schedule = stage.throttle_redial
+        threshold = stage.throttle_cache_threshold
+        if schedule is None:
+            budgets.append(0)
+            continue
         if (
-            depth == last_depth
+            threshold is None
+            or threshold <= 0
+            or depth == last_depth
             or deployment.deployment_id == sticky_deployment_id
             or deployment.deployment_id == pinned_deployment_id
         ):
@@ -365,3 +401,50 @@ def throttle_redial_budgets(
         share = min(1.0, fraction / threshold)
         budgets.append(int(schedule.max_attempts * share))
     return tuple(budgets)
+
+
+def record_cache_fraction(
+    loads: RungLoadRegistry,
+    entry: InflightRequest,
+    attempt_id: str,
+    terminal: GatewayEvent,
+    *,
+    lock: threading.Lock,
+    sample_gate: Callable[[str], bool] | None,
+) -> None:
+    """Fold only actual provider cache evidence into the rung fairness sample once.
+
+    Args:
+        loads: Existing worker admission registry receiving the observed sample.
+        entry: Request-local attempt ownership and completed-sample membership.
+        attempt_id: Durable physical attempt being settled.
+        terminal: Final event; estimated disconnect usage never establishes cache warmth.
+        lock: Accounting lock protecting the existing membership test and mark.
+        sample_gate: Optional hosted funding eligibility check, run outside the lock.
+    """
+    usage = terminal.usage
+    if usage is None or usage.input_tokens is None or terminal.usage_estimated:
+        return
+    depth = entry.attempt_depths.get(attempt_id)
+    if depth is None:
+        return
+    if sample_gate is not None:
+        # Promo-funded (or otherwise excluded) attempts must not buy
+        # fair-share weight; an erroring gate skips the sample rather
+        # than admit one the host meant to exclude.
+        try:
+            if not sample_gate(attempt_id):
+                return
+        except Exception:  # noqa: BLE001 - the sample is telemetry, never worth failing settle.
+            return
+    with lock:
+        if attempt_id in entry.cache_recorded_attempts:
+            return
+        entry.cache_recorded_attempts.add(attempt_id)
+    cached = usage.cached_input_tokens
+    loads.record_settle(
+        rung_load_key(entry.route.deployments[depth]),
+        entry.authorization.organization_id,
+        cached_tokens=0 if cached is None else cached,
+        input_tokens=usage.input_tokens,
+    )

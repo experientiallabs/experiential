@@ -377,10 +377,8 @@ pub(super) fn contains_nul(value: &Value) -> bool {
 /// Storage normalization never touches forwarded bytes. Preserve colliding object keys.
 fn normalize(value: &mut Value) {
     match value {
-        Value::String(text) => {
-            if text.contains('\0') {
-                *text = text.replace('\0', "\u{fffd}");
-            }
+        Value::String(text) if text.contains('\0') => {
+            *text = text.replace('\0', "\u{fffd}");
         }
         Value::Array(values) => values.iter_mut().for_each(normalize),
         Value::Object(object) => {

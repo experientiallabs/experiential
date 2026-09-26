@@ -9,6 +9,7 @@ import typer
 
 from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from exp.cli.shared.options import ROOT_OPTION, usage_error
+from exp.common.config.settings import load_settings
 from exp.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,
@@ -74,7 +75,10 @@ def budget_set(
     manager = GatewayManagement(root)
     with usage_error(ValueError):
         manager.require_initialized()
-        changed, limit = SQLiteBudgetStore(manager.database_path).set_limit(
+        resources = load_settings(root).gateway
+        changed, limit = SQLiteBudgetStore(
+            manager.database_path, snapshot_max_bytes=resources.budget_snapshot_max_bytes
+        ).set_limit(
             organization_id=manager.organization_id,
             period=selected_period,
             scope=scope,

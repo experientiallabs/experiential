@@ -1,6 +1,7 @@
 //! Capture authorized provider evidence before public protocol projection.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::collector::Collector;
 use crate::admission::Admission;
@@ -18,34 +19,75 @@ pub(crate) async fn checkpoint_winner(
     collector: Option<&Arc<Collector>>,
     admission: &Admission,
     guard: &mut AttemptGuard,
-    won: Won,
+    mut won: Won,
+    deadline: Instant,
 ) -> Won {
-    let (Some(collector), Won::Committed(attempt)) = (collector, &won) else {
+    let (Some(collector), Won::Committed(attempt)) = (collector, &mut won) else {
         return won;
     };
-    if admission.route.get(attempt.depth).is_some_and(|wire| {
-        wire.billing_customer_managed || collector.checkpoint(&admission.request_id)
-    }) {
+    if admission
+        .route
+        .get(attempt.depth)
+        .is_some_and(|wire| wire.billing_customer_managed)
+    {
         return won;
     }
-    // Dispatch has already reserved a physical attempt. Request-only abandon
-    // would disarm its drop backstop without closing that reservation.
+    let receipt = collector.checkpoint_receipt(&admission.request_id);
+    let mut unfinished = UnexposedCheckpoint {
+        collector,
+        request_id: &admission.request_id,
+        armed: true,
+    };
+    let failure = match receipt {
+        Ok(None) => {
+            unfinished.armed = false;
+            return won;
+        }
+        Ok(Some(receipt)) => match tokio::time::timeout_at(deadline.into(), receipt).await {
+            Ok(Ok(true)) => {
+                unfinished.armed = false;
+                return won;
+            }
+            Err(_) => Failure::new(
+                FailureClass::Timeout,
+                "capture checkpoint deadline exceeded",
+            ),
+            _ => Failure::new(FailureClass::Internal, "capture checkpoint failed"),
+        },
+        Err(()) => Failure::new(FailureClass::Internal, "capture checkpoint failed"),
+    };
+    // Close the physical transport before any durable settlement callback can wait.
+    attempt.relay.close_transport();
     let usage = attempt.usage.clone();
     let tool_names = attempt.tool_names.clone();
     drop(won);
-    guard
-        .settle(
-            "failed",
-            usage.as_ref(),
-            &tool_names,
-            Some(&Failure::new(
-                FailureClass::Internal,
-                "capture checkpoint failed",
-            )),
-            true,
-        )
-        .await;
-    Won::Failed(PublicError::internal())
+    drop(unfinished);
+    if failure.failure_class == FailureClass::Timeout {
+        guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+    } else {
+        guard
+            .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
+            .await;
+    }
+    Won::Failed(if failure.failure_class == FailureClass::Timeout {
+        crate::relay::collection_public_error(&failure)
+    } else {
+        PublicError::internal()
+    })
+}
+
+struct UnexposedCheckpoint<'a> {
+    collector: &'a Collector,
+    request_id: &'a str,
+    armed: bool,
+}
+
+impl Drop for UnexposedCheckpoint<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.collector.finish_unexposed(self.request_id);
+        }
+    }
 }
 
 pub(crate) struct Observer {

@@ -54,11 +54,35 @@ class CommandBudgetSettings(BaseModel):
         return value
 
 
+class GatewayResourceSettings(BaseModel):
+    """Operator-owned local gateway resource budgets, not catalog validity limits.
+
+    Attributes:
+        budget_snapshot_max_bytes: Authoring-only bound for pool or deployment budget
+            snapshots. Defaults to 64 MiB; a strict integer from 1 through 2^63-1.
+        serving_snapshot_max_bytes: Independent per-file bound when classifying normalized
+            and authored serving snapshots. Defaults to 64 MiB; a strict integer from
+            1 through 2^63-1. Oversized files fail closed, never become unchained.
+    """
+
+    budget_snapshot_max_bytes: int = Field(
+        default=64 * 1024 * 1024, strict=True, ge=1, le=2**63 - 1
+    )
+    serving_snapshot_max_bytes: int = Field(
+        default=64 * 1024 * 1024, strict=True, ge=1, le=2**63 - 1
+    )
+
+
 class ProjectSettings(BaseModel):
-    """Local telemetry preference and optional shared command-budget ceiling."""
+    """Local telemetry preference and optional shared command-budget ceiling.
+
+    Attributes:
+        gateway: Local snapshot resource limits, defaulting to bounded gateway settings.
+    """
 
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     commands: CommandBudgetSettings = Field(default_factory=CommandBudgetSettings)
+    gateway: GatewayResourceSettings = Field(default_factory=GatewayResourceSettings)
 
 
 def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -49,6 +49,7 @@ from exp.common.models.catalog_prices import (
 from exp.common.models.catalog_roles import ModelRoles
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.failover_tokens import FailoverToken
+from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
@@ -56,7 +57,10 @@ from exp.common.models.model import (
     ModelSnapshot,
     ReasoningEffort,
 )
-from exp.common.models.nano_usd_upgrade import upgrade_model_catalog_document
+from exp.common.models.nano_usd_upgrade import (
+    upgrade_legacy_billing_source,
+    upgrade_model_catalog_document,
+)
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -637,7 +641,12 @@ class GatewayDeploymentCapabilities(ContractModel):
 
 
 class GatewayDeploymentMetadata(ContractModel):
-    """Optional gateway-only metadata authored beside one existing model record."""
+    """Optional gateway-only metadata authored beside one existing model record.
+
+    Attributes:
+        cache_retention_seconds: Declared positive cache lifetime, at most one hour;
+            None supplies no plausible warmth claim.
+    """
 
     exact_model_id: ArtifactId | None = None
     capabilities: GatewayDeploymentCapabilities = Field(
@@ -647,7 +656,7 @@ class GatewayDeploymentMetadata(ContractModel):
     pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
     pricing_effective_at: AwareDatetime | None = None
     dispatch: GatewayRungDispatchPolicy | None = None
-    """Optional dispatch policy for this rung; ``None`` is fully inert."""
+    cache_retention_seconds: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
 
 
 class ModelRecord(ContractModel):
@@ -730,7 +739,11 @@ and fails closed rather than being read as a future contract.
 
 
 class ModelCatalog(ContractModel):
-    """The local model aliases, connection metadata, and project role assignments."""
+    """The local model aliases, connection metadata, and project role assignments.
+
+    Attributes:
+        gateway_model_chains: Authored chains keyed by canonical model ID; empty by default.
+    """
 
     schema_version: int = Field(
         default=MODEL_CATALOG_SCHEMA_VERSION, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
@@ -749,11 +762,12 @@ class ModelCatalog(ContractModel):
     safe by construction; a revision that REINTERPRETS existing fields must not
     reuse this channel — it needs a new field name or a fleet-first tolerance
     release. Version 1 stays rejected here: it is only readable through
-    ``_migrate_legacy_model_catalog`` on the TOML load path.
+    ``upgrade_legacy_billing_source`` on the TOML load path.
     """
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
     gateway_pools: dict[str, GatewayPoolRecord] = Field(default_factory=dict)
+    gateway_model_chains: dict[str, GatewayModelChain] = Field(default_factory=dict)
     roles: ModelRoles = Field(default_factory=ModelRoles)
 
     @field_validator("schema_version", mode="before")
@@ -872,56 +886,10 @@ def load_model_catalog(path: Path) -> ModelCatalog:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
         return ModelCatalog.model_validate(
-            upgrade_model_catalog_document(_migrate_legacy_model_catalog(raw_catalog))
+            upgrade_model_catalog_document(upgrade_legacy_billing_source(raw_catalog))
         )
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
-
-
-def _migrate_legacy_model_catalog(raw_catalog: JsonObject) -> JsonObject:
-    """Upgrade only schema-v1 local catalogs with conservative customer-owned billing.
-
-    Args:
-        raw_catalog: Parsed secret-free TOML payload.
-
-    Returns:
-        A schema-v2 payload. Current schema records are returned unchanged so a missing
-        ``billing_source`` remains a validation error.
-    """
-    raw_version = raw_catalog.get("schema_version", 1)
-    if type(raw_version) is not int or raw_version != 1:
-        return raw_catalog
-    payload = cast(JsonObject, dict(raw_catalog))
-    models = raw_catalog.get("models")
-    if isinstance(models, dict):
-        migrated_models: JsonObject = {}
-        for alias, value in models.items():
-            if isinstance(value, dict):
-                record = cast(JsonObject, dict(value))
-                if "billing_source" in record:
-                    raise ValueError(
-                        "schema-v1 model record must not declare current billing_source"
-                    )
-                record["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                provenance = record.get("sft_provenance")
-                if isinstance(provenance, dict):
-                    migrated_provenance = cast(JsonObject, dict(provenance))
-                    base_model = provenance.get("base_model")
-                    if isinstance(base_model, dict):
-                        migrated_base = cast(JsonObject, dict(base_model))
-                        if "billing_source" in migrated_base:
-                            raise ValueError(
-                                "schema-v1 SFT base model must not declare current billing_source"
-                            )
-                        migrated_base["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                        migrated_provenance["base_model"] = migrated_base
-                    record["sft_provenance"] = migrated_provenance
-                migrated_models[str(alias)] = record
-            else:
-                migrated_models[str(alias)] = value
-        payload["models"] = migrated_models
-    payload["schema_version"] = 2
-    return payload
 
 
 def write_model_catalog(path: Path, catalog: ModelCatalog) -> None:

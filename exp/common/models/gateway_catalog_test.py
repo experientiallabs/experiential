@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError, model_validator
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json
+from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
@@ -37,6 +37,12 @@ from exp.common.models.gateway_catalog import (
     normalize_gateway_catalog,
     read_pinned_normalized_snapshot,
 )
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
+    expand_model_chain,
+)
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.model import ModelCapabilities, ModelSnapshot
 
@@ -57,6 +63,224 @@ def _minimal_normalized() -> NormalizedGatewayCatalog:
     )
     pool = ExactModelPool(pool_id="dep-1", exact_model_id="exact-1", deployment_ids=("dep-1",))
     return NormalizedGatewayCatalog(deployments=(deployment,), pools=(pool,))
+
+
+def unavailable_child_catalog() -> ModelCatalog:
+    """Author a parent suffix and independent model without inventing a retired child's lane."""
+    return ModelCatalog(
+        connections={"provider": ConnectionConfig(provider="openai")},
+        models={
+            alias: ModelRecord(
+                connection="provider",
+                model=f"provider-{model}",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id=model),
+            )
+            for alias, model in (("a1", "a"), ("a2", "a"), ("c1", "c"))
+        },
+        gateway_pools={
+            "pool-a": GatewayPoolRecord(
+                exact_model_id="a",
+                deployment_aliases=("a1", "a2"),
+                equivalence=GatewayEquivalenceCertification(
+                    certification_id="parent",
+                    provenance="test exact-model evidence",
+                    evidence_sha256=_DIGEST,
+                    certified_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+            ),
+        },
+        gateway_model_chains={
+            "a": GatewayModelChain(
+                model_id="a",
+                pool_id="pool-a",
+                revision="parent",
+                rungs=(
+                    GatewayDeploymentRung(deployment_id="a1"),
+                    GatewayModelReferenceRung(model_id="b"),
+                    GatewayDeploymentRung(deployment_id="a2"),
+                ),
+            ),
+            "b": GatewayModelChain(
+                model_id="b",
+                pool_id="retired-b",
+                revision="retired",
+                available=False,
+            ),
+        },
+    )
+
+
+def test_poolless_unavailable_child_normalizes_without_synthetic_routes() -> None:
+    """An explicit empty tombstone preserves the parent suffix and independent plain model."""
+    authored = unavailable_child_catalog()
+    normalized = normalize_gateway_catalog(authored)
+    assert tuple(d.deployment_id for d in normalized.deployments) == ("a1", "a2", "c1")
+    assert {p.pool_id for p in normalized.pools} == {"pool-a", "c1"}
+    assert set(authored.models) == {"a1", "a2", "c1"}
+    expanded = expand_model_chain("a", normalized.chains_by_model())
+    assert [segment.deployment_ids for segment in expanded.segments] == [("a1",), ("a2",)]
+    assert expanded.visited_model_ids == ("a", "b")
+    assert expanded.examined_rungs == 3
+    assert [(e.reason, e.model_id, e.cursor) for e in expanded.events] == [
+        ("model_entered", "a", 0),
+        ("model_entered", "b", 1),
+        ("model_unavailable", "b", 1),
+        ("traversal_exhausted", "a", 2),
+    ]
+    assert normalized.requires_model_chain_authority(pool_id="pool-a")
+    assert not normalized.requires_model_chain_authority(pool_id="c1")
+    with pytest.raises(ValueError, match="pool is absent"):
+        normalized.requires_model_chain_authority(pool_id="retired-b")
+    assert NormalizedGatewayCatalog.model_validate_json(normalized.model_dump_json()) == normalized
+    plain = normalize_gateway_catalog(authored.model_copy(update={"gateway_model_chains": {}}))
+    assert plain.identity_sha256() != normalized.identity_sha256()
+    revised = authored.gateway_model_chains["b"].model_copy(update={"revision": "retired-again"})
+    changed = normalize_gateway_catalog(
+        authored.model_copy(
+            update={
+                "gateway_model_chains": {"a": authored.gateway_model_chains["a"], "b": revised},
+            }
+        )
+    )
+    assert changed.identity_sha256() != normalized.identity_sha256()
+
+
+@pytest.mark.parametrize(
+    "case", ["available", "unavailable-nonempty", "foreign-pool", "foreign-rung", "omitted-child"]
+)
+def test_unavailable_child_exception_never_weakens_pool_or_reference_identity(case: str) -> None:
+    """Only an absent pool on an explicitly unavailable empty chain is permitted."""
+    normalized = normalize_gateway_catalog(unavailable_child_catalog())
+    parent, child = normalized.model_chains
+    if case in {"available", "unavailable-nonempty"}:
+        child = GatewayModelChain(
+            model_id="b",
+            pool_id="retired-b",
+            revision="r",
+            available=case == "available",
+            rungs=(GatewayDeploymentRung(deployment_id="b1"),),
+        )
+    elif case == "foreign-pool":
+        child = child.model_copy(update={"pool_id": "pool-a"})
+    elif case == "foreign-rung":
+        parent = parent.model_copy(
+            update={"available": False, "rungs": (GatewayDeploymentRung(deployment_id="c1"),)}
+        )
+    with pytest.raises(ValueError, match="same-exact|belong|unavailable"):
+        NormalizedGatewayCatalog(
+            deployments=normalized.deployments,
+            pools=normalized.pools,
+            model_chains=(parent,) if case == "omitted-child" else (parent, child),
+        )
+    with pytest.raises(ValidationError, match="at least 1"):
+        ExactModelPool(pool_id="retired-b", exact_model_id="b", deployment_ids=())
+
+
+class _PoolRequiredChainReader(ContractModel):
+    """Frozen pool-required reader boundary before poolless unavailable-child support.
+
+    Attributes:
+        schema_version: Reader's known schema, default five.
+        deployments: Actual deployment metadata, empty by default.
+        pools: Nonempty physical pool records, empty by default.
+        model_chains: Explicit chain policy, empty by default.
+    """
+
+    schema_version: int = 5
+    deployments: tuple[ExactModelDeployment, ...] = ()
+    pools: tuple[ExactModelPool, ...] = ()
+    model_chains: tuple[GatewayModelChain, ...] = ()
+
+    @model_validator(mode="after")
+    def _require_pool(self) -> _PoolRequiredChainReader:
+        """Preserve the exact cross-field condition, not a prunable unknown-field error."""
+        pools = {pool.pool_id: pool for pool in self.pools}
+        for chain in self.model_chains:
+            pool = pools.get(chain.pool_id)
+            if pool is None or pool.exact_model_id != chain.model_id:
+                raise ValueError("model chain must name its same-exact certified pool")
+        return self
+
+
+@pytest.mark.parametrize("schema", [5, 6])
+def test_poolless_tombstone_requires_capable_reader_even_under_tolerant_loading(
+    schema: int,
+) -> None:
+    """A prior chain reader rejects the new shape rather than silently inventing an empty pool."""
+    normalized = normalize_gateway_catalog(unavailable_child_catalog())
+    raw = normalized.model_dump(mode="json")
+    raw["schema_version"] = schema
+    with pytest.raises(ValidationError, match="same-exact"):
+        load_forward_compatible(_PoolRequiredChainReader, json.dumps(raw))
+    plain = _minimal_normalized()
+    old = _PoolRequiredChainReader.model_validate_json(plain.model_dump_json())
+    assert (
+        sha256_json(old.model_dump(mode="json", exclude_defaults=True)) == plain.identity_sha256()
+    )
+
+
+class _PreChainSchema5(ContractModel):
+    """Frozen current-main top-level reader shape without model-chain execution."""
+
+    schema_version: int = Field(default=5, ge=1)
+    deployments: tuple[ExactModelDeployment, ...] = ()
+    pools: tuple[ExactModelPool, ...] = ()
+
+    def identity_sha256(self) -> Sha256:
+        """Reproduce the current-main default-excluding identity contract."""
+        return sha256_json(self.model_dump(mode="json", by_alias=True, exclude_defaults=True))
+
+
+class _PreChainSchema4(_PreChainSchema5):
+    """Older stable reader uses tolerant parsing for schema-five documents."""
+
+    schema_version: int = Field(default=4, ge=1)
+
+
+def _read_pre_chain(data: str, digest: str, *, schema: int) -> _PreChainSchema5:
+    """Exercise each old reader's same-schema digest check and foreign-schema bypass."""
+    parsed, _dropped = load_forward_compatible(
+        _PreChainSchema5 if schema == 5 else _PreChainSchema4, data
+    )
+    if parsed.schema_version == schema and parsed.identity_sha256() != digest:
+        raise CatalogSnapshotDigestError("catalog snapshot digest does not match pinned authority")
+    return parsed
+
+
+def test_empty_model_chains_preserve_current_main_schema5_identity() -> None:
+    """Empty chains preserve current-main identity and older serving compatibility."""
+    current = _minimal_normalized()
+    for explicit in (False, True):
+        document = current.model_dump(mode="json")
+        if not explicit:
+            document.pop("model_chains")
+        for schema in (4, 5):
+            loaded = _read_pre_chain(json.dumps(document), current.identity_sha256(), schema=schema)
+            assert loaded.deployments == current.deployments
+            assert loaded.pools == current.pools
+            if schema == 5:
+                assert loaded.identity_sha256() == current.identity_sha256()
+
+
+def test_populated_chains_require_a_feature_floor_not_only_schema5() -> None:
+    """Current-main refuses lost policy, but schema-four workers require the host fleet fence."""
+    plain = _minimal_normalized()
+    policy = GatewayModelChain(
+        model_id="exact-1",
+        pool_id="dep-1",
+        revision="explicit-policy",
+        available=False,
+        rungs=(GatewayDeploymentRung(deployment_id="dep-1"),),
+    )
+    current = plain.model_copy(update={"model_chains": (policy,)})
+    with pytest.raises(CatalogSnapshotDigestError):
+        _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=5)
+    # Schema four treats five as foreign and silently drops the unavailable
+    # policy. Publishing chains to that fleet is unsafe even though main uses five.
+    lost_policy = _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=4)
+    assert lost_policy.deployments == plain.deployments
+    assert "model_chains" not in type(lost_policy).model_fields
 
 
 def test_load_forward_compatible_drops_unknown_fields_and_reports_them() -> None:
@@ -362,7 +586,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     }
     assert fingerprint == {
         "schema_version": 5,
-        "normalized": ["deployments", "pools", "schema_version"],
+        "normalized": ["deployments", "model_chains", "pools", "schema_version"],
         "deployment": [
             "billing_source",
             "capabilities",

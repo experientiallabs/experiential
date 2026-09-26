@@ -234,7 +234,12 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
     let mut headers = vec![
         (
             "x-gateway-canonical-model".to_string(),
-            admission.exact_model_id.clone(),
+            admission
+                .route
+                .get(depth)
+                .filter(|wire| !wire.exact_model_id.is_empty())
+                .map(|wire| wire.exact_model_id.clone())
+                .unwrap_or_else(|| admission.exact_model_id.clone()),
         ),
         ("x-gateway-provider".to_string(), provider),
         ("x-gateway-deployment".to_string(), deployment_id),

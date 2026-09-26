@@ -794,3 +794,6 @@ fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
         }
     }
 }
+
+#[path = "checkpoint_test.rs"]
+mod checkpoints;

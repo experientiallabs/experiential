@@ -26,6 +26,7 @@ from exp.common.models import (
     normalize_gateway_catalog,
     write_model_catalog,
 )
+from exp.runtime.gateway.model_chain_authority import refuse_unenforced_model_chains
 
 
 class GatewayCatalogAuthoringError(ValueError):
@@ -261,6 +262,7 @@ def apply_singleton_deployment_update(root: Path, update: SingletonDeploymentUpd
         root: EXP root containing the locked catalog.
         update: Previously validated singleton deployment mutation.
     """
+    refuse_unenforced_model_chains(update.normalized)
     if update.changed:
         write_model_catalog(root / "models.toml", update.updated)
     _write_catalog_snapshot(root, update.updated, update.normalized)
@@ -468,6 +470,7 @@ def apply_certified_pool_update(root: Path, update: CertifiedPoolUpdate) -> None
         root: EXP root containing the locked catalog.
         update: Previously validated mutation plan.
     """
+    refuse_unenforced_model_chains(update.normalized)
     if update.changed:
         write_model_catalog(root / "models.toml", update.updated)
     _write_catalog_snapshot(root, update.updated, update.normalized)
@@ -568,6 +571,8 @@ def _write_catalog_snapshot(
     Returns:
         Content-addressed normalized snapshot path.
     """
+    refuse_unenforced_model_chains(normalized)
+    refuse_unenforced_model_chains(catalog)
     snapshot = root / "gateway" / "catalog-snapshots" / f"{normalized.identity_sha256()}.json"
     authored = authored_snapshot_path(snapshot)
     authored_bytes = canonical_json_bytes(catalog)

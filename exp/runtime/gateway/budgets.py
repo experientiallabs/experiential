@@ -8,52 +8,32 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import assert_never
+from typing import Literal
 
 from pydantic import Field, model_validator
 
+from exp.common.config.settings import GatewayResourceSettings
 from exp.common.core.artifacts import ContractModel, stable_id
-from exp.common.models.gateway_catalog import (
-    CatalogSnapshotDigestError,
-    ExactModelDeployment,
-    ExactModelPool,
-    read_pinned_normalized_snapshot,
+from exp.runtime.gateway.attempt_costs import (
+    LONG_CONTEXT_TIER_MARGIN_PERCENT as LONG_CONTEXT_TIER_MARGIN_PERCENT,
 )
-from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.attempt_costs import (
+    maximum_attempt_cost_nano_usd as maximum_attempt_cost_nano_usd,
+)
 from exp.runtime.gateway.auth import utc_text
-from exp.runtime.gateway.cache_write import requests_hour_cache
-from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.gateway.decisions_contracts import DecisionRequest
-from exp.runtime.gateway.embeddings_contracts import (
-    EmbeddingsRequest,
-    ServingRequest,
-    embeddings_input_ceiling_nano_usd,
+from exp.runtime.gateway.budget_authority import (
+    BudgetAliasRevision,
+    active_budget_revision,
+    validate_budget_revision,
 )
-from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_nano_usd
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
-    require_representable_nano_usd,
 )
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 __all__ = ["MAXIMUM_NANO_USD"]
-
-LONG_CONTEXT_TIER_MARGIN_PERCENT = 20
-"""How far below a long-context threshold the input estimate may sit and still
-reserve at the premium schedule.
-
-The input reservation is a realistic estimate with headroom, not an upper
-bound, so an estimate just under the threshold can settle just over it and
-be repriced for the WHOLE request (the tier doubles Gemini's rates above
-200k). The reservation therefore treats the tier as reachable inside this
-band below the threshold: a request estimated at 160k+ tokens against a 200k
-tier reserves at premium rates and settles at whatever schedule the provider
-actually applied. The cost of the rule is a one-attempt over-reservation of
-roughly the tier multiple inside the band; without it a hard monthly budget
-could be overdrawn by the same multiple on a threshold-straddling request.
-"""
 
 
 class BudgetScopeKind(StrEnum):
@@ -138,12 +118,42 @@ class MonthlyBudgetRemaining(ContractModel):
     exhausted: bool
 
 
+BudgetApplication = Literal["root", "destination", "shared"]
+
+
+class BudgetRefusalBinding(ContractModel):
+    """Exact request and budget scope selected by the atomic refusal decision.
+
+    Attributes:
+        request_id: Logical request whose atomic reservation was refused.
+        organization_id: Tenant owning the refused request.
+        alias_revision_id: Exact authorized alias revision used by the reservation.
+        scope: Budget scope selected by the authoritative refusal.
+        application: Whether that scope applies to the root, destination, or shared request.
+    """
+
+    request_id: str
+    organization_id: str
+    alias_revision_id: str
+    scope: BudgetScope
+    application: BudgetApplication
+
+
 class BudgetReservationRejected(ValueError):
     """One physical route cannot reserve beneath every applicable hard limit."""
 
-    def __init__(self, *, scope_kind: BudgetScopeKind, reason: str) -> None:
-        """Create one content-free route rejection."""
+    def __init__(
+        self,
+        *,
+        scope_kind: BudgetScopeKind,
+        reason: str,
+        binding: BudgetRefusalBinding | None = None,
+    ) -> None:
+        """Create a rejection; only a matching atomic binding permits scoped continuation."""
+        if binding is not None and binding.scope.kind != scope_kind:
+            raise ValueError("budget refusal binding kind differs from its rejection")
         self.scope_kind = scope_kind
+        self.binding = binding
         super().__init__(reason)
 
 
@@ -156,11 +166,17 @@ class SQLiteBudgetStore:
         *,
         clock: GatewayClock | None = None,
         busy_timeout_ms: int = 5_000,
+        snapshot_max_bytes: int | None = None,
     ) -> None:
-        """Bind one initialized gateway database and injectable UTC clock."""
+        """Bind storage, time, and an optional authoring-only snapshot resource budget."""
         self.database_path = database_path
         self._clock = SystemGatewayClock() if clock is None else clock
         self._busy_timeout_ms = busy_timeout_ms
+        self._snapshot_max_bytes = (
+            GatewayResourceSettings()
+            if snapshot_max_bytes is None
+            else GatewayResourceSettings(budget_snapshot_max_bytes=snapshot_max_bytes)
+        ).budget_snapshot_max_bytes
         initialize_database(database_path, busy_timeout_ms=busy_timeout_ms)
 
     def set_limit(
@@ -199,12 +215,17 @@ class SQLiteBudgetStore:
                 "scope_key": scope.storage_key(),
             },
         )
+        revision = self._prepare_pool_scope(organization_id, scope)
         with self._transaction() as connection:
             self._require_scope_authority(
                 connection,
                 organization_id=organization_id,
                 scope=scope,
             )
+            if revision is not None and scope.alias_id is not None:
+                current = active_budget_revision(connection, organization_id, scope.alias_id)
+                if current != revision:
+                    raise ValueError("budget alias revision changed; reload its scope and retry")
             row = connection.execute(
                 """
                 SELECT limit_nano_usd, strict_unknown_cost FROM gateway_monthly_budgets
@@ -438,77 +459,22 @@ class SQLiteBudgetStore:
             ).fetchone()
             if alias is None:
                 raise ValueError("budget alias is not active")
-        if scope.pool_id is not None:
-            self._require_pool_scope(connection, organization_id=organization_id, scope=scope)
 
-    def _require_pool_scope(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        organization_id: str,
-        scope: BudgetScope,
-    ) -> None:
-        """Require the scoped pool, and any scoped deployment, to exist for the alias.
-
-        The pool must be the direct target of the alias's active revision, because
-        runtime routing and budget charging match on the active revision only. A
-        deployment scope must additionally name a deployment inside that pool in the
-        active revision's pinned catalog snapshot, verified against the registered
-        digest, so a stored limit always references attempts the ledger can charge.
-        """
-        row = connection.execute(
-            """
-            SELECT r.pool_id, r.snapshot_ref, r.catalog_sha256
-            FROM gateway_aliases AS a
-            JOIN alias_revisions AS r
-              ON r.organization_id = a.organization_id
-             AND r.alias_id = a.alias_id
-             AND r.revision_id = a.active_revision_id
-            WHERE a.organization_id = ? AND a.alias_id = ?
-            """,
-            (organization_id, scope.alias_id),
-        ).fetchone()
-        if row is None or row["pool_id"] != scope.pool_id:
-            raise ValueError("budget pool is not the active revision target of its alias")
-        if scope.deployment_id is None:
-            return
-        pools = self._snapshot_pools(
-            str(row["snapshot_ref"]),
-            catalog_sha256=str(row["catalog_sha256"]),
+    def _prepare_pool_scope(
+        self, organization_id: str, scope: BudgetScope
+    ) -> BudgetAliasRevision | None:
+        """Validate pinned graph outside the write transaction and return its revision fence."""
+        if scope.pool_id is None or scope.alias_id is None:
+            return None
+        with self._connect() as connection:
+            revision = active_budget_revision(connection, organization_id, scope.alias_id)
+        return validate_budget_revision(
+            self.database_path,
+            revision,
+            scope.pool_id,
+            scope.deployment_id,
+            self._snapshot_max_bytes,
         )
-        for pool in pools:
-            if pool.pool_id != scope.pool_id:
-                continue
-            if scope.deployment_id in pool.deployment_ids:
-                return
-        raise ValueError("budget deployment is not in its pool's active catalog snapshot")
-
-    def _snapshot_pools(
-        self,
-        snapshot_ref: str,
-        *,
-        catalog_sha256: str,
-    ) -> tuple[ExactModelPool, ...]:
-        """Load the certified pools from one pinned catalog snapshot reference.
-
-        Raises:
-            ValueError: The reference escapes gateway state, is unreadable, or does
-                not match its registered digest, so configuration fails closed
-                instead of storing an unverifiable scope.
-        """
-        state_dir = self.database_path.parent.resolve()
-        snapshot = (state_dir / snapshot_ref).resolve()
-        if not snapshot.is_relative_to(state_dir):
-            raise ValueError("budget catalog snapshot reference escapes gateway state")
-        try:
-            # Roll-tolerant read: a newer build's snapshot is scoped under its
-            # pinned digest; a same-version one still verifies byte-for-byte.
-            catalog = read_pinned_normalized_snapshot(snapshot.read_bytes(), catalog_sha256)
-        except CatalogSnapshotDigestError:
-            raise
-        except (OSError, ValueError) as exc:
-            raise ValueError("budget scope catalog snapshot is unreadable") from exc
-        return catalog.pools
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -551,115 +517,6 @@ def budget_period_start(period: str) -> str:
     return f"{period}-01T00:00:00+00:00"
 
 
-def maximum_attempt_cost_nano_usd(
-    request: ServingRequest,
-    deployment: ExactModelDeployment,
-    *,
-    input_tokens: int | None = None,
-) -> int | None:
-    """Return a conservative nano-USD ceiling for one physical call (per surface).
-
-    ``input_tokens`` is the request's :func:`worst_case_input_tokens` when the
-    caller already computed it (a ladder walk prices every candidate from one
-    tokenizer pass); it is computed here otherwise. Both the platform's token
-    reservation and this money ceiling price the same estimate.
-    """
-    if input_tokens is None:
-        input_tokens = worst_case_input_tokens(request)
-    match request:
-        case EmbeddingsRequest():
-            return embeddings_input_ceiling_nano_usd(
-                input_tokens=input_tokens,
-                input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
-            )
-        case ImagesRequest():
-            return images_ceiling_nano_usd(
-                request,
-                input_tokens=input_tokens,
-                input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
-                output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
-            )
-        case GatewayRequest() | DecisionRequest():
-            return _token_attempt_cost_nano_usd(request, deployment, input_tokens)
-        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
-            assert_never(request)
-
-
-def _token_attempt_cost_nano_usd(
-    request: GatewayRequest | DecisionRequest,
-    deployment: ExactModelDeployment,
-    input_tokens: int,
-) -> int | None:
-    """Reserve the maximum applicable rate for each surface-specific token bound.
-
-    Args:
-        request: Canonical request including forwarded cache TTL markers.
-        deployment: Frozen capabilities and base, tier, and cache-write prices.
-        input_tokens: Input estimate including the configured headroom.
-
-    Returns:
-        Nano-USD ceiling, or None when an applicable rate is unknown.
-    """
-    output_tokens = worst_case_output_tokens(request, deployment)
-    prices = deployment.gateway.prices
-    capabilities = deployment.gateway.capabilities
-    # The tier reprices the whole request once actual input reaches its
-    # threshold, and the estimate can land under a threshold the provider's
-    # count then crosses, so the tier is treated as reachable from
-    # LONG_CONTEXT_TIER_MARGIN_PERCENT below it; a reachable tier must survive
-    # the whole-request premium schedule.
-    tier = prices.long_context
-    if tier is not None and input_tokens * 100 < tier.input_threshold_tokens * (
-        100 - LONG_CONTEXT_TIER_MARGIN_PERCENT
-    ):
-        tier = None
-    schedules = [prices] if tier is None else [prices, tier]
-    for schedule in schedules:
-        required_rates = [
-            schedule.input_nano_usd_per_million_tokens,
-            schedule.output_nano_usd_per_million_tokens,
-        ]
-        if capabilities.reports_cached_input_tokens:
-            required_rates.append(schedule.cached_input_nano_usd_per_million_tokens)
-        if capabilities.reports_cache_creation_input_tokens:
-            required_rates.append(schedule.cache_creation_input_nano_usd_per_million_tokens)
-            if requests_hour_cache(request):
-                required_rates.append(schedule.cache_creation_1h_input_nano_usd_per_million_tokens)
-        if capabilities.reports_reasoning_tokens:
-            required_rates.append(schedule.reasoning_nano_usd_per_million_tokens)
-        if any(rate is None for rate in required_rates):
-            return None
-    input_rate = max(
-        rate
-        for schedule in schedules
-        for rate in (
-            schedule.input_nano_usd_per_million_tokens,
-            schedule.cached_input_nano_usd_per_million_tokens,
-            schedule.cache_creation_input_nano_usd_per_million_tokens
-            if capabilities.reports_cache_creation_input_tokens
-            else None,
-            schedule.cache_creation_1h_input_nano_usd_per_million_tokens
-            if capabilities.reports_cache_creation_input_tokens and requests_hour_cache(request)
-            else None,
-        )
-        if rate is not None
-    )
-    output_rate = max(
-        rate
-        for schedule in schedules
-        for rate in (
-            schedule.output_nano_usd_per_million_tokens,
-            schedule.reasoning_nano_usd_per_million_tokens,
-        )
-        if rate is not None
-    )
-    numerator = input_tokens * input_rate
-    numerator += output_tokens * output_rate
-    return require_representable_nano_usd(
-        (numerator + 999_999) // 1_000_000, what="attempt reservation ceiling"
-    )
-
-
 def require_attempt_budget(
     connection: sqlite3.Connection,
     *,
@@ -671,6 +528,9 @@ def require_attempt_budget(
     attempt_id: str,
     period_start: str,
     maximum_cost_nano_usd: int | None,
+    root_pool_id: str | None = None,
+    request_id: str | None = None,
+    alias_revision_id: str | None = None,
 ) -> None:
     """Atomically require room beneath every limit applicable to one attempt.
 
@@ -678,7 +538,8 @@ def require_attempt_budget(
     attempt outright and rejects every attempt while unknown-cost attempts remain
     unresolved. A default limit admits an unpriced attempt, records it as one
     unknown-cost charge for later reconciliation, and keeps enforcing the hard
-    cap over every known-cost reservation and settlement.
+    cap over every known-cost reservation and settlement. Request-wide gates run
+    before any skippable child or deployment refusal, regardless of scope-key order.
     """
     rows = connection.execute(
         """
@@ -686,11 +547,13 @@ def require_attempt_budget(
         WHERE organization_id = ? AND period_start = ? AND (
             scope_kind = 'team'
             OR (scope_kind = 'identity' AND identity_id = ?)
-            OR (scope_kind = 'pool' AND alias_id = ? AND pool_id = ?)
+            OR (scope_kind = 'pool' AND alias_id = ? AND pool_id IN (?, ?))
             OR (scope_kind = 'deployment' AND alias_id = ? AND pool_id = ?
                 AND deployment_id = ?)
         )
-        ORDER BY scope_kind, scope_key
+        ORDER BY CASE WHEN scope_kind IN ('team', 'identity')
+            OR (scope_kind = 'pool' AND pool_id = ?) THEN 0 ELSE 1 END,
+            scope_kind, scope_key
         """,
         (
             organization_id,
@@ -698,15 +561,34 @@ def require_attempt_budget(
             identity_id,
             alias_id,
             pool_id,
+            root_pool_id or pool_id,
             alias_id,
             pool_id,
             deployment_id,
+            root_pool_id or pool_id,
         ),
     ).fetchall()
     if not rows:
         return
     for row in rows:
         scope_kind = BudgetScopeKind(str(row["scope_kind"]))
+        refusal = None
+        if request_id is not None and alias_revision_id is not None:
+            scope = _limit_from_row(row).scope
+            application: BudgetApplication = "shared"
+            if scope_kind in (BudgetScopeKind.POOL, BudgetScopeKind.DEPLOYMENT):
+                application = (
+                    "root" if scope.pool_id == (root_pool_id or pool_id) else "destination"
+                )
+                if pool_id == (root_pool_id or pool_id):
+                    application = "shared"
+            refusal = BudgetRefusalBinding(
+                request_id=request_id,
+                organization_id=organization_id,
+                alias_revision_id=alias_revision_id,
+                scope=scope,
+                application=application,
+            )
         strict = bool(row["strict_unknown_cost"])
         unknown = int(row["unknown_cost_attempts"])
         charged = int(row["reserved_nano_usd"]) + int(row["settled_nano_usd"])
@@ -714,18 +596,21 @@ def require_attempt_budget(
         if strict and unknown:
             raise BudgetReservationRejected(
                 scope_kind=scope_kind,
+                binding=refusal,
                 reason="monthly hard limit has prior attempts with unknown cost",
             )
         if maximum_cost_nano_usd is None:
             if strict:
                 raise BudgetReservationRejected(
                     scope_kind=scope_kind,
+                    binding=refusal,
                     reason="monthly hard limit requires a known maximum attempt cost",
                 )
             continue
         if maximum_cost_nano_usd > max(0, limit - charged):
             raise BudgetReservationRejected(
                 scope_kind=scope_kind,
+                binding=refusal,
                 reason=f"monthly {scope_kind.value} allocation is exhausted",
             )
     for row in rows:
@@ -961,11 +846,22 @@ def _attempt_scope_predicate(
             str(row["identity_id"]),
         )
     if kind is BudgetScopeKind.POOL:
-        return f"{base} AND r.alias_id = ? AND a.pool_id = ?", (
-            organization_id,
-            period_start,
-            str(row["alias_id"]),
-            str(row["pool_id"]),
+        # Charge the destination or the accepted revision's root, never the active alias.
+        return (
+            f"""{base} AND r.alias_id = ? AND (a.pool_id = ? OR EXISTS (
+            SELECT 1 FROM alias_revisions AS revision
+            WHERE revision.organization_id = r.organization_id
+              AND revision.alias_id = r.alias_id
+              AND revision.revision_id = r.alias_revision_id
+              AND revision.pool_id = ?
+        ))""",
+            (
+                organization_id,
+                period_start,
+                str(row["alias_id"]),
+                str(row["pool_id"]),
+                str(row["pool_id"]),
+            ),
         )
     return f"{base} AND r.alias_id = ? AND a.pool_id = ? AND a.deployment_id = ?", (
         organization_id,

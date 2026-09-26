@@ -128,10 +128,8 @@ pub fn completed_responses_body_with_gateway_tools(
     let mut tool_names = Vec::new();
     for event in events {
         match event {
-            Event::ToolCallCompleted { call, .. } => {
-                if !tool_names.contains(&call.name) {
-                    tool_names.push(call.name.clone());
-                }
+            Event::ToolCallCompleted { call, .. } if !tool_names.contains(&call.name) => {
+                tool_names.push(call.name.clone());
             }
             // Hosted tool INVOCATIONS are provider-executed but still
             // invoked tools; their item type names the activity for the

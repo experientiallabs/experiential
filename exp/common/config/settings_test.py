@@ -9,13 +9,54 @@ import pytest
 
 from exp.common.config.settings import (
     DEFAULT_COMMAND_BUDGET_USD,
+    GatewayResourceSettings,
     ensure_telemetry_anonymous_id,
     load_settings,
     resolve_command_budget_usd,
+    save_settings,
     set_maximum_command_cost_usd,
     set_telemetry_enabled,
     settings_path,
 )
+
+
+def test_gateway_resource_setting_survives_other_settings_updates(tmp_path: Path) -> None:
+    """The single settings file preserves existing fields and the explicit resource budget."""
+    settings = load_settings(tmp_path)
+    settings.gateway = GatewayResourceSettings(
+        budget_snapshot_max_bytes=128 * 1024 * 1024,
+        serving_snapshot_max_bytes=256 * 1024 * 1024,
+    )
+    save_settings(settings, tmp_path)
+    set_telemetry_enabled(False, tmp_path)
+    set_maximum_command_cost_usd(2.5, tmp_path)
+    loaded = load_settings(tmp_path)
+    assert loaded.gateway.budget_snapshot_max_bytes == 128 * 1024 * 1024
+    assert loaded.gateway.serving_snapshot_max_bytes == 256 * 1024 * 1024
+    assert not loaded.telemetry.enabled and loaded.commands.maximum_cost_usd == 2.5
+
+
+def test_gateway_serving_resource_default_is_separate_from_authoring() -> None:
+    """Raising the authoring limit never silently raises the serving resource policy."""
+    settings = GatewayResourceSettings(budget_snapshot_max_bytes=128 * 1024 * 1024)
+    assert settings.serving_snapshot_max_bytes == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, float("inf"), "123", 2**63])
+def test_gateway_serving_resource_limit_is_strict_positive(value: object) -> None:
+    """Unsafe resource settings fail before opening a snapshot or doing gateway work."""
+    with pytest.raises(ValueError):
+        GatewayResourceSettings.model_validate({"serving_snapshot_max_bytes": value})
+
+
+def test_invalid_serving_resource_file_names_setting_and_repair(tmp_path: Path) -> None:
+    """A bad serving policy points to the selected root, not an unrelated user setting."""
+    settings_path(tmp_path).write_text("[gateway]\nserving_snapshot_max_bytes = 0\n")
+    with pytest.raises(ValueError) as error:
+        load_settings(tmp_path)
+    assert str(settings_path(tmp_path)) in str(error.value)
+    assert "serving_snapshot_max_bytes" in str(error.value)
+    assert "fix the file" in str(error.value)
 
 
 def test_missing_settings_defaults_to_telemetry_enabled(tmp_path: Path) -> None:

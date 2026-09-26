@@ -3200,6 +3200,46 @@ def test_capture_release_imports_cannot_modify_the_publish_artifact() -> None:
     assert "name: python-dist" in smoke and "name: python-dist" in publish
 
 
+def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture() -> None:
+    """Windows needs executed kernel tests, while whole-package Capture stays on 3.13."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "gate.yml").read_text()
+    windows = workflow.split("  windows-snapshot-authority:\n", 1)[1].split(
+        "  w16-darwin-evidence:\n", 1
+    )[0]
+    assert "runs-on: windows-latest" in windows
+    assert 'UV_PYTHON: "3.12"' in windows
+    assert 'EXP_TELEMETRY: "0"' in windows
+    job_configuration = windows.split("    steps:\n", 1)[0]
+    assert "runner." not in job_configuration, "runner context is unavailable before job routing"
+    test_step = windows.split("      - name: Verify real Windows snapshot authority\n", 1)[1]
+    test_step = test_step.split("      - name:", 1)[0]
+    assert (
+        "        env:\n          XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth"
+        in test_step
+    )
+    assert "pytest --noconftest" in windows
+    selectors = tuple(
+        line.strip() for line in test_step.splitlines() if line.strip().startswith("exp/")
+    )
+    assert selectors == (
+        "exp/runtime/gateway/snapshot_file_windows_test.py",
+        "exp/runtime/gateway/snapshot_file_test.py::test_snapshot_resource_budget_is_a_strict_positive_integer",
+        "exp/runtime/gateway/snapshot_file_test.py::test_bounded_reader_accepts_limit_and_rejects_growth",
+        "exp/runtime/gateway/snapshot_file_test.py::test_growth_after_initial_stat_still_obeys_the_read_budget",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_resource_override_and_reachable_authority",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_refuses_unauthorized_targets",
+        "exp/runtime/gateway/budget_authority_test.py::test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch",
+        "exp/common/config/settings_test.py",
+    )
+    assert "exp/cli/" not in windows, "Windows authority proof does not import the Unix-only CLI"
+    assert "assert len(kernel) == 25" in windows
+    assert '("skipped", "failure", "error")' in windows
+    for job in ("  gate:\n", "  w16-darwin-evidence:\n"):
+        assert 'UV_PYTHON: "3.13"' in workflow.split(job, 1)[1].split("    steps:", 1)[0]
+    assert "uv run pytest -q exp/runtime/capture exp/cli/capture" in workflow
+
+
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 
