@@ -31,6 +31,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.group_commit import (
     GroupCommitAttemptLedger,
     SyncGroupCommitLedger,
+    _PendingWrite,
     abandoned_write_outcome,
 )
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
@@ -328,7 +329,7 @@ def test_group_chain_preflights_run_concurrently_before_begin(tmp_path: Path) ->
 
     def check_prepared_batch(
         connection: sqlite3.Connection,
-        batch: list[object],
+        batch: list[_PendingWrite],
     ) -> None:
         """Ensure both workers completed before the atomic write transaction begins."""
         assert len(proofs) == 2
