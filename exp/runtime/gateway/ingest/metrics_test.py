@@ -74,6 +74,9 @@ def test_current_turn_gets_measured_time_and_usage_once() -> None:
     assert first.usage.cache_write_input_tokens == 10
     assert first.attributes["gen_ai.usage.reasoning_tokens"] == 12
     assert parallel.usage is None
+    assert "gen_ai.usage.input_tokens" not in parallel.attributes
+    assert first.attributes["gen_ai.usage.cache_creation_input_tokens"] == 10
+    assert parallel.attributes["exp.capture.usage.shared_with"] == first.span_id
     assert parallel.attributes["exp.gateway.usage.shared_with"] == first.span_id
     assert parallel.started_at == first.started_at
 

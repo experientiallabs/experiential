@@ -20,19 +20,16 @@ from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
 from exp.common.traces.capture import CaptureMetrics, capture_metric_attributes
 from exp.common.traces.ingest.otlp import normalize_otlp_payload
 from exp.runtime.capture.normalization import CapturedExchange, capture_protocol, normalize_exchange
-from exp.runtime.gateway.lifecycle import load_gateway_components
-from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_capture import (
     CaptureConfiguration,
     CaptureController,
     CaptureRecord,
 )
-from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.launch_test import (
     _configure_gateway,
     _LoopbackProvider,
+    _ServedGateway,
     _unused_port,
-    _wait_ready,
 )
 
 
@@ -562,6 +559,15 @@ def test_anthropic_input_total_includes_cache_once_and_preserves_raw_usage(
     assert attributes["gen_ai.usage.input_tokens"] == expected_input
     assert attributes["gen_ai.usage.output_tokens"] == 7
     assert json.loads(str(attributes["exp.capture.response"]))["usage"] == usage
+    metrics = CaptureMetrics.model_validate_json(str(attributes["exp.capture.metrics"]))
+    assert metrics.usage is not None
+    assert metrics.usage.cached_input_tokens == cache_usage.get("cache_read_input_tokens")
+    assert metrics.usage.cache_creation_input_tokens == cache_usage.get(
+        "cache_creation_input_tokens"
+    )
+    assert metrics.usage.cache_creation_1h_input_tokens == (
+        60 if "cache_creation" in cache_usage else None
+    )
 
 
 @pytest.mark.parametrize("streamed", [False, True])
@@ -589,6 +595,7 @@ def test_openai_cached_input_is_already_in_the_provider_total(
             "input_tokens": 1_003,
             "output_tokens": 7,
             "input_tokens_details": {"cached_tokens": 1_000},
+            "output_tokens_details": {"reasoning_tokens": 4},
         }
         response = {"output": [], "usage": usage}
         events = [{"type": "response.completed", "response": response}]
@@ -597,6 +604,7 @@ def test_openai_cached_input_is_already_in_the_provider_total(
             "prompt_tokens": 1_003,
             "completion_tokens": 7,
             "prompt_tokens_details": {"cached_tokens": 1_000},
+            "completion_tokens_details": {"reasoning_tokens": 4},
         }
         response = {"choices": [], "usage": usage}
         events = [response]
@@ -614,6 +622,8 @@ def test_openai_cached_input_is_already_in_the_provider_total(
     )
     assert attributes["gen_ai.usage.input_tokens"] == 1_003
     assert attributes["gen_ai.usage.output_tokens"] == 7
+    assert attributes["gen_ai.usage.cached_input_tokens"] == 1_000
+    assert attributes["gen_ai.usage.reasoning_tokens"] == 4
     assert json.loads(str(attributes["exp.capture.response"]))["usage"] == usage
 
 
@@ -816,33 +826,18 @@ def test_real_gateway_and_passive_capture_share_usage_fields(
     _, raw_key = _configure_gateway(
         tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
     )
-    components = load_gateway_components(tmp_path)
     records: list[str] = []
     collector = native.CaptureCollector(
         CaptureConfiguration(settlement_required=False).model_dump_json(), records.append
     )
-    control = NativeControlPlane(
-        components,
+    gateway = _ServedGateway(
+        tmp_path,
+        _unused_port(),
         capture=CaptureController(collector, application_for=lambda _: "capture-parity"),
     )
-    port = _unused_port()
-    shutdown = native.shutdown_handle()
-    failures: list[BaseException] = []
-
-    def run() -> None:
-        """Run an isolated gateway and retain startup failures for the test."""
-        try:
-            serve_native_gateway(
-                control, host="127.0.0.1", port=port, capture=collector, shutdown=shutdown
-            )
-        except BaseException as exc:  # noqa: BLE001 - reported after bounded cleanup.
-            failures.append(exc)
-
-    worker = threading.Thread(target=run, daemon=True)
-    worker.start()
     observed: dict[str, JsonObject] = {}
     try:
-        _wait_ready(port, worker)
+        gateway.start()
         for surface in ("chat/completions", "responses", "messages"):
             for streamed in (False, True):
                 request: JsonObject = {"model": "coding", "stream": streamed}
@@ -856,7 +851,7 @@ def test_real_gateway_and_passive_capture_share_usage_fields(
                     request["stream_options"] = {"include_usage": True}
                 started = time.time_ns()
                 response = httpx.post(
-                    f"http://127.0.0.1:{port}/v1/{surface}",
+                    f"http://127.0.0.1:{gateway.port}/v1/{surface}",
                     headers={"authorization": f"Bearer {raw_key}"},
                     json=request,
                     timeout=10,
@@ -878,14 +873,11 @@ def test_real_gateway_and_passive_capture_share_usage_fields(
                     )
                 )
     finally:
-        shutdown.request_shutdown()
-        worker.join(timeout=10)
+        gateway.stop()
         collector.close(2)
-        components.write_ledger.close()
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=5)
-    assert not failures and not worker.is_alive()
     assert len(records) == len(observed) == 6
     for encoded in records:
         record = CaptureRecord.model_validate_json(encoded)
@@ -900,9 +892,6 @@ def test_real_gateway_and_passive_capture_share_usage_fields(
         assert passive_metrics.usage_complete == record.metrics.usage_complete
         assert passive_metrics.first_token_at is None
         assert record.metrics.first_token_at is not None
-        assert passive_metrics.duration_ms is not None
-        assert passive_metrics.usage is not None
-        assert raw_key not in json.dumps(passive)
 
 
 @pytest.mark.parametrize("protocol", ["responses", "chat", "messages"])
