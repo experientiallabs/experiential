@@ -99,6 +99,48 @@ def test_load_langfuse_file_keeps_completion_and_customer_identity(tmp_path: Pat
     assert answer.attributes["exp.customer.id"] == "customer-3"
 
 
+def test_load_langfuse_file_uses_nested_generation_request(tmp_path: Path) -> None:
+    """A generation request retains a trace whose trace-level input is absent."""
+    trace = _trace()
+    trace["input"] = None
+    path = tmp_path / "langfuse.json"
+    path.write_text(json.dumps([trace]), encoding="utf-8")
+
+    result = LANGFUSE_SOURCE.load(path)
+
+    assert result.issues == ()
+    assert result.traces[0].task == "Where is my order?"
+
+
+def test_load_langfuse_file_uses_later_generation_request(tmp_path: Path) -> None:
+    """A later generation can supply the request after model and tool observations."""
+    observations = _observations()
+    observations[0]["input"] = [{"role": "assistant", "content": "No user request"}]
+    observations[3]["input"] = [{"role": "user", "content": "Where is my order?"}]
+    trace = _trace(observations)
+    trace["input"] = None
+    path = tmp_path / "langfuse.json"
+    path.write_text(json.dumps([trace]), encoding="utf-8")
+
+    result = LANGFUSE_SOURCE.load(path)
+
+    assert result.issues == ()
+    assert result.traces[0].task == "Where is my order?"
+
+
+def test_load_langfuse_file_prefers_trace_request_over_generation(tmp_path: Path) -> None:
+    """An explicit trace request keeps priority over a nested generation request."""
+    observations = _observations()
+    observations[0]["input"] = [{"role": "user", "content": "Use nested request"}]
+    path = tmp_path / "langfuse.json"
+    path.write_text(json.dumps([_trace(observations)]), encoding="utf-8")
+
+    result = LANGFUSE_SOURCE.load(path)
+
+    assert result.issues == ()
+    assert result.traces[0].task == "Where is my order?"
+
+
 def test_load_langfuse_file_accepts_bare_observations(tmp_path: Path) -> None:
     """Observation exports without a trace wrapper group by their declared traceId."""
     path = tmp_path / "langfuse.jsonl"
