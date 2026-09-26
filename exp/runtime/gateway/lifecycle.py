@@ -305,13 +305,17 @@ def _serve_or_fallback(
     fallback = state.fallback_revisions.get((authorization.alias, authorization.alias_revision_id))
     if fallback is None:
         return None
-    return authorization.model_copy(
+    served = authorization.model_copy(
         update={
             "alias_revision_id": fallback.alias_revision_id,
             "catalog_sha256": fallback.catalog_sha256,
             "target": fallback.target,
         }
     )
+    # The authorization-time witness belongs to the dead active revision. Let
+    # acceptance classify and bind the fallback revision's exact authority.
+    served._local_sqlite_chain_witness = None
+    return served
 
 
 @dataclass(frozen=True)
@@ -379,8 +383,18 @@ class _ReadyControlStore:
             app_title=app_title,
             client_ip=client_ip,
         )
-        served = _serve_or_fallback(self.reloader.state, authorization)
+        state = self.reloader.state
+        served = _serve_or_fallback(state, authorization)
         if served is not None:
+            active = next(
+                (authority for authority in state.authorities if authority[0] == served.alias),
+                None,
+            )
+            if active is not None and active[1] != served.alias_revision_id:
+                # The old runtime revision is still available to this request,
+                # but its authorization-time witness predates the activation.
+                # Reclassify against the current SQLite rows before acceptance.
+                served._local_sqlite_chain_witness = None
             return served
         # The SQLite authority names a revision this generation has not loaded
         # (a concurrent activation, or an active revision whose snapshot was
