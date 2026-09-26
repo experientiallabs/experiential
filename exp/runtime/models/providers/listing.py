@@ -10,13 +10,14 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from urllib.parse import urlencode
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ReasoningEffort
 from exp.common.models.discovery import DiscoveredModel
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, ANTHROPIC_VERSION
+from exp.runtime.models.providers.experiential_catalog import catalog_url, model_metadata
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL
 from exp.runtime.models.providers.openai import OPENAI_BASE_URL
 from exp.runtime.models.providers.openai_compatible import (
@@ -38,6 +39,8 @@ LISTING_RETRY_POLICY = RetryPolicy(maximum_attempts=2)
 _ANTHROPIC_PAGE_SIZE = 1_000
 _MAXIMUM_ANTHROPIC_PAGES = 10
 _MAXIMUM_GEMINI_PAGES = 10
+_CATALOG_PAGE_SIZE = 1_000
+_MAXIMUM_CATALOG_PAGES = 10
 _CREDENTIAL_STATUS_CODES = frozenset({401, 403})
 
 
@@ -47,11 +50,19 @@ class ProviderListingError(RuntimeError):
 
 @dataclass(frozen=True)
 class ProviderEndpoint:
-    """One authenticated provider endpoint whose available models can be listed."""
+    """One authenticated provider endpoint whose available models can be listed.
+
+    Attributes:
+        provider: Runtime provider family.
+        api_key: Resolved credential, never persisted with discovered metadata.
+        base_url: Explicit provider origin, or the family's standard origin.
+        catalog: Explicit hosted metadata contract; generic compatible endpoints leave it unset.
+    """
 
     provider: str
     api_key: str
     base_url: str | None = None
+    catalog: Literal["experiential"] | None = None
 
 
 class ProviderModelLister(Protocol):
@@ -149,13 +160,63 @@ class HttpProviderModelLister:
 
     def _openai_compatible_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
         """List OpenAI-compatible models, keeping only validated optional metadata."""
+        entries = _entries(endpoint.provider, self._openai_listing(endpoint))
+        metadata = (
+            self._experiential_catalog(endpoint) if endpoint.catalog == "experiential" else {}
+        )
         models = []
-        for entry in _entries(endpoint.provider, self._openai_listing(endpoint)):
+        for entry in entries:
             identity = _text(entry.get("id"))
             if identity is None:
                 continue
-            models.append(_openai_compatible_model(endpoint.provider, identity, entry))
+            models.append(
+                _openai_compatible_model(
+                    endpoint.provider, identity, {**entry, **metadata.get(identity, {})}
+                )
+            )
         return models
+
+    def _experiential_catalog(self, endpoint: ProviderEndpoint) -> dict[str, JsonObject]:
+        """Read bounded catalog pages from the selected Cloud gateway's own origin.
+
+        Args:
+            endpoint: Explicit Experiential Cloud listing connection.
+
+        Returns:
+            Default-route metadata indexed by exact public model slug.
+
+        Raises:
+            ProviderListingError: The catalog is unavailable or pagination is malformed.
+        """
+        try:
+            url = catalog_url(endpoint.base_url or "")
+        except ValueError as exc:
+            raise ProviderListingError(str(exc)) from exc
+        metadata: dict[str, JsonObject] = {}
+        offset = 0
+        for _ in range(_MAXIMUM_CATALOG_PAGES):
+            body = self._read(
+                endpoint,
+                f"{url}?{urlencode({'limit': _CATALOG_PAGE_SIZE, 'offset': offset})}",
+                {"Authorization": f"Bearer {endpoint.api_key}"},
+            )
+            entries = _entries(endpoint.provider, body.get("models"))
+            total = _generation_integer(body.get("total"))
+            if total is None or body.get("offset") != offset:
+                raise ProviderListingError("Experiential Cloud returned invalid catalog pagination")
+            for entry in entries:
+                projected = model_metadata(entry)
+                if projected is not None:
+                    slug, fields = projected
+                    metadata[slug] = fields
+            offset += len(entries)
+            if offset >= total:
+                return metadata
+            if not entries:
+                raise ProviderListingError(
+                    "Experiential Cloud returned an incomplete model catalog"
+                )
+        raise ProviderListingError("Experiential Cloud model catalog exceeded its page limit")
 
     def _openai_listing(self, endpoint: ProviderEndpoint) -> object:
         """Read one OpenAI-shaped ``/models`` array from the configured origin."""
@@ -275,6 +336,7 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         provider=provider,
         model=identity,
         supports_completions=_strict_bool(entry.get("supports_completions")),
+        supports_embeddings=_strict_bool(entry.get("supports_embeddings")),
         supports_tools=_strict_bool(entry.get("supports_tools")),
         supports_structured_output=_strict_bool(entry.get("supports_structured_output")),
         supports_temperature=_strict_bool(entry.get("supports_temperature")),
@@ -285,6 +347,9 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         supports_presence_penalty=_strict_bool(entry.get("supports_presence_penalty")),
         supports_reasoning=_strict_bool(entry.get("supports_reasoning")),
         reasoning_effort=_reasoning_effort(entry.get("reasoning_effort")),
+        supported_reasoning_efforts=_reasoning_effort_choices(
+            entry.get("supported_reasoning_efforts")
+        ),
         sampling_requires_reasoning_none=_strict_bool(
             entry.get("sampling_requires_reasoning_none")
         ),
@@ -305,6 +370,9 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         ),
         cached_input_cost_per_million_tokens_usd=_nano_usd_price(
             prices.get("cached_input_nano_usd_per_million_tokens")
+        ),
+        cache_write_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("cache_write_nano_usd_per_million_tokens")
         ),
     )
 
@@ -456,6 +524,16 @@ def _strict_positive_int(value: object) -> int | None:
 def _strict_bool(value: object) -> bool | None:
     """Read one exact boolean, rejecting truthy integers and other shapes."""
     return value if isinstance(value, bool) else None
+
+
+def _reasoning_effort_choices(value: object) -> tuple[ReasoningEffort, ...] | None:
+    """Preserve an explicit effort list, rejecting malformed or unknown declarations."""
+    if not isinstance(value, list):
+        return None
+    efforts = tuple(_reasoning_effort(item) for item in value)
+    if any(effort is None for effort in efforts) or len(set(efforts)) != len(efforts):
+        return None
+    return tuple(effort for effort in efforts if effort is not None)
 
 
 def _reasoning_effort(value: object) -> ReasoningEffort | None:

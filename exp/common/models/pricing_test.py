@@ -12,6 +12,7 @@ from exp.common.models import (
     BillingSource,
     CandidateTokenPrice,
     CompletionCostReservation,
+    ModelCapabilities,
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
@@ -20,6 +21,7 @@ from exp.common.models import (
     completion_request_cost_usd,
     persist_pricing_snapshot,
     reconcile_completion_economics,
+    verify_completion_reservation,
 )
 from exp.common.project import ProjectConfig, ProjectStore
 
@@ -64,6 +66,45 @@ def test_pricing_snapshot_replay_reuses_original_materialization_time(tmp_path: 
     assert replay.created_at == created
 
 
+def test_pricing_snapshot_upgrade_preserves_prior_revision(tmp_path: Path) -> None:
+    """Identical prices from a new producer coexist with the original frozen snapshot."""
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    prices = (
+        CandidateTokenPrice(
+            candidate_alias="candidate-a",
+            input_usd_per_million_tokens=1,
+            output_usd_per_million_tokens=2,
+            cached_input_usd_per_million_tokens=0.5,
+            cache_write_usd_per_million_tokens=1.5,
+        ),
+    )
+    created = datetime(2026, 8, 13, tzinfo=UTC)
+    first = persist_pricing_snapshot(
+        project.artifacts, prices, created_at=created, code_revision="release-one"
+    )
+    original = project.artifacts.read_bytes(first.pricing_snapshot_id, "pricing.json")
+
+    upgraded = persist_pricing_snapshot(
+        project.artifacts,
+        prices,
+        created_at=created + timedelta(hours=1),
+        code_revision="release-two",
+    )
+    replay = persist_pricing_snapshot(
+        project.artifacts,
+        prices,
+        created_at=created + timedelta(hours=2),
+        code_revision="release-two",
+    )
+
+    assert upgraded.pricing_snapshot_id != first.pricing_snapshot_id
+    assert upgraded.code_revision == "release-two"
+    assert upgraded.candidate_prices == first.candidate_prices
+    assert replay == upgraded
+    assert project.artifacts.read_bytes(first.pricing_snapshot_id, "pricing.json") == original
+
+
 def test_completion_reservation_covers_cache_write_output_and_retries() -> None:
     """One call uses the highest total input rate plus output for every retry."""
     reservation = completion_cost_reservation(
@@ -78,6 +119,45 @@ def test_completion_reservation_covers_cache_write_output_and_retries() -> None:
     )
 
     assert reservation.estimated_maximum_call_cost_usd == pytest.approx(0.012)
+
+
+def test_unpublished_output_reservation_still_checks_context_prices_and_known_limits() -> None:
+    """An unknown provider cap permits finite request bounds but never weakens other checks."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=1_000,
+    )
+    capabilities = ModelCapabilities(
+        supports_completions=True,
+        context_window_tokens=1_000,
+        input_cost_per_million_tokens_usd=1,
+        output_cost_per_million_tokens_usd=4,
+        cached_input_cost_per_million_tokens_usd=0.5,
+        cache_write_cost_per_million_tokens_usd=2,
+    )
+    verify_completion_reservation(
+        reservation, model=_model(), capabilities=capabilities, maximum_attempts=3
+    )
+    for updates, message in (
+        ({"context_window_tokens": 999}, "context capacity"),
+        ({"context_window_tokens": None}, "context capacity"),
+        ({"context_window_tokens": 2_000, "maximum_output_tokens": 999}, "output capacity"),
+        ({"input_cost_per_million_tokens_usd": None}, "pricing is incomplete"),
+        ({"input_cost_per_million_tokens_usd": 2}, "pricing differs"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            verify_completion_reservation(
+                reservation,
+                model=_model(),
+                capabilities=capabilities.model_copy(update=updates),
+                maximum_attempts=3,
+            )
 
 
 def test_completion_reservation_prices_from_the_realistic_input_estimate() -> None:
@@ -351,3 +431,27 @@ def _model() -> ModelSnapshot:
         capabilities_sha256="a" * 64,
         connection_sha256="b" * 64,
     )
+
+
+@pytest.mark.parametrize("attempts", [1, 2, 3])
+def test_observed_attempts_release_unused_retry_allowance(attempts: int) -> None:
+    """An ordinary successful call does not incur phantom charges for unused retries."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=1,
+        cache_write_usd_per_million_tokens=1,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    cost = reconcile_completion_economics(
+        reservation,
+        OperationEconomics(
+            provider_attempts=attempts,
+            usage=Usage(input_tokens=100, output_tokens=10),
+        ),
+    ).cost_usd
+    assert cost is not None
+    assert cost.value == pytest.approx(0.00014 + (attempts - 1) * 0.0021)

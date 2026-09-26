@@ -94,6 +94,117 @@ def test_openai_compatible_listing_uses_the_configured_base_url() -> None:
     assert transport.requests[0].url == "https://gateway.internal/v1/models"
 
 
+def test_cloud_listing_joins_catalog_pages_without_adding_unavailable_models() -> None:
+    """Bare OpenAI identities acquire default-route metadata without promotion discounts."""
+    entry: JsonObject = {
+        "model": {
+            "slug": "chat",
+            "output_modalities": ["text"],
+            "context_window": 128000,
+            "max_output_tokens": 32000,
+        },
+        "providers": [
+            {
+                "id": "default",
+                "status": "active",
+                "routable": True,
+                "input_nano_usd_per_million": 200000000,
+                "output_nano_usd_per_million": 1200000000,
+                "cached_input_nano_usd_per_million": 20000000,
+                "cache_write_input_nano_usd_per_million": 250000000,
+                "capabilities": {
+                    "supports_tools": True,
+                    "supports_structured_output": True,
+                    "supports_reasoning": True,
+                    "reasoning_default_effort": "high",
+                    "maximum_output_tokens": 16000,
+                },
+            }
+        ],
+        "default_provider_ids": ["default"],
+    }
+    transport = _transport(
+        _ok({"data": [{"id": "chat"}, {"id": "unmatched"}]}),
+        _ok({"models": [{"model": {"slug": "catalog-only"}}], "total": 2, "offset": 0}),
+        _ok(
+            {
+                "models": [entry],
+                "total": 2,
+                "offset": 1,
+                "promotions": [{"slugs": ["chat"], "free": True, "percent_off": 100}],
+            }
+        ),
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(
+            provider="openai-compatible",
+            api_key="secret-key",
+            base_url="https://preview.example.test/v1",
+            catalog="experiential",
+        )
+    )
+
+    assert [model.model for model in models] == ["chat", "unmatched"]
+    chat = models[0]
+    assert chat.supports_completions is True
+    assert chat.supports_structured_output is True
+    assert chat.supports_tools is True
+    assert chat.reasoning_effort == "high"
+    assert chat.input_cost_per_million_tokens_usd == 0.2
+    assert chat.output_cost_per_million_tokens_usd == 1.2
+    assert chat.cached_input_cost_per_million_tokens_usd == 0.02
+    assert chat.cache_write_cost_per_million_tokens_usd == 0.25
+    assert chat.context_window_tokens == 128000
+    assert chat.maximum_output_tokens == 16000
+    assert models[1].supports_completions is None
+    assert models[1].input_cost_per_million_tokens_usd is None
+    assert [request.url for request in transport.requests] == [
+        "https://preview.example.test/v1/models",
+        "https://preview.example.test/api/models?limit=1000&offset=0",
+        "https://preview.example.test/api/models?limit=1000&offset=1",
+    ]
+    assert all(
+        request.headers["Authorization"] == "Bearer secret-key" for request in transport.requests
+    )
+
+
+def test_cloud_catalog_failure_is_actionable_instead_of_a_metadata_questionnaire() -> None:
+    """A failed catalog read uses provider recovery rather than silently dropping metadata."""
+    transport = _transport(
+        _ok({"data": [{"id": "chat"}]}),
+        JsonHttpResponse(status_code=403, body={}),
+    )
+
+    with pytest.raises(ProviderListingError, match="rejected the configured credential"):
+        _lister(transport).list_models(
+            ProviderEndpoint(
+                provider="openai-compatible",
+                api_key="secret-key",
+                base_url="https://api.experientiallabs.ai/v1",
+                catalog="experiential",
+            )
+        )
+
+
+def test_cloud_catalog_rejects_truncated_pagination() -> None:
+    """An incomplete page cannot silently mark the remaining account models as unknown."""
+    transport = _transport(
+        _ok({"data": [{"id": "chat"}]}),
+        _ok({"models": [], "total": 1, "offset": 0}),
+    )
+
+    with pytest.raises(ProviderListingError, match="incomplete model catalog"):
+        _lister(transport).list_models(
+            ProviderEndpoint(
+                provider="openai-compatible",
+                api_key="secret-key",
+                base_url="https://api.experientiallabs.ai/v1",
+                catalog="experiential",
+            )
+        )
+
+
 def test_openai_listing_discards_optional_entry_metadata() -> None:
     """Official OpenAI listing stays identity-only even when extra keys are present."""
     transport = _transport(

@@ -16,6 +16,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    load_model_catalog,
     router_candidate_capabilities_sha256,
 )
 from exp.common.project import ProjectStore, artifact_input
@@ -29,6 +30,7 @@ from exp.optimize.router.automatic.execution_contract import (
 from exp.optimize.router.automatic.preflight import (
     AutomaticRouterOptions,
     AutomaticRouterPreflight,
+    simulation_configuration_sha256,
 )
 from exp.optimize.router.composition import RouterPolicyLock
 from exp.optimize.router.fit.report import HeldOutRouterReport
@@ -221,9 +223,12 @@ def find_persisted_automatic_router_replay(
     Raises:
         AutomaticRouterReplayError: A matching chain is ambiguous or internally inconsistent.
     """
-    completed = project.load_project().build
+    config = project.load_project()
+    completed = config.build
     if completed is None:
         return None
+    catalog = load_model_catalog(project.model_catalog_path)
+    resolver = RuntimeModelCatalog(catalog, environment={})
     matches = []
     for policy_id in _artifact_ids(project, "router-policy"):
         policy = _load_policy(project, policy_id)
@@ -253,6 +258,27 @@ def find_persisted_automatic_router_replay(
             project.artifacts,
             execution_input.artifact_id,
         )
+        aliases = tuple(item.candidate_alias for item in execution.candidates)
+        if (
+            aliases != tuple(sorted(catalog.roles.candidates))
+            or execution.incumbent_alias != catalog.roles.incumbent
+            or any(
+                resolver.snapshot(item.candidate_alias)[0] != item.model
+                for item in execution.candidates
+            )
+            or resolver.snapshot(execution.world_model_alias)[0] != execution.world_model
+            or resolver.snapshot(execution.judge_alias)[0] != execution.judge_model
+            or execution.simulation_configuration_sha256
+            != simulation_configuration_sha256(
+                config,
+                agent_identity=execution.agent_factory_sha256,
+                candidate_aliases=aliases,
+                world_model_reasoning_effort=catalog.roles.world_model_reasoning_effort,
+                judge_reasoning_effort=catalog.roles.judge_reasoning_effort,
+                candidate_reasoning_efforts=catalog.roles.candidate_reasoning_efforts,
+            )
+        ):
+            continue
         if not _persisted_execution_matches(
             project,
             policy,

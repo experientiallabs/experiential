@@ -13,7 +13,13 @@ from exp.common.core.artifacts import (
     sorted_unique_inputs,
     stable_id,
 )
-from exp.common.evaluations import EvaluationPlan, build_evaluation_dataset, build_evaluation_plan
+from exp.common.evaluations import (
+    EvaluationPlan,
+    EvaluationProtocol,
+    build_evaluation_dataset,
+    build_evaluation_plan,
+)
+from exp.common.evaluations.evidence import evaluation_protocol_digest
 from exp.common.evaluations.model_report import ModelEvaluationReport, build_model_evaluation_report
 from exp.common.judging import verify_persisted_calibration
 from exp.common.progress import ProgressHook, report
@@ -32,7 +38,10 @@ from exp.optimize.router.evaluation.build import completed_project_build
 from exp.optimize.router.evaluation.setup import verify_router_evaluation_setup
 from exp.optimize.router.evaluation.simulation_spec import build_router_simulation_spec
 from exp.optimize.router.evaluation.spend import verified_simulation_spend
-from exp.optimize.router.judgment_budget import complete_cell_evidence
+from exp.optimize.router.judgment_budget import (
+    JudgmentExclusionRecord,
+    complete_cell_evidence,
+)
 from exp.simulation.specs import SimulationSpec
 
 
@@ -90,6 +99,20 @@ def evaluate_models(
     Raises:
         ValueError: Inputs drift, historical cells are supplied, or evidence/budget gates fail.
     """
+    spending_limit = (
+        budget.maximum_cost_usd
+        if services.spending_limit_usd is None
+        else services.spending_limit_usd
+    )
+    if not math.isfinite(spending_limit) or spending_limit <= 0:
+        raise ValueError("evaluation spending limit must be finite and positive")
+    if (services.judging_protocol is None) != (services.judging_input is None):
+        raise ValueError("a judging revision requires both its protocol and immutable input")
+    if services.judging_protocol is not None and (
+        services.judging_protocol.model_dump(exclude={"protocol_id"})
+        != setup.simulation_protocol.model_dump(exclude={"protocol_id"})
+    ):
+        raise ValueError("judging retry must preserve the frozen evaluation protocol")
     report(progress, "preflight")
     completed = completed_project_build(project)
     if setup.observed_cells:
@@ -112,7 +135,7 @@ def evaluate_models(
         calibration_id=calibration.calibration_id,
     )
     tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
-    required_judgments = len(tasks) * len(setup.candidates)
+    required_judgments = len(tasks) * len(setup.candidates) * setup.repeats
     if required_judgments > budget.maximum_judgments:
         raise ValueError("evaluation judgment ceiling is below scenarios times worker models")
     execution_input = _execution_contract(project, setup, budget, created_at, code_revision)
@@ -122,6 +145,7 @@ def evaluate_models(
         candidate_snapshots=setup.candidates,
         pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=(),
+        repeats=tuple(range(setup.repeats)),
         additional_inputs=sorted_unique_inputs(
             calibration_input, execution_input, *services.plan_inputs
         ),
@@ -153,24 +177,44 @@ def evaluate_models(
     simulation_cost = verified_simulation_spend(
         project, simulated, setup.simulation_completion_input
     )
-    if simulation_cost > budget.maximum_cost_usd:
+    if simulation_cost > spending_limit:
         raise ValueError("simulation exceeded the authorized budget before judging")
     report(progress, "judging")
+    judging_setup = setup
+    prior_judge_cost = 0.0
+    judge_inputs: tuple[ArtifactInput, ...] = ()
+    if services.judging_protocol is not None:
+        if services.judging_input is None:
+            raise ValueError("a fresh judging protocol requires its reviewed revision")
+        protocol = services.judging_protocol
+        judging_setup = setup.model_copy(update={"simulation_protocol": protocol})
+        judge_inputs = (services.judging_input,)
+        if services.judge_spend is None:
+            prior_judge_cost = _prior_judging_cost(
+                project, plan_input, simulated.artifact_ids, protocol
+            )
+    authoritative_judge_spend = services.judge_spend
     evidence, _, judge_cost = complete_cell_evidence(
         project,
         plan_input,
         plan.cells,
         simulated.artifact_ids,
-        setup,
+        judging_setup,
         EvaluationJudge(calibration.rubric_id, calibration.calibration_id),
         services.judge,
         budget.maximum_judgments,
-        remaining_cost_usd=budget.maximum_cost_usd - simulation_cost,
+        remaining_cost_usd=spending_limit - simulation_cost - prior_judge_cost,
         stop_on_overspend=True,
         spend_ceiling_crossed=_reject_overspend,
+        reconciled_spend=(
+            (lambda: authoritative_judge_spend(simulated.artifact_ids))
+            if authoritative_judge_spend is not None
+            else None
+        ),
         progress=progress,
     )
-    if math.fsum((simulation_cost, judge_cost)) > budget.maximum_cost_usd:
+    judge_cost = math.fsum((judge_cost, prior_judge_cost))
+    if math.fsum((simulation_cost, judge_cost)) > spending_limit:
         raise ValueError("reconciled evaluation spend exceeds its authorized ceiling")
     dataset = build_evaluation_dataset(
         project.artifacts,
@@ -178,6 +222,7 @@ def evaluate_models(
         pricing_snapshot_id=setup.pricing_snapshot_id,
         protocols=(protocol,),
         cell_evidence=evidence,
+        additional_inputs=judge_inputs,
         purposes=("fit", "held_out"),
         created_at=plan.created_at,
         code_revision=code_revision,
@@ -250,3 +295,28 @@ def _execution_contract(
         files={"execution.json": canonical_json_bytes(contract)},
     )
     return artifact_input(manifest)
+
+
+def _prior_judging_cost(
+    project: ProjectStore,
+    plan: ArtifactInput,
+    rollout_ids: tuple[str, ...],
+    protocol: EvaluationProtocol,
+) -> float:
+    """Retain costs from earlier excluded judging attempts when a new pass succeeds."""
+    costs = []
+    for artifact_id in project.artifacts.list_ids():
+        stored = project.artifacts.read(artifact_id)
+        if stored.manifest.artifact_type != "judgment-exclusion":
+            continue
+        exclusion = JudgmentExclusionRecord.model_validate_json(
+            project.artifacts.read_bytes(artifact_id, "exclusion.json")
+        )
+        if (
+            exclusion.plan == plan
+            and exclusion.rollout.artifact_id in rollout_ids
+            and exclusion.calibration.artifact_id == protocol.judge_calibration_id
+            and exclusion.protocol_sha256 != evaluation_protocol_digest(protocol)
+        ):
+            costs.append(exclusion.conservative_cost_usd)
+    return math.fsum(costs)

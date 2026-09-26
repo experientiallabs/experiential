@@ -635,6 +635,7 @@ def _workflow_services(
             input_usd_per_million_tokens=(
                 preflight.retrieval_embedding_reservation.input_usd_per_million_tokens
             ),
+            maximum_input_tokens=embedder.capabilities.context_window_tokens,
         )
         retriever = load_fit_rag_retriever(
             project.artifacts,

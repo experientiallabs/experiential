@@ -89,6 +89,7 @@ def gemini_generate_request(
     Raises:
         ValueError: A visible request message cannot preserve its tool linkage on Gemini's wire.
     """
+    json_object_output = json_object_output or request.json_object_output
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
@@ -97,7 +98,7 @@ def gemini_generate_request(
     # (consecutive user contents are accepted on this wire); only the leading
     # run is hoisted.
     for message in fold_instruction_turns_after_the_leading_run(request.messages):
-        if message.role == "system":
+        if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append({"text": message.content})

@@ -50,6 +50,10 @@ from exp.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeMode
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.retrieval import RAGLineageBinding
+from exp.simulation.retrieval.embedding_inputs import (
+    embedding_chunk_bytes,
+    plan_rag_embedding_inputs,
+)
 from exp.simulation.retrieval.transitions import extract_real_transitions
 
 if TYPE_CHECKING:
@@ -195,16 +199,16 @@ def preflight_hosted(
                 bindings,
                 included_partitions=frozenset({"fit", "held_out"}),
             )
-            fit = extract_real_transitions(
-                traces,
-                bindings,
-                included_partitions=frozenset({"fit"}),
-            )
             price = embedder_capabilities.input_cost_per_million_tokens_usd
             if price is not None:
-                tokens = sum(len(item.key_text.encode("utf-8")) for item in (*serving, *fit))
+                plan = plan_rag_embedding_inputs(
+                    tuple(item.key_text for item in serving),
+                    maximum_chunk_bytes=embedding_chunk_bytes(
+                        embedder_capabilities.context_window_tokens
+                    ),
+                )
                 build_cost = reserve_usd(
-                    tokens * RetryPolicy().maximum_attempts * price / 1_000_000
+                    plan.maximum_input_tokens * RetryPolicy().maximum_attempts * price / 1_000_000
                 )
         except ValueError as exc:
             problems.append(f"grounded build inputs: {exc}")
@@ -259,6 +263,13 @@ def preflight_hosted(
     if len(snapshots) == len(required_aliases):
         project_catalog = ProjectModelCatalog(
             project_id=config.project_id,
+            world_model_reasoning_effort=active.roles.world_model_reasoning_effort,
+            judge_reasoning_effort=active.roles.judge_reasoning_effort,
+            candidate_reasoning_efforts={
+                alias: effort
+                for alias, effort in active.roles.candidate_reasoning_efforts.items()
+                if alias in setup.models.candidates
+            },
             models=tuple(
                 ProjectCatalogModel(
                     alias=alias,

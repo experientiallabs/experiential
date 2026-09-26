@@ -14,7 +14,7 @@ from rich.prompt import Confirm
 from exp.cli.judge.review import build_manual_judge_reviewer
 from exp.cli.judge.rubric import maybe_edit_setup_plan
 from exp.cli.judge.transcript import model_display_name
-from exp.cli.shared.consent import can_prompt, require_spend_consent
+from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.config import resolve_command_budget_usd
@@ -182,12 +182,12 @@ def judge_calibrate(
         None,
         "--maximum-cost-usd",
         min=0.000001,
-        help="Calibration spend ceiling. Defaults to the shared command-budget setting, then $10.",
+        help="Calibration warning budget. Defaults to the shared command-budget setting.",
     ),
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm an in-budget estimate when the shared policy requires it.",
+        help="Confirm the estimate, including any budget warning.",
     ),
     approve: bool = typer.Option(
         False, "--approve", help="Approve the report after it is displayed."
@@ -223,8 +223,8 @@ def judge_calibrate(
         input_price: Optional advanced input-price override.
         output_price: Optional advanced output-price override.
         maximum_input_tokens: Conservative input bound for every call attempt.
-        maximum_cost_usd: Optional spend ceiling; otherwise the shared command-budget setting.
-        yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
+        maximum_cost_usd: Optional warning budget; otherwise the shared command-budget setting.
+        yes: Explicit confirmation for the estimate, including any budget warning.
         approve: Separate approval of the displayed completed report.
         accept_insufficient_labels: Explicit risk acceptance below five completed reviews.
         non_interactive: Refuse prompts and require complete explicit decisions.
@@ -266,11 +266,6 @@ def judge_calibrate(
                 maximum_cost_usd=sys.float_info.max,
                 completed_review_count=reviewed,
             )
-            if maximum_cost_usd is not None and budget.estimated_cost_usd > maximum_cost_usd:
-                raise ValueError(
-                    "judge calibration estimate exceeds --maximum-cost-usd; raise the ceiling "
-                    "or reduce the labeled sample"
-                )
         if page and not completed and budget.call_count and not can_prompt(_console):
             raise ValueError("--page requires an interactive terminal; omit it for wrapped output")
     if completed:
@@ -291,6 +286,11 @@ def judge_calibrate(
             command=f"exp config judge calibrate {project}",
             non_interactive=non_interactive,
             previously_confirmed=False,
+            additional_budgets=(
+                (SpendBudget("judge calibration", budget.estimated_cost_usd, maximum_cost_usd),)
+                if maximum_cost_usd is not None
+                else ()
+            ),
         ):
             _console.print("Judge calibration was not started. No provider calls or reviews ran.")
             return
@@ -301,7 +301,7 @@ def judge_calibrate(
                 input_usd_per_million_tokens=input_price,
                 output_usd_per_million_tokens=output_price,
                 maximum_input_tokens_per_call=maximum_input_tokens,
-                maximum_cost_usd=max(calibration_ceiling, 0.000001),
+                maximum_cost_usd=max(calibration_ceiling, budget.estimated_cost_usd, 0.000001),
                 completed_review_count=reviewed,
             )
         if drafted:

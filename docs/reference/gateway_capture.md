@@ -100,7 +100,11 @@ Hosted destinations can opt into `CaptureCollector.batched(config_json, write_ba
 Batching does not change acknowledgement semantics. A host that already owns an
 asynchronous capture lifecycle, such as Platform, may explicitly configure
 `asynchronous_delivery=True`: checkpoint and terminal callbacks then return after
-bounded queue admission rather than durable storage. The host must monitor
+transferring already-admitted ownership, without waiting for a delivery slot or
+durable storage. The same admission remains charged until storage acknowledges;
+there is no unbounded overflow queue. Completed response bodies release unused
+worst-case reservation while keeping their allocated bytes charged until decode.
+The host must monitor
 delivery failures and drain before closing its destination. Default and local
 collectors continue to wait for durable acknowledgement. Neither mode adds a
 process-crash recovery journal.
@@ -142,8 +146,10 @@ record limit. Shutdown flushes a partial batch without waiting to fill it.
 The batch destination reserves five times that combined bound plus 256 bytes per
 batch slot before queue admission. Rust rejects configurations without room for
 this reservation and one queued record. Persistent failures can fill the bounded
-batch or queue and backpressure new requests; batching does not promise unbounded
-progress around failed records or process-crash durability.
+batch or queue. Asynchronous handoff stays nonblocking while admission-owned
+records and response memory fit their existing limits. Exhausting total admission
+still refuses new capture, and exhausting response memory still backpressures
+body collection. This is not unlimited outage tolerance or process-crash durability.
 
 Delivery limits bound record count, each final encoded payload and retained record
 memory, including a record currently held by a slow destination. One destination
@@ -163,15 +169,17 @@ tree while encoding and persisting it. Separate bounds cover in-flight entry cou
 and request lifetime. Expiration runs on collector operations and once per second
 on an idle destination worker; a blocked destination delays idle maintenance but
 does not remove the memory caps. A response reserves its complete buffer allowance
-before reading any provider bytes. Saturated delivery waits for capacity rather
-than discarding records. Sustained storage pressure therefore increases latency and
-limits throughput to what the destination can persist.
+before reading any provider bytes. Synchronous delivery waits for capacity rather
+than discarding records. Asynchronous delivery retains the handoff under its
+existing admission charge instead. Sustained storage pressure can exhaust the
+separate admission or response-memory bounds in either mode.
 
 When capture is required but admission cannot register it, the gateway returns a
 sanitized `capture_unavailable` 503 before provider dispatch. Policy-disabled capture
 still serves normally. An eligible response waits for durable acknowledgement
-unless its host explicitly enables asynchronous delivery. Both modes wait for
-bounded queue capacity. A destination error retains the current record and
+unless its host explicitly enables asynchronous delivery. Asynchronous handoff
+does not wait for delivery-queue capacity; it does not remove admission or
+response-memory bounds. A destination error retains the current record and
 its queue slot, and retries with exponential backoff from 25 milliseconds to one
 second. There is no retry-count expiry: a persistent outage backpressures capture
 instead of discarding accepted data. A malformed or oversized payload that cannot
@@ -184,6 +192,10 @@ the response ends, so hosts must also monitor destination failure counters for
 these late writes. Destination exceptions never print potentially sensitive details.
 `counts()` returns pending records, retained delivery bytes, successful destination calls,
 failed preparation/write attempts, delivery drops and collector skips.
+Pending records and bytes include admission-owned handoffs waiting for a writer
+slot, not only promoted delivery entries. These totals can exceed delivery-only
+limits; the separate admission limits still bound waiting work. In-progress
+requests that have not handed off are not delivery backlog.
 `maintenance_failures()` separately counts retention/WAL cleanup failures, including
 maintenance during destination retries. A failed checkpoint does not make an
 already committed record a failed write.

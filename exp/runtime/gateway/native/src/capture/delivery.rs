@@ -106,8 +106,7 @@ struct Checkpoint {
     wire: Option<WireResponse>,
     bytes: usize,
     lease: CheckpointLease,
-    completed: tokio::sync::oneshot::Sender<bool>,
-    queue_only: bool,
+    completed: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
 struct Pending {
@@ -129,7 +128,7 @@ struct Prepared<P> {
 /// Gather until a count, byte or oldest-item deadline is reached.
 /// Failed members keep their slot while acknowledged neighbors release theirs.
 fn run_worker<S: Sink>(
-    receiver: mpsc::Receiver<Pending>,
+    receiver: mpsc::Receiver<Option<Pending>>,
     checkpoints: Arc<Mutex<VecDeque<Checkpoint>>>,
     limits: Limits,
     maximum_queued_bytes: usize,
@@ -159,7 +158,8 @@ fn run_worker<S: Sink>(
             #[cfg(test)]
             sink.before_receive();
             match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(item) => pending.push(Prepared { item, value: None }),
+                Ok(Some(item)) => pending.push(Prepared { item, value: None }),
+                Ok(None) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if checkpoints.lock().is_ok_and(|waiting| waiting.is_empty()) {
@@ -216,8 +216,15 @@ fn run_worker<S: Sink>(
             if pending.len() >= sink.batch_records() || bytes >= sink.batch_bytes() {
                 break;
             }
+            if let Some(item) =
+                admit_checkpoint(&checkpoints, &counters, &limits, maximum_queued_bytes)
+            {
+                pending.push(Prepared { item, value: None });
+                continue;
+            }
             match receiver.recv_timeout(batch_deadline.saturating_duration_since(Instant::now())) {
-                Ok(item) => pending.push(Prepared { item, value: None }),
+                Ok(Some(item)) => pending.push(Prepared { item, value: None }),
+                Ok(None) => continue,
                 Err(_) => break,
             }
         }
@@ -291,12 +298,6 @@ fn admit_checkpoint(
     let checkpoint = waiting.pop_front()?;
     counters.bytes.fetch_add(checkpoint.bytes, Ordering::AcqRel);
     counters.pending.fetch_add(1, Ordering::AcqRel);
-    let completed = if checkpoint.queue_only {
-        let _ = checkpoint.completed.send(true);
-        None
-    } else {
-        Some(checkpoint.completed)
-    };
     Some(Pending {
         value: Some(checkpoint.value),
         wire: checkpoint.wire,
@@ -304,7 +305,7 @@ fn admit_checkpoint(
         counters: counters.clone(),
         completed: None,
         _admission: None,
-        checkpoint: Some((checkpoint.lease, completed)),
+        checkpoint: Some((checkpoint.lease, checkpoint.completed)),
     })
 }
 
@@ -324,7 +325,8 @@ impl Drop for Pending {
 pub(crate) struct Delivery {
     limits: Limits,
     maximum_queued_bytes: usize,
-    sender: Mutex<Option<mpsc::SyncSender<Pending>>>,
+    // None is a wakeup for admission-owned work, not an uncharged record.
+    sender: Mutex<Option<mpsc::SyncSender<Option<Pending>>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     checkpoints: Arc<Mutex<VecDeque<Checkpoint>>>,
     counters: Arc<Counters>,
@@ -339,7 +341,7 @@ impl Delivery {
             .checked_sub(preparation_bytes)
             .filter(|available| *available >= limits.maximum_record_bytes)
             .ok_or("capture byte budget must fit destination preparation and one record")?;
-        let (sender, receiver) = mpsc::sync_channel::<Pending>(limits.maximum_records);
+        let (sender, receiver) = mpsc::sync_channel::<Option<Pending>>(limits.maximum_records);
         let counters = Arc::new(Counters::default());
         let worker_counters = counters.clone();
         let checkpoints = Arc::new(Mutex::new(VecDeque::new()));
@@ -369,7 +371,7 @@ impl Delivery {
         })
     }
 
-    /// Retain work independently of its waiter; async mode acknowledges only delivery admission.
+    /// Retain admission-charged work; async callers never wait for delivery capacity.
     pub(super) fn checkpoint(
         &self,
         value: Record,
@@ -383,10 +385,13 @@ impl Delivery {
             return Err(());
         }
         let sender = self.sender.lock().map_err(|_| ())?;
-        if sender.is_none() {
-            return Err(());
-        }
+        let sender = sender.as_ref().ok_or(())?;
         let (completed, receipt) = tokio::sync::oneshot::channel();
+        let (handoff, completed) = if queue_only {
+            (Some(completed), None)
+        } else {
+            (None, Some(completed))
+        };
         self.checkpoints
             .lock()
             .map_err(|_| ())?
@@ -396,8 +401,13 @@ impl Delivery {
                 bytes,
                 lease,
                 completed,
-                queue_only,
             });
+        // A full channel already has work to wake the writer. This notification
+        // never takes a delivery slot or waits behind a blocked destination.
+        let _ = sender.try_send(None);
+        if let Some(handoff) = handoff {
+            let _ = handoff.send(true);
+        }
         Ok(receipt)
     }
 
@@ -408,6 +418,7 @@ impl Delivery {
     }
 
     /// Transfer ownership to the background writer, not to the database caller.
+    #[cfg(test)]
     pub(super) fn submit_record(
         &self,
         value: Record,
@@ -475,7 +486,7 @@ impl Delivery {
             _admission: admission,
             checkpoint: None,
         };
-        if sender.send(item).is_err() {
+        if sender.send(Some(item)).is_err() {
             return self.dropped();
         }
         true
@@ -507,10 +518,14 @@ impl Delivery {
     }
 
     pub(crate) fn counts(&self) -> [u64; 5] {
+        // Hold the promotion lock while reading both partitions, so an item
+        // moving into the writer is neither missed nor counted twice.
+        let waiting = self.checkpoints.lock().unwrap_or_else(|e| e.into_inner());
         [
-            self.counters.pending.load(Ordering::Acquire) as u64,
+            self.counters.pending.load(Ordering::Acquire) as u64 + waiting.len() as u64,
             self.counters.bytes.load(Ordering::Acquire) as u64
-                + self.counters.preparation_bytes.load(Ordering::Acquire) as u64,
+                + self.counters.preparation_bytes.load(Ordering::Acquire) as u64
+                + waiting.iter().map(|entry| entry.bytes as u64).sum::<u64>(),
             self.counters.persisted.load(Ordering::Relaxed),
             self.counters.failed.load(Ordering::Relaxed),
             self.counters.dropped.load(Ordering::Relaxed),

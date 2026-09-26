@@ -440,6 +440,11 @@ class GatewayRequest(ContractModel):
 
     Attributes:
         include_output_text_logprobs: Responses probability selector (default false).
+        top_logprobs: Optional strict integer from zero through twenty for alternative tokens.
+        thinking_budget: Optional strict numeric Chat control, at least -1; provider validation
+            defines zero and -1 semantics. Excluded from serialization, retained in replay identity.
+        reasoning_effort_parameter: Optional exact caller spelling of the effort control;
+            omission uses the surface default when reporting unsupported parameters.
         gateway: Optional request routing/retry policy; excluded from provider serialization.
     """
 
@@ -469,15 +474,8 @@ class GatewayRequest(ContractModel):
     reasoning_effort_parameter: (
         Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
     ) = Field(default=None, exclude=True)
-    """Exact caller field normalized into ``reasoning_effort``, when a surface
-    offers more than one (the Messages surface takes Anthropic's
-    ``output_config.effort`` and the OpenRouter ``reasoning.effort`` extension);
-    an effort the route cannot serve is rejected by that name so the caller's
-    own recovery finds the field it sent. ``None`` means the surface default
-    (see :attr:`caller_effort_parameter`)."""
     # Level-less enable-thinking; the route seam resolves the concrete effort.
     thinking_budget: int | None = Field(default=None, ge=-1, strict=True, exclude=True)
-    """Numeric Chat thinking control; provider validation owns zero and -1 semantics."""
     thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     reasoning_summary_parameters: tuple[

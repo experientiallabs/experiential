@@ -13,7 +13,12 @@ import typer
 from rich.console import Console
 
 from exp.cli.shared import consent as consent_module
-from exp.cli.shared.consent import NO_CONSENT_EXIT_CODE, can_prompt, require_spend_consent
+from exp.cli.shared.consent import (
+    NO_CONSENT_EXIT_CODE,
+    SpendBudget,
+    can_prompt,
+    require_spend_consent,
+)
 from exp.common.config.settings import set_maximum_command_cost_usd
 
 
@@ -167,26 +172,22 @@ def test_estimate_at_exactly_the_budget_requires_confirmation(
     assert len(answer.asked) == 1
 
 
-def test_estimate_above_budget_fails_even_with_yes(
+def test_estimate_above_budget_warns_and_accepts_yes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The invocation confirmation never overrides the configured ceiling."""
+    """Explicit invocation consent can exceed the saved budget without changing it."""
     root = tmp_path / ".exp root"
     set_maximum_command_cost_usd(20.0, root)
     answer = _Answer(True)
     monkeypatch.setattr(consent_module, "Confirm", answer)
     console, buffer = _console(terminal=True)
 
-    with pytest.raises(typer.BadParameter) as caught:
-        _authorize(console, root, estimate=20.000001, yes=True)
+    assert _authorize(console, root, estimate=20.000001, yes=True)
 
     assert answer.asked == []
-    message = str(caught.value)
-    assert "exceeds the configured per-command budget" in message
-    assert "exp config budget 20.01 --root" in message
-    assert "exp root" in message
-    assert "--yes cannot override" in message
+    assert "warning command estimate $20.01 exceeds the $20.00 budget" in _flat(buffer)
+    assert consent_module.resolve_command_budget_usd(root, None) == 20.0
 
 
 def test_over_budget_interactive_override_defaults_to_no(
@@ -207,9 +208,8 @@ def test_over_budget_interactive_override_defaults_to_no(
     assert answer.defaults == [False]
     prompt = answer.asked[0]
     assert "Proceed anyway" in prompt
-    assert "warning" in prompt
     assert "$35.00" in prompt
-    assert "exceeds the $20.00 budget" in prompt
+    assert "warning command estimate $35.00 exceeds the $20.00 budget" in _flat(buffer)
     assert "No spend was authorized." in _flat(buffer)
 
 
@@ -232,23 +232,66 @@ def test_over_budget_interactive_explicit_yes_authorizes(
     assert "No spend was authorized." not in _flat(buffer)
 
 
-def test_over_budget_noninteractive_fails_even_with_yes(
+def test_over_budget_noninteractive_accepts_yes_after_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     interactive_stdin: None,
 ) -> None:
-    """The explicit noninteractive flag keeps the over-budget rejection fail-closed."""
+    """Automation can authorize the displayed estimate with an explicit flag."""
     root = tmp_path / ".exp"
     set_maximum_command_cost_usd(20.0, root)
     answer = _Answer(True)
     monkeypatch.setattr(consent_module, "Confirm", answer)
-    console, _buffer = _console(terminal=True)
+    console, buffer = _console(terminal=True)
 
-    with pytest.raises(typer.BadParameter) as caught:
-        _authorize(console, root, estimate=35.0, yes=True, non_interactive=True)
+    assert _authorize(console, root, estimate=35.0, yes=True, non_interactive=True)
 
     assert answer.asked == []
-    assert "--yes cannot override" in str(caught.value)
+    assert "warning command estimate $35.00 exceeds the $20.00 budget" in _flat(buffer)
+
+
+def test_over_budget_noninteractive_without_consent_explains_how_to_proceed(tmp_path: Path) -> None:
+    """Lack of an answer stops spend with a usable override, rather than a budget error."""
+    root = tmp_path / ".exp"
+    set_maximum_command_cost_usd(20.0, root)
+    console, buffer = _console(terminal=False)
+    with pytest.raises(typer.Exit) as caught:
+        _authorize(console, root, estimate=35.0, non_interactive=True)
+    assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
+    assert "warning command estimate $35.00 exceeds the $20.00 budget" in _flat(buffer)
+    assert "interactive terminal to proceed, or use --yes" in _flat(buffer)
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_component_budgets_share_one_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+    accepted: bool,
+) -> None:
+    """Component overruns prompt even below half the shared budget, without duplicate asks."""
+    answer = _Answer(accepted)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=True)
+    assert (
+        require_spend_consent(
+            console,
+            root=tmp_path / ".exp",
+            yes=False,
+            estimated_cost_usd=9.0,
+            command="exp build support",
+            additional_budgets=(
+                SpendBudget("embedding", 7.94, 5.0),
+                SpendBudget("router", 1.06, 1.0),
+            ),
+        )
+        is accepted
+    )
+    assert len(answer.asked) == 1
+    assert answer.defaults == [False]
+    assert "$9.00" in answer.asked[0]
+    assert "embedding estimate $7.94 exceeds the $5.00 budget" in _flat(buffer)
+    assert "router estimate $1.06 exceeds the $1.00 budget" in _flat(buffer)
 
 
 def test_sub_cent_estimates_are_displayed_conservatively(tmp_path: Path) -> None:
@@ -329,15 +372,16 @@ def test_interactive_decline_returns_false_without_authorizing(
     assert len(answer.asked) == 1
 
 
-def test_zero_budget_allows_only_a_zero_cost_replay(tmp_path: Path) -> None:
-    """A zero ceiling disables paid work while preserving deterministic replay."""
+def test_zero_budget_requires_confirmation_for_any_paid_work(tmp_path: Path) -> None:
+    """A zero budget keeps replay free and requires explicit consent for paid work."""
     root = tmp_path / ".exp"
     set_maximum_command_cost_usd(0.0, root)
     console, _buffer = _console(terminal=False)
 
     assert _authorize(console, root, estimate=0.0)
-    with pytest.raises(typer.BadParameter):
-        _authorize(console, root, estimate=0.000001, yes=True)
+    with pytest.raises(typer.Exit):
+        _authorize(console, root, estimate=0.000001)
+    assert _authorize(console, root, estimate=0.000001, yes=True)
 
 
 def test_can_prompt_requires_both_terminal_streams(monkeypatch: pytest.MonkeyPatch) -> None:

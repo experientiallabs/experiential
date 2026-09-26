@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-import shlex
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import NoReturn
@@ -17,6 +18,21 @@ from rich.prompt import Confirm
 from exp.common.config import ARTIFACT_DIR, resolve_command_budget_usd
 
 NO_CONSENT_EXIT_CODE = 2
+
+
+@dataclass(frozen=True)
+class SpendBudget:
+    """A named component estimate and its configured warning threshold.
+
+    Attributes:
+        name: User-facing component name, such as embedding or router.
+        estimated_cost_usd: Conservative component cost, or None when unpriced.
+        maximum_cost_usd: Configured amount above which explicit consent is required.
+    """
+
+    name: str
+    estimated_cost_usd: float | None
+    maximum_cost_usd: float
 
 
 def _stdin_is_terminal() -> bool:
@@ -49,14 +65,15 @@ def require_spend_consent(
     command: str,
     non_interactive: bool = False,
     previously_confirmed: bool = False,
+    additional_budgets: Sequence[SpendBudget] = (),
 ) -> bool:
     """Enforce the configured authorization policy for one conservative cost estimate.
 
     Estimates at or below half of the configured budget run automatically. Higher estimates up
     to the budget require ``--yes``, a prior immutable confirmation, or an explicit terminal
-    answer. An estimate above the budget is a warning that only an explicit interactive answer
-    can override, defaulting to no; without a terminal the invocation fails before credentials
-    or provider clients, and ``--yes`` never overrides the ceiling.
+    answer. An estimate above any budget warns and offers the same explicit confirmation,
+    defaulting to no. ``--yes`` or a recorded confirmation authorizes the displayed estimate
+    even above the configured budget; it does not change the saved budget for future commands.
 
     An undefined estimate (``None``) means the catalog carries no pricing for a selected model,
     so no ceiling comparison is possible. EXP reports the cost as undefined honestly instead of
@@ -67,19 +84,19 @@ def require_spend_consent(
     Args:
         console: Command-owned output console.
         root: EXP root that owns ``settings.toml``.
-        yes: Explicit invocation confirmation for an in-budget estimate.
+        yes: Explicit invocation confirmation, including an over-budget estimate.
         estimated_cost_usd: Conservative upper-bound estimate, or ``None`` when the selected
             models carry no catalog pricing and the cost cannot be estimated.
         command: Complete command identity shown to the operator.
         non_interactive: Whether this invocation forbids terminal questions.
         previously_confirmed: Whether immutable command state records an earlier confirmation.
+        additional_budgets: Component budgets to review together with the command total.
 
     Returns:
         True when execution is authorized, or False after an interactive decline.
 
     Raises:
-        typer.BadParameter: Settings or cost arithmetic are invalid, or the estimate exceeds the
-            configured budget without a terminal able to override it.
+        typer.BadParameter: Settings or cost arithmetic are invalid.
         typer.Exit: No explicit confirmation is available in a noninteractive session.
     """
     if estimated_cost_usd is None:
@@ -96,10 +113,29 @@ def require_spend_consent(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     budget = _cost_decimal(configured, label="configured command budget")
-    if estimate > budget:
-        if non_interactive or not can_prompt(console):
-            raise typer.BadParameter(_over_budget_message(root, estimate, budget))
-        return _confirm_over_budget(console, command=command, estimate=estimate, budget=budget)
+    warnings: list[str] = []
+    for component in (
+        SpendBudget("command", estimated_cost_usd, configured),
+        *additional_budgets,
+    ):
+        limit = _cost_decimal(component.maximum_cost_usd, label=f"{component.name} budget")
+        if component.estimated_cost_usd is None:
+            continue
+        cost = _cost_decimal(component.estimated_cost_usd, label=f"{component.name} estimate")
+        if cost > limit:
+            warnings.append(
+                f"[yellow]warning[/yellow] {escape(component.name)} estimate "
+                f"{_format_usd(cost)} exceeds the {_format_usd(limit)} budget."
+            )
+    if warnings:
+        return _confirm_over_budget(
+            console,
+            command=command,
+            estimate=estimate,
+            warnings=warnings,
+            yes=yes or previously_confirmed,
+            non_interactive=non_interactive,
+        )
     if estimate <= budget / Decimal(2) or yes or previously_confirmed:
         return True
     if non_interactive or not can_prompt(console):
@@ -168,30 +204,42 @@ def _confirm_over_budget(
     *,
     command: str,
     estimate: Decimal,
-    budget: Decimal,
+    warnings: Sequence[str],
+    yes: bool,
+    non_interactive: bool,
 ) -> bool:
-    """Warn about an over-budget estimate and require an explicit terminal override.
+    """Warn about exceeded budgets and offer one explicit override for this invocation.
 
     Args:
         console: Command-owned output console.
         command: Complete command identity.
-        estimate: Conservative invocation estimate above the configured budget.
-        budget: Configured per-command ceiling.
+        estimate: Conservative total invocation estimate.
+        warnings: Named budget overruns to display before confirmation.
+        yes: Whether the invocation already has explicit confirmation.
+        non_interactive: Whether this invocation forbids terminal questions.
 
     Returns:
-        True only after an explicit yes; a blank answer or a decline authorizes nothing.
+        True only after explicit confirmation; a blank answer or decline authorizes nothing.
 
     Raises:
-        typer.Exit: Terminal input ended before an answer.
+        typer.Exit: No explicit answer is available.
     """
-    prompt = (
-        f"[yellow]warning[/yellow] estimated {_format_usd(estimate)} exceeds the "
-        f"{_format_usd(budget)} budget. Proceed anyway?"
-    )
+    for warning in warnings:
+        console.print(warning)
+    if yes:
+        return True
+    if non_interactive or not can_prompt(console):
+        console.print(
+            "No spend was authorized. Re-run in an interactive terminal to proceed, or use "
+            f"--yes after reviewing {escape(command)} (up to {_format_usd(estimate)})."
+        )
+        raise typer.Exit(NO_CONSENT_EXIT_CODE)
+    prompt = f"Proceed anyway (up to {_format_usd(estimate)})?"
     try:
         confirmed = Confirm.ask(prompt, default=False, console=console)
     except EOFError:
-        _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
+        console.print("No answer received. No spend was authorized.")
+        raise typer.Exit(NO_CONSENT_EXIT_CODE) from None
     if confirmed:
         return True
     console.print("No spend was authorized.")
@@ -230,27 +278,6 @@ def _format_usd(value: Decimal) -> str:
     """
     rounded = value.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
     return f"${rounded:.2f}"
-
-
-def _over_budget_message(root: str | Path, estimate: Decimal, budget: Decimal) -> str:
-    """Return actionable remediation for a noninteractive over-budget rejection.
-
-    Args:
-        root: EXP settings root.
-        estimate: Rejected conservative estimate.
-        budget: Configured ceiling.
-
-    Returns:
-        Error text naming every safe way to proceed.
-    """
-    amount = _format_usd(estimate).removeprefix("$")
-    command = f"exp config budget {amount} --root {shlex.quote(str(root))}"
-    return (
-        f"conservative estimate {_format_usd(estimate)} exceeds the configured per-command "
-        f"budget {_format_usd(budget)}. Re-run in an interactive terminal to review and "
-        f"explicitly override, increase the limit with `{command}`, or reduce this command's "
-        "cost inputs. --yes cannot override the ceiling"
-    )
 
 
 def _refuse_noninteractive(

@@ -258,9 +258,10 @@ def test_response_without_choices_fails_closed_without_exposing_the_key() -> Non
         base_url="https://example.test/v1",
         api_key=secret,
         transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=1),
     )
 
-    with pytest.raises(OpenAICompatibleResponseError, match="no choices") as captured:
+    with pytest.raises(ProviderResponseError, match="no choices") as captured:
         client.complete(_request())
     assert secret not in str(captured.value)
     assert secret not in repr(captured.value)

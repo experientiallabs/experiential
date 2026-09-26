@@ -182,6 +182,13 @@ impl Tap {
             return true;
         }
         self.finished = true;
+        // While streaming, reserve room for the largest permitted body. Once
+        // complete, retain only allocated bytes so small queued responses do
+        // not pin a maximum-size slot until the destination decodes them.
+        if let Some(permit) = self.permit.as_mut() {
+            let unused = permit.num_permits().saturating_sub(self.charged);
+            drop(permit.split(unused));
+        }
         let wire = WireResponse {
             relay: None,
             bytes: std::mem::take(&mut self.bytes),

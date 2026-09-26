@@ -43,6 +43,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderRetryableResponseError,
     require_array,
     require_integer,
     require_object,
@@ -177,6 +178,8 @@ def openai_compatible_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
+    if request.json_object_output:
+        payload["response_format"] = {"type": "json_object"}
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
@@ -270,7 +273,7 @@ def openai_compatible_response(
     """
     choices = require_array(payload.get("choices"), "choices")
     if not choices:
-        raise OpenAICompatibleResponseError("OpenAI-compatible response has no choices")
+        raise ProviderRetryableResponseError("OpenAI-compatible response has no choices")
     choice = require_object(choices[0], "choices[0]")
     message = require_object(choice.get("message"), "choices[0].message")
     if choice.get("finish_reason") in {"content_filter", "safety"} or isinstance(
@@ -289,7 +292,7 @@ def openai_compatible_response(
     try:
         output = AssistantAction(content=content, tool_calls=tool_calls)
     except ValueError as exc:
-        raise OpenAICompatibleResponseError(
+        raise ProviderRetryableResponseError(
             "OpenAI-compatible response has neither text nor a complete tool call"
         ) from exc
     return ModelResponse.completed(

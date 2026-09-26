@@ -7,6 +7,7 @@ mode.  A concrete simulator validates the settings it consumes before it starts 
 from __future__ import annotations
 
 import math
+from operator import not_
 from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
@@ -35,6 +36,7 @@ class WorldModelSettings(ContractModel):
     prompt_version: str = Field(min_length=1, max_length=256)
     query_embedding: EmbeddingCostReservation | None = None
     maximum_output_tokens: int = Field(default=16_000, ge=256)
+    json_object_output: bool = Field(default=False, exclude_if=not_)
     allow_tools: Literal[False] = False
 
 

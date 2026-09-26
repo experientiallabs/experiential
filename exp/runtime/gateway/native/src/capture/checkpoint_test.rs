@@ -137,6 +137,75 @@ fn asynchronous_queue_ack_retains_checkpoint_owner_until_storage_ack() {
     assert_eq!(receiver.try_iter().count(), 1);
 }
 
+#[test]
+fn asynchronous_handoff_never_waits_for_delivery_capacity() {
+    for mode in ["local", "settlement", "checkpoint"] {
+        let (entered, started) = mpsc::channel();
+        let (records, receiver) = mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let mut configuration = config();
+        configuration.asynchronous_delivery = true;
+        configuration.settlement_required = mode != "local";
+        configuration.maximum_pending_records = 2;
+        configuration.delivery.maximum_records = 1;
+        let collector = Arc::new(
+            Collector::new(
+                configuration,
+                PausedSink {
+                    entered,
+                    released: released.clone(),
+                    records: MemorySink(records),
+                },
+            )
+            .unwrap(),
+        );
+        let handoff = |collector: &Collector, id: &str| match mode {
+            "local" => assert!(collector.finish(id, Some(response()), None)),
+            "checkpoint" => assert!(collector.checkpoint(id)),
+            _ => collector.settle(id, true, false),
+        };
+        assert!(collector.begin(request("first")));
+        handoff(&collector, "first");
+        assert!(started.recv_timeout(Duration::from_secs(2)).is_ok());
+        let first_counts = collector.counts();
+        assert_eq!(first_counts[0], 1);
+        assert!(collector.begin(request("second")));
+        let (finished, returned) = mpsc::channel();
+        let worker = collector.clone();
+        let producer = std::thread::spawn(move || {
+            match mode {
+                "local" => assert!(worker.finish("second", Some(response()), None)),
+                "checkpoint" => assert!(worker.checkpoint("second")),
+                _ => worker.settle("second", true, false),
+            }
+            finished.send(()).unwrap();
+        });
+        let early = returned.recv_timeout(Duration::from_millis(100)).is_ok();
+        assert_eq!(collector.admissions.load(Ordering::Acquire), 2);
+        let waiting_counts = collector.counts();
+        // The retained handoff does not expand the admission budget or release
+        // ownership prematurely, even though delivery has only one slot.
+        assert!(!collector.begin(request("over-capacity")));
+        assert!(receiver.try_recv().is_err());
+        released.store(true, Ordering::Release);
+        producer.join().unwrap();
+        if mode == "checkpoint" {
+            collector.settle("first", false, false);
+            collector.settle("second", false, false);
+        }
+        let records = drain(&collector, receiver);
+        assert!(early, "{mode} waited for database capacity");
+        assert_eq!(waiting_counts[0], 2, "the retained backlog is observable");
+        assert!(waiting_counts[1] > first_counts[1]);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].request.request_id, "first");
+        assert_eq!(records[1].request.request_id, "second");
+        assert_eq!(collector.admissions.load(Ordering::Acquire), 0);
+        assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(collector.counts()[4], 0);
+    }
+}
+
 struct ReceiveBarrierSink {
     sink: PausedSink,
     entered: mpsc::Sender<()>,

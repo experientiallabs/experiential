@@ -22,6 +22,7 @@ CLI_PACKAGES = frozenset(
         "build",
         "capture",
         "config",
+        "evaluation",
         "gateway",
         "judge",
         "optimize",

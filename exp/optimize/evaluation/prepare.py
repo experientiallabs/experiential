@@ -21,11 +21,15 @@ from exp.common.models import (
     CompletionCostReservation,
     ModelCatalog,
     RoutedCandidateSnapshot,
+    SetupRole,
     persist_pricing_snapshot,
+    serves_role,
 )
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationSetup
+from exp.optimize.evaluation.judge_selection import select_judge_model
 from exp.optimize.evaluation.planning import EvaluationCostPlan, estimate_model_evaluation
 from exp.optimize.router.automatic.provisional import (
     _judge_request_reservation,
@@ -55,21 +59,25 @@ class ModelEvaluationOptions(ContractModel):
     """Bounded execution controls independent of router fitting and activation.
 
     Attributes:
-        maximum_steps: Positive per-rollout step cap, default 100.
-        maximum_rollout_output_tokens: Positive cumulative worker output cap, default 1,000,000.
-        maximum_concurrency: Rollout concurrency from 1 through 32, default 1.
-        maximum_output_tokens: Optional positive per-request cap; None uses model capacity.
-        maximum_judge_input_tokens: Positive judge input reservation, default 32,768.
+        maximum_steps: Positive turn ceiling, default 100.
+        maximum_rollout_output_tokens: Total generation ceiling, default one million tokens.
+        maximum_concurrency: Positive simultaneous-rollout limit, default eight.
+        repeats: Positive independent repeats per scenario/model pair, default one.
+        maximum_output_tokens: Optional per-call limit; omission uses published model limits
+            or the rollout budget within the context window when no output limit is published.
+        maximum_judge_input_tokens: Optional input ceiling; omission uses the judge context
+            capacity minus its output reservation.
         maximum_judge_output_tokens: Positive judge output reservation, default 8,192.
-        maximum_retrieval_query_tokens: Positive query token reservation, default 32,768.
-        seed: Reproducible simulation seed, default 0.
+        maximum_retrieval_query_tokens: Positive per-query embedding limit, default 32,768.
+        seed: Reproducible scenario seed, default zero.
     """
 
     maximum_steps: int = Field(default=100, ge=1)
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
-    maximum_concurrency: int = Field(default=1, ge=1, le=32)
+    maximum_concurrency: int = Field(default=8, ge=1)
+    repeats: int = Field(default=1, ge=1)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
-    maximum_judge_input_tokens: int = Field(default=32_768, gt=0)
+    maximum_judge_input_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_output_tokens: int = Field(default=8_192, gt=0)
     maximum_retrieval_query_tokens: int = Field(default=32_768, gt=0)
     seed: int = 0
@@ -142,12 +150,15 @@ def prepare_model_evaluation(
     worker_aliases: tuple[str, ...],
     *,
     continuation_of: str | None = None,
+    run_id: str | None = None,
     judge_setup: ArtifactInput | None = None,
+    judge_alias: str | None = None,
     calibration_id: str | None = None,
     embedder_alias: str,
     options: ModelEvaluationOptions,
     created_at: datetime,
     code_revision: str,
+    progress: ProgressHook | None = None,
 ) -> PreparedModelEvaluation:
     """Freeze a completed project's worker matrix and estimate it without provider calls.
 
@@ -156,12 +167,15 @@ def prepare_model_evaluation(
         catalog: Secret-free catalog with explicit model capabilities and prices.
         worker_aliases: Two or more distinct worker aliases, never an incumbent or router.
         continuation_of: Prior simulation ID to continue under increased budgets.
+        run_id: Optional distinct experiment identity; identical settings can run fresh evidence.
         judge_setup: Authored judge setup manifest, or omit both judge arguments for task success.
+        judge_alias: Optional model override retaining the syllabus with provisional calibration.
         calibration_id: Verified calibration identity paired with an explicit judge setup.
         embedder_alias: Catalog alias matching the completed fit-RAG embedder.
         options: Bounded execution controls.
         created_at: Timestamp for newly persisted immutable pricing/contracts.
         code_revision: Exact engine producer revision.
+        progress: Optional observer of verification, cost estimation, and artifact stages.
 
     Returns:
         Frozen setup and prepared-project quote suitable for credit admission by a host.
@@ -171,9 +185,11 @@ def prepare_model_evaluation(
     """
     if len(worker_aliases) < 2 or len(set(worker_aliases)) != len(worker_aliases):
         raise ValueError("select at least two distinct worker models")
+    report(progress, "Verifying built project")
     completed = completed_project_build(project)
     if (judge_setup is None) != (calibration_id is None):
         raise ValueError("supply both judge setup and calibration, or omit both for task success")
+    report(progress, "Preparing judge")
     if judge_setup is None:
         default = prepare_hosted_provisional_judge(
             project,
@@ -200,14 +216,32 @@ def prepare_model_evaluation(
     ):
         raise ValueError("judge setup or calibration differs from the completed evaluation project")
     static = RuntimeModelCatalog(catalog, environment={})
+    judge_model, judge_caps = static.snapshot(judge_alias or selected.judge_alias)
+    if not serves_role(judge_caps, SetupRole.JUDGE):
+        raise ValueError("judge requires structured output and pricing; choose another judge model")
+    if judge_alias is not None and judge_alias != selected.judge_alias:
+        judge_setup, calibration_id = select_judge_model(
+            project,
+            selected,
+            calibration,
+            alias=judge_alias,
+            model=judge_model,
+            created_at=created_at,
+            code_revision=code_revision,
+        )
+        selected = read_evaluation_judge(project, judge_setup)
+        calibration, _ = verify_persisted_calibration(project, calibration_id)
+        assert calibration.status == "provisional"
     judge_model, judge_caps = static.snapshot(selected.judge_alias)
     if judge_model != selected.judge_model:
         raise ValueError("judge catalog changed; prepare a new judge setup")
+    report(progress, "Loading world model")
     world = load_grounded_world_model_artifact(project.artifacts, completed.world_model)
     world_snapshot, _ = static.snapshot(world.model_alias)
     if world_snapshot != world.model:
         raise ValueError("simulation catalog changed; build a new grounded project")
     embedder, _ = static.snapshot(embedder_alias)
+    report(progress, "Loading retrieval index")
     fit = load_rag_index(project.artifacts, completed.fit_rag.artifact_id)
     if artifact_input(fit.manifest) != completed.fit_rag or fit.index.embedder != embedder:
         raise ValueError("selected embedder differs from the completed fit RAG")
@@ -215,26 +249,27 @@ def prepare_model_evaluation(
         RoutedCandidateSnapshot(alias=alias, model=static.snapshot(alias)[0])
         for alias in sorted(worker_aliases)
     )
-    capacities = {
-        alias: static.snapshot(alias)[1].maximum_output_tokens
-        for alias in (*worker_aliases, world.model_alias)
-    }
-    if any(value is None for value in capacities.values()):
-        raise ValueError("evaluation requires declared worker and world-model output capacities")
-    maximum_output_tokens = options.maximum_output_tokens or max(
-        value for value in capacities.values() if value is not None
-    )
+    output_budgets: dict[str, int] = {}
+    for alias in (*worker_aliases, world.model_alias):
+        capabilities = static.snapshot(alias)[1]
+        if capabilities.context_window_tokens is None:
+            raise ValueError(f"context window is missing for {alias}; refresh model metadata")
+        output_budgets[alias] = capabilities.maximum_output_tokens or min(
+            options.maximum_rollout_output_tokens, capabilities.context_window_tokens
+        )
+    maximum_output_tokens = options.maximum_output_tokens or max(output_budgets.values())
+    report(progress, "Loading traces for cost estimates")
     traces = load_trace_dataset(project.artifacts, completed.trace_dataset.artifact_id).traces
-    input_estimates = {
-        alias: simulation_input_token_estimate(
+    input_estimates: dict[str, int | None] = {}
+    report(progress, "Estimating model costs", completed=0, total=len(output_budgets))
+    for index, (alias, output_budget) in enumerate(output_budgets.items(), start=1):
+        input_estimates[alias] = simulation_input_token_estimate(
             traces,
             retrieved_transition_count=world.top_k,
             maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-            maximum_output_tokens=min(maximum_output_tokens, capacity),
+            maximum_output_tokens=min(maximum_output_tokens, output_budget),
         )
-        for alias, capacity in capacities.items()
-        if capacity is not None
-    }
+        report(progress, "Estimating model costs", completed=index, total=len(output_budgets))
     if any(value is None for value in input_estimates.values()):
         raise ValueError("evaluation requires captured source traces for a cost estimate")
     attempts = RetryPolicy().maximum_attempts
@@ -274,6 +309,7 @@ def prepare_model_evaluation(
         maximum_model_calls=options.maximum_steps,
         system_prompt=config.system.system_prompt if config.system else None,
     )
+    report(progress, "Freezing evaluation settings")
     pricing = persist_pricing_snapshot(
         project.artifacts,
         tuple(
@@ -340,6 +376,7 @@ def prepare_model_evaluation(
         pricing_snapshot_id=pricing.pricing_snapshot_id,
     )
     setup = EvaluationSetup(
+        run_id=run_id,
         candidates=candidates,
         production_protocol=production,
         simulation_protocol=simulation,
@@ -352,6 +389,7 @@ def prepare_model_evaluation(
             prompt_version=WORLD_MODEL_TEXT_PROMPT_VERSION,
             query_embedding=retrieval,
             maximum_output_tokens=maximum_output_tokens,
+            json_object_output=True,
         ),
         simulation_completion_input=completion_input,
         agent_id=config.project_id,
@@ -364,7 +402,9 @@ def prepare_model_evaluation(
         maximum_steps=options.maximum_steps,
         maximum_rollout_output_tokens=options.maximum_rollout_output_tokens,
         maximum_concurrency=options.maximum_concurrency,
+        repeats=options.repeats,
     )
+    report(progress, "Calculating evaluation quote")
     cost = estimate_model_evaluation(
         project,
         setup,

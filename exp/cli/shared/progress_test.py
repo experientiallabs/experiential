@@ -6,9 +6,17 @@ import io
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
-from exp.cli.shared.progress import progress_display, qualified
+from exp.cli.shared.progress import ProgressDisplay, progress_display, qualified
 from exp.common.progress import ProgressEvent
+from exp.simulation.retrieval.contracts import RAGAction
+from exp.simulation.retrieval.embedding import (
+    RAGEmbeddingCache,
+    default_rag_embedder,
+    embed_rag_texts,
+)
+from exp.simulation.retrieval.transitions import render_rag_key
 
 
 def _plain_console(*, interactive: bool) -> tuple[Console, io.StringIO]:
@@ -34,6 +42,24 @@ def test_noninteractive_output_is_stable_lines_without_cursor_control() -> None:
     output = buffer.getvalue()
     assert output == ("  . normalization\n  . embeddings (serving index) 2/5\n")
     assert "\x1b[" not in output
+
+
+def test_embedding_batches_retain_the_serving_and_fit_index_labels() -> None:
+    """Chunk progress must preserve the index qualifier, including a fully reused fit index."""
+    console, buffer = _plain_console(interactive=False)
+    binding = default_rag_embedder()
+    cache = RAGEmbeddingCache(binding, maximum_chunk_bytes=2_048)
+    keys = (
+        render_rag_key(
+            task="task", initial_context={}, action=RAGAction(kind="message", content="action")
+        ),
+    )
+    with progress_display(console) as observe:
+        embed_rag_texts(binding, keys, cache=cache, progress=qualified(observe, "serving index"))
+        embed_rag_texts(binding, keys, cache=cache, progress=qualified(observe, "fit-only index"))
+    output = buffer.getvalue()
+    assert "embeddings (serving index) 2/2" in output
+    assert "embeddings (fit-only index) 2/2" in output
 
 
 def test_interactive_display_prints_each_finished_stage_once() -> None:
@@ -126,6 +152,36 @@ def test_single_line_failure_still_marks_the_active_stage_unfinished() -> None:
             observe(ProgressEvent(stage="fitting"))
             raise RuntimeError("boom")
     assert "[ ] fitting" in buffer.getvalue()
+
+
+def test_single_line_keeps_elapsed_time_live_between_completed_rollouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long provider request keeps the display moving without inventing completed work."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    now = [100.0]
+    monkeypatch.setattr("exp.cli.shared.progress.monotonic", lambda: now[0])
+    console, buffer = _plain_console(interactive=True)
+    display = ProgressDisplay(console, single_line=True)
+    assert display._live is not None
+    display._live.auto_refresh = False
+    display.start()
+    try:
+        display.observe(ProgressEvent(stage="Rollouts", completed=0, total=100))
+        assert "0/100" in Text.from_ansi(buffer.getvalue()).plain
+        previous_length = len(buffer.getvalue())
+        now[0] = 165.0
+        display._live.refresh()
+        current = Text.from_ansi(buffer.getvalue()[previous_length:]).plain
+        assert "0/100" in current
+        assert "1m05s elapsed" in current
+        assert "eta" not in current
+        display.observe(ProgressEvent(stage="Judging", completed=0, total=100))
+        assert "1m05s elapsed" in Text.from_ansi(buffer.getvalue()).plain
+    finally:
+        display.stop()
+    assert "\x1b[?1049h" not in buffer.getvalue()
+    assert "\x1b[?25h" in buffer.getvalue()
 
 
 def test_qualified_attaches_a_detail_and_preserves_counts() -> None:

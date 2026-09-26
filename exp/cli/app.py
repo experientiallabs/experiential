@@ -11,6 +11,7 @@ from exp.cli.auth import login
 from exp.cli.build.app import build
 from exp.cli.capture.app import capture_app
 from exp.cli.config.app import config_app
+from exp.cli.evaluation.app import evaluate
 from exp.cli.gateway.home import default_gateway
 from exp.cli.gateway.serve import (
     DEFAULT_GATEWAY_PORT,
@@ -36,6 +37,7 @@ add_deferred_typer(
     help="Optimize supported frozen project artifacts.",
     known_names=("router", "model"),
 )
+app.command("eval", help="Evaluate models on a project and inspect saved results.")(evaluate)
 app.command("build", help="Import traces, mine scenarios, and build a grounded world model.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 app.command(

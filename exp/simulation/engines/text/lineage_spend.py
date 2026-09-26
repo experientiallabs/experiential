@@ -1,14 +1,39 @@
 """Count physical provider work once across retries and retained continuation prefixes."""
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
+from exp.common.evaluations import EvaluationCell
 from exp.common.project import ArtifactStore, artifact_input
-from exp.common.rollouts import RolloutArtifact
+from exp.common.rollouts import RolloutArtifact, SimulationCellBinding
 from exp.simulation.engines.text.bindings import rollout_id_for_binding
 from exp.simulation.engines.text.errors import SimulationResumeError
-from exp.simulation.engines.text.resume import load_rollout
+from exp.simulation.engines.text.resume import ResumePins, load_rollout, persisted_cell_attempts
 from exp.simulation.engines.text.rollout_support import rollout_spend
+
+
+def resolution_spend(
+    store: ArtifactStore,
+    cells: Sequence[EvaluationCell],
+    bindings: Mapping[str, SimulationCellBinding],
+    pins: ResumePins,
+) -> float | None:
+    """Reconcile every saved attempt before admitting more work in one resolution.
+
+    Args:
+        store: Immutable rollout owner.
+        cells: Frozen plan cells indexed by the supplied bindings.
+        bindings: Exact cell identities selected for this resolution.
+        pins: Artifact identities required when loading retained attempts.
+
+    Returns:
+        Retry-inclusive spend, or unknown when dispatched work cannot be priced.
+    """
+    by_id = {cell.cell_id: cell for cell in cells}
+    rollouts: list[RolloutArtifact] = []
+    for cell_id, binding in bindings.items():
+        rollouts.extend(persisted_cell_attempts(store, by_id[cell_id], binding, pins))
+    return lineage_spend(store, rollouts)
 
 
 def lineage_spend(

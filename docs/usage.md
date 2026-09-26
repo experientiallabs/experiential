@@ -8,9 +8,10 @@ The root surface is deliberately small:
 | Command | Purpose | Local result |
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
-| `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
+| `exp login [--root ROOT]` | Sign in to Experiential Cloud, save the returned organization key, and synchronize account-visible models with the catalog's default-route capabilities and undiscounted prices. Known metadata is reused without capability or price questions. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
+| `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Import file or gateway traces, mine scenarios, and prepare world-model grounding; omitting traces opens the guided build. | Canonical imports in `gateway/traffic.db`, versioned scenarios, serving RAG, fit RAG and a grounded world model. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -21,7 +22,7 @@ The root surface is deliberately small:
 | `exp config gateway models [--json]` | List the aliases a live gateway grants to the presented key (caller view of `GET /v1/models`). | One HTTP request against the running gateway; no local state. |
 | `exp config gateway key check [--json]` | Validate one raw virtual key against a live gateway and print its granted aliases without storing the key. | One HTTP request against the running gateway; no local state. |
 | `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. `experiential-cloud` points at the hosted Platform gateway and reuses the credential from `exp login`; login already performs its provider/model synchronization. Setup also persists, replaces, or removes user-local provider keys. | Local `.exp/models.toml` plus optional records in the user-data credential file. |
-| `exp config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
+| `exp config budget [USD] --root ROOT` | Read or set the budget warning threshold for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
 | `exp config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
 
 ## Direct provider capture on macOS
@@ -140,13 +141,15 @@ Capture checks the cloud API before starting interception. Live Codex and Claude
 compatibility remains part of local acceptance; existing open connections may need to be
 restarted to enter capture.
 
-`build`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
+`build`, `eval`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
 policy. An estimate at or below 50% of the budget runs automatically. A higher estimate
-up to the budget requires a clear terminal confirmation or `--yes`; an estimate above the budget
-warns and requires an explicit interactive override that defaults to no, and fails closed before
-credentials or provider clients when no terminal is available. Set the deterministic ceiling with
-`exp config budget USD --root ROOT`. `--yes` confirms only an in-budget invocation and never raises
-the ceiling. Exact completed replays report a zero-dollar estimate and do not prompt.
+requires a clear terminal confirmation or `--yes`. An estimate above the budget warns and offers
+"Proceed anyway?", defaulting to no. `--yes` also authorizes an over-budget estimate after the
+warning. Without a terminal or explicit consent, the command explains how to proceed and makes
+no provider calls. Set the warning budget with `exp config budget USD --root ROOT`. Build embedding
+and router budgets and the judge-calibration budget use the same warning and confirmation flow.
+Approval applies to this invocation; saved budgets stay unchanged. Exact completed replays report
+a zero-dollar estimate and do not prompt.
 
 Successful build, router, simulation, and SFT operations preserve anonymous aggregate PostHog
 product telemetry, which may send unless disabled. Gateway startup makes no provider call.
@@ -190,7 +193,11 @@ same provider is edited again. Runtime commands never prompt. They resolve an ex
 caller-supplied environment mapping first, then a non-empty process environment value, then
 the stored key for that connection ID. Environment values override the store without rewriting
 it. Missing credentials fail with the environment name and a recovery that points at
-`exp config providers`. Bedrock stays on the AWS credential chain. Current provider revisions
+`exp config providers`. The model picker accepts multiple models from each provider (Space toggles
+selections). Selected models stay in the catalog for evaluation even without a build role.
+Reasoning choices come from the selected deployment or maintained provider contract; DeepSeek
+shows its distinct off (`none`), low, high, and max modes instead of compatibility aliases.
+Bedrock stays on the AWS credential chain. Current provider revisions
 live in SQLite; immutable serving snapshots bind exact revisions while build and evaluation
 artifacts remain in the project artifact store.
 
@@ -325,6 +332,16 @@ calls. The quote and result exclude earlier trace mining and grounding costs; a 
 those separately before offering a complete trace-to-report price. Credit conversion, promotions,
 identity authorization and job persistence remain hosting responsibilities.
 
+Judges use their declared context capacity minus the output reservation. Full visible task and
+tool evidence is retained; a transcript that exceeds that capacity is excluded with an explicit
+admission reason. Judge requests preserve configured reasoning without adding sampling controls.
+If a run stops during judging, select it under Saved evaluations in `exp eval PROJECT`. The launch
+review offers a fresh judging pass over saved rollouts under the same spending limit. Successful
+scores are reused, earlier failed-attempt spend is retained, and the new judging recipe is recorded
+separately without editing the original run preparation or simulation artifacts. Request-ledger
+charges include responses whose later probe or judgment write failed. The approved spending limit
+governs recovery accounting independently of the original theoretical simulation ceiling.
+
 ## Gateway clients
 
 Official OpenAI SDK clients use the issued virtual key and loopback base URL:
@@ -386,7 +403,9 @@ world-model grounding. Model roles belong to the project; embedding work uses th
 preflight. An unchanged completed build reuses its scenarios and indexes without new provider calls.
 `--dry-run` uses temporary SQLite for source ingestion and may checkpoint deterministic project
 evidence, but makes no provider calls, durable trace imports, or completed-build selection.
-The interactive build prompts for an explicit source file; automation supplies `--traces`.
+The interactive build prompts for an explicit source file and detects chat JSON, native capture,
+and recognizable OpenTelemetry exports. Unknown or ambiguous files get a format question in the
+TUI. An explicit `--source` is always respected; automation supplies `--traces` and `--source`.
 OTel sources (`otlp`, `otel-genai`) and completed exported chat captures (`experiential`) use the
 same persistence path. See [trace input and storage](reference/ingest.md) for the Python API.
 
@@ -403,3 +422,36 @@ currently materialize the canonical corpus, so the whole build's memory grows wi
 See [local traffic capture](reference/local_gateway_traffic.md) for default-on,
 identity-scoped collection. `--source gateway` reads every retained record for the required
 identity from one consistent snapshot, including corpora larger than one page.
+
+### Evaluate a project
+
+`exp eval powerset --models gpt-5.6-luna,deepseek-v4.1-flash` prepares and reviews the model matrix,
+then simulates, judges, and writes a report. Model names are configured catalog aliases; project
+world-model and judge choices come from the configured project. Existing authored/calibrated project judges
+are reused by default. Choosing another judge model preserves the project rubric and prompt,
+creates provisional calibration for that run, and leaves project defaults and previous runs intact.
+Without an authored judge, the task-success judge is explicitly provisional.
+
+`exp eval powerset` requires a completed `exp build powerset` first. It opens a small project
+screen: select models, runs per scenario, and judge; review the estimate; then choose Start
+evaluation. Provider connections, traces, scenarios, and world-model grounding come from build.
+Advanced rollout budgets are optional. Saved results show score, assistant cost, and latency;
+Open report opens plots and side-by-side traces. Details exposes paths and accounting.
+The default minimum is 20 distinct scenarios,
+with one repeat, eight parallel workers, 100 steps, and 1,000,000 generated tokens per rollout.
+Retries are separate from repeats. New evaluations collect fresh evidence; resume reuses the
+exact saved run. Settings are saved in the project's `evaluation.json`.
+
+Use `--dry-run` for provider-free preparation, `--resume RUN_ID` for exact saved execution, and
+`--report RUN_ID` for read-only results. Ctrl-C cancels queued work and drains active rollouts;
+completed cells remain immutable and resume does not repeat them. Unknown in-flight provider
+outcomes remain invalid evidence, with their cost reservation retained by the engine.
+
+Each completed run writes `report.json`, `rollouts.jsonl`, and a standalone offline `report.html`
+under `.exp/projects/PROJECT/runtime/evaluations/RUN_ID/`. The HTML contains a cost-quality Pareto
+plot and one tile per scenario with model and repeat selectors. Assistant cost and quality use the
+shared valid cohort; invalid/incomplete coverage and total experiment spend remain visible.
+
+Assistant cost per task reprices recorded successful-rollout tokens at the frozen catalog rates.
+It excludes simulation, judging, invalid attempts, and hypothetical retry reservations.
+Conservative experiment-spend accounting remains separate from the report's operating cost.

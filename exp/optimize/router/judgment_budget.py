@@ -498,6 +498,7 @@ def complete_cell_evidence(
     spend_ceiling_crossed: Callable[[bool, str, str], None],
     progress: ProgressHook | None = None,
     progress_detail: str | None = None,
+    reconciled_spend: Callable[[], float] | None = None,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int, float]:
     """Verify evidence and reserve each bounded judgment dispatch durably before calling it.
 
@@ -538,6 +539,7 @@ def complete_cell_evidence(
         spend_ceiling_crossed: Fail-closed or warn-once handler for a crossed spend ceiling.
         progress: Optional progress hook for judgment counting.
         progress_detail: Optional stable progress label.
+        reconciled_spend: Optional authoritative ledger including incomplete paid responses.
 
     Returns:
         Bound cell evidence, consumed dispatch count, and reconciled judge spend.
@@ -624,6 +626,7 @@ def complete_cell_evidence(
         rollout = rollouts_by_id[rollout_id]
         if _rollout_failed(rollout):
             evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
+            _report_judgments()
             continue
         try:
             judgment = judgments_by_rollout.get(rollout_id)
@@ -669,6 +672,8 @@ def complete_cell_evidence(
             _report_judgments()
             continue
         if judgment is None:
+            if reconciled_spend is not None:
+                judge_spend_usd = reconciled_spend()
             if judge_spend_usd >= remaining_cost_usd:
                 if stop_on_overspend or not overspend_warned:
                     spend_ceiling_crossed(
@@ -746,6 +751,8 @@ def complete_cell_evidence(
     reconciled = math.fsum(
         [*(_known_judgment_spend(item) for item in judgments_by_rollout.values()), *excluded_costs]
     )
+    if reconciled_spend is not None:
+        reconciled = reconciled_spend()
     return tuple(evidence), consumed, reconciled
 
 

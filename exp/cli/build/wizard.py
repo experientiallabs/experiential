@@ -16,6 +16,12 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 
+from exp.cli.build.providers import (
+    configure_build_providers as _configure_build_providers,
+)
+from exp.cli.build.providers import (
+    require_replay_role_overrides as _require_replay_role_overrides,
+)
 from exp.cli.build.traces import load_build_traces
 from exp.cli.build.wizard_screens import (
     WizardBuildPlan,
@@ -29,7 +35,7 @@ from exp.cli.build.wizard_screens import (
 from exp.cli.build.wizard_screens import (
     select_workflow as _select_workflow,
 )
-from exp.cli.shared.consent import require_spend_consent
+from exp.cli.shared.consent import SpendBudget, require_spend_consent
 from exp.cli.shared.progress import progress_display
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -82,7 +88,7 @@ from exp.simulation.world_model import load_grounded_world_model_artifact
 def run_build_wizard(
     project: str,
     *,
-    source: str,
+    source: str | None,
     root: Path,
     world_model: str | None,
     judge: str | None,
@@ -97,14 +103,14 @@ def run_build_wizard(
 
     Args:
         project: Safe local project identifier.
-        source: Initial trace-source choice.
+        source: Explicit trace-source choice, or None to recognize the selected export.
         root: Local EXP artifact root.
         world_model: Optional world-model alias override.
         judge: Optional judge alias override.
         embedder: Optional embedder alias override.
         top_k: Serving retrieval result limit.
-        maximum_build_cost_usd: Strict grounded-build provider ceiling.
-        maximum_router_cost_usd: Optional strict router ceiling, or automatic planning.
+        maximum_build_cost_usd: Embedding budget requiring confirmation when exceeded.
+        maximum_router_cost_usd: Optional router budget requiring confirmation when exceeded.
         providers: Repeatable provider names that skip the opening provider list.
         console: Interactive terminal for prompts and progress.
 
@@ -126,10 +132,6 @@ def run_build_wizard(
         judge=judge,
         embedder=embedder,
     )
-    replay = _completed_replay(root, project, code_revision=code_revision)
-    if replay is not None:
-        _render_completed_replay(console=console)
-        return
     selection = _select_workflow(console=console)
     existing = _completed_build_plan(
         root,
@@ -157,11 +159,24 @@ def run_build_wizard(
             maximum_build_cost_usd=maximum_build_cost_usd,
             code_revision=code_revision,
             providers=providers,
-            setup_providers=selection.providers,
             console=console,
         )
     else:
-        plan = existing
+        catalog = _configure_build_providers(
+            root,
+            project,
+            providers=providers,
+            world_model=world_model,
+            judge=judge,
+            embedder=embedder,
+            console=console,
+        )
+        plan = replace(existing, catalog=catalog)
+        if not selection.judge_rubric and not selection.judge_calibration:
+            replay = _completed_replay(root, project, code_revision=code_revision)
+            if replay is not None:
+                _render_completed_replay(console=console)
+                return
     cost_plan: AutomaticRouterCostPlan | None = None
     router_ceiling = 0.0
     catalog = plan.catalog
@@ -176,32 +191,18 @@ def run_build_wizard(
             candidate_plan.selection,
         )
         router_ceiling = cost_plan.required_provider_cost_usd
-        if (
-            maximum_router_cost_usd is not None
-            and maximum_router_cost_usd < cost_plan.required_provider_cost_usd
-        ):
-            raise ValueError(
-                f"router cap ${maximum_router_cost_usd:.2f} is below the exact required "
-                f"${cost_plan.required_provider_cost_usd:.2f}; increase "
-                "--max-router-cost-usd or omit it"
-            )
-    if (
-        not plan.build_reused
-        and plan.build_estimate_usd is not None
-        and plan.build_estimate_usd > maximum_build_cost_usd
-    ):
-        raise ValueError(
-            f"grounded build requires ${plan.build_estimate_usd:.2f}, above the configured "
-            f"${maximum_build_cost_usd:.2f} ceiling; increase --max-build-cost-usd"
-        )
     build_estimate = 0.0 if plan.build_reused else plan.build_estimate_usd
     total_estimate = None if build_estimate is None else math.fsum((build_estimate, router_ceiling))
+    budgets = [SpendBudget("embedding", build_estimate, maximum_build_cost_usd)]
+    if maximum_router_cost_usd is not None:
+        budgets.append(SpendBudget("router", router_ceiling, maximum_router_cost_usd))
     if (total_estimate is None or total_estimate > 0) and not require_spend_consent(
         console,
         root=root,
         yes=False,
         estimated_cost_usd=total_estimate,
         command=f"exp build {project}",
+        additional_budgets=budgets,
     ):
         console.print("Stopped before paid build or router work.")
         return
@@ -228,7 +229,7 @@ def run_build_wizard(
                 embedder_snapshot=embedder_snapshot,
                 top_k=top_k,
                 estimate=plan.build_estimate_usd,
-                maximum_build_cost_usd=maximum_build_cost_usd,
+                maximum_build_cost_usd=max(maximum_build_cost_usd, build_estimate or 0.0),
                 provider_spend_authorized=True,
                 progress=progress,
             )
@@ -425,6 +426,7 @@ def _run_selected_judge_calibration(
         yes=False,
         estimated_cost_usd=required,
         command=f"exp build {project}",
+        additional_budgets=(SpendBudget("router", required, router_ceiling),),
     ):
         return None, 0.0
     return recomputed, max(router_ceiling, required)
@@ -468,48 +470,6 @@ def _completed_replay(
     )
 
 
-def _require_replay_role_overrides(
-    root: Path,
-    project: str,
-    *,
-    world_model: str | None,
-    judge: str | None,
-    embedder: str | None,
-) -> None:
-    """Reject role overrides that differ from a selected completed build.
-
-    Args:
-        root: Local EXP root.
-        project: Existing project identifier.
-        world_model: Optional requested world-model alias.
-        judge: Optional requested judge alias.
-        embedder: Optional requested embedder alias.
-
-    Raises:
-        ValueError: A supplied override differs from the selected completed-build role.
-    """
-    store = ProjectStore(root, project)
-    if not store.paths.project_toml.exists():
-        return
-    config = store.load_project()
-    if config.build is None or config.models is None:
-        return
-    requested = {
-        "world_model": world_model,
-        "judge": judge,
-        "embedder": embedder,
-    }
-    mismatches = tuple(
-        f"{role}={alias!r} (selected {getattr(config.models, role)!r})"
-        for role, alias in requested.items()
-        if alias is not None and alias != getattr(config.models, role)
-    )
-    if mismatches:
-        raise ValueError(
-            "role overrides differ from the selected completed build: " + ", ".join(mismatches)
-        )
-
-
 def _prepare_new_build(
     project: str,
     *,
@@ -523,7 +483,6 @@ def _prepare_new_build(
     maximum_build_cost_usd: float,
     code_revision: str,
     providers: tuple[str, ...],
-    setup_providers: bool = True,
     console: Console,
 ) -> WizardBuildPlan:
     """Materialize deterministic build evidence and return a credential-free plan.
@@ -537,54 +496,40 @@ def _prepare_new_build(
         judge: Optional judge override.
         embedder: Optional embedder override.
         top_k: Serving retrieval result limit.
-        maximum_build_cost_usd: Strict embedding ceiling.
+        maximum_build_cost_usd: Embedding budget requiring confirmation when exceeded.
         code_revision: Installed producer revision.
         providers: Repeatable provider names that skip the opening provider list.
-        setup_providers: Whether the providers workflow step may run interactive setup.
         console: Interactive terminal.
 
     Returns:
         Complete provider-free plan with deterministic persisted evidence.
 
     Raises:
-        ValueError: Traces are invalid, or required roles are missing while the
-            providers step was not selected.
+        ValueError: Traces, confirmed model roles, or existing project settings are invalid.
     """
     from exp.cli.build.app import (
         _embedding_cost_ceiling,
-        _missing_build_configuration,
         _project_store,
         _reuse_completed_grounded_artifacts,
         _selected_roles,
         _validated_role_snapshots,
     )
-    from exp.cli.providers.setup import ProviderSetupOptions, run_provider_setup
 
     normalized = load_build_traces(project, root=root, path=trace_path, source=source)
-    catalog_path = root / "models.toml"
-    existing_catalog = load_model_catalog(catalog_path) if catalog_path.exists() else None
-    if _missing_build_configuration(existing_catalog):
-        if not setup_providers:
-            raise ValueError(
-                "the providers step was not selected but models.toml is missing required "
-                "roles; include the providers step or run exp config providers first"
-            )
-        catalog = run_provider_setup(
-            root,
-            ProviderSetupOptions(providers=providers),
-            non_interactive=False,
-            replace=False,
-            console=console,
-            offer_recommended_defaults=True,
-        )
-    else:
-        assert existing_catalog is not None
-        catalog = existing_catalog
-    selected = _selected_roles(
-        catalog,
+    catalog = _configure_build_providers(
+        root,
+        project,
+        providers=providers,
         world_model=world_model,
         judge=judge,
         embedder=embedder,
+        console=console,
+    )
+    selected = _selected_roles(
+        catalog,
+        world_model=None,
+        judge=None,
+        embedder=None,
     )
     runtime = RuntimeModelCatalog(catalog)
     world_snapshot, embedder_snapshot, embedder_capabilities = _validated_role_snapshots(
@@ -883,6 +828,7 @@ def _candidate_plan(root: Path, catalog: ModelCatalog) -> RouterCandidateSetupPl
         selection=RouterCandidateSelection(
             candidates=catalog.roles.candidates,
             incumbent=incumbent,
+            candidate_reasoning_efforts=catalog.roles.candidate_reasoning_efforts,
         ),
         candidate_models=(),
         prospective_catalog=catalog,

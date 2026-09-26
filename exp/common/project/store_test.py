@@ -12,6 +12,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     SourceIdentity,
     canonical_json_bytes,
+    canonical_jsonl_bytes,
 )
 from exp.common.project import (
     ArtifactAlreadyExistsError,
@@ -365,6 +366,54 @@ def test_read_bytes_rejects_a_symlink_swapped_after_full_verification(
         store.artifacts.read_bytes("task-set-v1", "tasks.json")
 
 
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_jsonl_artifacts_preserve_unicode_separators_inside_strings(
+    tmp_path: Path, separator: str, line_ending: bytes
+) -> None:
+    """JSONL uses physical newlines while Unicode text remains inside each record."""
+    store = _store(tmp_path)
+    payload = canonical_jsonl_bytes(
+        [{"content": f"First{separator}paragraph"}, {"content": "Second record"}]
+    ).replace(b"\n", line_ending)
+    store.artifacts.write(
+        artifact_id="unicode-text",
+        artifact_type="trace-dataset",
+        envelope=_envelope(),
+        files={"traces.jsonl": payload},
+    )
+    assert store.artifacts.read_bytes("unicode-text", "traces.jsonl") == payload
+    unsafe = canonical_jsonl_bytes(
+        [
+            {"content": f"First{separator}paragraph"},
+            {"content": "sk-abcdefghijklmnopqrstuvwxyz123456"},
+        ]
+    ).replace(b"\n", line_ending)
+    with pytest.raises(ArtifactStoreError, match="secret boundary"):
+        store.artifacts.write(
+            artifact_id="unsafe-unicode-text",
+            artifact_type="trace-dataset",
+            envelope=_envelope(),
+            files={"traces.jsonl": unsafe},
+        )
+
+
+@pytest.mark.parametrize("relative_path", ["records.json", "records.jsonl"])
+def test_invalid_json_is_not_reported_as_a_secret_violation(
+    tmp_path: Path, relative_path: str
+) -> None:
+    """Invalid syntax is reported without printing input contents or misclassifying it."""
+    store = _store(tmp_path)
+    with pytest.raises(ArtifactStoreError, match="contains invalid JSON") as raised:
+        store.artifacts.write(
+            artifact_id="invalid-json",
+            artifact_type="trace-dataset",
+            envelope=_envelope(),
+            files={relative_path: b'{"content":"private-incomplete-value'},
+        )
+    assert "private-incomplete-value" not in str(raised.value)
+
+
 def test_secret_boundary_review_draft_and_write_once_model_config_binding(tmp_path: Path) -> None:
     """Artifacts reject credentials; review is mutable and the SFT config pointer is write-once."""
     store = _store(tmp_path)
@@ -375,12 +424,12 @@ def test_secret_boundary_review_draft_and_write_once_model_config_binding(tmp_pa
             envelope=_envelope(),
             files={"tasks.json": {"api_key_env": "OPENAI_API_KEY"}},
         )
-    with pytest.raises(ArtifactStoreError, match="credential environment name"):
+    with pytest.raises(ArtifactStoreError, match="credential_ref"):
         store.artifacts.write_json(
             artifact_id="unsafe-variable-v1",
             artifact_type="task-set",
             envelope=_envelope(),
-            files={"tasks.json": {"connection_hint": "OPENAI_API_KEY"}},
+            files={"tasks.json": {"credential_ref": "OPENAI_API_KEY"}},
         )
     with pytest.raises(ArtifactStoreError, match="relative POSIX"):
         store.artifacts.write_json(

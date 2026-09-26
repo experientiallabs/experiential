@@ -45,11 +45,11 @@ _SECRET_FIELD_NAMES = frozenset(
         "token_env",
     }
 )
-_SECRET_VALUE_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
+_SECRET_VALUE_RULES = (
+    ("sk-", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("AKIA", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("xox", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("bearer", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE)),
 )
 _SECRET_ENVIRONMENT_NAME_PATTERN = re.compile(
     r"\b(?:[A-Z][A-Z0-9]*_)*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN|SECRET|"
@@ -69,7 +69,10 @@ _SECRET_REFERENCE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SECRET_REDACTION_PLACEHOLDER = "[REDACTED]"
-_SECRET_REDACTION_PATTERNS = (*_SECRET_VALUE_PATTERNS, _SECRET_ENVIRONMENT_NAME_PATTERN)
+_SECRET_REDACTION_PATTERNS = (
+    *(pattern for _, pattern in _SECRET_VALUE_RULES),
+    _SECRET_ENVIRONMENT_NAME_PATTERN,
+)
 
 
 class ContractModel(BaseModel):
@@ -330,7 +333,11 @@ def validate_artifact_file_path(value: str) -> PurePosixPath:
 
 
 def assert_secret_free(value: BaseModel | JsonValue) -> None:
-    """Reject secret values and credential references at immutable artifact boundaries.
+    """Reject secret values and credential configuration fields in structured artifacts.
+
+    Public credential-variable names in recorded prose or code are ordinary text, not secret
+    values. Structured fields such as ``api_key_env`` and ``credential_ref`` still cannot carry
+    local provider configuration into evidence.
 
     Args:
         value: The structured content about to enter an immutable artifact.
@@ -357,7 +364,7 @@ def assert_text_secret_free(value: str) -> None:
     """
     if _SECRET_REFERENCE_PATTERN.search(value) or _SECRET_ENVIRONMENT_NAME_PATTERN.search(value):
         raise SecretBoundaryError("immutable artifacts cannot contain credential references")
-    if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
+    if _has_secret_value(value):
         raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
 
 
@@ -410,6 +417,15 @@ def redact_secret_json(value: JsonValue) -> tuple[JsonValue, int]:
     return value, 0
 
 
+def _has_secret_value(value: str) -> bool:
+    """Skip a regex scan only when its mandatory literal prefix is absent."""
+    for prefix, pattern in _SECRET_VALUE_RULES:
+        text = value.lower() if pattern.flags & re.IGNORECASE else value
+        if prefix in text and pattern.search(value):
+            return True
+    return False
+
+
 def _assert_json_value_secret_free(value: JsonValue, *, path: str) -> None:
     """Recursively apply the immutable-artifact secret boundary."""
     if isinstance(value, dict):
@@ -425,11 +441,7 @@ def _assert_json_value_secret_free(value: JsonValue, *, path: str) -> None:
             _assert_json_value_secret_free(nested_value, path=f"{path}[{index}]")
         return
     if isinstance(value, str):
-        if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS):
+        if _has_secret_value(value):
             raise SecretBoundaryError(
                 f"immutable artifacts cannot contain a secret-like value at {path}"
-            )
-        if _SECRET_ENVIRONMENT_NAME_PATTERN.search(value):
-            raise SecretBoundaryError(
-                f"immutable artifacts cannot contain a credential environment name at {path}"
             )

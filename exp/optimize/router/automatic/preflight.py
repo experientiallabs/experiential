@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,6 +21,7 @@ from exp.common.models import (
     router_candidate_prices,
     validate_router_candidate_selection,
 )
+from exp.common.models.model import ReasoningEffort
 from exp.common.project import (
     ProjectBuildArtifacts,
     ProjectConfig,
@@ -436,13 +437,50 @@ def preflight_automatic_router(
         judge_reservation_cost_usd=judge_reservation_cost_usd,
         remaining_simulation_cost_usd=remaining_cost_usd,
         agent_factory_sha256=agent_identity,
-        simulation_configuration_sha256=sha256_json(
-            {
-                "version": "automatic-router-simulation-configuration-v1",
-                "agent_factory_sha256": agent_identity,
-                "redacted_field_names": list(config.redacted_field_names),
-            }
+        simulation_configuration_sha256=simulation_configuration_sha256(
+            config,
+            agent_identity=agent_identity,
+            candidate_aliases=selection.candidates,
+            world_model_reasoning_effort=catalog.roles.world_model_reasoning_effort,
+            judge_reasoning_effort=catalog.roles.judge_reasoning_effort,
+            candidate_reasoning_efforts=catalog.roles.candidate_reasoning_efforts,
         ),
+    )
+
+
+def simulation_configuration_sha256(
+    config: ProjectConfig,
+    *,
+    agent_identity: Sha256,
+    candidate_aliases: tuple[str, ...],
+    world_model_reasoning_effort: ReasoningEffort | None,
+    judge_reasoning_effort: ReasoningEffort | None,
+    candidate_reasoning_efforts: Mapping[str, ReasoningEffort],
+) -> Sha256:
+    """Bind agent configuration and confirmed reasoning choices without pricing or I/O.
+
+    Args:
+        config: Frozen project configuration supplying redaction behavior.
+        agent_identity: Exact agent factory identity for the execution.
+        candidate_aliases: Selected router candidates, independent of picker ordering.
+        world_model_reasoning_effort: Confirmed world-model reasoning choice.
+        judge_reasoning_effort: Confirmed judge reasoning choice.
+        candidate_reasoning_efforts: Confirmed reasoning choices by candidate alias.
+
+    Returns:
+        Deterministic simulation identity used by execution and completed replay.
+    """
+    return sha256_json(
+        {
+            "version": "automatic-router-simulation-configuration-v2",
+            "agent_factory_sha256": agent_identity,
+            "redacted_field_names": list(config.redacted_field_names),
+            "world_model_reasoning_effort": world_model_reasoning_effort,
+            "judge_reasoning_effort": judge_reasoning_effort,
+            "candidate_reasoning_efforts": {
+                alias: candidate_reasoning_efforts.get(alias) for alias in sorted(candidate_aliases)
+            },
+        }
     )
 
 

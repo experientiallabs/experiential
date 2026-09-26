@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import Lock
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, cast
 
 from pydantic import JsonValue
 
@@ -47,6 +47,7 @@ from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.tasks import TaskCase
 from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRetryableResponseError
 from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
@@ -60,8 +61,9 @@ from exp.simulation.engines.text.prompt import (
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.redaction import redact_json
+from exp.simulation.engines.text.tokens import TokenCounter, bound_unpublished_output
 from exp.simulation.retrieval import RAGQuery
-from exp.simulation.retrieval.transitions import render_rag_key
+from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 
 if TYPE_CHECKING:
     from exp.simulation.world_model import GroundedWorldModel
@@ -76,24 +78,6 @@ class TextSimulationError(RuntimeError):
         super().__init__(failure.message)
         self.stop_reason = stop_reason
         self.failure = failure
-
-
-@runtime_checkable
-class TokenCounter(Protocol):
-    """Counts the full serialized request before a model client can send it."""
-
-    def count(self, request: ModelRequest) -> int:
-        """Return a nonnegative context-token bound for the complete visible request."""
-        ...
-
-
-class Utf8UpperBoundTokenCounter:
-    """Provider-neutral byte upper bound used when no exact tokenizer is supplied."""
-
-    def count(self, request: ModelRequest) -> int:
-        """Bound complete request tokens by UTF-8 bytes plus per-message framing."""
-        rendered = request.model_dump_json(exclude_none=False)
-        return len(rendered.encode("utf-8")) + 4 * len(request.messages)
 
 
 @dataclass(frozen=True)
@@ -128,6 +112,7 @@ class RecordingCandidateClient:
         maximum_steps: int,
         maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
+        world_model_json_object_output: bool = False,
         redacted_field_names: frozenset[str],
         clock: Callable[[], datetime],
         token_counter: TokenCounter,
@@ -148,6 +133,7 @@ class RecordingCandidateClient:
                 next dispatch; by default the authorized episode warns once and continues.
             maximum_steps: Maximum candidate model turns allowed in this episode.
             maximum_output_tokens: Per-call output budget used without silent truncation.
+            world_model_json_object_output: Frozen provider JSON mode for simulation responses.
             redacted_field_names: Project fields redacted before events persist.
             clock: Time source used to order emitted spans deterministically in tests.
             token_counter: Full-request counter used before every provider call.
@@ -165,6 +151,7 @@ class RecordingCandidateClient:
         self._maximum_steps = maximum_steps
         self._maximum_rollout_output_tokens = maximum_rollout_output_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._world_model_json_object_output = world_model_json_object_output
         self._redacted_field_names = redacted_field_names
         self._clock = clock
         self._token_counter = token_counter
@@ -306,7 +293,8 @@ class RecordingCandidateClient:
             failure = StructuredFailure(
                 code=FailureCode.PROVIDER,
                 message=f"text simulation provider call failed with {type(exc).__name__}",
-                retryable=classification.retryable,
+                retryable=classification.retryable
+                or isinstance(exc, (ProviderRefusalError, ProviderRetryableResponseError)),
                 exception_type=type(exc).__name__,
                 attribution=FailureAttribution.MODEL,
                 details=details,
@@ -365,6 +353,9 @@ class RecordingCandidateClient:
                 self._remaining_output_tokens(),
                 self._candidate.capabilities.maximum_output_tokens or self._maximum_output_tokens,
             ),
+        )
+        candidate_request = bound_unpublished_output(
+            candidate_request, self._candidate.capabilities, self._token_counter
         )
         _preflight_context(
             self._candidate.alias,
@@ -442,24 +433,17 @@ class RecordingCandidateClient:
             )
             for action in candidate_rag_actions(candidate_response.output)
         )
-        if any(
-            len(
-                render_rag_key(
-                    task=query.task, initial_context=query.initial_context, action=query.action
-                ).encode("utf-8")
+        try:
+            query_economics = estimate_retrieval_economics(
+                queries, self._grounded_world_model.retriever, self._query_embedding
             )
-            > self._query_embedding.maximum_input_tokens
-            for query in queries
-        ):
+        except RAGQueryInputLimitError as exc:
             raise _text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
                 "grounding query exceeds its reserved input-token ceiling",
                 phase="query_embedding_budget",
-            )
-        query_economics = estimate_retrieval_economics(
-            queries, self._grounded_world_model.retriever, self._query_embedding
-        )
+            ) from exc
         self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)
         prepared = self._dispatch_provider(
@@ -480,6 +464,16 @@ class RecordingCandidateClient:
             reserved_cost_usd=0.0,
         )
         self._clear_unknown_dispatch()
+        prepared = replace(
+            prepared,
+            request=bound_unpublished_output(
+                prepared.request.model_copy(
+                    update={"json_object_output": self._world_model_json_object_output}
+                ),
+                self._world_model.capabilities,
+                self._token_counter,
+            ),
+        )
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,
@@ -887,14 +881,10 @@ def _preflight_context(
             f"model alias {alias!r} has no explicit output budget",
             phase="output_budget",
         )
-    if capabilities.maximum_output_tokens is None:
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.UNSUPPORTED,
-            f"model alias {alias!r} does not report an output limit for safe text simulation",
-            phase="model_capabilities",
-        )
-    if capabilities.maximum_output_tokens < budget:
+    if (
+        capabilities.maximum_output_tokens is not None
+        and capabilities.maximum_output_tokens < budget
+    ):
         raise _text_failure(
             StopReason.FAILURE,
             FailureCode.UNSUPPORTED,

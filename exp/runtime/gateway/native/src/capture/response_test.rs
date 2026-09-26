@@ -110,8 +110,10 @@ impl Sink for HeldSink {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
-    for fail in [false, true] {
+async fn stalled_writer_only_backpressures_when_response_memory_is_reserved() {
+    for (fail, maximum_pending_bytes) in
+        [(false, 32768), (true, 32768), (false, 65536), (true, 65536)]
+    {
         let (started, entered) = tokio::sync::oneshot::channel();
         let (resume, paused) = mpsc::channel();
         let (records, observed) = mpsc::channel();
@@ -124,8 +126,7 @@ async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
                         maximum_record_bytes: 8192,
                     },
                     maximum_pending_records: 8,
-                    // Eight request trees plus the two admitted response bodies.
-                    maximum_pending_bytes: 32768,
+                    maximum_pending_bytes,
                     maximum_request_bytes: 2048,
                     maximum_response_bytes: 16384,
                     ttl_seconds: 30,
@@ -143,20 +144,22 @@ async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
             )
             .unwrap(),
         );
-        // Two whole responses fit; a third waits before consuming any bytes.
-        let first = collector.body_permit().await.unwrap();
-        let second = collector.body_permit().await.unwrap();
+        // Active streams reserve whole bodies; completed streams retain actual bytes.
+        let mut permits = Vec::new();
+        for _ in 0..maximum_pending_bytes / 16384 {
+            permits.push(collector.body_permit().await.unwrap());
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(20), collector.body_permit())
                 .await
                 .is_err()
         );
-        drop(first);
+        drop(permits.pop());
         let third = tokio::time::timeout(Duration::from_secs(1), collector.body_permit())
             .await
             .unwrap()
             .unwrap();
-        drop((second, third));
+        drop((permits, third));
         let mut tasks = Vec::new();
         for index in 0..8 {
             let id = index.to_string();
@@ -197,6 +200,16 @@ async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
         )
         .await
         .unwrap();
+        // The larger budget fits every completed body plus an active stream.
+        // Keep the smaller arm to prove real byte-pressure remains bounded.
+        if maximum_pending_bytes == 65536 {
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                while tasks.iter().any(|task| !task.is_finished()) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+        }
         let completed = tasks.iter().filter(|task| task.is_finished()).count();
         let failures = collector.counts()[3..].to_vec();
         resume.send(()).unwrap();
@@ -207,9 +220,11 @@ async fn stalled_writer_backpressures_only_after_queue_capacity_is_consumed() {
                 .unwrap();
         }
         assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
-        // The first response leaves without waiting for storage, then the
-        // single-slot destination applies bounded backpressure to the rest.
-        assert_eq!(completed, 1);
+        if maximum_pending_bytes == 65536 {
+            assert_eq!(completed, 8);
+        } else {
+            assert!((2..8).contains(&completed));
+        }
         assert_eq!(failures, [0, 0, 0]);
         let rows: Vec<_> = observed.try_iter().collect();
         assert_eq!(rows.len(), 8);
