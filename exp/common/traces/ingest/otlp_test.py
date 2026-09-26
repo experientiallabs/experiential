@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -252,6 +253,54 @@ def test_normalizes_w3c_genai_trace_and_exp_outcome_extensions() -> None:
         == ConnectionConfig(provider="openai").identity_sha256()
     )
     assert trace.spans[1].parent_span_id == _CALL_SPAN_ID
+
+
+def test_otlp_decodes_negative_integer_attribute() -> None:
+    """A signed int64 decimal string remains a canonical integer attribute."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.append({"key": "test.offset", "value": {"intValue": "-1"}})
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].attributes["test.offset"] == -1
+
+
+def test_negative_string_usage_is_an_otlp_trace_issue() -> None:
+    """Signed usage strings remain subject to nonnegative token-count bounds."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.extend(
+        (
+            _attribute("gen_ai.usage.input_tokens", -1),
+            _attribute("gen_ai.usage.output_tokens", 2),
+        )
+    )
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "gen_ai.usage.input_tokens must be nonnegative" in result.issues[0].message
+
+
+def test_oversized_negative_integer_is_an_otlp_trace_issue() -> None:
+    """An integer beyond the local conversion ceiling cannot abort ingestion."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes.append({"key": "test.offset", "value": {"intValue": f"-{'9' * 641}"}})
+
+    previous_limit = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(640)
+        result = normalize_otlp_payload(payload, source=_source())
+    finally:
+        sys.set_int_max_str_digits(previous_limit)
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "OTLP intValue must be an integer" in result.issues[0].message
 
 
 def test_otlp_retains_a_declared_model_connection_digest() -> None:
