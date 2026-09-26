@@ -610,12 +610,24 @@ def write_production_rollout(
     )
     try:
         if store.paths.artifact_directory(artifact_id).exists():
-            existing = RolloutArtifact.model_validate_json(
-                store.artifacts.read_bytes(artifact_id, "rollout.json")
+            existing, pointer = read_artifact_json(
+                store,
+                artifact_id=artifact_id,
+                expected_artifact_type="rollout",
+                relative_path="rollout.json",
+                model_type=RolloutArtifact,
             )
             # A production trace is independent of the later judge or importing package.
-            # Retain its actual producer; exact replay below still checks every evidence field.
-            rollout = rollout.model_copy(update={"code_revision": existing.code_revision})
+            # Compare typed evidence so newly optional fields need no rewrite of older files.
+            expected = rollout.model_copy(
+                update={
+                    "code_revision": existing.code_revision,
+                    "created_at": existing.created_at,
+                }
+            )
+            if canonical_json_bytes(expected) != canonical_json_bytes(existing):
+                raise ValueError("production trace projection changed")
+            return pointer
         _stored, manifest = store.artifacts.write_or_replay(
             artifact_id=artifact_id,
             artifact_type="rollout",
