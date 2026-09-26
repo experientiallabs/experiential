@@ -554,6 +554,11 @@ def _write_gateway_diagnostics(
             "request_duration_ms",
             "permit_wait_ms",
             "bridge_call_ms",
+            "bridge_call_authenticate_ms",
+            "bridge_call_admit_ms",
+            "bridge_call_start_attempt_ms",
+            "bridge_call_settle_ms",
+            "bridge_call_other_ms",
         )
         metrics = {
             name: data_plane[name]

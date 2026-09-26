@@ -137,6 +137,11 @@ pub struct Metrics {
     pub request_duration_ms: Histogram,
     pub permit_wait_ms: Histogram,
     pub bridge_call_ms: Histogram,
+    pub bridge_call_authenticate_ms: Histogram,
+    pub bridge_call_admit_ms: Histogram,
+    pub bridge_call_start_attempt_ms: Histogram,
+    pub bridge_call_settle_ms: Histogram,
+    pub bridge_call_other_ms: Histogram,
 }
 
 /// The one registry shared by the serving runtime and the snapshot readers.
@@ -166,7 +171,25 @@ impl Metrics {
             request_duration_ms: Histogram::new(),
             permit_wait_ms: Histogram::new(),
             bridge_call_ms: Histogram::new(),
+            bridge_call_authenticate_ms: Histogram::new(),
+            bridge_call_admit_ms: Histogram::new(),
+            bridge_call_start_attempt_ms: Histogram::new(),
+            bridge_call_settle_ms: Histogram::new(),
+            bridge_call_other_ms: Histogram::new(),
         }
+    }
+
+    /// Record one bridge duration both globally and under a bounded operation name.
+    pub fn record_bridge_call(&self, method: &str, elapsed: Duration) {
+        self.bridge_call_ms.record(elapsed);
+        let method_histogram = match method {
+            "authenticate" => &self.bridge_call_authenticate_ms,
+            "admit" => &self.bridge_call_admit_ms,
+            "start_attempt" => &self.bridge_call_start_attempt_ms,
+            "settle" => &self.bridge_call_settle_ms,
+            _ => &self.bridge_call_other_ms,
+        };
+        method_histogram.record(elapsed);
     }
 
     /// Count one natively admitted (served) request.
@@ -268,6 +291,11 @@ impl Metrics {
             "request_duration_ms": self.request_duration_ms.snapshot(),
             "permit_wait_ms": self.permit_wait_ms.snapshot(),
             "bridge_call_ms": self.bridge_call_ms.snapshot(),
+            "bridge_call_authenticate_ms": self.bridge_call_authenticate_ms.snapshot(),
+            "bridge_call_admit_ms": self.bridge_call_admit_ms.snapshot(),
+            "bridge_call_start_attempt_ms": self.bridge_call_start_attempt_ms.snapshot(),
+            "bridge_call_settle_ms": self.bridge_call_settle_ms.snapshot(),
+            "bridge_call_other_ms": self.bridge_call_other_ms.snapshot(),
         })
     }
 }
@@ -392,7 +420,30 @@ mod tests {
                 "request_duration_ms",
                 "permit_wait_ms",
                 "bridge_call_ms",
+                "bridge_call_authenticate_ms",
+                "bridge_call_admit_ms",
+                "bridge_call_start_attempt_ms",
+                "bridge_call_settle_ms",
+                "bridge_call_other_ms",
             ]
         );
+    }
+
+    #[test]
+    fn bridge_call_histograms_use_a_bounded_method_set() {
+        let metrics = Metrics::new();
+        metrics.record_bridge_call("authenticate", Duration::from_millis(2));
+        metrics.record_bridge_call("admit", Duration::from_millis(3));
+        metrics.record_bridge_call("start_attempt", Duration::from_millis(4));
+        metrics.record_bridge_call("settle", Duration::from_millis(5));
+        metrics.record_bridge_call("unlisted_method", Duration::from_millis(6));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["bridge_call_ms"]["count"], 5);
+        assert_eq!(snapshot["bridge_call_authenticate_ms"]["count"], 1);
+        assert_eq!(snapshot["bridge_call_admit_ms"]["sum_ms"], 3.0);
+        assert_eq!(snapshot["bridge_call_start_attempt_ms"]["sum_ms"], 4.0);
+        assert_eq!(snapshot["bridge_call_settle_ms"]["sum_ms"], 5.0);
+        assert_eq!(snapshot["bridge_call_other_ms"]["count"], 1);
     }
 }
