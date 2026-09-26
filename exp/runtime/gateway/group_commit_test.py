@@ -313,6 +313,8 @@ def test_group_chain_preflights_run_concurrently_before_begin(tmp_path: Path) ->
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     (tmp_path / "snapshot-one").write_text("{}")
     authorizations = [_authorize(store, clock, raw_key, f"parallel-{index}") for index in range(2)]
+    for authorization in authorizations:
+        authorization._local_sqlite_chain_witness = None
     grouped = GroupCommitAttemptLedger(core, max_batch_size=3)
     entered, release = threading.Event(), threading.Event()
     barrier = threading.Barrier(2)
@@ -335,7 +337,7 @@ def test_group_chain_preflights_run_concurrently_before_begin(tmp_path: Path) ->
         observation: SQLiteChainAuthorityObservation | None = None,
     ) -> Iterator[SQLiteChainPreflight | None]:
         """Wait for a peer preparation to prove neither runs on the serial writer."""
-        assert connection is None
+        assert connection is None and observation is not None
         with original_prepare(authorization, operation, observation=observation) as proof:
             assert proof is not None
             proofs.append(proof)

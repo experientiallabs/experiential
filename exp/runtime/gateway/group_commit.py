@@ -116,7 +116,7 @@ class _PendingWrite:
     Attributes:
         observe: Optional writer-thread read for authorities without a request witness.
         observation_key: Shared authority identity used to deduplicate optional writer reads.
-        prepare: Optional parallel pretransaction context retaining proof handles through write.
+        prepare: Pretransaction context retaining proof handles through the write.
     """
 
     apply: Callable[[sqlite3.Connection], object]
@@ -140,7 +140,7 @@ def _prepared_chain_write(
     operation: ChainOperation,
     apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
 ) -> Iterator[Callable[[sqlite3.Connection], object]]:
-    """Own a parallel snapshot proof through the writer commit, including cancellation."""
+    """Own an operation-scoped snapshot proof through the writer commit."""
     with core.prepare_chain_authority(authorization, operation, observation=observation) as proof:
         yield lambda connection: apply(connection, proof)
 
@@ -151,7 +151,7 @@ def _enter_preparation(
     AbstractContextManager[Callable[[sqlite3.Connection], object]],
     Callable[[sqlite3.Connection], object],
 ]:
-    """Enter one independent snapshot preparation on a preflight worker."""
+    """Enter one operation-scoped snapshot preparation before its write transaction."""
     return preparation, preparation.__enter__()
 
 
@@ -439,16 +439,18 @@ class GroupCommitAttemptLedger:
                                 ready.append(pending)
                                 continue
                             try:
+                                if pending.observe is None:
+                                    preparation, apply = _enter_preparation(pending.prepare(None))
+                                    preparations.callback(_close_preparation, preparation)
+                                    ready.append(_PendingWrite(apply, pending.future))
+                                    continue
                                 observation = None
-                                if pending.observe is not None:
-                                    if pending.observation_key is None:
-                                        raise RuntimeError(
-                                            "chain observer has no authority identity"
-                                        )
-                                    observation = observations.get(pending.observation_key)
-                                    if observation is None:
-                                        observation = pending.observe(connection)
-                                        observations[pending.observation_key] = observation
+                                if pending.observation_key is None:
+                                    raise RuntimeError("chain observer has no authority identity")
+                                observation = observations.get(pending.observation_key)
+                                if observation is None:
+                                    observation = pending.observe(connection)
+                                    observations[pending.observation_key] = observation
                                 preparation = pending.prepare(observation)
                                 future = self._chain_preflights.submit(
                                     _enter_preparation, preparation
