@@ -23,17 +23,19 @@ impl UpstreamClient {
 
     /// Validate the canonical URL before attaching credentials or building a request.
     pub(crate) fn post(&self, raw: &str) -> Result<reqwest::RequestBuilder, Failure> {
-        if self.public_only
-            && raw
-                .bytes()
-                .any(|byte| byte <= 32 || byte == 127 || byte == b'\\')
+        // Preserve reqwest's builder errors and the existing transport detail
+        // for standalone callers, which may legitimately use local HTTP.
+        if !self.public_only {
+            return Ok(self.inner.post(raw));
+        }
+        if raw
+            .bytes()
+            .any(|byte| byte <= 32 || byte == 127 || byte == b'\\')
         {
             return Err(refused());
         }
         let url = reqwest::Url::parse(raw).map_err(|_| refused())?;
-        if self.public_only {
-            validate_url(&url)?;
-        }
+        validate_url(&url)?;
         Ok(self.inner.post(url))
     }
 }

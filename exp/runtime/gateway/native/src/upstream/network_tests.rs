@@ -99,6 +99,35 @@ fn canonical_url_gate_covers_literal_parser_bypasses() {
     }
     let local = crate::upstream::build_client(Duration::from_secs(1), false).unwrap();
     assert!(local.post("http://127.0.0.1:8080/v1").is_ok());
+    assert!(local
+        .post("not a URL")
+        .unwrap()
+        .build()
+        .unwrap_err()
+        .is_builder());
+}
+
+/// A real TLS connection exercises SystemResolver's port-zero answers all the
+/// way through reqwest. Opt in because ordinary unit tests need no Internet.
+#[tokio::test]
+#[ignore = "requires outbound public DNS and HTTPS; run explicitly for egress-policy changes"]
+async fn restricted_system_resolver_completes_public_https() {
+    let client = crate::upstream::build_client(Duration::from_secs(10), true).unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(20),
+        client
+            .post("https://example.com:443/")
+            .unwrap()
+            .body("")
+            .send(),
+    )
+    .await
+    .expect("bounded public HTTPS request")
+    .expect("public DNS, TCP and verified TLS");
+    // The site's method policy may return 405. Any HTTP response proves the
+    // public address was dialed at port 443 and the TLS hostname was verified.
+    assert_eq!(response.url().host_str(), Some("example.com"));
+    assert_eq!(response.url().port_or_known_default(), Some(443));
 }
 
 #[derive(Clone)]
