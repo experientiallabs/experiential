@@ -164,3 +164,26 @@ def test_cumulative_output_bound_keeps_unknown_retry_output_reserved(tmp_path: P
         * MAXIMUM_CELL_ATTEMPTS
     )
     assert quote.workers.maximum_cost_usd >= retry_output
+
+
+def test_transition_retry_bound_changes_world_maximum_not_expected_worker_cost(
+    tmp_path: Path,
+) -> None:
+    """Simulator protocol retries have an explicit maximum without becoming extra worker runs."""
+    project, _, _, prepared = _prepare(tmp_path)
+    setup = prepared.setup
+    single = setup.model_copy(
+        update={
+            "world_model_settings": setup.world_model_settings.model_copy(
+                update={"maximum_transition_attempts": 1}
+            )
+        }
+    )
+    one = estimate_model_evaluation(project, single, judge_request=prepared.judge_request)
+    three = estimate_model_evaluation(project, setup, judge_request=prepared.judge_request)
+    assert three.quote_sha256 != one.quote_sha256
+    assert three.simulation.maximum_cost_usd == pytest.approx(3 * one.simulation.maximum_cost_usd)
+    assert three.workers == one.workers
+    assert three.retrieval == one.retrieval
+    assert three.judge == one.judge
+    assert three.estimated_cost_usd == one.estimated_cost_usd

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-from exp.common.core.artifacts import SourceIdentity
+import pytest
+
+from exp.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
 from exp.common.judging.evidence import (
     DEFAULT_JUDGE_OUTPUT_TOKENS,
     visible_rollout_evidence,
@@ -232,3 +234,52 @@ def test_task_context_is_empty_without_recorded_requests() -> None:
         )
     )
     assert visible_rollout_evidence(rollout)["task_context"] == []
+
+
+def test_judge_sees_only_delivered_world_observations_not_retries_or_private_state() -> None:
+    """Simulator diagnostics and private state cannot become evidence of worker performance."""
+    rejected = _span(
+        "world-rejected",
+        RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL,
+        {
+            "response": {"output": {"content": "REJECTED simulator output"}},
+            "request": {"messages": [{"role": "user", "content": "PRIVATE world prompt"}]},
+        },
+    ).model_copy(
+        update={
+            "failure": StructuredFailure(
+                code=FailureCode.PROVIDER, message="invalid world transition", retryable=True
+            )
+        }
+    )
+    accepted = _span(
+        "world-accepted",
+        RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL,
+        {
+            "response": {"output": {"content": '{"state":{"private":"SECRET state"}}'}},
+            "visible_messages": [
+                {"role": "tool", "tool_call_id": "call-1", "content": "Visible result"}
+            ],
+        },
+    )
+    evidence = visible_rollout_evidence(_rollout((rejected, accepted)))
+    text = json.dumps(evidence)
+    assert "Visible result" in text
+    assert "call-1" in text
+    assert "REJECTED" not in text
+    assert "PRIVATE" not in text
+    assert "SECRET" not in text
+    assert evidence["task_context"] == []
+    spans = evidence["spans"]
+    assert isinstance(spans, list) and len(spans) == 1
+
+
+def test_world_evidence_without_delivered_observations_requires_a_new_evaluation() -> None:
+    """Old raw simulator state cannot silently become an empty or privileged judge transcript."""
+    span = _span(
+        "world-1",
+        RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL,
+        {"response": {"output": {"content": "raw simulator state"}}},
+    )
+    with pytest.raises(ValueError, match="run a new evaluation"):
+        visible_rollout_evidence(_rollout((span,)))
