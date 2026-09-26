@@ -8,6 +8,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import assert_never
 
@@ -57,6 +58,7 @@ from exp.runtime.gateway.sqlite.setup_authority import (
 )
 
 _LAST_USED_REFRESH_SECONDS = 60.0
+_AUTH_WRITE_LOCK_WAIT_MS = 1
 
 
 class GatewayStoreError(ValueError):
@@ -672,6 +674,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
             connect=self._connect,
             transaction=self._transaction,
             authenticate=self._authenticate_in_transaction,
+            authenticate_readonly=partial(
+                self._authenticate_in_transaction,
+                update_last_used=False,
+            ),
+            busy_timeout_ms=_AUTH_WRITE_LOCK_WAIT_MS,
             classification_memo=self.classification_memo,
             serving_snapshot_max_bytes=self._serving_snapshot_max_bytes,
             alias_not_granted_error=AliasNotGrantedError,
@@ -739,8 +746,31 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         Raises:
             InvalidVirtualKeyError: The key is unknown, expired, or revoked.
         """
-        with self._transaction() as connection:
-            self._authenticate_in_transaction(connection, raw_key)
+        with self._connect() as connection:
+            try:
+                with self._transaction(
+                    connection=connection,
+                    busy_timeout_ms=_AUTH_WRITE_LOCK_WAIT_MS,
+                ):
+                    self._authenticate_in_transaction(connection, raw_key)
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if code is None or code & 0xFF not in (
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                ):
+                    raise
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                # Authentication is a pre-body gate. Under writer contention,
+                # validate from a WAL read snapshot and leave the coarse
+                # last-used timestamp for the full authorization path.
+                with self._transaction(connection=connection, immediate=False):
+                    self._authenticate_in_transaction(
+                        connection,
+                        raw_key,
+                        update_last_used=False,
+                    )
 
     def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
         """Return the organization and identity IDs owning one valid key."""
@@ -802,7 +832,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         return self._pepper.rotate()
 
     def _authenticate_in_transaction(
-        self, connection: sqlite3.Connection, raw_key: str
+        self,
+        connection: sqlite3.Connection,
+        raw_key: str,
+        *,
+        update_last_used: bool = True,
     ) -> tuple[str, str, str]:
         """Authenticate one key inside the caller's authority transaction.
 
@@ -811,7 +845,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         so hot keys do not dirty a page and pay a durable write per request.
 
         Args:
-            connection: Immediate transaction retained through the authority read.
+            connection: Authority transaction retained through the credential read.
             raw_key: Caller key that must never enter SQLite or logs.
 
         Returns:
@@ -869,7 +903,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
             or (now - datetime.fromisoformat(str(last_used))).total_seconds()
             >= _LAST_USED_REFRESH_SECONDS
         )
-        if stale:
+        if stale and update_last_used:
             connection.execute(
                 """
                 UPDATE virtual_keys SET last_used_at = ?
@@ -889,18 +923,32 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
 
     @contextmanager
     def _transaction(
-        self, *, connection: sqlite3.Connection | None = None, immediate: bool = True
+        self,
+        *,
+        connection: sqlite3.Connection | None = None,
+        immediate: bool = True,
+        busy_timeout_ms: int | None = None,
     ) -> Iterator[sqlite3.Connection]:
         """Run an immediate or read transaction, optionally borrowing a connection."""
         with self._connect() if connection is None else nullcontext(connection) as connection:
-            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            original_busy_timeout_ms: int | None = None
+            if busy_timeout_ms is not None:
+                original_busy_timeout_ms = int(
+                    connection.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
             try:
-                yield connection
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
-            else:
-                connection.execute("COMMIT")
+                connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                try:
+                    yield connection
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+                else:
+                    connection.execute("COMMIT")
+            finally:
+                if original_busy_timeout_ms is not None:
+                    connection.execute(f"PRAGMA busy_timeout = {original_busy_timeout_ms}")
 
     @staticmethod
     def _operation_replay(

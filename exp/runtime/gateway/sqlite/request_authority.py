@@ -25,6 +25,8 @@ def authorize_sqlite_alias(
     connect: Callable[[], AbstractContextManager[sqlite3.Connection]],
     transaction: Callable[..., AbstractContextManager[sqlite3.Connection]],
     authenticate: Callable[[sqlite3.Connection, str], tuple[str, str, str]],
+    authenticate_readonly: Callable[[sqlite3.Connection, str], tuple[str, str, str]],
+    busy_timeout_ms: int,
     classification_memo: SnapshotClassificationMemo,
     serving_snapshot_max_bytes: int,
     alias_not_granted_error: type[Exception],
@@ -49,9 +51,12 @@ def authorize_sqlite_alias(
 
     def read_alias(
         connection: sqlite3.Connection,
+        *,
+        readonly: bool = False,
     ) -> tuple[str, str, str, sqlite3.Row | None]:
         """Authenticate and resolve the active row within one SQLite snapshot."""
-        organization_id, identity_id, key_id = authenticate(connection, raw_key)
+        authenticate_key = authenticate_readonly if readonly else authenticate
+        organization_id, identity_id, key_id = authenticate_key(connection, raw_key)
         row = connection.execute(
             """
             SELECT a.alias_id, a.alias_name, a.active_revision_id,
@@ -88,7 +93,11 @@ def authorize_sqlite_alias(
         try:
             # Fresh keys only read authority. Deferred mode avoids serializing
             # concurrent admissions on SQLite's writer lock.
-            with transaction(connection=reader, immediate=False) as connection:
+            with transaction(
+                connection=reader,
+                immediate=False,
+                busy_timeout_ms=busy_timeout_ms,
+            ) as connection:
                 organization_id, identity_id, key_id, row = read_alias(connection)
         except sqlite3.OperationalError as exc:
             code = getattr(exc, "sqlite_errorcode", None)
@@ -100,9 +109,14 @@ def authorize_sqlite_alias(
             if reader.in_transaction:
                 reader.execute("ROLLBACK")
             # A concurrent stale-key refresh can invalidate a deferred read's
-            # write upgrade. Retry that rare case with the normal write lock.
-            with transaction(connection=reader) as connection:
-                organization_id, identity_id, key_id, row = read_alias(connection)
+            # write upgrade. Re-read authority from a fresh snapshot without
+            # refreshing coarse last-used telemetry instead of waiting for a
+            # long writer timeout.
+            with transaction(connection=reader, immediate=False) as connection:
+                organization_id, identity_id, key_id, row = read_alias(
+                    connection,
+                    readonly=True,
+                )
         if row is None:
             raise alias_not_granted_error("requested model alias is not granted")
 
