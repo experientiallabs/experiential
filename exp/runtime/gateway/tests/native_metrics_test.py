@@ -206,6 +206,9 @@ def test_native_metrics_snapshot_moves_for_served_keyed_and_escalated_traffic(
         payload = snapshot.json()
         data_plane = payload["data_plane"]
         assert data_plane["served_requests"] == 3
+        # Only keyed Chat needs its own pre-authentication bridge crossing.
+        # Plain chat combines that check with admission.
+        assert data_plane["bridge_call_authenticate_ms"]["count"] == 1
         assert data_plane["requests"] == {
             "completed": 3,
             "incomplete": 0,

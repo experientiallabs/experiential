@@ -57,7 +57,10 @@ from exp.runtime.gateway.native_admission import (
     resolve_admission_route,
     select_single_route_before_search,
 )
-from exp.runtime.gateway.native_authentication import NativeAuthenticationMixin
+from exp.runtime.gateway.native_authentication import (
+    NativeAuthenticationMixin,
+    authenticate_raw_key,
+)
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
@@ -287,7 +290,9 @@ class NativeControlPlane(
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
                 body text), optional ``surface`` (``"chat"`` or
-                ``"responses"``, defaulting to chat), and optional
+                ``"responses"``, defaulting to chat), optional
+                ``authenticate_before_body_decode`` for unkeyed native Chat,
+                and optional
                 ``app_referer``/``app_title`` caller app identity.
 
         Returns:
@@ -300,8 +305,10 @@ class NativeControlPlane(
                 capability admission failed.
         """
         assert_not_internal_classification()
-        self._accounting.sweep_expired()
         data = json.loads(argument)
+        if data.get("authenticate_before_body_decode") is True:
+            authenticate_raw_key(self._components, data["raw_key"])
+        self._accounting.sweep_expired()
         surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
             data["body"],
