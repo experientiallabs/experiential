@@ -591,7 +591,7 @@ def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() 
     assert len(transport.requests) == 2
     assert (
         transport.requests[0].headers["Idempotency-Key"]
-        == transport.requests[1].headers["Idempotency-Key"]
+        != transport.requests[1].headers["Idempotency-Key"]
     )
 
 

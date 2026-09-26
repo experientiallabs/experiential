@@ -178,6 +178,8 @@ def openai_compatible_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
+    if request.json_object_output:
+        payload["response_format"] = {"type": "json_object"}
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}

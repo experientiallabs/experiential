@@ -89,6 +89,7 @@ def gemini_generate_request(
     Raises:
         ValueError: A visible request message cannot preserve its tool linkage on Gemini's wire.
     """
+    json_object_output = json_object_output or request.json_object_output
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}

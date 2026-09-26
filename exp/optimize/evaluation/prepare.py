@@ -389,6 +389,7 @@ def prepare_model_evaluation(
             prompt_version=WORLD_MODEL_TEXT_PROMPT_VERSION,
             query_embedding=retrieval,
             maximum_output_tokens=maximum_output_tokens,
+            json_object_output=True,
         ),
         simulation_completion_input=completion_input,
         agent_id=config.project_id,

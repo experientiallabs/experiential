@@ -236,6 +236,7 @@ def _recorder(
     maximum_steps: int = 2,
     maximum_rollout_output_tokens: int = 1_000_000,
     output_limit: int | None = 16_000,
+    world_model_json_object_output: bool = False,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -251,6 +252,7 @@ def _recorder(
         maximum_cost_usd: Reconciled provider-spend ceiling for the recorded cell.
         stop_on_overspend: Fail before the next paid dispatch once spend reaches the ceiling.
         output_limit: Published candidate and world output limit, or ``None``.
+        world_model_json_object_output: Explicit frozen world-only JSON output control.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -310,6 +312,7 @@ def _recorder(
         maximum_steps=maximum_steps,
         maximum_rollout_output_tokens=maximum_rollout_output_tokens,
         maximum_output_tokens=16_000,
+        world_model_json_object_output=world_model_json_object_output,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
         token_counter=_Utf8Counter(),
@@ -346,7 +349,10 @@ class _Utf8Counter:
         return len(request.model_dump_json().encode("utf-8"))
 
 
-def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> None:
+@pytest.mark.parametrize("json_output", [False, True])
+def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free(
+    json_output: bool,
+) -> None:
     """A visible candidate turn becomes one strict JSON world transition without hidden transfer."""
     candidate_snapshot = _snapshot("candidate-a")
     world_snapshot = _snapshot("world-model-a")
@@ -359,7 +365,7 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
             )
         ]
     )
-    recorder = _recorder(candidate_client, world_client)
+    recorder = _recorder(candidate_client, world_client, world_model_json_object_output=json_output)
 
     response = recorder.complete(
         ModelRequest(messages=(ModelMessage(role="user", content="My delivery is late."),))
@@ -368,6 +374,8 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
     assert response.output.content == "I can help."
     assert world_client.requests[0].tools == ()
     assert world_client.requests[0].tool_choice == "none"
+    assert world_client.requests[0].json_object_output is json_output
+    assert candidate_client.requests[0].json_object_output is False
     assert "candidate_hidden_reasoning" not in world_client.requests[0].model_dump_json()
     assert recorder.recorded.transitions[0].message == "What is your order number?"
     assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(

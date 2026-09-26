@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Sequence
 from enum import StrEnum
+from operator import not_
 from typing import Final, Literal
 
 from pydantic import (
@@ -674,6 +675,10 @@ class ModelRequest(ContractModel):
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
             explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.
+        json_object_output: Request one JSON object, without a JSON schema. Chat, Responses,
+            and Gemini use native JSON mode; other adapters add an explicit instruction.
+            Callers must still validate the response. Omitted when false to retain ordinary
+            saved request identities.
     """
 
     messages: tuple[ModelMessage, ...] = Field(min_length=1)
@@ -686,6 +691,7 @@ class ModelRequest(ContractModel):
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    json_object_output: bool = Field(default=False, exclude_if=not_)
 
     @model_validator(mode="after")
     def _require_coherent_tools_and_messages(self) -> ModelRequest:

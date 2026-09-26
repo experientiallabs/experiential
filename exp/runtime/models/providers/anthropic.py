@@ -15,6 +15,7 @@ from exp.common.models import (
     ToolChoice,
     Usage,
 )
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_MAXIMUM_OUTPUT_TOKENS,
@@ -71,6 +72,8 @@ def anthropic_messages_request(
             continue
         role, blocks = _anthropic_blocks(message)
         _append_anthropic_message(messages, role, blocks)
+    if request.json_object_output:
+        system_parts.append(JSON_OBJECT_SYSTEM_INSTRUCTION)
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,

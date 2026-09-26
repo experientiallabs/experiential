@@ -752,6 +752,7 @@ class WorldModelSimulator:
             maximum_steps=spec.maximum_steps,
             maximum_rollout_output_tokens=spec.maximum_rollout_output_tokens,
             maximum_output_tokens=settings.maximum_output_tokens,
+            world_model_json_object_output=settings.json_object_output,
             redacted_field_names=self._redacted_field_names,
             clock=self._clock,
             token_counter=self._token_counter,

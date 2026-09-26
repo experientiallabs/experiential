@@ -112,6 +112,7 @@ class RecordingCandidateClient:
         maximum_steps: int,
         maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
+        world_model_json_object_output: bool = False,
         redacted_field_names: frozenset[str],
         clock: Callable[[], datetime],
         token_counter: TokenCounter,
@@ -132,6 +133,7 @@ class RecordingCandidateClient:
                 next dispatch; by default the authorized episode warns once and continues.
             maximum_steps: Maximum candidate model turns allowed in this episode.
             maximum_output_tokens: Per-call output budget used without silent truncation.
+            world_model_json_object_output: Frozen provider JSON mode for simulation responses.
             redacted_field_names: Project fields redacted before events persist.
             clock: Time source used to order emitted spans deterministically in tests.
             token_counter: Full-request counter used before every provider call.
@@ -149,6 +151,7 @@ class RecordingCandidateClient:
         self._maximum_steps = maximum_steps
         self._maximum_rollout_output_tokens = maximum_rollout_output_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._world_model_json_object_output = world_model_json_object_output
         self._redacted_field_names = redacted_field_names
         self._clock = clock
         self._token_counter = token_counter
@@ -464,7 +467,11 @@ class RecordingCandidateClient:
         prepared = replace(
             prepared,
             request=bound_unpublished_output(
-                prepared.request, self._world_model.capabilities, self._token_counter
+                prepared.request.model_copy(
+                    update={"json_object_output": self._world_model_json_object_output}
+                ),
+                self._world_model.capabilities,
+                self._token_counter,
             ),
         )
         _preflight_context(

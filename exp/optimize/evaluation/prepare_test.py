@@ -71,6 +71,7 @@ def test_prepare_freezes_replayable_catalog_selection_without_provider_access(
         judge_caps.context_window_tokens - prepared.judge_request.maximum_output_tokens
     )
     assert prepared.setup.world_model_settings.maximum_output_tokens == 32_000
+    assert prepared.setup.world_model_settings.json_object_output is True
     assert prepared.cost.worker_count == 2
     assert prepared.cost.scenario_count == 3
     assert prepared.cost.maximum_cost_usd > 0

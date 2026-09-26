@@ -3,6 +3,7 @@
 from typing import Protocol, runtime_checkable
 
 from exp.common.models import ModelCapabilities, ModelRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 
 
 @runtime_checkable
@@ -34,7 +35,12 @@ class Utf8UpperBoundTokenCounter:
             A conservative nonnegative bound that never silently shortens request content.
         """
         rendered = request.model_dump_json(exclude_none=False)
-        return len(rendered.encode("utf-8")) + 4 * len(request.messages)
+        instruction = (
+            len(JSON_OBJECT_SYSTEM_INSTRUCTION.encode("utf-8")) + 4
+            if request.json_object_output
+            else 0
+        )
+        return len(rendered.encode("utf-8")) + 4 * len(request.messages) + instruction
 
 
 def bound_unpublished_output(

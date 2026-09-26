@@ -141,6 +141,8 @@ def openai_responses_request(
         }
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
+    if request.json_object_output:
+        payload["text"] = {"format": {"type": "json_object"}}
     return payload
 
 
