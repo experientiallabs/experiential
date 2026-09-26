@@ -238,7 +238,11 @@ with an independently verified association for that provider account. Missing ma
 creation before reserving funds. A conflicting mapping fails closed. Neither the caller nor a
 provider response can establish the mapping; numeric endpoints cannot be remapped to another
 project. The create URL, model, region and credentials remain exactly those admitted, and only the
-verified numeric namespace is accepted for creation results and reuse.
+verified numeric namespace is accepted for creation results and reuse. Native Vertex profiles
+retain the receipt of the atomically resolved service-account credential so a host can bind the
+resource to that account generation. Refreshing an OAuth bearer does not replace the source receipt;
+resolving a rotated service account does. This receipt does not enable static-auth cache-affinity
+recovery for Vertex, including when the host declares an operational region.
 
 Cache creation happens only after route selection and generation reservation. Rust makes at most
 one cache-create HTTP request, using the selected endpoint's credentials, no redirects or retries,

@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 
+from exp.common.models import ModelSnapshot
 from exp.common.models.catalog import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import normalize_gateway_catalog
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayUsage
@@ -40,6 +41,7 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.messages_payloads import anthropic_messages_stream_payload
 from exp.runtime.models.providers.protocol import NativeWireClient
+from exp.runtime.models.providers.vertex import VertexClient
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.registry_test import _catalog
 
@@ -163,6 +165,58 @@ def test_actual_runtime_client_auth_and_receipt_rotate_together() -> None:
         "authorization"
     ] == "Bearer K2"
     assert k1.credential_receipt is first
+
+
+@pytest.mark.parametrize("region", [None, "global", "us-central1"])
+def test_vertex_source_receipt_never_enables_static_auth_recovery(region: str | None) -> None:
+    """Even a host-declared region cannot turn an OAuth source into bearer evidence."""
+    deployment = _route().deployment.model_copy(update={"provider": "vertex"})
+    receipt = DispatchCredentialReceipt(uuid4())
+    profile = GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://aiplatform.googleapis.com/v1/projects/fruit-project/locations/global/publishers/google/models/gemini-test:streamGenerateContent",
+        model_id="gemini-test",
+        credential_receipt=receipt,
+        operational_region=region,
+    )
+    client = VertexClient(
+        model=ModelSnapshot(
+            billing_source=deployment.billing_source,
+            provider="vertex",
+            model_id="gemini-test",
+            revision="fixture",
+            capabilities_sha256="a" * 64,
+            connection_sha256=deployment.connection_sha256,
+        ),
+        api_key="synthetic-source",
+        base_url="https://aiplatform.googleapis.com/v1/projects/fruit-project/locations/global",
+        token_provider=lambda: "synthetic-bearer",
+    )
+    host = Host()
+    bound = bind_recovery_profiles((deployment,), ((profile, client),), "org", host)
+    assert bound[0][0].credential_receipt is receipt
+    assert bound[0][0].recovery_binding is None
+    assert host.observed == []
+    attempted = FrozenRecoveryBinding(
+        deployment.deployment_id,
+        deployment.connection_sha256,
+        profile.url,
+        profile.model_id,
+        RecoveryScope(
+            provider="vertex",
+            exact_model_id=deployment.exact_model_id,
+            endpoint_scope="endpoint",
+            region_scope="global",
+            credential_scope=str(receipt.binding_id),
+            organization_id="org",
+        ),
+        region,
+        profile.dialect,
+    )
+    assert (
+        validated_recovery_binding(deployment, replace(profile, recovery_binding=attempted), "org")
+        is None
+    )
 
 
 def test_receipt_is_frozen_before_choice_and_never_serialized() -> None:

@@ -384,6 +384,7 @@ class RuntimeModelCatalog:
                 vertex_client,
                 None,
                 served_model_id=record.served_model_id,
+                credential_receipt=credential.receipt,
             )
         if provider == "openai":
             openai_client = OpenAIClient(
