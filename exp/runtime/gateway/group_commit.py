@@ -42,6 +42,7 @@ from exp.runtime.gateway.model_chain_authority import (
     ChainOperation,
     SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
+    observe_sqlite_chain_authority,
 )
 from exp.runtime.gateway.native_settlement import (
     tool_search_requests_kwarg,
@@ -112,13 +113,15 @@ class _PendingWrite:
     """One queued ledger operation and the future resolved after durable commit.
 
     Attributes:
-        observe: Optional writer-thread read that binds the operation to exact alias rows.
+        observe: Writer-thread read that binds the operation to exact alias rows.
+        observation_key: Authority identity shared by requests on the same alias revision.
         prepare: Optional parallel pretransaction context retaining proof handles through write.
     """
 
     apply: Callable[[sqlite3.Connection], object]
     future: concurrent.futures.Future[object]
     observe: Callable[[sqlite3.Connection], SQLiteChainAuthorityObservation] | None = None
+    observation_key: tuple[str, str] | None = None
     prepare: (
         Callable[
             [SQLiteChainAuthorityObservation],
@@ -416,6 +419,7 @@ class GroupCommitAttemptLedger:
                 try:
                     with ExitStack() as preparations:
                         ready: list[_PendingWrite] = []
+                        observations: dict[tuple[str, str], SQLiteChainAuthorityObservation] = {}
                         preparing: list[
                             tuple[
                                 _PendingWrite,
@@ -434,9 +438,12 @@ class GroupCommitAttemptLedger:
                                 ready.append(pending)
                                 continue
                             try:
-                                if pending.observe is None:
+                                if pending.observe is None or pending.observation_key is None:
                                     raise RuntimeError("chain preflight has no database observer")
-                                observation = pending.observe(connection)
+                                observation = observations.get(pending.observation_key)
+                                if observation is None:
+                                    observation = pending.observe(connection)
+                                    observations[pending.observation_key] = observation
                                 preparation = pending.prepare(observation)
                                 future = self._chain_preflights.submit(
                                     _enter_preparation, preparation
@@ -587,7 +594,12 @@ class GroupCommitAttemptLedger:
         """Queue classification before BEGIN without giving callers ownership of live handles."""
         return self._enqueue(
             lambda connection: apply(connection, None),
-            observe=lambda connection: self.core.observe_chain_authority(connection, authorization),
+            observe=lambda connection: observe_sqlite_chain_authority(
+                connection,
+                authorization.organization_id,
+                authorization.alias_revision_id,
+            ),
+            observation_key=(authorization.organization_id, authorization.alias_revision_id),
             prepare=lambda observation: _prepared_chain_write(
                 self.core, observation, authorization, operation, apply
             ),
@@ -598,6 +610,7 @@ class GroupCommitAttemptLedger:
         apply: Callable[[sqlite3.Connection], _T],
         *,
         observe: Callable[[sqlite3.Connection], SQLiteChainAuthorityObservation] | None = None,
+        observation_key: tuple[str, str] | None = None,
         prepare: Callable[
             [SQLiteChainAuthorityObservation],
             AbstractContextManager[Callable[[sqlite3.Connection], object]],
@@ -624,6 +637,7 @@ class GroupCommitAttemptLedger:
                     apply=apply,
                     future=cast("concurrent.futures.Future[object]", future),
                     observe=observe,
+                    observation_key=observation_key,
                     prepare=prepare,
                 )
             )

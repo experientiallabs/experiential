@@ -5,7 +5,6 @@ from __future__ import annotations
 import hmac
 import sqlite3
 import time
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
@@ -36,7 +35,6 @@ from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.model_chain_authority import (
     LocalSnapshotMemoOwner,
     SnapshotClassificationMemo,
-    prepare_sqlite_chain_authority,
     refuse_sqlite_chain_snapshot,
     serving_snapshot_limit,
 )
@@ -53,6 +51,7 @@ from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionMutation,
 )
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
+from exp.runtime.gateway.sqlite.request_authority import authorize_sqlite_alias
 from exp.runtime.gateway.sqlite.setup_authority import (
     configure_direct_alias_with_identity,
 )
@@ -665,71 +664,18 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         if deadline_monotonic <= self._clock.monotonic():
             raise GatewayStoreError("request deadline has already expired")
 
-        def authorized_alias(
-            connection: sqlite3.Connection,
-        ) -> tuple[str, str, str, sqlite3.Row | None]:
-            organization_id, identity_id, key_id = self._authenticate_in_transaction(
-                connection, raw_key
-            )
-            row = connection.execute(
-                """
-                SELECT a.alias_id, a.alias_name, a.active_revision_id,
-                       r.target_kind, r.pool_id, r.project_ref, r.activation_ref,
-                       r.catalog_sha256, r.refusal_failover
-                FROM identity_alias_grants AS g
-                JOIN identities AS i
-                  ON i.organization_id = g.organization_id AND i.identity_id = g.identity_id
-                JOIN gateway_aliases AS a
-                  ON a.organization_id = g.organization_id AND a.alias_id = g.alias_id
-                JOIN alias_revisions AS r
-                  ON r.organization_id = a.organization_id
-                 AND r.alias_id = a.alias_id
-                 AND r.revision_id = a.active_revision_id
-                WHERE g.organization_id = ? AND g.identity_id = ?
-                  AND a.alias_name = ? AND i.active = 1 AND a.active = 1
-                """,
-                (organization_id, identity_id, alias),
-            ).fetchone()
-            return organization_id, identity_id, key_id, row
-
-        try:
-            # Fresh keys only read authority. Deferred mode keeps concurrent
-            # admissions from serializing on SQLite's writer lock; stale-key
-            # telemetry upgrades this transaction only when it needs a write.
-            with self._transaction(immediate=False) as connection:
-                organization_id, identity_id, key_id, row = authorized_alias(connection)
-        except sqlite3.OperationalError as exc:
-            code = getattr(exc, "sqlite_errorcode", None)
-            if code is None or code & 0xFF not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-                raise
-            # A concurrent stale-key refresh can invalidate a deferred read's
-            # write upgrade. Retry that rare case with the normal write lock.
-            with self._transaction() as connection:
-                organization_id, identity_id, key_id, row = authorized_alias(connection)
-        if row is None:
-            raise AliasNotGrantedError("requested model alias is not granted")
-        request_id = f"request-{uuid.uuid4().hex}"
-        with (
-            self._connect() as reader,
-            prepare_sqlite_chain_authority(
-                reader,
-                organization_id,
-                str(row["active_revision_id"]),
-                request_id=request_id,
-                operation="authorize",
-                maximum_bytes=self._serving_snapshot_max_bytes,
-                remaining_seconds=deadline_monotonic - self._clock.monotonic(),
-                classification_memo=self.classification_memo,
-            ) as proof,
-            self._transaction(connection=reader, immediate=False) as connection,
-        ):
-            proof.validate(
-                connection,
-                request_id=request_id,
-                organization_id=organization_id,
-                alias_revision_id=str(row["active_revision_id"]),
-                operation="authorize",
-            )
+        organization_id, identity_id, key_id, row, request_id = authorize_sqlite_alias(
+            raw_key=raw_key,
+            alias=alias,
+            deadline_monotonic=deadline_monotonic,
+            clock=self._clock,
+            connect=self._connect,
+            transaction=self._transaction,
+            authenticate=self._authenticate_in_transaction,
+            classification_memo=self.classification_memo,
+            serving_snapshot_max_bytes=self._serving_snapshot_max_bytes,
+            alias_not_granted_error=AliasNotGrantedError,
+        )
         target: GatewayTarget
         if str(row["target_kind"]) == "direct":
             target = DirectTarget(pool_id=str(row["pool_id"]))

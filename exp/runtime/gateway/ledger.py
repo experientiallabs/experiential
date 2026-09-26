@@ -27,6 +27,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.ledger_chain_authority import prepare_ledger_chain_authority
 from exp.runtime.gateway.ledger_errors import (
     AttemptRejectedError as AttemptRejectedError,
 )
@@ -60,8 +61,6 @@ from exp.runtime.gateway.model_chain_authority import (
     SnapshotClassificationMemo,
     SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
-    observe_sqlite_chain_authority,
-    prepare_sqlite_chain_authority,
     serving_snapshot_limit,
 )
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
@@ -106,46 +105,17 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         observation: SQLiteChainAuthorityObservation | None = None,
     ) -> Iterator[SQLiteChainPreflight | None]:
         """Classify before BEGIN from a writer read or its captured row observation."""
-        if observation is not None:
-            with prepare_sqlite_chain_authority(
-                None,
-                authorization.organization_id,
-                authorization.alias_revision_id,
-                request_id=authorization.request_id,
-                operation=operation,
-                maximum_bytes=self.serving_snapshot_max_bytes,
-                remaining_seconds=authorization.deadline_monotonic - self._clock.monotonic(),
-                classification_memo=self.classification_memo,
-                observation=observation,
-            ) as proof:
-                yield proof
-            return
-        with (
-            self._connect() if connection is None else nullcontext(connection) as connection,
-            prepare_sqlite_chain_authority(
-                connection,
-                authorization.organization_id,
-                authorization.alias_revision_id,
-                request_id=authorization.request_id,
-                operation=operation,
-                maximum_bytes=self.serving_snapshot_max_bytes,
-                remaining_seconds=authorization.deadline_monotonic - self._clock.monotonic(),
-                classification_memo=self.classification_memo,
-            ) as proof,
-        ):
+        with prepare_ledger_chain_authority(
+            authorization,
+            operation,
+            connect=self._connect,
+            clock=self._clock,
+            serving_snapshot_max_bytes=self.serving_snapshot_max_bytes,
+            classification_memo=self.classification_memo,
+            connection=connection,
+            observation=observation,
+        ) as proof:
             yield proof
-
-    @staticmethod
-    def observe_chain_authority(
-        connection: sqlite3.Connection,
-        authorization: AuthorizationSnapshot,
-    ) -> SQLiteChainAuthorityObservation:
-        """Capture the writer's current alias rows before snapshot I/O moves to workers."""
-        return observe_sqlite_chain_authority(
-            connection,
-            authorization.organization_id,
-            authorization.alias_revision_id,
-        )
 
     def _require_chain_authority(
         self,
