@@ -609,6 +609,13 @@ def write_production_rollout(
         candidate_economics=OperationEconomics(usage=_combined_usage(trace)),
     )
     try:
+        if store.paths.artifact_directory(artifact_id).exists():
+            existing = RolloutArtifact.model_validate_json(
+                store.artifacts.read_bytes(artifact_id, "rollout.json")
+            )
+            # A production trace is independent of the later judge or importing package.
+            # Retain its actual producer; exact replay below still checks every evidence field.
+            rollout = rollout.model_copy(update={"code_revision": existing.code_revision})
         _stored, manifest = store.artifacts.write_or_replay(
             artifact_id=artifact_id,
             artifact_type="rollout",
