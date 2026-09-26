@@ -201,12 +201,24 @@ def test_native_metrics_snapshot_moves_for_served_keyed_and_escalated_traffic(
         assert escalated.status_code == 500
         assert escalated.json()["error"]["code"] == "internal_error"
 
+        # Authentication still runs before invalid UTF-8 is rejected, but no
+        # admission callback occurs for the malformed body.
+        invalid_body = httpx.post(
+            f"{base}/v1/chat/completions",
+            headers=headers,
+            content=b"\xff",
+            timeout=10,
+        )
+        assert invalid_body.status_code == 400
+        assert invalid_body.json()["error"]["code"] == "invalid_json"
+
         snapshot = httpx.get(f"{base}/metrics.json", timeout=10)
         assert snapshot.status_code == 200
         payload = snapshot.json()
         data_plane = payload["data_plane"]
         assert data_plane["served_requests"] == 3
-        assert data_plane["bridge_call_authenticate_ms"]["count"] == 4
+        assert data_plane["bridge_call_authenticate_ms"]["count"] == 5
+        assert data_plane["bridge_call_admit_ms"]["count"] == 4
         assert data_plane["requests"] == {
             "completed": 3,
             "incomplete": 0,

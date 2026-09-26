@@ -303,13 +303,15 @@ fn authenticate_then_admit_chat_call(
         }))
         .map_err(|_| PublicError::internal())
     });
-    let admission = match admission_argument {
+    match admission_argument {
         Ok(_) if responder.is_closed() => Err(PublicError::internal()),
-        Ok(argument) => control_plane_call(py, object, "admit", argument),
+        Ok(argument) => {
+            let admission = control_plane_call(py, object, "admit", argument);
+            crate::metrics::METRICS.record_bridge_call("admit", admission_started.elapsed());
+            admission
+        }
         Err(error) => Err(error),
-    };
-    crate::metrics::METRICS.record_bridge_call("admit", admission_started.elapsed());
-    admission
+    }
 }
 
 /// Map one Python exception to a public error.
