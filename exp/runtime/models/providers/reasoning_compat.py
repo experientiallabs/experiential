@@ -277,7 +277,11 @@ def _gemini_supported_efforts(model_id: str) -> Collection[str]:
         .removeprefix("publishers/google/models/")
         .removeprefix("models/")
     )
-    if "gemini-3-7-flash" in normalized or "gemini-3-1-pro" in normalized:
+    if (
+        normalized == "gemini-3-8-flash"
+        or "gemini-3-7-flash" in normalized
+        or "gemini-3-1-pro" in normalized
+    ):
         supported: Collection[str] = ("low", "medium", "high")
     elif "gemini-3-pro" in normalized:
         supported = ("low", "high")

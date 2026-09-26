@@ -2368,6 +2368,101 @@ def test_admit_serves_gemini_stop_and_schema_on_the_native_wire(tmp_path: Path) 
     assert settled == "{}"
 
 
+@pytest.mark.parametrize("effort", ("low", "medium", "high", "minimal"))
+def test_gemini_38_native_rung_precedes_openrouter_for_supported_efforts(
+    tmp_path: Path, effort: str
+) -> None:
+    """Native admission preserves low/medium instead of leaking onto the relay."""
+    from datetime import UTC, datetime
+
+    from exp.common.models import GatewayEquivalenceCertification
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_certified_pool,
+        upsert_connection,
+    )
+
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    for provider, model_id in (
+        ("gemini", "gemini-3.8-flash"),
+        ("openrouter", "google/gemini-3.8-flash"),
+    ):
+        upsert_connection(
+            tmp_path,
+            name=provider,
+            connection=ConnectionConfig(provider=provider, api_key_env="TEST_PROVIDER_KEY"),
+            replace=False,
+        )
+        catalog, _snapshot, _changed = upsert_singleton_deployment(
+            tmp_path,
+            deployment_alias=provider,
+            connection_name=provider,
+            provider_model=model_id,
+            exact_model_id="gemini-3.8-flash",
+            revision=None,
+            capabilities=ModelCapabilities(supports_reasoning=True, maximum_output_tokens=8192),
+            gateway_capabilities=GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                # Mirrors the relay's published ladder. Native discovery must
+                # derive the SAME ladder from the exact engine model contract.
+                supported_reasoning_efforts=("low", "medium", "high")
+                if provider == "openrouter"
+                else (),
+            ),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    catalog, snapshot, _changed = upsert_certified_pool(
+        tmp_path,
+        pool_id="gemini-3.8-flash",
+        exact_model_id="gemini-3.8-flash",
+        deployment_aliases=("gemini", "openrouter"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="gemini-38-test",
+            provenance="same Google model on native and relay wires",
+            evidence_sha256="a" * 64,
+            certified_at=datetime(2026, 9, 23, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=catalog.identity_sha256(),
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gemini-3.8-flash",
+        alias_name="gemini-3.8-flash",
+        revision_id="gemini-38-test",
+        pool_id="gemini-3.8-flash",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=catalog.identity_sha256(),
+    )
+    manager.create_identity(identity_id="default", display_name="Default")
+    manager.add_grant(identity_id="default", alias_id="gemini-3.8-flash")
+    raw_key = manager.issue_key(identity_id="default", key_id="test").raw_key
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+    )
+    body = json.dumps(
+        {
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "reasoning_effort": effort,
+        }
+    )
+    if effort == "minimal":
+        with pytest.raises(NativeBridgeError):
+            _admit_started(control, raw_key, body)
+        return
+    admission = _admit_started(control, raw_key, body)
+    assert admission["dialect"] == "gemini_generate_content"
+    assert admission["ignored_parameters"] == []
+    payload = admission["upstream_payload"]
+    assert isinstance(payload, dict)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    assert generation["thinkingConfig"] == {"thinkingLevel": effort.upper()}
+
+
 def _configured_pool_gateway(
     root: Path,
     *,
