@@ -227,6 +227,11 @@ class NativeControlPlane(
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
         self._control_plane_timing = ControlPlaneTimingDiagnostics()
+        set_authority_timing = getattr(
+            components.store, "set_request_authority_timing_recorder", None
+        )
+        if callable(set_authority_timing):
+            set_authority_timing(self._control_plane_timing.record)
         self._capture = capture
         # The optional batch lane: hosts without it leave every batch route
         # answering the uniform not-enabled error below.
