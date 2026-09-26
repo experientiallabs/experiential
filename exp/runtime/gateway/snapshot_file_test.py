@@ -179,6 +179,37 @@ def test_prepared_absent_parent_cannot_be_created_before_fence(tmp_path: Path) -
             prepared.validate_current()
 
 
+@pytest.mark.parametrize(("defer", "prepare_checks"), [(False, 1), (True, 0)])
+def test_prepared_path_fence_can_be_deferred_to_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defer: bool,
+    prepare_checks: int,
+) -> None:
+    """Deferred opens still require an explicit secure path check before use."""
+    (tmp_path / "snapshot").write_bytes(b"{}")
+    calls = 0
+    original = snapshot_file.PreparedSnapshotFile.validate_current
+
+    def count_checks(prepared: snapshot_file.PreparedSnapshotFile) -> None:
+        """Count fences while preserving their real path and inode validation."""
+        nonlocal calls
+        calls += 1
+        original(prepared)
+
+    monkeypatch.setattr(snapshot_file.PreparedSnapshotFile, "validate_current", count_checks)
+    with snapshot_file.prepare_snapshot_file(
+        tmp_path,
+        "snapshot",
+        1024,
+        read_content=False,
+        defer_path_validation=defer,
+    ) as prepared:
+        assert calls == prepare_checks
+        prepared.validate_current()
+        assert calls == prepare_checks + 1
+
+
 def test_catalog_fixture_size_is_measured_not_a_universal_limit(tmp_path: Path) -> None:
     """The representative graph fits the default without claiming arbitrary catalog bounds."""
     clock = _Clock()

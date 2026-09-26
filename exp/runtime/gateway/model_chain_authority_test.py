@@ -963,6 +963,41 @@ def test_chain_preflight_fences_exact_database_and_file_changes(
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
 
 
+def test_hot_plain_preflight_fences_snapshot_paths_once_at_write_boundary(
+    tmp_path: Path,
+) -> None:
+    """Warm classification avoids the pre-write path walk but keeps the transaction fence."""
+    manager, raw_key = _configured_pool_gateway(tmp_path)
+    store = manager.store()
+    auth = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=decode_chat(json.loads(_chat_body())).request,
+        deadline_monotonic=time.monotonic() + 60,
+    )
+    ledger = SQLiteAttemptLedger(
+        manager.database_path,
+        classification_memo=manager.classification_memo,
+    )
+    calls = 0
+    original = authority.PreparedSnapshotFile.validate_current
+
+    def count_checks(prepared: authority.PreparedSnapshotFile) -> None:
+        """Keep the production fence and count its operation-scoped invocations."""
+        nonlocal calls
+        calls += 1
+        original(prepared)
+
+    try:
+        with patch.object(authority.PreparedSnapshotFile, "validate_current", count_checks):
+            ledger.accept_request(authorization=auth)
+        # One normalized snapshot plus its model-chain sidecar, each fenced once
+        # inside the durable acceptance transaction.
+        assert calls == 2
+    finally:
+        manager.close()
+
+
 def test_chain_preflight_rejects_missing_closed_wrong_request_and_wrong_operation(
     tmp_path: Path,
 ) -> None:

@@ -609,6 +609,7 @@ def prepare_sqlite_chain_authority(
                             str(source),
                             maximum_bytes,
                             read_content=False,
+                            defer_path_validation=True,
                         )
                     )
                     for source in (path, path.with_suffix(".models.json"))
