@@ -341,3 +341,29 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
     assert gateway_metrics["bridge_call_settle_ms"]["count"] > 0
     assert gateway_metrics["request_duration_ms"]["count"] > 0
     assert gateway_metrics["bridge_permit_wait_ms"]["count"] > 0
+
+
+def test_diagnostics_write_failure_keeps_latency_report(tmp_path: Path) -> None:
+    """An unwritable optional sidecar warns without discarding measured results."""
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("file", encoding="utf-8")
+    config = LatencyRunConfig(
+        warmup_requests=0,
+        measured_requests=1,
+        concurrency=1,
+        repeats=1,
+        stream_warmup_requests=0,
+        stream_measured_requests=1,
+        stream_concurrency=1,
+        timeout_s=10.0,
+        measure_streaming_ttft=False,
+    )
+
+    with pytest.warns(RuntimeWarning, match="optional gateway latency diagnostics"):
+        report = run_latency_report(
+            work_root=tmp_path / "gateway-root",
+            config=config,
+            output_diagnostics_json=blocker / "gateway-latency-diagnostics.json",
+        )
+
+    assert report.representative_run.gateway.failures == 0
