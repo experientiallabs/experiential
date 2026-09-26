@@ -54,6 +54,9 @@ class FingerprintPepperFile:
         """
         self._path = path
         self._lock = threading.RLock()
+        self._cached_signature: tuple[int, int, int, int, int, int] | None = None
+        self._cached_current_version: int | None = None
+        self._cached_keys: dict[int, bytes] | None = None
 
     @property
     def path(self) -> Path:
@@ -69,7 +72,7 @@ class FingerprintPepperFile:
         with self._lock:
             if not self._path.exists():
                 self._create_initial()
-            current_version, keys = self._read()
+            current_version, keys = self._load_cached()
             return PepperKey(version=current_version, value=keys[current_version])
 
     def key(self, version: int) -> PepperKey:
@@ -85,7 +88,7 @@ class FingerprintPepperFile:
             GatewayAuthError: The version is not retained.
         """
         with self._lock:
-            _, keys = self._read()
+            _, keys = self._load_cached()
             try:
                 value = keys[version]
             except KeyError as exc:
@@ -99,11 +102,64 @@ class FingerprintPepperFile:
             The new current version.
         """
         with self._lock:
-            current_version, keys = self._read()
+            current_version, keys = self._load_cached()
             next_version = current_version + 1
-            keys[next_version] = secrets.token_bytes(32)
-            self._replace(next_version, keys)
+            rotated_keys = dict(keys)
+            rotated_keys[next_version] = secrets.token_bytes(32)
+            self._replace(next_version, rotated_keys)
+            # Other processes sharing this state directory observe the atomic
+            # replacement through the generation check on their next lookup.
+            self._invalidate_cache()
             return next_version
+
+    def _load_cached(self) -> tuple[int, dict[int, bytes]]:
+        """Reuse decoded keys while the protected file generation stays unchanged."""
+        signature = self._file_signature()
+        if (
+            signature == self._cached_signature
+            and self._cached_current_version is not None
+            and self._cached_keys is not None
+        ):
+            return self._cached_current_version, self._cached_keys
+
+        # Atomic replacement or in-place edits during reload must not publish a
+        # keyring under the wrong file generation. Retry a few times, then fail
+        # closed if another process is actively changing the pepper.
+        for _attempt in range(3):
+            before = self._file_signature()
+            current_version, keys = self._read()
+            after = self._file_signature()
+            if before == after:
+                self._cached_signature = after
+                self._cached_current_version = current_version
+                self._cached_keys = keys
+                return current_version, keys
+        raise GatewayAuthError("virtual-key fingerprint pepper changed during read")
+
+    def _file_signature(self) -> tuple[int, int, int, int, int, int]:
+        """Return the protected generation used to invalidate the decoded key cache."""
+        try:
+            metadata = self._path.lstat()
+        except FileNotFoundError as exc:
+            raise GatewayAuthError("virtual-key fingerprint pepper is missing") from exc
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise GatewayAuthError(
+                "virtual-key fingerprint pepper must be a regular mode-0600 file"
+            )
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def _invalidate_cache(self) -> None:
+        """Forget a decoded keyring after a local atomic replacement."""
+        self._cached_signature = None
+        self._cached_current_version = None
+        self._cached_keys = None
 
     def _create_initial(self) -> None:
         """Create version one without following links or replacing existing state."""

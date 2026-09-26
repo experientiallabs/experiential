@@ -31,6 +31,21 @@ def test_pepper_is_mode_0600_and_rotation_retains_old_fingerprint_keys(tmp_path:
     assert fingerprint_virtual_key(raw_key, pepper_file.current()) != first_fingerprint
 
 
+def test_pepper_cache_observes_another_process_rotating_the_file(tmp_path: Path) -> None:
+    """A cached keyring refreshes after the shared file is atomically replaced."""
+    path = tmp_path / "pepper.json"
+    reader = FingerprintPepperFile(path)
+    writer = FingerprintPepperFile(path)
+    first = reader.current()
+    assert writer.current().version == first.version
+
+    assert writer.rotate() == 2
+
+    assert reader.current().version == 2
+    assert reader.key(1).value == first.value
+    assert reader.key(2).value == writer.current().value
+
+
 def test_pepper_rejects_group_readable_and_symlink_state(tmp_path: Path) -> None:
     """Permission drift and link substitution fail closed."""
     path = tmp_path / "pepper.json"
