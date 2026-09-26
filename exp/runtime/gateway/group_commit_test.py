@@ -37,6 +37,7 @@ from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
 from exp.runtime.gateway.model_chain_authority import (
     ChainOperation,
     ModelChainAuthorityError,
+    SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
 )
 from exp.runtime.gateway.snapshot_file import PreparedSnapshotFile
@@ -179,9 +180,10 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
         operation: ChainOperation,
         *,
         connection: sqlite3.Connection | None = None,
+        observation: SQLiteChainAuthorityObservation | None = None,
     ) -> Iterator[SQLiteChainPreflight | None]:
-        """Pause only outside the transaction and retain each real production proof."""
-        with original(auth, operation, connection=connection) as proof:
+        """Pause preparation outside the writer and retain each real production proof."""
+        with original(auth, operation, connection=connection, observation=observation) as proof:
             assert proof is not None
             proofs.append(proof)
             entered.set()
@@ -286,6 +288,82 @@ def test_group_preflight_reuses_the_writer_database_connection(
     finally:
         release.set()
         grouped.close()
+
+
+def test_group_chain_preflights_run_concurrently_before_begin(tmp_path: Path) -> None:
+    """A queued batch prepares its exact snapshot proofs in parallel before one write txn."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    (tmp_path / "snapshot-one").write_text("{}")
+    authorizations = [_authorize(store, clock, raw_key, f"parallel-{index}") for index in range(2)]
+    grouped = GroupCommitAttemptLedger(core, max_batch_size=3)
+    entered, release = threading.Event(), threading.Event()
+    barrier = threading.Barrier(2)
+    proof_threads: set[int] = set()
+    proofs: list[SQLiteChainPreflight] = []
+    original_prepare = core.prepare_chain_authority
+    original_commit = grouped._commit_batch
+
+    def pause(connection: sqlite3.Connection) -> None:
+        """Hold batch commit until both proof preparations are in the same queue batch."""
+        entered.set()
+        assert release.wait(5)
+
+    @contextmanager
+    def tracked(
+        authorization: AuthorizationSnapshot,
+        operation: ChainOperation,
+        *,
+        connection: sqlite3.Connection | None = None,
+        observation: SQLiteChainAuthorityObservation | None = None,
+    ) -> Iterator[SQLiteChainPreflight | None]:
+        """Wait for a peer preparation to prove neither runs on the serial writer."""
+        assert connection is None and observation is not None
+        with original_prepare(authorization, operation, observation=observation) as proof:
+            assert proof is not None
+            proofs.append(proof)
+            proof_threads.add(threading.get_ident())
+            barrier.wait(timeout=5)
+            yield proof
+
+    def check_prepared_batch(
+        connection: sqlite3.Connection,
+        batch: list[object],
+    ) -> None:
+        """Ensure both workers completed before the atomic write transaction begins."""
+        assert len(proofs) == 2
+        assert len(proof_threads) == 2
+        original_commit(connection, batch)
+
+    blocker = grouped._enqueue(pause)
+    assert entered.wait(5)
+    try:
+        with (
+            mock.patch.object(core, "prepare_chain_authority", tracked),
+            mock.patch.object(grouped, "_commit_batch", check_prepared_batch),
+        ):
+            writes = [
+                grouped._enqueue_chain(
+                    authorization,
+                    "accept",
+                    lambda connection, proof, authorization=authorization: (
+                        core.apply_accept_request(
+                            connection,
+                            authorization=authorization,
+                            chain_preflight=proof,
+                        )
+                    ),
+                )
+                for authorization in authorizations
+            ]
+            release.set()
+            blocker.result(timeout=5)
+            for write in writes:
+                write.result(timeout=5)
+    finally:
+        release.set()
+        grouped.close()
+    assert len(proofs) == 2 and all(proof._closed for proof in proofs)
 
 
 def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:

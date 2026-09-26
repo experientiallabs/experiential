@@ -18,6 +18,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -337,6 +338,30 @@ def _preflight_timeout() -> AttemptRejectedError:
 _AuthorityRows = tuple[tuple[str | None, ...], ...]
 
 
+@dataclass(frozen=True)
+class SQLiteChainAuthorityObservation:
+    """Writer-thread database identity captured before parallel snapshot preparation."""
+
+    database: str
+    rows: _AuthorityRows
+
+
+def observe_sqlite_chain_authority(
+    connection: sqlite3.Connection,
+    organization_id: str,
+    alias_revision_id: str,
+) -> SQLiteChainAuthorityObservation:
+    """Capture the exact database rows that a later transaction must revalidate."""
+    if connection.in_transaction:
+        raise ModelChainAuthorityError(
+            "observe local chain authority before beginning a transaction"
+        )
+    return SQLiteChainAuthorityObservation(
+        _database_path(connection),
+        _chain_authority_rows(connection, organization_id, alias_revision_id),
+    )
+
+
 class _PlainSnapshotPair:
     """Two classified file generations with at most two retained anti-reuse leaf descriptors."""
 
@@ -573,7 +598,7 @@ class SQLiteChainPreflight:
 
 @contextmanager
 def prepare_sqlite_chain_authority(
-    connection: sqlite3.Connection,
+    connection: sqlite3.Connection | None,
     organization_id: str,
     alias_revision_id: str,
     *,
@@ -582,14 +607,16 @@ def prepare_sqlite_chain_authority(
     maximum_bytes: int,
     remaining_seconds: float,
     classification_memo: SnapshotClassificationMemo | None = None,
+    observation: SQLiteChainAuthorityObservation | None = None,
 ) -> Iterator[SQLiteChainPreflight]:
     """Classify both catalog views before BEGIN and retain handles through commit or rollback."""
-    if connection.in_transaction:
-        raise ModelChainAuthorityError(
-            "prepare local chain authority before beginning a transaction"
-        )
-    database = _database_path(connection)
-    rows = _chain_authority_rows(connection, organization_id, alias_revision_id)
+    if observation is None:
+        if connection is None:
+            raise ModelChainAuthorityError("local chain preflight has no database observation")
+        observation = observe_sqlite_chain_authority(connection, organization_id, alias_revision_id)
+    elif connection is not None:
+        raise ValueError("pass either a database connection or a captured chain observation")
+    database, rows = observation.database, observation.rows
     references = dict.fromkeys(
         row[index] for row in rows for index in (4, 7) if row[index] is not None
     )

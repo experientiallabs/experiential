@@ -58,7 +58,9 @@ from exp.runtime.gateway.model_chain_authority import (
     ChainOperation,
     LocalSnapshotMemoOwner,
     SnapshotClassificationMemo,
+    SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
+    observe_sqlite_chain_authority,
     prepare_sqlite_chain_authority,
     serving_snapshot_limit,
 )
@@ -101,8 +103,23 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         operation: ChainOperation,
         *,
         connection: sqlite3.Connection | None = None,
+        observation: SQLiteChainAuthorityObservation | None = None,
     ) -> Iterator[SQLiteChainPreflight | None]:
-        """Classify before BEGIN, borrowing the writer's connection when supplied."""
+        """Classify before BEGIN from a writer read or its captured row observation."""
+        if observation is not None:
+            with prepare_sqlite_chain_authority(
+                None,
+                authorization.organization_id,
+                authorization.alias_revision_id,
+                request_id=authorization.request_id,
+                operation=operation,
+                maximum_bytes=self.serving_snapshot_max_bytes,
+                remaining_seconds=authorization.deadline_monotonic - self._clock.monotonic(),
+                classification_memo=self.classification_memo,
+                observation=observation,
+            ) as proof:
+                yield proof
+            return
         with (
             self._connect() if connection is None else nullcontext(connection) as connection,
             prepare_sqlite_chain_authority(
@@ -117,6 +134,18 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             ) as proof,
         ):
             yield proof
+
+    @staticmethod
+    def observe_chain_authority(
+        connection: sqlite3.Connection,
+        authorization: AuthorizationSnapshot,
+    ) -> SQLiteChainAuthorityObservation:
+        """Capture the writer's current alias rows before snapshot I/O moves to workers."""
+        return observe_sqlite_chain_authority(
+            connection,
+            authorization.organization_id,
+            authorization.alias_revision_id,
+        )
 
     def _require_chain_authority(
         self,

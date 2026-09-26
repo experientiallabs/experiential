@@ -38,7 +38,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
 )
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-from exp.runtime.gateway.model_chain_authority import ChainOperation, SQLiteChainPreflight
+from exp.runtime.gateway.model_chain_authority import (
+    ChainOperation,
+    SQLiteChainAuthorityObservation,
+    SQLiteChainPreflight,
+)
 from exp.runtime.gateway.native_settlement import (
     tool_search_requests_kwarg,
     upstream_provider_kwarg,
@@ -49,6 +53,7 @@ from exp.runtime.gateway.sqlite.migrations import connect_database
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_BATCH_SIZE = 128
+_MAX_CHAIN_PREFLIGHT_WORKERS = 8
 
 _T = TypeVar("_T")
 
@@ -107,15 +112,17 @@ class _PendingWrite:
     """One queued ledger operation and the future resolved after durable commit.
 
     Attributes:
-        prepare: Optional pretransaction context retaining proof handles through the write;
-            None applies the queued operation directly.
+        observe: Optional writer-thread read that binds the operation to exact alias rows.
+        prepare: Optional parallel pretransaction context retaining proof handles through write.
     """
 
     apply: Callable[[sqlite3.Connection], object]
     future: concurrent.futures.Future[object]
+    observe: Callable[[sqlite3.Connection], SQLiteChainAuthorityObservation] | None = None
     prepare: (
         Callable[
-            [sqlite3.Connection], AbstractContextManager[Callable[[sqlite3.Connection], object]]
+            [SQLiteChainAuthorityObservation],
+            AbstractContextManager[Callable[[sqlite3.Connection], object]],
         ]
         | None
     ) = None
@@ -124,14 +131,31 @@ class _PendingWrite:
 @contextmanager
 def _prepared_chain_write(
     core: SQLiteAttemptLedger,
-    connection: sqlite3.Connection,
+    observation: SQLiteChainAuthorityObservation,
     authorization: AuthorizationSnapshot,
     operation: ChainOperation,
     apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
 ) -> Iterator[Callable[[sqlite3.Connection], object]]:
-    """Own a queued operation's proof on the writer, including after caller cancellation."""
-    with core.prepare_chain_authority(authorization, operation, connection=connection) as proof:
+    """Own a parallel snapshot proof through the writer commit, including cancellation."""
+    with core.prepare_chain_authority(authorization, operation, observation=observation) as proof:
         yield lambda connection: apply(connection, proof)
+
+
+def _enter_preparation(
+    preparation: AbstractContextManager[Callable[[sqlite3.Connection], object]],
+) -> tuple[
+    AbstractContextManager[Callable[[sqlite3.Connection], object]],
+    Callable[[sqlite3.Connection], object],
+]:
+    """Enter one independent snapshot preparation on a preflight worker."""
+    return preparation, preparation.__enter__()
+
+
+def _close_preparation(
+    preparation: AbstractContextManager[Callable[[sqlite3.Connection], object]],
+) -> None:
+    """Release operation-scoped snapshot handles after the commit or rollback."""
+    preparation.__exit__(None, None, None)
 
 
 class GroupCommitAttemptLedger:
@@ -163,6 +187,10 @@ class GroupCommitAttemptLedger:
         self._max_batch_size = max_batch_size
         self._queue: queue.SimpleQueue[_PendingWrite | None] = queue.SimpleQueue()
         self._closed = False
+        self._chain_preflights = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max_batch_size, _MAX_CHAIN_PREFLIGHT_WORKERS),
+            thread_name_prefix="gateway-chain-preflight",
+        )
         # Serializes enqueue against close so no operation can land behind the
         # stop sentinel and strand its caller after the writer thread exits.
         self._submit_lock = threading.Lock()
@@ -366,6 +394,7 @@ class GroupCommitAttemptLedger:
             )
         except Exception:  # noqa: BLE001 - every blocked caller receives the closed error.
             _logger.exception("gateway ledger writer failed to open its connection")
+            self._chain_preflights.shutdown(wait=True, cancel_futures=False)
             self._fail_pending()
             return
         try:
@@ -387,16 +416,42 @@ class GroupCommitAttemptLedger:
                 try:
                     with ExitStack() as preparations:
                         ready: list[_PendingWrite] = []
+                        preparing: list[
+                            tuple[
+                                _PendingWrite,
+                                concurrent.futures.Future[
+                                    tuple[
+                                        AbstractContextManager[
+                                            Callable[[sqlite3.Connection], object]
+                                        ],
+                                        Callable[[sqlite3.Connection], object],
+                                    ]
+                                ],
+                            ]
+                        ] = []
                         for pending in batch:
+                            if pending.prepare is None:
+                                ready.append(pending)
+                                continue
                             try:
-                                apply = (
-                                    pending.apply
-                                    if pending.prepare is None
-                                    else preparations.enter_context(pending.prepare(connection))
+                                if pending.observe is None:
+                                    raise RuntimeError("chain preflight has no database observer")
+                                observation = pending.observe(connection)
+                                preparation = pending.prepare(observation)
+                                future = self._chain_preflights.submit(
+                                    _enter_preparation, preparation
                                 )
                             except Exception as exc:  # noqa: BLE001 - isolate each preflight failure.
                                 _resolve_exception(pending.future, exc)
                             else:
+                                preparing.append((pending, future))
+                        for pending, future in preparing:
+                            try:
+                                preparation, apply = future.result()
+                            except Exception as exc:  # noqa: BLE001 - isolate each preflight failure.
+                                _resolve_exception(pending.future, exc)
+                            else:
+                                preparations.callback(_close_preparation, preparation)
                                 ready.append(_PendingWrite(apply, pending.future))
                         if ready:
                             self._commit_batch(connection, ready)
@@ -414,6 +469,7 @@ class GroupCommitAttemptLedger:
                             )
         finally:
             connection.close()
+            self._chain_preflights.shutdown(wait=True, cancel_futures=False)
             self.core.classification_memo.clear()
             self._fail_pending()
 
@@ -531,8 +587,9 @@ class GroupCommitAttemptLedger:
         """Queue classification before BEGIN without giving callers ownership of live handles."""
         return self._enqueue(
             lambda connection: apply(connection, None),
-            prepare=lambda connection: _prepared_chain_write(
-                self.core, connection, authorization, operation, apply
+            observe=lambda connection: self.core.observe_chain_authority(connection, authorization),
+            prepare=lambda observation: _prepared_chain_write(
+                self.core, observation, authorization, operation, apply
             ),
         )
 
@@ -540,8 +597,10 @@ class GroupCommitAttemptLedger:
         self,
         apply: Callable[[sqlite3.Connection], _T],
         *,
+        observe: Callable[[sqlite3.Connection], SQLiteChainAuthorityObservation] | None = None,
         prepare: Callable[
-            [sqlite3.Connection], AbstractContextManager[Callable[[sqlite3.Connection], object]]
+            [SQLiteChainAuthorityObservation],
+            AbstractContextManager[Callable[[sqlite3.Connection], object]],
         ]
         | None = None,
     ) -> concurrent.futures.Future[_T]:
@@ -564,6 +623,7 @@ class GroupCommitAttemptLedger:
                 _PendingWrite(
                     apply=apply,
                     future=cast("concurrent.futures.Future[object]", future),
+                    observe=observe,
                     prepare=prepare,
                 )
             )
