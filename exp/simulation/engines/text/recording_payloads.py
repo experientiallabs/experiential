@@ -4,9 +4,43 @@ from datetime import datetime
 
 from pydantic import JsonValue
 
-from exp.common.models import ModelMessage, ModelRequest, ModelResponse
+from exp.common.models import (
+    AssistantAction,
+    CompletionCostReservation,
+    ModelCapabilities,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+)
 from exp.common.rollouts import RolloutEventKind, RolloutSpan
+from exp.simulation.engines.text.prompt import retry_world_model_request
 from exp.simulation.engines.text.redaction import redact_json
+from exp.simulation.engines.text.tokens import TokenCounter
+
+
+def world_retry_request(
+    request: ModelRequest,
+    action: AssistantAction,
+    reason: str,
+    *,
+    capabilities: ModelCapabilities,
+    reservation: CompletionCostReservation | None,
+    token_counter: TokenCounter,
+) -> ModelRequest:
+    """Add format feedback only when it fits the original context and input reservation.
+
+    With no room for feedback, the next simulator attempt uses the admitted original request.
+    No evidence is removed and the original output allowance remains available.
+    """
+    corrected = retry_world_model_request(request, action, reason)
+    context = capabilities.context_window_tokens
+    output = request.maximum_output_tokens
+    if context is None or output is None:
+        return request
+    ceiling = context - output
+    if reservation is not None:
+        ceiling = min(ceiling, reservation.maximum_input_tokens)
+    return corrected if 0 <= token_counter.count(corrected) <= ceiling else request
 
 
 def bounded_candidate_request(

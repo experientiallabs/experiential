@@ -58,13 +58,13 @@ from exp.simulation.engines.text.prompt import (
     TextWorldModelTransition,
     candidate_rag_actions,
     parse_world_model_transition,
-    retry_world_model_request,
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.recording_payloads import (
     bounded_candidate_request,
     delivered_world_span,
     model_span,
+    world_retry_request,
 )
 from exp.simulation.engines.text.redaction import redact_json
 from exp.simulation.engines.text.tokens import TokenCounter, bound_unpublished_output
@@ -532,7 +532,14 @@ class RecordingCandidateClient:
                     ) from exc
                 attempt = replace(
                     prepared,
-                    request=retry_world_model_request(prepared.request, prepared.action, str(exc)),
+                    request=world_retry_request(
+                        prepared.request,
+                        prepared.action,
+                        str(exc),
+                        capabilities=self._world_model.capabilities,
+                        reservation=self._world_model_request,
+                        token_counter=self._token_counter,
+                    ),
                 )
         raise AssertionError("a positive transition allowance must return or raise")
 

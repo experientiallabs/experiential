@@ -240,6 +240,7 @@ def _recorder(
     world_model_json_object_output: bool = False,
     maximum_transition_attempts: int = 1,
     task: TaskCase | None = None,
+    world_context_window: int = 100_000,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -258,6 +259,7 @@ def _recorder(
         world_model_json_object_output: Explicit frozen world-only JSON output control.
         maximum_transition_attempts: Permitted simulator replies for the same candidate turn.
         task: Optional task carrying declared tools for observation-boundary tests.
+        world_context_window: Exact world-model context ceiling for retry admission tests.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -277,6 +279,7 @@ def _recorder(
     world_model = _resolved(
         "world-model-a",
         resolved_world_client or world_client,
+        context_window_tokens=world_context_window,
         completion_pricing=world_request is not None,
         output_limit=output_limit,
     )
@@ -1018,3 +1021,47 @@ def test_world_retry_does_not_repair_wrong_ids_or_deliver_rejected_tool_content(
     assert recorder.recorded.world_model_spans[0].failure is not None
     assert "chatcmpl-tool-exact" in (world.requests[1].messages[-1].content or "")
     assert recorder.checkpoint() is not None
+
+
+@pytest.mark.parametrize("limited_by", ["context", "reservation"])
+def test_world_retry_without_feedback_room_reuses_full_original_request(limited_by: str) -> None:
+    """Retries remain usable at either input ceiling without discarding evidence or output space."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="question"),))
+    candidate_response = _response("answer", model=_snapshot("candidate-a"))
+    invalid = _response("bad", model=_snapshot("world-model-a"))
+    baseline_world = _ScriptedClient([invalid])
+    baseline = _recorder(_ScriptedClient([candidate_response]), baseline_world)
+    with pytest.raises(TextSimulationError):
+        baseline.complete(request)
+    input_tokens = _Utf8Counter().count(baseline_world.requests[0])
+    world = _ScriptedClient(
+        [
+            invalid,
+            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+        ]
+    )
+    world.responses = [
+        response.model_copy(
+            update={
+                "economics": response.economics.model_copy(
+                    update={"cost_usd": None, "provider_attempts": 1}
+                )
+            }
+        )
+        for response in world.responses
+    ]
+    candidate = _ScriptedClient([candidate_response])
+    recorder = _recorder(
+        candidate,
+        world,
+        maximum_transition_attempts=3,
+        world_context_window=input_tokens + 16_000 if limited_by == "context" else 100_000,
+        world_request=_completion_reservation("world-model-a", maximum_input_tokens=input_tokens)
+        if limited_by == "reservation"
+        else None,
+    )
+    recorder.complete(request)
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 2
+    assert world.requests[1] == world.requests[0]
+    assert recorder.world_model_terminal
