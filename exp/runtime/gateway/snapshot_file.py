@@ -268,6 +268,9 @@ def validate_snapshot_generation(
         os.name == "nt"
         or os.stat not in os.supports_dir_fd
         or os.stat not in os.supports_follow_symlinks
+        or os.open not in os.supports_dir_fd
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
     ):
         with _snapshot_observation(root, relative_path) as (current, identities):
             stamp = None if current is None else _file_stamp(current)

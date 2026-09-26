@@ -41,6 +41,7 @@ jobs:
         run: >-
           uv run python -m exp.runtime.gateway.latency_report
           --output-json gateway-latency.json
+          --output-diagnostics-json gateway-latency-diagnostics.json
           --output-badge shields/gateway-latency.json
           --github-summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the versioned latency report
@@ -50,6 +51,7 @@ jobs:
           name: gateway-latency-report
           path: |
             gateway-latency.json
+            gateway-latency-diagnostics.json
             shields/gateway-latency.json
           if-no-files-found: warn
 
