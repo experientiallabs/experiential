@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import Literal, cast
 
@@ -13,7 +15,6 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
-    sha256_json,
     stable_id,
 )
 from exp.common.judging import RawJudgment, Rubric
@@ -30,12 +31,13 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact
+from exp.optimize.router.errors import JudgeTranscriptAdmissionError
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
     JudgeProtocolProbeArtifact,
     ManualJudgeError,
 )
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 PairwiseCitationEvidence = tuple[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]], ...]
 
@@ -104,6 +106,7 @@ class TemplateJudgeClient:
         code_revision: str,
         maximum_input_tokens: int | None = None,
         maximum_output_tokens: int,
+        request_scope: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Bind one target, optional same-task reference, and exact finalized contract.
 
@@ -121,6 +124,7 @@ class TemplateJudgeClient:
             code_revision: Exact producer revision for probe artifacts.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
             maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
+            request_scope: Optional durable request scope keyed by the exact probe identity.
 
         Raises:
             ManualJudgeError: Pairwise feedback lacks a distinct same-task reference, or the
@@ -150,6 +154,7 @@ class TemplateJudgeClient:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._request_scope = request_scope
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
         self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
@@ -208,18 +213,8 @@ class TemplateJudgeClient:
         Returns:
             Provider response after model dispatch or exact probe replay.
         """
-        probe_id = stable_id(
-            "manual-judge-probe",
-            {
-                "setup": self._setup_input.model_dump(mode="json"),
-                "rollout": self._rollout_input.model_dump(mode="json"),
-                "reference": (
-                    self._reference_input.model_dump(mode="json")
-                    if self._reference_input is not None
-                    else None
-                ),
-                "order": order,
-            },
+        probe_id = judge_probe_id(
+            self._setup_input, self._rollout_input, self._reference_input, order
         )
         saved = _read_probe_if_present(self._store, probe_id)
         if saved is not None:
@@ -236,16 +231,18 @@ class TemplateJudgeClient:
                 model=saved.model,
                 economics=saved.economics,
             )
-        response = self._client.complete(
-            _bounded_judge_request(
-                self._template,
-                self._rubric,
-                candidate_a,
-                candidate_b,
-                maximum_input_tokens=self._maximum_input_tokens,
-                maximum_output_tokens=self._maximum_output_tokens,
+        context = self._request_scope(probe_id) if self._request_scope else nullcontext()
+        with context:
+            response = self._client.complete(
+                _bounded_judge_request(
+                    self._template,
+                    self._rubric,
+                    candidate_a,
+                    candidate_b,
+                    maximum_input_tokens=self._maximum_input_tokens,
+                    maximum_output_tokens=self._maximum_output_tokens,
+                )
             )
-        )
         self._provider_calls_made += 1
         raw = _raw_response(response)
         inputs = tuple(
@@ -465,6 +462,24 @@ def pairwise_citation_evidence_from_probes(
     return tuple((dimension_id, (), ()) for dimension_id in first_by_id)
 
 
+def judge_probe_id(
+    setup: ArtifactInput,
+    rollout: ArtifactInput,
+    reference: ArtifactInput | None,
+    order: Literal["single", "forward", "reverse"],
+) -> str:
+    """Identify one exact provider probe, including probes interrupted before artifact storage."""
+    return stable_id(
+        "manual-judge-probe",
+        {
+            "setup": setup.model_dump(mode="json"),
+            "rollout": rollout.model_dump(mode="json"),
+            "reference": reference.model_dump(mode="json") if reference is not None else None,
+            "order": order,
+        },
+    )
+
+
 def _read_probe_if_present(store: ProjectStore, probe_id: str) -> JudgeProtocolProbeArtifact | None:
     """Load a completed probe when its stable identity already exists.
 
@@ -579,68 +594,39 @@ def _bounded_judge_request(
     maximum_input_tokens: int | None,
     maximum_output_tokens: int,
 ) -> ModelRequest:
-    """Build one judge request whose rendered evidence fits the reserved input ceiling.
-
-    Span payloads are elided deterministically, largest first, until the complete request
-    fits. Each elided payload keeps its span identity plus an exact digest and byte count,
-    so the judge still sees the full episode structure and the final output.
+    """Preserve full visible evidence and reject requests beyond the declared capacity.
 
     Args:
         template: Finalized executable prompt contract.
         rubric: Finalized scoring rubric.
         candidate_a: Single or first candidate rollout.
         candidate_b: Optional second pairwise candidate.
-        maximum_input_tokens: Reserved conservative request ceiling, or ``None`` for no bound.
-        maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
+        maximum_input_tokens: Conservative model input capacity, or None for no bound.
+        maximum_output_tokens: Reserved per-call output-token ceiling.
 
     Returns:
-        Complete provider-neutral judge request within the reserved ceiling.
+        Complete request without explicit sampling controls, preserving configured reasoning.
 
     Raises:
-        ManualJudgeError: The request exceeds the ceiling with every span payload elided.
+        JudgeTranscriptAdmissionError: Full evidence cannot fit the reserved model capacity.
     """
-    counter = Utf8UpperBoundTokenCounter()
-    rollouts = (candidate_a,) if candidate_b is None else (candidate_a, candidate_b)
-    elided: set[tuple[str, str]] = set()
-    while True:
-        request = ModelRequest(
-            messages=(
-                ModelMessage(role="system", content=template.prompt.text),
-                ModelMessage(
-                    role="user",
-                    content=_render_request(
-                        template,
-                        rubric,
-                        candidate_a,
-                        candidate_b,
-                        elided_spans=frozenset(elided),
-                    ),
-                ),
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content=template.prompt.text),
+            ModelMessage(
+                role="user", content=_render_request(template, rubric, candidate_a, candidate_b)
             ),
-            temperature=0.0,
-            maximum_output_tokens=maximum_output_tokens,
+        ),
+        maximum_output_tokens=maximum_output_tokens,
+    )
+    counted = Utf8UpperBoundTokenCounter().count(request)
+    if maximum_input_tokens is not None and counted > maximum_input_tokens:
+        raise JudgeTranscriptAdmissionError(
+            f"full judge evidence needs {counted:,} conservative input tokens, above the "
+            f"{maximum_input_tokens:,} reservation; choose a larger-context judge or "
+            "increase the judge input reservation"
         )
-        if maximum_input_tokens is None or counter.count(request) <= maximum_input_tokens:
-            return request
-        remaining = [
-            (
-                len(
-                    json.dumps(span["payload"], ensure_ascii=False, sort_keys=True).encode("utf-8")
-                ),
-                rollout.rollout_id,
-                cast(str, span["span_id"]),
-            )
-            for rollout in rollouts
-            for span in cast(list[JsonObject], visible_rollout_evidence(rollout)["spans"])
-            if (rollout.rollout_id, span["span_id"]) not in elided and span["payload"]
-        ]
-        if not remaining:
-            raise ManualJudgeError(
-                "judge request exceeds its reserved input ceiling with every span "
-                "payload elided; raise the judge input reservation"
-            )
-        _size, rollout_id, span_id = max(remaining)
-        elided.add((rollout_id, span_id))
+    return request
 
 
 def _render_request(
@@ -648,8 +634,6 @@ def _render_request(
     rubric: Rubric,
     candidate_a: RolloutArtifact,
     candidate_b: RolloutArtifact | None,
-    *,
-    elided_spans: frozenset[tuple[str, str]] = frozenset(),
 ) -> str:
     """Render all finalized mapped variables and the exact saved response schema.
 
@@ -661,7 +645,6 @@ def _render_request(
         rubric: Finalized scoring rubric.
         candidate_a: Single or first candidate rollout.
         candidate_b: Optional second pairwise candidate.
-        elided_spans: Rollout and span identities whose payloads are digest-elided.
 
     Returns:
         Deterministic request body containing every mapped variable and schema.
@@ -670,10 +653,10 @@ def _render_request(
         "rubric": [item.prompt_payload() for item in rubric.dimensions],
     }
     if candidate_b is None:
-        values["rollout"] = _rollout_payload(candidate_a, elided_spans)
+        values["rollout"] = visible_rollout_evidence(candidate_a)
     else:
-        values["candidate_a"] = _rollout_payload(candidate_a, elided_spans)
-        values["candidate_b"] = _rollout_payload(candidate_b, elided_spans)
+        values["candidate_a"] = visible_rollout_evidence(candidate_a)
+        values["candidate_b"] = visible_rollout_evidence(candidate_b)
     sections = [
         f"{cast(str, template.variable_mapping[key])}:\n"
         + json.dumps(values[key], ensure_ascii=False, sort_keys=True)
@@ -684,43 +667,6 @@ def _render_request(
         + json.dumps(template.response_schema, ensure_ascii=False, sort_keys=True)
     )
     return "\n\n".join(sections)
-
-
-def _rollout_payload(
-    rollout: RolloutArtifact,
-    elided_spans: frozenset[tuple[str, str]] = frozenset(),
-) -> JsonObject:
-    """Return judge-visible evidence with selected span payloads digest-elided.
-
-    Args:
-        rollout: Verified immutable production rollout.
-        elided_spans: Rollout and span identities whose payloads are digest-elided.
-
-    Returns:
-        Deterministic judge-visible evidence projection with elided payload stubs.
-    """
-    evidence = visible_rollout_evidence(rollout)
-    if not elided_spans:
-        return evidence
-    spans = []
-    for span in cast(list[JsonObject], evidence["spans"]):
-        if (rollout.rollout_id, cast(str, span["span_id"])) not in elided_spans:
-            spans.append(span)
-            continue
-        payload = cast(JsonObject, span["payload"])
-        spans.append(
-            {
-                **span,
-                "payload": {
-                    "payload_elided": True,
-                    "payload_sha256": sha256_json(payload),
-                    "payload_bytes": len(
-                        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-                    ),
-                },
-            }
-        )
-    return {**evidence, "spans": spans}
 
 
 def _validate_normalized_dimensions(dimensions: list[JsonObject], rubric: Rubric) -> None:

@@ -873,12 +873,16 @@ def _assert_payload_secret_free(relative_path: str, payload: bytes) -> None:
         if suffix == ".json":
             assert_secret_free(_JSON_VALUE_ADAPTER.validate_json(payload))
         elif suffix == ".jsonl":
-            for _line_number, line in enumerate(text.splitlines(), start=1):
+            for line in text.split("\n"):
                 if line:
                     assert_secret_free(_JSON_VALUE_ADAPTER.validate_json(line))
         else:
             assert_text_secret_free(text)
-    except (SecretBoundaryError, ValidationError) as exc:
+    except ValidationError as exc:
+        raise ArtifactStoreError(
+            f"artifact data file {relative_path} contains invalid JSON"
+        ) from exc
+    except SecretBoundaryError as exc:
         raise ArtifactStoreError(
             f"artifact data file {relative_path} violates the secret boundary"
         ) from exc

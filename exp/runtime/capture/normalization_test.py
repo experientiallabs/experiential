@@ -208,7 +208,9 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
                     {
                         "index": 0,
                         "delta": {
-                            "content": "retain ordinary output" if index == 0 else "",
+                            "content": "retain ordinary output Bearer "
+                            if index == 0
+                            else "SYNTHETIC_SPLIT_SECRET",
                             "tool_calls": [{"index": 0, "function": {"arguments": fragment}}],
                         },
                     }
@@ -221,7 +223,12 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
             {
                 "type": "content_block_start",
                 "index": 0,
-                "content_block": {"type": "text", "text": "retain ordinary output"},
+                "content_block": {"type": "text", "text": "retain ordinary output Bearer "},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "SYNTHETIC_SPLIT_SECRET"},
             },
             {
                 "type": "content_block_start",
@@ -249,6 +256,7 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
         max_body_bytes=4096,
     )[0]
     assert canary.encode() not in payload
+    assert b"SYNTHETIC_SPLIT_SECRET" not in payload
     assert b"[REDACTED_INVALID_TOOL_ARGUMENTS]" in payload
     assert b"retain ordinary output" in payload
 
@@ -298,6 +306,7 @@ def test_terminal_response_survives_later_transport_failure(
         "status": "completed" if completed else "incomplete",
         "model": "test",
         "output": [],
+        "metadata": {"record_id": 18446744073709551617},
         "usage": {"input_tokens": 23, "output_tokens": 17},
     }
     body = json.dumps(response).encode()
@@ -314,6 +323,8 @@ def test_terminal_response_survives_later_transport_failure(
     assert attributes["exp.capture.interrupted"] is not completed
     assert attributes["gen_ai.usage.input_tokens"] == 23
     assert attributes["gen_ai.usage.output_tokens"] == 17
+    assert json.loads(str(attributes["exp.capture.response"]))["metadata"] == response["metadata"]
+    assert "exp.capture.events" not in attributes
     span = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])["resourceSpans"][0][
         "scopeSpans"
     ][0]["spans"][0]
@@ -457,7 +468,11 @@ def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
             "content_block": {"type": "tool_use", "name": "f", "id": "t", "input": {}},
         },
         {"type": "content_block_stop", "index": 99},
-        {"type": "content_block_delta", "index": 0, "delta": {"partial_json": '{"x":1}'}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"partial_json": '{"x":18446744073709551617,"password":"TOOL_SECRET"}'},
+        },
         {"type": "message_delta", "usage": {"output_tokens": 4}},
     ]
     body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
@@ -472,7 +487,12 @@ def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
     raw_response = attributes["exp.capture.response"]
     assert isinstance(raw_response, str)
     response = json.loads(raw_response)
-    assert response["content"][0]["input"] == {"x": 1}
+    assert response["content"][0]["input"] == {
+        "x": 18446744073709551617,
+        "password": "[REDACTED]",
+    }
+    assert "TOOL_SECRET" not in str(attributes)
+    assert "capture_input_source_json" not in str(attributes)
     assert attributes["gen_ai.usage.input_tokens"] == 9
     assert attributes["gen_ai.usage.output_tokens"] == 4
 

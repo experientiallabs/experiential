@@ -100,6 +100,9 @@ pub(super) fn assemble(frames: &[Value]) -> (Value, bool) {
             match serde_json::from_str::<Value>(&argument) {
                 Ok(value) => {
                     valid &= value.is_object();
+                    if super::response::contains_wide_number(&value) {
+                        block["capture_input_source_json"] = Value::String(argument);
+                    }
                     block["input"] = value;
                 }
                 Err(_) => {

@@ -54,6 +54,7 @@ from exp.common.tasks import TaskCase, TaskSet, ToolSchema
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import EnvironmentSession
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRefusalSignal
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.engines.text.bindings import (
     binding_digest,
@@ -79,6 +80,7 @@ from exp.simulation.retrieval import (
     load_fit_rag_retriever,
     persist_trace_rag,
 )
+from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 from exp.simulation.retrieval.tests.retrieval_test import _persist_traces
 from exp.simulation.retrieval.transitions import render_rag_key
 from exp.simulation.specs import (
@@ -135,15 +137,17 @@ class _TimeoutClient:
 class _FlakyOnceClient:
     """Raise one exhausted transport failure, then delegate to scripted responses."""
 
-    def __init__(self, responses: list[ModelResponse]) -> None:
+    def __init__(self, responses: list[ModelResponse], *, failure: Exception | None = None) -> None:
         """Store the answers served after the single scripted transport failure.
 
         Args:
             responses: Responses returned in order once the transport recovers.
+            failure: Optional explicit refusal or transport exception on the first call.
         """
         self._responses = list(responses)
         self.requests: list[ModelRequest] = []
         self._failed = False
+        self._failure = failure or ProviderTransportError("connection reset by provider")
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Fail the first dispatch at the transport level and answer afterwards.
@@ -160,7 +164,7 @@ class _FlakyOnceClient:
         self.requests.append(request)
         if not self._failed:
             self._failed = True
-            raise ProviderTransportError("connection reset by provider")
+            raise self._failure
         return self._responses.pop(0)
 
 
@@ -239,6 +243,8 @@ class _FitRetriever:
             initial_context=query.initial_context,
             action=query.action,
         )
+        if len(key_text.encode("utf-8")) > reservation.maximum_input_tokens:
+            raise RAGQueryInputLimitError("query input ceiling")
         reserved_tokens = len(key_text.encode("utf-8")) * reservation.maximum_attempts
         return OperationEconomics(
             cost_usd=NumericMeasurement(
@@ -1438,8 +1444,10 @@ def test_invalid_production_usage_charges_reservation_and_admits_later_paid_cell
     assert (len(candidate_client.requests), len(world_client.requests)) == calls
 
 
+@pytest.mark.parametrize("refused", [False, True])
 def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     tmp_path: Path,
+    refused: bool,
 ) -> None:
     """A persisted transport failure is superseded on resume by a fresh-budget attempt.
 
@@ -1452,7 +1460,12 @@ def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     plan_input = _persist_plan(store, plan)
     task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
     candidate_client = _FlakyOnceClient(
-        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)],
+        failure=(
+            ProviderRefusalError(provider="test", signal=ProviderRefusalSignal.PROVIDER_REFUSAL)
+            if refused
+            else None
+        ),
     )
     world_client = _ScriptedClient(
         [
@@ -1490,7 +1503,9 @@ def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     assert first.stop_reason == StopReason.FAILURE
     assert first.failure is not None
     assert first.failure.retryable is True
-    assert first.failure.exception_type == "ProviderTransportError"
+    assert first.failure.exception_type == (
+        "ProviderRefusalError" if refused else "ProviderTransportError"
+    )
     assert first.failure.details["provider_dispatch_unknown_spend"] is True
     reserved = first.failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY]
     assert isinstance(reserved, float) and reserved > 0
@@ -1889,6 +1904,7 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
                     resolution,
                     resolution_input,
                     bindings,
+                    parallel_admission=False,
                 )
             assert candidate_client.requests == []
             assert world_client.requests == []
@@ -1977,7 +1993,10 @@ def test_resume_recovers_a_later_stale_cell_before_admitting_earlier_pending_cel
     assert len(world_client.requests) == 1
 
 
-def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stop_on_overspend", [False, True])
+def test_text_simulation_serializes_finite_cost_admission(
+    tmp_path: Path, stop_on_overspend: bool
+) -> None:
     """Serialize cells so later admission uses reconciled provider spend.
 
     Args:
@@ -1994,7 +2013,7 @@ def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> Non
     task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
         [_response(f"candidate {index}", snapshot=_snapshot("candidate-a")) for index in range(4)],
-        delay_seconds=0.03,
+        delay_seconds=0.06,
     )
     world_client = _ScriptedClient(
         [
@@ -2013,11 +2032,18 @@ def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> Non
         candidate_client,
         world_client,
     )
+    simulator._leases = TextCellLeaseStore(
+        store.project_directory,
+        clock=lambda: _TIME,
+        wait_timeout_seconds=0.01,
+        poll_interval_seconds=0.001,
+    )
     spec = _spec(
         plan_input,
         task_set_input,
         tuple(cell.cell_id for cell in cells),
         maximum_concurrency=2,
+        stop_on_overspend=stop_on_overspend,
     )
 
     artifact_set = simulator.run(spec)
@@ -2025,6 +2051,44 @@ def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> Non
     assert len(artifact_set.artifact_ids) == 4
     assert candidate_client.maximum_active_calls == 1
     assert world_client.maximum_active_calls == 1
+
+
+def test_serial_fallback_reserves_remaining_budget_per_call(tmp_path: Path) -> None:
+    """Affordable short episodes run when the full parallel rollout ceiling cannot fit."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    contract_input = _persist_completion_contract(store)
+    candidate = _ScriptedClient([_response("done", snapshot=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [_response('{"message":"done","terminal":true}', snapshot=_snapshot("world-model-a"))]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_input,
+        candidate,
+        world,
+        completion_contract_input=contract_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_input,
+        (cell.cell_id,),
+        completion_contract_input=contract_input,
+        maximum_concurrency=2,
+        maximum_cost_usd=0.4,
+        stop_on_overspend=True,
+    )
+    result = simulator.run(spec)
+    rollout = simulator._load_rollout(result.artifact_ids[0])
+    assert rollout.stop_reason == StopReason.COMPLETED, rollout.failure
+    assert len(candidate.requests) == len(world.requests) == 1
+    assert simulator.run(spec).artifact_ids == result.artifact_ids
+    assert len(candidate.requests) == len(world.requests) == 1
 
 
 def test_text_simulation_continues_after_agent_completion_until_world_terminal(

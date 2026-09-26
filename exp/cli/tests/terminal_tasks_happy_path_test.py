@@ -311,12 +311,13 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
         "1",
     ]
     _RuntimeCatalog.judge_clients = []
+    over_budget.remove("--yes")
     refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
-    assert "conservative estimate $0.74 exceeds the configured per-command budget" in refused_text
+    assert "command estimate $0.74 exceeds the $0.50 budget" in refused_text
     assert "$0.50" in refused_text
-    assert "--yes cannot override" in refused_text
+    assert "interactive terminal to proceed, or use --yes" in refused_text
     assert "missing labels" not in refused_text
     assert _RuntimeCatalog.judge_clients == []
     assert store.read_review() == before_preflight

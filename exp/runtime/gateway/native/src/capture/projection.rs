@@ -39,9 +39,8 @@ impl<'a> CapturedResponse<'a> {
         }
         let (frames, sources) = super::response::data_frames_with_sources(bytes);
         let captured = CapturedResponse::sse(protocol, &frames);
-        let events_json = (!captured.projectable
-            || !sources.is_empty()
-            || super::response::contains_wide_number(&captured.body))
+        let events_json = (matches!(protocol, Protocol::Responses)
+            && (captured.body["capture_incomplete"] == true || !sources.is_empty()))
         .then(|| super::response::source_frames(&frames, &sources));
         (captured.body.to_string(), captured.completed, events_json)
     }

@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" /><title>
+    Experiential evaluation
+  </title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      font: 15px system-ui;
+      color: #0a0a0a;
+      background: #fff;
+      margin: 40px auto;
+      max-width: 1440px;
+      padding: 0 24px;
+    }
+    h1,
+    h2 {
+      font-weight: 600;
+    }
+    small,
+    .muted {
+      color: #0a0a0a;
+    }
+    button,
+    select {
+      font: inherit;
+      padding: 10px;
+      border: 1px solid #ececec;
+      background: white;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover {
+      border-color: #0070f3;
+    }
+    #tiles {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 12px;
+      margin: 24px 0;
+    }
+    #tiles button {
+      text-align: left;
+      min-height: 90px;
+    }
+    #compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: white;
+      border: 1px solid #ececec;
+      padding: 16px;
+      max-height: 75vh;
+      overflow: auto;
+      font:
+        13px ui-monospace,
+        monospace;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 24px 0;
+    }
+    td,
+    th {
+      text-align: left;
+      padding: 12px;
+      border-bottom: 1px solid #ececec;
+    }
+    svg {
+      width: 100%;
+      height: auto;
+      fill: #0a0a0a;
+    }
+    #detail {
+      display: none;
+    }
+    @media (max-width: 750px) {
+      #compare {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+  <h1>Model evaluation</h1>
+  <p id="summary" class="muted"></p>
+  <p id="method" class="muted"></p>
+  <p id="spend" class="muted"></p>
+  <svg
+    id="plot"
+    viewBox="0 0 1100 430"
+    role="img"
+    aria-label="Assistant cost and quality Pareto plot"
+  ></svg>
+  <table id="metrics"></table>
+  <h2>Scenarios</h2>
+  <div id="tiles"></div>
+  <section id="detail">
+    <h2 id="task"></h2>
+    <label
+      >Left model
+      <select id="left"></select
+    ></label>
+    <label
+      >Right model
+      <select id="right"></select
+    ></label>
+    <label
+      >Repeat
+      <select id="repeat"></select
+    ></label>
+    <div id="compare">
+      <pre id="traceA"></pre>
+      <pre id="traceB"></pre>
+    </div>
+  </section>
+  <script type="application/json" id="data">
+    __DATA__
+  </script>
+  <script>
+    const d = JSON.parse(document.getElementById("data").textContent),
+      $ = (id) => document.getElementById(id);
+    const models = d.report.models,
+      fmt = (x, n = 3) => (x == null ? "unavailable" : Number(x).toFixed(n));
+    function cost(x) {
+      if (x == null) return "unavailable";
+      const value = Number(x),
+        rounded = value.toFixed(value !== 0 && Math.abs(value) < 0.001 ? 6 : 4);
+      return value !== 0 && Number(rounded) === 0
+        ? value.toExponential(2)
+        : rounded;
+    }
+    $("summary").textContent =
+      `${d.project} · ${d.tasks.length} distinct scenarios · ${models.length} models · ${d.report.compared_cells} shared valid scenario/repeat pairs · ${d.report.excluded_cells} excluded pairs`;
+    $("method").textContent =
+      `Simulated environment: ${d.world_model} · Judge: ${d.judge_model} (${d.judgment_status})`;
+    const dollars = (value) =>
+      value == null ? "unavailable" : "$" + cost(value);
+    $("spend").textContent =
+      `Accounted experiment spend: simulation ${dollars(d.simulation_cost_usd)} · judge ${dollars(d.judge_cost_usd)}. Includes invalid attempts and retry reserves; separate from assistant cost per task.`;
+    const headers = [
+      "Model",
+      "Quality / 100",
+      "Assistant / task ($)",
+      "Assistant latency (s)",
+      "Scored",
+      "Invalid",
+      "Incomplete",
+    ];
+    const tr = document.createElement("tr");
+    headers.forEach((x) => {
+      const e = document.createElement("th");
+      e.textContent = x;
+      tr.append(e);
+    });
+    $("metrics").append(tr);
+    models.forEach((m) => {
+      const row = document.createElement("tr");
+      [
+        m.candidate.alias,
+        m.quality == null ? "unavailable" : fmt(m.quality * 100, 1),
+        cost(m.operating_cost_usd),
+        fmt(m.latency_seconds, 1),
+        m.scored_cells,
+        m.failed_cells,
+        m.incomplete_cells,
+      ].forEach((x) => {
+        const e = document.createElement("td");
+        e.textContent = x;
+        row.append(e);
+      });
+      $("metrics").append(row);
+    });
+    const points = models.filter(
+        (m) => m.quality != null && m.operating_cost_usd != null,
+      ),
+      max =
+        (Math.max(...points.map((m) => m.operating_cost_usd), 0) || 0.001) *
+        1.25;
+    function svg(tag, attrs, text) {
+      const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+      Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v));
+      if (text != null) e.textContent = text;
+      $("plot").append(e);
+      return e;
+    }
+    const x = (v) => 75 + (v / max) * 920,
+      y = (v) => 360 - v * 290;
+    for (let i = 0; i <= 5; i++) {
+      const v = i / 5;
+      svg("line", { x1: 75, y1: y(v), x2: 1010, y2: y(v), stroke: "#ececec" });
+      svg(
+        "text",
+        { x: 30, y: y(v) + 5, fill: "#0a0a0a", "font-size": 13 },
+        (v * 100).toFixed(0),
+      );
+      svg(
+        "text",
+        { x: x(v * max), y: 386, fill: "#0a0a0a", "font-size": 13 },
+        "$" + cost(v * max),
+      );
+    }
+    svg(
+      "text",
+      { x: 75, y: 25, "font-size": 18 },
+      "Higher quality, lower assistant cost",
+    );
+    svg(
+      "text",
+      { x: 350, y: 423, "font-size": 14 },
+      "Assistant cost per task ($), valid common cohort",
+    );
+    const front = points
+      .filter((m) => d.report.frontier_aliases.includes(m.candidate.alias))
+      .sort((a, b) => a.operating_cost_usd - b.operating_cost_usd);
+    svg("polyline", {
+      points: front
+        .map((m) => `${x(m.operating_cost_usd)},${y(m.quality)}`)
+        .join(" "),
+      fill: "none",
+      stroke: "#0070f3",
+      "stroke-width": 2,
+    });
+    const used = [];
+    points
+      .sort((a, b) => b.quality - a.quality)
+      .forEach((m) => {
+        const px = x(m.operating_cost_usd),
+          py = y(m.quality);
+        let ly = py - 12;
+        while (
+          used.some((p) => Math.abs(p.x - px) < 180 && Math.abs(p.y - ly) < 19)
+        )
+          ly -= 22;
+        if (ly < 48) {
+          ly = py + 20;
+          while (
+            used.some(
+              (p) => Math.abs(p.x - px) < 180 && Math.abs(p.y - ly) < 19,
+            )
+          )
+            ly += 22;
+        }
+        used.push({ x: px, y: ly });
+        svg("circle", {
+          cx: px,
+          cy: py,
+          r: 5,
+          fill: d.report.frontier_aliases.includes(m.candidate.alias)
+            ? "#0070f3"
+            : "white",
+          stroke: "#0070f3",
+          "stroke-width": 2,
+        });
+        svg("line", {
+          x1: px,
+          y1: py - 6,
+          x2: px + 8,
+          y2: ly + 4,
+          stroke: "#ececec",
+        });
+        svg("text", { x: px + 8, y: ly, "font-size": 13 }, m.candidate.alias);
+      });
+    ["left", "right"].forEach((id) =>
+      models.forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m.candidate.alias;
+        o.textContent = m.candidate.alias;
+        $(id).append(o);
+      }),
+    );
+    $("right").selectedIndex = Math.min(1, models.length - 1);
+    const repeats = [...new Set(d.rows.map((r) => r.repeat))].sort(
+      (a, b) => a - b,
+    );
+    repeats.forEach((r) => {
+      const o = document.createElement("option");
+      o.value = r;
+      o.textContent = r + 1;
+      $("repeat").append(o);
+    });
+    let selected = null;
+    function trace(alias) {
+      const row = d.rows.find(
+        (r) =>
+          r.task_id === selected.task_id &&
+          r.candidate_alias === alias &&
+          r.repeat === Number($("repeat").value),
+      );
+      if (!row) return "No planned rollout";
+      const rollout = d.rollouts.find((r) => r.rollout_id === row.rollout_id);
+      const spans = (rollout?.spans || []).filter(
+        (s) => s.kind === "agent_model_call",
+      );
+      const last = spans.at(-1)?.payload;
+      const messages = [...(last?.request?.messages || [])];
+      if (last?.response?.output)
+        messages.push({
+          role: "assistant",
+          assistant_action: last.response.output,
+        });
+      const timeline = messages
+        .map((m) => {
+          const action = m.assistant_action;
+          const body = m.content || action?.content || "";
+          const calls = action?.tool_calls?.length
+            ? "\n" + JSON.stringify(action.tool_calls, null, 2)
+            : "";
+          return (
+            m.role.toUpperCase() +
+            (m.tool_call_id ? " · " + m.tool_call_id : "") +
+            "\n" +
+            body +
+            calls
+          );
+        })
+        .join("\n\n");
+      return `${alias} · ${row.status} · quality ${fmt(row.score == null ? null : row.score * 100, 1)}/100\n\n${timeline || "No saved assistant messages."}`;
+    }
+    function update() {
+      if (!selected) return;
+      $("traceA").textContent = trace($("left").value);
+      $("traceB").textContent = trace($("right").value);
+    }
+    d.tasks.forEach((t, i) => {
+      const b = document.createElement("button");
+      b.textContent = `${i + 1}. ${t.instruction.slice(0, 180)}`;
+      b.onclick = () => {
+        selected = t;
+        $("detail").style.display = "block";
+        $("task").textContent = t.instruction;
+        update();
+        $("detail").scrollIntoView({ behavior: "smooth" });
+      };
+      $("tiles").append(b);
+    });
+    ["left", "right", "repeat"].forEach((id) => ($(id).onchange = update));
+  </script>
+</html>

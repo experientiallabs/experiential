@@ -189,6 +189,7 @@ def _resolved(
     context_window_tokens: int = 100_000,
     completion_pricing: bool = False,
     input_price: float | None = 1.0,
+    output_limit: int | None = 16_000,
 ) -> ResolvedModel:
     """Resolve one scripted model with optional complete finite-cost metadata.
 
@@ -198,6 +199,7 @@ def _resolved(
         context_window_tokens: Declared request context capacity.
         completion_pricing: Whether to declare completion eligibility and prices.
         input_price: Explicit input price, or ``None`` for an unknown-price test.
+        output_limit: Provider output capacity, or ``None`` when unpublished.
 
     Returns:
         Exact scripted runtime model.
@@ -208,7 +210,7 @@ def _resolved(
         capabilities=ModelCapabilities(
             supports_completions=True if completion_pricing else None,
             context_window_tokens=context_window_tokens,
-            maximum_output_tokens=16_000,
+            maximum_output_tokens=output_limit,
             input_cost_per_million_tokens_usd=input_price if completion_pricing else None,
             output_cost_per_million_tokens_usd=2.0 if completion_pricing else None,
             cached_input_cost_per_million_tokens_usd=0.5 if completion_pricing else None,
@@ -233,6 +235,8 @@ def _recorder(
     stop_on_overspend: bool = False,
     maximum_steps: int = 2,
     maximum_rollout_output_tokens: int = 1_000_000,
+    output_limit: int | None = 16_000,
+    world_model_json_object_output: bool = False,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -247,6 +251,8 @@ def _recorder(
         active_input_price: Active catalog input price for secure reservation tests.
         maximum_cost_usd: Reconciled provider-spend ceiling for the recorded cell.
         stop_on_overspend: Fail before the next paid dispatch once spend reaches the ceiling.
+        output_limit: Published candidate and world output limit, or ``None``.
+        world_model_json_object_output: Explicit frozen world-only JSON output control.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -257,6 +263,7 @@ def _recorder(
         context_window_tokens=candidate_context_window,
         completion_pricing=candidate_request is not None,
         input_price=active_input_price,
+        output_limit=output_limit,
     )
     if candidate_served_model_id is not None:
         candidate = replace(candidate, served_model_id=candidate_served_model_id)
@@ -266,6 +273,7 @@ def _recorder(
         "world-model-a",
         resolved_world_client or world_client,
         completion_pricing=world_request is not None,
+        output_limit=output_limit,
     )
     grounded = GroundedWorldModel(
         artifact_input=ArtifactInput(artifact_id="grounded-world-model", sha256="d" * 64),
@@ -304,6 +312,7 @@ def _recorder(
         maximum_steps=maximum_steps,
         maximum_rollout_output_tokens=maximum_rollout_output_tokens,
         maximum_output_tokens=16_000,
+        world_model_json_object_output=world_model_json_object_output,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
         token_counter=_Utf8Counter(),
@@ -311,13 +320,14 @@ def _recorder(
 
 
 def _completion_reservation(
-    alias: str, *, maximum_input_tokens: int = 80_000
+    alias: str, *, maximum_input_tokens: int = 80_000, maximum_output_tokens: int = 16_000
 ) -> CompletionCostReservation:
     """Return a complete one-attempt request reservation for a scripted alias.
 
     Args:
         alias: Exact candidate or world-model alias.
         maximum_input_tokens: Full request input ceiling.
+        maximum_output_tokens: Finite request output budget.
 
     Returns:
         Conservative completion request reservation.
@@ -330,7 +340,7 @@ def _completion_reservation(
         cache_write_usd_per_million_tokens=1.5,
         maximum_attempts=1,
         maximum_input_tokens=maximum_input_tokens,
-        maximum_output_tokens=16_000,
+        maximum_output_tokens=maximum_output_tokens,
     )
 
 
@@ -339,7 +349,10 @@ class _Utf8Counter:
         return len(request.model_dump_json().encode("utf-8"))
 
 
-def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> None:
+@pytest.mark.parametrize("json_output", [False, True])
+def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free(
+    json_output: bool,
+) -> None:
     """A visible candidate turn becomes one strict JSON world transition without hidden transfer."""
     candidate_snapshot = _snapshot("candidate-a")
     world_snapshot = _snapshot("world-model-a")
@@ -352,7 +365,7 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
             )
         ]
     )
-    recorder = _recorder(candidate_client, world_client)
+    recorder = _recorder(candidate_client, world_client, world_model_json_object_output=json_output)
 
     response = recorder.complete(
         ModelRequest(messages=(ModelMessage(role="user", content="My delivery is late."),))
@@ -361,6 +374,8 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
     assert response.output.content == "I can help."
     assert world_client.requests[0].tools == ()
     assert world_client.requests[0].tool_choice == "none"
+    assert world_client.requests[0].json_object_output is json_output
+    assert candidate_client.requests[0].json_object_output is False
     assert "candidate_hidden_reasoning" not in world_client.requests[0].model_dump_json()
     assert recorder.recorded.transitions[0].message == "What is your order number?"
     assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(
@@ -604,14 +619,19 @@ def test_candidate_reservation_failure_blocks_every_provider_call(
     assert world_client.requests == []
 
 
-def test_recorder_fails_context_preflight_and_explicit_length_stops_without_truncation() -> None:
+@pytest.mark.parametrize("output_limit", [None, 16_000])
+def test_recorder_fails_context_preflight_and_explicit_length_stops_without_truncation(
+    output_limit: int | None,
+) -> None:
     """Provider calls are blocked before overflow, while explicit provider length stops persist."""
     candidate_client = _ScriptedClient([])
     world_client = _ScriptedClient([])
-    overflow = _recorder(candidate_client, world_client, candidate_context_window=16_000)
+    overflow = _recorder(
+        candidate_client, world_client, candidate_context_window=16_000, output_limit=output_limit
+    )
 
     with pytest.raises(TextSimulationError) as overflow_error:
-        overflow.complete(ModelRequest(messages=(ModelMessage(role="user", content="short"),)))
+        overflow.complete(ModelRequest(messages=(ModelMessage(role="user", content="x" * 16_000),)))
 
     assert overflow_error.value.stop_reason == StopReason.CONTEXT_OVERFLOW
     assert candidate_client.requests == []
@@ -626,7 +646,7 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
             )
         ]
     )
-    length = _recorder(length_client, _ScriptedClient([]))
+    length = _recorder(length_client, _ScriptedClient([]), output_limit=output_limit)
 
     with pytest.raises(TextSimulationError) as length_error:
         length.complete(ModelRequest(messages=(ModelMessage(role="user", content="short"),)))
@@ -637,6 +657,39 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
         "output": {"content": "unfinished response", "tool_calls": []},
         "finish_reason": "length",
     }
+
+
+def test_unpublished_output_limits_dispatch_full_requests_within_context_and_reservations() -> None:
+    """Both completion roles work without an invented provider limit and keep exact inputs."""
+    candidate = _ScriptedClient(
+        [
+            _response("Done.", model=_snapshot("candidate-a")).model_copy(
+                update={
+                    "economics": OperationEconomics(usage=Usage(input_tokens=4, output_tokens=3))
+                }
+            )
+        ]
+    )
+    world = _ScriptedClient(
+        [_response('{"message":"Done.","terminal":true}', model=_snapshot("world-model-a"))]
+    )
+    recorder = _recorder(
+        candidate,
+        world,
+        candidate_context_window=10_000,
+        output_limit=None,
+        candidate_request=_completion_reservation(
+            "candidate-a", maximum_input_tokens=10_000, maximum_output_tokens=10_000
+        ),
+        world_request=_completion_reservation("world-model-a", maximum_input_tokens=100_000),
+    )
+    request = ModelRequest(messages=(ModelMessage(role="user", content="Complete the task."),))
+    recorder.complete(request)
+    assert candidate.requests[0].messages == request.messages
+    for dispatched, context in ((candidate.requests[0], 10_000), (world.requests[0], 100_000)):
+        assert dispatched.maximum_output_tokens is not None
+        assert _Utf8Counter().count(dispatched) + dispatched.maximum_output_tokens <= context
+    assert recorder.world_model_terminal
 
 
 def test_recorder_fails_closed_on_rebound_response_identity_but_allows_explicit_served_id() -> None:

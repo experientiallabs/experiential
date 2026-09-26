@@ -6,13 +6,11 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
-from io import StringIO
 from pathlib import Path
 
 import pytest
 from click import unstyle
 from pydantic import JsonValue
-from rich.console import Console
 from typer.testing import CliRunner
 
 import exp.cli.build.app as build_command
@@ -21,6 +19,7 @@ import exp.simulation.build as simulation_build
 from exp.cli.app import app
 from exp.cli.build.wizard import _prepare_new_build
 from exp.cli.providers.setup_test import _FakeLister as _SetupLister
+from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
@@ -374,7 +373,7 @@ def test_first_build_provider_flags_skip_the_opening_list(
             "--provider",
             "openai",
         ],
-        input="1\n\n1\n\n1\n\ny\n",
+        input="all\n\n1\n\n1\n\n1\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -387,12 +386,15 @@ def test_first_build_provider_flags_skip_the_opening_list(
     replay = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
+        input="\n" * 7 + "y\n",
     )
 
     assert replay.exit_code == 0, replay.output
     assert lister.requests == ["openai"]
     assert "Select the providers you want to use" not in unstyle(replay.output)
     assert "Model setup is required" not in unstyle(replay.output)
+    assert "Providers" in unstyle(replay.output)
+    assert "Models to configure" in unstyle(replay.output)
 
 
 def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path) -> None:
@@ -450,7 +452,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
-        input="/openai\n1\n\n1\n\n1\n\n2\n\ny\n",
+        input="/openai\n1\n\nall\n\n1\n\n1\n\n2\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -466,6 +468,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     replay = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
+        input="\n" * 7 + "y\n",
     )
 
     assert replay.exit_code == 0, replay.output
@@ -719,13 +722,13 @@ def test_build_package_upgrade_over_ceiling_preserves_selected_review(
     )
 
     assert blocked.exit_code == 2
-    assert "conservative embedding estimate $6.000000 exceeds" in unstyle(blocked.output)
+    assert "embedding estimate $6.00 exceeds the $5.00 budget" in unstyle(blocked.output)
     assert _RESOLVE_CALLS == []
     assert store.load_project().build == first_build
     assert store.read_review() == first_review
 
 
-def test_configured_budget_rejects_build_before_provider_resolution(
+def test_unconfirmed_budget_overrun_stops_before_provider_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -766,15 +769,14 @@ def test_configured_budget_rejects_build_before_provider_resolution(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root), "--yes"],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
     )
 
     assert result.exit_code == 2
     output = " ".join(unstyle(result.output).replace("│", " ").split())
-    assert "conservative estimate $1.00 exceeds the configured per-command budget" in output
+    assert "command estimate $1.00 exceeds the $0.50 budget" in output
     assert "$0.50" in output
-    assert "exp config budget 1.00" in output
-    assert "--yes cannot override" in output
+    assert "interactive terminal to proceed, or use --yes" in output
     assert provider_resolutions == []
     store = ProjectStore(root, "support")
     assert store.load_project().build is None
@@ -940,6 +942,42 @@ def test_interactive_build_uses_the_cost_specific_confirmation(
     assert "Authorize exp build support" in output
     assert "$0.75" in output
     assert "Proceed?" not in output
+
+
+@pytest.mark.parametrize("yes_flag", [False, True])
+def test_explicit_build_can_authorize_both_command_and_embedding_overruns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yes_flag: bool
+) -> None:
+    """Both budgets warn once and the approved estimate reaches the embedding provider."""
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 7.9447329)
+    monkeypatch.setattr(consent_module, "can_prompt", lambda _console: not yes_flag)
+    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    if yes_flag:
+        arguments.extend(["--yes", "--no-interactive"])
+
+    result = _RUNNER.invoke(app, arguments, input="y\n")
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(unstyle(result.output).split())
+    assert "command estimate $7.95 exceeds the $1.00 budget" in output
+    assert "embedding estimate $7.95 exceeds the $5.00 budget" in output
+    assert output.count("Proceed anyway") == (0 if yes_flag else 1)
+    assert _RESOLVE_CALLS == ["embed"]
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is not None
+    saved_budgets = store.load_project().budgets
+    assert saved_budgets is not None and float(saved_budgets.maximum_build_cost_usd) == 5.0
+
+    _RESOLVE_CALLS.clear()
+    replay = _RUNNER.invoke(app, arguments)
+    assert replay.exit_code == 0, replay.output
+    assert "Proceed anyway" not in replay.output
+    assert _RESOLVE_CALLS == []
 
 
 @pytest.mark.parametrize("failure_mode", ["cost", "grounded"])
@@ -1233,7 +1271,7 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
         write_model_catalog(path / "models.toml", catalog)
         return catalog
 
-    monkeypatch.setattr("exp.cli.build.app.run_provider_setup", configure)
+    monkeypatch.setattr("exp.cli.providers.setup.run_provider_setup", configure)
 
     result = _RUNNER.invoke(
         app,
@@ -1249,12 +1287,15 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
 
 def test_build_retains_active_positional_trace_consumer_but_rejects_project_option(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The hidden trace positional remains active while PROJECT stays positional.
 
     Args:
         tmp_path: Temporary project and trace root.
+        monkeypatch: Keep operator-owned local catalogs and projects outside the test.
     """
+    monkeypatch.chdir(tmp_path)
     source = _otlp_export(tmp_path)
     positional = _RUNNER.invoke(app, ["build", "support", str(source)])
     project_option = _RUNNER.invoke(
@@ -1308,7 +1349,7 @@ def test_build_preflight_auto_runs_without_proceed(tmp_path: Path) -> None:
     assert "world model  world (world-id)" in output
     assert "embedder     embed (embed-id)" in output
     assert "embedding    at most $" in output
-    assert "ceiling      $5.000000" in output
+    assert "budget       $5.000000" in output
     assert "Proceed?" not in output
     assert "serving index" in output
     assert "fit-only index" in output
@@ -1344,9 +1385,10 @@ def test_over_ceiling_build_fails_before_provider_construction(tmp_path: Path) -
 
     assert result.exit_code == 2
     output = " ".join(unstyle(result.output).replace("│", " ").split())
-    assert "conservative embedding estimate $" in output
-    assert "exceeds --max-build-cost-usd $0.010000" in output
-    assert "exp build support --traces" in output
+    assert "embedding estimate $" in output
+    assert "exceeds the $0.01 budget" in output
+    assert "exp build support" in output
+    assert "interactive terminal to proceed, or use --yes" in output
     assert "Proceed?" not in output
     assert _RESOLVE_CALLS == []
     store = ProjectStore(root, "support")
@@ -1491,7 +1533,7 @@ def test_wizard_preconsent_plan_persists_only_provider_free_unselected_evidence(
         maximum_build_cost_usd=5.0,
         code_revision="a" * 40,
         providers=(),
-        console=Console(file=StringIO(), force_terminal=False),
+        console=ScriptedConsole("\n" * 5 + "y\n"),
     )
 
     store = ProjectStore(root, "support")

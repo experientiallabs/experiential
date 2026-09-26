@@ -13,6 +13,7 @@ from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.router.automatic.service_test import _REVISION, _TIME, _RuntimeCatalog
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
+from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.transport import ProviderTransportError
 
 
@@ -26,6 +27,12 @@ class _FailingClient:
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Return a paid response that cannot be parsed as a judgment."""
+        if self._failure == "parameters":
+            raise ProviderParameterError(
+                message="temperature is incompatible with configured reasoning",
+                param="temperature",
+                code="invalid_parameter",
+            )
         response = self._delegate.complete(request)
         if self._failure == "transport":
             raise ProviderTransportError("connection reset by provider")
@@ -90,3 +97,25 @@ def test_judge_failure_has_durable_cost_and_never_redispatches(
     )
     assert replay == result
     assert len(state.completion_calls) == calls
+
+
+def test_judge_parameter_error_stops_without_excluding_cells(tmp_path: Path) -> None:
+    """A shared local request bug is actionable, rather than a failure for every candidate."""
+    project, catalog, state, prepared = _prepare(tmp_path)
+    failing = _FailingCatalog(catalog, state)
+    failing.failure = "parameters"
+    with pytest.raises(ValueError, match="judge request settings are invalid.*temperature"):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            cast(RuntimeModelCatalog, failing),
+            budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    assert not any(alias == "judge" for alias, _ in state.completion_calls)
+    assert not any(
+        project.artifacts.read(key).manifest.artifact_type == "judgment-exclusion"
+        for key in project.artifacts.list_ids()
+    )

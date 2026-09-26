@@ -57,6 +57,7 @@ def sync_account_models(
             provider=connection.provider,
             api_key=api_key,
             base_url=connection.base_url,
+            catalog="experiential",
         )
     )
     if not discovered:
@@ -92,6 +93,8 @@ def sync_account_models(
             model=item.model,
             billing_source=BillingSource.HOST_MANAGED,
             capabilities=resolved.capabilities,
+            supported_reasoning_efforts=item.supported_reasoning_efforts,
+            discovery=item,
         )
 
     sync_provider_models(

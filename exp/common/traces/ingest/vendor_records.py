@@ -115,7 +115,7 @@ def _decode_jsonl(
     """
     payloads: list[JsonValue] = []
     issues: list[TraceNormalizationIssue] = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    for line_number, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         try:

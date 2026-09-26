@@ -77,7 +77,7 @@ def router(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm an in-budget estimate when the shared policy requires it.",
+        help="Confirm the estimate, including any budget warning.",
     ),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
 ) -> None:
@@ -98,7 +98,7 @@ def router(
         maximum_concurrency: Maximum simulation workers.
         stop_on_overspend: Block the next paid dispatch once reconciled spend reaches the
             ceiling instead of warning and completing the authorized run.
-        yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
+        yes: Explicit confirmation for the estimate, including any budget warning.
         non_interactive: Refuse prompts and require complete repeatable inputs.
 
     Raises:

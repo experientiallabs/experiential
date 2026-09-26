@@ -6,9 +6,10 @@ import logging
 import math
 import os
 import stat
+import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -20,7 +21,7 @@ from pydantic import AwareDatetime, Field, ValidationError, field_validator, mod
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
 from exp.common.core.files import fsync_directory_best_effort
-from exp.common.core.locks import FileLockTimeout, file_write_lock
+from exp.common.core.locks import DEFAULT_LOCK_TIMEOUT_S, FileLockTimeout, file_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ class TextCellLeaseStore:
         self._stale_after = timedelta(seconds=stale_after_seconds)
         self._poll_interval_seconds = poll_interval_seconds
         self._wait_timeout_seconds = wait_timeout_seconds
+        self._admission_lock = threading.Lock()
 
     def acquire(
         self,
@@ -172,6 +174,7 @@ class TextCellLeaseStore:
         observed_spend_usd: Callable[[], float | None],
         stop_on_overspend: bool = False,
         cancelled: Callable[[], bool] | None = None,
+        reservation_cost_usd: float | None = None,
     ) -> TextCellLeaseClaim:
         """Atomically reserve one paid cell, or wait for its completed immutable artifact.
 
@@ -188,6 +191,7 @@ class TextCellLeaseStore:
             stop_on_overspend: When true, unknown or ceiling-reaching spend blocks admission;
                 by default the authorized run continues with a logged warning.
             cancelled: Optional cooperative cancellation probe checked before and during waits.
+            reservation_cost_usd: Optional frozen whole-cell bound enabling parallel admission.
 
         Returns:
             An owned claim, completed follower result, budget block, or stale recovery result.
@@ -197,6 +201,10 @@ class TextCellLeaseStore:
         """
         if maximum_cost_usd is not None and maximum_cost_usd <= 0:
             raise ValueError("text-cell maximum_cost_usd must be positive")
+        if reservation_cost_usd is not None and (
+            not math.isfinite(reservation_cost_usd) or reservation_cost_usd <= 0
+        ):
+            raise ValueError("cell reservation must be finite and positive")
         deadline = self._monotonic() + self._wait_timeout_seconds
         is_cancelled = (lambda: False) if cancelled is None else cancelled
         while True:
@@ -216,6 +224,7 @@ class TextCellLeaseStore:
                     rollout_completed=rollout_completed,
                     observed_spend_usd=observed_spend_usd,
                     stop_on_overspend=stop_on_overspend,
+                    reservation_cost_usd=reservation_cost_usd,
                     lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
                 )
             except FileLockTimeout:
@@ -230,6 +239,9 @@ class TextCellLeaseStore:
     def release(self, lease: TextCellLease) -> None:
         """Remove this owner's claim after its immutable rollout is safely persisted.
 
+        Lock or filesystem cleanup failures are logged and leave the claim intact. A later
+        admission reaps it using the authoritative rollout, without repeating provider work.
+
         Args:
             lease: Exact active claim obtained from ``acquire`` or its durable intent successor.
 
@@ -239,7 +251,7 @@ class TextCellLeaseStore:
         self._ensure_directory()
         path = self._path(lease.lease_id)
         try:
-            with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+            with self._admission_transaction():
                 existing = self._read_optional(path)
                 if existing is None:
                     return
@@ -249,7 +261,7 @@ class TextCellLeaseStore:
                         f"text-cell lease {lease.lease_id!r} changed before its owner released it"
                     )
                 self._reap(path, existing)
-        except OSError as exc:
+        except (OSError, FileLockTimeout) as exc:
             logger.warning(
                 "could not release text-cell lease %s after immutable rollout persistence: %s",
                 lease.lease_id,
@@ -296,7 +308,7 @@ class TextCellLeaseStore:
         self._ensure_directory()
         path = self._path(lease.lease_id)
         intended = lease.model_copy(update={"dispatch_intent_recorded": True})
-        with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+        with self._admission_transaction():
             existing = self._read_optional(path)
             if existing is None:
                 raise TextCellLeaseError(
@@ -324,14 +336,11 @@ class TextCellLeaseStore:
         observed_spend_usd: Callable[[], float | None],
         stop_on_overspend: bool,
         lock_timeout_seconds: float,
+        reservation_cost_usd: float | None = None,
     ) -> TextCellLeaseClaim | None:
         """Make one lock-protected admission attempt, returning ``None`` for a live follower."""
         self._ensure_directory()
-        with file_write_lock(
-            self._admission_path(),
-            what="text simulation cell admission",
-            timeout_s=lock_timeout_seconds,
-        ):
+        with self._admission_transaction(timeout_s=lock_timeout_seconds):
             path = self._path(lease_id)
             existing = self._read_optional(path)
             now = _aware_now(self._clock)
@@ -367,6 +376,7 @@ class TextCellLeaseStore:
                 observed_spend_usd=spend,
                 active_leases=active_leases,
                 stop_on_overspend=stop_on_overspend,
+                reservation_cost_usd=reservation_cost_usd,
             )
             if contended:
                 return None
@@ -388,6 +398,38 @@ class TextCellLeaseStore:
             self._write_exclusive(path, lease)
             return TextCellLeaseClaim(TextCellLeaseState.OWNED, lease, spend)
 
+    @contextmanager
+    def _admission_transaction(
+        self, *, timeout_s: float = DEFAULT_LOCK_TIMEOUT_S
+    ) -> Iterator[None]:
+        """Queue local metadata writers before the bounded cross-process lock.
+
+        Local workers wake directly when their predecessor exits instead of repeatedly
+        polling the file lock while newer workers acquire it. Both waits share one deadline.
+        No provider call runs under either lock.
+
+        Args:
+            timeout_s: Combined local and cross-process lock wait allowance.
+
+        Yields:
+            None while both metadata locks are held.
+
+        Raises:
+            FileLockTimeout: Another metadata writer holds either lock past the deadline.
+        """
+        deadline = time.monotonic() + timeout_s
+        if not self._admission_lock.acquire(timeout=timeout_s):
+            raise FileLockTimeout("local text simulation metadata is busy; retry the operation")
+        try:
+            with file_write_lock(
+                self._admission_path(),
+                what="text simulation cell admission",
+                timeout_s=max(0.0, deadline - time.monotonic()),
+            ):
+                yield
+        finally:
+            self._admission_lock.release()
+
     def _reserve_budget(
         self,
         *,
@@ -395,6 +437,7 @@ class TextCellLeaseStore:
         observed_spend_usd: float | None,
         active_leases: tuple[TextCellLease, ...],
         stop_on_overspend: bool,
+        reservation_cost_usd: float | None = None,
     ) -> tuple[float | None, bool]:
         """Reserve budget for one paid cell under the selected overspend policy.
 
@@ -403,8 +446,8 @@ class TextCellLeaseStore:
         spend unknown, the cell is admitted with a logged warning and a conservative
         whole-budget reservation. In stop mode unknown or ceiling-reaching spend yields no
         reservation, so the caller blocks the cell instead of dispatching it. Finite-budget
-        cells serialize on live reservations in both modes so spend reconciliation stays
-        exact.
+        cells without a per-cell reservation serialize. Stop-mode cells with frozen
+        reservations can overlap while the total reserved and observed spend stays in budget.
         """
         if maximum_cost_usd is None:
             return None, False
@@ -420,6 +463,12 @@ class TextCellLeaseStore:
         if stop_on_overspend:
             if observed_spend_usd is None:
                 return None, False
+            if reservation_cost_usd is not None:
+                reserved = math.fsum(lease.reserved_cost_usd or 0 for lease in active_leases)
+                available = maximum_cost_usd - observed_spend_usd - reserved
+                if reservation_cost_usd <= available + 1e-9:
+                    return reservation_cost_usd, False
+                return None, bool(active_leases)
             if active_leases:
                 return None, True
             remaining_ceiling = maximum_cost_usd - observed_spend_usd

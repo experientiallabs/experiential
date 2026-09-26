@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Literal, cast
 
 from exp.common.models import ModelClient, ModelFinishReason, ModelMessage, ModelRequest, Usage
 from exp.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
@@ -63,6 +64,21 @@ class ChatAgentRuntime:
             if self._system_prompt is not None
             else []
         )
+        captured = task.initial_context.get("instruction_messages", [])
+        if isinstance(captured, list):
+            for instruction in captured:
+                if isinstance(instruction, dict) and instruction.get("role") in (
+                    "system",
+                    "developer",
+                ):
+                    content = instruction.get("content")
+                    if isinstance(content, str):
+                        messages.append(
+                            ModelMessage(
+                                role=cast(Literal["system", "developer"], instruction["role"]),
+                                content=content,
+                            )
+                        )
         messages.append(ModelMessage(role="user", content=_task_prompt(task)))
         events: list[RolloutSpan] = []
         usages: list[Usage] = []
@@ -170,7 +186,15 @@ def _task_prompt(task: TaskCase) -> str:
         return task.instruction
     import json
 
-    context = json.dumps(task.initial_context, sort_keys=True, separators=(",", ":"))
+    context = json.dumps(
+        {
+            key: value
+            for key, value in task.initial_context.items()
+            if key != "instruction_messages"
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return f"{task.instruction}\n\nInitial context:\n{context}"
 
 

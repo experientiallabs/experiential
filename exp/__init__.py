@@ -141,6 +141,7 @@ if TYPE_CHECKING:
     from exp.optimize.router.spend import ProviderSpendLedger as ProviderSpendLedger
     from exp.optimize.router.spend import ProviderSpendStatus as ProviderSpendStatus
     from exp.runtime.models import RuntimeModelCatalog as RuntimeModelCatalog
+    from exp.runtime.models.budget import SpendLimitReached as SpendLimitReached
     from exp.runtime.router.economics import (
         BillingSourceEconomics as BillingSourceEconomics,
     )
@@ -197,6 +198,7 @@ _EXPORT_MODULES = {
     "PreparedModelEvaluation": "exp.optimize.evaluation.prepare",
     "prepare_model_evaluation": "exp.optimize.evaluation.prepare",
     "run_prepared_model_evaluation": "exp.optimize.evaluation.runtime",
+    "SpendLimitReached": "exp.runtime.models.budget",
     "ModelEvaluationResult": "exp.optimize.evaluation.service",
     "evaluate_models": "exp.optimize.evaluation.service",
     "ManualJudgeSetupPlan": "exp.optimize.router.judging.service",

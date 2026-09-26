@@ -60,20 +60,20 @@ _PROVIDER_OPTION = typer.Option(
 )
 
 
-@config_app.command("budget", help="View or set the maximum cost allowed for one command.")
+@config_app.command("budget", help="View or set the budget warning threshold for one command.")
 def config_budget(
     maximum_cost_usd: float | None = typer.Argument(
         None,
         min=0,
         metavar="USD",
-        help="Finite nonnegative per-command ceiling. Omit to show the current value.",
+        help="Finite nonnegative warning threshold. Omit to show the current value.",
     ),
     root: Path = ROOT_OPTION,
 ) -> None:
-    """View or persist the user-owned per-command cost ceiling.
+    """View or persist the user-owned per-command budget warning threshold.
 
     Args:
-        maximum_cost_usd: Optional finite nonnegative ceiling in USD.
+        maximum_cost_usd: Optional finite nonnegative warning budget in USD.
         root: EXP artifact root containing ``settings.toml``.
 
     Raises:

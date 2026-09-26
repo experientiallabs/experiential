@@ -40,9 +40,12 @@ from exp.simulation.retrieval.contracts import (
 )
 from exp.simulation.retrieval.embedding import (
     RAGEmbedderBinding,
+    RAGEmbeddingCache,
     default_rag_embedder,
     embed_rag_texts,
 )
+from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
+from exp.simulation.retrieval.embedding_inputs import embedding_chunk_bytes
 from exp.simulation.retrieval.transitions import extract_real_transitions
 
 
@@ -68,11 +71,15 @@ def persist_trace_rag(
     default_top_k: int = 5,
     included_partitions: frozenset[Literal["fit", "held_out"]] = frozenset({"fit"}),
     progress: ProgressHook | None = None,
+    embedding_cache: RAGEmbeddingCache | None = None,
 ) -> PersistedRAGIndex:
     """Build a read-only index from selected partitions of real imported traces.
 
     Trace count is not a product restriction. Roughly 100 to 1,000 traces is a useful common
     starting range, but one trace and corpora larger than 1,000 follow the same contract.
+    Completed embedding batches are checkpointed under the project runtime directory before
+    progress advances. A restarted build reuses them; an interrupted uncommitted request may
+    still be sent again.
 
     Args:
         store: Project-local immutable artifact store.
@@ -87,6 +94,7 @@ def persist_trace_rag(
         included_partitions: Frozen lineage partitions eligible for this index. Fit-only indexes
             use ``{"fit"}``; serving indexes use both real-evidence partitions.
         progress: Optional observer of embedding and index-persistence stages.
+        embedding_cache: Optional same-invocation cache for reusing exact component vectors.
 
     Returns:
         The immutable envelope, manifest, observed transitions, and persisted vectors.
@@ -113,9 +121,17 @@ def persist_trace_rag(
             "verified included traces contain no real action-to-subsequent-observation transitions"
         )
     binding = embedder or default_rag_embedder()
-    report(progress, "embeddings", completed=0, total=len(transitions))
-    embedded = embed_rag_texts(binding, tuple(item.key_text for item in transitions))
-    report(progress, "embeddings", completed=len(transitions), total=len(transitions))
+    chunk_bytes = embedding_chunk_bytes(binding.maximum_input_tokens)
+    embedded = embed_rag_texts(
+        binding,
+        tuple(item.key_text for item in transitions),
+        cache=embedding_cache,
+        maximum_chunk_bytes=chunk_bytes,
+        progress=progress,
+        checkpoint=RAGEmbeddingCheckpoint(
+            store.project_directory, binding.snapshot, maximum_chunk_bytes=chunk_bytes
+        ),
+    )
     report(progress, "RAG")
     vectors = tuple(
         RAGVector(transition_id=transition.transition_id, values=values)
@@ -143,6 +159,7 @@ def persist_trace_rag(
         "default_top_k": default_top_k,
         "embedder": binding.snapshot.model_dump(mode="json"),
         "embedding_dimension": dimensions,
+        "embedding_chunk_bytes": chunk_bytes,
         "fit_lineage_ids": list(fit_lineages),
         "included_lineage_ids": list(included_lineages),
         "included_partitions": sorted(included_partitions),
@@ -173,6 +190,7 @@ def persist_trace_rag(
         included_lineage_ids=included_lineages,
         included_partitions=tuple(sorted(included_partitions)),
         embedding_dimension=dimensions,
+        embedding_chunk_bytes=chunk_bytes,
         transition_count=len(transitions),
         default_top_k=default_top_k,
     )

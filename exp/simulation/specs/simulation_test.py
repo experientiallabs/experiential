@@ -64,6 +64,11 @@ def test_world_model_spec_binds_rollout_budget_and_continuation_identity() -> No
 
     assert parsed.model_dump(mode="json") == payload
     assert parsed.world_model is not None
+    assert parsed.world_model.json_object_output is False
+    json_world = parsed.world_model.model_copy(update={"json_object_output": True})
+    assert simulation_spec_digest(parsed) != simulation_spec_digest(
+        parsed.model_copy(update={"world_model": json_world})
+    )
     assert set(parsed.world_model.model_dump(mode="json")) == {
         "world_model_alias",
         "grounded_world_model_input",

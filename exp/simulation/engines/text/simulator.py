@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -35,7 +36,9 @@ from exp.common.rollouts import (
 from exp.runtime.agents import AgentRuntime
 from exp.runtime.agents.factory import is_builtin_chat_factory
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.budget import RequestBudget, SpendLimitReached
 from exp.simulation.engines.clock import timestamp, utc_now
+from exp.simulation.engines.text import dispatch
 from exp.simulation.engines.text.artifact_set import persist_artifact_set
 from exp.simulation.engines.text.bindings import (
     SimulationResolution,
@@ -72,12 +75,10 @@ from exp.simulation.engines.text.leases import (
     TextCellLeaseState,
     TextCellLeaseStore,
 )
-from exp.simulation.engines.text.lineage_spend import lineage_spend, prefix_retry_credit
+from exp.simulation.engines.text.lineage_spend import prefix_retry_credit, resolution_spend
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
-    TokenCounter,
-    Utf8UpperBoundTokenCounter,
     text_prompt_digest,
 )
 from exp.simulation.engines.text.redaction import redact_rollout_secrets, redacted_field_set
@@ -86,7 +87,6 @@ from exp.simulation.engines.text.resume import (
     ResumePins,
     load_optional_rollout,
     load_rollout,
-    persisted_cell_attempts,
     resolve_cell_attempt,
     validate_resume_rollout,
     verify_persisted_evaluation_plan,
@@ -100,6 +100,7 @@ from exp.simulation.engines.text.rollout_support import (
     orchestration_economics,
 )
 from exp.simulation.engines.text.spec_persistence import persist_canonical_specification
+from exp.simulation.engines.text.tokens import TokenCounter, Utf8UpperBoundTokenCounter
 from exp.simulation.orchestration import require_implemented_mode
 from exp.simulation.retrieval import TraceRAGRetriever
 from exp.simulation.specs import SimulationSpec
@@ -116,23 +117,6 @@ class WorldModelSimulator:
     persists one immutable rollout per selected cell, never exposes a mutable world-model session,
     sends no tools to the world model, and records candidate economics apart from simulator cost.
 
-    Args:
-        store: Immutable local artifact store receiving specifications and rollout artifacts.
-        evaluation_plan: Frozen plan whose explicit simulated cells may be selected.
-        evaluation_plan_input: Verified persisted-plan manifest reference.
-        task_set_input: Verified full immutable task-set manifest reference.
-        fit_rag_input: Exact completed fit-only RAG manifest reference.
-        fit_retriever: Read-only retriever bound to ``fit_rag_input`` and its exact embedder.
-        candidate_models: Independently resolved candidate models keyed by plan alias.
-        world_models: Independently resolved world-model providers keyed by local alias.
-        grounded_world_models: Artifact-bound fit-only executors keyed by world-model alias.
-        agent_factory: Creates an isolated customer-agent runtime for each episode worker.
-        completion_contract_input: Optional exact automatic-simulation reservation artifact.
-        redacted_field_names: Project-configured labels removed before evidence persists.
-        clock: Time source for artifact and span timestamps.
-        monotonic: Monotonic time source for orchestration latency measurements.
-        token_counter: Optional full-request preflight counter. The default never truncates input.
-        progress: Optional observer of exact per-cell completion counts.
     """
 
     def __init__(
@@ -154,6 +138,7 @@ class WorldModelSimulator:
         monotonic: Callable[[], float] = time.monotonic,
         token_counter: TokenCounter | None = None,
         progress: ProgressHook | None = None,
+        request_budget: RequestBudget | None = None,
     ) -> None:
         """Bind one immutable plan and all explicit runtime dependencies.
 
@@ -174,6 +159,7 @@ class WorldModelSimulator:
             monotonic: Duration source, injectable for deterministic tests.
             token_counter: Full-request counter used before each provider call.
             progress: Optional observer of exact per-cell completion counts.
+            request_budget: Optional shared request admission and replay ledger.
 
         Raises:
             SimulationConfigurationError: The supplied plan input does not name this plan.
@@ -203,6 +189,7 @@ class WorldModelSimulator:
         self._monotonic = monotonic
         self._token_counter = token_counter or Utf8UpperBoundTokenCounter()
         self._progress = progress
+        self._request_budget = request_budget
         self._rollout_builder = GroundedRolloutBuilder(
             plan_input=self._plan_input,
             task_set_input=self._task_set_input,
@@ -256,8 +243,22 @@ class WorldModelSimulator:
 
         observe_cells = cell_progress_reporter(self._progress, cells, completed)
         observe_cells()
-        for cell in pending:
-            completed[cell.cell_id] = self._execute_and_persist_cell(
+        if self._request_budget is not None:
+            workers = spec.maximum_concurrency
+        else:
+            workers = dispatch.worker_count(
+                spec,
+                pending,
+                self._completion_contract,
+                self._tasks,
+                resolution_spend(
+                    self._store, self._plan.cells, bindings, self._pins(resolution_input)
+                ),
+            )
+
+        def execute(cell: EvaluationCell) -> RolloutArtifact:
+            """Claim and persist a cell under the shared reservation ledger."""
+            return self._execute_and_persist_cell(
                 spec,
                 cell,
                 world_model,
@@ -266,8 +267,16 @@ class WorldModelSimulator:
                 resolution,
                 resolution_input,
                 bindings,
+                parallel_admission=workers > 1,
             )
-            observe_cells()
+
+        dispatch.dispatch_cells(
+            pending,
+            workers=workers,
+            execute=execute,
+            completed=completed,
+            observe=observe_cells,
+        )
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
         return persist_artifact_set(
             store=self._store,
@@ -530,6 +539,8 @@ class WorldModelSimulator:
         resolution: SimulationResolution,
         resolution_input: ArtifactInput,
         bindings: Mapping[ArtifactId, SimulationCellBinding],
+        *,
+        parallel_admission: bool,
     ) -> RolloutArtifact:
         """Claim, execute, and persist one cell within the reconciled budget remainder.
 
@@ -542,6 +553,7 @@ class WorldModelSimulator:
             resolution: Immutable resolution owning the cell binding.
             resolution_input: Exact resolution manifest pointer.
             bindings: Complete bindings for every selected cell.
+            parallel_admission: Whether this dispatch can reserve whole cells concurrently.
 
         Returns:
             Newly persisted or exactly replayed rollout evidence.
@@ -563,10 +575,26 @@ class WorldModelSimulator:
                 simulation_id=spec.simulation_id,
                 rollout_id=rollout_id,
                 binding_sha256=binding_digest(binding),
-                maximum_cost_usd=spec.maximum_cost_usd,
+                maximum_cost_usd=(None if self._request_budget else spec.maximum_cost_usd),
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
-                observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
+                # The request ledger owns spend admission for evals. Re-reading every
+                # rollout under this shared cell lock can starve sibling workers.
+                observed_spend_usd=lambda: (
+                    None
+                    if self._request_budget is not None
+                    else resolution_spend(self._store, self._plan.cells, bindings, pins)
+                ),
                 stop_on_overspend=spec.stop_on_overspend,
+                reservation_cost_usd=(
+                    dispatch.cell_reservation(
+                        spec,
+                        cell,
+                        self._completion_contract,
+                        has_tools=bool(self._tasks[cell.task_id].tools),
+                    )
+                    if parallel_admission and self._request_budget is None
+                    else None
+                ),
             )
         except TextCellLeaseError as exc:
             raise SimulationResumeError(
@@ -603,42 +631,37 @@ class WorldModelSimulator:
             raise SimulationResumeError("owned text-cell admission omitted its durable lease")
         try:
             observed_spend = claim.observed_spend_usd or 0.0
-            maximum_cell_cost_usd = (spec.maximum_cost_usd or 0.0) - observed_spend
-            rollout = self._execute_cell(
-                spec,
-                cell,
-                world_model,
-                grounded_world_model,
-                binding,
-                resolution_input,
-                maximum_cell_cost_usd=maximum_cell_cost_usd,
-                attempt=attempt,
+            maximum_cell_cost_usd = claim.lease.reserved_cost_usd or (
+                (spec.maximum_cost_usd or 0.0) - observed_spend
             )
+            context = (
+                self._request_budget.scope(f"{binding_digest(binding)}:{attempt}")
+                if self._request_budget is not None
+                else nullcontext()
+            )
+            with context:
+                rollout = self._execute_cell(
+                    spec,
+                    cell,
+                    world_model,
+                    grounded_world_model,
+                    binding,
+                    resolution_input,
+                    maximum_cell_cost_usd=maximum_cell_cost_usd,
+                    attempt=attempt,
+                )
             persisted = self._persist_rollout(
                 rollout, cell, binding, resolution_input, attempt=attempt
             )
+        except SpendLimitReached:
+            # No request was dispatched at this boundary. Completed provider responses
+            # are fsync-backed in the request ledger and replay on the next launch.
+            self._leases.release(claim.lease)
+            raise
         except BaseException:
             raise
         self._leases.release(claim.lease)
         return persisted
-
-    def _known_resolution_spend(
-        self,
-        bindings: Mapping[ArtifactId, SimulationCellBinding],
-        resolution_input: ArtifactInput,
-    ) -> float | None:
-        """Return conservative provider spend or unknown when one bound cell is unpriced.
-
-        Every persisted attempt of every bound cell counts, so a superseded unknown-spend
-        failure keeps charging its worst-case reservation while its re-execution is admitted
-        under whatever ceiling remains.
-        """
-        rollouts: list[RolloutArtifact] = []
-        pins = self._pins(resolution_input)
-        for cell_id, binding in bindings.items():
-            cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
-            rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
-        return lineage_spend(self._store, rollouts)
 
     def _execute_cell(
         self,
@@ -729,6 +752,7 @@ class WorldModelSimulator:
             maximum_steps=spec.maximum_steps,
             maximum_rollout_output_tokens=spec.maximum_rollout_output_tokens,
             maximum_output_tokens=settings.maximum_output_tokens,
+            world_model_json_object_output=settings.json_object_output,
             redacted_field_names=self._redacted_field_names,
             clock=self._clock,
             token_counter=self._token_counter,

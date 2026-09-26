@@ -267,7 +267,7 @@ def _normalize_jsonl(
     profile_payloads: list[JsonValue] = []
     profile_eligible = True
     issues: list[TraceNormalizationIssue] = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    for line_number, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         try:

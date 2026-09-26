@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,13 +20,14 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.prompt import Confirm
 
-from exp.cli.providers.declaration import merge_declared_models
+from exp.cli.providers.declaration import declare_role_metadata, merge_declared_models
 from exp.cli.providers.model_picker import (
     RoleAssignment,
     assign_roles,
     available_models,
     build_result,
     configured_models,
+    model_selection,
     recommendation_key,
     render_summary,
     select_models,
@@ -92,6 +93,7 @@ def run_provider_setup(
     console: Console,
     lister: ProviderModelLister | None = None,
     offer_recommended_defaults: bool = False,
+    validate_setup: Callable[[ProviderSetup], None] | None = None,
 ) -> ModelCatalog:
     """Collect a complete catalog update before one conflict-checked atomic write.
 
@@ -103,6 +105,7 @@ def run_provider_setup(
         console: Rich console used for prompts, summaries, and guidance.
         lister: Provider listing seam, injected by tests so no live request is made.
         offer_recommended_defaults: Whether verified discovery may fill every safe role at once.
+        validate_setup: Optional caller validation applied before any catalog write.
 
     Returns:
         The complete catalog committed after final confirmation.
@@ -110,6 +113,7 @@ def run_provider_setup(
     Raises:
         typer.BadParameter: Structured input is invalid or incomplete.
         typer.Abort: Interactive collection is cancelled or reaches EOF.
+        ValueError: Caller validation rejects the collected setup without saving it.
     """
     path = root / "models.toml"
     starting_digest = catalog_state_sha256(path)
@@ -123,6 +127,8 @@ def run_provider_setup(
             setup = _noninteractive_setup(options, existing=existing)
         except (EOFError, KeyboardInterrupt):
             raise typer.Abort() from None
+        if validate_setup is not None:
+            validate_setup(setup)
         return configure_provider_catalog(
             path,
             setup,
@@ -143,6 +149,8 @@ def run_provider_setup(
     )
     if result is None:
         raise typer.Abort()
+    if validate_setup is not None:
+        validate_setup(result.setup)
     return _commit(path, result, replace=replace, expected_state_sha256=starting_digest)
 
 
@@ -182,7 +190,15 @@ def _interactive_setup(
         connection_providers=existing_connection_providers,
         retainable_roles=retainable_roles,
     )
-    session = SetupSession(selected=tuple(model.alias for model in configured))
+    role_aliases = {
+        role_inputs.world_model,
+        role_inputs.judge,
+        role_inputs.embedder,
+        *role_inputs.candidates,
+    }
+    session = SetupSession(
+        selected=tuple(model.alias for model in configured if model.alias in role_aliases)
+    )
     skip_opening_list = bool(explicit_providers)
     if explicit_providers:
         session.providers, session.advanced_models = explicit_provider_selection(explicit_providers)
@@ -423,12 +439,10 @@ def _collect_models_and_roles(
     role_inputs: SetupRoleInputs,
     console: Console,
 ) -> ProviderSetupResult | None:
-    """Run the role-first assignment and confirmation screens for one prepared provider set.
+    """Select a model pool, assign build roles, and confirm the provider configuration.
 
-    Discovered models go straight to one picker per role. Identity-only OpenAI-compatible
-    models stay visible; assigning one collects an explicit capability and price declaration.
-    Providers whose model IDs must be declared by hand first run the model-declaration screen,
-    then the same role pickers. Only the models actually assigned a role are persisted.
+    The model screen accepts multiple selections from each provider. All selected models
+    are retained for evaluation, including those not assigned a build role.
 
     Args:
         session: Answers already collected in this setup session.
@@ -444,25 +458,19 @@ def _collect_models_and_roles(
         SetupCancelled: The user cancelled setup or declined to save.
     """
     while True:
-        if session.advanced_models:
-            selected = select_models(session, console=console)
-            if selected is None:
-                return None
-            session.selected = selected
-            pool = tuple(item for item in available_models(session) if item.alias in selected)
-        else:
-            pool = available_models(session)
+        selected = select_models(session, console=console)
+        if selected is None:
+            return None
+        session.selected = selected
+        pool = tuple(item for item in available_models(session) if item.alias in selected)
         roles = assign_roles(pool, role_inputs=role_inputs, console=console)
         if roles is None:
-            if session.advanced_models:
-                continue
-            return None
-        used = {roles.world_model, roles.judge, roles.embedder, *roles.candidates}
-        chosen = tuple(
-            item
-            for item in merge_declared_models(pool, roles.declared_models)
-            if item.alias in used
+            continue
+        chosen = _complete_selected_metadata(
+            merge_declared_models(pool, roles.declared_models), console=console
         )
+        if chosen is None:
+            continue
         result = build_result(
             chosen,
             roles=roles,
@@ -474,6 +482,30 @@ def _collect_models_and_roles(
         if not Confirm.ask("Save this configuration?", default=True, console=console):
             raise SetupCancelled
         return result
+
+
+def _complete_selected_metadata(
+    chosen: tuple[AvailableModel, ...], *, console: Console
+) -> tuple[AvailableModel, ...] | None:
+    """Collect missing setup fields for selected new aliases, including unused models."""
+    complete = []
+    for item in chosen:
+        if not item.configured:
+            try:
+                model_selection(item)
+            except ValueError:
+                role = (
+                    SetupRole.EMBEDDER
+                    if (item.capabilities is not None and item.capabilities.supports_embeddings)
+                    or (item.published is not None and item.published.supports_embeddings is True)
+                    else SetupRole.WORLD_MODEL
+                )
+                declared = declare_role_metadata(item, role, console=console)
+                if declared is None:
+                    return None
+                item = declared
+        complete.append(item)
+    return tuple(complete)
 
 
 def _commit(

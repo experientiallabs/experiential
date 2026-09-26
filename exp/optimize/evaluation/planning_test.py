@@ -41,20 +41,17 @@ def test_quote_bounds_parallel_tool_retrieval_by_worker_output_capacity(
         project.artifacts, setup.simulation_completion_input.artifact_id
     )
     queries_per_step = sum(
-        request.request.maximum_output_tokens if tools else 1
+        min(
+            request.request.maximum_output_tokens * setup.maximum_steps,
+            setup.maximum_rollout_output_tokens,
+        )
+        if tools
+        else setup.maximum_steps
         for request in completion.candidate_requests
     )
-    expected = (
-        prepared.cost.scenario_count
-        * setup.maximum_steps
-        * queries_per_step
-        * unit.value
-        * MAXIMUM_CELL_ATTEMPTS
-    )
+    expected = prepared.cost.scenario_count * queries_per_step * unit.value * MAXIMUM_CELL_ATTEMPTS
     assert prepared.cost.retrieval.maximum_cost_usd == pytest.approx(expected)
-    assert prepared.cost.retrieval.estimated_cost_usd == pytest.approx(
-        prepared.cost.scenario_count * setup.maximum_steps * prepared.cost.worker_count * unit.value
-    )
+    assert 0 < prepared.cost.retrieval.estimated_cost_usd < expected
 
 
 def test_evaluation_quote_is_read_only_and_prices_every_stage(tmp_path: Path) -> None:
@@ -92,6 +89,7 @@ def test_evaluation_quote_is_read_only_and_prices_every_stage(tmp_path: Path) ->
     )
     assert changed.quote_sha256 != quote.quote_sha256
     assert changed.maximum_cost_usd > quote.maximum_cost_usd
+    assert changed.estimated_cost_usd == quote.estimated_cost_usd
 
 
 def test_quote_refuses_unbound_or_wrong_judge_pricing(tmp_path: Path) -> None:
@@ -116,3 +114,53 @@ def test_quote_refuses_calibration_status_drift(tmp_path: Path) -> None:
             setup.model_copy(update={"judgment_status": "human_calibrated"}),
             judge_request=_completion_reservation("judge-model"),
         )
+
+
+def test_expected_cost_tracks_repeats_not_unused_rollout_limits(tmp_path: Path) -> None:
+    """A large output allowance cannot masquerade as expected consumption on every turn."""
+    project, _, _, prepared = _prepare(tmp_path)
+    setup = prepared.setup.model_copy(update={"maximum_steps": 100})
+    quote = estimate_model_evaluation(project, setup, judge_request=prepared.judge_request)
+    larger = estimate_model_evaluation(
+        project,
+        setup.model_copy(
+            update={
+                "maximum_steps": 1000,
+                "maximum_rollout_output_tokens": 10_000_000,
+            }
+        ),
+        judge_request=prepared.judge_request,
+    )
+    assert larger.estimated_cost_usd == quote.estimated_cost_usd
+    repeated = estimate_model_evaluation(
+        project, setup.model_copy(update={"repeats": 3}), judge_request=prepared.judge_request
+    )
+    assert repeated.estimated_cost_usd == pytest.approx(3 * quote.estimated_cost_usd)
+    assert quote.measured_turns == 0
+    assert quote.captured_turns == 6
+
+
+def test_cumulative_output_bound_keeps_unknown_retry_output_reserved(tmp_path: Path) -> None:
+    """The cumulative success budget does not erase potentially billed failed provider attempts."""
+    project, _, _, prepared = _prepare(tmp_path)
+    setup = prepared.setup.model_copy(
+        update={"maximum_steps": 100, "maximum_rollout_output_tokens": 1000}
+    )
+    quote = estimate_model_evaluation(project, setup, judge_request=prepared.judge_request)
+    assert setup.simulation_completion_input is not None
+    contract, _ = load_simulation_completion_contract(
+        project.artifacts, setup.simulation_completion_input.artifact_id
+    )
+    retry_output = (
+        sum(
+            100
+            * (item.request.maximum_attempts - 1)
+            * 1000
+            * item.request.output_usd_per_million_tokens
+            / 1_000_000
+            for item in contract.candidate_requests
+        )
+        * quote.scenario_count
+        * MAXIMUM_CELL_ATTEMPTS
+    )
+    assert quote.workers.maximum_cost_usd >= retry_output

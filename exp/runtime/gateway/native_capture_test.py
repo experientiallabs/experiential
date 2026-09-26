@@ -239,6 +239,57 @@ def test_wide_number_in_invalid_context_fails_closed_without_panicking() -> None
     assert collector.close(1)
 
 
+def test_retained_async_handoffs_keep_native_batching() -> None:
+    """A paused destination drains admitted records in batches without losing any."""
+    entered, release = threading.Event(), threading.Event()
+    batches: list[tuple[str, ...]] = []
+
+    def write(records: tuple[str, ...]) -> list[bool]:
+        """Hold the first write while every remaining request hands off independently."""
+        entered.set()
+        assert release.wait(3)
+        batches.append(records)
+        return [True] * len(records)
+
+    configuration = CaptureConfiguration(
+        asynchronous_delivery=True,
+        maximum_pending_records=12,
+        delivery=CaptureDeliveryLimits(maximum_records=8),
+    )
+    collector = native.CaptureCollector.batched(configuration.model_dump_json(), write)
+    expected = {f"batch-{index}" for index in range(12)}
+    for index in range(12):
+        request = json.loads(_request_json())
+        request["request_id"] = f"batch-{index}"
+        assert collector.begin(json.dumps(request))
+
+    def handoff() -> None:
+        """Complete more records than the destination queue can currently accept."""
+        for index in range(1, 12):
+            collector.settle(f"batch-{index}", True, False)
+
+    producer = threading.Thread(target=handoff)
+    try:
+        collector.settle("batch-0", True, False)
+        assert entered.wait(1)
+        producer.start()
+        producer.join(1)
+        assert not producer.is_alive()
+        assert collector.counts()[0] == 12
+        assert not collector.close(0)
+    finally:
+        release.set()
+        if producer.ident is not None:
+            producer.join(3)
+        assert collector.close(3)
+    assert any(len(batch) > 1 for batch in batches)
+    assert {
+        json.loads(value)["request"]["request_id"] for batch in batches for value in batch
+    } == expected
+    assert sum(map(len, batches)) == len(expected)
+    assert collector.counts() == (0, 0, len(expected), 0, 0, 0)
+
+
 @pytest.mark.parametrize("asynchronous_delivery", [False, True])
 def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
     capfd: pytest.CaptureFixture[str],
@@ -860,7 +911,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
 @pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages", "responses-ws"])
 @pytest.mark.parametrize("ending", ["disconnect", "deadline"])
 @pytest.mark.parametrize("retention", ["discard", "prompt", "response"])
-@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(("asynchronous", "blocked"), [(False, True), (True, True), (True, False)])
 def test_pending_checkpoint_does_not_pin_transport_or_settlement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -868,9 +919,13 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
     ending: str,
     retention: str,
     asynchronous: bool,
+    blocked: bool,
 ) -> None:
     """A refused sink keeps capture ownership, not the request's transport or reserved attempt."""
     provider_closed, write_attempted, allow_write, settled = (threading.Event() for _ in range(4))
+    if not blocked:
+        # Control arm: asynchronous deadline behavior must match a healthy sink.
+        allow_write.set()
     calls: list[str] = []
 
     class Provider(BaseHTTPRequestHandler):
@@ -915,8 +970,8 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
     )
     collector = native.CaptureCollector(configuration.model_dump_json(), persist)
     if asynchronous:
-        # Queue-only mode advances after admission, so occupy its sole delivery slot
-        # to test a cancellable checkpoint capacity wait rather than an ordinary stream timeout.
+        # Occupy the sole delivery slot. Admitted async requests must still
+        # expose output while their checkpoint remains owned behind that slot.
         assert collector.begin(_request_json())
         collector.settle("request", True, False)
         assert write_attempted.wait(2)
@@ -998,16 +1053,22 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
             while not calls and time.monotonic() < until:
                 time.sleep(0.01)
             assert len(calls) == 1
-            if ws is not None:
-                with pytest.raises(TimeoutError):
-                    ws.recv(timeout=0.1)
-            else:
-                assert client is not None
-                client.settimeout(0.1)
-                with pytest.raises(TimeoutError):
-                    client.recv(1)
-            count, retained, *_ = collector.counts()
-            assert count == 1 and retained <= configuration.delivery.maximum_bytes
+            visible = ""
+            while "checkpoint-visible" not in visible:
+                if ws is not None:
+                    visible += str(ws.recv(timeout=1))
+                else:
+                    assert client is not None
+                    client.settimeout(1)
+                    chunk = client.recv(4096)
+                    assert chunk, "stream closed before output despite available capture memory"
+                    visible += chunk.decode()
+            if blocked:
+                count, retained, *_ = collector.counts()
+                assert count == 2
+                assert retained <= (
+                    configuration.delivery.maximum_bytes + configuration.maximum_pending_bytes
+                )
         if ws is not None:
             ws.send(json.dumps({"type": "response.create", "model": "coding", "input": "queued"}))
         if ending == "disconnect":
@@ -1030,10 +1091,21 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
         )
         with sqlite3.connect(manager.database_path) as connection:
             rows = connection.execute(f"SELECT {columns} FROM gateway_attempts").fetchall()
-        assert len(rows) == 1 and rows[0][:2] == (settlements[0]["attempt_id"], "cancelled")
-        assert rows[0][2] > 0 and rows[0][3] > 0 and rows[0][4] == "estimated"
-        assert not records
-        assert not collector.close(0) and not collector.close(0)
+        # With output flowing, provider timeout and request cancellation race.
+        # Both also occur with healthy storage. Pin each existing accounting
+        # contract, rather than making capture scheduling choose the winner.
+        expected_states = (
+            {"failed", "cancelled"} if asynchronous and ending == "deadline" else {"cancelled"}
+        )
+        assert len(rows) == 1 and rows[0][0] == settlements[0]["attempt_id"]
+        assert rows[0][1] in expected_states
+        if rows[0][1] == "failed":
+            assert rows[0][2:5] == (None, None, "unknown")
+        else:
+            assert rows[0][2] > 0 and rows[0][3] > 0 and rows[0][4] == "estimated"
+        if blocked:
+            assert not records
+            assert not collector.close(0) and not collector.close(0)
         shutdown.request_shutdown()
         worker.join(2)
         assert not worker.is_alive(), "capture retry pinned runtime shutdown"

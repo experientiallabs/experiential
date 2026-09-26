@@ -97,6 +97,8 @@ from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import provider_free_build_review, select_build_review
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.retrieval import RAGEmbedderBinding, RAGLineageBinding, persist_trace_rag
+from exp.simulation.retrieval.embedding import RAGEmbeddingCache
+from exp.simulation.retrieval.embedding_inputs import embedding_chunk_bytes
 from exp.simulation.world_model import persist_grounded_world_model
 
 
@@ -652,6 +654,10 @@ def _ensure_grounded_build(
         snapshot=embedder.snapshot,
         maximum_attempts=RetryPolicy().maximum_attempts,
         input_usd_per_million_tokens=price,
+        maximum_input_tokens=embedder.capabilities.context_window_tokens,
+    )
+    embedding_cache = RAGEmbeddingCache(
+        binding, maximum_chunk_bytes=embedding_chunk_bytes(binding.maximum_input_tokens)
     )
     try:
         serving = persist_trace_rag(
@@ -663,6 +669,7 @@ def _ensure_grounded_build(
             embedder=binding,
             default_top_k=setup.retrieval.top_k,
             included_partitions=frozenset({"fit", "held_out"}),
+            embedding_cache=embedding_cache,
         )
         fit = persist_trace_rag(
             project.artifacts,
@@ -673,6 +680,7 @@ def _ensure_grounded_build(
             embedder=binding,
             default_top_k=setup.retrieval.top_k,
             included_partitions=frozenset({"fit"}),
+            embedding_cache=embedding_cache,
         )
         world = persist_grounded_world_model(
             project.artifacts,

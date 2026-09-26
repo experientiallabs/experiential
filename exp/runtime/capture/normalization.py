@@ -98,6 +98,28 @@ def normalize_exchange(
         exchange.protocol, response_bytes, "text/event-stream" in exchange.response_content_type
     )
     response = _object(captured.body_json)
+    events: list[JsonValue] = json.loads(captured.events_json) if captured.events_json else []
+    if events and not response.get("capture_incomplete"):
+        for event in reversed(events):
+            if (
+                isinstance(event, dict)
+                and event.get("type")
+                in {"response.completed", "response.incomplete", "response.failed"}
+                and isinstance(source := event.get("response"), dict)
+            ):
+                response = source | {"error": response.get("error")}
+                break
+        events = []
+    if (
+        exchange.protocol == "messages"
+        and "text/event-stream" in exchange.response_content_type
+        and isinstance(content := response.get("content"), list)
+    ):
+        for block in content:
+            if isinstance(block, dict) and isinstance(
+                source := block.pop("capture_input_source_json", None), str
+            ):
+                block["input"] = json.loads(source)
     completed = captured.completed
     interrupted = exchange.failed and not completed
     refused = _refused(exchange.protocol, response)
@@ -143,8 +165,7 @@ def normalize_exchange(
         attributes["gen_ai.usage.output_tokens"] = counts[1]
     sanitized = _sanitize(attributes)
     assert isinstance(sanitized, dict)
-    if captured.events_json is not None:
-        events: list[JsonValue] = json.loads(captured.events_json)
+    if events:
         sanitized["exp.capture.events"] = [
             _sanitize(event, events=True)
             if isinstance(event, dict)

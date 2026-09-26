@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Sequence
 from enum import StrEnum
+from operator import not_
 from typing import Final, Literal
 
 from pydantic import (
@@ -106,8 +107,16 @@ class NumericMeasurement(ContractModel):
 
 
 class OperationEconomics(ContractModel):
-    """Usage, cost, and latency observed for one isolated operation."""
+    """Usage, cost, and latency observed for one isolated operation.
 
+    Attributes:
+        provider_attempts: Observed dispatch attempts, or None when not reported.
+        usage: Successful-response token accounting, when available.
+        cost_usd: Observed or conservatively estimated provider charge.
+        latency_seconds: Observed or estimated operation duration.
+    """
+
+    provider_attempts: int | None = Field(default=None, ge=1)
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None
@@ -318,22 +327,22 @@ class AssistantAction(ContractModel):
 
 
 class ModelMessage(ContractModel):
-    """One request-visible message exchanged with a model."""
+    """One request-visible message exchanged with a model.
 
-    role: Literal["system", "user", "assistant", "tool"]
+    Attributes:
+        role: Required system, developer, user, assistant, or tool author role.
+        content: Optional visible text; required unless an assistant action is supplied.
+        tool_call_id: Optional tool-result linkage, allowed only for tool messages.
+        assistant_action: Optional structured output, allowed only for assistant messages.
+        content_parts: Ordered text/media content, empty by default and excluded from serialization.
+            Text parts concatenate to content; supported providers retain the exact interleaving.
+    """
+
+    role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
     content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
-    """Ordered caller content parts when a user or tool message carries attachments.
-
-    Empty on every text-only message. The text parts concatenate to
-    ``content``, so selectors, simulators, and persisted artifacts keep
-    seeing exactly the text they saw before media existed; provider clients
-    that can carry media read the parts and emit the caller's exact
-    interleaving. Excluded from serialization so identities of text-only
-    requests are byte-identical to pre-media traffic.
-    """
 
     @model_validator(mode="after")
     def _require_message_payload(self) -> ModelMessage:
@@ -666,6 +675,10 @@ class ModelRequest(ContractModel):
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
             explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.
+        json_object_output: Request one JSON object, without a JSON schema. Chat, Responses,
+            and Gemini use native JSON mode; other adapters add an explicit instruction.
+            Callers must still validate the response. Omitted when false to retain ordinary
+            saved request identities.
     """
 
     messages: tuple[ModelMessage, ...] = Field(min_length=1)
@@ -678,6 +691,7 @@ class ModelRequest(ContractModel):
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    json_object_output: bool = Field(default=False, exclude_if=not_)
 
     @model_validator(mode="after")
     def _require_coherent_tools_and_messages(self) -> ModelRequest:

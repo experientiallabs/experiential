@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.122"
+version = "0.7.123"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
-    "exp-gateway-native>=0.3.111,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "exp-gateway-native>=0.3.112,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     "filelock>=3.12",
     "ijson>=3.4,<4",  # incremental parsing of local trace archives
     "typer>=0.16",
@@ -23,6 +23,7 @@ dependencies = [
     "cryptography>=42,<49; python_version >= '3.13'",
     "brotli>=1.2,<2; python_version >= '3.13'",
     "zstandard>=0.23,<1; python_version >= '3.13'",
+    "truststore>=0.10,<0.11",  # verified provider TLS through native system certificate stores
     # Security floor for HTTPX's async transport (CVE-2026-63374).
     "anyio>=4.14.2",
     "rich>=14.1",

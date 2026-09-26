@@ -178,7 +178,9 @@ def prepare_manual_judge_setup(
         prompt_template = judge_template(definition)
     project = store.load_project()
     build = _load_build_review(store)
-    if build.project_config != project.model_copy(update={"build": None}):
+    if build.project_config.model_copy(update={"hosted_judge": None}) != project.model_copy(
+        update={"build": None, "hosted_judge": None}
+    ):
         raise ManualJudgeError("completed build belongs to a different project configuration")
     selected_alias = judge_alias or catalog.roles.judge
     if selected_alias is None:
@@ -878,6 +880,7 @@ def write_lineage_split(
     split_id = stable_id(
         "router-lineage-split",
         {
+            "setup_id": setup.setup_id,
             "task_set": setup.task_set.model_dump(mode="json"),
             "fit": list(fit),
             "held_out": list(held_out),
@@ -895,6 +898,17 @@ def write_lineage_split(
         held_out_lineage_ids=held_out,
         assignments=assignments,
     )
+    if store.paths.artifact_directory(split_id).exists():
+        existing, _ = read_artifact_json(
+            store,
+            artifact_id=split_id,
+            expected_artifact_type="router-lineage-split",
+            relative_path="split.json",
+            model_type=RouterLineageSplit,
+        )
+        # Reusing identical partitions retains their original producer provenance.
+        # The writer still verifies every input, assignment, and persisted payload.
+        split = split.model_copy(update={"code_revision": existing.code_revision})
     return write_router_lineage_split(store, split)
 
 

@@ -1,8 +1,4 @@
-"""Strict private wire models for the public Chat and Responses surfaces.
-
-Closed models own field validation; ``requests`` owns manifest gating,
-official-SDK cross-checks and canonical translation.
-"""
+"""Strict private field schemas; request translation and SDK checks live in requests."""
 
 from __future__ import annotations
 
@@ -53,6 +49,12 @@ class _TextPart(_WireModel):
 
     Echoed output_text annotations and probabilities are accepted as typed
     objects, then stripped from provider history; the text remains unchanged.
+
+    Attributes:
+        type: Required Chat or Responses text-part discriminator.
+        text: Required visible text, preserved verbatim.
+        annotations: Optional echoed annotation objects with nonempty type names.
+        logprobs: Optional echoed token-probability objects, omitted from provider history.
     """
 
     type: Literal["text", "input_text", "output_text"]
@@ -108,12 +110,7 @@ _MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS = 65_536
 
 
 class _ResponsesImagePart(_WireModel):
-    """One Responses ``input_image`` content part.
-
-    Responses carries the reference as a bare ``image_url`` string, or as the
-    ``file_id`` of an image the caller already uploaded to OpenAI Files.
-    Exactly one of the two is present.
-    """
+    """Responses ``input_image`` with exactly one ``image_url`` or uploaded ``file_id``."""
 
     type: Literal["input_image"]
     image_url: str | None = Field(
@@ -416,7 +413,14 @@ class _ResponseMessage(_Message):
 
 
 class _FunctionDefinition(_WireModel):
-    """One function schema offered through Chat Completions."""
+    """One function schema offered through Chat Completions.
+
+    Attributes:
+        name: Required nonempty name, at most 256 characters.
+        description: Optional verbatim instructions within the aggregate request limit.
+        parameters: Input JSON Schema, empty by default.
+        strict: Whether strict schema mode is requested, false by default.
+    """
 
     name: str = Field(min_length=1, max_length=256)
     description: str | None = None
@@ -449,7 +453,14 @@ class _ChatTool(_WireModel):
 
 
 class _StructuredSchema(_WireModel):
-    """Named strict JSON Schema in a Chat response format."""
+    """Named strict JSON Schema in a Chat response format.
+
+    Attributes:
+        name: Required nonempty format name, at most 256 characters.
+        description: Optional format instructions, at most 65,536 characters.
+        schema_: Required JSON Schema carried as the public schema field.
+        strict: Whether strict output validation is requested, true by default.
+    """
 
     name: str = Field(min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS)
@@ -508,10 +519,9 @@ class _ChatReasoning(_WireModel):
 class _ThinkingConfig(_WireModel):
     """Anthropic-style ``thinking`` config on a Chat request.
 
-    Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
-    turn thinking on at the model's default effort; ``disabled`` maps to
-    ``reasoning_effort=none``. An enabled ``budget_tokens`` is preserved
-    for route admission and translated only where its numeric value is supported.
+    Attributes:
+        type: Required enabled/adaptive or disabled mode, mapped to reasoning controls.
+        budget_tokens: Optional strict integer of at least 1,024; preserved only on qualified wires.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
@@ -528,7 +538,17 @@ class _ChatTemplateKwargs(_WireModel):
 
 
 class _ChatRequest(_WireModel):
-    """Closed gateway Chat Completions request profile."""
+    """Closed gateway Chat Completions request profile.
+
+    Attributes:
+        max_output_tokens: Optional positive strict integer, normalized as a caller output cap.
+        logprobs: Optional strict boolean requesting token probabilities.
+        top_logprobs: Optional strict integer from zero through twenty; requires logprobs=true.
+        thinking_budget: Optional strict numeric budget of at least -1; provider owns sentinels.
+        n: Optional completion count, accepted only at the supported value of one.
+        store: Optional provider retention selector, accepted only when false.
+        enable_thinking: Optional DashScope switch normalized to the canonical reasoning control.
+    """
 
     model: str = Field(min_length=1, max_length=256)
     messages: tuple[_Message, ...] = Field(min_length=1)
@@ -540,13 +560,6 @@ class _ChatRequest(_WireModel):
     max_output_tokens: int | None = Field(default=None, gt=0, strict=True)
     stop: str | tuple[str, ...] | None = None
     n: int | None = None
-    """Completion-count selector, accepted only at its no-op default of 1.
-
-    VS Code Copilot's custom-endpoint provider hardcodes ``n: 1`` on every
-    Chat request (wire-captured 2026-09-02); this gateway serves exactly one
-    completion per request, so 1 is accepted as already satisfied and any
-    other value stays a named rejection.
-    """
 
     @field_validator("n")
     @classmethod
@@ -560,13 +573,6 @@ class _ChatRequest(_WireModel):
         return value
 
     store: bool | None = None
-    """Provider-side retention opt-out, accepted only at its no-op of false.
-
-    OpenAI agents hardcode ``store: false`` on every Chat request to refuse
-    retention; this gateway never retains Chat output, so false is already
-    satisfied and any other value (true, which would ask the gateway to retain
-    for distillation/evals) stays a named rejection.
-    """
 
     @field_validator("store")
     @classmethod
@@ -591,9 +597,6 @@ class _ChatRequest(_WireModel):
     chat_template_kwargs: _ChatTemplateKwargs | None = None
     thinking_budget: int | None = Field(default=None, ge=-1, strict=True)
     enable_thinking: bool | None = None
-    """DashScope's top-level enable-thinking switch (``extra_body``), translated
-    like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it
-    on every request."""
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -636,7 +639,16 @@ class _ChatRequest(_WireModel):
 
 
 class _ResponseTool(_WireModel):
-    """Responses API function tool declaration."""
+    """Responses API function tool declaration.
+
+    Attributes:
+        type: Function discriminator, default function.
+        name: Required nonempty name, at most 256 characters.
+        description: Optional verbatim instructions within the aggregate request limit.
+        parameters: Input JSON Schema, empty by default.
+        strict: Optional strict-schema selector, preserving caller omission.
+        defer_loading: Optional marker making the function available through tool search.
+    """
 
     type: Literal["function"] = "function"
     name: str = Field(min_length=1, max_length=256)
@@ -644,21 +656,20 @@ class _ResponseTool(_WireModel):
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
     defer_loading: bool | None = None
-    """OpenAI's deferred-loading marker for a ``tool_search`` request."""
 
 
 class _ResponseFunctionCall(_WireModel):
     """Completed Responses function call included as assistant history.
 
-    ``id`` and ``status`` arrive on verbatim echoes of prior output items
-    and are retained for exact replay; ``call_id`` is the linkage that
-    matters. ``namespace`` attributes the call to the nested tool tree that
-    declared it (the ``namespace`` declarations carried by
-    ``GatewayProviderNativeTool``) and must round-trip verbatim: the
-    provider rejects a namespaced call replayed without it ("Missing
-    namespace for function_call .... Round-trip the model's function_call
-    item with its namespace field included."), which wedges every later
-    turn of the session because the item is baked into history.
+    Attributes:
+        type: Required function-call discriminator.
+        id: Optional nonempty echoed output-item identity, at most 256 characters.
+        call_id: Required bounded linkage to the corresponding tool result.
+        name: Required nonempty tool name, at most 256 characters.
+        namespace: Optional nonempty tool-tree owner, preserved verbatim for provider replay.
+        caller: Optional opaque programmatic-call attribution, preserved verbatim.
+        arguments: Required JSON argument text, at most four million characters.
+        status: Optional echoed lifecycle marker retained for exact replay.
     """
 
     type: Literal["function_call"]
@@ -667,10 +678,6 @@ class _ResponseFunctionCall(_WireModel):
     name: str = Field(min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
     caller: JsonObject | None = None
-    """Opaque SDK 3.0 programmatic tool-calling attribution (for example
-    ``{"type": "program", "id": ...}``); an evolving provider surface, so it
-    is validated only as an object and round-trips verbatim like
-    ``namespace``."""
     arguments: str = Field(max_length=4_000_000)
     status: _EchoedItemStatus | None = None
 
@@ -678,17 +685,15 @@ class _ResponseFunctionCall(_WireModel):
 class _ResponseFunctionOutput(_WireModel):
     """Text function result included as Responses tool history.
 
-    ``id`` and ``status`` arrive when a stored turn's input items are
-    re-listed and echoed; accepted and dropped like the other echo markers.
-    ``name`` and ``namespace`` attribute the result to a namespaced tool
-    (Codex serializes both on outputs of namespaced calls) and round-trip
-    verbatim like the sibling ``function_call`` namespace.
-
-    ``output`` is the SDK union: plain text, or an ordered list of content
-    parts for tools that return images beside text. The decoder maps a part
-    list onto the canonical tool message's content parts (text and image
-    only, the tool-message contract); any other part kind is rejected by
-    name rather than dropped.
+    Attributes:
+        type: Required function-result discriminator.
+        call_id: Required bounded linkage to the corresponding assistant tool call.
+        name: Optional nonempty tool name, at most 256 characters and preserved verbatim.
+        namespace: Optional nonempty tool-tree owner, at most 256 characters and retained on replay.
+        caller: Optional opaque programmatic-call attribution, preserved verbatim.
+        output: Required text or ordered text/image parts; unsupported part kinds are rejected.
+        id: Optional nonempty echoed item identity, at most 256 characters, accepted and dropped.
+        status: Optional echoed lifecycle marker, accepted and dropped.
     """
 
     type: Literal["function_call_output"]
@@ -696,9 +701,6 @@ class _ResponseFunctionOutput(_WireModel):
     name: str | None = Field(default=None, min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
     caller: JsonObject | None = None
-    """Opaque SDK 3.0 attribution of this result to the program that invoked
-    the call; validated only as an object and round-tripped verbatim like the
-    sibling ``function_call`` caller."""
     output: str | tuple[_ContentPart, ...]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
@@ -721,23 +723,13 @@ class _ReasoningTextPart(_WireModel):
 class _ResponseReasoningItem(_WireModel):
     """One opaque reasoning item a stateless caller replays with its input.
 
-    ``encrypted_content`` is the round-trip payload; the display-only
-    ``summary`` and ``content`` parts and the echoed lifecycle ``status``
-    are validated and dropped because the provider derives the
-    model-visible reasoning from the encrypted payload alone. Codex echoes
-    reasoning output items with an explicit ``content: null`` (captured
-    live 2026-08-29); the provider accepts that null while rejecting a
-    null ``summary``, so exactly ``content`` is nullable here.
-
-    ``encrypted_content`` itself is OPTIONAL, as the SDK marks it: a
-    ``store: true`` flow replays reasoning by item id alone and the
-    provider resolves it from stored state. An id-only item is carried
-    verbatim to homogeneous native Responses routes (the only wire that
-    can resolve the id) and the provider judges resolvability with its own
-    error — the hosted-item posture. Verified live 2026-09-05
-    (api.openai.com, gpt-5.1): a stored response's reasoning item replayed
-    by id with no encrypted_content completed with 200 under BOTH
-    ``store: true`` and ``store: false``.
+    Attributes:
+        type: Required reasoning-item discriminator.
+        id: Required nonempty provider item handle, at most 256 characters.
+        encrypted_content: Optional nonempty opaque payload; native routes may resolve the id alone.
+        summary: Display-only summary parts, empty by default and dropped from provider history.
+        content: Optional display-only reasoning parts; explicit null is accepted and dropped.
+        status: Optional echoed lifecycle marker, validated and dropped.
     """
 
     type: Literal["reasoning"]
@@ -749,7 +741,15 @@ class _ResponseReasoningItem(_WireModel):
 
 
 class _ResponseFormat(_WireModel):
-    """Supported Responses text format."""
+    """Supported Responses text format.
+
+    Attributes:
+        type: Required text or JSON-schema discriminator.
+        name: Optional nonempty name, required for structured output and at most 256 characters.
+        description: Optional format instructions, at most 65,536 characters.
+        schema_: Optional public schema object, required for structured output.
+        strict: Whether strict output validation is requested, true by default.
+    """
 
     type: Literal["text", "json_schema"]
     name: str | None = Field(default=None, min_length=1, max_length=256)
@@ -949,7 +949,12 @@ class _PromptCacheOptions(_WireModel):
 
 
 class _ResponsesRequest(_WireModel):
-    """Closed gateway Responses request profile."""
+    """Closed gateway Responses request profile.
+
+    Attributes:
+        top_logprobs: Optional strict integer from zero through twenty for alternative tokens.
+        truncation: Optional context policy, accepted only as disabled; no input is dropped.
+    """
 
     model: str = Field(min_length=1, max_length=256)
     input: str | tuple[_ResponsesInputItem, ...]
@@ -968,14 +973,6 @@ class _ResponsesRequest(_WireModel):
     reasoning: _ResponseReasoning | None = None
     text: _ResponseText | None = None
     truncation: str | None = Field(default=None, max_length=64)
-    """Context-truncation selector, accepted only at its no-op default.
-
-    VS Code Copilot's custom-endpoint provider hardcodes
-    ``truncation: "disabled"`` on every Responses request (wire-captured
-    2026-09-02). This gateway never truncates context, so "disabled" is
-    accepted as already satisfied; "auto" asks for dropping context the
-    gateway does not implement and stays a closed rejection.
-    """
 
     @field_validator("truncation")
     @classmethod
