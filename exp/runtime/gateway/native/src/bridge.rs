@@ -17,7 +17,9 @@
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
+use bytes::Bytes;
 use pyo3::prelude::*;
+use serde_json::json;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::PublicError;
@@ -25,11 +27,29 @@ use crate::errors::PublicError;
 /// One queued control-plane call and the responder that hands its outcome
 /// back to the awaiting request task.
 struct Job {
-    method: &'static str,
-    argument: String,
+    operation: JobOperation,
+    started_at: std::time::Instant,
     responder: oneshot::Sender<Result<String, PublicError>>,
     // Cancellation of the awaiting request cannot release queued/running capacity.
     _permit: OwnedSemaphorePermit,
+}
+
+/// One callback or one authentication-first Chat admission on a worker.
+enum JobOperation {
+    Callback {
+        method: &'static str,
+        argument: String,
+    },
+    AuthenticatedChatAdmission(ChatAdmission),
+}
+
+/// Chat body and trusted metadata held until the key has been authenticated.
+pub(crate) struct ChatAdmission {
+    pub(crate) raw_key: String,
+    pub(crate) body: Bytes,
+    pub(crate) client_request_id: Option<String>,
+    pub(crate) client_ip: Option<String>,
+    pub(crate) capture_session_id: Option<String>,
 }
 
 /// Record callback-pool wait time even when the waiting request is cancelled.
@@ -97,6 +117,25 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
+        self.dispatch(JobOperation::Callback { method, argument }, Some(method))
+            .await
+    }
+
+    /// Authenticate one Chat key before converting or encoding its request body,
+    /// then admit it on the same worker job and permit.
+    pub async fn authenticate_then_admit_chat(
+        &self,
+        request: ChatAdmission,
+    ) -> Result<String, PublicError> {
+        self.dispatch(JobOperation::AuthenticatedChatAdmission(request), None)
+            .await
+    }
+
+    async fn dispatch(
+        &self,
+        operation: JobOperation,
+        measured_method: Option<&'static str>,
+    ) -> Result<String, PublicError> {
         let permit_wait_timer =
             BridgePermitWaitTimer::new(&crate::metrics::METRICS.bridge_permit_wait_ms);
         let permit = self
@@ -114,8 +153,8 @@ impl Bridge {
             Ok(guard) => match guard.as_ref() {
                 Some(sender) => sender
                     .send(Job {
-                        method,
-                        argument,
+                        operation,
+                        started_at: call_started,
                         responder,
                         _permit: permit,
                     })
@@ -128,7 +167,9 @@ impl Bridge {
             return Err(PublicError::internal());
         }
         let outcome = outcome.await;
-        crate::metrics::METRICS.record_bridge_call(method, call_started.elapsed());
+        if let Some(method) = measured_method {
+            crate::metrics::METRICS.record_bridge_call(method, call_started.elapsed());
+        }
         match outcome {
             Ok(result) => result,
             Err(_) => Err(PublicError::internal()),
@@ -176,14 +217,29 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
                 Err(_) => Err(()),
             });
             let Ok(job) = received else { break };
+            let Job {
+                operation,
+                started_at,
+                responder,
+                _permit,
+            } = job;
             // A panic maps to the shared internal error and never poisons
             // the receive lock, so one poisoned call cannot take down the
             // pool.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control_plane_call(py, object, job.method, job.argument)
-            }))
-            .unwrap_or_else(|_| Err(PublicError::internal()));
-            let _ = job.responder.send(outcome);
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match operation {
+                    JobOperation::Callback { method, argument } => {
+                        control_plane_call(py, object, method, argument)
+                    }
+                    JobOperation::AuthenticatedChatAdmission(request) => {
+                        authenticate_then_admit_chat_call(
+                            py, object, request, &responder, started_at,
+                        )
+                    }
+                }))
+                .unwrap_or_else(|_| Err(PublicError::internal()));
+            let _ = responder.send(outcome);
+            drop(_permit);
         }
         // The control plane caches one SQLite connection per worker thread;
         // closing them here bounds a host that starts and stops many
@@ -214,6 +270,48 @@ fn control_plane_call(
     }
 }
 
+/// Authenticate a Chat key before body conversion, then call Python admission.
+fn authenticate_then_admit_chat_call(
+    py: Python<'_>,
+    object: &Py<PyAny>,
+    request: ChatAdmission,
+    responder: &oneshot::Sender<Result<String, PublicError>>,
+    started_at: std::time::Instant,
+) -> Result<String, PublicError> {
+    let authentication_argument = serde_json::to_string(&json!({"raw_key": request.raw_key}))
+        .map_err(|_| PublicError::internal())?;
+    let authentication = control_plane_call(py, object, "authenticate", authentication_argument);
+    crate::metrics::METRICS.record_bridge_call("authenticate", started_at.elapsed());
+    authentication?;
+    if responder.is_closed() {
+        return Err(PublicError::internal());
+    }
+
+    // Body conversion and JSON encoding happen only after authentication, while
+    // the GIL is released so another worker can run its bounded callback.
+    let admission_started = std::time::Instant::now();
+    let admission_argument = py.detach(move || {
+        let body =
+            String::from_utf8(request.body.to_vec()).map_err(|_| PublicError::invalid_json())?;
+        serde_json::to_string(&json!({
+            "raw_key": request.raw_key,
+            "body": body,
+            "idempotency_key": Option::<String>::None,
+            "client_request_id": request.client_request_id,
+            "client_ip": request.client_ip,
+            "capture_session_id": request.capture_session_id,
+        }))
+        .map_err(|_| PublicError::internal())
+    });
+    let admission = match admission_argument {
+        Ok(_) if responder.is_closed() => Err(PublicError::internal()),
+        Ok(argument) => control_plane_call(py, object, "admit", argument),
+        Err(error) => Err(error),
+    };
+    crate::metrics::METRICS.record_bridge_call("admit", admission_started.elapsed());
+    admission
+}
+
 /// Map one Python exception to a public error.
 ///
 /// The control plane attaches a `public_error_json` attribute to every
@@ -237,6 +335,7 @@ mod tests {
 
     /// An instrumented control plane recording the threads that served it.
     const PLANE_SOURCE: &std::ffi::CStr = cr#"
+import json
 import threading
 
 
@@ -250,6 +349,8 @@ class Plane:
         self.barrier = threading.Barrier(2, timeout=10.0)
         self.started = threading.Event()
         self.release = threading.Event()
+        self.authentication_calls = []
+        self.admission_calls = []
 
     def block(self, argument):
         self.started.set()
@@ -268,6 +369,30 @@ class Plane:
 
     def boom(self, argument):
         raise RuntimeError("unsanitized failure")
+
+    def authenticate(self, argument):
+        data = json.loads(argument)
+        with self.lock:
+            self.authentication_calls.append(data["raw_key"])
+        if data["raw_key"] == "block":
+            self.started.set()
+            if not self.release.wait(timeout=10.0):
+                raise RuntimeError("authentication callback was not released")
+        if data["raw_key"] == "invalid":
+            error = RuntimeError("virtual key rejected")
+            error.public_error_json = json.dumps({
+                "status_code": 401,
+                "code": "invalid_key",
+                "message": "A valid gateway Bearer key is required.",
+                "error_type": "authentication_error",
+            })
+            raise error
+        return "{}"
+
+    def admit(self, argument):
+        with self.lock:
+            self.admission_calls.append(json.loads(argument))
+        return "{}"
 
     def close_thread_resources(self, argument):
         with self.lock:
@@ -442,5 +567,113 @@ class Plane:
             serde_json::to_value(&error).expect("error serializes"),
             serde_json::to_value(PublicError::internal()).expect("error serializes"),
         );
+    }
+
+    #[test]
+    fn chat_admission_authenticates_before_body_conversion() {
+        let object = plane();
+        let observer = Python::attach(|py| object.clone_ref(py));
+        let bridge = Bridge::new(object, 1).expect("bridge starts");
+
+        let invalid_key = block_on(bridge.authenticate_then_admit_chat(ChatAdmission {
+            raw_key: "invalid".to_string(),
+            body: Bytes::from_static(&[0xff]),
+            client_request_id: None,
+            client_ip: None,
+            capture_session_id: None,
+        }))
+        .expect_err("invalid key is rejected before invalid UTF-8 is decoded");
+        assert_eq!(invalid_key.status_code, 401);
+        assert_eq!(invalid_key.code, "invalid_key");
+        assert_eq!(attribute_length(&observer, "authentication_calls"), 1);
+        assert_eq!(attribute_length(&observer, "admission_calls"), 0);
+
+        let invalid_body = block_on(bridge.authenticate_then_admit_chat(ChatAdmission {
+            raw_key: "valid".to_string(),
+            body: Bytes::from_static(&[0xff]),
+            client_request_id: None,
+            client_ip: None,
+            capture_session_id: None,
+        }))
+        .expect_err("valid key still receives the invalid-body response");
+        assert_eq!(invalid_body.status_code, 400);
+        assert_eq!(invalid_body.code, "invalid_json");
+        assert_eq!(attribute_length(&observer, "authentication_calls"), 2);
+        assert_eq!(attribute_length(&observer, "admission_calls"), 0);
+
+        let admitted = block_on(bridge.authenticate_then_admit_chat(ChatAdmission {
+            raw_key: "valid".to_string(),
+            body: Bytes::from_static(br#"{"model":"coding"}"#),
+            client_request_id: Some("client-1".to_string()),
+            client_ip: Some("127.0.0.1".to_string()),
+            capture_session_id: Some("capture-1".to_string()),
+        }))
+        .expect("valid Chat admission succeeds");
+        assert_eq!(admitted, "{}");
+        assert_eq!(attribute_length(&observer, "authentication_calls"), 3);
+        assert_eq!(attribute_length(&observer, "admission_calls"), 1);
+        drop(bridge);
+    }
+
+    #[test]
+    fn cancelled_chat_admission_stops_after_authentication() {
+        let object = plane();
+        let observer = Python::attach(|py| object.clone_ref(py));
+        let bridge = Arc::new(Bridge::new(object, 1).expect("bridge starts"));
+
+        block_on(async {
+            let caller = bridge.clone();
+            let task = tokio::spawn(async move {
+                caller
+                    .authenticate_then_admit_chat(ChatAdmission {
+                        raw_key: "block".to_string(),
+                        body: Bytes::from_static(&[0xff]),
+                        client_request_id: None,
+                        client_ip: None,
+                        capture_session_id: None,
+                    })
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let started = Python::attach(|py| {
+                        observer
+                            .bind(py)
+                            .getattr("started")
+                            .unwrap()
+                            .call_method0("is_set")
+                            .unwrap()
+                            .extract::<bool>()
+                            .unwrap()
+                    });
+                    if started {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("authentication callback starts");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            Python::attach(|py| {
+                observer
+                    .bind(py)
+                    .getattr("release")
+                    .unwrap()
+                    .call_method0("set")
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while bridge.permits.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled callback releases its permit");
+        });
+
+        assert_eq!(attribute_length(&observer, "authentication_calls"), 1);
+        assert_eq!(attribute_length(&observer, "admission_calls"), 0);
     }
 }
