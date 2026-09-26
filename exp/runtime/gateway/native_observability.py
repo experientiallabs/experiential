@@ -54,9 +54,9 @@ _ADMISSION_TIMING_STAGES = (
 class ControlPlaneTimingDiagnostics:
     """Bounded content-free stage summaries for successful request admission."""
 
-    def __init__(self) -> None:
+    def __init__(self, stages: tuple[str, ...] = _ADMISSION_TIMING_STAGES) -> None:
         self._lock = threading.Lock()
-        self._values = {name: [0, 0.0, 0.0] for name in _ADMISSION_TIMING_STAGES}
+        self._values = {name: [0, 0.0, 0.0] for name in stages}
 
     def record(self, name: str, started_at: float) -> None:
         """Record one elapsed stage without retaining request-specific data."""
@@ -87,6 +87,7 @@ class NativeObservabilityMixin:
     _components: NativeGatewayComponents
     _accounting: NativeAttemptAccounting
     _control_plane_timing: ControlPlaneTimingDiagnostics
+    _accounting_timing: ControlPlaneTimingDiagnostics
     _data_plane_metrics: Callable[[], str] | None
     _usage_reporter: Callable[[], JsonObject] | None
     _readiness_probe: Callable[[], bool] | None
@@ -228,6 +229,7 @@ class NativeObservabilityMixin:
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
             "accounting_healthy": self._accounting.accounting_healthy,
             "admission_stage_ms": self._control_plane_timing.snapshot(),
+            "accounting_stage_ms": self._accounting_timing.snapshot(),
         }
         group_writer = getattr(self._components, "write_ledger", None)
         writer_metrics = getattr(group_writer, "metrics_snapshot", None)

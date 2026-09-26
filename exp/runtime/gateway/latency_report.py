@@ -576,10 +576,14 @@ def _write_gateway_diagnostics(
         admission_timings = (
             control_plane.get("admission_stage_ms") if isinstance(control_plane, dict) else None
         )
+        accounting_timings = (
+            control_plane.get("accounting_stage_ms") if isinstance(control_plane, dict) else None
+        )
     except (httpx.HTTPError, ValueError) as exc:
         metrics = {"collection_error": type(exc).__name__}
         writer_metrics = None
         admission_timings = None
+        accounting_timings = None
     diagnostics: JsonObject = {
         "schema_name": "exp.gateway.latency_diagnostics",
         "schema_version": 1,
@@ -592,6 +596,8 @@ def _write_gateway_diagnostics(
         diagnostics["ledger_group_commit"] = cast(JsonObject, writer_metrics)
     if isinstance(admission_timings, dict):
         diagnostics["admission_stage_ms"] = cast(JsonObject, admission_timings)
+    if isinstance(accounting_timings, dict):
+        diagnostics["accounting_stage_ms"] = cast(JsonObject, accounting_timings)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")

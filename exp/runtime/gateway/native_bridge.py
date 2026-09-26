@@ -238,6 +238,16 @@ class NativeControlPlane(
         self._components = components
         self._explicit_cache = validate_explicit_cache_host(explicit_cache)
         self._control_plane_timing = ControlPlaneTimingDiagnostics()
+        self._accounting_timing = ControlPlaneTimingDiagnostics(
+            (
+                "attempt_preparation_ms",
+                "attempt_writer_ms",
+                "attempt_postprocess_ms",
+                "settlement_preparation_ms",
+                "settlement_writer_ms",
+                "settlement_postprocess_ms",
+            )
+        )
         set_authority_timing = getattr(
             components.store, "set_request_authority_timing_recorder", None
         )
@@ -275,6 +285,7 @@ class NativeControlPlane(
             cache_sample_gate=cache_sample_gate,
             recovery_host=recovery_host,
             default_lane_bound=default_lane_bound,
+            timing_recorder=self._accounting_timing.record,
         )
         # Every reservation tokenizes its prompt; build the packaged BPE now so
         # a fresh process pays that once at bind time, never on its first
