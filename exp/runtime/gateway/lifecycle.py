@@ -333,6 +333,12 @@ class _ReadyControlStore:
         """Use the paced read-only key gate without consulting alias readiness."""
         self.store.authenticate_key_for_preflight(raw_key=raw_key)
 
+    def set_request_authority_timing_recorder(
+        self, recorder: Callable[[str, float], None] | None
+    ) -> None:
+        """Forward optional content-free hot-path diagnostics to the SQLite store."""
+        self.store.set_request_authority_timing_recorder(recorder)
+
     def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
         """Delegate key-owner resolution without consulting alias readiness."""
         return self.store.authenticated_identity(raw_key=raw_key)

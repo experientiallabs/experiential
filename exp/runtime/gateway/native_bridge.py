@@ -309,9 +309,11 @@ class NativeControlPlane(
                 capability admission failed.
         """
         assert_not_internal_classification()
+        sweep_started = time.monotonic()
+        self._accounting.sweep_expired()
+        self._control_plane_timing.record("expired_sweep_ms", sweep_started)
         decode_started = time.monotonic()
         data = json.loads(argument)
-        self._accounting.sweep_expired()
         surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
             data["body"],
