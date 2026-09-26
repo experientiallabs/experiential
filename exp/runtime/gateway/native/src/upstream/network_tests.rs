@@ -85,7 +85,7 @@ fn canonical_url_gate_covers_literal_parser_bypasses() {
         "https://public.example\\@127.0.0.1/v1",
         "not a URL",
     ] {
-        let failure = client.post(url).err().expect(url);
+        let failure = client.post(url).expect_err(url);
         assert!(!failure.retryable_same_deployment);
         assert!(failure.failover_eligible);
     }
