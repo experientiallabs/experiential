@@ -518,10 +518,14 @@ impl Delivery {
     }
 
     pub(crate) fn counts(&self) -> [u64; 5] {
+        // Hold the promotion lock while reading both partitions, so an item
+        // moving into the writer is neither missed nor counted twice.
+        let waiting = self.checkpoints.lock().unwrap_or_else(|e| e.into_inner());
         [
-            self.counters.pending.load(Ordering::Acquire) as u64,
+            self.counters.pending.load(Ordering::Acquire) as u64 + waiting.len() as u64,
             self.counters.bytes.load(Ordering::Acquire) as u64
-                + self.counters.preparation_bytes.load(Ordering::Acquire) as u64,
+                + self.counters.preparation_bytes.load(Ordering::Acquire) as u64
+                + waiting.iter().map(|entry| entry.bytes as u64).sum::<u64>(),
             self.counters.persisted.load(Ordering::Relaxed),
             self.counters.failed.load(Ordering::Relaxed),
             self.counters.dropped.load(Ordering::Relaxed),

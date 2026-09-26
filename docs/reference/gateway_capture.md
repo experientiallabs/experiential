@@ -190,6 +190,10 @@ the response ends, so hosts must also monitor destination failure counters for
 these late writes. Destination exceptions never print potentially sensitive details.
 `counts()` returns pending records, retained delivery bytes, successful destination calls,
 failed preparation/write attempts, delivery drops and collector skips.
+Pending records and bytes include admission-owned handoffs waiting for a writer
+slot, not only promoted delivery entries. These totals can exceed delivery-only
+limits; the separate admission limits still bound waiting work. In-progress
+requests that have not handed off are not delivery backlog.
 `maintenance_failures()` separately counts retention/WAL cleanup failures, including
 maintenance during destination retries. A failed checkpoint does not make an
 already committed record a failed write.

@@ -275,6 +275,7 @@ def test_retained_async_handoffs_keep_native_batching() -> None:
         producer.start()
         producer.join(1)
         assert not producer.is_alive()
+        assert collector.counts()[0] == 12
         assert not collector.close(0)
     finally:
         release.set()
@@ -1064,7 +1065,10 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
                     visible += chunk.decode()
             if blocked:
                 count, retained, *_ = collector.counts()
-                assert count == 1 and retained <= configuration.delivery.maximum_bytes
+                assert count == 2
+                assert retained <= (
+                    configuration.delivery.maximum_bytes + configuration.maximum_pending_bytes
+                )
         if ws is not None:
             ws.send(json.dumps({"type": "response.create", "model": "coding", "input": "queued"}))
         if ending == "disconnect":
