@@ -538,10 +538,7 @@ def test_writer_collects_an_arriving_write_before_committing(tmp_path: Path) -> 
                 first_item_taken.set()
             return item
 
-    with (
-        mock.patch.object(group_commit_module.queue, "SimpleQueue", SignaledQueue),
-        mock.patch.object(group_commit_module, "_BATCH_COLLECTION_WINDOW_SECONDS", 0.05),
-    ):
+    with mock.patch.object(group_commit_module.queue, "SimpleQueue", SignaledQueue):
         grouped = GroupCommitAttemptLedger(core, max_batch_size=2)
     original_commit = grouped._commit_batch
 
@@ -552,11 +549,16 @@ def test_writer_collects_an_arriving_write_before_committing(tmp_path: Path) -> 
 
     try:
         with mock.patch.object(grouped, "_commit_batch", record_batch):
-            first = grouped._enqueue(lambda connection: connection.execute("SELECT 1").fetchone())
-            assert first_item_taken.wait(5)
-            second = grouped._enqueue(lambda connection: connection.execute("SELECT 2").fetchone())
-            first.result(timeout=5)
-            second.result(timeout=5)
+            with mock.patch.object(group_commit_module, "_BATCH_COLLECTION_WINDOW_SECONDS", 0.05):
+                first = grouped._enqueue(
+                    lambda connection: connection.execute("SELECT 1").fetchone()
+                )
+                assert first_item_taken.wait(5)
+                second = grouped._enqueue(
+                    lambda connection: connection.execute("SELECT 2").fetchone()
+                )
+                first.result(timeout=5)
+                second.result(timeout=5)
     finally:
         grouped.close()
     assert batch_sizes == [2]
