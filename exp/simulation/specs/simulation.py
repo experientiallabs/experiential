@@ -7,7 +7,8 @@ mode.  A concrete simulator validates the settings it consumes before it starts 
 from __future__ import annotations
 
 import math
-from operator import not_
+from functools import partial
+from operator import eq, not_
 from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
@@ -29,6 +30,11 @@ class WorldModelSettings(ContractModel):
 
     The settings retain the normal artifact envelope so a selected prompt and provider alias can
     be compared across immutable runs without introducing a second configuration file format.
+
+    Attributes:
+        maximum_transition_attempts: Positive limit on simulator responses per candidate action.
+            Defaults to one; new evaluations explicitly freeze three. Rejected replies remain
+            in simulation accounting and never consume another candidate turn.
     """
 
     world_model_alias: ArtifactId
@@ -37,6 +43,7 @@ class WorldModelSettings(ContractModel):
     query_embedding: EmbeddingCostReservation | None = None
     maximum_output_tokens: int = Field(default=16_000, ge=256)
     json_object_output: bool = Field(default=False, exclude_if=not_)
+    maximum_transition_attempts: int = Field(default=1, ge=1, exclude_if=partial(eq, 1))
     allow_tools: Literal[False] = False
 
 

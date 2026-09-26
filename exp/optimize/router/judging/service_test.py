@@ -259,27 +259,29 @@ def _catalog() -> ModelCatalog:
     )
 
 
-def _trace(index: int) -> Trace:
+def _trace(index: int, *, case: int | None = None) -> Trace:
     """Build one distinct real normalized trace with captured model output.
 
     Args:
         index: Unique trace and lineage fixture index.
+        case: Request identity, allowing independent captures of the same task.
 
     Returns:
         Complete normalized successful production trace.
     """
     started_at = _TIME + timedelta(minutes=index)
+    case = index if case is None else case
     return Trace(
         trace_id=f"trace-{index}",
         conversation_id=f"conversation-{index}",
-        task=f"Resolve support case {index}",
+        task=f"Resolve support case {case}",
         spans=(
             TraceSpan(
                 span_id=f"span-{index}",
                 name="agent.model_call",
                 started_at=started_at,
                 ended_at=started_at + timedelta(seconds=1),
-                attributes={"output": f"Resolved case {index}."},
+                attributes={"output": f"Resolved case {case}."},
                 model=_model(),
             ),
         ),
@@ -381,11 +383,12 @@ def _persist_grounded_build(
     return completed
 
 
-def _built_store(tmp_path: Path) -> ProjectStore:
-    """Create a completed build with three fit lineages and one held-out lineage.
+def _built_store(tmp_path: Path, *, paired: bool = False) -> ProjectStore:
+    """Create a completed build with distinct cases or exact repeated requests.
 
     Args:
         tmp_path: Isolated test directory.
+        paired: Include two captured outputs per identical request for pairwise calibration.
 
     Returns:
         Initialized project store with deterministic build readiness.
@@ -393,7 +396,12 @@ def _built_store(tmp_path: Path) -> ProjectStore:
     store = ProjectStore(tmp_path / ".exp", "support")
     store.initialize(ProjectConfig(project_id="support"))
     built = build_project(
-        TraceNormalizationResult(traces=tuple(_trace(index) for index in range(100)), issues=()),
+        TraceNormalizationResult(
+            traces=tuple(
+                _trace(index, case=index // 2 if paired else index) for index in range(100)
+            ),
+            issues=(),
+        ),
         store,
         created_at=_TIME,
         code_revision="test-revision",
@@ -1253,7 +1261,7 @@ def test_non_scalar_calibration_executes_saved_contract(
 
 def test_pairwise_calibration_uses_same_task_and_counterbalances_order(tmp_path: Path) -> None:
     """Pairwise calibration freezes typed labels, both orders, and direct bias counts."""
-    store = _built_store(tmp_path)
+    store = _built_store(tmp_path, paired=True)
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),
@@ -1266,6 +1274,8 @@ def test_pairwise_calibration_uses_same_task_and_counterbalances_order(tmp_path:
     plan = prepare_manual_judge_calibration(store, sample_size=1)
     reference = plan.reference_traces[0]
     assert reference is not None
+    assert plan.traces[0].task == reference.task
+    assert plan.traces[0].trace_id != reference.trace_id
     labels = (
         ManualJudgeLabel(
             trace_id=plan.traces[0].trace_id,
@@ -1572,7 +1582,7 @@ def test_retry_reuses_audit_when_review_pointer_write_was_interrupted(
 
 def test_interrupted_pairwise_probe_reuses_forward_order(tmp_path: Path) -> None:
     """A reverse-order interruption reuses the frozen forward probe on retry."""
-    store = _built_store(tmp_path)
+    store = _built_store(tmp_path, paired=True)
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),

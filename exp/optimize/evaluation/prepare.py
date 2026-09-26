@@ -390,6 +390,7 @@ def prepare_model_evaluation(
             query_embedding=retrieval,
             maximum_output_tokens=maximum_output_tokens,
             json_object_output=True,
+            maximum_transition_attempts=3,
         ),
         simulation_completion_input=completion_input,
         agent_id=config.project_id,

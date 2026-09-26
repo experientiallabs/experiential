@@ -186,14 +186,14 @@ const SEARCH_TURN: &[&str] = &[
 
 struct SearchHarness {
     bridge: Arc<Bridge>,
-    http: reqwest::Client,
+    http: crate::upstream::UpstreamClient,
 }
 
 impl SearchHarness {
     fn new() -> Self {
         Self {
             bridge: Arc::new(Bridge::new(plane(), 2).expect("bridge starts")),
-            http: build_client(Duration::from_secs(2)).expect("client"),
+            http: build_client(Duration::from_secs(2), false).expect("client"),
         }
     }
 

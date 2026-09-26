@@ -25,6 +25,7 @@ from exp.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    ToolCall,
     Usage,
     completion_cost_reservation,
 )
@@ -237,6 +238,9 @@ def _recorder(
     maximum_rollout_output_tokens: int = 1_000_000,
     output_limit: int | None = 16_000,
     world_model_json_object_output: bool = False,
+    maximum_transition_attempts: int = 1,
+    task: TaskCase | None = None,
+    world_context_window: int = 100_000,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -253,6 +257,9 @@ def _recorder(
         stop_on_overspend: Fail before the next paid dispatch once spend reaches the ceiling.
         output_limit: Published candidate and world output limit, or ``None``.
         world_model_json_object_output: Explicit frozen world-only JSON output control.
+        maximum_transition_attempts: Permitted simulator replies for the same candidate turn.
+        task: Optional task carrying declared tools for observation-boundary tests.
+        world_context_window: Exact world-model context ceiling for retry admission tests.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -272,6 +279,7 @@ def _recorder(
     world_model = _resolved(
         "world-model-a",
         resolved_world_client or world_client,
+        context_window_tokens=world_context_window,
         completion_pricing=world_request is not None,
         output_limit=output_limit,
     )
@@ -294,7 +302,7 @@ def _recorder(
         client=world_client,
     )
     return RecordingCandidateClient(
-        task=_task(),
+        task=task or _task(),
         candidate=candidate,
         world_model=world_model,
         grounded_world_model=grounded,
@@ -313,6 +321,7 @@ def _recorder(
         maximum_rollout_output_tokens=maximum_rollout_output_tokens,
         maximum_output_tokens=16_000,
         world_model_json_object_output=world_model_json_object_output,
+        maximum_transition_attempts=maximum_transition_attempts,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
         token_counter=_Utf8Counter(),
@@ -869,3 +878,190 @@ def test_missing_token_usage_blocks_further_dispatch() -> None:
     with pytest.raises(TextSimulationError, match="usage is missing"):
         recorder.complete(request)
     assert len(candidate.requests) == 1
+
+
+@pytest.mark.parametrize("invalid", ['{"message":', '{"message":"hello","extra":true}', "{}"])
+def test_invalid_world_reply_retries_same_candidate_turn_and_accounts_all_costs(
+    invalid: str,
+) -> None:
+    """A bad simulator reply never becomes a worker turn, free spend, or visible observation."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response(invalid, model=_snapshot("world-model-a")),
+            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+        ]
+    )
+    recorder = _recorder(candidate, world, maximum_transition_attempts=3)
+    request = ModelRequest(messages=(ModelMessage(role="user", content="question"),))
+    response = recorder.complete(request)
+    assert response.output.content == "answer"
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 2
+    assert len(recorder.recorded.transitions) == 1
+    assert len(recorder.recorded.world_model_spans) == 2
+    assert recorder.recorded.world_model_spans[0].failure is not None
+    assert recorder.recorded.world_model_spans[1].failure is None
+    assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.1, provenance="observed"
+    )
+    assert recorder.recorded.world_model_economics.cost_usd is not None
+    assert recorder.recorded.world_model_economics.cost_usd.value == pytest.approx(0.2)
+    assert world.requests[1].messages[:2] == world.requests[0].messages
+    assert "invalid" in (world.requests[1].messages[-1].content or "")
+    checkpoint = recorder.checkpoint()
+    assert checkpoint is not None
+    assert len(checkpoint.invalid_world_model_responses) == 1
+
+
+def test_world_retry_exhaustion_is_invalid_and_retains_each_paid_response() -> None:
+    """The frozen attempt count ends only the invalid cell, with all simulator spend retained."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient([_response("bad", model=_snapshot("world-model-a")) for _ in range(3)])
+    recorder = _recorder(candidate, world, maximum_transition_attempts=3)
+    with pytest.raises(TextSimulationError, match="JSON transition") as exc:
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="question"),)))
+    assert exc.value.failure.retryable
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 3
+    assert recorder.recorded.world_model_economics.cost_usd is not None
+    assert recorder.recorded.world_model_economics.cost_usd.value == pytest.approx(0.3)
+    assert recorder.recorded.transitions == ()
+    assert recorder.checkpoint() is None
+
+
+def test_world_retry_checks_spend_before_another_dispatch() -> None:
+    """Protocol retries honor the cell's existing stop-on-overspend contract."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient([_response("bad", model=_snapshot("world-model-a"))])
+    recorder = _recorder(
+        candidate,
+        world,
+        maximum_transition_attempts=3,
+        maximum_cost_usd=0.2,
+        stop_on_overspend=True,
+    )
+    with pytest.raises(TextSimulationError, match="ceiling"):
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="question"),)))
+    assert len(world.requests) == 1
+    assert recorder.recorded.world_model_economics.cost_usd is not None
+    assert recorder.recorded.world_model_economics.cost_usd.value == pytest.approx(0.1)
+
+
+def test_checkpoint_after_world_retry_restores_valid_state_and_all_prior_spend() -> None:
+    """Continuation restores accepted observations while preserving rejected simulator charges."""
+    candidate = _ScriptedClient([_response("first", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response("bad", model=_snapshot("world-model-a")),
+            _response(
+                '{"message":"continue","state":{"step":1}}', model=_snapshot("world-model-a")
+            ),
+        ]
+    )
+    recorder = _recorder(candidate, world, maximum_transition_attempts=3)
+    request = ModelRequest(messages=(ModelMessage(role="user", content="question"),))
+    recorder.complete(request)
+    checkpoint = recorder.checkpoint()
+    assert checkpoint is not None
+    next_candidate = _ScriptedClient([_response("second", model=_snapshot("candidate-a"))])
+    next_world = _ScriptedClient(
+        [
+            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+        ]
+    )
+    resumed = _recorder(next_candidate, next_world, maximum_transition_attempts=3)
+    resumed.restore(
+        checkpoint, (*recorder.recorded.candidate_spans, *recorder.recorded.world_model_spans)
+    )
+    resumed.complete(request)
+    assert len(next_candidate.requests) == len(next_world.requests) == 1
+    assert json.loads(next_world.requests[0].messages[1].content or "")["environment_state"] == {
+        "step": 1
+    }
+    assert resumed.recorded.candidate_economics.cost_usd is not None
+    assert resumed.recorded.candidate_economics.cost_usd.value == pytest.approx(0.2)
+    assert resumed.recorded.world_model_economics.cost_usd is not None
+    assert resumed.recorded.world_model_economics.cost_usd.value == pytest.approx(0.3)
+    spans = resumed.recorded.world_model_spans
+    assert len({span.span_id for span in spans}) == len(spans) == 3
+    assert resumed.checkpoint() is not None
+
+
+def test_world_retry_does_not_repair_wrong_ids_or_deliver_rejected_tool_content() -> None:
+    """The simulator must generate a valid exact-ID result; the engine never rewrites a bad ID."""
+    tool = ToolSchema(name="lookup", description="Look up company facts.", input_schema={})
+    task = _task().model_copy(update={"tools": (tool,)})
+    call = ToolCall(call_id="chatcmpl-tool-exact", name="lookup", arguments={})
+    worker_response = _response("", model=_snapshot("candidate-a")).model_copy(
+        update={"output": AssistantAction(tool_calls=(call,))}
+    )
+    candidate = _ScriptedClient([worker_response])
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"tool_results":[{"call_id":"chatmpl-tool-exact","content":"rejected"}]}',
+                model=_snapshot("world-model-a"),
+            ),
+            _response(
+                '{"tool_results":[{"call_id":"chatcmpl-tool-exact","content":"accepted"}]}',
+                model=_snapshot("world-model-a"),
+            ),
+        ]
+    )
+    recorder = _recorder(candidate, world, maximum_transition_attempts=3, task=task)
+    recorder.complete(
+        ModelRequest(messages=(ModelMessage(role="user", content="question"),), tools=(tool,))
+    )
+    assert len(candidate.requests) == 1
+    assert recorder.observe_tool(call).content == "accepted"
+    assert "rejected" not in json.dumps(
+        [m.model_dump(mode="json") for m in recorder.visible_transcript]
+    )
+    assert recorder.recorded.world_model_spans[0].failure is not None
+    assert "chatcmpl-tool-exact" in (world.requests[1].messages[-1].content or "")
+    assert recorder.checkpoint() is not None
+
+
+@pytest.mark.parametrize("limited_by", ["context", "reservation"])
+def test_world_retry_without_feedback_room_reuses_full_original_request(limited_by: str) -> None:
+    """Retries remain usable at either input ceiling without discarding evidence or output space."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="question"),))
+    candidate_response = _response("answer", model=_snapshot("candidate-a"))
+    invalid = _response("bad", model=_snapshot("world-model-a"))
+    baseline_world = _ScriptedClient([invalid])
+    baseline = _recorder(_ScriptedClient([candidate_response]), baseline_world)
+    with pytest.raises(TextSimulationError):
+        baseline.complete(request)
+    input_tokens = _Utf8Counter().count(baseline_world.requests[0])
+    world = _ScriptedClient(
+        [
+            invalid,
+            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+        ]
+    )
+    world.responses = [
+        response.model_copy(
+            update={
+                "economics": response.economics.model_copy(
+                    update={"cost_usd": None, "provider_attempts": 1}
+                )
+            }
+        )
+        for response in world.responses
+    ]
+    candidate = _ScriptedClient([candidate_response])
+    recorder = _recorder(
+        candidate,
+        world,
+        maximum_transition_attempts=3,
+        world_context_window=input_tokens + 16_000 if limited_by == "context" else 100_000,
+        world_request=_completion_reservation("world-model-a", maximum_input_tokens=input_tokens)
+        if limited_by == "reservation"
+        else None,
+    )
+    recorder.complete(request)
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 2
+    assert world.requests[1] == world.requests[0]
+    assert recorder.world_model_terminal

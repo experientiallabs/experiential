@@ -16,7 +16,10 @@ from exp.runtime.gateway.native_server import (
 )
 
 
-def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("public_only", [False, True])
+def test_host_passes_the_serve_configuration(
+    monkeypatch: pytest.MonkeyPatch, public_only: bool
+) -> None:
     """The host serializes the exact serve configuration for the extension."""
     captured: dict[str, object] = {}
 
@@ -47,6 +50,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         max_active_requests=23,
         graceful_timeout_seconds=45.0,
         connect_timeout_seconds=4.0,
+        public_upstreams_only=public_only,
         time_to_first_byte_seconds=12.0,
         native_usage_enabled=False,
     )
@@ -60,6 +64,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
     assert config["request_timeout_seconds"] == 37.0
     assert config["graceful_timeout_seconds"] == 45.0
     assert config["connect_timeout_seconds"] == 4.0
+    assert config["public_upstreams_only"] is public_only
     assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
     assert captured["guardrail_detectors"] == {}

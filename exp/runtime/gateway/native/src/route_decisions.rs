@@ -292,7 +292,7 @@ fn timeout_failure() -> Failure {
 }
 
 async fn dispatch(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &DecisionsAdmission,

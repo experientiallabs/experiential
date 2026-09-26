@@ -267,7 +267,7 @@ async fn run_ladder(
 /// carries whether the provider dispatch opened (for deployment-health
 /// recording); a rejected open never opened.
 async fn dispatch(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &EmbeddingsAdmission,

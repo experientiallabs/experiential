@@ -60,6 +60,12 @@ from exp.simulation.engines.text.prompt import (
     parse_world_model_transition,
     text_prompt_sha256,
 )
+from exp.simulation.engines.text.recording_payloads import (
+    bounded_candidate_request,
+    delivered_world_span,
+    model_span,
+    world_retry_request,
+)
 from exp.simulation.engines.text.redaction import redact_json
 from exp.simulation.engines.text.tokens import TokenCounter, bound_unpublished_output
 from exp.simulation.retrieval import RAGQuery
@@ -67,6 +73,7 @@ from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 
 if TYPE_CHECKING:
     from exp.simulation.world_model import GroundedWorldModel
+    from exp.simulation.world_model.runtime import PreparedGroundedWorldModelCall
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +120,7 @@ class RecordingCandidateClient:
         maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
         world_model_json_object_output: bool = False,
+        maximum_transition_attempts: int = 1,
         redacted_field_names: frozenset[str],
         clock: Callable[[], datetime],
         token_counter: TokenCounter,
@@ -134,10 +142,14 @@ class RecordingCandidateClient:
             maximum_steps: Maximum candidate model turns allowed in this episode.
             maximum_output_tokens: Per-call output budget used without silent truncation.
             world_model_json_object_output: Frozen provider JSON mode for simulation responses.
+            maximum_transition_attempts: Bounded simulator attempts for each candidate action.
             redacted_field_names: Project fields redacted before events persist.
             clock: Time source used to order emitted spans deterministically in tests.
             token_counter: Full-request counter used before every provider call.
         """
+        if maximum_transition_attempts < 1:
+            raise ValueError("maximum_transition_attempts must be positive")
+        self._maximum_transition_attempts = maximum_transition_attempts
         self._task = task
         self._candidate = candidate
         self._world_model = world_model
@@ -159,6 +171,7 @@ class RecordingCandidateClient:
         self._world_model_spans: list[RolloutSpan] = []
         self._candidate_responses: list[ModelResponse] = []
         self._world_model_responses: list[ModelResponse] = []
+        self._invalid_world_model_responses: list[ModelResponse] = []
         self._transitions: list[TextWorldModelTransition] = []
         self._retrieved_transition_ids: list[tuple[str, ...]] = []
         self._retrieval_economics: list[OperationEconomics] = []
@@ -250,7 +263,13 @@ class RecordingCandidateClient:
                 require_complete_usage=False,
             ),
             world_model_economics=combine_economics(
-                tuple(response.economics for response in self._world_model_responses),
+                tuple(
+                    response.economics
+                    for response in (
+                        *self._world_model_responses,
+                        *self._invalid_world_model_responses,
+                    )
+                ),
                 require_complete_usage=False,
             ),
             retrieval_economics=combine_economics(
@@ -345,7 +364,7 @@ class RecordingCandidateClient:
                 "candidate request must preserve the task's declared tool schemas",
                 phase="candidate_tools",
             )
-        candidate_request = _bounded_candidate_request(
+        candidate_request = bounded_candidate_request(
             request,
             visible_transcript=self._visible_transcript,
             maximum_output_tokens=min(
@@ -399,7 +418,7 @@ class RecordingCandidateClient:
         candidate_ended_at = timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
-            _model_span(
+            model_span(
                 span_id=f"candidate-{len(self._candidate_responses)}",
                 kind=RolloutEventKind.AGENT_MODEL_CALL,
                 started_at=candidate_started_at,
@@ -474,6 +493,60 @@ class RecordingCandidateClient:
                 self._token_counter,
             ),
         )
+        transition = self._complete_world_turn(prepared, candidate_ended_at)
+        self._transitions.append(transition)
+        self._visible_transcript = (
+            *self._visible_transcript,
+            ModelMessage(role="assistant", assistant_action=candidate_response.output),
+            *transition.visible_messages,
+        )
+        self._environment_state = transition.state
+        self._pending_tools = {
+            call.call_id: (call, result)
+            for call, result in zip(calls, transition.tool_results, strict=True)
+        }
+        self._terminal = transition.terminal
+        return candidate_response
+
+    def _complete_world_turn(
+        self, prepared: PreparedGroundedWorldModelCall, candidate_ended_at: datetime
+    ) -> TextWorldModelTransition:
+        """Retry invalid simulator replies without repeating the candidate or retrieval.
+
+        Each attempt passes normal context and spend admission and retains its raw response.
+        Correction messages stay private to the simulator and never enter the visible transcript.
+        """
+        attempt = prepared
+        for number in range(self._maximum_transition_attempts):
+            try:
+                return self._dispatch_world_turn(attempt, candidate_ended_at)
+            except TextWorldModelProtocolError as exc:
+                if number + 1 == self._maximum_transition_attempts:
+                    raise _text_failure(
+                        StopReason.FAILURE,
+                        FailureCode.PROVIDER,
+                        str(exc),
+                        phase="world_model_protocol",
+                        exception_type=type(exc).__name__,
+                        retryable=True,
+                    ) from exc
+                attempt = replace(
+                    prepared,
+                    request=world_retry_request(
+                        prepared.request,
+                        prepared.action,
+                        str(exc),
+                        capabilities=self._world_model.capabilities,
+                        reservation=self._world_model_request,
+                        token_counter=self._token_counter,
+                    ),
+                )
+        raise AssertionError("a positive transition allowance must return or raise")
+
+    def _dispatch_world_turn(
+        self, prepared: PreparedGroundedWorldModelCall, candidate_ended_at: datetime
+    ) -> TextWorldModelTransition:
+        """Admit, record and validate one simulator reply, including rejected reply costs."""
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,
@@ -522,8 +595,8 @@ class RecordingCandidateClient:
         )
         self._world_model_responses.append(world_response)
         self._world_model_spans.append(
-            _model_span(
-                span_id=f"world-model-{len(self._world_model_responses)}",
+            model_span(
+                span_id=f"world-model-{len(self._world_model_spans) + 1}",
                 kind=RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL,
                 started_at=world_started_at,
                 ended_at=world_ended_at,
@@ -538,27 +611,23 @@ class RecordingCandidateClient:
         try:
             transition = self._grounded_world_model.parse_turn(dispatched).transition
         except TextWorldModelProtocolError as exc:
-            raise _text_failure(
+            self._invalid_world_model_responses.append(self._world_model_responses.pop())
+            failure = _text_failure(
                 StopReason.FAILURE,
                 FailureCode.PROVIDER,
                 str(exc),
                 phase="world_model_protocol",
                 exception_type=type(exc).__name__,
                 retryable=True,
-            ) from exc
-        self._transitions.append(transition)
-        self._visible_transcript = (
-            *self._visible_transcript,
-            ModelMessage(role="assistant", assistant_action=candidate_response.output),
-            *transition.visible_messages,
+            )
+            self._world_model_spans[-1] = self._world_model_spans[-1].model_copy(
+                update={"failure": failure.failure}
+            )
+            raise
+        self._world_model_spans[-1] = delivered_world_span(
+            self._world_model_spans[-1], transition.visible_messages, self._redacted_field_names
         )
-        self._environment_state = transition.state
-        self._pending_tools = {
-            call.call_id: (call, result)
-            for call, result in zip(calls, transition.tool_results, strict=True)
-        }
-        self._terminal = transition.terminal
-        return candidate_response
+        return transition
 
     def _remaining_output_tokens(self) -> int:
         """Admit generated tokens, including reasoning, without treating missing usage as zero."""
@@ -594,6 +663,7 @@ class RecordingCandidateClient:
             candidate_responses=tuple(self._candidate_responses),
             world_model_responses=tuple(self._world_model_responses),
             retrieval_economics=tuple(self._retrieval_economics),
+            invalid_world_model_responses=tuple(self._invalid_world_model_responses),
         )
         raw = checkpoint.model_dump(mode="json")
         safe, _ = redact_secret_json(redact_json(raw, self._redacted_field_names))
@@ -604,6 +674,7 @@ class RecordingCandidateClient:
         self._visible_transcript = checkpoint.visible_transcript
         self._candidate_responses = list(checkpoint.candidate_responses)
         self._world_model_responses = list(checkpoint.world_model_responses)
+        self._invalid_world_model_responses = list(checkpoint.invalid_world_model_responses)
         self._transitions = [
             parse_world_model_transition(item.output) for item in checkpoint.world_model_responses
         ]
@@ -631,6 +702,7 @@ class RecordingCandidateClient:
         costs = [
             *(response.economics.cost_usd for response in self._candidate_responses),
             *(response.economics.cost_usd for response in self._world_model_responses),
+            *(response.economics.cost_usd for response in self._invalid_world_model_responses),
             *(economics.cost_usd for economics in self._retrieval_economics),
         ]
         if any(cost is None for cost in costs):
@@ -788,40 +860,6 @@ def text_prompt_digest() -> str:
     return text_prompt_sha256()
 
 
-def _bounded_candidate_request(
-    request: ModelRequest,
-    *,
-    visible_transcript: tuple[ModelMessage, ...],
-    maximum_output_tokens: int,
-) -> ModelRequest:
-    """Inject the visible transcript and enforce a caller-visible output budget."""
-    requested_budget = request.maximum_output_tokens
-    return request.model_copy(
-        update={
-            "messages": _messages_with_visible_transcript(request.messages, visible_transcript),
-            "maximum_output_tokens": min(
-                requested_budget or maximum_output_tokens, maximum_output_tokens
-            ),
-            "tool_choice": request.tool_choice,
-        }
-    )
-
-
-def _messages_with_visible_transcript(
-    messages: tuple[ModelMessage, ...],
-    visible_transcript: tuple[ModelMessage, ...],
-) -> tuple[ModelMessage, ...]:
-    """Merge retained turns before the matching suffix owned by a restarted agent."""
-    if not visible_transcript:
-        return messages
-    for overlap in range(min(len(messages), len(visible_transcript)), 0, -1):
-        suffix = visible_transcript[-overlap:]
-        # Match a complete action boundary, never a coincidentally identical task/user prompt.
-        if suffix[0].role == "assistant" and messages[-overlap:] == suffix:
-            return (*messages[:-overlap], *visible_transcript)
-    return (*messages, *visible_transcript)
-
-
 def _require_response_identity(
     response: ModelResponse,
     resolved: ResolvedModel,
@@ -915,38 +953,6 @@ def _preflight_context(
             f"fit {input_tokens} input plus {budget} output tokens",
             phase="context_preflight",
         )
-
-
-def _model_span(
-    *,
-    span_id: str,
-    kind: RolloutEventKind,
-    started_at: datetime,
-    ended_at: datetime,
-    request: ModelRequest,
-    response: ModelResponse,
-    redacted_field_names: frozenset[str],
-) -> RolloutSpan:
-    """Build one redacted model-call span from canonical request and visible response fields."""
-    payload_value: JsonValue = {
-        "request": request.model_dump(mode="json", exclude_none=True),
-        "response": {
-            "output": response.output.model_dump(mode="json", exclude_none=True),
-            "finish_reason": response.finish_reason.value,
-        },
-    }
-    payload = redact_json(payload_value, redacted_field_names)
-    if not isinstance(payload, dict):  # pragma: no cover - fixed object input remains an object
-        raise TypeError("model span payload must remain a JSON object")
-    return RolloutSpan(
-        span_id=span_id,
-        kind=kind,
-        started_at=started_at,
-        ended_at=ended_at,
-        payload=payload,
-        model=response.model,
-        usage=response.economics.usage,
-    )
 
 
 def _text_failure(

@@ -113,7 +113,7 @@ Wire facts come from each resolved client's `gateway_wire_profile()`. The dialec
 Bedrock uses AWS binary event streams, not SSE. Admission freezes the Converse body; after its
 bounded dispatch permit, the data plane obtains SigV4 headers through Python's `sign_dispatch`
 callback immediately before POSTing those exact bytes. Signing after queue wait avoids stale
-signatures. The bounded immediate open retry reuses that signature; later retries sign afresh.
+signatures. The bounded immediate open retry reuses that signature; later retries sign afresh. See [provider destination policy](gateway-egress.md) for hosted egress controls.
 
 ### Native decisions
 

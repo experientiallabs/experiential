@@ -382,14 +382,14 @@ const THROTTLE_FRAME: &str = "{\"error\":{\"code\":\"rate_limit_exceeded\",\
 /// Everything one ladder run needs, kept alive together.
 pub(super) struct Harness {
     bridge: Arc<Bridge>,
-    http: reqwest::Client,
+    http: crate::upstream::UpstreamClient,
 }
 
 impl Harness {
     pub(super) fn new() -> Self {
         Self {
             bridge: Arc::new(Bridge::new(plane(), 2).expect("bridge starts")),
-            http: build_client(Duration::from_secs(2)).expect("client"),
+            http: build_client(Duration::from_secs(2), false).expect("client"),
         }
     }
 

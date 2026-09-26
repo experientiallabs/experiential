@@ -46,8 +46,8 @@ pub(super) fn wire(url: &str) -> DeploymentWire {
     })).unwrap()
 }
 
-fn http() -> reqwest::Client {
-    crate::upstream::build_client(Duration::from_secs(1)).unwrap()
+fn http() -> crate::upstream::UpstreamClient {
+    crate::upstream::build_client(Duration::from_secs(1), false).unwrap()
 }
 
 pub(super) fn expiry() -> (f64, String) {
