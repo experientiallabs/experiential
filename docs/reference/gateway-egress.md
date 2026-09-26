@@ -19,4 +19,3 @@ cache creation requests. It does not cover separate HTTP clients in Python
 control-plane callbacks, custom tools, batch jobs, or endpoint probes. Those
 paths still need their own destination checks and network egress restrictions.
 URL admission checks alone cannot prevent a later DNS change.
-
