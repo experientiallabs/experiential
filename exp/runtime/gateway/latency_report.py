@@ -13,14 +13,16 @@ by gateway p50.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
+import httpx
 from pydantic import Field
 from rich.console import Console
 
@@ -451,6 +453,7 @@ def run_latency_report(
     work_root: Path,
     config: LatencyRunConfig,
     mock_credential: str = "latency-mock-credential",
+    output_diagnostics_json: Path | None = None,
 ) -> LatencyReport:
     """Configure, serve, measure, and return one versioned latency report.
 
@@ -458,6 +461,7 @@ def run_latency_report(
         work_root: Directory that receives the temporary EXP root.
         config: Fixed request schedule.
         mock_credential: Value placed in the mock provider environment.
+        output_diagnostics_json: Optional sidecar for the gateway's content-free timing histograms.
 
     Returns:
         Completed report for the representative (median) run plus every repeat.
@@ -499,6 +503,12 @@ def run_latency_report(
         )
         representative = select_representative_run(runs)
         _assert_functional_success(runs)
+        if output_diagnostics_json is not None:
+            _write_gateway_diagnostics(
+                output_diagnostics_json,
+                port=port,
+                config=config,
+            )
         return LatencyReport(
             measured_at=datetime.now(UTC),
             config=config,
@@ -516,9 +526,54 @@ def run_latency_report(
             runs=runs,
         )
     finally:
-        if process is not None:
-            stop_gateway_process(process)
-        mock.stop()
+        try:
+            if process is not None:
+                stop_gateway_process(process)
+        finally:
+            mock.stop()
+
+
+def _write_gateway_diagnostics(
+    path: Path,
+    *,
+    port: int,
+    config: LatencyRunConfig,
+) -> None:
+    """Write an aggregate, content-free native timing snapshot beside the report."""
+    try:
+        response = httpx.get(f"http://127.0.0.1:{port}/metrics.json", timeout=5.0)
+        response.raise_for_status()
+        snapshot = response.json()
+        if not isinstance(snapshot, dict):
+            raise ValueError("gateway metrics response is not an object")
+        data_plane = snapshot.get("data_plane")
+        if not isinstance(data_plane, dict):
+            raise ValueError("gateway data-plane metrics are missing")
+        metric_names = (
+            "time_to_first_byte_ms",
+            "request_duration_ms",
+            "permit_wait_ms",
+            "bridge_call_ms",
+        )
+        metrics = {
+            name: data_plane[name]
+            for name in metric_names
+            if isinstance(data_plane.get(name), dict)
+        }
+        if len(metrics) != len(metric_names):
+            raise ValueError("gateway timing histograms are incomplete")
+    except (httpx.HTTPError, ValueError) as exc:
+        metrics = {"collection_error": type(exc).__name__}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics: JsonObject = {
+        "schema_name": "exp.gateway.latency_diagnostics",
+        "schema_version": 1,
+        "commit_sha": resolve_commit_sha(),
+        "sampled_at": datetime.now(UTC).isoformat(),
+        "config": cast(JsonObject, config.model_dump(mode="json")),
+        "gateway_metrics": cast(JsonObject, metrics),
+    }
+    path.write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")
 
 
 def _assert_functional_success(runs: tuple[LatencyMeasuredRun, ...]) -> None:
@@ -618,6 +673,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write the versioned JSON report to this path.",
     )
     parser.add_argument(
+        "--output-diagnostics-json",
+        type=Path,
+        help="Write content-free gateway timing histograms to this sidecar path.",
+    )
+    parser.add_argument(
         "--output-badge",
         type=Path,
         help="Write the Shields endpoint JSON for the README latency badge.",
@@ -677,11 +737,23 @@ def main(argv: list[str] | None = None) -> int:
             summary = Path(env_summary)
     if args.work_root is not None:
         return _run_and_write(
-            args.work_root, config, args.output_json, args.output_badge, summary, console
+            args.work_root,
+            config,
+            args.output_json,
+            args.output_diagnostics_json,
+            args.output_badge,
+            summary,
+            console,
         )
     with tempfile.TemporaryDirectory(prefix="exp-gateway-latency-") as tmp_dir:
         return _run_and_write(
-            Path(tmp_dir), config, args.output_json, args.output_badge, summary, console
+            Path(tmp_dir),
+            config,
+            args.output_json,
+            args.output_diagnostics_json,
+            args.output_badge,
+            summary,
+            console,
         )
 
 
@@ -689,6 +761,7 @@ def _run_and_write(
     work_root: Path,
     config: LatencyRunConfig,
     output_json: Path | None,
+    output_diagnostics_json: Path | None,
     output_badge: Path | None,
     github_summary: Path | None,
     console: Console,
@@ -699,6 +772,7 @@ def _run_and_write(
         work_root: EXP root for the temporary gateway.
         config: Fixed request schedule.
         output_json: Optional JSON artifact path.
+        output_diagnostics_json: Optional content-free data-plane metrics sidecar path.
         output_badge: Optional Shields endpoint JSON path.
         github_summary: Optional GitHub Actions summary path.
         console: User-facing console.
@@ -707,7 +781,11 @@ def _run_and_write(
         Process exit status.
     """
     try:
-        report = run_latency_report(work_root=work_root, config=config)
+        report = run_latency_report(
+            work_root=work_root,
+            config=config,
+            output_diagnostics_json=output_diagnostics_json,
+        )
     except RuntimeError as exc:
         console.print(str(exc), markup=False)
         return 1
