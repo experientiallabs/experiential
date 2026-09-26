@@ -30,7 +30,12 @@ class NativeAuthenticationMixin:
         """
         data = json.loads(argument)
         try:
-            self._components.store.authenticate_key(raw_key=data["raw_key"])
+            store = self._components.store
+            preflight_authenticate = getattr(store, "authenticate_key_for_preflight", None)
+            if callable(preflight_authenticate):
+                preflight_authenticate(raw_key=data["raw_key"])
+            else:
+                store.authenticate_key(raw_key=data["raw_key"])
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise authority_error(exc) from exc
         return "{}"
