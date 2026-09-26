@@ -179,6 +179,10 @@ class NativeObservabilityMixin:
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
             "accounting_healthy": self._accounting.accounting_healthy,
         }
+        group_writer = getattr(self._components, "write_ledger", None)
+        writer_metrics = getattr(group_writer, "metrics_snapshot", None)
+        if callable(writer_metrics):
+            control_plane["ledger_group_commit"] = writer_metrics()
         return {"data_plane": data_plane, "control_plane": control_plane}
 
     def metrics_json(self, argument: str) -> str:
