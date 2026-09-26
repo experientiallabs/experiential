@@ -26,7 +26,7 @@ pub struct CaptureResponse {
 impl CaptureResponse {
     #[new]
     fn new(py: Python<'_>, protocol: &str, body: &[u8], sse: bool) -> PyResult<Self> {
-        use super::{observation::CapturedResponse, record::Protocol};
+        use super::{projection::CapturedResponse, record::Protocol};
         let protocol = match protocol {
             "responses" => Protocol::Responses,
             "chat" => Protocol::ChatCompletions,

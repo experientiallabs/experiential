@@ -315,6 +315,13 @@ def _sanitize(value: JsonValue, depth: int = 0, *, events: bool = False) -> Json
                 )
             ):
                 result[key] = _INVALID_TOOL_ARGUMENTS
+            elif key == "events" and isinstance(item, list):
+                result[key] = [
+                    _sanitize(event, depth + 1, events=True)
+                    if isinstance(event, dict)
+                    else "[REDACTED_UNPARSED_EVENT]"
+                    for event in item
+                ]
             elif key in {"arguments", "capture_partial_input"} and isinstance(item, str):
                 result[key] = _sanitize_arguments(item, depth + 1)
             else:

@@ -228,6 +228,7 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
                 }
             )
     body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+    body += b'data: {"password":"' + canary.encode() + b'",\n\n'
     payload = normalize_exchange(
         _exchange(
             protocol=protocol,
@@ -635,6 +636,7 @@ def test_chat_stream_reassembles_tool_arguments_and_final_usage() -> None:
             "usage": {"prompt_tokens": 2, "completion_tokens": 3},
         },
     ]
+    events.append({"choices": [{"delta": {"content": "unindexed"}}]})
     body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
     attributes = _attributes(
         _exchange(

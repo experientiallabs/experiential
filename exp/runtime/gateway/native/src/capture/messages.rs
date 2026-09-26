@@ -1,5 +1,5 @@
 //! Reassemble observed Messages content while tracking complete block lifecycles.
-use super::observation::append;
+use super::projection::append;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 

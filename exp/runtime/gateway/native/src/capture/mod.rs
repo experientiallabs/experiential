@@ -9,7 +9,7 @@ mod local_payload;
 mod local_store;
 mod messages;
 pub(crate) mod metrics;
-mod observation;
+mod projection;
 pub(crate) mod python;
 pub(crate) mod reasoning;
 pub(crate) mod record;
