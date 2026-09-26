@@ -329,6 +329,10 @@ class _ReadyControlStore:
         """Delegate authentication without consulting alias readiness."""
         self.store.authenticate_key(raw_key=raw_key)
 
+    def authenticate_key_for_preflight(self, *, raw_key: str) -> None:
+        """Use the paced read-only key gate without consulting alias readiness."""
+        self.store.authenticate_key_for_preflight(raw_key=raw_key)
+
     def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
         """Delegate key-owner resolution without consulting alias readiness."""
         return self.store.authenticated_identity(raw_key=raw_key)

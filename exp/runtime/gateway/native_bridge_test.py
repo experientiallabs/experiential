@@ -12,7 +12,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from unittest import mock
 from uuid import uuid4
 
@@ -3495,6 +3495,37 @@ def test_authenticate_rejects_an_invalid_key(tmp_path: Path) -> None:
     payload = json.loads(excinfo.value.public_error_json)
     assert payload["status_code"] == 401
     assert payload["code"] == "invalid_key"
+
+
+def test_native_authenticate_uses_read_only_preflight_when_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Chat body gate uses the store's paced reader when it provides one."""
+    _manager, raw_key = _configured_gateway(tmp_path)
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+        )
+    )
+    store = cast(SQLiteGatewayStore, cast(Any, control._components.store).store)
+    authenticate_preflight = store.authenticate_key_for_preflight
+    preflight_keys: list[str] = []
+
+    def record_preflight(*, raw_key: str) -> None:
+        preflight_keys.append(raw_key)
+        authenticate_preflight(raw_key=raw_key)
+
+    def reject_write_lock_authentication(*, raw_key: str) -> None:
+        del raw_key
+        pytest.fail("native body preflight called the write-lock authenticator")
+
+    monkeypatch.setattr(store, "authenticate_key_for_preflight", record_preflight)
+    monkeypatch.setattr(store, "authenticate_key", reject_write_lock_authentication)
+
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+    assert preflight_keys == [raw_key]
 
 
 def test_models_and_detail_are_exact_openai_discovery_bodies(tmp_path: Path) -> None:

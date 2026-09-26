@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -58,7 +59,7 @@ from exp.runtime.gateway.sqlite.setup_authority import (
 )
 
 _LAST_USED_REFRESH_SECONDS = 60.0
-_AUTH_WRITE_LOCK_WAIT_MS = 5
+_AUTH_WRITE_LOCK_WAIT_MS = 1
 
 
 class GatewayStoreError(ValueError):
@@ -146,6 +147,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         self._serving_snapshot_max_bytes = serving_snapshot_limit(serving_snapshot_max_bytes)
         self.database_path = database_path
         self._busy_timeout_ms = busy_timeout_ms
+        self._preflight_authentication_lock = threading.Lock()
         self._clock = SystemGatewayClock() if clock is None else clock
         self._pepper = FingerprintPepperFile(
             pepper_path or database_path.with_name("gateway-key-pepper.json")
@@ -746,31 +748,24 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         Raises:
             InvalidVirtualKeyError: The key is unknown, expired, or revoked.
         """
-        with self._connect() as connection:
-            try:
-                with self._transaction(
-                    connection=connection,
-                    busy_timeout_ms=_AUTH_WRITE_LOCK_WAIT_MS,
-                ):
-                    self._authenticate_in_transaction(connection, raw_key)
-            except sqlite3.OperationalError as exc:
-                code = getattr(exc, "sqlite_errorcode", None)
-                if code is None or code & 0xFF not in (
-                    sqlite3.SQLITE_BUSY,
-                    sqlite3.SQLITE_LOCKED,
-                ):
-                    raise
-                if connection.in_transaction:
-                    connection.execute("ROLLBACK")
-                # Authentication is a pre-body gate. Under writer contention,
-                # validate from a WAL read snapshot and leave the coarse
-                # last-used timestamp for the full authorization path.
-                with self._transaction(connection=connection, immediate=False):
-                    self._authenticate_in_transaction(
-                        connection,
-                        raw_key,
-                        update_last_used=False,
-                    )
+        with self._transaction() as connection:
+            self._authenticate_in_transaction(connection, raw_key)
+
+    def authenticate_key_for_preflight(self, *, raw_key: str) -> None:
+        """Read-authenticate a body gate without waiting for SQLite writers.
+
+        The process-local lock keeps concurrent preflight readers paced before
+        they enter the later durable admission stages. Full authorization still
+        rechecks current key and alias authority and owns the coarse
+        ``last_used_at`` refresh.
+        """
+        with self._preflight_authentication_lock:
+            with self._transaction(immediate=False) as connection:
+                self._authenticate_in_transaction(
+                    connection,
+                    raw_key,
+                    update_last_used=False,
+                )
 
     def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
         """Return the organization and identity IDs owning one valid key."""

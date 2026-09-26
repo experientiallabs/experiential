@@ -250,7 +250,7 @@ def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(
         store.granted_aliases(raw_key=raw_key)
 
 
-def test_key_preflight_falls_back_to_read_while_writer_holds_lock(tmp_path: Path) -> None:
+def test_key_preflight_read_and_authorization_do_not_wait_for_writer(tmp_path: Path) -> None:
     """A held SQLite writer cannot pin pre-body key authentication."""
     store, clock, raw_key = _configured_store(tmp_path)
     store.authenticate_key(raw_key=raw_key)
@@ -265,7 +265,7 @@ def test_key_preflight_falls_back_to_read_while_writer_holds_lock(tmp_path: Path
         with ThreadPoolExecutor(max_workers=1) as executor:
 
             def preflight_and_authorize() -> AuthorizationSnapshot:
-                store.authenticate_key(raw_key=raw_key)
+                store.authenticate_key_for_preflight(raw_key=raw_key)
                 return store.authorize_request(
                     raw_key=raw_key,
                     alias="coding",
