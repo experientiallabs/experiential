@@ -111,6 +111,7 @@ class NativeAttemptAccounting:
         cache_sample_gate: Callable[[str], bool] | None = None,
         recovery_host: RecoveryHost | None = None,
         default_lane_bound: int | None = None,
+        timing_recorder: Callable[[str, float], None] | None = None,
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -127,11 +128,13 @@ class NativeAttemptAccounting:
                 fair-share weight with the very replay the promotion already
                 subsidizes. ``None`` admits every sample; a raising gate
                 skips the sample (fails closed).
+            timing_recorder: Optional content-free callback-stage recorder.
         """
         self._write_ledger = write_ledger
         self._finish_attempt: Callable[..., None] = write_ledger.finish_attempt
         self._budget_error_factory = budget_error_factory
         self._cache_sample_gate = cache_sample_gate
+        self._timing_recorder = timing_recorder
         self.recovery_host = recovery_host
         self.recovery = SessionRecoveryRegistry()
         self._health = DeploymentHealthRegistry()
@@ -179,6 +182,11 @@ class NativeAttemptAccounting:
     def accounting_healthy(self) -> bool:
         """Return whether every durable terminal write has landed."""
         return self._accounting_healthy
+
+    def _record_timing(self, name: str, started_at: float) -> None:
+        """Forward one optional elapsed stage without retaining request-specific data."""
+        if self._timing_recorder is not None:
+            self._timing_recorder(name, started_at)
 
     @property
     def health(self) -> DeploymentHealthRegistry:
@@ -343,6 +351,7 @@ class NativeAttemptAccounting:
 
     def _start_attempt(self, argument: str) -> str:
         """Select and reserve one ordinal under its request-local execution gate."""
+        preparation_started = time.monotonic()
         data = json.loads(argument)
         request_id = str(data["request_id"])
         with self._lock:
@@ -527,27 +536,38 @@ class NativeAttemptAccounting:
             )
             if tool_search_round:
                 dispatch_reason = TOOL_SEARCH_ROUND
+            maximum_cost = maximum_attempt_cost_nano_usd(
+                reservation_request, deployment, input_tokens=reserved_input_tokens
+            )
+            route_reason = route.attempt_route_reason(route.deployments[candidate])
+            fallback_reason = rule_fallback_reason(route, candidate, current_depth, failure)
+            durable_dispatch_reason = (
+                entry.recovery_reason
+                if candidate == 0
+                and entry.total_attempts == 0
+                and entry.recovery_reason is not None
+                and dispatch_reason in (None, "affinity", "affinity_sticky")
+                else dispatch_reason
+            )
+            self._record_timing("attempt_preparation_ms", preparation_started)
+            writer_started = time.monotonic()
             try:
-                attempt_id = self._write_ledger.start_attempt(
-                    snapshot=route.snapshot,
-                    deployment=deployment,
-                    attempt_ordinal=entry.total_attempts,
-                    route_depth=candidate,
-                    maximum_cost_nano_usd=maximum_attempt_cost_nano_usd(
-                        reservation_request, deployment, input_tokens=reserved_input_tokens
-                    ),
-                    reserved_input_tokens=reserved_input_tokens,
-                    reserved_output_tokens=reserved_output_tokens,
-                    route_reason=route.attempt_route_reason(route.deployments[candidate]),
-                    fallback_reason=rule_fallback_reason(route, candidate, current_depth, failure),
-                    dispatch_reason=entry.recovery_reason
-                    if candidate == 0
-                    and entry.total_attempts == 0
-                    and entry.recovery_reason is not None
-                    and dispatch_reason in (None, "affinity", "affinity_sticky")
-                    else dispatch_reason,
-                    preferred_deployment=preferred_deployment,
-                )
+                try:
+                    attempt_id = self._write_ledger.start_attempt(
+                        snapshot=route.snapshot,
+                        deployment=deployment,
+                        attempt_ordinal=entry.total_attempts,
+                        route_depth=candidate,
+                        maximum_cost_nano_usd=maximum_cost,
+                        reserved_input_tokens=reserved_input_tokens,
+                        reserved_output_tokens=reserved_output_tokens,
+                        route_reason=route_reason,
+                        fallback_reason=fallback_reason,
+                        dispatch_reason=durable_dispatch_reason,
+                        preferred_deployment=preferred_deployment,
+                    )
+                finally:
+                    self._record_timing("attempt_writer_ms", writer_started)
             except BudgetReservationRejected as exc:
                 if ticket is not None:
                     self._loads.release_ticket(ticket)
@@ -558,6 +578,7 @@ class NativeAttemptAccounting:
                     last_failure = budget_quota_failure()
                     forced_overflow = False
                     candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                    preparation_started = time.monotonic()
                     continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
@@ -580,6 +601,7 @@ class NativeAttemptAccounting:
                 # a later destination reached after this one's budget rejection.
                 forced_overflow = False
                 candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                preparation_started = time.monotonic()
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 # A reservation that raised before returning an attempt id
@@ -601,6 +623,7 @@ class NativeAttemptAccounting:
                 with self._lock:
                     self._inflight.pop(request_id, None)
                 raise error from exc
+            postprocess_started = time.monotonic()
             if ticket is not None:
                 self._loads.bind(ticket, attempt_id)
             if disposition == THROTTLE_FAILOVER_COLD:
@@ -624,10 +647,12 @@ class NativeAttemptAccounting:
                 entry.total_attempts += 1
                 entry.active_attempt_id = attempt_id
                 entry.attempt_depths[attempt_id] = candidate
-            return json.dumps(
+            result = json.dumps(
                 {"attempt_id": attempt_id, "route_depth": candidate},
                 separators=(",", ":"),
             )
+            self._record_timing("attempt_postprocess_ms", postprocess_started)
+            return result
         exhaustion = last_failure
         if exhaustion is None:
             # Nothing dispatched and nothing classified: forced claims admit
@@ -669,6 +694,7 @@ class NativeAttemptAccounting:
                 in-flight entry is kept so a retried settlement (from the
                 data plane or the deadline sweep) can still reach the ledger.
         """
+        preparation_started = time.monotonic()
         data = json.loads(argument)
         request_id = str(data["request_id"])
         with self._lock:
@@ -681,19 +707,24 @@ class NativeAttemptAccounting:
         parsed = terminal_from_settlement(data, surface=entry.authorization.surface)
         retain_recovery_observation_time(self.recovery, entry, attempt_id)
         terminal, failure = settled_terminal(data, entry, parsed=parsed, loads=self._loads)
+        settlement_kwargs = {
+            **settlement_metadata(data, self._finish_attempt),
+            **web_search_requests_kwarg(
+                self._finish_attempt, web_search_requests_from_terminal(terminal)
+            ),
+            **tool_search_requests_kwarg(
+                self._finish_attempt, tool_search_requests_from_terminal(terminal)
+            ),
+        }
+        self._record_timing("settlement_preparation_ms", preparation_started)
+        writer_started = time.monotonic()
         try:
             self._finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                **settlement_metadata(data, self._finish_attempt),
-                **web_search_requests_kwarg(
-                    self._finish_attempt, web_search_requests_from_terminal(terminal)
-                ),
-                **tool_search_requests_kwarg(
-                    self._finish_attempt, tool_search_requests_from_terminal(terminal)
-                ),
+                **settlement_kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -702,6 +733,9 @@ class NativeAttemptAccounting:
             with self._lock:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
+        finally:
+            self._record_timing("settlement_writer_ms", writer_started)
+        postprocess_started = time.monotonic()
         self._record_health(entry, attempt_id, opened=opened, failure=failure)
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
@@ -717,6 +751,7 @@ class NativeAttemptAccounting:
                 self._inflight.pop(request_id, None)
             elif entry.active_attempt_id == attempt_id:
                 entry.active_attempt_id = None
+        self._record_timing("settlement_postprocess_ms", postprocess_started)
         return "{}"
 
     def abandon(self, argument: str) -> str:

@@ -1,12 +1,16 @@
 """Local resource cleanup through the native observability callback."""
 
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_components import NativeGatewayComponents
-from exp.runtime.gateway.native_observability import NativeObservabilityMixin
+from exp.runtime.gateway.native_observability import (
+    ControlPlaneTimingDiagnostics,
+    NativeObservabilityMixin,
+)
 from exp.runtime.gateway.snapshot_file import prepare_snapshot_file
 
 
@@ -28,3 +32,15 @@ def test_callback_cleanup_evicts_shared_memo_without_disabling_active_proof(tmp_
         assert not ledger.classification_memo._closed
         first.validate_current()
     ledger.close()
+
+
+def test_control_plane_timing_diagnostics_accepts_accounting_stages() -> None:
+    """A second bounded recorder keeps reservation and settlement timings separate."""
+    diagnostics = ControlPlaneTimingDiagnostics(("attempt_writer_ms",))
+    diagnostics.record("attempt_writer_ms", time.monotonic() - 0.001)
+
+    snapshot = diagnostics.snapshot()
+
+    assert tuple(snapshot) == ("attempt_writer_ms",)
+    stage = cast(dict[str, object], snapshot["attempt_writer_ms"])
+    assert stage["count"] == 1
