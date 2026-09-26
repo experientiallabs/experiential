@@ -229,6 +229,9 @@ def _observation(
     output = json_value(raw.get("output"))
     tool_calls = declared_tool_calls(output)
     model, declared_model = _model_identity(raw, trace_provider)
+    usage = declared_usage(raw.get("usage"))
+    if usage is None:
+        usage = declared_usage(raw.get("usageDetails"))
     return VendorObservation(
         source_trace_id=source_trace_id,
         source_span_id=source_span_id,
@@ -242,7 +245,7 @@ def _observation(
         completion_text=declared_completion_text(output) or None,
         tool_calls=tool_calls,
         model=model,
-        usage=declared_usage(raw.get("usage", raw.get("usageDetails"))),
+        usage=usage,
         failure_message=failure,
         declared_attributes=(
             {} if declared_model is None else {"gen_ai.request.model": declared_model}

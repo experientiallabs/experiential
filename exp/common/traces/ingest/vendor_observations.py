@@ -317,6 +317,8 @@ def _token_count(usage: JsonObject, keys: tuple[str, ...]) -> int | None:
         if key not in usage:
             continue
         value = usage[key]
+        if value is None:
+            continue
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise VendorTraceFormatError(f"usage {key} must be a non-negative integer")
         return value
