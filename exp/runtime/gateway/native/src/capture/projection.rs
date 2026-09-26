@@ -1,6 +1,6 @@
 //! Provider response evidence shared by passive capture and gateway destinations.
 use super::record::{Protocol, Record, Response};
-use serde_json::{json, value::RawValue, Map, Value};
+use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -13,7 +13,7 @@ pub(super) struct CapturedResponse<'a> {
 
 impl<'a> CapturedResponse<'a> {
     /// Decode a bounded wire copy; callers own decompression and storage policy.
-    pub fn decode(protocol: Protocol, bytes: &[u8], sse: bool) -> (String, bool) {
+    pub fn decode(protocol: Protocol, bytes: &[u8], sse: bool) -> (String, bool, Option<String>) {
         if !sse {
             let source = std::str::from_utf8(bytes).unwrap_or("");
             return match serde_json::from_str::<Value>(source)
@@ -23,6 +23,7 @@ impl<'a> CapturedResponse<'a> {
                 Some(body) => (
                     source.to_owned(),
                     Self::json(protocol, Cow::Owned(body)).completed,
+                    None,
                 ),
                 None => (
                     if bytes.is_empty() {
@@ -32,26 +33,17 @@ impl<'a> CapturedResponse<'a> {
                     }
                     .to_owned(),
                     false,
+                    None,
                 ),
             };
         }
         let (frames, sources) = super::response::data_frames_with_sources(bytes);
         let captured = CapturedResponse::sse(protocol, &frames);
-        let body_json = if !captured.projectable
+        let events_json = (!captured.projectable
             || !sources.is_empty()
-            || super::response::contains_wide_number(&captured.body)
-        {
-            let mut fields: BTreeMap<String, Box<RawValue>> =
-                serde_json::from_str(&captured.body.to_string()).unwrap();
-            fields.insert(
-                "events".to_owned(),
-                RawValue::from_string(super::response::source_frames(&frames, &sources)).unwrap(),
-            );
-            serde_json::to_string(&fields).unwrap()
-        } else {
-            captured.body.to_string()
-        };
-        (body_json, captured.completed)
+            || super::response::contains_wide_number(&captured.body))
+        .then(|| super::response::source_frames(&frames, &sources));
+        (captured.body.to_string(), captured.completed, events_json)
     }
 
     pub fn json(protocol: Protocol, body: Cow<'a, Value>) -> Self {
@@ -101,8 +93,7 @@ impl<'a> CapturedResponse<'a> {
                 Some(Cow::Owned(body))
             }
         };
-        let mut body = body
-            .unwrap_or_else(|| Cow::Owned(json!({"capture_incomplete": true, "events": frames})));
+        let mut body = body.unwrap_or_else(|| Cow::Owned(json!({"capture_incomplete": true})));
         if let Some(error) = frames.iter().find(|v| has_error(v)) {
             body.to_mut()["error"] = error
                 .get("error")

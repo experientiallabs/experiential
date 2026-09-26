@@ -72,6 +72,11 @@ def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
         "password": canary,
         "nested": [{"api_key": canary}],
         "query": "retain useful tool content",
+        "events": [
+            "login",
+            "logout",
+            {"arguments": '{"city":"SF"}', "partial_json": "literal value"},
+        ],
     }
     if array_arguments:
         arguments = [arguments]
@@ -148,6 +153,11 @@ def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
             "password": "[REDACTED]",
             "nested": [{"api_key": "[REDACTED]"}],
             "query": "retain useful tool content",
+            "events": [
+                "login",
+                "logout",
+                {"arguments": '{"city":"SF"}', "partial_json": "literal value"},
+            ],
         }
 
 
@@ -273,7 +283,7 @@ def test_cancelled_sse_keeps_request_and_complete_events_without_inventing_usage
         _exchange(response=body, response_content_type="text/event-stream", failed=True)
     )
     assert "gen_ai.usage.input_tokens" not in attributes
-    assert "partial" in str(attributes["exp.capture.response"])
+    assert "partial" in str(attributes["exp.capture.events"])
     assert attributes["exp.capture.interrupted"] is True
 
 
@@ -380,7 +390,7 @@ def test_interrupted_compressed_sse_retains_complete_events_without_compression_
         assert attributes["gen_ai.usage.input_tokens"] == 3
         assert attributes["gen_ai.usage.output_tokens"] == 7
     else:
-        assert "retained text" in str(attributes["exp.capture.response"])
+        assert "retained text" in str(attributes["exp.capture.events"])
         assert "gen_ai.usage.input_tokens" not in attributes
 
 

@@ -143,6 +143,14 @@ def normalize_exchange(
         attributes["gen_ai.usage.output_tokens"] = counts[1]
     sanitized = _sanitize(attributes)
     assert isinstance(sanitized, dict)
+    if captured.events_json is not None:
+        events: list[JsonValue] = json.loads(captured.events_json)
+        sanitized["exp.capture.events"] = [
+            _sanitize(event, events=True)
+            if isinstance(event, dict)
+            else "[REDACTED_UNPARSED_EVENT]"
+            for event in events
+        ]
     trace_id = exchange.trace_id or uuid4().hex
     span: JsonObject = {
         "traceId": trace_id,
@@ -307,25 +315,14 @@ def _sanitize(value: JsonValue, depth: int = 0, *, events: bool = False) -> Json
         for key, item in value.items():
             if _SECRET_KEY.fullmatch(key):
                 result[key] = "[REDACTED]"
-            elif (
-                key == "partial_json"
-                or (events and key == "arguments")
-                or (
-                    key == "delta" and value.get("type") == "response.function_call_arguments.delta"
-                )
+            elif (events and key in {"partial_json", "arguments"}) or (
+                key == "delta" and value.get("type") == "response.function_call_arguments.delta"
             ):
                 result[key] = _INVALID_TOOL_ARGUMENTS
-            elif key == "events" and isinstance(item, list):
-                result[key] = [
-                    _sanitize(event, depth + 1, events=True)
-                    if isinstance(event, dict)
-                    else "[REDACTED_UNPARSED_EVENT]"
-                    for event in item
-                ]
             elif key in {"arguments", "capture_partial_input"} and isinstance(item, str):
                 result[key] = _sanitize_arguments(item, depth + 1)
             else:
-                result[key] = _sanitize(item, depth + 1, events=events or key == "events")
+                result[key] = _sanitize(item, depth + 1, events=events)
         return result
     if isinstance(value, list):
         return [_sanitize(item, depth + 1, events=events) for item in value]

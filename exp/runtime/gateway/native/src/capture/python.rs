@@ -20,6 +20,8 @@ pub struct CaptureResponse {
     body_json: String,
     #[pyo3(get)]
     completed: bool,
+    #[pyo3(get)]
+    events_json: Option<String>,
 }
 
 #[pymethods]
@@ -33,10 +35,12 @@ impl CaptureResponse {
             "messages" => Protocol::Messages,
             _ => return Err(PyValueError::new_err("unknown capture protocol")),
         };
-        let (body_json, completed) = py.detach(|| CapturedResponse::decode(protocol, body, sse));
+        let (body_json, completed, events_json) =
+            py.detach(|| CapturedResponse::decode(protocol, body, sse));
         Ok(Self {
             body_json,
             completed,
+            events_json,
         })
     }
 }
