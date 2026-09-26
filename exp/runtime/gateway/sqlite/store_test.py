@@ -310,6 +310,65 @@ def test_preflight_identity_revalidates_key_revocation_before_admission(tmp_path
         )
 
 
+def test_preflight_authorization_rechecks_alias_grant_before_admission(tmp_path: Path) -> None:
+    """An exact key preflight cannot carry an alias grant past its revocation."""
+    store, clock, raw_key = _configured_store(tmp_path)
+    preauthenticated_key = store.authenticate_key_for_preflight(raw_key=raw_key)
+
+    assert store.revoke_alias_grant(
+        organization_id="org-one",
+        identity_id="identity-one",
+        alias_id="alias-coding",
+    )
+    with pytest.raises(AliasNotGrantedError, match="not granted"):
+        store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(),
+            deadline_monotonic=clock.monotonic() + 30,
+            preauthenticated_key=preauthenticated_key,
+        )
+
+
+def test_preflight_authority_uses_one_joined_key_and_alias_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full preflight recheck resolves exact key and granted alias together."""
+    store, clock, raw_key = _configured_store(tmp_path)
+    preauthenticated_key = store.authenticate_key_for_preflight(raw_key=raw_key)
+    statements: list[str] = []
+    connect = store._connect
+
+    @contextmanager
+    def traced_connect() -> Iterator[sqlite3.Connection]:
+        with connect() as connection:
+            connection.set_trace_callback(statements.append)
+            try:
+                yield connection
+            finally:
+                connection.set_trace_callback(None)
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    authorized = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request(),
+        deadline_monotonic=clock.monotonic() + 30,
+        preauthenticated_key=preauthenticated_key,
+    )
+
+    joined_queries = [
+        statement
+        for statement in statements
+        if "FROM virtual_keys AS k" in statement
+        and "LEFT JOIN gateway_aliases AS a" in statement
+        and "LEFT JOIN identity_alias_grants AS g" in statement
+    ]
+    assert authorized.virtual_key_id == "key-one"
+    assert len(joined_queries) == 1
+
+
 def test_authorization_serializes_with_concurrent_key_revocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
