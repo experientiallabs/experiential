@@ -664,7 +664,10 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         """
         if deadline_monotonic <= self._clock.monotonic():
             raise GatewayStoreError("request deadline has already expired")
-        with self._transaction() as connection:
+
+        def authorized_alias(
+            connection: sqlite3.Connection,
+        ) -> tuple[str, str, str, sqlite3.Row | None]:
             organization_id, identity_id, key_id = self._authenticate_in_transaction(
                 connection, raw_key
             )
@@ -687,6 +690,22 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
                 """,
                 (organization_id, identity_id, alias),
             ).fetchone()
+            return organization_id, identity_id, key_id, row
+
+        try:
+            # Fresh keys only read authority. Deferred mode keeps concurrent
+            # admissions from serializing on SQLite's writer lock; stale-key
+            # telemetry upgrades this transaction only when it needs a write.
+            with self._transaction(immediate=False) as connection:
+                organization_id, identity_id, key_id, row = authorized_alias(connection)
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            if code is None or code & 0xFF not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
+            # A concurrent stale-key refresh can invalidate a deferred read's
+            # write upgrade. Retry that rare case with the normal write lock.
+            with self._transaction() as connection:
+                organization_id, identity_id, key_id, row = authorized_alias(connection)
         if row is None:
             raise AliasNotGrantedError("requested model alias is not granted")
         request_id = f"request-{uuid.uuid4().hex}"
@@ -702,7 +721,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
                 remaining_seconds=deadline_monotonic - self._clock.monotonic(),
                 classification_memo=self.classification_memo,
             ) as proof,
-            self._transaction(connection=reader) as connection,
+            self._transaction(connection=reader, immediate=False) as connection,
         ):
             proof.validate(
                 connection,
@@ -922,11 +941,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
 
     @contextmanager
     def _transaction(
-        self, *, connection: sqlite3.Connection | None = None
+        self, *, connection: sqlite3.Connection | None = None, immediate: bool = True
     ) -> Iterator[sqlite3.Connection]:
-        """Run an immediate transaction, optionally borrowing the preflight connection."""
+        """Run an immediate or read transaction, optionally borrowing a connection."""
         with self._connect() if connection is None else nullcontext(connection) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
                 yield connection
             except BaseException:
