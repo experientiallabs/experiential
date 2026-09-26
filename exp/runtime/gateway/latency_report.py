@@ -569,8 +569,13 @@ def _write_gateway_diagnostics(
         }
         if len(metrics) != len(metric_names):
             raise ValueError("gateway timing histograms are incomplete")
+        control_plane = snapshot.get("control_plane")
+        writer_metrics = (
+            control_plane.get("ledger_group_commit") if isinstance(control_plane, dict) else None
+        )
     except (httpx.HTTPError, ValueError) as exc:
         metrics = {"collection_error": type(exc).__name__}
+        writer_metrics = None
     diagnostics: JsonObject = {
         "schema_name": "exp.gateway.latency_diagnostics",
         "schema_version": 1,
@@ -579,6 +584,8 @@ def _write_gateway_diagnostics(
         "config": cast(JsonObject, config.model_dump(mode="json")),
         "gateway_metrics": cast(JsonObject, metrics),
     }
+    if isinstance(writer_metrics, dict):
+        diagnostics["ledger_group_commit"] = cast(JsonObject, writer_metrics)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")

@@ -59,6 +59,8 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_MAX_BATCH_SIZE = 128
 _BATCH_COLLECTION_WINDOW_SECONDS = 0.00025
 _MAX_CHAIN_PREFLIGHT_WORKERS = 8
+_GROUP_COMMIT_METRIC_BUCKETS_MS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100)
+_GROUP_COMMIT_OPERATIONS = ("accept", "reserve", "settle", "finish_request", "flush", "other")
 
 _T = TypeVar("_T")
 
@@ -124,6 +126,8 @@ class _PendingWrite:
 
     apply: Callable[[sqlite3.Connection], object]
     future: concurrent.futures.Future[object]
+    operation: str = "other"
+    enqueued_at: float = 0.0
     observe: Callable[[sqlite3.Connection], SQLiteChainAuthorityObservation] | None = None
     observation_key: tuple[str, str] | None = None
     prepare: (
@@ -133,6 +137,95 @@ class _PendingWrite:
         ]
         | None
     ) = None
+
+
+class _TimingHistogram:
+    """Bounded numeric summary for content-free local writer diagnostics."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.sum = 0.0
+        self.maximum = 0.0
+        self._buckets = [0] * len(_GROUP_COMMIT_METRIC_BUCKETS_MS)
+        self._overflow = 0
+
+    def observe(self, value: float) -> None:
+        self.count += 1
+        self.sum += value
+        self.maximum = max(self.maximum, value)
+        for index, boundary in enumerate(_GROUP_COMMIT_METRIC_BUCKETS_MS):
+            if value <= boundary:
+                self._buckets[index] += 1
+                return
+        self._overflow += 1
+
+    def snapshot(self) -> dict[str, object]:
+        cumulative = 0
+        buckets: list[dict[str, float | int | None]] = []
+        for boundary, count in zip(_GROUP_COMMIT_METRIC_BUCKETS_MS, self._buckets, strict=True):
+            cumulative += count
+            buckets.append({"le_ms": boundary, "count": cumulative})
+        buckets.append({"le_ms": None, "count": self.count})
+        return {
+            "count": self.count,
+            "sum_ms": round(self.sum, 3),
+            "mean_ms": 0.0 if self.count == 0 else round(self.sum / self.count, 3),
+            "max_ms": round(self.maximum, 3),
+            "buckets": buckets,
+        }
+
+
+class _GroupCommitDiagnostics:
+    """Aggregate writer queue, preparation, and SQLite transaction timings."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._histograms = {
+            name: _TimingHistogram()
+            for name in (
+                "batch_size_ops",
+                "queue_wait_ms",
+                "preparation_ms",
+                "sqlite_begin_ms",
+                "sqlite_apply_ms",
+                "sqlite_commit_ms",
+            )
+        }
+        self._operation_apply = {name: _TimingHistogram() for name in _GROUP_COMMIT_OPERATIONS}
+        self._operation_counts = {name: 0 for name in _GROUP_COMMIT_OPERATIONS}
+        self._batch_count = 0
+
+    def observe(self, name: str, value: float) -> None:
+        with self._lock:
+            self._histograms[name].observe(value)
+
+    def record_batch(self, batch: list[_PendingWrite]) -> None:
+        with self._lock:
+            self._batch_count += 1
+            self._histograms["batch_size_ops"].observe(float(len(batch)))
+            for pending in batch:
+                operation = pending.operation
+                self._operation_counts[operation] += 1
+
+    def record_operation_apply(self, operation: str, elapsed_ms: float) -> None:
+        with self._lock:
+            self._operation_apply[operation].observe(elapsed_ms)
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "batch_count": self._batch_count,
+                "operation_counts": dict(self._operation_counts),
+                "batch_size_ops": self._histograms["batch_size_ops"].snapshot(),
+                "queue_wait_ms": self._histograms["queue_wait_ms"].snapshot(),
+                "preparation_ms": self._histograms["preparation_ms"].snapshot(),
+                "sqlite_begin_ms": self._histograms["sqlite_begin_ms"].snapshot(),
+                "sqlite_apply_ms": self._histograms["sqlite_apply_ms"].snapshot(),
+                "sqlite_commit_ms": self._histograms["sqlite_commit_ms"].snapshot(),
+                "operation_apply_ms": {
+                    name: histogram.snapshot() for name, histogram in self._operation_apply.items()
+                },
+            }
 
 
 @contextmanager
@@ -198,6 +291,7 @@ class GroupCommitAttemptLedger:
             max_workers=min(max_batch_size, _MAX_CHAIN_PREFLIGHT_WORKERS),
             thread_name_prefix="gateway-chain-preflight",
         )
+        self._diagnostics = _GroupCommitDiagnostics()
         # Serializes enqueue against close so no operation can land behind the
         # stop sentinel and strand its caller after the writer thread exits.
         self._submit_lock = threading.Lock()
@@ -217,6 +311,10 @@ class GroupCommitAttemptLedger:
         readiness closed instead of queueing writes that only fail per call.
         """
         return self._closed
+
+    def metrics_snapshot(self) -> dict[str, object]:
+        """Return content-free queue and SQLite timing summaries."""
+        return self._diagnostics.snapshot()
 
     async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Durably persist accepted authority before route selection or dispatch.
@@ -348,7 +446,8 @@ class GroupCommitAttemptLedger:
                 **upstream_provider_kwarg(apply, upstream_provider),
                 **web_search_requests_kwarg(apply, web_search_requests),
                 **tool_search_requests_kwarg(apply, tool_search_requests),
-            )
+            ),
+            operation="settle",
         )
 
     async def finish_request(
@@ -366,7 +465,8 @@ class GroupCommitAttemptLedger:
         await self._submit(
             lambda connection: self.core.apply_finish_request(
                 connection, authorization=authorization, failure=failure
-            )
+            ),
+            operation="finish_request",
         )
 
     @property
@@ -376,7 +476,7 @@ class GroupCommitAttemptLedger:
 
     async def flush(self) -> None:
         """Resolve after every previously enqueued operation is durably committed."""
-        await self._submit(lambda connection: None)
+        await self._submit(lambda connection: None, operation="flush")
 
     def close(self) -> None:
         """Stop the writer thread after draining every queued operation.
@@ -424,6 +524,11 @@ class GroupCommitAttemptLedger:
                         stopping = True
                         break
                     batch.append(extra)
+                batch_started = time.monotonic()
+                for pending in batch:
+                    self._diagnostics.observe(
+                        "queue_wait_ms", (batch_started - pending.enqueued_at) * 1_000
+                    )
                 try:
                     with ExitStack() as preparations:
                         ready: list[_PendingWrite] = []
@@ -449,7 +554,14 @@ class GroupCommitAttemptLedger:
                                 if pending.observe is None:
                                     preparation, apply = _enter_preparation(pending.prepare(None))
                                     preparations.callback(_close_preparation, preparation)
-                                    ready.append(_PendingWrite(apply, pending.future))
+                                    ready.append(
+                                        _PendingWrite(
+                                            apply,
+                                            pending.future,
+                                            operation=pending.operation,
+                                            enqueued_at=pending.enqueued_at,
+                                        )
+                                    )
                                     continue
                                 observation = None
                                 if pending.observation_key is None:
@@ -473,7 +585,17 @@ class GroupCommitAttemptLedger:
                                 _resolve_exception(pending.future, exc)
                             else:
                                 preparations.callback(_close_preparation, preparation)
-                                ready.append(_PendingWrite(apply, pending.future))
+                                ready.append(
+                                    _PendingWrite(
+                                        apply,
+                                        pending.future,
+                                        operation=pending.operation,
+                                        enqueued_at=pending.enqueued_at,
+                                    )
+                                )
+                        self._diagnostics.observe(
+                            "preparation_ms", (time.monotonic() - batch_started) * 1_000
+                        )
                         if ready:
                             self._commit_batch(connection, ready)
                 except Exception as exc:  # noqa: BLE001 - blocked callers receive the failure.
@@ -512,8 +634,8 @@ class GroupCommitAttemptLedger:
                     continue
                 _resolve_exception(item.future, _closed_error())
 
-    @staticmethod
     def _commit_batch(
+        self,
         connection: sqlite3.Connection,
         batch: list[_PendingWrite],
     ) -> None:
@@ -528,16 +650,22 @@ class GroupCommitAttemptLedger:
             connection: Writer-owned configured SQLite connection.
             batch: Queued operations resolved after this shared commit.
         """
+        self._diagnostics.record_batch(batch)
+        begin_started = time.monotonic()
         try:
             connection.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
+            self._diagnostics.observe("sqlite_begin_ms", (time.monotonic() - begin_started) * 1_000)
             for pending in batch:
                 _resolve_exception(pending.future, exc)
             return
+        self._diagnostics.observe("sqlite_begin_ms", (time.monotonic() - begin_started) * 1_000)
+        apply_started = time.monotonic()
         outcomes: list[tuple[_PendingWrite, object, BaseException | None]] = []
         for index, pending in enumerate(batch):
             savepoint = f"gateway_op_{index}"
             connection.execute(f"SAVEPOINT {savepoint}")
+            operation_started = time.monotonic()
             try:
                 value = pending.apply(connection)
             except Exception as exc:  # noqa: BLE001 - the caller re-raises its own failure.
@@ -547,9 +675,18 @@ class GroupCommitAttemptLedger:
             else:
                 connection.execute(f"RELEASE {savepoint}")
                 outcomes.append((pending, value, None))
+            finally:
+                self._diagnostics.record_operation_apply(
+                    pending.operation, (time.monotonic() - operation_started) * 1_000
+                )
+        self._diagnostics.observe("sqlite_apply_ms", (time.monotonic() - apply_started) * 1_000)
+        commit_started = time.monotonic()
         try:
             connection.execute("COMMIT")
         except sqlite3.Error as exc:
+            self._diagnostics.observe(
+                "sqlite_commit_ms", (time.monotonic() - commit_started) * 1_000
+            )
             try:
                 connection.execute("ROLLBACK")
             except sqlite3.Error:
@@ -557,13 +694,19 @@ class GroupCommitAttemptLedger:
             for pending in batch:
                 _resolve_exception(pending.future, exc)
             return
+        self._diagnostics.observe("sqlite_commit_ms", (time.monotonic() - commit_started) * 1_000)
         for pending, value, error in outcomes:
             if error is not None:
                 _resolve_exception(pending.future, error)
             else:
                 _resolve_result(pending.future, value)
 
-    def submit_blocking(self, apply: Callable[[sqlite3.Connection], _T]) -> _T:
+    def submit_blocking(
+        self,
+        apply: Callable[[sqlite3.Connection], _T],
+        *,
+        operation: str = "other",
+    ) -> _T:
         """Enqueue one operation and block the calling thread on its durable commit.
 
         For threads with no running event loop, such as the native data
@@ -574,6 +717,7 @@ class GroupCommitAttemptLedger:
 
         Args:
             apply: Operation run on the writer connection inside the batch transaction.
+            operation: Fixed diagnostic category for this write.
 
         Returns:
             The operation's return value after its batch has committed.
@@ -582,9 +726,14 @@ class GroupCommitAttemptLedger:
             RuntimeError: The writer is closed, before or while waiting.
             Exception: The operation itself failed and was rolled back.
         """
-        return self._enqueue(apply).result()
+        return self._enqueue(apply, operation=operation).result()
 
-    async def _submit(self, apply: Callable[[sqlite3.Connection], _T]) -> _T:
+    async def _submit(
+        self,
+        apply: Callable[[sqlite3.Connection], _T],
+        *,
+        operation: str = "other",
+    ) -> _T:
         """Enqueue one operation and await its durable batch commit.
 
         The queued write is shielded from caller cancellation: a cancelled
@@ -597,7 +746,7 @@ class GroupCommitAttemptLedger:
         Returns:
             The operation's return value after its batch has committed.
         """
-        return await asyncio.shield(asyncio.wrap_future(self._enqueue(apply)))
+        return await asyncio.shield(asyncio.wrap_future(self._enqueue(apply, operation=operation)))
 
     def _enqueue_chain(
         self,
@@ -630,6 +779,7 @@ class GroupCommitAttemptLedger:
             prepare=lambda observation: _prepared_chain_write(
                 self.core, observation, authorization, operation, apply
             ),
+            operation=operation,
         )
 
     def _enqueue(
@@ -643,6 +793,7 @@ class GroupCommitAttemptLedger:
             AbstractContextManager[Callable[[sqlite3.Connection], object]],
         ]
         | None = None,
+        operation: str = "other",
     ) -> concurrent.futures.Future[_T]:
         """Queue one operation for the writer thread and return its commit future.
 
@@ -663,6 +814,8 @@ class GroupCommitAttemptLedger:
                 _PendingWrite(
                     apply=apply,
                     future=cast("concurrent.futures.Future[object]", future),
+                    operation=operation if operation in _GROUP_COMMIT_OPERATIONS else "other",
+                    enqueued_at=time.monotonic(),
                     observe=observe,
                     observation_key=observation_key,
                     prepare=prepare,
@@ -819,7 +972,8 @@ class SyncGroupCommitLedger:
                 **upstream_provider_kwarg(apply, upstream_provider),
                 **web_search_requests_kwarg(apply, web_search_requests),
                 **tool_search_requests_kwarg(apply, tool_search_requests),
-            )
+            ),
+            operation="settle",
         )
 
     def finish_request(
@@ -837,9 +991,10 @@ class SyncGroupCommitLedger:
         self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_request(
                 connection, authorization=authorization, failure=failure
-            )
+            ),
+            operation="finish_request",
         )
 
     def flush(self) -> None:
         """Return after every previously enqueued operation is durably committed."""
-        self._writer.submit_blocking(lambda connection: None)
+        self._writer.submit_blocking(lambda connection: None, operation="flush")
