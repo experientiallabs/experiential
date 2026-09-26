@@ -13,11 +13,19 @@ class _HasComponents(Protocol):
     _components: NativeGatewayComponents
 
 
+def authenticate_raw_key(components: NativeGatewayComponents, raw_key: str) -> None:
+    """Authenticate one virtual key and map storage failures to public errors."""
+    try:
+        components.store.authenticate_key(raw_key=raw_key)
+    except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+        raise authority_error(exc) from exc
+
+
 class NativeAuthenticationMixin:
-    """Authenticate one bearer before the data plane reads a request body."""
+    """Authenticate virtual keys before request-body decoding."""
 
     def authenticate(self: _HasComponents, argument: str) -> str:
-        """Authenticate one virtual key before the data plane reads the body.
+        """Authenticate one virtual key before the data plane decodes the body.
 
         Args:
             argument: JSON object with ``raw_key``.
@@ -29,8 +37,5 @@ class NativeAuthenticationMixin:
             NativeBridgeError: The key is invalid, expired, or revoked.
         """
         data = json.loads(argument)
-        try:
-            self._components.store.authenticate_key(raw_key=data["raw_key"])
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise authority_error(exc) from exc
+        authenticate_raw_key(self._components, data["raw_key"])
         return "{}"

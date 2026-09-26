@@ -53,14 +53,27 @@ pub(crate) async fn chat(
         Ok(key) => key,
         Err(error) => return error_response(&error),
     };
-    let authenticate = compact_json(&json!({"raw_key": raw_key}));
-    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
-        return error_response(&error);
+    let idempotency_key = latin1_header(&headers, "idempotency-key");
+    if idempotency_key.is_some() {
+        let authenticate = compact_json(&json!({"raw_key": raw_key}));
+        if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+            return error_response(&error);
+        }
     }
 
     let body_text = match String::from_utf8(body.to_vec()) {
         Ok(text) => text,
-        Err(_) => return error_response(&PublicError::invalid_json()),
+        Err(_) => {
+            // Preserve authentication-before-body-validation for invalid
+            // UTF-8 even when ordinary chat combines both control-plane steps.
+            if idempotency_key.is_none() {
+                let authenticate = compact_json(&json!({"raw_key": raw_key}));
+                if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+                    return error_response(&error);
+                }
+            }
+            return error_response(&PublicError::invalid_json());
+        }
     };
 
     // Replay-keyed chat runs the python engine's exact idempotency protocol
@@ -72,7 +85,6 @@ pub(crate) async fn chat(
     // Only the standard Idempotency-Key opts into replay: callers reuse
     // x-client-request-id as a session correlation id across distinct
     // sequential requests, so it never keys an operation.
-    let idempotency_key = latin1_header(&headers, "idempotency-key");
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
     if idempotency_key.is_some() {
@@ -118,6 +130,7 @@ pub(crate) async fn chat(
     let admit_argument = compact_json(&json!({
         "raw_key": raw_key,
         "body": body_text,
+        "authenticate_before_body_decode": idempotency_key.is_none(),
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
         "client_ip": client_ip(&headers),
