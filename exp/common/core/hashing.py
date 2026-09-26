@@ -32,4 +32,10 @@ def signed_token_embedding(text: str, dimensions: int) -> tuple[float, ...]:
         sign = 1.0 if digest[4] % 2 == 0 else -1.0
         vector[index] += sign
     norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0.0:
+        # Preserve nonzero embeddings and give cancelling token sequences distinct vectors.
+        digest = hashlib.blake2b("\0".join(tokens).encode("utf-8"), digest_size=8).digest()
+        index = int.from_bytes(digest[:4], "big") % dimensions
+        vector[index] = 1.0 if digest[4] % 2 == 0 else -1.0
+        norm = 1.0
     return tuple(value / norm for value in vector)
