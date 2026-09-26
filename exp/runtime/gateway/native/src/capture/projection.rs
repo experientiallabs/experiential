@@ -38,7 +38,7 @@ impl<'a> CapturedResponse<'a> {
             };
         }
         let (frames, sources) = super::response::data_frames_with_sources(bytes);
-        let captured = CapturedResponse::sse(protocol, &frames);
+        let captured = CapturedResponse::sse(protocol, &frames, true);
         let events_json = (matches!(protocol, Protocol::Responses)
             && (captured.body["capture_incomplete"] == true || !sources.is_empty()))
         .then(|| super::response::source_frames(&frames, &sources));
@@ -59,7 +59,7 @@ impl<'a> CapturedResponse<'a> {
         }
     }
 
-    pub fn sse(protocol: Protocol, frames: &'a [Value]) -> Self {
+    pub fn sse(protocol: Protocol, frames: &'a [Value], input_sources: bool) -> Self {
         let event = frames.iter().rev().find(|v| {
             matches!(
                 v["type"].as_str(),
@@ -78,7 +78,7 @@ impl<'a> CapturedResponse<'a> {
                 .filter(|v| v.is_object())
                 .map(Cow::Borrowed),
             Protocol::Messages => {
-                let (body, lifecycle_complete) = super::messages::assemble(frames);
+                let (body, lifecycle_complete) = super::messages::assemble(frames, input_sources);
                 valid = lifecycle_complete;
                 Some(Cow::Owned(body))
             }
@@ -137,12 +137,12 @@ impl<'a> CapturedResponse<'a> {
                     .as_ref()
                     .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
                 {
-                    let captured = CapturedResponse::sse(protocol, &frames);
+                    let captured = CapturedResponse::sse(protocol, &frames, false);
                     return captured
                         .projectable
                         .then(|| Cow::Owned(captured.body.into_owned()));
                 }
-                Self::sse(protocol, frames)
+                Self::sse(protocol, frames, false)
             }
             _ => return None,
         };

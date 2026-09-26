@@ -3,7 +3,7 @@ use super::projection::append;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub(super) fn assemble(frames: &[Value]) -> (Value, bool) {
+pub(super) fn assemble(frames: &[Value], input_sources: bool) -> (Value, bool) {
     let mut message = json!({"usage": {}});
     let mut blocks = BTreeMap::new();
     let mut arguments: BTreeMap<u64, String> = BTreeMap::new();
@@ -100,7 +100,8 @@ pub(super) fn assemble(frames: &[Value]) -> (Value, bool) {
             match serde_json::from_str::<Value>(&argument) {
                 Ok(value) => {
                     valid &= value.is_object();
-                    if super::response::contains_wide_number(&value) {
+                    // Desktop decodes exact inputs before redaction; gateway retains raw frames separately.
+                    if input_sources && super::response::contains_wide_number(&value) {
                         block["capture_input_source_json"] = Value::String(argument);
                     }
                     block["input"] = value;
@@ -124,7 +125,7 @@ mod tests {
 
     #[test]
     fn preserves_thinking_signatures_tool_inputs_and_requires_complete_lifecycle() {
-        let frames = vec![
+        let mut frames = vec![
             json!({"type":"message_start","message":{"type":"message","id":"msg","role":"assistant","content":[],"usage":{"input_tokens":2},"stop_reason":null}}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" exactly\0雪\n"}}),
@@ -137,12 +138,23 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}),
             json!({"type":"message_stop"}),
         ];
-        let (result, complete) = assemble(&frames);
+        let (result, complete) = assemble(&frames, false);
         assert!(complete);
         assert_eq!(result["content"][0]["thinking"], " exactly\0雪\n");
         assert_eq!(result["content"][0]["signature"], "signed");
         assert_eq!(result["content"][1]["input"], json!({"x":1}));
-        assert!(!assemble(&frames[..frames.len() - 1]).1);
+        assert!(!assemble(&frames[..frames.len() - 1], false).1);
+        frames[7]["delta"]["partial_json"] = json!("18446744073709551616}");
+        for input_sources in [false, true] {
+            let (body, complete) = assemble(&frames, input_sources);
+            assert!(complete);
+            assert_eq!(
+                body["content"][1]
+                    .get("capture_input_source_json")
+                    .is_some(),
+                input_sources
+            );
+        }
     }
 
     #[test]
@@ -155,7 +167,7 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
             json!({"type":"message_stop"}),
         ];
-        let message = assemble(&frames).0;
+        let message = assemble(&frames, false).0;
         assert_eq!(message["content"][0]["input"], json!({}));
     }
 }
