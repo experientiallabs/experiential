@@ -30,6 +30,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.explicit_cache import ExplicitCacheHost
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
@@ -88,7 +89,7 @@ from exp.runtime.gateway.native_continuation import (
 )
 from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
 from exp.runtime.gateway.native_decisions import NativeDecisionsMixin
-from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
+from exp.runtime.gateway.native_decode_boundary import NativeDecodeMixin
 from exp.runtime.gateway.native_dispatch_signing import NativeDispatchSigningMixin
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
 from exp.runtime.gateway.native_execution import (
@@ -98,6 +99,11 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     resolve_route_profiles,
     select_route_deployments,
+)
+from exp.runtime.gateway.native_explicit_cache import (
+    NativeExplicitCacheMixin,
+    bind_explicit_cache,
+    validate_explicit_cache_host,
 )
 from exp.runtime.gateway.native_images import NativeImagesMixin
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
@@ -148,7 +154,6 @@ from exp.runtime.openai_protocol.errors import (
     invalid_field,
     public_failure_error,
 )
-from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import BoundedContinuationStore
 
 _logger = logging.getLogger(__name__)
@@ -159,6 +164,8 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 class NativeControlPlane(
     NativeAuthenticationMixin,
+    NativeDecodeMixin,
+    NativeExplicitCacheMixin,
     NativeBatchRelayMixin,
     NativeDispatchSigningMixin,
     NativeToolSearchMixin,
@@ -192,6 +199,7 @@ class NativeControlPlane(
         capture: CaptureController | None = None,
         web_search: WebSearchBackend | None = None,
         default_lane_bound: int | None = None,
+        explicit_cache: ExplicitCacheHost | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -219,10 +227,13 @@ class NativeControlPlane(
                 no ``concurrency_bound`` (``lane_saturation.default_lane_bound``
                 of the data plane's ``max_active_requests``); ``None`` leaves
                 unauthored rungs unbounded, the historical behavior.
+            explicit_cache: Durable host policy and resource accounting for marked Google
+                prefixes. None disables explicit cache operations; generation is unchanged.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._explicit_cache = validate_explicit_cache_host(explicit_cache)
         self._capture = capture
         # The optional batch lane: hosts without it leave every batch route
         # answering the uniform not-enabled error below.
@@ -622,6 +633,15 @@ class NativeControlPlane(
                         strict=True,
                     )
                 )
+            cache_state, public_request = bind_explicit_cache(
+                self._explicit_cache,
+                authorization,
+                route.deployments,
+                resolved_wires,
+                provider_request,
+                public_request,
+                wire_route,
+            )
         except NativeBridgeError:
             # The enriched fail-closed capability rejection above already
             # finished the accepted request; let it cross the boundary as-is.
@@ -727,6 +747,7 @@ class NativeControlPlane(
                 resolved_wires=None if tool_search_state is None else tuple(resolved_wires),
                 public_request=None if tool_search_state is None else public_request,
                 tool_search=tool_search_state,
+                explicit_cache_state=cache_state,
             )
         )
         select_capture_model(self._capture, authorization.request_id, route.snapshot.exact_model_id)
@@ -932,27 +953,6 @@ class NativeControlPlane(
             raise NativeBridgeError(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
-
-    def _decode_body(
-        self,
-        body: str,
-        *,
-        surface: str = "chat",
-        idempotency_key: str | None = None,
-        client_request_id: str | None = None,
-        anthropic_beta: str | None = None,
-    ) -> DecodedGatewayRequest:
-        """Decode one raw request body with the shared surface decoder."""
-        try:
-            return decode_native_body(
-                body,
-                surface=surface,
-                idempotency_key=idempotency_key,
-                client_request_id=client_request_id,
-                anthropic_beta=anthropic_beta,
-            )
-        except NativeDecodeError as exc:
-            raise NativeBridgeError(exc.error) from exc
 
     def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str:
         """Finish one accepted-but-unservable request and return its disposition.

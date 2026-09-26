@@ -37,6 +37,9 @@ def bind_recovery_profiles(
             host is not None
             and receipt is not None
             and not profile.signs_request_body
+            # Vertex receipts identify the OAuth source account for explicit
+            # resources, not the rotating bearer used by static-auth recovery.
+            and deployment.provider != "vertex"
             and request_region is None
             and region is not None
         ):
@@ -97,7 +100,7 @@ def validated_recovery_binding(
 ) -> FrozenRecoveryBinding | None:
     """Reject accidental binding reassignment after route narrowing or reordering."""
     binding = profile.recovery_binding
-    if binding is None or not binding.scope.region_scope:
+    if binding is None or not binding.scope.region_scope or deployment.provider == "vertex":
         return None
     if (
         binding.deployment_id != deployment.deployment_id

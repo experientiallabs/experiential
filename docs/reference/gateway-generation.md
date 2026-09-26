@@ -175,6 +175,109 @@ meaning; thinking tokens still contribute to billed output. An absent usage obje
 Cumulative reports from one generation are merged, not added. Costs from separate physical
 generations cannot acquire a known total by adding a known count to an unknown one.
 
+## Gemini usage trailers
+
+Native Gemini and Vertex Gemini routes use upstream `streamGenerateContent` SSE even when
+Chat callers request a non-streaming JSON response. A candidate's `finishReason` freezes its
+content and outcome, but the gateway continues reading metadata so `usageMetadata` can arrive
+before, alongside, or after that finish. Later text, tools, errors, and finish reasons cannot
+reopen or replace the declared answer. The final meter precedes one terminal settlement.
+
+This metadata-only drain has one absolute allowance: the selected connection's existing body-read
+timeout, measured from the decoded finish and capped by the request's remaining deadline.
+Trailers and keepalives cannot renew it. EOF completes immediately, with no fixed waiting period.
+A stalled transport can therefore add up to that allowance before the response finishes.
+Cancellation closes the upstream without waiting for more metadata. At the hard request deadline,
+public SSE delivery can close without a final client frame; settlement still preserves an already
+decoded provider outcome and the meter observed so far. This guarantee starts after the finish
+passes framing and normalization. The shared SSE decoder rejects an entire network batch on a
+framing error, so a finish earlier in that rejected batch is not yet a decoded outcome.
+
+Partial or empty suffixes cannot erase earlier counts. Prompt, candidate, thinking, and cache
+counts accumulate independently of the last publishable meter; withholding a cache subset does
+not discard output counts that arrive before input. Cumulative snapshots are never added together.
+Cache counts greater than accumulated input stay pending, even when a consistent meter already
+exists. A later input report promotes the greatest actual observed cache count it covers, while
+larger counts remain pending. Smaller newly valid cache reports can therefore advance the meter
+independently of a larger pending count. Counts are never clamped to invent a subset. The set of
+distinct pending counts is bounded by the existing 4,096-entry provider-state limit; an overflow
+ends the drain with the already decoded outcome and last safe meter.
+
+Newer consistent primary counts can advance the meter without publishing pending cache counts.
+A report that itself contradicts the subset relation cannot replace the last consistent meter.
+Without reconciled input, pending nonzero cache evidence cannot authorize new output-only usage,
+even after an empty report; previously observed output legs remain pending until input arrives.
+An absent whole usage object stays unknown, and a finished all-zero report keeps the existing
+unknown-meter settlement policy. An interrupted or expired drain preserves the best consistent
+report, not a guarantee that the provider's final report was received. It does not trigger another
+generation to recover missing usage.
+
+This behavior applies to new requests. It does not reconstruct historical provider frames,
+attribute past missing meters to a particular cause, or authorize retrospective billing changes.
+
+## Host-authorized Google cache resources
+
+Native Gemini and Vertex can create explicit cache resources only when the embedder supplies
+`NativeControlPlane(..., explicit_cache=host)`. The default is `None`, which leaves existing
+implicit caching and ignored-marker disclosures unchanged. A host must require both an explicit
+five-minute ephemeral checkpoint and a configured customer-funded cache allowance; missing or zero
+allowance never authorizes creation. `prompt_cache_key` alone is not a spending instruction.
+
+The initial native path handles exact text prefixes on Google's official Gemini `v1beta` and
+Vertex `v1` endpoints. It retains the marked prefix, its system instructions and supported function
+tools in one cache resource, and sends the remaining content with `cachedContent`. A checkpoint
+cannot move to a different prefix. Media, tool-call history, automatic/request-level markers,
+interleaved instructions and other unsupported shapes retain their existing uncached behavior and
+disclosures. Cache handling is skipped for body-signed requests, search rounds and repaired payloads.
+ZDR requests do not create retained resources.
+
+Vertex returns resource names with a numeric project number, even when the endpoint uses a
+project ID. For those endpoints, the host supplies
+`GoogleCacheAuthority(vertex_project=VertexCacheProject(endpoint_project="my-project", project_number="123456789"), ...)`
+with an independently verified association for that provider account. Missing mapping skips
+creation before reserving funds. A conflicting mapping fails closed. Neither the caller nor a
+provider response can establish the mapping; numeric endpoints cannot be remapped to another
+project. The create URL, model, region and credentials remain exactly those admitted, and only the
+verified numeric namespace is accepted for creation results and reuse. Native Vertex profiles
+retain the receipt of the atomically resolved service-account credential so a host can bind the
+resource to that account generation. Refreshing an OAuth bearer does not replace the source receipt;
+resolving a rotated service account does. This receipt does not enable static-auth cache-affinity
+recovery for Vertex, including when the host declares an operational region.
+
+Cache creation happens only after route selection and generation reservation. Rust makes at most
+one cache-create HTTP request, using the selected endpoint's credentials, no redirects or retries,
+and the remaining request deadline. The request sends a fixed absolute expiration no more than
+five minutes away, not a sliding TTL. Response parsing is bounded to 64 KiB and exposes only the
+resource name, provider-measured token count, expiration, optional creation time and status to the
+host callback. `CacheResult.create_time` carries Google's `createTime` as an absolute Unix timestamp,
+not a TTL or locally inferred start time. A known value is positive, finite and no later than the
+reported expiration or its observation; missing, malformed or future creation facts remain `None`.
+A valid resource can remain ready with `create_time=None`: readiness establishes usability, not
+billing completeness. A host whose published customer schedule requires creation time must retain
+its full hold until it has sufficient provider facts and may refuse accounting acknowledgement.
+The provider-reported resource interval is evidence, not an exact invoice formula or proof of
+provider billing granularity, garbage-collection timing or realized storage charges.
+
+The host owns durable cross-worker claims, customer allowance, credential-generation binding and
+resource-cost accounting. Its `claim` must commit the complete create-plus-storage reservation
+before granting one creator. Ready resources are isolated by tenant, account generation, endpoint,
+project/location, model and exact prefix. A worker-local dictionary is not a durable implementation.
+Token storage is priced per million-token-hour, separately from generation/cache-write token legs;
+unknown rates are not zero, while an explicitly verified zero create-input rate is representable.
+The 300-second quote applies the host-authored customer schedule and bounds that authorized
+reservation; it does not establish an upper bound on every possible provider invoice adjustment.
+
+Creation timeouts, cancellations and malformed outcomes retain reserved exposure and never trigger
+blind resource recreation. Known but expired resource facts still reach accounting, but the resource
+is not reused. Freshness is rechecked after host I/O and again in Rust before use. A failed accounting
+acknowledgement prevents generation; an acknowledged unavailable resource can use the original
+payload within existing deadlines and generation-attempt limits. No warm-up generation is added.
+
+This engine interface does not install a hosted spending policy, durable resource store, verified
+price catalog or customer settings UI. Those must be implemented and tested by the embedder before
+activation. Offline and loopback tests do not establish live Google eligibility, realized savings or
+provider-side storage billing. No customer is opted in by installing the engine package.
+
 ## Verification boundaries
 
 Regression coverage exercises the actual native normalizers, encoders, and served loopback

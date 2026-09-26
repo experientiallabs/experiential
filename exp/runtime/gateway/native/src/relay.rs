@@ -298,6 +298,8 @@ impl UpstreamRelay {
     pub(crate) fn close_transport(&mut self) {
         self.stream = futures_util::stream::empty().boxed();
         self.eof = true;
+        let events = self.normalizer.finish_metadata_drain();
+        self.queue_events(events);
         // Drain only already decoded events through effective stop/tool rules.
         // This never polls the provider and retains a stop-adjusted terminal.
         let mut drain_failure = None;
@@ -548,6 +550,7 @@ impl UpstreamRelay {
     /// propagates. See `Normalizer::recover_abnormal_end`.
     fn recover_or_fail(&mut self, failure: Failure) -> Result<(), Failure> {
         self.eof = true;
+        self.stream = futures_util::stream::empty().boxed();
         let events = self.normalizer.recover_abnormal_end(failure)?;
         self.queue_events(events);
         Ok(())
@@ -600,13 +603,24 @@ impl UpstreamRelay {
             // Already decoded events, especially a terminal with usage, are
             // drained first. A slow downstream consumer cannot turn a received
             // terminal into a provider stall. No fresh read may bypass expiry.
-            if let Some(failure) = self.read_failure(deadline, phase_timeout) {
+            let drain_started = self.normalizer.metadata_drain_started();
+            if let Some(started) = drain_started {
+                // One existing body-read allowance from declared finish, never
+                // renewed by trailers, keepalives or downstream backpressure.
+                // EOF ends immediately; the total request deadline still wins.
+                if remaining(deadline).is_zero() || started.elapsed() >= phase_timeout {
+                    self.close_transport();
+                    continue;
+                }
+            } else if let Some(failure) = self.read_failure(deadline, phase_timeout) {
                 return Err(failure);
             }
             // Bytes never renew either bound. Genuine progress renews the
             // generation idle window, while the total request deadline stays
             // fixed across progress and all physical attempts.
-            let progress_deadline = if self.provider_tools.active() {
+            let progress_deadline = if let Some(started) = drain_started {
+                started + phase_timeout
+            } else if self.provider_tools.active() {
                 Instant::now() + phase_timeout
             } else if self.stall_bound_armed {
                 self.first_token_deadline
@@ -680,11 +694,21 @@ impl UpstreamRelay {
                     continue;
                 }
                 Err(_) => {
+                    if drain_started.is_some() {
+                        self.close_transport();
+                        continue;
+                    }
                     return Err(self
                         .read_failure(deadline, phase_timeout)
                         .unwrap_or_else(|| stream_timeout_failure(deadline)));
                 }
             };
+            if drain_started.is_some_and(|started| {
+                remaining(deadline).is_zero() || started.elapsed() >= phase_timeout
+            }) {
+                self.close_transport();
+                continue;
+            }
             if !self.first_byte_recorded {
                 METRICS
                     .time_to_first_byte_ms
@@ -713,6 +737,11 @@ impl UpstreamRelay {
                         break;
                     }
                 }
+            }
+            if self.normalizer.metadata_drain_started().is_some() {
+                // An always-ready stream of trailers must not prevent the
+                // request owner from cancelling its pending read.
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -772,6 +801,8 @@ pub async fn collect_committed(
     }
 }
 
+#[cfg(test)]
+mod gemini_usage_tests;
 #[cfg(test)]
 mod progress_tests;
 #[cfg(test)]

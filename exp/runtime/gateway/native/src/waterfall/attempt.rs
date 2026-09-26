@@ -18,6 +18,9 @@ use crate::upstream::open_stream;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+#[path = "google_cache.rs"]
+mod google_cache;
+
 pub(super) async fn run_attempt(
     ctx: &WaterfallContext<'_>,
     guard: &mut AttemptGuard,
@@ -64,6 +67,22 @@ pub(super) async fn run_attempt(
             };
         }
     };
+    let cached_wire =
+        match google_cache::prepare(ctx, wire, reactive_repair || repaired.is_some()).await {
+            Ok(wire) => wire,
+            Err(failure) => {
+                return AttemptEnd::Ladder {
+                    failure,
+                    refusal_eligible: false,
+                    exhaustion_flush: Vec::new(),
+                    usage: None,
+                    tool_names: Vec::new(),
+                    opened: false,
+                    encrypted_reasoning_stripped: false,
+                };
+            }
+        };
+    let wire = cached_wire.as_ref().unwrap_or(wire);
     // The connection's raw timeout paces each BODY chunk read, exactly like
     // the python streaming path. The open (request/response-header) phase is
     // bounded by the fail-fast time-to-first-byte window alone (fresh per

@@ -56,6 +56,7 @@ from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeW
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+    from exp.runtime.gateway.native_explicit_cache import NativeCacheState
 
 # The frozen native retry policy.
 MAXIMUM_TOTAL_ATTEMPTS = 8
@@ -163,6 +164,8 @@ class InflightRequest:
         recovery_recorded_attempts: Attempts whose recovery effects already ran, initially empty.
         recovery_reason: Optional content-free reason for the admitted recovery placement.
         denied_destination_pools: Exactly bound destination-only budget refusals in this request.
+        explicit_cache_state: Private marked-prefix plans and durable operation bindings,
+            absent unless a host provides explicit cache spending authority.
     """
 
     authorization: AuthorizationSnapshot
@@ -234,6 +237,7 @@ class InflightRequest:
     resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
     public_request: GatewayRequest | None = None
     tool_search: ToolSearchState | None = None
+    explicit_cache_state: NativeCacheState | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""

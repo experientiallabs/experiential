@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Literal
+from uuid import uuid4
 
 import pytest
 
@@ -20,7 +21,14 @@ from exp.common.models import (
     ModelSnapshot,
     Usage,
 )
-from exp.runtime.models.credentials import ModelCredentialError
+from exp.common.models.gateway_catalog import normalize_gateway_catalog
+from exp.runtime.gateway.execution_resolution import _resolved_wire_profile
+from exp.runtime.models.credentials import (
+    CredentialResolution,
+    DispatchCredentialReceipt,
+    ModelCredentialError,
+)
+from exp.runtime.models.credentials_test import AtomicEnvironment
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
 from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.azure import AzureClient
@@ -32,6 +40,7 @@ from exp.runtime.models.providers.tinker_sampling import (
 )
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
+from exp.runtime.models.providers.vertex import VertexTokenProvider
 from exp.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
@@ -40,6 +49,58 @@ _DEFAULT_CAPABILITIES = ModelCapabilities(
     context_window_tokens=128_000,
     maximum_output_tokens=16_000,
 )
+
+
+def test_native_vertex_retains_atomic_source_receipt_across_bearer_refresh_and_rotation() -> None:
+    """The service-account binding survives OAuth refresh, not credential rotation."""
+    first, second = DispatchCredentialReceipt(uuid4()), DispatchCredentialReceipt(uuid4())
+    environment = AtomicEnvironment(
+        CredentialResolution("source-one", "environment", receipt=first)
+    )
+    tokens = {"source-one": "token-one", "source-two": "token-two"}
+
+    def factory(*, credentials_json: str) -> VertexTokenProvider:
+        """Resolve a synthetic bearer using the exact source supplied to this client."""
+        return lambda: tokens[credentials_json]
+
+    catalog = ModelCatalog(
+        connections={
+            "vertex": ConnectionConfig(
+                provider="vertex",
+                base_url="https://aiplatform.googleapis.com/v1/projects/fruit-project/locations/global",
+                api_key_env="VERTEX_TEST",
+            )
+        },
+        models={
+            "gemini-test": ModelRecord(
+                connection="vertex",
+                model="gemini-2.5-pro",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True),
+            )
+        },
+    )
+    runtime = RuntimeModelCatalog(
+        catalog, environment=environment, vertex_token_provider_factory=factory
+    )
+    deployment = normalize_gateway_catalog(catalog).deployments[0]
+    resolved = runtime.resolve("gemini-test")
+    original = _resolved_wire_profile(deployment, resolved)
+    assert original.credential_receipt is first
+    assert original.headers["authorization"] == "Bearer token-one"
+    tokens["source-one"] = "token-one-refreshed"
+    refreshed = _resolved_wire_profile(deployment, resolved)
+    assert refreshed.credential_receipt is first
+    assert refreshed.headers["authorization"] == "Bearer token-one-refreshed"
+    environment.resolved = CredentialResolution("source-two", "environment", receipt=second)
+    rotated = _resolved_wire_profile(deployment, runtime.resolve("gemini-test"))
+    assert rotated.credential_receipt is second
+    assert rotated.headers["authorization"] == "Bearer token-two"
+    assert original.credential_receipt is first
+    assert original.headers["authorization"] == "Bearer token-one"
+    assert environment.calls == 2
+    assert "source-one" not in repr(original)
+    assert str(first.binding_id) not in repr(original)
 
 
 class _FakeTinkerSampler:

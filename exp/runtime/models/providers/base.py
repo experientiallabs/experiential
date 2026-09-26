@@ -102,8 +102,10 @@ class GatewayWireProfile:
     that only the resolved Python client knows.
 
     Attributes:
-        credential_receipt: Optional worker-private static-auth receipt, excluded
-            from diagnostics and never serialized onto the native wire.
+        credential_receipt: Optional worker-private source-credential receipt,
+            excluded from diagnostics and never serialized onto the native wire.
+            On Vertex this identifies the resolved service account, not a rotating
+            OAuth bearer, and does not authorize static-auth recovery.
         recovery_binding: Optional private scope frozen from this exact profile
             before recovery selection, excluded from diagnostics.
         operational_region: Verified region or named global service scope for

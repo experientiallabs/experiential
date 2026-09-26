@@ -1,24 +1,36 @@
 //! Gemini `streamGenerateContent` frame mapping plus its golden-fixture tests.
 
+#[path = "gemini_usage.rs"]
+mod usage;
+pub(super) use usage::StreamState;
+
 use serde_json::Value;
 
 use super::{malformed, parse_object, Normalizer};
 use crate::errors::{Failure, FailureClass};
-use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
+use crate::events::{require_string, Event, ToolAccumulator};
 
 impl Normalizer {
     /// Normalize one Gemini `streamGenerateContent` SSE frame: thought parts
     /// stay capture-only, whole function calls expand to start/arguments/completed,
-    /// and the terminal candidate flushes the latest usage before its finish
-    /// reason maps to the shared completion, incomplete, refusal, or
-    /// provider-internal outcome. A prompt-level block (`promptFeedback.
-    /// blockReason`, delivered with no candidates at all) is the same
+    /// and the terminal candidate freezes content while metadata trailers can
+    /// complete the meter. Its declared outcome is emitted once transport ends.
+    /// A prompt-level block (`promptFeedback.blockReason`, delivered with no
+    /// candidates at all) is the same
     /// content-free refusal a candidate-level safety finish produces.
     pub(super) fn feed_gemini(
         &mut self,
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
+        if self.metadata_drain_started().is_some() {
+            if let Some(raw) = payload.get("usageMetadata").filter(|raw| !raw.is_null()) {
+                self.observe_gemini_usage(raw)?;
+            }
+            // The first finish is authoritative. Late content, tools, errors,
+            // refusals and further finish reasons cannot reopen the answer.
+            return Ok(Vec::new());
+        }
         if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
             // Google's error envelope ({"error":{"code":503,"status":"UNAVAILABLE"}})
             // arrives as a candidate-less frame; without this branch it reads
@@ -43,7 +55,7 @@ impl Normalizer {
         }
         if let Some(raw_usage) = payload.get("usageMetadata") {
             if !raw_usage.is_null() {
-                self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
+                self.observe_gemini_usage(raw_usage)?;
             }
         }
         if gemini_prompt_blocked(&payload)? {
@@ -158,29 +170,24 @@ impl Normalizer {
             Some(Value::String(reason)) => reason.clone(),
             Some(_) => return Err(malformed("Gemini finishReason must be text")),
         };
-        if let Some(usage) = self.usage.take() {
-            events.push(Event::Usage(usage));
-        }
-        match finish_reason.as_str() {
-            "STOP" | "FINISH_REASON_UNSPECIFIED" => events.push(Event::Completed),
-            "MAX_TOKENS" => events.push(Event::Incomplete),
+        let terminal = match finish_reason.as_str() {
+            "STOP" | "FINISH_REASON_UNSPECIFIED" => Event::Completed,
+            "MAX_TOKENS" => Event::Incomplete,
             // The python mapper's refusal signal table: safety, copyright,
             // and sensitive-information stops are content-free refusals. The
             // finish token names the category (RECITATION, SPII, SAFETY), so
             // the caller sees which policy declined without any provider prose.
             "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII"
-            | "IMAGE_SAFETY" => {
-                events.push(Event::Failed(Failure::refusal(
-                    crate::stream_errors::refusal_reason(Some(&finish_reason), None),
-                )));
-            }
-            _ => {
-                events.push(Event::Failed(Failure::new(
-                    FailureClass::ProviderInternal,
-                    "provider ended the stream unexpectedly",
-                )));
-            }
-        }
+            | "IMAGE_SAFETY" => Event::Failed(Failure::refusal(
+                crate::stream_errors::refusal_reason(Some(&finish_reason), None),
+            )),
+            _ => Event::Failed(Failure::new(
+                FailureClass::ProviderInternal,
+                "provider ended the stream unexpectedly",
+            )),
+        };
+        self.gemini.finish = Some(terminal);
+        self.gemini.finished_at = Some(std::time::Instant::now());
         Ok(events)
     }
 
@@ -259,6 +266,10 @@ fn gemini_block_reason(payload: &serde_json::Map<String, Value>) -> Option<Strin
         .and_then(Value::as_str)
         .map(str::to_string)
 }
+
+#[cfg(test)]
+#[path = "gemini_usage_tests.rs"]
+mod usage_tests;
 
 #[cfg(test)]
 mod gemini_tests {
@@ -884,8 +895,14 @@ mod gemini_tests {
             data: json!({"candidates": [{"content": {"parts": [{"text": "late"}]}}]}).to_string(),
         };
         let events = normalizer.feed(&terminal).expect("terminal frame");
-        assert!(events.iter().any(Event::is_terminal));
-        assert!(normalizer.saw_terminal());
+        assert!(!events.iter().any(Event::is_terminal));
+        assert!(!normalizer.saw_terminal());
+        assert!(normalizer.metadata_drain_started().is_some());
         assert!(normalizer.feed(&trailing).expect("ignored").is_empty());
+        assert!(matches!(
+            normalizer.on_stream_end().unwrap().as_slice(),
+            [Event::Completed]
+        ));
+        assert!(normalizer.saw_terminal());
     }
 }

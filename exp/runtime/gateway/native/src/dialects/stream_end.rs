@@ -9,11 +9,45 @@
 //! post-commit streams in 14 days, 2026-09-14). Child of `dialects` so the
 //! parent stays under the hand-authored line budget.
 
-use super::{finish_open_tools_relay, Dialect, Normalizer};
-use crate::errors::Failure;
+use super::{finish_open_tools_relay, Dialect, Normalizer, OUTPUT_OVERFLOW_MESSAGE};
+use crate::errors::{Failure, FailureClass};
 use crate::events::{Event, ProviderOutputItemStatus};
 
 impl Normalizer {
+    /// Recover a Gemini abnormal end without discarding served output or meters.
+    /// A declared finish remains authoritative after a trailer failure; before
+    /// finish, served content is incomplete and pre-content breaks can retry.
+    /// Other dialects and deliberate content-validation limits remain errors.
+    pub fn recover_abnormal_end(&mut self, failure: Failure) -> Result<Vec<Event>, Failure> {
+        if self.metadata_drain_started().is_some() {
+            return Ok(self.finish_metadata_drain());
+        }
+        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE
+            || (failure.failure_class == FailureClass::MalformedResponse
+                && !failure.retryable_same_deployment
+                && !failure.failover_eligible)
+            || self.terminal
+            || self.dialect != Dialect::GeminiGenerateContent
+        {
+            return Err(failure);
+        }
+        if !self.emitted_output {
+            return Err(Failure::new(
+                FailureClass::Transport,
+                "provider transport failed; retry the request",
+            )
+            .with_retry(true, true)
+            .with_provider_detail(failure.provider_detail));
+        }
+        let mut events = Vec::new();
+        if let Some(usage) = self.usage.take() {
+            events.push(Event::Usage(usage));
+        }
+        events.push(Event::Incomplete);
+        self.terminal = true;
+        Ok(events)
+    }
+
     /// Synthesize the terminal events for a stream that closed cleanly
     /// without an explicit terminal frame, or nothing when a terminal already
     /// ended the stream or nothing was served (the caller then fails it
@@ -23,6 +57,9 @@ impl Normalizer {
     pub fn on_stream_end(&mut self) -> Result<Vec<Event>, Failure> {
         if self.terminal {
             return Ok(Vec::new());
+        }
+        if self.metadata_drain_started().is_some() {
+            return Ok(self.finish_metadata_drain());
         }
         // An OpenAI-compatible finish reason already seen is a complete
         // ending whether or not output followed it (a content_filter finish
@@ -110,6 +147,17 @@ impl Normalizer {
     }
 }
 
+fn dialect_name(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::OpenAiResponses => "openai_responses",
+        Dialect::AnthropicMessages => "anthropic_messages",
+        Dialect::OpenAiCompatible => "openai_compatible",
+        Dialect::GeminiGenerateContent => "gemini_generate_content",
+        Dialect::BedrockConverseStream => "bedrock_converse_stream",
+        Dialect::TypesafeSystemone => "typesafe_systemone",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,16 +241,5 @@ mod tests {
                 );
             }
         }
-    }
-}
-
-fn dialect_name(dialect: Dialect) -> &'static str {
-    match dialect {
-        Dialect::OpenAiResponses => "openai_responses",
-        Dialect::AnthropicMessages => "anthropic_messages",
-        Dialect::OpenAiCompatible => "openai_compatible",
-        Dialect::GeminiGenerateContent => "gemini_generate_content",
-        Dialect::BedrockConverseStream => "bedrock_converse_stream",
-        Dialect::TypesafeSystemone => "typesafe_systemone",
     }
 }
