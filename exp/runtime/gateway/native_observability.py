@@ -11,6 +11,8 @@ module keeps only the request-serving authority path.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable
 from typing import cast
 
@@ -32,12 +34,52 @@ from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.sqlite.migrations import close_idle_connections
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
+_ADMISSION_TIMING_STAGES = (
+    "decode_and_body_ms",
+    "alias_authorization_ms",
+    "pre_accept_policy_ms",
+    "ledger_accept_ms",
+    "route_and_register_ms",
+    "response_encode_ms",
+)
+
+
+class ControlPlaneTimingDiagnostics:
+    """Bounded content-free stage summaries for successful request admission."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values = {name: [0, 0.0, 0.0] for name in _ADMISSION_TIMING_STAGES}
+
+    def record(self, name: str, started_at: float) -> None:
+        """Record one elapsed stage without retaining request-specific data."""
+        elapsed_ms = max(0.0, (time.monotonic() - started_at) * 1_000)
+        with self._lock:
+            value = self._values[name]
+            value[0] += 1
+            value[1] += elapsed_ms
+            value[2] = max(value[2], elapsed_ms)
+
+    def snapshot(self) -> dict[str, object]:
+        """Return bounded count, sum, mean, and maximum values per stage."""
+        with self._lock:
+            return {
+                name: {
+                    "count": count,
+                    "sum_ms": round(total, 3),
+                    "mean_ms": 0.0 if count == 0 else round(total / count, 3),
+                    "max_ms": round(maximum, 3),
+                }
+                for name, (count, total, maximum) in self._values.items()
+            }
+
 
 class NativeObservabilityMixin:
     """Content-free read-side callbacks shared by the native control plane."""
 
     _components: NativeGatewayComponents
     _accounting: NativeAttemptAccounting
+    _control_plane_timing: ControlPlaneTimingDiagnostics
     _data_plane_metrics: Callable[[], str] | None
     _usage_reporter: Callable[[], JsonObject] | None
     _readiness_probe: Callable[[], bool] | None
@@ -178,6 +220,7 @@ class NativeObservabilityMixin:
             "reconciled_expired_requests": self._components.reconciled_expired_requests,
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
             "accounting_healthy": self._accounting.accounting_healthy,
+            "admission_stage_ms": self._control_plane_timing.snapshot(),
         }
         group_writer = getattr(self._components, "write_ledger", None)
         writer_metrics = getattr(group_writer, "metrics_snapshot", None)

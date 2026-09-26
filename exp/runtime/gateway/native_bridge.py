@@ -100,7 +100,10 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_images import NativeImagesMixin
-from exp.runtime.gateway.native_observability import NativeObservabilityMixin
+from exp.runtime.gateway.native_observability import (
+    ControlPlaneTimingDiagnostics,
+    NativeObservabilityMixin,
+)
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,
     has_active_reasoning_content,
@@ -223,6 +226,7 @@ class NativeControlPlane(
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._control_plane_timing = ControlPlaneTimingDiagnostics()
         self._capture = capture
         # The optional batch lane: hosts without it leave every batch route
         # answering the uniform not-enabled error below.
@@ -300,6 +304,7 @@ class NativeControlPlane(
                 capability admission failed.
         """
         assert_not_internal_classification()
+        decode_started = time.monotonic()
         data = json.loads(argument)
         self._accounting.sweep_expired()
         surface = str(data.get("surface", "chat"))
@@ -312,6 +317,8 @@ class NativeControlPlane(
         )
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
+        self._control_plane_timing.record("decode_and_body_ms", decode_started)
+        authorization_started = time.monotonic()
         try:
             # Freeze native app attribution and the trusted client IP onto caller authority.
             authorization = self._components.store.authorize_request(
@@ -325,13 +332,16 @@ class NativeControlPlane(
             )
             authorization = authorize_serving_model_chains(self._components, authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            self._control_plane_timing.record("alias_authorization_ms", authorization_started)
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)
             if pointer is not None:
                 raise pointer from exc
             raise mapped from exc
+        self._control_plane_timing.record("alias_authorization_ms", authorization_started)
 
         # Resolve continuation after authorization and before any durable acceptance.
+        pre_accept_started = time.monotonic()
         continuation_context: ContinuationContext | None = None
         if request.surface == GatewayApiSurface.RESPONSES:
             try:
@@ -411,16 +421,20 @@ class NativeControlPlane(
             # Execution receives authenticated plaintext, but the bounded
             # continuation store keeps the post-guardrail history sealed.
             continuation_context.messages = retention_request.messages
+        self._control_plane_timing.record("pre_accept_policy_ms", pre_accept_started)
 
         # The ledger accepts the logical request before route selection, so a
         # keyed operation whose durable terminal already exists (or whose key
         # was reused with different content) fails closed here, before
         # learned selection can run request-time embedding or any other
         # provider-touching work.
+        ledger_accept_started = time.monotonic()
         try:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            self._control_plane_timing.record("ledger_accept_ms", ledger_accept_started)
             raise _authority_error(exc) from exc
+        self._control_plane_timing.record("ledger_accept_ms", ledger_accept_started)
 
         if not begin_capture(
             self._capture,
@@ -436,6 +450,7 @@ class NativeControlPlane(
             raise NativeBridgeError(
                 OpenAIProtocolError(status_code=503, code="capture_unavailable", message=message)
             )
+        route_started = time.monotonic()
         # Escalation finishes the accepted request quietly before returning, so it is
         # accounted content-free and never billed. Routing failures found by
         # the probe are raised against the accepted request below.
@@ -772,7 +787,11 @@ class NativeControlPlane(
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
-        return json.dumps(response, separators=(",", ":"))
+        self._control_plane_timing.record("route_and_register_ms", route_started)
+        response_started = time.monotonic()
+        encoded_response = json.dumps(response, separators=(",", ":"))
+        self._control_plane_timing.record("response_encode_ms", response_started)
+        return encoded_response
 
     def start_attempt(self, argument: str) -> str:
         """Reserve one physical dispatch through the accounting registry.
