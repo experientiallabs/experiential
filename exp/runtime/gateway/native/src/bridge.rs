@@ -104,9 +104,7 @@ impl Bridge {
             return Err(PublicError::internal());
         }
         let outcome = outcome.await;
-        crate::metrics::METRICS
-            .bridge_call_ms
-            .record(call_started.elapsed());
+        crate::metrics::METRICS.record_bridge_call(method, call_started.elapsed());
         match outcome {
             Ok(result) => result,
             Err(_) => Err(PublicError::internal()),
