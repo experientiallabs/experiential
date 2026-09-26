@@ -116,6 +116,19 @@ def _file_stamp(stream: BinaryIO) -> _FileStamp:
     )
 
 
+def _stat_file_stamp(info: os.stat_result) -> _FileStamp:
+    """Build the POSIX snapshot stamp from a no-follow ``stat`` result."""
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_ctime_ns,
+    )
+
+
 @contextmanager
 def snapshot_stream(root: Path, relative_path: str) -> Iterator[BinaryIO]:
     """Open one required descendant without following symlink or reparse-point components."""
@@ -251,10 +264,54 @@ def validate_snapshot_generation(
         relative_path: Unresolved descendant spelling used by the original proof.
         generation: Identity and metadata captured when the content was classified.
     """
-    with _snapshot_observation(root, relative_path) as (current, identities):
-        stamp = None if current is None else _file_stamp(current)
-        if identities != generation[0] or stamp != generation[1]:
-            raise ValueError("serving snapshot changed after preflight; retry the operation")
+    if (
+        os.name == "nt"
+        or os.stat not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+    ):
+        with _snapshot_observation(root, relative_path) as (current, identities):
+            stamp = None if current is None else _file_stamp(current)
+            observed = (identities, stamp)
+    else:
+        observed = _snapshot_generation_by_stat(root, relative_path)
+    if observed != generation:
+        raise ValueError("serving snapshot changed after preflight; retry the operation")
+
+
+def _snapshot_generation_by_stat(root: Path, relative_path: str) -> SnapshotGeneration:
+    """Fence one POSIX snapshot with secure directory opens and a no-follow leaf stat."""
+    relative = Path(relative_path)
+    windows = PureWindowsPath(relative_path)
+    if (
+        relative.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or not relative.parts
+        or any(part in (".", "..") for part in relative.parts)
+    ):
+        raise ValueError("budget catalog snapshot reference escapes gateway state")
+    directories = [os.open(root.resolve(), os.O_RDONLY | os.O_DIRECTORY)]
+    identities = [_handle_identity(directories[0])]
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directories[-1]
+            )
+            directories.append(child)
+            identities.append(_handle_identity(child))
+        try:
+            info = os.stat(relative.parts[-1], dir_fd=directories[-1], follow_symlinks=False)
+        except FileNotFoundError:
+            return tuple(identities), None
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("budget catalog snapshot must be a regular file")
+        identities.append((info.st_dev, info.st_ino.to_bytes(16, "big")))
+        return tuple(identities), _stat_file_stamp(info)
+    except FileNotFoundError:
+        return tuple(identities), None
+    finally:
+        for directory in reversed(directories):
+            os.close(directory)
 
 
 @contextmanager
