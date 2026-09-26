@@ -329,9 +329,9 @@ class _ReadyControlStore:
         """Delegate authentication without consulting alias readiness."""
         self.store.authenticate_key(raw_key=raw_key)
 
-    def authenticate_key_for_preflight(self, *, raw_key: str) -> None:
+    def authenticate_key_for_preflight(self, *, raw_key: str) -> tuple[str, str, str]:
         """Use the paced read-only key gate without consulting alias readiness."""
-        self.store.authenticate_key_for_preflight(raw_key=raw_key)
+        return self.store.authenticate_key_for_preflight(raw_key=raw_key)
 
     def set_request_authority_timing_recorder(
         self, recorder: Callable[[str, float], None] | None
@@ -376,6 +376,7 @@ class _ReadyControlStore:
         alias: str,
         request: ServingRequest,
         deadline_monotonic: float,
+        preauthenticated_key: tuple[str, str, str] | None = None,
         app_referer: str | None = None,
         app_title: str | None = None,
         client_ip: str | None = None,
@@ -384,15 +385,27 @@ class _ReadyControlStore:
 
         An authority minted just before an activation swap is pinned to its revision, not rejected.
         """
-        authorization = self.store.authorize_request(
-            raw_key=raw_key,
-            alias=alias,
-            request=request,
-            deadline_monotonic=deadline_monotonic,
-            app_referer=app_referer,
-            app_title=app_title,
-            client_ip=client_ip,
-        )
+        if preauthenticated_key is None:
+            authorization = self.store.authorize_request(
+                raw_key=raw_key,
+                alias=alias,
+                request=request,
+                deadline_monotonic=deadline_monotonic,
+                app_referer=app_referer,
+                app_title=app_title,
+                client_ip=client_ip,
+            )
+        else:
+            authorization = self.store.authorize_request(
+                raw_key=raw_key,
+                alias=alias,
+                request=request,
+                deadline_monotonic=deadline_monotonic,
+                preauthenticated_key=preauthenticated_key,
+                app_referer=app_referer,
+                app_title=app_title,
+                client_ip=client_ip,
+            )
         state = self.reloader.state
         served = _serve_or_fallback(state, authorization)
         if served is not None:

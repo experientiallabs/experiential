@@ -27,6 +27,8 @@ def authorize_sqlite_alias(
     transaction: Callable[..., AbstractContextManager[sqlite3.Connection]],
     authenticate: Callable[[sqlite3.Connection, str], tuple[str, str, str]],
     authenticate_readonly: Callable[[sqlite3.Connection, str], tuple[str, str, str]],
+    authenticate_preflight: Callable[..., tuple[str, str, str]],
+    preauthenticated_key: tuple[str, str, str] | None,
     busy_timeout_ms: int,
     classification_memo: SnapshotClassificationMemo,
     serving_snapshot_max_bytes: int,
@@ -57,9 +59,17 @@ def authorize_sqlite_alias(
         readonly: bool = False,
     ) -> tuple[str, str, str, sqlite3.Row | None]:
         """Authenticate and resolve the active row within one SQLite snapshot."""
-        authenticate_key = authenticate_readonly if readonly else authenticate
         authentication_started = time.monotonic()
-        organization_id, identity_id, key_id = authenticate_key(connection, raw_key)
+        if preauthenticated_key is None:
+            authenticate_key = authenticate_readonly if readonly else authenticate
+            organization_id, identity_id, key_id = authenticate_key(connection, raw_key)
+        else:
+            organization_id, identity_id, key_id = authenticate_preflight(
+                connection,
+                raw_key,
+                preauthenticated_key,
+                update_last_used=not readonly,
+            )
         if timing_recorder is not None:
             timing_recorder("sqlite_key_authentication_ms", authentication_started)
         alias_lookup_started = time.monotonic()

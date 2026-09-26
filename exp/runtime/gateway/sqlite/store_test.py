@@ -265,12 +265,13 @@ def test_key_preflight_read_and_authorization_do_not_wait_for_writer(tmp_path: P
         with ThreadPoolExecutor(max_workers=1) as executor:
 
             def preflight_and_authorize() -> AuthorizationSnapshot:
-                store.authenticate_key_for_preflight(raw_key=raw_key)
+                preauthenticated_key = store.authenticate_key_for_preflight(raw_key=raw_key)
                 return store.authorize_request(
                     raw_key=raw_key,
                     alias="coding",
                     request=_request(),
                     deadline_monotonic=clock.monotonic() + 30,
+                    preauthenticated_key=preauthenticated_key,
                 )
 
             authentication = executor.submit(preflight_and_authorize)
@@ -290,6 +291,23 @@ def test_key_preflight_read_and_authorization_do_not_wait_for_writer(tmp_path: P
 
     assert authorized.virtual_key_id == "key-one"
     assert last_used_after == last_used_before
+
+
+def test_preflight_identity_revalidates_key_revocation_before_admission(tmp_path: Path) -> None:
+    """A pre-body proof skips the prefix scan but cannot outlive key revocation."""
+    store, clock, raw_key = _configured_store(tmp_path)
+    preauthenticated_key = store.authenticate_key_for_preflight(raw_key=raw_key)
+
+    assert preauthenticated_key == ("org-one", "identity-one", "key-one")
+    assert store.revoke_virtual_key(organization_id="org-one", key_id="key-one")
+    with pytest.raises(InvalidVirtualKeyError, match="invalid"):
+        store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(),
+            deadline_monotonic=clock.monotonic() + 30,
+            preauthenticated_key=preauthenticated_key,
+        )
 
 
 def test_authorization_serializes_with_concurrent_key_revocation(
