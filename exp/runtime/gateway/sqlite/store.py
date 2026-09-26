@@ -739,23 +739,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         Raises:
             InvalidVirtualKeyError: The key is unknown, expired, or revoked.
         """
-        with self._connect() as connection:
-            try:
-                with self._transaction(connection=connection, immediate=False):
-                    self._authenticate_in_transaction(connection, raw_key)
-            except sqlite3.OperationalError as exc:
-                code = getattr(exc, "sqlite_errorcode", None)
-                if code is None or code & 0xFF not in (
-                    sqlite3.SQLITE_BUSY,
-                    sqlite3.SQLITE_LOCKED,
-                ):
-                    raise
-                if connection.in_transaction:
-                    connection.execute("ROLLBACK")
-                # A stale last-used refresh may need a read-to-write upgrade.
-                # Retry that uncommon case with the write lock acquired first.
-                with self._transaction(connection=connection):
-                    self._authenticate_in_transaction(connection, raw_key)
+        with self._transaction() as connection:
+            self._authenticate_in_transaction(connection, raw_key)
 
     def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
         """Return the organization and identity IDs owning one valid key."""
@@ -826,7 +811,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         so hot keys do not dirty a page and pay a durable write per request.
 
         Args:
-            connection: Connection participating in the authority transaction.
+            connection: Immediate transaction retained through the authority read.
             raw_key: Caller key that must never enter SQLite or logs.
 
         Returns:

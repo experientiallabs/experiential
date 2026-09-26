@@ -249,24 +249,6 @@ def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(
         store.granted_aliases(raw_key=raw_key)
 
 
-def test_key_authentication_read_does_not_wait_for_an_unrelated_writer(tmp_path: Path) -> None:
-    """A fresh key check reads concurrently with an unrelated SQLite writer."""
-    store, _clock, raw_key = _configured_store(tmp_path)
-    store.authenticate_key(raw_key=raw_key)
-
-    with store._connect() as writer:
-        writer.execute("BEGIN IMMEDIATE")
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            authentication = executor.submit(store.authenticate_key, raw_key=raw_key)
-            try:
-                authentication.result(timeout=1)
-            except TimeoutError:
-                writer.execute("ROLLBACK")
-                authentication.result(timeout=5)
-                pytest.fail("fresh-key authentication waited for the SQLite writer lock")
-            writer.execute("ROLLBACK")
-
-
 def test_authorization_serializes_with_concurrent_key_revocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
