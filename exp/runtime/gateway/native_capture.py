@@ -59,8 +59,9 @@ class CaptureConfiguration(ContractModel):
         maximum_response_bytes: Response buffer ceiling, defaulting to 3,670,016 bytes.
         ttl_seconds: Unsettled request lifetime, defaulting to 1800 seconds.
         settlement_required: Require hosted retention permission, true by default.
-        asynchronous_delivery: Explicit hosted opt-in to queue acknowledgement instead
-            of waiting for durable storage, false by default. The host owns draining.
+        asynchronous_delivery: Explicit hosted opt-in to admission-owned handoff instead
+            of waiting for delivery capacity or durable storage, false by default.
+            The host owns draining. Admission and response-memory limits still apply.
         relay_metadata: Wait for an outer relay's caller-facing metadata, false by default.
         truncate_request: Preserve the hosted bounded-copy policy for oversized inputs.
     """

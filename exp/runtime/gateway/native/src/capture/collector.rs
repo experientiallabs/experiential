@@ -636,8 +636,9 @@ impl Collector {
         if let Some(wire) = entry.wire.as_mut() {
             wire.relay = entry.relay.take();
         }
-        // Unexposed failures must not wait on storage, even if checkpoint admission failed.
-        if entry.checkpointing || entry.unexposed {
+        // Admission already owns these bytes. Async handoff must not wait for
+        // storage capacity; unexposed failures retain the same ownership rule.
+        if self.config.asynchronous_delivery || entry.checkpointing || entry.unexposed {
             let lease = CheckpointLease {
                 admission: entry._admission,
                 pending: self.pending.clone(),
@@ -658,13 +659,7 @@ impl Collector {
         wire: Option<WireResponse>,
         admission: Option<Arc<Admission>>,
     ) -> bool {
-        let deliver = || {
-            if self.config.asynchronous_delivery {
-                self.delivery.submit_record(record, wire, admission)
-            } else {
-                self.delivery.submit_wait(record, wire, admission)
-            }
-        };
+        let deliver = || self.delivery.submit_wait(record, wire, admission);
         // A blocked destination must not occupy a Tokio executor thread or a
         // collector lock. Python entrypoints already release the interpreter.
         if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {

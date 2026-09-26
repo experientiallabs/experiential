@@ -100,7 +100,11 @@ Hosted destinations can opt into `CaptureCollector.batched(config_json, write_ba
 Batching does not change acknowledgement semantics. A host that already owns an
 asynchronous capture lifecycle, such as Platform, may explicitly configure
 `asynchronous_delivery=True`: checkpoint and terminal callbacks then return after
-bounded queue admission rather than durable storage. The host must monitor
+transferring already-admitted ownership, without waiting for a delivery slot or
+durable storage. The same admission remains charged until storage acknowledges;
+there is no unbounded overflow queue. Completed response bodies release unused
+worst-case reservation while keeping their allocated bytes charged until decode.
+The host must monitor
 delivery failures and drain before closing its destination. Default and local
 collectors continue to wait for durable acknowledgement. Neither mode adds a
 process-crash recovery journal.
@@ -142,8 +146,10 @@ record limit. Shutdown flushes a partial batch without waiting to fill it.
 The batch destination reserves five times that combined bound plus 256 bytes per
 batch slot before queue admission. Rust rejects configurations without room for
 this reservation and one queued record. Persistent failures can fill the bounded
-batch or queue and backpressure new requests; batching does not promise unbounded
-progress around failed records or process-crash durability.
+batch or queue. Asynchronous handoff stays nonblocking while admission-owned
+records and response memory fit their existing limits. Exhausting total admission
+still refuses new capture, and exhausting response memory still backpressures
+body collection. This is not unlimited outage tolerance or process-crash durability.
 
 Delivery limits bound record count, each final encoded payload and retained record
 memory, including a record currently held by a slow destination. One destination
