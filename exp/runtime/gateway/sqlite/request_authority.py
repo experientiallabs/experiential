@@ -29,7 +29,7 @@ def authorize_sqlite_alias(
     serving_snapshot_max_bytes: int,
     alias_not_granted_error: type[Exception],
 ) -> tuple[str, str, str, sqlite3.Row, str, SQLiteChainWitness]:
-    """Authenticate, resolve one alias and fence its local snapshot before routing.
+    """Authenticate, resolve one alias and capture its classified request witness.
 
     Args:
         raw_key: Caller virtual key.
@@ -127,26 +127,16 @@ def authorize_sqlite_alias(
             rows=(authority_row,),
         )
         request_id = f"request-{uuid.uuid4().hex}"
-        with (
-            prepare_sqlite_chain_authority(
-                None,
-                organization_id,
-                alias_revision_id,
-                request_id=request_id,
-                operation="authorize",
-                maximum_bytes=serving_snapshot_max_bytes,
-                remaining_seconds=deadline_monotonic - clock.monotonic(),
-                classification_memo=classification_memo,
-                observation=observation,
-            ) as proof,
-            transaction(connection=reader, immediate=False) as connection,
-        ):
-            proof.validate(
-                connection,
-                request_id=request_id,
-                organization_id=organization_id,
-                alias_revision_id=alias_revision_id,
-                operation="authorize",
-            )
+        with prepare_sqlite_chain_authority(
+            None,
+            organization_id,
+            alias_revision_id,
+            request_id=request_id,
+            operation="authorize",
+            maximum_bytes=serving_snapshot_max_bytes,
+            remaining_seconds=deadline_monotonic - clock.monotonic(),
+            classification_memo=classification_memo,
+            observation=observation,
+        ) as proof:
             witness = proof.authority_witness()
     return organization_id, identity_id, key_id, row, request_id, witness
