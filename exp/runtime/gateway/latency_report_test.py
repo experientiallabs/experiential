@@ -326,6 +326,7 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
         "time_to_first_byte_ms",
         "request_duration_ms",
         "permit_wait_ms",
+        "bridge_permit_wait_ms",
         "bridge_call_ms",
         "bridge_call_authenticate_ms",
         "bridge_call_admit_ms",
@@ -339,3 +340,4 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
     assert gateway_metrics["bridge_call_start_attempt_ms"]["count"] > 0
     assert gateway_metrics["bridge_call_settle_ms"]["count"] > 0
     assert gateway_metrics["request_duration_ms"]["count"] > 0
+    assert gateway_metrics["bridge_permit_wait_ms"]["count"] > 0

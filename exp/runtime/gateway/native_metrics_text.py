@@ -43,6 +43,10 @@ _HISTOGRAMS: tuple[tuple[str, str], ...] = (
     ("time_to_first_byte_ms", "Milliseconds from admission to the first upstream byte."),
     ("request_duration_ms", "Total milliseconds spent serving one request."),
     ("permit_wait_ms", "Milliseconds a request waited for an admission permit."),
+    (
+        "bridge_permit_wait_ms",
+        "Milliseconds a bridge call waited for a Python callback worker.",
+    ),
     ("bridge_call_ms", "Milliseconds one control-plane bridge call took."),
     (
         "bridge_call_authenticate_ms",
