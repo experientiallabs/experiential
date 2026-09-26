@@ -623,13 +623,13 @@ class SQLiteChainPreflight:
         operation: ChainOperation,
         *,
         staged: bool,
-    ) -> None:
+    ) -> str:
         """Refuse missing local proof or chain policy before the ledger's atomic mutation."""
         if staged or authorization.model_chain_authority is not None or proof is None:
             raise ModelChainAuthorityError(
                 "local SQLite requires plain policy and a live chain preflight"
             )
-        proof.validate(
+        return proof.validate(
             connection,
             request_id=authorization.request_id,
             organization_id=authorization.organization_id,
@@ -645,7 +645,7 @@ class SQLiteChainPreflight:
         organization_id: str,
         alias_revision_id: str,
         operation: ChainOperation,
-    ) -> None:
+    ) -> str:
         """Fence exact DB identities and paths without reading bytes or parsing under the lock."""
         if self._closed or self._binding != (
             request_id,
@@ -677,6 +677,10 @@ class SQLiteChainPreflight:
             raise ModelChainAuthorityError(
                 "serving snapshot changed after preflight; retry the operation"
             ) from exc
+        alias_id = self._rows[0][1] if self._rows else None
+        if alias_id is None:
+            raise ModelChainAuthorityError("requested local alias authority is unavailable")
+        return alias_id
 
 
 @contextmanager

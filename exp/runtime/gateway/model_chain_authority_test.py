@@ -1363,6 +1363,20 @@ def test_shared_memo_keeps_every_request_proof_and_resource_cap_fresh(tmp_path: 
             )
         with components.ledger.prepare_chain_authority(auth, "reserve") as proof:
             assert proof is not None
+            with components.ledger._transaction() as connection:
+                alias_id = proof.validate(
+                    connection,
+                    request_id=auth.request_id,
+                    organization_id=auth.organization_id,
+                    alias_revision_id=auth.alias_revision_id,
+                    operation="reserve",
+                )
+                row = connection.execute(
+                    "SELECT alias_id FROM alias_revisions WHERE revision_id = ?",
+                    (auth.alias_revision_id,),
+                ).fetchone()
+                assert row is not None
+                assert alias_id == str(row["alias_id"])
             with manager.store()._transaction() as connection:
                 connection.execute("UPDATE gateway_aliases SET active_revision_id=NULL")
             with (
