@@ -553,6 +553,7 @@ def _write_gateway_diagnostics(
             "time_to_first_byte_ms",
             "request_duration_ms",
             "permit_wait_ms",
+            "bridge_permit_wait_ms",
             "bridge_call_ms",
             "bridge_call_authenticate_ms",
             "bridge_call_admit_ms",

@@ -76,12 +76,16 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| PublicError::internal())?;
+        let permit_wait_started = std::time::Instant::now();
+        let permit = self.permits.clone().acquire_owned().await.map_err(|_| {
+            crate::metrics::METRICS
+                .bridge_permit_wait_ms
+                .record(permit_wait_started.elapsed());
+            PublicError::internal()
+        })?;
+        crate::metrics::METRICS
+            .bridge_permit_wait_ms
+            .record(permit_wait_started.elapsed());
         // Latency is measured from permit grant so it reflects the python
         // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();
