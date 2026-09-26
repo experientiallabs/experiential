@@ -321,16 +321,28 @@ class NativeControlPlane(
         authorization_started = time.monotonic()
         try:
             # Freeze native app attribution and the trusted client IP onto caller authority.
-            authorization = self._components.store.authorize_request(
-                raw_key=data["raw_key"],
-                alias=decoded.alias,
-                request=request,
-                deadline_monotonic=deadline,
-                app_referer=optional_text(data.get("app_referer")),
-                app_title=optional_text(data.get("app_title")),
-                client_ip=optional_text(data.get("client_ip")),
-            )
-            authorization = authorize_serving_model_chains(self._components, authorization)
+            sqlite_authority_started = time.monotonic()
+            try:
+                authorization = self._components.store.authorize_request(
+                    raw_key=data["raw_key"],
+                    alias=decoded.alias,
+                    request=request,
+                    deadline_monotonic=deadline,
+                    app_referer=optional_text(data.get("app_referer")),
+                    app_title=optional_text(data.get("app_title")),
+                    client_ip=optional_text(data.get("client_ip")),
+                )
+            finally:
+                self._control_plane_timing.record(
+                    "sqlite_request_authority_ms", sqlite_authority_started
+                )
+            chain_authority_started = time.monotonic()
+            try:
+                authorization = authorize_serving_model_chains(self._components, authorization)
+            finally:
+                self._control_plane_timing.record(
+                    "serving_chain_authorization_ms", chain_authority_started
+                )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             self._control_plane_timing.record("alias_authorization_ms", authorization_started)
             mapped = _authority_error(exc)
