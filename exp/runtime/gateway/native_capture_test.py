@@ -15,7 +15,6 @@ import pytest
 from websockets.sync.client import ClientConnection, connect
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.traces.capture import CaptureSseResponse
 from exp.runtime.gateway.capture_context import capture_context_document, restore_capture_context
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -26,6 +25,7 @@ from exp.runtime.gateway.native_capture import (
     CaptureDeliveryLimits,
     CaptureRecord,
     CaptureRequest,
+    CaptureSseResponse,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.routing import GatewayRoutingError

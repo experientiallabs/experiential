@@ -32,7 +32,6 @@ from exp.runtime.gateway.catalog_authority import (
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import NativeControlPlane
-from exp.runtime.gateway.native_capture import CaptureController
 from exp.runtime.gateway.native_server import serve_native_gateway
 
 exp_gateway_native = pytest.importorskip("exp_gateway_native")
@@ -41,21 +40,18 @@ exp_gateway_native = pytest.importorskip("exp_gateway_native")
 class _ServedGateway:
     """One native gateway served on a loopback port in a background thread."""
 
-    def __init__(self, root: Path, port: int, *, capture: CaptureController | None = None) -> None:
+    def __init__(self, root: Path, port: int) -> None:
         """Load components over the seeded root and bind the serving facts.
 
         Args:
             root: Initialized EXP root whose granted aliases are served.
             port: Loopback port the native plane will bind.
-            capture: Optional collector exercised through the real HTTP listener.
         """
         self.port = port
-        self.capture = capture
         self.components = load_gateway_components(root)
         self.control_plane = NativeControlPlane(
             self.components,
             data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
-            capture=capture,
         )
         self.shutdown = exp_gateway_native.shutdown_handle()
         self.error: BaseException | None = None
@@ -68,7 +64,6 @@ class _ServedGateway:
                 self.control_plane,
                 host="127.0.0.1",
                 port=self.port,
-                capture=self.capture.native if self.capture is not None else None,
                 shutdown=self.shutdown,
             )
         except BaseException as error:  # noqa: BLE001 - surfaced to the starter.

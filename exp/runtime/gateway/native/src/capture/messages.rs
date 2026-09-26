@@ -1,137 +1,150 @@
-//! Lossless completed Messages projection from ordered public SSE data frames.
+//! Public Messages assembly shared by complete gateway and partial passive evidence.
 
-use serde_json::{Map, Value};
+use super::projection::append;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+#[derive(Default)]
 struct Block {
     value: Value,
     arguments: Option<String>,
     closed: bool,
 }
 
-pub(super) fn assemble(frames: &[Value]) -> Option<Value> {
-    let mut message: Option<Value> = None;
-    let mut blocks: BTreeMap<u64, Block> = BTreeMap::new();
+pub(super) fn assemble(frames: &[Value], complete_only: bool) -> Option<Value> {
+    let mut message = json!({"usage": {}});
+    let mut started = false;
     let mut stopped = false;
+    let mut blocks: BTreeMap<u64, Block> = BTreeMap::new();
     for frame in frames {
-        if stopped {
+        if complete_only && stopped {
             return None;
         }
         match frame.get("type")?.as_str()? {
             "ping" => {}
-            "message_start" if message.is_none() => {
-                let start = frame.get("message")?;
-                if start.get("type")?.as_str()? != "message"
-                    || !start.get("content")?.as_array()?.is_empty()
+            "message_start" => {
+                let start = frame.get("message")?.as_object()?;
+                if complete_only
+                    && (started
+                        || start.get("type")?.as_str()? != "message"
+                        || !start.get("content")?.as_array()?.is_empty())
                 {
                     return None;
                 }
-                message = Some(start.clone());
+                if complete_only {
+                    message = Value::Object(start.clone());
+                } else {
+                    message.as_object_mut()?.extend(start.clone());
+                }
+                started = true;
             }
-            "content_block_start" if message.is_some() => {
+            "content_block_start" => {
                 let index = frame.get("index")?.as_u64()?;
-                if blocks.contains_key(&index) || index != blocks.len() as u64 {
+                if complete_only
+                    && (!started || blocks.contains_key(&index) || index != blocks.len() as u64)
+                {
                     return None;
                 }
                 blocks.insert(
                     index,
                     Block {
-                        value: frame.get("content_block")?.clone(),
-                        arguments: None,
-                        closed: false,
+                        value: Value::Object(frame.get("content_block")?.as_object()?.clone()),
+                        ..Block::default()
                     },
                 );
             }
             "content_block_delta" => {
-                let block = blocks.get_mut(&frame.get("index")?.as_u64()?)?;
-                if block.closed {
+                let index = frame.get("index")?.as_u64()?;
+                if complete_only && !blocks.contains_key(&index) {
+                    return None;
+                }
+                let block = blocks.entry(index).or_insert_with(|| Block {
+                    value: json!({}),
+                    ..Block::default()
+                });
+                if complete_only && block.closed {
                     return None;
                 }
                 let delta = frame.get("delta")?;
-                match delta.get("type")?.as_str()? {
-                    "text_delta" => append(
-                        block.value.as_object_mut()?,
-                        "text",
-                        delta.get("text")?.as_str()?,
-                    )?,
-                    "thinking_delta" => append(
-                        block.value.as_object_mut()?,
-                        "thinking",
-                        delta.get("thinking")?.as_str()?,
-                    )?,
-                    "signature_delta" => append(
-                        block.value.as_object_mut()?,
-                        "signature",
-                        delta.get("signature")?.as_str()?,
-                    )?,
-                    "input_json_delta" => block
-                        .arguments
-                        .get_or_insert_with(String::new)
-                        .push_str(delta.get("partial_json")?.as_str()?),
-                    "citations_delta" => block
-                        .value
-                        .as_object_mut()?
-                        .entry("citations")
-                        .or_insert_with(|| Value::Array(vec![]))
-                        .as_array_mut()?
-                        .push(delta.get("citation")?.clone()),
-                    _ => return None,
+                let fields: &[&str] = if complete_only {
+                    match delta.get("type")?.as_str()? {
+                        "text_delta" => &["text"],
+                        "thinking_delta" => &["thinking"],
+                        "signature_delta" => &["signature"],
+                        "input_json_delta" => &["partial_json"],
+                        "citations_delta" => &["citation"],
+                        _ => return None,
+                    }
+                } else {
+                    &["text", "thinking", "signature", "partial_json", "citation"]
+                };
+                for key in fields {
+                    let Some(value) = delta.get(*key) else {
+                        if complete_only {
+                            return None;
+                        }
+                        continue;
+                    };
+                    match *key {
+                        "partial_json" => block
+                            .arguments
+                            .get_or_insert_with(String::new)
+                            .push_str(value.as_str()?),
+                        "citation" => {
+                            append(block.value.as_object_mut()?, "citations", &json!([value]))?
+                        }
+                        _ => {
+                            value.as_str()?;
+                            append(block.value.as_object_mut()?, key, value)?;
+                        }
+                    }
                 }
             }
             "content_block_stop" => {
                 let block = blocks.get_mut(&frame.get("index")?.as_u64()?)?;
-                if block.closed {
+                if complete_only && block.closed {
                     return None;
-                }
-                if let Some(arguments) = &block.arguments {
-                    if !arguments.is_empty() {
-                        let input: Value = serde_json::from_str(arguments).ok()?;
-                        if !input.is_object() {
-                            return None;
-                        }
-                        block.value["input"] = input;
-                    }
                 }
                 block.closed = true;
             }
             "message_delta" => {
-                let target = message.as_mut()?.as_object_mut()?;
-                for (key, value) in frame.get("delta")?.as_object()? {
-                    target.insert(key.clone(), value.clone());
+                if complete_only && (!started || !frame["delta"].is_object()) {
+                    return None;
+                }
+                if let Some(delta) = frame.get("delta").and_then(Value::as_object) {
+                    message.as_object_mut()?.extend(delta.clone());
                 }
                 if let Some(usage) = frame.get("usage") {
-                    let target = target.get_mut("usage")?.as_object_mut()?;
-                    for (key, value) in usage.as_object()? {
-                        target.insert(key.clone(), value.clone());
-                    }
+                    message["usage"]
+                        .as_object_mut()?
+                        .extend(usage.as_object()?.clone());
                 }
             }
             "message_stop" => stopped = true,
+            "error" if !complete_only => message["error"] = frame["error"].clone(),
+            _ if !complete_only => {}
             _ => return None,
         }
     }
-    let mut message = message?;
-    if !stopped
-        || !message.get("stop_reason").is_some_and(Value::is_string)
-        || blocks.values().any(|block| !block.closed)
+    if complete_only
+        && (!stopped
+            || !message["stop_reason"].is_string()
+            || blocks.values().any(|block| !block.closed))
     {
         return None;
     }
+    for block in blocks.values_mut() {
+        if let Some(arguments) = &block.arguments {
+            match serde_json::from_str::<Value>(arguments) {
+                Ok(value) if !complete_only || value.is_object() => block.value["input"] = value,
+                _ if complete_only && arguments.is_empty() => {}
+                _ if complete_only => return None,
+                _ => block.value["capture_partial_input"] = json!(arguments),
+            }
+        }
+    }
     message["content"] = Value::Array(blocks.into_values().map(|block| block.value).collect());
     Some(message)
-}
-
-fn append(object: &mut Map<String, Value>, key: &str, delta: &str) -> Option<()> {
-    match object
-        .entry(key)
-        .or_insert_with(|| Value::String(String::new()))
-    {
-        Value::String(text) => {
-            text.push_str(delta);
-            Some(())
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -154,11 +167,12 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}),
             json!({"type":"message_stop"}),
         ];
-        let result = assemble(&frames).unwrap();
+        let result = assemble(&frames, true).unwrap();
         assert_eq!(result["content"][0]["thinking"], " exactly\0雪\n");
         assert_eq!(result["content"][0]["signature"], "signed");
         assert_eq!(result["content"][1]["input"], json!({"x":1}));
-        assert!(assemble(&frames[..frames.len() - 1]).is_none());
+        assert!(assemble(&frames[..frames.len() - 1], true).is_none());
+        assert_eq!(assemble(&frames[..frames.len() - 1], false), Some(result));
     }
 
     #[test]
@@ -171,7 +185,7 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
             json!({"type":"message_stop"}),
         ];
-        let message = assemble(&frames).unwrap();
+        let message = assemble(&frames, true).unwrap();
         assert_eq!(message["content"][0]["input"], json!({}));
     }
 }

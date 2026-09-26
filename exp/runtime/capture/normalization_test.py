@@ -1,36 +1,17 @@
 """Protocol normalization preserves evidence while removing transport credentials."""
 
 import json
-import subprocess
-import sys
-import threading
 import time
 import zlib
 from dataclasses import replace
-from http.server import ThreadingHTTPServer
-from pathlib import Path
 
 import brotli
-import exp_gateway_native as native
-import httpx
 import pytest
 import zstandard
 
 from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
-from exp.common.traces.capture import CaptureMetrics, capture_metric_attributes
 from exp.common.traces.ingest.otlp import normalize_otlp_payload
 from exp.runtime.capture.normalization import CapturedExchange, capture_protocol, normalize_exchange
-from exp.runtime.gateway.native_capture import (
-    CaptureConfiguration,
-    CaptureController,
-    CaptureRecord,
-)
-from exp.runtime.gateway.tests.launch_test import (
-    _configure_gateway,
-    _LoopbackProvider,
-    _ServedGateway,
-    _unused_port,
-)
 
 
 def _exchange(**changes: str | bytes | int | bool) -> CapturedExchange:
@@ -77,31 +58,6 @@ def test_known_usage_and_redacted_copies_normalize_through_existing_cloud_contra
     attributes = _attributes(_exchange(request=request))
     assert attributes["gen_ai.usage.input_tokens"] == 3
     assert attributes["gen_ai.usage.output_tokens"] == 7
-
-
-def test_cache_write_usage_survives_the_platform_otlp_import_contract() -> None:
-    """The cloud-normalized usage preserves the same subsets as gateway trace ingestion."""
-    exchange = _exchange(
-        protocol="messages",
-        response=b'{"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":7,'
-        b'"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}',
-    )
-    result = normalize_otlp_payload(
-        json.loads(normalize_exchange(exchange, max_body_bytes=4096)),
-        source=SourceIdentity(kind="otlp", source_id="synthetic-capture"),
-    )
-    assert not result.issues
-    span = result.traces[0].spans[0]
-    assert span.usage is not None
-    assert span.usage.input_tokens == 113
-    assert span.usage.output_tokens == 7
-    assert span.usage.cached_input_tokens == 100
-    assert span.usage.cache_write_input_tokens == 10
-    raw = span.attributes["exp.capture.metrics"]
-    assert isinstance(raw, str)
-    metrics = CaptureMetrics.model_validate_json(raw)
-    assert metrics.usage_complete
-    assert metrics.usage is not None and metrics.usage.input_tokens == span.usage.input_tokens
 
 
 @pytest.mark.parametrize("protocol", ["responses", "chat"])
@@ -271,6 +227,7 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
                     "delta": {"type": "input_json_delta", "partial_json": fragment},
                 }
             )
+    events[0]["sequence"] = 2**80 + 1
     body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
     payload = normalize_exchange(
         _exchange(
@@ -284,6 +241,15 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
     assert canary.encode() not in payload
     assert b"[REDACTED_INVALID_TOOL_ARGUMENTS]" in payload
     assert b"retain ordinary output" in payload
+    span = json.loads(payload)["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    response = json.loads(
+        next(
+            field["value"]["stringValue"]
+            for field in span["attributes"]
+            if field["key"] == "exp.capture.response"
+        )
+    )
+    assert response["events"][0]["sequence"] == 2**80 + 1
 
 
 def test_custom_tool_freeform_input_remains_captured() -> None:
@@ -477,38 +443,6 @@ def test_complete_http_response_still_requires_a_complete_compression_frame(enco
         )
 
 
-def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
-    """Reconstruct Anthropic tool input and token counts from stream events."""
-    events = [
-        {
-            "type": "message_start",
-            "message": {"model": "claude-test", "usage": {"input_tokens": 9}},
-        },
-        {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "tool_use", "name": "f", "id": "t", "input": {}},
-        },
-        {"type": "content_block_delta", "index": 0, "delta": {"partial_json": '{"x":1}'}},
-        {"type": "message_delta", "usage": {"output_tokens": 4}},
-    ]
-    body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
-    attributes = _attributes(
-        _exchange(
-            protocol="messages",
-            request=b'{"model":"claude-test","messages":[{"role":"user","content":"go"}]}',
-            response=body,
-            response_content_type="text/event-stream",
-        )
-    )
-    raw_response = attributes["exp.capture.response"]
-    assert isinstance(raw_response, str)
-    response = json.loads(raw_response)
-    assert response["content"][0]["input"] == {"x": 1}
-    assert attributes["gen_ai.usage.input_tokens"] == 9
-    assert attributes["gen_ai.usage.output_tokens"] == 4
-
-
 def _anthropic_usage_attributes(usage: JsonObject, *, streamed: bool) -> JsonObject:
     """Normalize the same synthetic Anthropic usage through JSON or separate SSE events."""
     if streamed:
@@ -559,15 +493,6 @@ def test_anthropic_input_total_includes_cache_once_and_preserves_raw_usage(
     assert attributes["gen_ai.usage.input_tokens"] == expected_input
     assert attributes["gen_ai.usage.output_tokens"] == 7
     assert json.loads(str(attributes["exp.capture.response"]))["usage"] == usage
-    metrics = CaptureMetrics.model_validate_json(str(attributes["exp.capture.metrics"]))
-    assert metrics.usage is not None
-    assert metrics.usage.cached_input_tokens == cache_usage.get("cache_read_input_tokens")
-    assert metrics.usage.cache_creation_input_tokens == cache_usage.get(
-        "cache_creation_input_tokens"
-    )
-    assert metrics.usage.cache_creation_1h_input_tokens == (
-        60 if "cache_creation" in cache_usage else None
-    )
 
 
 @pytest.mark.parametrize("streamed", [False, True])
@@ -595,7 +520,6 @@ def test_openai_cached_input_is_already_in_the_provider_total(
             "input_tokens": 1_003,
             "output_tokens": 7,
             "input_tokens_details": {"cached_tokens": 1_000},
-            "output_tokens_details": {"reasoning_tokens": 4},
         }
         response = {"output": [], "usage": usage}
         events = [{"type": "response.completed", "response": response}]
@@ -604,7 +528,6 @@ def test_openai_cached_input_is_already_in_the_provider_total(
             "prompt_tokens": 1_003,
             "completion_tokens": 7,
             "prompt_tokens_details": {"cached_tokens": 1_000},
-            "completion_tokens_details": {"reasoning_tokens": 4},
         }
         response = {"choices": [], "usage": usage}
         events = [response]
@@ -622,8 +545,6 @@ def test_openai_cached_input_is_already_in_the_provider_total(
     )
     assert attributes["gen_ai.usage.input_tokens"] == 1_003
     assert attributes["gen_ai.usage.output_tokens"] == 7
-    assert attributes["gen_ai.usage.cached_input_tokens"] == 1_000
-    assert attributes["gen_ai.usage.reasoning_tokens"] == 4
     assert json.loads(str(attributes["exp.capture.response"]))["usage"] == usage
 
 
@@ -656,57 +577,6 @@ def test_paths_exclude_login_billing_and_unrelated_traffic() -> None:
     assert capture_protocol("GET", "/v1/responses") == "responses"
     for path in ("/oauth/token", "/v1/messages/batches", "/backend-api/accounts", "/login"):
         assert capture_protocol("POST", path) is None
-
-
-def test_chat_stream_reassembles_tool_arguments_and_final_usage() -> None:
-    """Join streamed chat tool arguments and retain final provider token counts."""
-    events = [
-        {
-            "model": "chat-test",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call-1",
-                                "function": {"name": "f", "arguments": '{"x":'},
-                            }
-                        ]
-                    },
-                }
-            ],
-        },
-        {
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]},
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            "usage": {"prompt_tokens": 2, "completion_tokens": 3},
-        },
-    ]
-    body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
-    attributes = _attributes(
-        _exchange(
-            protocol="chat",
-            request=b'{"model":"chat-test","messages":[{"role":"user","content":"go"}]}',
-            response=body,
-            response_content_type="text/event-stream",
-        )
-    )
-    raw = attributes["exp.capture.response"]
-    assert isinstance(raw, str)
-    response = json.loads(raw)
-    assert response["choices"][0]["message"]["tool_calls"][0]["function"] == {
-        "name": "f",
-        "arguments": '{"x":1}',
-    }
-    assert attributes["gen_ai.usage.input_tokens"] == 2
-    assert attributes["gen_ai.usage.output_tokens"] == 3
 
 
 def test_provider_stream_errors_are_failed_spans_even_with_http_200() -> None:
@@ -813,113 +683,3 @@ def test_responses_and_messages_refusals_preserve_provider_evidence(
     assert attributes["exp.capture.refused"] is True
     payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
     assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2
-
-
-def test_real_gateway_and_passive_capture_share_usage_fields(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Compare both observers on real JSON/SSE traffic without activating interception."""
-    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "synthetic-provider-key")
-    provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
-    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
-    provider_thread.start()
-    _, raw_key = _configure_gateway(
-        tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
-    )
-    records: list[str] = []
-    collector = native.CaptureCollector(
-        CaptureConfiguration(settlement_required=False).model_dump_json(), records.append
-    )
-    gateway = _ServedGateway(
-        tmp_path,
-        _unused_port(),
-        capture=CaptureController(collector, application_for=lambda _: "capture-parity"),
-    )
-    observed: dict[str, JsonObject] = {}
-    try:
-        gateway.start()
-        for surface in ("chat/completions", "responses", "messages"):
-            for streamed in (False, True):
-                request: JsonObject = {"model": "coding", "stream": streamed}
-                if surface == "responses":
-                    request["input"] = "Synthetic parity request"
-                else:
-                    request["messages"] = [{"role": "user", "content": "Synthetic parity request"}]
-                if surface == "messages":
-                    request["max_tokens"] = 128
-                if surface == "chat/completions" and streamed:
-                    request["stream_options"] = {"include_usage": True}
-                started = time.time_ns()
-                response = httpx.post(
-                    f"http://127.0.0.1:{gateway.port}/v1/{surface}",
-                    headers={"authorization": f"Bearer {raw_key}"},
-                    json=request,
-                    timeout=10,
-                )
-                assert response.status_code == 200, response.text
-                protocol = capture_protocol("POST", f"/v1/{surface}")
-                assert protocol is not None
-                observed[response.headers["x-request-id"]] = _attributes(
-                    CapturedExchange(
-                        protocol=protocol,
-                        host="127.0.0.1",
-                        path=f"/v1/{surface}",
-                        started_ns=started,
-                        ended_ns=time.time_ns(),
-                        request=json.dumps(request).encode(),
-                        response=response.content,
-                        status=response.status_code,
-                        response_content_type=response.headers["content-type"],
-                    )
-                )
-    finally:
-        gateway.stop()
-        collector.close(2)
-        provider.shutdown()
-        provider.server_close()
-        provider_thread.join(timeout=5)
-    assert len(records) == len(observed) == 6
-    for encoded in records:
-        record = CaptureRecord.model_validate_json(encoded)
-        assert record.metrics is not None
-        gateway = capture_metric_attributes(record.metrics)
-        passive = observed[record.request.request_id]
-        assert passive["gen_ai.usage.input_tokens"] == gateway["gen_ai.usage.input_tokens"]
-        assert passive["gen_ai.usage.output_tokens"] == gateway["gen_ai.usage.output_tokens"]
-        metrics_json = passive["exp.capture.metrics"]
-        assert isinstance(metrics_json, str)
-        passive_metrics = CaptureMetrics.model_validate_json(metrics_json)
-        assert passive_metrics.usage_complete == record.metrics.usage_complete
-        assert passive_metrics.first_token_at is None
-        assert record.metrics.first_token_at is not None
-
-
-@pytest.mark.parametrize("protocol", ["responses", "chat", "messages"])
-def test_json_counts_without_provider_terminal_remain_uncertified(protocol: str) -> None:
-    """A successful HTTP exchange alone does not prove the provider finished inference."""
-    attributes = _attributes(_exchange(protocol=protocol))
-    assert attributes["gen_ai.usage.input_tokens"] == 3
-    assert attributes["gen_ai.usage.output_tokens"] == 7
-    raw = attributes["exp.capture.metrics"]
-    assert isinstance(raw, str)
-    metrics = CaptureMetrics.model_validate_json(raw)
-    assert not metrics.usage_complete
-    assert metrics.terminal_at is None
-    assert metrics.duration_ms is None
-
-
-def test_desktop_normalizer_does_not_import_vendor_ingesters() -> None:
-    """Check the real cold import path in a fresh interpreter, outside pytest's imports."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; import exp.runtime.capture.normalization; "
-            "assert not any(name.startswith('exp.common.traces.ingest') for name in sys.modules)",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr

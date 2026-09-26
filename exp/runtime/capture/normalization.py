@@ -8,15 +8,14 @@ import json
 import re
 import zlib
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeGuard
 from uuid import uuid4
 
 import brotli
 import zstandard
+from exp_gateway_native import capture_stream_response
 
 from exp.common.core.artifacts import JsonObject, JsonValue
-from exp.common.traces.capture import capture_metric_attributes, capture_usage_attributes
-from exp.runtime.capture.metrics import observed_metrics
 
 CaptureProtocol = Literal["responses", "chat", "messages"]
 _SECRET_KEY = re.compile(
@@ -133,16 +132,10 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
         attributes["exp.capture.response_id_hash"] = hashlib.sha256(
             response_id.encode()
         ).hexdigest()[:16]
-    terminal = completed or response.get("status") in ("incomplete", "failed")
-    metrics = observed_metrics(
-        exchange.protocol,
-        response,
-        started_ns=exchange.started_ns,
-        ended_ns=exchange.ended_ns,
-        terminal=terminal,
-    )
-    attributes.update(capture_metric_attributes(metrics))
-    attributes.update(capture_usage_attributes(metrics.usage))
+    usage = response.get("usage")
+    if isinstance(usage, dict) and (counts := _usage_counts(exchange.protocol, usage)) is not None:
+        attributes["gen_ai.usage.input_tokens"] = counts[0]
+        attributes["gen_ai.usage.output_tokens"] = counts[1]
     sanitized = _sanitize(attributes)
     assert isinstance(sanitized, dict)
     trace_id = exchange.trace_id or uuid4().hex
@@ -250,15 +243,17 @@ def _response(protocol: CaptureProtocol, body: bytes, content_type: str) -> tupl
                 if isinstance(response, dict):
                     return response, kind == "response.completed"
         return {"capture_incomplete": True, "events": events}, False
+    encoded, source_required = capture_stream_response(protocol, json.dumps(events))
+    response = _object(encoded.encode())
+    if source_required:
+        response["events"] = events
     if protocol == "messages":
-        return _anthropic_response(events), any(
-            event.get("type") == "message_stop" for event in events
-        )
+        return response, any(event.get("type") == "message_stop" for event in events)
     done = any(
         block.strip() == b"data: [DONE]"
         for block in body.replace(b"\r\n", b"\n").split(b"\n\n")[:-1]
     )
-    return _chat_response(events), done
+    return response, done
 
 
 def _json_completed(protocol: CaptureProtocol, response: JsonObject) -> bool:
@@ -278,106 +273,6 @@ def _json_completed(protocol: CaptureProtocol, response: JsonObject) -> bool:
             for choice in choices
         )
     )
-
-
-def _anthropic_response(events: list[JsonObject]) -> JsonObject:
-    """Reassemble Anthropic content blocks and usage from SSE event payloads."""
-    result: JsonObject = {}
-    blocks: dict[int, JsonObject] = {}
-    arguments: dict[int, str] = {}
-    usage: JsonObject = {}
-    for event in events:
-        kind = event.get("type")
-        if kind == "error":
-            result["error"] = event.get("error", "provider stream error")
-        if kind == "message_start" and isinstance(message := event.get("message"), dict):
-            result.update(message)
-            if isinstance(initial_usage := message.get("usage"), dict):
-                usage.update(initial_usage)
-        index = event.get("index")
-        if type(index) is int:
-            if kind == "content_block_start" and isinstance(
-                block := event.get("content_block"), dict
-            ):
-                blocks[index] = dict(block)
-            if kind == "content_block_delta" and isinstance(delta := event.get("delta"), dict):
-                target = blocks.setdefault(index, {})
-                for key in ("text", "thinking", "signature"):
-                    value = delta.get(key)
-                    if isinstance(value, str):
-                        prior = target.get(key)
-                        target[key] = (prior if isinstance(prior, str) else "") + value
-                if isinstance(partial := delta.get("partial_json"), str):
-                    arguments[index] = arguments.get(index, "") + partial
-        if kind == "message_delta":
-            if isinstance(final_usage := event.get("usage"), dict):
-                usage.update(final_usage)
-            if isinstance(delta := event.get("delta"), dict):
-                result.update(delta)
-    for index, argument in arguments.items():
-        try:
-            blocks[index]["input"] = json.loads(argument)
-        except (ValueError, RecursionError):
-            blocks[index]["capture_partial_input"] = argument
-    result["content"] = [blocks[index] for index in sorted(blocks)]
-    result["usage"] = usage
-    return result
-
-
-def _chat_response(events: list[JsonObject]) -> JsonObject:
-    """Collect text, refusals, finish reasons, tool arguments, and token usage."""
-    result: JsonObject = {}
-    choices: dict[int, JsonObject] = {}
-    finish_reasons: dict[int, str] = {}
-    calls: dict[tuple[int, int], JsonObject] = {}
-    for event in events:
-        if "error" in event:
-            result["error"] = event["error"]
-        for key in ("model", "id", "usage"):
-            if key in event:
-                result[key] = event[key]
-        raw_choices = event.get("choices")
-        if not isinstance(raw_choices, list):
-            continue
-        for choice in raw_choices:
-            if not isinstance(choice, dict) or type(index := choice.get("index")) is not int:
-                continue
-            message = choices.setdefault(index, {"role": "assistant", "content": ""})
-            if isinstance(reason := choice.get("finish_reason"), str):
-                finish_reasons[index] = reason
-            delta = choice.get("delta")
-            if not isinstance(delta, dict):
-                continue
-            for key in ("content", "refusal"):
-                if isinstance(content := delta.get(key), str):
-                    prior = message.get(key)
-                    message[key] = (prior if isinstance(prior, str) else "") + content
-            raw_calls = delta.get("tool_calls")
-            if isinstance(raw_calls, list):
-                for call in raw_calls:
-                    if not isinstance(call, dict) or type(slot := call.get("index")) is not int:
-                        continue
-                    target = calls.setdefault((index, slot), {"type": "function"})
-                    if isinstance(call_id := call.get("id"), str):
-                        target["id"] = call_id
-                    if isinstance(function := call.get("function"), dict):
-                        existing = target.setdefault("function", {})
-                        assert isinstance(existing, dict)
-                        for key in ("name", "arguments"):
-                            if isinstance(value := function.get(key), str):
-                                prior = existing.get(key)
-                                existing[key] = (prior if isinstance(prior, str) else "") + value
-    for index, message in choices.items():
-        selected: list[JsonValue] = [
-            call for (owner, _), call in sorted(calls.items()) if owner == index
-        ]
-        if selected:
-            message["tool_calls"] = selected
-    result["choices"] = [
-        {"index": index, "message": message, "finish_reason": finish_reasons.get(index)}
-        for index, message in sorted(choices.items())
-    ]
-    return result
 
 
 def _refused(protocol: CaptureProtocol, response: JsonObject) -> bool:
@@ -456,7 +351,7 @@ def _prompt(messages: list[JsonValue]) -> str:
     return "Model request (no user prompt present in this request)"
 
 
-def _sanitize(value: JsonValue, depth: int = 0) -> JsonValue:
+def _sanitize(value: JsonValue, depth: int = 0, *, fragments: bool = False) -> JsonValue:
     """Redact credential fields and recognizable bearer secrets from copied content."""
     if depth > 48:
         return "[REDACTED_DEEP_VALUE]"
@@ -467,13 +362,15 @@ def _sanitize(value: JsonValue, depth: int = 0) -> JsonValue:
                 result[key] = "[REDACTED]"
             elif key == "delta" and value.get("type") == "response.function_call_arguments.delta":
                 result[key] = _INVALID_TOOL_ARGUMENTS
+            elif key == "partial_json" or (fragments and key == "arguments"):
+                result[key] = _INVALID_TOOL_ARGUMENTS
             elif key in {"arguments", "capture_partial_input"} and isinstance(item, str):
                 result[key] = _sanitize_arguments(item, depth + 1)
             else:
-                result[key] = _sanitize(item, depth + 1)
+                result[key] = _sanitize(item, depth + 1, fragments=fragments or key == "events")
         return result
     if isinstance(value, list):
-        return [_sanitize(item, depth + 1) for item in value]
+        return [_sanitize(item, depth + 1, fragments=fragments) for item in value]
     if isinstance(value, str):
         return _SECRET_TEXT.sub("[REDACTED]", value)
     return value
@@ -505,3 +402,24 @@ def _attribute(value: JsonValue) -> JsonObject:
     if isinstance(value, str):
         return {"stringValue": value}
     return {"stringValue": json.dumps(value, separators=(",", ":"), ensure_ascii=False)}
+
+
+def _usage_counts(protocol: CaptureProtocol, usage: JsonObject) -> tuple[int, int] | None:
+    """Return reported total input and output, including Anthropic's separate cache categories."""
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+    if not _token_count(input_tokens) or not _token_count(output_tokens):
+        return None
+    if protocol == "messages":
+        # Cache creation details partition the creation total and must not be added again.
+        for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+            cached = usage.get(key, 0)
+            if not _token_count(cached):
+                return None
+            input_tokens += cached
+    return input_tokens, output_tokens
+
+
+def _token_count(value: JsonValue) -> TypeGuard[int]:
+    """Accept known nonnegative token counts, rejecting bool and unknown values."""
+    return type(value) is int and value >= 0

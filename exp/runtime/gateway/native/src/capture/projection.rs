@@ -69,12 +69,12 @@ pub(super) fn completed_response(record: &Record) -> Option<Cow<'_, Value>> {
                     Cow::Owned(frames) => terminal_response(&frames).cloned().map(Cow::Owned),
                 }
             } else if matches!(protocol, Protocol::Messages) {
-                super::messages::assemble(&frames).map(Cow::Owned)
+                super::messages::assemble(&frames, true).map(Cow::Owned)
             } else {
                 if frames.last().and_then(Value::as_str) != Some("[DONE]") {
                     return None;
                 }
-                assemble_chat(&frames[..frames.len() - 1]).map(Cow::Owned)
+                assemble_chat(&frames[..frames.len() - 1], true).map(Cow::Owned)
             }
         }
         _ => None,
@@ -94,18 +94,34 @@ fn terminal_response(frames: &[Value]) -> Option<&Value> {
         .get("response")
         .filter(|value| value.is_object())
 }
-fn assemble_chat(chunks: &[Value]) -> Option<Value> {
-    let first = chunks.first()?;
-    let mut result = json!({"id": first.get("id")?, "object": "chat.completion",
-        "model": first.get("model")?, "created": first.get("created").unwrap_or(&Value::Null)});
+pub(super) fn assemble_chat(chunks: &[Value], complete_only: bool) -> Option<Value> {
+    let first = chunks.first().unwrap_or(&Value::Null);
+    if complete_only && (first.get("id").is_none() || first.get("model").is_none()) {
+        return None;
+    }
+    let mut result = json!({"id": first["id"], "model": first["model"],
+        "object": "chat.completion", "created": first["created"]});
     let mut choices: BTreeMap<u64, Value> = BTreeMap::new();
     let mut tools: BTreeMap<u64, BTreeMap<u64, Value>> = BTreeMap::new();
     for chunk in chunks {
-        if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
-            result["usage"] = usage.clone();
+        for key in ["id", "model", "created", "usage", "error"] {
+            if let Some(value) = chunk.get(key).filter(|value| {
+                !value.is_null() && (!complete_only || key == "usage" || key == "error")
+            }) {
+                result[key] = value.clone();
+            }
         }
-        for choice in chunk.get("choices")?.as_array()? {
-            let index = choice.get("index")?.as_u64()?;
+        let raw_choices = chunk.get("choices").and_then(Value::as_array);
+        if complete_only && raw_choices.is_none() {
+            return None;
+        }
+        for choice in raw_choices.into_iter().flatten() {
+            let Some(index) = choice.get("index").and_then(Value::as_u64) else {
+                if complete_only {
+                    return None;
+                }
+                continue;
+            };
             let target = choices.entry(index).or_insert_with(
                 || json!({"index": index, "message": {"role": "assistant"}, "finish_reason": null}),
             );
@@ -130,10 +146,11 @@ fn assemble_chat(chunks: &[Value]) -> Option<Value> {
         choices.get_mut(&index)?["message"]["tool_calls"] =
             Value::Array(calls.into_values().collect());
     }
-    if choices.is_empty()
-        || choices
-            .values()
-            .any(|choice| choice["finish_reason"].is_null())
+    if complete_only
+        && (choices.is_empty()
+            || choices
+                .values()
+                .any(|choice| choice["finish_reason"].is_null()))
     {
         return None;
     }
@@ -141,7 +158,7 @@ fn assemble_chat(chunks: &[Value]) -> Option<Value> {
     Some(result)
 }
 
-fn append(object: &mut Map<String, Value>, key: &str, addition: &Value) -> Option<()> {
+pub(super) fn append(object: &mut Map<String, Value>, key: &str, addition: &Value) -> Option<()> {
     if addition.is_null() {
         return Some(());
     }
@@ -236,9 +253,14 @@ mod tests {
                 "function":{"name":"lookup","arguments":"{"}}]},"finish_reason":null}]});
         let last = json!({"id":"completion","model":"model","choices":[{"index":0,
             "delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},
-            "finish_reason":"tool_calls"}]});
-        assert!(assemble_chat(std::slice::from_ref(&first)).is_none());
-        let result = assemble_chat(&[first, last]).unwrap();
+            "finish_reason":"tool_calls"}], "usage":{"prompt_tokens":5,"completion_tokens":3}});
+        assert!(assemble_chat(std::slice::from_ref(&first), true).is_none());
+        assert!(assemble_chat(std::slice::from_ref(&first), false).is_some());
+        let result = assemble_chat(&[first, last], true).unwrap();
+        assert_eq!(
+            result["usage"],
+            json!({"prompt_tokens":5,"completion_tokens":3})
+        );
         assert_eq!(
             result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{}"
@@ -254,7 +276,7 @@ mod tests {
             let last = json!({"id":"completion","model":"model","choices":[{"index":0,
                 "delta":{"tool_calls":[{"index":index,"function":{"arguments":" \"雪\" }"}}]},
                 "finish_reason":"tool_calls"}]});
-            let result = assemble_chat(&[first, last]).unwrap();
+            let result = assemble_chat(&[first, last], true).unwrap();
             assert_eq!(
                 result["choices"][0]["message"]["tool_calls"],
                 json!([
@@ -279,7 +301,7 @@ mod tests {
                 {"index":9,"function":{"arguments":"]"}}
             ]},"finish_reason":"tool_calls"}]}),
         ];
-        let result = assemble_chat(&chunks).unwrap();
+        let result = assemble_chat(&chunks, true).unwrap();
         let tools = &result["choices"][0]["message"]["tool_calls"];
         assert_eq!(tools[0]["id"], "first");
         assert_eq!(tools[0]["function"]["arguments"], "{}");

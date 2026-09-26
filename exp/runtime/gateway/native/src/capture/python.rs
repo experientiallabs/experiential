@@ -13,6 +13,28 @@ use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
 use super::record::{Record, Request};
 
+/// Assemble copied stream frames without treating a partial observation as completed.
+#[pyfunction]
+pub(crate) fn capture_stream_response(
+    py: Python<'_>,
+    protocol: &str,
+    frames_json: &str,
+) -> PyResult<(String, bool)> {
+    py.detach(|| {
+        let frames: Vec<Value> = serde_json::from_str(frames_json)
+            .map_err(|_| PyValueError::new_err("capture frames are not valid JSON"))?;
+        let body = match protocol {
+            "chat" => super::projection::assemble_chat(&frames, false),
+            "messages" => super::messages::assemble(&frames, false),
+            _ => return Err(PyValueError::new_err("unsupported capture protocol")),
+        }
+        .ok_or_else(|| PyValueError::new_err("invalid capture stream frames"))?;
+        let source_required = frames.iter().any(super::response::contains_wide_number)
+            || super::response::contains_wide_number(&body);
+        Ok((body.to_string(), source_required))
+    })
+}
+
 struct PythonSink(Py<PyAny>);
 
 #[derive(Deserialize)]

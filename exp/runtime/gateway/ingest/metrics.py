@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from exp.common.models import Usage
 from exp.common.traces import Trace, TraceSpan
-from exp.common.traces.capture import CaptureMetrics, capture_metric_attributes, capture_usage
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.common.traces.ingest.vendor_trace import SOURCE_SPAN_ATTRIBUTE
+from exp.runtime.gateway.native_capture import CaptureMetrics
 
 
 def apply_gateway_metrics(result: TraceNormalizationResult) -> TraceNormalizationResult:
@@ -44,7 +45,6 @@ def measured_trace(trace: Trace) -> Trace:
             continue
         metrics = CaptureMetrics.model_validate(raw_metrics)
         attributes = dict(span.attributes)
-        attributes.update(capture_metric_attributes(metrics, owns_usage=not charged))
         attributes["exp.gateway.metrics.scope"] = "selected_attempt"
         attributes["exp.gateway.metrics"] = metrics.model_dump(mode="json")
         usage = None
@@ -53,11 +53,22 @@ def measured_trace(trace: Trace) -> Trace:
             owner = span.span_id
             if meter is not None:
                 attributes["exp.gateway.usage.complete"] = metrics.usage_complete
-                usage = capture_usage(metrics)
+                if meter.reasoning_tokens is not None:
+                    attributes["gen_ai.usage.reasoning_tokens"] = meter.reasoning_tokens
+                if (
+                    metrics.usage_complete
+                    and meter.input_tokens is not None
+                    and meter.output_tokens is not None
+                ):
+                    usage = Usage(
+                        input_tokens=meter.input_tokens,
+                        output_tokens=meter.output_tokens,
+                        cached_input_tokens=meter.cached_input_tokens,
+                        cache_write_input_tokens=meter.cache_creation_input_tokens,
+                    )
             charged = True
         else:
             attributes["exp.gateway.usage.shared_with"] = owner
-            attributes["exp.capture.usage.shared_with"] = owner
         updates = {"attributes": attributes, "usage": usage}
         if metrics.terminal_at is not None and metrics.duration_ms is not None:
             started = datetime.fromtimestamp(metrics.started_at, UTC)
