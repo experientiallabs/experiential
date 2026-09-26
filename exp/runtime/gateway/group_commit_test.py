@@ -42,7 +42,7 @@ from exp.runtime.gateway.model_chain_authority import (
     SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
 )
-from exp.runtime.gateway.snapshot_file import PreparedSnapshotFile
+from exp.runtime.gateway.snapshot_file import SnapshotGeneration
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 _CATALOG_DIGEST = "a" * 64
@@ -193,8 +193,9 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
                 assert release.wait(5)
             yield proof
 
-    def fail_fence(prepared: PreparedSnapshotFile) -> None:
+    def fail_fence(root: Path, relative_path: str, generation: SnapshotGeneration) -> None:
         """Refuse an actual apply fence after the real out-of-lock preparation completed."""
+        del root, relative_path, generation
         if entered.is_set():
             raise ValueError("controlled generation change")
 
@@ -213,7 +214,7 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
                     SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
             elif outcome == "refusal":
                 with (
-                    mock.patch.object(PreparedSnapshotFile, "validate_current", fail_fence),
+                    mock.patch.object(authority, "validate_snapshot_generation", fail_fence),
                     pytest.raises(ModelChainAuthorityError),
                 ):
                     SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
@@ -250,16 +251,21 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
 
 
 @pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("reuse_witness", [True, False])
 def test_group_preflight_reuses_the_writer_database_connection(
     tmp_path: Path,
     batch_size: int,
+    reuse_witness: bool,
 ) -> None:
-    """Prepared batch size never allocates cached or concurrently held reader connections."""
+    """Request witnesses skip observations while compatibility paths deduplicate them."""
     clock = FakeLedgerClock()
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     authorizations = [
         _authorize(store, clock, raw_key, f"request-{index}") for index in range(batch_size)
     ]
+    if not reuse_witness:
+        for authorization in authorizations:
+            authorization._local_sqlite_chain_witness = None
     entered, release = threading.Event(), threading.Event()
     grouped = GroupCommitAttemptLedger(core, max_batch_size=batch_size)
 
@@ -295,7 +301,7 @@ def test_group_preflight_reuses_the_writer_database_connection(
             for write in writes:
                 write.result(timeout=5)
             assert reader_checkouts.call_count == 0
-            assert authority_observations.call_count == 1
+            assert authority_observations.call_count == (0 if reuse_witness else 1)
     finally:
         release.set()
         grouped.close()
@@ -329,7 +335,7 @@ def test_group_chain_preflights_run_concurrently_before_begin(tmp_path: Path) ->
         observation: SQLiteChainAuthorityObservation | None = None,
     ) -> Iterator[SQLiteChainPreflight | None]:
         """Wait for a peer preparation to prove neither runs on the serial writer."""
-        assert connection is None and observation is not None
+        assert connection is None
         with original_prepare(authorization, operation, observation=observation) as proof:
             assert proof is not None
             proofs.append(proof)
@@ -377,8 +383,8 @@ def test_group_chain_preflights_run_concurrently_before_begin(tmp_path: Path) ->
     assert len(proofs) == 2 and all(proof._closed for proof in proofs)
 
 
-def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:
-    """Every JSON classification can obtain another write lock because BEGIN has not started."""
+def test_group_writer_reuses_request_classification_witness(tmp_path: Path) -> None:
+    """Acceptance and reservation do not parse catalog bytes after request authorization."""
     clock = FakeLedgerClock()
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     (tmp_path / "snapshot-one").write_text("{}")
@@ -408,7 +414,7 @@ def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:
             )
     finally:
         grouped.close()
-    assert reads == 1  # Reservation reuses only the already classified, still-current plain pair.
+    assert reads == 0  # Request-scoped proof facts avoid repeated writer-side classification.
 
 
 def test_full_request_lifecycle_commits_durably_through_group_writer(tmp_path: Path) -> None:

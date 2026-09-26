@@ -18,6 +18,7 @@ from exp.runtime.gateway.snapshot_file_windows import (
 
 _PathIdentity = tuple[tuple[int, bytes], ...]
 _FileStamp = tuple[int, int, int, int, int, int, int | None]
+SnapshotGeneration = tuple[_PathIdentity, _FileStamp | None]
 
 
 class SnapshotSizeError(ValueError):
@@ -236,6 +237,24 @@ class PreparedSnapshotFile:
                 or (self._stream is not None and _file_stamp(self._stream) != self._stamp)
             ):
                 raise ValueError("serving snapshot changed after preflight; retry the operation")
+
+
+def validate_snapshot_generation(
+    root: Path,
+    relative_path: str,
+    generation: SnapshotGeneration,
+) -> None:
+    """Securely reopen a path and require the same no-follow identity and file stamp.
+
+    Args:
+        root: Trusted gateway directory containing the relative reference.
+        relative_path: Unresolved descendant spelling used by the original proof.
+        generation: Identity and metadata captured when the content was classified.
+    """
+    with _snapshot_observation(root, relative_path) as (current, identities):
+        stamp = None if current is None else _file_stamp(current)
+        if identities != generation[0] or stamp != generation[1]:
+            raise ValueError("serving snapshot changed after preflight; retry the operation")
 
 
 @contextmanager

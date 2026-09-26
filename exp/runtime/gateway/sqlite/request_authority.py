@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.model_chain_authority import (
     SnapshotClassificationMemo,
+    SQLiteChainWitness,
     prepare_sqlite_chain_authority,
 )
 
@@ -26,7 +27,7 @@ def authorize_sqlite_alias(
     classification_memo: SnapshotClassificationMemo,
     serving_snapshot_max_bytes: int,
     alias_not_granted_error: type[Exception],
-) -> tuple[str, str, str, sqlite3.Row, str]:
+) -> tuple[str, str, str, sqlite3.Row, str, SQLiteChainWitness]:
     """Authenticate, resolve one alias and fence its local snapshot before routing.
 
     Args:
@@ -42,7 +43,7 @@ def authorize_sqlite_alias(
         alias_not_granted_error: Store-specific error raised for an inactive grant.
 
     Returns:
-        Organization, identity, key and alias row, plus the bound request ID.
+        Organization, identity, key and alias row, plus the request ID and chain witness.
     """
 
     def read_alias(
@@ -109,4 +110,5 @@ def authorize_sqlite_alias(
             alias_revision_id=str(row["active_revision_id"]),
             operation="authorize",
         )
-    return organization_id, identity_id, key_id, row, request_id
+        witness = proof.authority_witness()
+    return organization_id, identity_id, key_id, row, request_id, witness

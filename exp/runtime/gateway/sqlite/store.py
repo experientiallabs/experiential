@@ -664,7 +664,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         if deadline_monotonic <= self._clock.monotonic():
             raise GatewayStoreError("request deadline has already expired")
 
-        organization_id, identity_id, key_id, row, request_id = authorize_sqlite_alias(
+        organization_id, identity_id, key_id, row, request_id, witness = authorize_sqlite_alias(
             raw_key=raw_key,
             alias=alias,
             deadline_monotonic=deadline_monotonic,
@@ -702,7 +702,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
                     )
             case _:  # pragma: no cover - exhaustive over the ServingRequest union.
                 assert_never(request)
-        return AuthorizationSnapshot(
+        authorization = AuthorizationSnapshot(
             request_id=request_id,
             organization_id=organization_id,
             identity_id=identity_id,
@@ -727,6 +727,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
             app_title=app_title,
             client_ip=client_ip,
         )
+        authorization._local_sqlite_chain_witness = witness
+        return authorization
 
     def authenticate_key(self, *, raw_key: str) -> None:
         """Validate one virtual key without loading grants or request content.

@@ -42,6 +42,7 @@ from exp.runtime.gateway.model_chain_authority import (
     ChainOperation,
     SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
+    SQLiteChainWitness,
     observe_sqlite_chain_authority,
 )
 from exp.runtime.gateway.native_settlement import (
@@ -113,8 +114,8 @@ class _PendingWrite:
     """One queued ledger operation and the future resolved after durable commit.
 
     Attributes:
-        observe: Writer-thread read that binds the operation to exact alias rows.
-        observation_key: Authority identity shared by requests on the same alias revision.
+        observe: Optional writer-thread read for authorities without a request witness.
+        observation_key: Shared authority identity used to deduplicate optional writer reads.
         prepare: Optional parallel pretransaction context retaining proof handles through write.
     """
 
@@ -124,7 +125,7 @@ class _PendingWrite:
     observation_key: tuple[str, str] | None = None
     prepare: (
         Callable[
-            [SQLiteChainAuthorityObservation],
+            [SQLiteChainAuthorityObservation | None],
             AbstractContextManager[Callable[[sqlite3.Connection], object]],
         ]
         | None
@@ -134,7 +135,7 @@ class _PendingWrite:
 @contextmanager
 def _prepared_chain_write(
     core: SQLiteAttemptLedger,
-    observation: SQLiteChainAuthorityObservation,
+    observation: SQLiteChainAuthorityObservation | None,
     authorization: AuthorizationSnapshot,
     operation: ChainOperation,
     apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
@@ -438,12 +439,16 @@ class GroupCommitAttemptLedger:
                                 ready.append(pending)
                                 continue
                             try:
-                                if pending.observe is None or pending.observation_key is None:
-                                    raise RuntimeError("chain preflight has no database observer")
-                                observation = observations.get(pending.observation_key)
-                                if observation is None:
-                                    observation = pending.observe(connection)
-                                    observations[pending.observation_key] = observation
+                                observation = None
+                                if pending.observe is not None:
+                                    if pending.observation_key is None:
+                                        raise RuntimeError(
+                                            "chain observer has no authority identity"
+                                        )
+                                    observation = observations.get(pending.observation_key)
+                                    if observation is None:
+                                        observation = pending.observe(connection)
+                                        observations[pending.observation_key] = observation
                                 preparation = pending.prepare(observation)
                                 future = self._chain_preflights.submit(
                                     _enter_preparation, preparation
@@ -592,14 +597,27 @@ class GroupCommitAttemptLedger:
         apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
     ) -> concurrent.futures.Future[object]:
         """Queue classification before BEGIN without giving callers ownership of live handles."""
+        witness = authorization._local_sqlite_chain_witness
+        use_witness = (
+            isinstance(witness, SQLiteChainWitness)
+            and witness.maximum_bytes == self.core.serving_snapshot_max_bytes
+        )
         return self._enqueue(
             lambda connection: apply(connection, None),
-            observe=lambda connection: observe_sqlite_chain_authority(
-                connection,
-                authorization.organization_id,
-                authorization.alias_revision_id,
+            observe=(
+                None
+                if use_witness
+                else lambda connection: observe_sqlite_chain_authority(
+                    connection,
+                    authorization.organization_id,
+                    authorization.alias_revision_id,
+                )
             ),
-            observation_key=(authorization.organization_id, authorization.alias_revision_id),
+            observation_key=(
+                None
+                if use_witness
+                else (authorization.organization_id, authorization.alias_revision_id)
+            ),
             prepare=lambda observation: _prepared_chain_write(
                 self.core, observation, authorization, operation, apply
             ),
@@ -612,7 +630,7 @@ class GroupCommitAttemptLedger:
         observe: Callable[[sqlite3.Connection], SQLiteChainAuthorityObservation] | None = None,
         observation_key: tuple[str, str] | None = None,
         prepare: Callable[
-            [SQLiteChainAuthorityObservation],
+            [SQLiteChainAuthorityObservation | None],
             AbstractContextManager[Callable[[sqlite3.Connection], object]],
         ]
         | None = None,

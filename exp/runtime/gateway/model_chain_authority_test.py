@@ -980,21 +980,22 @@ def test_hot_plain_preflight_fences_snapshot_paths_once_at_write_boundary(
         manager.database_path,
         classification_memo=manager.classification_memo,
     )
-    calls = 0
-    original = authority.PreparedSnapshotFile.validate_current
+    checked_paths: list[str] = []
+    original = authority.validate_snapshot_generation
 
-    def count_checks(prepared: authority.PreparedSnapshotFile) -> None:
+    def count_checks(
+        root: Path, relative_path: str, generation: authority.SnapshotGeneration
+    ) -> None:
         """Keep the production fence and count its operation-scoped invocations."""
-        nonlocal calls
-        calls += 1
-        original(prepared)
+        checked_paths.append(relative_path)
+        original(root, relative_path, generation)
 
     try:
-        with patch.object(authority.PreparedSnapshotFile, "validate_current", count_checks):
+        with patch.object(authority, "validate_snapshot_generation", count_checks):
             ledger.accept_request(authorization=auth)
         # One normalized snapshot plus its model-chain sidecar, each fenced once
         # inside the durable acceptance transaction.
-        assert calls == 2
+        assert len(checked_paths) == 2
     finally:
         manager.close()
 
@@ -1105,7 +1106,7 @@ def test_chain_preflight_rejects_missing_closed_wrong_request_and_wrong_operatio
 
 
 def test_preflight_budget_exhaustion_is_timeout_and_releases_permit(tmp_path: Path) -> None:
-    """Waiting or finishing CPU work past the request budget cannot write or leak a permit."""
+    """Fallback classification past the request budget cannot write or leak a permit."""
     manager, raw_key = _configured_pool_gateway(tmp_path)
     store = manager.store()
     auth = store.authorize_request(
@@ -1118,6 +1119,7 @@ def test_preflight_budget_exhaustion_is_timeout_and_releases_permit(tmp_path: Pa
     assert authority._PREFLIGHT_PERMIT.acquire(timeout=1)
     try:
         expired = auth.model_copy(update={"deadline_monotonic": time.monotonic() + 0.01})
+        expired._local_sqlite_chain_witness = None
         with pytest.raises(AttemptRejectedError) as error:
             ledger.accept_request(authorization=expired)
         assert error.value.failure.failure_class == "timeout"
