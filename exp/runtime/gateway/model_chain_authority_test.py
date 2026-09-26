@@ -1155,7 +1155,7 @@ def test_preflight_wait_budget_rejects_unrepresentable_values(remaining: float) 
 def test_classification_memo_reuses_plain_pair_without_caching_authorization(
     tmp_path: Path,
 ) -> None:
-    """Warm pair classification avoids JSON work while each logical request still owns a proof."""
+    """Warm plain classifications avoid leaf opens while each request keeps fresh authority."""
     manager, raw_key = _configured_pool_gateway(tmp_path)
     store = manager.store()
     request = decode_chat(json.loads(_chat_body())).request
@@ -1171,12 +1171,17 @@ def test_classification_memo_reuses_plain_pair_without_caching_authorization(
                 deadline_monotonic=time.monotonic() + 60,
             )
             cold = parse.call_count
-            second = store.authorize_request(
-                raw_key=raw_key,
-                alias="coding",
-                request=request,
-                deadline_monotonic=time.monotonic() + 60,
-            )
+            with patch.object(
+                authority,
+                "prepare_snapshot_file",
+                side_effect=AssertionError("warm classification must not reopen snapshot leaves"),
+            ):
+                second = store.authorize_request(
+                    raw_key=raw_key,
+                    alias="coding",
+                    request=request,
+                    deadline_monotonic=time.monotonic() + 60,
+                )
             assert cold == 2 and parse.call_count == cold
         assert first.request_id != second.request_id
         alias = manager.aliases()[0]
