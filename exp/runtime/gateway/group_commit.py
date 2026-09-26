@@ -5,8 +5,9 @@ writer thread that drains queued operations into one SQLite transaction per
 batch. Every caller awaits its own operation's durable commit before
 proceeding, so acceptance, budget reservation, and terminal settlement keep
 their exact fail-closed semantics while the per-request fsync cost is
-amortized across all operations sharing a batch. There is no flush window:
-no caller observes success before its write is durable on disk.
+amortized across all operations sharing a batch. No caller observes success
+before its write is durable on disk. A short bounded collection window lets
+concurrent operations share that commit.
 
 Two callers share the one queue and writer thread: the asyncio engine awaits
 :class:`GroupCommitAttemptLedger`, while threads without an event loop (the
@@ -23,6 +24,7 @@ import logging
 import queue
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
@@ -55,6 +57,7 @@ from exp.runtime.gateway.sqlite.migrations import connect_database
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_BATCH_SIZE = 128
+_BATCH_COLLECTION_WINDOW_SECONDS = 0.00025
 _MAX_CHAIN_PREFLIGHT_WORKERS = 8
 
 _T = TypeVar("_T")
@@ -408,9 +411,13 @@ class GroupCommitAttemptLedger:
                 if item is None:
                     break
                 batch = [item]
+                collect_until = time.monotonic() + _BATCH_COLLECTION_WINDOW_SECONDS
                 while len(batch) < self._max_batch_size:
+                    remaining = collect_until - time.monotonic()
+                    if remaining <= 0:
+                        break
                     try:
-                        extra = self._queue.get_nowait()
+                        extra = self._queue.get(timeout=remaining)
                     except queue.Empty:
                         break
                     if extra is None:
