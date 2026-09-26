@@ -37,6 +37,8 @@ from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usa
 _ADMISSION_TIMING_STAGES = (
     "decode_and_body_ms",
     "alias_authorization_ms",
+    "sqlite_request_authority_ms",
+    "serving_chain_authorization_ms",
     "pre_accept_policy_ms",
     "ledger_accept_ms",
     "route_and_register_ms",
