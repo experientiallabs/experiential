@@ -14,6 +14,7 @@ import pytest
 
 from exp.common.models import ConnectionConfig
 from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
     DirectTarget,
     GatewayApiSurface,
     GatewayMessage,
@@ -247,6 +248,48 @@ def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(
     assert store.revoke_virtual_key(organization_id="org-one", key_id="key-one")
     with pytest.raises(InvalidVirtualKeyError, match="invalid"):
         store.granted_aliases(raw_key=raw_key)
+
+
+def test_key_preflight_falls_back_to_read_while_writer_holds_lock(tmp_path: Path) -> None:
+    """A held SQLite writer cannot pin pre-body key authentication."""
+    store, clock, raw_key = _configured_store(tmp_path)
+    store.authenticate_key(raw_key=raw_key)
+    with store._connect() as reader:
+        last_used_before = reader.execute(
+            "SELECT last_used_at FROM virtual_keys WHERE key_id = 'key-one'"
+        ).fetchone()[0]
+    clock.advance(61)
+
+    with store._connect() as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+
+            def preflight_and_authorize() -> AuthorizationSnapshot:
+                store.authenticate_key(raw_key=raw_key)
+                return store.authorize_request(
+                    raw_key=raw_key,
+                    alias="coding",
+                    request=_request(),
+                    deadline_monotonic=clock.monotonic() + 30,
+                )
+
+            authentication = executor.submit(preflight_and_authorize)
+            try:
+                authorized = authentication.result(timeout=1)
+                with store._connect() as reader:
+                    last_used_after = reader.execute(
+                        "SELECT last_used_at FROM virtual_keys WHERE key_id = 'key-one'"
+                    ).fetchone()[0]
+            except TimeoutError:
+                writer.execute("ROLLBACK")
+                authentication.result(timeout=5)
+                pytest.fail("key preflight waited for the SQLite writer lock")
+            finally:
+                if writer.in_transaction:
+                    writer.execute("ROLLBACK")
+
+    assert authorized.virtual_key_id == "key-one"
+    assert last_used_after == last_used_before
 
 
 def test_authorization_serializes_with_concurrent_key_revocation(
