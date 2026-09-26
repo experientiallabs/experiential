@@ -1166,7 +1166,8 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     assert boundary.replace("_", " ") in str(first.exception)
     assert state.completion_calls == []
     build_embeddings = tuple(state.embedding_calls)
-    assert len(build_embeddings) == 2
+    # Fit reuses serving's exact text vectors instead of paying for a second embedding pass.
+    assert len(build_embeddings) == 1
     monkeypatch.setattr(wizard, "_ensure_judge_calibration", original_calibration)
     monkeypatch.setattr(wizard, "preflight_automatic_router", original_preflight)
 

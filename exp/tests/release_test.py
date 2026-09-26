@@ -61,6 +61,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "rich",
         "tiktoken",
         "tomli-w",
+        "truststore",
         "typer",
     }
 )

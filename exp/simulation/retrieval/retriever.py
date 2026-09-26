@@ -14,6 +14,7 @@ from exp.simulation.retrieval.embedding import (
     default_rag_embedder,
     embed_rag_texts,
 )
+from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
 from exp.simulation.retrieval.store import LoadedRAGIndex, load_rag_index
 from exp.simulation.retrieval.transitions import render_rag_key
 
@@ -68,7 +69,7 @@ class TraceRAGRetriever:
 
     @property
     def maximum_attempts(self) -> int:
-        """Return the maximum provider attempts made by one query embedding."""
+        """Return the maximum provider attempts made by each query-embedding batch."""
         return self._embedder.maximum_attempts
 
     @property
@@ -106,7 +107,9 @@ class TraceRAGRetriever:
             initial_context=query.initial_context,
             action=query.action,
         )
-        input_tokens = len(key_text.encode("utf-8"))
+        input_tokens = plan_rag_embedding_inputs(
+            (key_text,), maximum_chunk_bytes=self._index.embedding_chunk_bytes
+        ).maximum_input_tokens
         if input_tokens > reservation.maximum_input_tokens:
             raise RAGQueryInputLimitError(
                 "canonical RAG query exceeds its reserved input-token ceiling"
@@ -135,7 +138,11 @@ class TraceRAGRetriever:
             initial_context=query.initial_context,
             action=query.action,
         )
-        query_vector = embed_rag_texts(self._embedder, (key_text,))[0]
+        query_vector = embed_rag_texts(
+            self._embedder,
+            (key_text,),
+            maximum_chunk_bytes=self._index.embedding_chunk_bytes,
+        )[0]
         if len(query_vector) != self._index.embedding_dimension:
             raise ValueError(
                 f"RAG query embedding has dimension {len(query_vector)}, expected "

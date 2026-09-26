@@ -59,6 +59,11 @@ from exp.simulation.retrieval import (
     load_rag_index,
     persist_trace_rag,
 )
+from exp.simulation.retrieval.embedding import RAGEmbeddingCache
+from exp.simulation.retrieval.embedding_inputs import (
+    embedding_chunk_bytes,
+    plan_rag_embedding_inputs,
+)
 from exp.simulation.retrieval.transitions import extract_real_transitions
 from exp.simulation.world_model.artifact import (
     WORLD_MODEL_ARTIFACT_PATH,
@@ -224,8 +229,8 @@ def build(
         except ProviderTransportError as exc:
             _console.print(f"[red]error[/red] a provider request failed: {exc}")
             _console.print(
-                "Completed paid work is saved. Run exp build again to resume; finished "
-                "steps replay exactly without new spend."
+                "Completed embedding batches and finished steps are saved. Run exp build again "
+                "to resume; an interrupted request may be retried."
             )
             raise typer.Exit(code=1) from exc
         except SimulationContentionError as exc:
@@ -557,13 +562,13 @@ def _embedding_cost_ceiling(
         bindings,
         included_partitions=frozenset({"fit", "held_out"}),
     )
-    fit = extract_real_transitions(
-        traces,
-        bindings,
-        included_partitions=frozenset({"fit"}),
+    # Fit is a strict subset of serving. The same invocation reuses exact text vectors across
+    # indexes, without sharing transition membership or observations between partitions.
+    plan = plan_rag_embedding_inputs(
+        tuple(transition.key_text for transition in serving),
+        maximum_chunk_bytes=embedding_chunk_bytes(capabilities.context_window_tokens),
     )
-    byte_count = sum(len(transition.key_text.encode("utf-8")) for transition in (*serving, *fit))
-    maximum_input_tokens = byte_count * RetryPolicy().maximum_attempts
+    maximum_input_tokens = plan.maximum_input_tokens * RetryPolicy().maximum_attempts
     return maximum_input_tokens * price / 1_000_000
 
 
@@ -632,6 +637,11 @@ def _build_grounded_artifacts(
         snapshot=resolved_embedder.snapshot,
         maximum_attempts=RetryPolicy().maximum_attempts,
         input_usd_per_million_tokens=0.0 if embedding_price is None else embedding_price,
+        maximum_input_tokens=resolved_embedder.capabilities.context_window_tokens,
+    )
+    embedding_cache = RAGEmbeddingCache(
+        rag_embedder,
+        maximum_chunk_bytes=embedding_chunk_bytes(rag_embedder.maximum_input_tokens),
     )
     serving = persist_trace_rag(
         store.artifacts,
@@ -643,6 +653,7 @@ def _build_grounded_artifacts(
         default_top_k=top_k,
         included_partitions=frozenset({"fit", "held_out"}),
         progress=qualified(progress, "serving index"),
+        embedding_cache=embedding_cache,
     )
     fit = persist_trace_rag(
         store.artifacts,
@@ -654,6 +665,7 @@ def _build_grounded_artifacts(
         default_top_k=top_k,
         included_partitions=frozenset({"fit"}),
         progress=qualified(progress, "fit-only index"),
+        embedding_cache=embedding_cache,
     )
     report(progress, "grounded model")
     world = persist_grounded_world_model(
