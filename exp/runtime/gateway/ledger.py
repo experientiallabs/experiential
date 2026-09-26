@@ -125,9 +125,9 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         chain_preflight: SQLiteChainPreflight | None,
         operation: ChainOperation,
         staged: bool = False,
-    ) -> None:
+    ) -> str:
         """Require a live preflight and fence policy at the atomic write boundary."""
-        SQLiteChainPreflight.require_ledger(
+        return SQLiteChainPreflight.require_ledger(
             connection, authorization, chain_preflight, operation, staged=staged
         )
 
@@ -173,7 +173,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             IdempotencyConflictError: The caller operation exists for another request.
             IdempotencyReplayUnavailableError: The matching operation already exists.
         """
-        self._require_chain_authority(
+        alias_id = self._require_chain_authority(
             connection,
             authorization=authorization,
             chain_preflight=chain_preflight,
@@ -219,15 +219,6 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                     raise IdempotencyReplayUnavailableError(
                         "matching keyed request exists but durable content replay is unavailable"
                     )
-        alias_row = connection.execute(
-            """
-            SELECT alias_id FROM alias_revisions
-            WHERE organization_id = ? AND revision_id = ?
-            """,
-            (authorization.organization_id, authorization.alias_revision_id),
-        ).fetchone()
-        if alias_row is None:
-            raise GatewayLedgerError("authorized alias revision is not present in the ledger")
         connection.execute(
             """
             INSERT INTO gateway_requests (
@@ -242,7 +233,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 authorization.organization_id,
                 authorization.identity_id,
                 authorization.virtual_key_id,
-                str(alias_row["alias_id"]),
+                alias_id,
                 authorization.alias_revision_id,
                 authorization.surface.value,
                 authorization.canonical_request_sha256,

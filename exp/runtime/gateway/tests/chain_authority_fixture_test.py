@@ -364,7 +364,7 @@ class ChainAttemptLedger(SQLiteAttemptLedger):
         chain_preflight: SQLiteChainPreflight | None,
         operation: ChainOperation,
         staged: bool = False,
-    ) -> None:
+    ) -> str:
         """Revalidate durable issuance and epoch inside each acceptance/reservation transaction."""
         _initialize(connection)
         floor = connection.execute(
@@ -387,7 +387,7 @@ class ChainAttemptLedger(SQLiteAttemptLedger):
             ):
                 raise ModelChainAuthorityError("attempt authority differs from accepted request")
             plain = connection.execute(
-                """SELECT r.pool_id,r.catalog_sha256,c.catalog FROM alias_revisions r
+                """SELECT r.pool_id,r.catalog_sha256,c.catalog,r.alias_id FROM alias_revisions r
                 JOIN test_chain_floors c ON c.organization_id=r.organization_id
                   AND c.digest=r.catalog_sha256 WHERE r.organization_id=? AND r.revision_id=?""",
                 (authorization.organization_id, authorization.alias_revision_id),
@@ -403,7 +403,7 @@ class ChainAttemptLedger(SQLiteAttemptLedger):
                     or catalog.requires_model_chain_authority(pool_id=plain[0])
                 ):
                     raise ModelChainAuthorityError("test host plain alias authority mismatch")
-                return
+                return str(plain[3])
             return super()._require_chain_authority(
                 connection,
                 authorization=authorization,
@@ -427,6 +427,7 @@ class ChainAttemptLedger(SQLiteAttemptLedger):
             raise ModelChainAuthorityError("test host receipt floor is stale")
         if str(receipt.process_generation) != _GENERATION:
             raise ModelChainAuthorityError("test host process generation mismatch")
+        return str(floor["alias_id"])
 
 
 def chain_components(root: Path, *, environment: dict[str, str]) -> NativeGatewayComponents:
