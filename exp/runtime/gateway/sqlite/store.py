@@ -58,7 +58,7 @@ from exp.runtime.gateway.sqlite.setup_authority import (
 )
 
 _LAST_USED_REFRESH_SECONDS = 60.0
-_AUTH_WRITE_LOCK_WAIT_MS = 1
+_AUTH_WRITE_LOCK_WAIT_MS = 5
 
 
 class GatewayStoreError(ValueError):
