@@ -35,6 +35,7 @@ from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
 _ADMISSION_TIMING_STAGES = (
+    "expired_sweep_ms",
     "decode_and_body_ms",
     "alias_authorization_ms",
     "sqlite_request_authority_ms",
