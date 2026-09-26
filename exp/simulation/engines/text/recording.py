@@ -47,7 +47,7 @@ from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.tasks import TaskCase
 from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
-from exp.runtime.models.providers.errors import ProviderRefusalError
+from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRetryableResponseError
 from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
@@ -63,7 +63,7 @@ from exp.simulation.engines.text.prompt import (
 from exp.simulation.engines.text.redaction import redact_json
 from exp.simulation.engines.text.tokens import TokenCounter, bound_unpublished_output
 from exp.simulation.retrieval import RAGQuery
-from exp.simulation.retrieval.transitions import render_rag_key
+from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 
 if TYPE_CHECKING:
     from exp.simulation.world_model import GroundedWorldModel
@@ -290,7 +290,8 @@ class RecordingCandidateClient:
             failure = StructuredFailure(
                 code=FailureCode.PROVIDER,
                 message=f"text simulation provider call failed with {type(exc).__name__}",
-                retryable=classification.retryable or isinstance(exc, ProviderRefusalError),
+                retryable=classification.retryable
+                or isinstance(exc, (ProviderRefusalError, ProviderRetryableResponseError)),
                 exception_type=type(exc).__name__,
                 attribution=FailureAttribution.MODEL,
                 details=details,
@@ -429,24 +430,17 @@ class RecordingCandidateClient:
             )
             for action in candidate_rag_actions(candidate_response.output)
         )
-        if any(
-            len(
-                render_rag_key(
-                    task=query.task, initial_context=query.initial_context, action=query.action
-                ).encode("utf-8")
+        try:
+            query_economics = estimate_retrieval_economics(
+                queries, self._grounded_world_model.retriever, self._query_embedding
             )
-            > self._query_embedding.maximum_input_tokens
-            for query in queries
-        ):
+        except RAGQueryInputLimitError as exc:
             raise _text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
                 "grounding query exceeds its reserved input-token ceiling",
                 phase="query_embedding_budget",
-            )
-        query_economics = estimate_retrieval_economics(
-            queries, self._grounded_world_model.retriever, self._query_embedding
-        )
+            ) from exc
         self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)
         prepared = self._dispatch_provider(

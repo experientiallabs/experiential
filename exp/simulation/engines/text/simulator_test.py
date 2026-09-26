@@ -242,6 +242,10 @@ class _FitRetriever:
             initial_context=query.initial_context,
             action=query.action,
         )
+        from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
+
+        if len(key_text.encode("utf-8")) > reservation.maximum_input_tokens:
+            raise RAGQueryInputLimitError("query input ceiling")
         reserved_tokens = len(key_text.encode("utf-8")) * reservation.maximum_attempts
         return OperationEconomics(
             cost_usd=NumericMeasurement(
