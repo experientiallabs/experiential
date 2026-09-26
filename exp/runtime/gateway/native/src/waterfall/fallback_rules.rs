@@ -164,6 +164,7 @@ mod tests {
             headers: HashMap::new(),
             model_id: String::new(),
             billing_customer_managed: tokens.is_some(),
+            explicit_cache: false,
             timeout_seconds: 60.0,
             upstream_payload: Value::Null,
             upstream_body: None,

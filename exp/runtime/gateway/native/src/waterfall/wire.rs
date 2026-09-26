@@ -36,6 +36,10 @@ pub struct DeploymentWire {
     /// deadness that fails over.
     #[serde(default)]
     pub billing_customer_managed: bool,
+    /// Host-authorized Google explicit-cache execution for this attempt.
+    /// The host still reserves and settles each cache operation separately.
+    #[serde(default)]
+    pub explicit_cache: bool,
     pub timeout_seconds: f64,
     /// Structured payload the data plane serializes itself; null for
     /// body-signing dialects, whose route entry carries `upstream_body`.

@@ -215,6 +215,46 @@ generation to recover missing usage.
 This behavior applies to new requests. It does not reconstruct historical provider frames,
 attribute past missing meters to a particular cause, or authorize retrospective billing changes.
 
+## Host-authorized Google cache resources
+
+Native Gemini and Vertex can create explicit cache resources only when the embedder supplies
+`NativeControlPlane(..., explicit_cache=host)`. The default is `None`, which leaves existing
+implicit caching and ignored-marker disclosures unchanged. A host must require both an explicit
+five-minute ephemeral checkpoint and a configured customer-funded cache allowance; missing or zero
+allowance never authorizes creation. `prompt_cache_key` alone is not a spending instruction.
+
+The initial native path handles exact text prefixes on Google's official Gemini `v1beta` and
+Vertex `v1` endpoints. It retains the marked prefix, its system instructions and supported function
+tools in one cache resource, and sends the remaining content with `cachedContent`. A checkpoint
+cannot move to a different prefix. Media, tool-call history, automatic/request-level markers,
+interleaved instructions and other unsupported shapes retain their existing uncached behavior and
+disclosures. Cache handling is skipped for body-signed requests, search rounds and repaired payloads.
+ZDR requests do not create retained resources.
+
+Cache creation happens only after route selection and generation reservation. Rust makes at most
+one cache-create HTTP request, using the selected endpoint's credentials, no redirects or retries,
+and the remaining request deadline. The request sends a fixed absolute expiration no more than
+five minutes away, not a sliding TTL. Response parsing is bounded to 64 KiB and exposes only the
+resource name, provider-measured token count, expiration and status to the host callback.
+
+The host owns durable cross-worker claims, customer allowance, credential-generation binding and
+resource-cost accounting. Its `claim` must commit the complete create-plus-storage reservation
+before granting one creator. Ready resources are isolated by tenant, account generation, endpoint,
+project/location, model and exact prefix. A worker-local dictionary is not a durable implementation.
+Token storage is priced per million-token-hour, separately from generation/cache-write token legs;
+unknown rates are not zero, while an explicitly verified zero create-input rate is representable.
+
+Creation timeouts, cancellations and malformed outcomes retain reserved exposure and never trigger
+blind resource recreation. Known but expired resource facts still reach accounting, but the resource
+is not reused. Freshness is rechecked after host I/O and again in Rust before use. A failed accounting
+acknowledgement prevents generation; an acknowledged unavailable resource can use the original
+payload within existing deadlines and generation-attempt limits. No warm-up generation is added.
+
+This engine interface does not install a hosted spending policy, durable resource store, verified
+price catalog or customer settings UI. Those must be implemented and tested by the embedder before
+activation. Offline and loopback tests do not establish live Google eligibility, realized savings or
+provider-side storage billing. No customer is opted in by installing the engine package.
+
 ## Verification boundaries
 
 Regression coverage exercises the actual native normalizers, encoders, and served loopback
