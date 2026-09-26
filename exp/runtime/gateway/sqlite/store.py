@@ -649,6 +649,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         alias: str,
         request: ServingRequest,
         deadline_monotonic: float,
+        preauthenticated_key: tuple[str, str, str] | None = None,
         app_referer: str | None = None,
         app_title: str | None = None,
         client_ip: str | None = None,
@@ -687,6 +688,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
                 self._authenticate_in_transaction,
                 update_last_used=False,
             ),
+            authenticate_preflight=self._authenticate_preflight_in_transaction,
+            preauthenticated_key=preauthenticated_key,
             busy_timeout_ms=_AUTH_WRITE_LOCK_WAIT_MS,
             classification_memo=self.classification_memo,
             serving_snapshot_max_bytes=self._serving_snapshot_max_bytes,
@@ -782,28 +785,28 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
                         update_last_used=False,
                     )
 
-    def authenticate_key_for_preflight(self, *, raw_key: str) -> None:
+    def authenticate_key_for_preflight(self, *, raw_key: str) -> tuple[str, str, str]:
         """Read-authenticate a body gate without waiting for SQLite writers.
 
         The process-local lock paces preflight readers for at most the bounded
         authentication wait. A caller that cannot acquire it within that
-        interval validates from its own read-only snapshot instead. Full
-        authorization still rechecks current key and alias authority and owns
-        the coarse ``last_used_at`` refresh.
+        interval validates from its own read-only snapshot instead. The returned
+        exact key identity lets full authorization recheck current key and alias
+        authority without repeating the prefix scan; admission owns the coarse
+        ``last_used_at`` refresh.
         """
         if not self._preflight_authentication_lock.acquire(
             timeout=_AUTH_WRITE_LOCK_WAIT_MS / 1_000
         ):
             with self._transaction(immediate=False) as connection:
-                self._authenticate_in_transaction(
+                return self._authenticate_in_transaction(
                     connection,
                     raw_key,
                     update_last_used=False,
                 )
-            return
         try:
             with self._transaction(immediate=False) as connection:
-                self._authenticate_in_transaction(
+                return self._authenticate_in_transaction(
                     connection,
                     raw_key,
                     update_last_used=False,
@@ -816,6 +819,79 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         with self._transaction() as connection:
             organization_id, identity_id, _ = self._authenticate_in_transaction(connection, raw_key)
         return organization_id, identity_id
+
+    def _authenticate_preflight_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        raw_key: str,
+        preauthenticated_key: tuple[str, str, str],
+        *,
+        update_last_used: bool = True,
+    ) -> tuple[str, str, str]:
+        """Revalidate one pre-body key proof by its exact SQLite identity.
+
+        The native Chat bridge authenticates before converting the body. Its
+        immediately following admission still checks the current key, identity,
+        organization, expiry, and revocation state, but can address that exact
+        key row directly instead of repeating the prefix scan.
+        """
+        organization_id, identity_id, key_id = preauthenticated_key
+        try:
+            prefix = key_prefix(raw_key)
+        except GatewayAuthError as exc:
+            raise InvalidVirtualKeyError("virtual key is invalid") from exc
+        selected = connection.execute(
+            """
+            SELECT k.organization_id, k.identity_id, k.key_id,
+                   k.fingerprint_version, k.fingerprint_sha256,
+                   k.expires_at, k.revoked_at, k.last_used_at,
+                   i.active AS identity_active,
+                   o.active AS organization_active
+            FROM virtual_keys AS k
+            JOIN identities AS i
+              ON i.organization_id = k.organization_id AND i.identity_id = k.identity_id
+            JOIN organizations AS o ON o.organization_id = k.organization_id
+            WHERE k.organization_id = ? AND k.identity_id = ? AND k.key_id = ?
+              AND k.prefix = ?
+            """,
+            (organization_id, identity_id, key_id, prefix),
+        ).fetchone()
+        if selected is None:
+            raise InvalidVirtualKeyError("virtual key is invalid")
+        try:
+            pepper = self._pepper.key(int(selected["fingerprint_version"]))
+        except GatewayAuthError as exc:
+            raise InvalidVirtualKeyError("virtual key is invalid") from exc
+        fingerprint = fingerprint_virtual_key(raw_key, pepper)
+        if not hmac.compare_digest(fingerprint, str(selected["fingerprint_sha256"])):
+            raise InvalidVirtualKeyError("virtual key is invalid")
+        expires_at = selected["expires_at"]
+        expired = (
+            expires_at is not None and datetime.fromisoformat(str(expires_at)) <= self._clock.now()
+        )
+        if (
+            selected["revoked_at"] is not None
+            or expired
+            or int(selected["identity_active"]) != 1
+            or int(selected["organization_active"]) != 1
+        ):
+            raise InvalidVirtualKeyError("virtual key is invalid")
+        last_used = selected["last_used_at"]
+        now = self._clock.now()
+        stale = (
+            last_used is None
+            or (now - datetime.fromisoformat(str(last_used))).total_seconds()
+            >= _LAST_USED_REFRESH_SECONDS
+        )
+        if stale and update_last_used:
+            connection.execute(
+                """
+                UPDATE virtual_keys SET last_used_at = ?
+                WHERE organization_id = ? AND key_id = ?
+                """,
+                (utc_text(now), organization_id, key_id),
+            )
+        return organization_id, identity_id, key_id
 
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
         """List only active aliases granted to the key-derived identity.

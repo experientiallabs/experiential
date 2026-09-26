@@ -280,7 +280,12 @@ fn authenticate_then_admit_chat_call(
 ) -> Result<String, PublicError> {
     let authentication_argument = serde_json::to_string(&json!({"raw_key": request.raw_key}))
         .map_err(|_| PublicError::internal())?;
-    let authentication = control_plane_call(py, object, "authenticate", authentication_argument);
+    let authentication = control_plane_call(
+        py,
+        object,
+        "authenticate_for_chat_admission",
+        authentication_argument,
+    );
     crate::metrics::METRICS.record_bridge_call("authenticate", started_at.elapsed());
     authentication?;
     if responder.is_closed() {
@@ -390,6 +395,9 @@ class Plane:
             })
             raise error
         return "{}"
+
+    def authenticate_for_chat_admission(self, argument):
+        return self.authenticate(argument)
 
     def admit(self, argument):
         with self.lock:

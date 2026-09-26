@@ -325,6 +325,7 @@ class NativeControlPlane(
         self._control_plane_timing.record("expired_sweep_ms", sweep_started)
         decode_started = time.monotonic()
         data = json.loads(argument)
+        preauthenticated_key = self._take_chat_admission_preflight(str(data.get("raw_key", "")))
         surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
             data["body"],
@@ -341,15 +342,27 @@ class NativeControlPlane(
             # Freeze native app attribution and the trusted client IP onto caller authority.
             sqlite_authority_started = time.monotonic()
             try:
-                authorization = self._components.store.authorize_request(
-                    raw_key=data["raw_key"],
-                    alias=decoded.alias,
-                    request=request,
-                    deadline_monotonic=deadline,
-                    app_referer=optional_text(data.get("app_referer")),
-                    app_title=optional_text(data.get("app_title")),
-                    client_ip=optional_text(data.get("client_ip")),
-                )
+                if preauthenticated_key is None:
+                    authorization = self._components.store.authorize_request(
+                        raw_key=data["raw_key"],
+                        alias=decoded.alias,
+                        request=request,
+                        deadline_monotonic=deadline,
+                        app_referer=optional_text(data.get("app_referer")),
+                        app_title=optional_text(data.get("app_title")),
+                        client_ip=optional_text(data.get("client_ip")),
+                    )
+                else:
+                    authorization = self._components.store.authorize_request(
+                        raw_key=data["raw_key"],
+                        alias=decoded.alias,
+                        request=request,
+                        deadline_monotonic=deadline,
+                        preauthenticated_key=preauthenticated_key,
+                        app_referer=optional_text(data.get("app_referer")),
+                        app_title=optional_text(data.get("app_title")),
+                        client_ip=optional_text(data.get("client_ip")),
+                    )
             finally:
                 self._control_plane_timing.record(
                     "sqlite_request_authority_ms", sqlite_authority_started

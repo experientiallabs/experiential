@@ -38,6 +38,7 @@ class GatewayControlStore(Protocol):
         alias: str,
         request: ServingRequest,
         deadline_monotonic: float,
+        preauthenticated_key: tuple[str, str, str] | None = None,
         app_referer: str | None = None,
         app_title: str | None = None,
         client_ip: str | None = None,

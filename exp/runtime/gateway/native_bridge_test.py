@@ -1713,7 +1713,7 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""
     control, raw_key = _control_plane(tmp_path)
-    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+    assert control.authenticate_for_chat_admission(json.dumps({"raw_key": raw_key})) == "{}"
 
     admission = _admit_started(control, raw_key, _chat_body())
     assert admission["maximum_total_attempts"] == 8
