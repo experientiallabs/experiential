@@ -1,137 +1,117 @@
-//! Lossless completed Messages projection from ordered public SSE data frames.
-
-use serde_json::{Map, Value};
+//! Reassemble observed Messages content while tracking complete block lifecycles.
+use super::observation::append;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-struct Block {
-    value: Value,
-    arguments: Option<String>,
-    closed: bool,
-}
-
-pub(super) fn assemble(frames: &[Value]) -> Option<Value> {
-    let mut message: Option<Value> = None;
-    let mut blocks: BTreeMap<u64, Block> = BTreeMap::new();
-    let mut stopped = false;
+pub(super) fn assemble(frames: &[Value]) -> (Value, bool) {
+    let mut message = json!({"usage": {}});
+    let mut blocks = BTreeMap::new();
+    let mut arguments: BTreeMap<u64, String> = BTreeMap::new();
+    let mut closed = std::collections::BTreeSet::new();
+    let (mut started, mut stopped, mut valid) = (false, false, true);
     for frame in frames {
-        if stopped {
-            return None;
-        }
-        match frame.get("type")?.as_str()? {
-            "ping" => {}
-            "message_start" if message.is_none() => {
-                let start = frame.get("message")?;
-                if start.get("type")?.as_str()? != "message"
-                    || !start.get("content")?.as_array()?.is_empty()
-                {
-                    return None;
+        valid &= !stopped;
+        let step = (|| -> Option<()> {
+            match frame.get("type")?.as_str()? {
+                "ping" => {}
+                "message_start" => {
+                    valid &= !started;
+                    let start = frame.get("message")?.as_object()?;
+                    valid &= start.get("type").is_some_and(|v| v == "message")
+                        && start
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .is_some_and(Vec::is_empty);
+                    message.as_object_mut()?.extend(start.clone());
+                    started = true;
                 }
-                message = Some(start.clone());
-            }
-            "content_block_start" if message.is_some() => {
-                let index = frame.get("index")?.as_u64()?;
-                if blocks.contains_key(&index) || index != blocks.len() as u64 {
-                    return None;
+                "content_block_start" => {
+                    let index = frame.get("index")?.as_u64()?;
+                    valid &=
+                        started && index == blocks.len() as u64 && !blocks.contains_key(&index);
+                    blocks.insert(
+                        index,
+                        Value::Object(frame.get("content_block")?.as_object()?.clone()),
+                    );
                 }
-                blocks.insert(
-                    index,
-                    Block {
-                        value: frame.get("content_block")?.clone(),
-                        arguments: None,
-                        closed: false,
-                    },
-                );
-            }
-            "content_block_delta" => {
-                let block = blocks.get_mut(&frame.get("index")?.as_u64()?)?;
-                if block.closed {
-                    return None;
-                }
-                let delta = frame.get("delta")?;
-                match delta.get("type")?.as_str()? {
-                    "text_delta" => append(
-                        block.value.as_object_mut()?,
-                        "text",
-                        delta.get("text")?.as_str()?,
-                    )?,
-                    "thinking_delta" => append(
-                        block.value.as_object_mut()?,
-                        "thinking",
-                        delta.get("thinking")?.as_str()?,
-                    )?,
-                    "signature_delta" => append(
-                        block.value.as_object_mut()?,
-                        "signature",
-                        delta.get("signature")?.as_str()?,
-                    )?,
-                    "input_json_delta" => block
-                        .arguments
-                        .get_or_insert_with(String::new)
-                        .push_str(delta.get("partial_json")?.as_str()?),
-                    "citations_delta" => block
-                        .value
-                        .as_object_mut()?
-                        .entry("citations")
-                        .or_insert_with(|| Value::Array(vec![]))
-                        .as_array_mut()?
-                        .push(delta.get("citation")?.clone()),
-                    _ => return None,
-                }
-            }
-            "content_block_stop" => {
-                let block = blocks.get_mut(&frame.get("index")?.as_u64()?)?;
-                if block.closed {
-                    return None;
-                }
-                if let Some(arguments) = &block.arguments {
-                    if !arguments.is_empty() {
-                        let input: Value = serde_json::from_str(arguments).ok()?;
-                        if !input.is_object() {
-                            return None;
+                "content_block_delta" => {
+                    let index = frame.get("index")?.as_u64()?;
+                    valid &= blocks.contains_key(&index) && !closed.contains(&index);
+                    let block = blocks
+                        .entry(index)
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()?;
+                    let delta = frame.get("delta")?;
+                    valid &= match delta["type"].as_str() {
+                        Some("text_delta") => delta["text"].is_string(),
+                        Some("thinking_delta") => delta["thinking"].is_string(),
+                        Some("signature_delta") => delta["signature"].is_string(),
+                        Some("input_json_delta") => delta["partial_json"].is_string(),
+                        Some("citations_delta") => delta.get("citation").is_some(),
+                        _ => false,
+                    };
+                    for key in ["text", "thinking", "signature"] {
+                        if let Some(value) = delta.get(key) {
+                            append(block, key, value)?;
                         }
-                        block.value["input"] = input;
+                    }
+                    if let Some(partial) = delta.get("partial_json") {
+                        arguments
+                            .entry(index)
+                            .or_default()
+                            .push_str(partial.as_str()?);
+                    }
+                    if let Some(citation) = delta.get("citation") {
+                        append(block, "citations", &json!([citation]))?;
                     }
                 }
-                block.closed = true;
-            }
-            "message_delta" => {
-                let target = message.as_mut()?.as_object_mut()?;
-                for (key, value) in frame.get("delta")?.as_object()? {
-                    target.insert(key.clone(), value.clone());
+                "content_block_stop" => {
+                    let index = frame.get("index")?.as_u64()?;
+                    valid &= blocks.contains_key(&index) && closed.insert(index);
                 }
-                if let Some(usage) = frame.get("usage") {
-                    let target = target.get_mut("usage")?.as_object_mut()?;
-                    for (key, value) in usage.as_object()? {
-                        target.insert(key.clone(), value.clone());
+                "message_delta" => {
+                    valid &= started && frame["delta"].is_object();
+                    if let Some(delta) = frame.get("delta") {
+                        message.as_object_mut()?.extend(delta.as_object()?.clone());
+                    }
+                    if let Some(usage) = frame.get("usage") {
+                        message["usage"]
+                            .as_object_mut()?
+                            .extend(usage.as_object()?.clone());
                     }
                 }
+                "message_stop" => stopped = true,
+                "error" => {
+                    message["error"] = frame
+                        .get("error")
+                        .cloned()
+                        .unwrap_or(json!("provider stream error"));
+                    valid = false;
+                }
+                _ => return None,
             }
-            "message_stop" => stopped = true,
-            _ => return None,
-        }
-    }
-    let mut message = message?;
-    if !stopped
-        || !message.get("stop_reason").is_some_and(Value::is_string)
-        || blocks.values().any(|block| !block.closed)
-    {
-        return None;
-    }
-    message["content"] = Value::Array(blocks.into_values().map(|block| block.value).collect());
-    Some(message)
-}
-
-fn append(object: &mut Map<String, Value>, key: &str, delta: &str) -> Option<()> {
-    match object
-        .entry(key)
-        .or_insert_with(|| Value::String(String::new()))
-    {
-        Value::String(text) => {
-            text.push_str(delta);
             Some(())
-        }
-        _ => None,
+        })();
+        valid &= step.is_some();
     }
+    for (index, argument) in arguments {
+        let block = blocks.get_mut(&index).unwrap();
+        if !argument.is_empty() {
+            match serde_json::from_str::<Value>(&argument) {
+                Ok(value) => {
+                    valid &= value.is_object();
+                    block["input"] = value;
+                }
+                Err(_) => {
+                    valid = false;
+                    block["capture_partial_input"] = Value::String(argument);
+                }
+            }
+        }
+    }
+    valid &= started && stopped && blocks.keys().all(|index| closed.contains(index));
+    message["content"] = Value::Array(blocks.into_values().collect());
+    (message, valid)
 }
 
 #[cfg(test)]
@@ -154,11 +134,12 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}),
             json!({"type":"message_stop"}),
         ];
-        let result = assemble(&frames).unwrap();
+        let (result, complete) = assemble(&frames);
+        assert!(complete);
         assert_eq!(result["content"][0]["thinking"], " exactly\0雪\n");
         assert_eq!(result["content"][0]["signature"], "signed");
         assert_eq!(result["content"][1]["input"], json!({"x":1}));
-        assert!(assemble(&frames[..frames.len() - 1]).is_none());
+        assert!(!assemble(&frames[..frames.len() - 1]).1);
     }
 
     #[test]
@@ -171,7 +152,7 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
             json!({"type":"message_stop"}),
         ];
-        let message = assemble(&frames).unwrap();
+        let message = assemble(&frames).0;
         assert_eq!(message["content"][0]["input"], json!({}));
     }
 }

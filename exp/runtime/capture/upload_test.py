@@ -420,7 +420,7 @@ def test_recovery_keeps_original_run_batch_and_never_sends_api_key_to_storage(
     prior = tmp_path / prior_run
     prior.mkdir()
     (prior / f"{batch}.json").write_bytes(
-        normalize_exchange(_usage_exchange(), max_body_bytes=4096)
+        normalize_exchange(_usage_exchange(), max_body_bytes=4096)[0]
     )
     requests: list[httpx.Request] = []
 
@@ -704,7 +704,7 @@ def test_running_retry_keeps_local_copy_until_verified_completion(
     directory = tmp_path / run
     directory.mkdir()
     path = directory / f"{uuid4()}.json"
-    path.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    path.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096)[0])
     statuses = iter(("running", terminal))
     requests: list[httpx.Request] = []
 
@@ -748,10 +748,12 @@ def test_shutdown_counts_unfinished_copies_and_freezes_final_pending(
     directory = tmp_path / run
     directory.mkdir()
     existing = directory / f"{uuid4()}.json"
-    existing.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    existing.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096)[0])
     entered, release = threading.Event(), threading.Event()
 
-    def stalled_normalization(exchange: CapturedExchange, *, max_body_bytes: int) -> bytes:
+    def stalled_normalization(
+        exchange: CapturedExchange, *, max_body_bytes: int
+    ) -> tuple[bytes, tuple[int, int] | None, str]:
         """Pause an accepted in-memory copy until after the shutdown deadline."""
         entered.set()
         assert release.wait(3)
@@ -850,7 +852,7 @@ def test_start_recovers_complete_temps_and_removes_bounded_partial_files(tmp_pat
     previous = tmp_path / prior
     previous.mkdir()
     complete = previous / f"{uuid4()}.tmp"
-    complete.write_bytes(normalize_exchange(_usage_exchange(), max_body_bytes=4096))
+    complete.write_bytes(normalize_exchange(_usage_exchange(), max_body_bytes=4096)[0])
     for content in (b'{"resourceSpans":', b'{"resourceSpans":[]}', b"x" * 5000):
         (previous / f"{uuid4()}.tmp").write_bytes(content)
     uploader = CaptureUploader(
@@ -877,7 +879,7 @@ def test_temporary_recovery_respects_combined_batch_count(tmp_path: Path) -> Non
     run = str(uuid4())
     directory = tmp_path / run
     directory.mkdir()
-    content = normalize_exchange(_exchange(), max_body_bytes=4096)
+    content = normalize_exchange(_exchange(), max_body_bytes=4096)[0]
     for _ in range(1024):
         (directory / f"{uuid4()}.json").write_bytes(content)
     temporary = directory / f"{uuid4()}.tmp"
@@ -963,7 +965,7 @@ def test_shutdown_commits_cloud_acceptance_before_cleanup_can_block(
     directory = tmp_path / run
     directory.mkdir()
     path = directory / f"{uuid4()}.json"
-    path.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    path.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096)[0])
     entered, release = threading.Event(), threading.Event()
     original_unlink = Path.unlink
 
@@ -1024,7 +1026,7 @@ def test_failed_accepted_cleanup_retains_quota_and_retries_without_reupload(
     directory = tmp_path / run
     directory.mkdir()
     path = directory / f"{uuid4()}.json"
-    payload = normalize_exchange(_exchange(), max_body_bytes=4096)
+    payload = normalize_exchange(_exchange(), max_body_bytes=4096)[0]
     path.write_bytes(payload)
     original_unlink = Path.unlink
     failed = True

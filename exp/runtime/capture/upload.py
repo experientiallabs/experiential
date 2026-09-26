@@ -270,12 +270,11 @@ class CaptureUploader:
 
     def _persist(self, exchange: CapturedExchange) -> None:
         """Write only sanitized OTLP, with finite per-origin/org spool capacity."""
-        payload = normalize_exchange(exchange, max_body_bytes=self._max_body_bytes)
+        payload, usage, receipt = normalize_exchange(exchange, max_body_bytes=self._max_body_bytes)
         if self._abandon.is_set():
             return
         if len(payload) > _MAX_BATCH_BYTES:
             raise ValueError("normalized capture exceeds the cloud batch limit")
-        usage, receipt = _capture_receipt(payload)
         files = self._files()
         occupied = 0
         for path in files:
@@ -575,76 +574,6 @@ class CaptureUploader:
         ):
             raise ValueError("capture upload destination differs from the approved ingest path")
         return parsed
-
-
-def _capture_receipt(payload: bytes) -> tuple[tuple[int, int] | None, str]:
-    """Read reported usage and content-free correlation fields from one normalized span.
-
-    This reads the in-memory OTLP envelope once during persistence. Delivery and
-    recovery never recount usage, so totals belong only to this foreground run.
-    Missing or malformed usage is unknown; zero reported tokens remain valid.
-    """
-    span: JsonValue = json.loads(payload)
-    for key in ("resourceSpans", "scopeSpans", "spans"):
-        if not isinstance(span, dict):
-            return None, "invalid capture receipt"
-        children = span.get(key)
-        if not isinstance(children, list) or len(children) != 1:
-            return None, "invalid capture receipt"
-        span = children[0]
-    if not isinstance(span, dict) or not isinstance(attributes := span.get("attributes"), list):
-        return None, "invalid capture receipt"
-    usage = _attribute_usage(attributes)
-    fields = {
-        item["key"]: item.get("value")
-        for item in attributes
-        if isinstance(item, dict) and isinstance(item.get("key"), str)
-    }
-    trace_id = span.get("traceId")
-    trace = (
-        trace_id
-        if isinstance(trace_id, str) and re.fullmatch(r"[0-9a-f]{32}", trace_id)
-        else "unknown"
-    )
-    response = fields.get("exp.capture.response_id_hash")
-    response_hash = response.get("stringValue") if isinstance(response, dict) else None
-    fingerprint = (
-        response_hash
-        if isinstance(response_hash, str) and re.fullmatch(r"[0-9a-f]{16}", response_hash)
-        else "unknown"
-    )
-    flags = " · ".join(
-        f"{name}={fields.get('exp.capture.' + name) == {'boolValue': True}}"
-        for name in ("completed", "interrupted", "transport_error")
-    )
-    outcome = "ok" if span.get("status") == {"code": 1} else "error"
-    tokens = f"{usage[0]} in / {usage[1]} out tokens" if usage is not None else "usage unknown"
-    return usage, f"trace {trace} · response {fingerprint} · {flags} · {outcome} · {tokens}"
-
-
-def _attribute_usage(attributes: list[JsonValue]) -> tuple[int, int] | None:
-    """Require exactly one valid nonnegative value for each reported token count."""
-    keys = ("gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens")
-    counts: dict[str, int] = {}
-    for attribute in attributes:
-        if not isinstance(attribute, dict):
-            continue
-        key = attribute.get("key")
-        if not isinstance(key, str) or key not in keys:
-            continue
-        value = attribute.get("value")
-        if key in counts or not isinstance(value, dict) or set(value) != {"intValue"}:
-            return None
-        raw = value["intValue"]
-        if not isinstance(raw, str) or re.fullmatch(r"[0-9]+", raw) is None:
-            return None
-        try:
-            counts[key] = int(raw)
-        except ValueError:
-            return None
-    if any(key not in counts for key in keys):
-        return None
-    return counts[keys[0]], counts[keys[1]]
 
 
 def _upload_scope(

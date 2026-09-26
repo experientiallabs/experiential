@@ -31,7 +31,7 @@ def _exchange(**changes: str | bytes | int | bool) -> CapturedExchange:
 
 def _attributes(exchange: CapturedExchange) -> JsonObject:
     """Normalize a synthetic exchange through the canonical OTLP contract."""
-    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])
     result = normalize_otlp_payload(
         payload, source=SourceIdentity(kind="otlp", source_id="synthetic-capture")
     )
@@ -51,7 +51,7 @@ def test_known_usage_and_redacted_copies_normalize_through_existing_cloud_contra
             "metadata": {"Cookie": "private-cookie", "token": "sk-proj-abcdefghijklmnop"},
         }
     ).encode()
-    payload = normalize_exchange(_exchange(request=request), max_body_bytes=4096)
+    payload = normalize_exchange(_exchange(request=request), max_body_bytes=4096)[0]
     assert b"TOP-SECRET" not in payload
     assert b"private-cookie" not in payload
     assert b"sk-proj-" not in payload
@@ -129,7 +129,7 @@ def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
         response=body,
         response_content_type="text/event-stream" if streamed else "application/json",
     )
-    payload = normalize_exchange(exchange, max_body_bytes=4096)
+    payload = normalize_exchange(exchange, max_body_bytes=4096)[0]
     assert canary.encode() not in payload
     attributes = _attributes(exchange)
     for key in ("gen_ai.input.messages", "gen_ai.output.messages"):
@@ -172,7 +172,7 @@ def test_malformed_tool_arguments_are_redacted(arguments: str) -> None:
         "input": [{"type": "function_call", "arguments": arguments}],
     }
     exchange = _exchange(request=json.dumps(request).encode())
-    payload = normalize_exchange(exchange, max_body_bytes=4096)
+    payload = normalize_exchange(exchange, max_body_bytes=4096)[0]
     assert b"ordinary-secret" not in payload
     attributes = _attributes(exchange)
     captured = json.loads(str(attributes["exp.capture.request"]))
@@ -236,7 +236,7 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
             failed=True,
         ),
         max_body_bytes=4096,
-    )
+    )[0]
     assert canary.encode() not in payload
     assert b"[REDACTED_INVALID_TOOL_ARGUMENTS]" in payload
     assert b"retain ordinary output" in payload
@@ -260,7 +260,7 @@ def test_deep_json_tool_arguments_are_bounded_and_redacted(nesting: int) -> None
     request = {"model": "gpt-test", "input": [{"type": "function_call", "arguments": arguments}]}
     payload = normalize_exchange(
         _exchange(request=json.dumps(request).encode()), max_body_bytes=4096
-    )
+    )[0]
     assert canary.encode() not in payload
     assert b"[REDACTED_DEEP_VALUE]" in payload
 
@@ -303,7 +303,7 @@ def test_terminal_response_survives_later_transport_failure(
     assert attributes["exp.capture.interrupted"] is not completed
     assert attributes["gen_ai.usage.input_tokens"] == 23
     assert attributes["gen_ai.usage.output_tokens"] == 17
-    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096))["resourceSpans"][0][
+    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])["resourceSpans"][0][
         "scopeSpans"
     ][0]["spans"][0]
     assert span["status"]["code"] == (1 if completed else 2)
@@ -339,7 +339,7 @@ def test_stream_completion_and_provider_errors_remain_separate_from_transport_er
     assert attributes["exp.capture.interrupted"] is not completed
     assert attributes["gen_ai.usage.input_tokens"] == 3
     assert attributes["gen_ai.usage.output_tokens"] == 7
-    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096))["resourceSpans"][0][
+    span = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])["resourceSpans"][0][
         "scopeSpans"
     ][0]["spans"][0]
     assert span["status"]["code"] == (2 if provider_error or not completed else 1)
@@ -445,6 +445,7 @@ def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
             "index": 0,
             "content_block": {"type": "tool_use", "name": "f", "id": "t", "input": {}},
         },
+        {"type": "content_block_stop", "index": 99},
         {"type": "content_block_delta", "index": 0, "delta": {"partial_json": '{"x":1}'}},
         {"type": "message_delta", "usage": {"output_tokens": 4}},
     ]
@@ -590,7 +591,9 @@ def test_compressed_copies_are_bounded(encoding: str) -> None:
         else zstandard.ZstdCompressor().compress(expanded)
     )
     with pytest.raises(ValueError, match="limit"):
-        normalize_exchange(_exchange(request=bomb, request_encoding=encoding), max_body_bytes=4096)
+        normalize_exchange(_exchange(request=bomb, request_encoding=encoding), max_body_bytes=4096)[
+            0
+        ]
 
 
 def test_paths_exclude_login_billing_and_unrelated_traffic() -> None:
@@ -663,7 +666,7 @@ def test_provider_stream_errors_are_failed_spans_even_with_http_200() -> None:
                 response_content_type="text/event-stream",
             ),
             max_body_bytes=4096,
-        )
+        )[0]
     )
     span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
     assert span["status"]["code"] == 2
@@ -697,7 +700,7 @@ def test_chat_refusals_preserve_text_and_finish_reason_as_failed_spans(
     assert response["choices"][0]["message"]["refusal"] == message["refusal"]
     assert response["choices"][0]["finish_reason"] == finish_reason
     assert attributes["exp.capture.refused"] is True
-    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])
     assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2
 
 
@@ -754,5 +757,5 @@ def test_responses_and_messages_refusals_preserve_provider_evidence(
     attributes = _attributes(exchange)
     assert "Cannot." in str(attributes["gen_ai.output.messages"])
     assert attributes["exp.capture.refused"] is True
-    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096)[0])
     assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2

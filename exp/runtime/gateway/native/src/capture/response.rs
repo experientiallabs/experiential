@@ -67,19 +67,13 @@ impl WireResponse {
             let mut truncated = self.truncated;
             loop {
                 let mut frame_value = Value::Array(frames);
-                let mut source_json = lossless_projection(&mut frame_value);
-                if !number_sources.is_empty() {
-                    let encoded = source_json
-                        .take()
-                        .unwrap_or_else(|| serde_json::to_string(&frame_value).unwrap());
-                    let mut raw: Vec<Box<RawValue>> = serde_json::from_str(&encoded).unwrap();
-                    for (index, source) in &number_sources {
-                        if let Some(frame) = raw.get_mut(*index) {
-                            *frame = RawValue::from_string(source.clone()).unwrap();
-                        }
-                    }
-                    source_json = Some(serde_json::to_string(&raw).unwrap());
-                }
+                let source_json = if number_sources.is_empty() {
+                    lossless_projection(&mut frame_value)
+                } else {
+                    let source = source_frames(frame_value.as_array().unwrap(), &number_sources);
+                    normalize(&mut frame_value);
+                    Some(source)
+                };
                 let Value::Array(moved_frames) = frame_value else {
                     unreachable!()
                 };
@@ -308,7 +302,7 @@ fn data_frames(bytes: &[u8]) -> Vec<Value> {
     data_frames_with_sources(bytes).0
 }
 
-fn data_frames_with_sources(bytes: &[u8]) -> (Vec<Value>, Vec<(usize, String)>) {
+pub(super) fn data_frames_with_sources(bytes: &[u8]) -> (Vec<Value>, Vec<(usize, String)>) {
     let mut frames = Vec::new();
     let mut number_sources = Vec::new();
     let mut data: Vec<&[u8]> = Vec::new();
@@ -335,6 +329,20 @@ fn data_frames_with_sources(bytes: &[u8]) -> (Vec<Value>, Vec<(usize, String)>) 
         }
     }
     (frames, number_sources)
+}
+
+/// Encode original event values, including numbers outside serde_json's integer range.
+pub(super) fn source_frames(frames: &[Value], sources: &[(usize, String)]) -> String {
+    let mut raw: Vec<Box<RawValue>> = frames
+        .iter()
+        .map(|v| RawValue::from_string(v.to_string()).unwrap())
+        .collect();
+    for (index, source) in sources {
+        if let Some(frame) = raw.get_mut(*index) {
+            *frame = RawValue::from_string(source.clone()).unwrap();
+        }
+    }
+    serde_json::to_string(&raw).unwrap()
 }
 
 /// Finite-width JSON can round integers beyond its signed/unsigned 64-bit range.

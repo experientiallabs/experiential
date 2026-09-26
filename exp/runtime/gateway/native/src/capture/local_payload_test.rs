@@ -25,7 +25,7 @@ fn record() -> Record {
 #[test]
 fn borrowed_payload_preserves_schema_content_sidecars_and_exact_limit() {
     let record = record();
-    let response = super::super::projection::completed_response(&record).unwrap();
+    let response = super::super::observation::CapturedResponse::completed_record(&record).unwrap();
     assert!(matches!(response, Cow::Borrowed(_)));
     let payload = encode(&record, &response, "experience-id", 8192).unwrap();
     let actual: Value = serde_json::from_str(&payload).unwrap();
@@ -73,7 +73,7 @@ fn completed_responses_event_is_borrowed_from_retained_frames() {
         client_disconnected: false,
         source_json: None,
     });
-    let response = super::super::projection::completed_response(&record).unwrap();
+    let response = super::super::observation::CapturedResponse::completed_record(&record).unwrap();
     assert!(matches!(response, Cow::Borrowed(_)));
     assert_eq!(response["id"], "response");
 }

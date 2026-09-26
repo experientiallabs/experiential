@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use super::delivery::Sink;
 use super::record::Record;
-use super::{local_store, projection};
+use super::{local_store, observation::CapturedResponse};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -90,7 +90,7 @@ impl Sink for SqliteSink {
                     && policy.scope.application_id == scope.application_id
             })
             .ok_or(())?;
-        let Some(response) = projection::completed_response(record) else {
+        let Some(response) = CapturedResponse::completed_record(record) else {
             return Ok(None);
         };
         let response_id = response

@@ -812,6 +812,7 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
     module.add_class::<RegexDetector>()?;
     module.add_class::<capture::python::CaptureCollector>()?;
+    module.add_class::<capture::python::CaptureResponse>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
