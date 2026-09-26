@@ -13,6 +13,7 @@ from exp.runtime.gateway.model_chain_authority import (
     SnapshotClassificationMemo,
     SQLiteChainAuthorityObservation,
     SQLiteChainPreflight,
+    SQLiteChainWitness,
     prepare_sqlite_chain_authority,
 )
 
@@ -44,6 +45,25 @@ def prepare_ledger_chain_authority(
     Yields:
         An open operation-bound preflight retained until its consumer finishes.
     """
+    witness = authorization._local_sqlite_chain_witness
+    if (
+        observation is None
+        and isinstance(witness, SQLiteChainWitness)
+        and witness.maximum_bytes == serving_snapshot_max_bytes
+    ):
+        with prepare_sqlite_chain_authority(
+            None,
+            authorization.organization_id,
+            authorization.alias_revision_id,
+            request_id=authorization.request_id,
+            operation=operation,
+            maximum_bytes=serving_snapshot_max_bytes,
+            remaining_seconds=authorization.deadline_monotonic - clock.monotonic(),
+            classification_memo=classification_memo,
+            witness=witness,
+        ) as proof:
+            yield proof
+        return
     if observation is not None:
         with prepare_sqlite_chain_authority(
             None,
