@@ -101,7 +101,12 @@ pub(super) fn assemble(frames: &[Value], complete_only: bool) -> Option<Value> {
                 }
             }
             "content_block_stop" => {
-                let block = blocks.get_mut(&frame.get("index")?.as_u64()?)?;
+                let Some(block) = blocks.get_mut(&frame.get("index")?.as_u64()?) else {
+                    if complete_only {
+                        return None;
+                    }
+                    continue;
+                };
                 if complete_only && block.closed {
                     return None;
                 }

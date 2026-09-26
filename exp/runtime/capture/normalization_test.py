@@ -208,6 +208,7 @@ def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol
         ]
     else:
         events = [
+            {"type": "content_block_stop", "index": 2},
             {
                 "type": "content_block_start",
                 "index": 0,
