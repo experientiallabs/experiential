@@ -542,14 +542,30 @@ class ProviderHttpClient(abc.ABC):
                 timeout_seconds=timeout_seconds,
             )
             if not 200 <= response.status_code < 300:
+                error = response.body.get("error")
+                if (
+                    idempotency_key is None
+                    and response.status_code == 409
+                    and isinstance(error, dict)
+                    and error.get("code") == "idempotency_replay_unavailable"
+                ):
+                    # The gateway confirms this completed operation cannot be replayed. A new
+                    # client-owned attempt gets a new key and remains inside the retry allowance.
+                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
                 )
-            return self._parse_response(
-                response.body,
-                latency_seconds=time.monotonic() - started_at,
-            )
+            try:
+                return self._parse_response(
+                    response.body,
+                    latency_seconds=time.monotonic() - started_at,
+                )
+            except ProviderRetryableResponseError:
+                if idempotency_key is None:
+                    # Replaying a cached, completed empty response cannot produce usable output.
+                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
+                raise
 
         result = await run_with_retry_async(
             attempt,

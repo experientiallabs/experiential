@@ -178,7 +178,9 @@ def prepare_manual_judge_setup(
         prompt_template = judge_template(definition)
     project = store.load_project()
     build = _load_build_review(store)
-    if build.project_config != project.model_copy(update={"build": None}):
+    if build.project_config.model_copy(update={"hosted_judge": None}) != project.model_copy(
+        update={"build": None, "hosted_judge": None}
+    ):
         raise ManualJudgeError("completed build belongs to a different project configuration")
     selected_alias = judge_alias or catalog.roles.judge
     if selected_alias is None:

@@ -1,5 +1,7 @@
 """Empty completed Chat responses receive bounded retries without accepting malformed tools."""
 
+import asyncio
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -37,6 +39,39 @@ def test_empty_chat_response_retries_then_returns_real_output(empty: JsonObject)
     )
     assert client.complete(_request()).output.content == "done"
     assert len(transport.requests) == 2
+    assert (
+        transport.requests[0].headers["Idempotency-Key"]
+        != transport.requests[1].headers["Idempotency-Key"]
+    )
+
+
+@pytest.mark.parametrize("explicit_key", [None, "caller-owned-operation"])
+def test_lost_completed_replay_rotates_only_client_owned_keys(explicit_key: str | None) -> None:
+    """A lost replay can start a fresh accounted attempt without rewriting caller identity."""
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=409, body={"error": {"code": "idempotency_replay_unavailable"}}
+            ),
+            JsonHttpResponse(status_code=200, body={"choices": [{"message": {"content": "done"}}]}),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fixture",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0),
+    )
+    response = (
+        client.complete(_request())
+        if explicit_key is None
+        else asyncio.run(client.complete_async(_request(), idempotency_key=explicit_key))
+    )
+    assert response.output.content == "done"
+    assert response.economics.provider_attempts == 2
+    keys = [request.headers["Idempotency-Key"] for request in transport.requests]
+    assert (keys[0] == keys[1]) is (explicit_key is not None)
 
 
 def test_empty_chat_response_stops_at_the_retry_bound() -> None:
