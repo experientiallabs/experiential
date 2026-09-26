@@ -78,6 +78,7 @@ from exp.runtime.openai_protocol.structured_text import (
 )
 from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
+from exp.runtime.openai_protocol.vendor_private_fields import drop_vendor_private_fields
 from exp.runtime.openai_protocol.web_search import (
     chat_web_search,
     responses_web_search,
@@ -240,6 +241,9 @@ def decode_chat(
     cache carriers for adapters that support them. Other unknown nested fields stay rejected. The
     Vercel AI SDK's camelCase ``promptCacheKey`` is folded onto
     ``prompt_cache_key`` first, so it decodes as the documented wire field.
+    Underscore-prefixed top-level fields are private to an intermediate hop
+    rather than gateway controls, so they are dropped with disclosure instead
+    of rejected.
 
     Args:
         payload: Parsed JSON request body.
@@ -253,6 +257,7 @@ def decode_chat(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
+    payload, vendor_private_disclosures = drop_vendor_private_fields(payload)
     cache_payload = payload
     payload = drop_opencode_cache_control(payload)
     _validate_manifest(payload, CHAT_MANIFEST)
@@ -308,6 +313,7 @@ def decode_chat(
             json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
+                *vendor_private_disclosures,
                 *cache_disclosures,
                 *thinking.disclosures,
                 *_replayed_reasoning_disclosures(request.messages),

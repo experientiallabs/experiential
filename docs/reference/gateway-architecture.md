@@ -341,6 +341,14 @@ provider serves 200K); non-allowlisted tokens drop with a per-token
 and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
 same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a
 `verbosity` disclosure on other routes. Invalid values remain named parameter errors.
+Underscore-prefixed top-level Chat fields (`_omnirouteSkipContextRelay` and the like) are
+bookkeeping private to a router in front of the gateway, not controls any provider honors. They
+are dropped before manifest validation and disclosed as `<field>->dropped(vendor_private)`,
+matched as a class so a new router spelling is not a fresh rejection. The disclosure is bounded
+in both name length and count, since a streaming response repeats the whole list on every chunk
+and the names are caller-chosen; fields past the limit are reported as a trailing
+`vendor_private->dropped(<n>_more)` count rather than named. Every other unknown top-level field
+stays rejected by name.
 Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
 declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,

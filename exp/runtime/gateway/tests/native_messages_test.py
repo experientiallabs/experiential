@@ -2945,6 +2945,44 @@ def test_chat_verbosity_serves_with_disclosure_on_a_compatible_provider(
     assert "text" not in dispatched[0]
 
 
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_vendor_private_field_serves_with_disclosure(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve a router's underscore-prefixed bookkeeping instead of refusing it."""
+    disclosure = "_omnirouteSkipContextRelay->dropped(vendor_private)"
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "_omnirouteSkipContextRelay": True,
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            chunk.get("x-experiential-ignored-parameters") == [disclosure] for chunk in chunks
+        )
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["x-experiential-ignored-parameters"] == [disclosure]
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert "_omnirouteSkipContextRelay" not in dispatched[0]
+
+
 def test_invalid_chat_verbosity_is_rejected_before_provider_dispatch(
     engine: _ServingEngine,
 ) -> None:
