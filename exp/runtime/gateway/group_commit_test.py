@@ -15,6 +15,7 @@ import pytest
 
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway import group_commit as group_commit_module
 from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -270,7 +271,15 @@ def test_group_preflight_reuses_the_writer_database_connection(
     blocker = grouped._enqueue(pause)
     assert entered.wait(5)
     try:
-        with mock.patch.object(core, "_connect", wraps=core._connect) as reader_checkouts:
+        original_observe = group_commit_module.observe_sqlite_chain_authority
+        with (
+            mock.patch.object(core, "_connect", wraps=core._connect) as reader_checkouts,
+            mock.patch.object(
+                group_commit_module,
+                "observe_sqlite_chain_authority",
+                wraps=original_observe,
+            ) as authority_observations,
+        ):
             writes = [
                 grouped._enqueue_chain(
                     auth,
@@ -286,6 +295,7 @@ def test_group_preflight_reuses_the_writer_database_connection(
             for write in writes:
                 write.result(timeout=5)
             assert reader_checkouts.call_count == 0
+            assert authority_observations.call_count == 1
     finally:
         release.set()
         grouped.close()
