@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -519,6 +520,46 @@ def test_concurrent_writes_share_batches_and_all_become_durable(tmp_path: Path) 
     count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
     connection.close()
     assert int(count) == 64
+
+
+def test_writer_collects_an_arriving_write_before_committing(tmp_path: Path) -> None:
+    """A write arriving during the bounded collection window shares its durable commit."""
+    core = SQLiteAttemptLedger(tmp_path / "gateway.db")
+    first_item_taken = threading.Event()
+    queue_type = queue.SimpleQueue
+    batch_sizes: list[int] = []
+
+    class SignaledQueue(queue_type):
+        """Expose when the writer has received the first operation."""
+
+        def get(self, block: bool = True, timeout: float | None = None) -> object:
+            item = super().get(block=block, timeout=timeout)
+            if item is not None:
+                first_item_taken.set()
+            return item
+
+    with (
+        mock.patch.object(group_commit_module.queue, "SimpleQueue", SignaledQueue),
+        mock.patch.object(group_commit_module, "_BATCH_COLLECTION_WINDOW_SECONDS", 0.05),
+    ):
+        grouped = GroupCommitAttemptLedger(core, max_batch_size=2)
+    original_commit = grouped._commit_batch
+
+    def record_batch(connection: sqlite3.Connection, batch: list[_PendingWrite]) -> None:
+        """Record the commit size while preserving the real durable writer."""
+        batch_sizes.append(len(batch))
+        original_commit(connection, batch)
+
+    try:
+        with mock.patch.object(grouped, "_commit_batch", record_batch):
+            first = grouped._enqueue(lambda connection: connection.execute("SELECT 1").fetchone())
+            assert first_item_taken.wait(5)
+            second = grouped._enqueue(lambda connection: connection.execute("SELECT 2").fetchone())
+            first.result(timeout=5)
+            second.result(timeout=5)
+    finally:
+        grouped.close()
+    assert batch_sizes == [2]
 
 
 def test_cancelled_caller_keeps_writer_running_and_write_durable(tmp_path: Path) -> None:
