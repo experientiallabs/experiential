@@ -374,15 +374,31 @@ def observe_sqlite_chain_authority(
     connection: sqlite3.Connection,
     organization_id: str,
     alias_revision_id: str,
+    *,
+    rows: _AuthorityRows | None = None,
 ) -> SQLiteChainAuthorityObservation:
-    """Capture the exact database rows that a later transaction must revalidate."""
+    """Capture exact authority rows for a later transaction to revalidate.
+
+    Args:
+        connection: File-backed SQLite connection outside a transaction.
+        organization_id: Tenant owning the requested revision.
+        alias_revision_id: Immutable revision selected for the request.
+        rows: Exact rows already returned by the alias lookup, when available.
+
+    Returns:
+        Database identity and row values that a write transaction must revalidate.
+    """
     if connection.in_transaction:
         raise ModelChainAuthorityError(
             "observe local chain authority before beginning a transaction"
         )
     return SQLiteChainAuthorityObservation(
         _database_path(connection),
-        _chain_authority_rows(connection, organization_id, alias_revision_id),
+        (
+            _chain_authority_rows(connection, organization_id, alias_revision_id)
+            if rows is None
+            else rows
+        ),
     )
 
 
