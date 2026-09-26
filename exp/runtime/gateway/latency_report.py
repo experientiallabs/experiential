@@ -18,6 +18,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -570,7 +571,6 @@ def _write_gateway_diagnostics(
             raise ValueError("gateway timing histograms are incomplete")
     except (httpx.HTTPError, ValueError) as exc:
         metrics = {"collection_error": type(exc).__name__}
-    path.parent.mkdir(parents=True, exist_ok=True)
     diagnostics: JsonObject = {
         "schema_name": "exp.gateway.latency_diagnostics",
         "schema_version": 1,
@@ -579,7 +579,16 @@ def _write_gateway_diagnostics(
         "config": cast(JsonObject, config.model_dump(mode="json")),
         "gateway_metrics": cast(JsonObject, metrics),
     }
-    path.write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        warnings.warn(
+            "Could not write optional gateway latency diagnostics "
+            f"({type(exc).__name__}); the latency report is still available.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _assert_functional_success(runs: tuple[LatencyMeasuredRun, ...]) -> None:
