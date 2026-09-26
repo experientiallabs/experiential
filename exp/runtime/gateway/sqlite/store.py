@@ -798,16 +798,14 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
     def authenticate_key_for_preflight(self, *, raw_key: str) -> tuple[str, str, str]:
         """Read-authenticate a body gate without waiting for SQLite writers.
 
-        The process-local lock paces preflight readers for at most the bounded
-        authentication wait. A caller that cannot acquire it within that
-        interval validates from its own read-only snapshot instead. The returned
-        exact key identity lets full authorization recheck current key and alias
-        authority without repeating the prefix scan; admission owns the coarse
-        ``last_used_at`` refresh.
+        One caller may perform the read while the process-local gate is free;
+        contending callers immediately validate from their own read-only
+        snapshots instead of waiting behind it. The returned exact key identity
+        lets full authorization recheck current key and alias authority without
+        repeating the prefix scan; admission owns the coarse ``last_used_at``
+        refresh.
         """
-        if not self._preflight_authentication_lock.acquire(
-            timeout=_AUTH_WRITE_LOCK_WAIT_MS / 1_000
-        ):
+        if not self._preflight_authentication_lock.acquire(blocking=False):
             with self._transaction(immediate=False) as connection:
                 return self._authenticate_in_transaction(
                     connection,
