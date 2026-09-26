@@ -748,24 +748,60 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         Raises:
             InvalidVirtualKeyError: The key is unknown, expired, or revoked.
         """
-        with self._transaction() as connection:
-            self._authenticate_in_transaction(connection, raw_key)
+        with self._connect() as connection:
+            try:
+                with self._transaction(
+                    connection=connection,
+                    busy_timeout_ms=_AUTH_WRITE_LOCK_WAIT_MS,
+                ):
+                    self._authenticate_in_transaction(connection, raw_key)
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if code is None or code & 0xFF not in (
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                ):
+                    raise
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                # Authentication is a pre-body gate. Under writer contention,
+                # validate from a fresh WAL read snapshot and skip only the
+                # coarse last-used telemetry update.
+                with self._transaction(connection=connection, immediate=False):
+                    self._authenticate_in_transaction(
+                        connection,
+                        raw_key,
+                        update_last_used=False,
+                    )
 
     def authenticate_key_for_preflight(self, *, raw_key: str) -> None:
         """Read-authenticate a body gate without waiting for SQLite writers.
 
-        The process-local lock keeps concurrent preflight readers paced before
-        they enter the later durable admission stages. Full authorization still
-        rechecks current key and alias authority and owns the coarse
-        ``last_used_at`` refresh.
+        The process-local lock paces preflight readers for at most the bounded
+        authentication wait. A caller that cannot acquire it within that
+        interval validates from its own read-only snapshot instead. Full
+        authorization still rechecks current key and alias authority and owns
+        the coarse ``last_used_at`` refresh.
         """
-        with self._preflight_authentication_lock:
+        if not self._preflight_authentication_lock.acquire(
+            timeout=_AUTH_WRITE_LOCK_WAIT_MS / 1_000
+        ):
             with self._transaction(immediate=False) as connection:
                 self._authenticate_in_transaction(
                     connection,
                     raw_key,
                     update_last_used=False,
                 )
+            return
+        try:
+            with self._transaction(immediate=False) as connection:
+                self._authenticate_in_transaction(
+                    connection,
+                    raw_key,
+                    update_last_used=False,
+                )
+        finally:
+            self._preflight_authentication_lock.release()
 
     def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
         """Return the organization and identity IDs owning one valid key."""
