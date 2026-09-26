@@ -160,7 +160,7 @@ async fn stalled_writer_only_backpressures_when_response_memory_is_reserved() {
             .unwrap()
             .unwrap();
         drop((permits, third));
-        let mut tasks = Vec::new();
+        // Admit requests before concurrent responses consume the remaining budget.
         for index in 0..8 {
             let id = index.to_string();
             assert!(collector.begin(Request {
@@ -174,6 +174,10 @@ async fn stalled_writer_only_backpressures_when_response_memory_is_reserved() {
                 model_id: Some("model".into()),
                 context: Arc::new(json!({"schema_version":1,"request":{}})),
             }));
+        }
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let id = index.to_string();
             let owner = collector.clone();
             tasks.push(tokio::spawn(async move {
                 let expected =
