@@ -20,7 +20,11 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.google_cache import GoogleCachePlan, build_google_cache_plan
+from exp.runtime.models.providers.google_cache import (
+    GoogleCachePlan,
+    VertexCacheProject,
+    build_google_cache_plan,
+)
 from exp.runtime.models.providers.messages_payloads import gemini_generate_content_stream_payload
 
 _MODEL = "gemini-2.5-pro"
@@ -535,6 +539,77 @@ def test_mismatched_or_extra_native_payload_fields_refuse(field: str) -> None:
     payload = _payload(request)
     payload[field] = {"unexpected": "synthetic"}
     assert build_google_cache_plan(_profile(), request, payload) is None
+
+
+@pytest.mark.parametrize("location", ["global", "us-central1"])
+def test_vertex_project_alias_needs_exact_host_number_before_resource_reuse(location: str) -> None:
+    """An ID-addressed create uses only the verified numeric response namespace."""
+    host = (
+        "aiplatform.googleapis.com"
+        if location == "global"
+        else f"{location}-aiplatform.googleapis.com"
+    )
+    url = (
+        f"https://{host}/v1/projects/fruit-project/locations/{location}"
+        f"/publishers/google/models/{_MODEL}:streamGenerateContent?alt=sse"
+    )
+    request = _request()
+    plan = build_google_cache_plan(_profile(url), request, _payload(request))
+    assert plan is not None
+    assert plan.bind_vertex_project(None) is None
+    bound = plan.bind_vertex_project(VertexCacheProject("fruit-project", "123456789"))
+    assert bound is not None
+    assert bound.create_url == plan.create_url
+    assert bound.create_payload == plan.create_payload
+    assert bound.generation_payload == plan.generation_payload
+    assert bound.prefix_sha256 != plan.prefix_sha256
+    resource = f"projects/123456789/locations/{location}/cachedContents/synthetic"
+    assert bound.apply(resource)["cachedContent"] == resource
+    for foreign in (
+        resource.replace("123456789", "987654321"),
+        resource.replace("123456789", "fruit-project"),
+        resource.replace(f"/{location}/", "/europe-west1/"),
+    ):
+        with pytest.raises(ValueError, match="planned collection"):
+            bound.apply(foreign)
+    with pytest.raises(ValueError, match="admitted endpoint"):
+        plan.bind_vertex_project(VertexCacheProject("other-project", "123456789"))
+    assert bound.bind_vertex_project(VertexCacheProject("fruit-project", "123456789")) == bound
+    other = plan.bind_vertex_project(VertexCacheProject("fruit-project", "987654321"))
+    assert other is not None
+    assert other.prefix_sha256 != bound.prefix_sha256
+
+
+def test_numeric_vertex_namespace_does_not_need_alias_but_cannot_be_remapped() -> None:
+    """Numeric endpoint scope is exact, while Gemini must never carry Vertex authority."""
+    url = (
+        "https://aiplatform.googleapis.com/v1/projects/123456789/locations/global"
+        f"/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+    request = _request()
+    plan = build_google_cache_plan(_profile(url), request, _payload(request))
+    assert plan is not None
+    assert plan.bind_vertex_project(None) is plan
+    assert plan.bind_vertex_project(VertexCacheProject("123456789", "123456789")) is plan
+    with pytest.raises(ValueError, match="canonical number"):
+        VertexCacheProject("123456789", "987654321")
+    with pytest.raises(ValueError, match="must not contain"):
+        _plan().bind_vertex_project(VertexCacheProject("fruit-project", "123456789"))
+    assert _plan().bind_vertex_project(None) is not None
+
+
+@pytest.mark.parametrize("number", ["", "0", "0123", "1.2", "-1", "１２３", "1/2", "9" * 21])
+def test_vertex_project_number_is_canonical_decimal(number: str) -> None:
+    """No normalization or caller-controlled path fragment can expand resource scope."""
+    with pytest.raises(ValueError, match="canonical number"):
+        VertexCacheProject("fruit-project", number)
+
+
+@pytest.mark.parametrize("project", ["", ".", "..", "a/b", "a?b", "a%2fb", "a" * 257])
+def test_vertex_project_alias_is_one_bounded_segment(project: str) -> None:
+    """Host alias data must still satisfy the frozen endpoint segment grammar."""
+    with pytest.raises(ValueError, match="canonical number"):
+        VertexCacheProject(project, "123456789")
 
 
 def test_plain_assistant_history_after_prefix_is_retained_verbatim() -> None:

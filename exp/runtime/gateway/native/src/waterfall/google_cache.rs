@@ -18,11 +18,13 @@ enum Preparation {
     Unavailable,
     Ready {
         resource_name: String,
+        resource_prefix: String,
         payload: Value,
         expires_at: f64,
     },
     Create {
         operation_id: String,
+        resource_prefix: String,
         url: String,
         payload: Value,
         expires_at: f64,
@@ -107,18 +109,22 @@ where
         }
         Preparation::Ready {
             resource_name,
+            resource_prefix,
             payload,
             expires_at,
         } => {
             ensure_remaining(deadline)?;
+            let endpoint = bind_resource_prefix(endpoint, &resource_prefix)?;
             overlay(wire, payload, &resource_name, &endpoint, expires_at)
         }
         Preparation::Create {
             operation_id,
+            resource_prefix,
             url,
             payload,
             expires_at,
         } => {
+            let endpoint = bind_resource_prefix(endpoint, &resource_prefix)?;
             // The host persists an unknown claim before returning create. Dropping this
             // future anywhere below therefore quarantines it without a Drop callback.
             if operation_id.is_empty() || operation_id.len() > 256 {
@@ -319,6 +325,41 @@ fn cache_endpoint(generation_url: &str, policy: EndpointPolicy) -> Option<CacheE
     })
 }
 
+/// Bind only the host-verified numeric namespace, preserving the admitted create URL.
+fn bind_resource_prefix(
+    mut endpoint: CacheEndpoint,
+    authorized: &str,
+) -> Result<CacheEndpoint, Failure> {
+    if endpoint.resource_prefix == "cachedContents/" {
+        return if authorized == endpoint.resource_prefix {
+            Ok(endpoint)
+        } else {
+            Err(internal())
+        };
+    }
+    let original: Vec<&str> = endpoint.resource_prefix.split('/').collect();
+    let canonical: Vec<&str> = authorized.split('/').collect();
+    if original.len() != 6
+        || canonical.len() != 6
+        || canonical[0] != "projects"
+        || canonical[2] != "locations"
+        || canonical[3] != original[3]
+        || canonical[4] != "cachedContents"
+        || !canonical[5].is_empty()
+        || canonical[1].is_empty()
+        || canonical[1].len() > 20
+        || canonical[1].starts_with('0')
+        || !canonical[1].bytes().all(|byte| byte.is_ascii_digit())
+        || (original[1].bytes().all(|byte| byte.is_ascii_digit()) && original[1] != canonical[1])
+    {
+        return Err(internal());
+    }
+    // Only the trusted preparation callback supplies this mapping. Provider names
+    // must match it exactly; they cannot change the project, location or origin.
+    endpoint.resource_prefix = authorized.to_string();
+    Ok(endpoint)
+}
+
 fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
@@ -352,7 +393,7 @@ fn valid_create(endpoint: &CacheEndpoint, url: &str, payload: &Value, expires_at
             .get("expireTime")
             .and_then(Value::as_str)
             .and_then(expiry_epoch)
-            .is_some_and(|absolute| (absolute - expires_at).abs() <= 0.001)
+            .is_some_and(|absolute| absolute == expires_at)
 }
 
 /// Compare the complete operation and decoded auth query without accepting added parameters.
@@ -416,7 +457,7 @@ async fn create(
     if !valid_resource(endpoint, name)
         || total_tokens == 0
         || actual_expiry <= 0.0
-        || actual_expiry > expires_at + 0.001
+        || actual_expiry > expires_at
     {
         return None;
     }
@@ -511,3 +552,7 @@ mod tests;
 #[cfg(test)]
 #[path = "google_cache_bridge_tests.rs"]
 mod bridge_tests;
+
+#[cfg(test)]
+#[path = "google_cache_scope_tests.rs"]
+mod scope_tests;

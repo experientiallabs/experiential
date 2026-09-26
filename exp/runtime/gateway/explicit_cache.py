@@ -21,6 +21,7 @@ from typing import Literal, Protocol
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.google_cache import VertexCacheProject
 
 CACHE_TTL_SECONDS = 300
 CACHE_EXPIRY_SAFETY_SECONDS = 5
@@ -51,6 +52,9 @@ class GoogleCacheAuthority:
         maximum_prefix_bytes: Positive serialized-prefix byte ceiling, default
             10 MiB. Tenant daily budgets are enforced atomically by host claim,
             not by a scalar allowance copied into this authority.
+        vertex_project: Host-verified endpoint project to canonical project-number
+            association. Required for project-ID Vertex endpoints, absent for
+            Gemini. Numeric Vertex endpoints already supply their exact number.
     """
 
     tenant_scope: str
@@ -59,6 +63,7 @@ class GoogleCacheAuthority:
     create_input_nano_usd_per_million: int
     storage_nano_usd_per_million_token_hour: int
     maximum_prefix_bytes: int = _MAXIMUM_PREFIX_BYTES
+    vertex_project: VertexCacheProject | None = None
 
     def __post_init__(self) -> None:
         """Reject incomplete scopes and unverified or unbounded numeric authority."""
@@ -68,6 +73,10 @@ class GoogleCacheAuthority:
         _integer(self.create_input_nano_usd_per_million, "create input rate")
         _integer(self.storage_nano_usd_per_million_token_hour, "storage rate", minimum=1)
         _integer(self.maximum_prefix_bytes, "maximum_prefix_bytes", minimum=1)
+        if self.vertex_project is not None and not isinstance(
+            self.vertex_project, VertexCacheProject
+        ):
+            raise ValueError("Vertex cache authority needs a verified project identity")
 
 
 @dataclass(frozen=True, repr=False)

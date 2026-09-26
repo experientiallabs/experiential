@@ -231,6 +231,15 @@ interleaved instructions and other unsupported shapes retain their existing unca
 disclosures. Cache handling is skipped for body-signed requests, search rounds and repaired payloads.
 ZDR requests do not create retained resources.
 
+Vertex returns resource names with a numeric project number, even when the endpoint uses a
+project ID. For those endpoints, the host supplies
+`GoogleCacheAuthority(vertex_project=VertexCacheProject(endpoint_project="my-project", project_number="123456789"), ...)`
+with an independently verified association for that provider account. Missing mapping skips
+creation before reserving funds. A conflicting mapping fails closed. Neither the caller nor a
+provider response can establish the mapping; numeric endpoints cannot be remapped to another
+project. The create URL, model, region and credentials remain exactly those admitted, and only the
+verified numeric namespace is accepted for creation results and reuse.
+
 Cache creation happens only after route selection and generation reservation. Rust makes at most
 one cache-create HTTP request, using the selected endpoint's credentials, no redirects or retries,
 and the remaining request deadline. The request sends a fixed absolute expiration no more than

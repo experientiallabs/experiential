@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -39,6 +39,7 @@ from exp.runtime.gateway.explicit_cache import (
     validate_cache_result,
 )
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
+from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import CACHE_CONTROL_NOT_FORWARDED_SUFFIX
 from exp.runtime.models.providers.google_cache import GoogleCachePlan, build_google_cache_plan
@@ -75,12 +76,16 @@ class NativeCacheState:
         bindings: Admitted cache plan at each route depth, absent when unsupported.
         offers: Create offers owned by this request, indexed by operation identifier.
         prepared_attempts: Attempt IDs whose prepare callback already ran.
+        observed_results: Immutable first observations, including unacknowledged writes.
+        recording_operations: Operations currently recording outside the execution gate.
         recorded_results: Validated results whose durable host write returned.
     """
 
     bindings: tuple[NativeCacheBinding | None, ...]
     offers: dict[str, tuple[str, CacheOffer, NativeCacheBinding]] = field(default_factory=dict)
     prepared_attempts: set[str] = field(default_factory=set)
+    observed_results: dict[str, CacheResult] = field(default_factory=dict)
+    recording_operations: set[str] = field(default_factory=set)
     recorded_results: dict[str, CacheResult] = field(default_factory=dict)
 
 
@@ -139,7 +144,12 @@ def bind_explicit_cache(
 
 
 class _CacheBoundary(BaseModel):
-    """Bounded attempt selector, authenticated against retained admission authority."""
+    """Bounded attempt selector, authenticated against retained admission authority.
+
+    Attributes:
+        request_id: Exact retained request identifier, at most 128 characters.
+        deployment_id: Exact selected route identifier, at most 256 characters.
+    """
 
     model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
     request_id: str = Field(min_length=1, max_length=128)
@@ -147,7 +157,16 @@ class _CacheBoundary(BaseModel):
 
 
 class _CacheFinish(_CacheBoundary):
-    """Allowlisted provider result facts, never raw provider content or credentials."""
+    """Allowlisted provider result facts, never raw provider content or credentials.
+
+    Attributes:
+        operation_id: Reserved cache operation identifier, at most 128 characters.
+        outcome: Ready or unknown; HTTP failure does not prove absence of spend.
+        http_status: Optional observed HTTP status, without headers or body.
+        name: Optional exact resource name, at most 1024 characters.
+        expire_time: Optional absolute provider expiration, at most 64 characters.
+        total_tokens: Optional positive provider measurement, bounded to int64.
+    """
 
     operation_id: str = Field(min_length=1, max_length=128)
     outcome: str = Field(pattern=r"^(ready|unknown)$")
@@ -158,8 +177,22 @@ class _CacheFinish(_CacheBoundary):
 
 
 class _Plane(Protocol):
+    """Require request accounting and the optional durable cache host."""
+
     _accounting: NativeAttemptAccounting
     _explicit_cache: ExplicitCacheHost | None
+
+
+def _attempt_active(
+    accounting: NativeAttemptAccounting, entry: InflightRequest, attempt_id: str
+) -> bool:
+    """Revalidate request ownership after host I/O without delaying abandonment."""
+    return (
+        accounting.entry(entry.authorization.request_id) is entry
+        and entry.active_attempt_id == attempt_id
+        and entry.pending_abandon is None
+        and time.monotonic() < entry.deadline_monotonic
+    )
 
 
 def _boundary_failure() -> NativeBridgeError:
@@ -195,6 +228,7 @@ def _ready_payload(plan: GoogleCachePlan, claim: CacheReady) -> str:
         {
             "state": "ready",
             "resource_name": claim.resource_name,
+            "resource_prefix": plan.resource_prefix,
             "expires_at": claim.expires_at,
             "payload": plan.apply(claim.resource_name),
         }
@@ -240,9 +274,18 @@ class NativeExplicitCacheMixin:
                 if attempt_id in state.prepared_attempts:
                     return _encoded({"state": "unavailable"})
                 state.prepared_attempts.add(attempt_id)
-                authority = host.authority(entry.authorization, binding.deployment, binding.profile)
+            # Host I/O must not own the execution gate: abandon must be able to
+            # finish the generation reservation even while a cache transaction hangs.
+            authority = host.authority(entry.authorization, binding.deployment, binding.profile)
+            with entry.execution_lock:
+                if not _attempt_active(self._accounting, entry, attempt_id):
+                    return _encoded({"state": "unavailable"})
                 if authority is None:
                     return _encoded({"state": "disabled"})
+                plan = binding.plan.bind_vertex_project(authority.vertex_project)
+                if plan is None:
+                    return _encoded({"state": "unavailable"})
+                binding = replace(binding, plan=plan)
                 # Never hash an access token: the host supplies a stable opaque
                 # credential generation independent of token refreshes.
                 endpoint = urlsplit(binding.plan.create_url)
@@ -268,8 +311,9 @@ class NativeExplicitCacheMixin:
                     # RFC3339 expiration, never extending the reserved horizon.
                     requested_at=float(int(time.time())),
                 )
-                claim = claim_cache(host, offer, clock=time.time)
-                if offer is None:
+            claim = claim_cache(host, offer, clock=time.time)
+            with entry.execution_lock:
+                if offer is None or not _attempt_active(self._accounting, entry, attempt_id):
                     return _encoded({"state": "unavailable"})
                 if isinstance(claim, CacheReady):
                     return _ready_payload(binding.plan, claim)
@@ -283,6 +327,7 @@ class NativeExplicitCacheMixin:
                     {
                         "state": "create",
                         "operation_id": claim.operation_id,
+                        "resource_prefix": binding.plan.resource_prefix,
                         "url": binding.plan.create_url,
                         "payload": payload,
                         "expires_at": offer.expires_at,
@@ -351,28 +396,31 @@ class NativeExplicitCacheMixin:
                             observed_at=observed_at,
                             http_status=selected.http_status,
                         )
-                previous = state.recorded_results.get(offer.operation_id)
-                if previous is None:
+                previous = state.observed_results.get(offer.operation_id)
+                if previous is not None:
+                    result = replace(result, observed_at=previous.observed_at)
+                    if result != previous:
+                        raise ValueError("cache result changed after observation")
+                else:
+                    state.observed_results[offer.operation_id] = result
+                if offer.operation_id in state.recording_operations:
+                    # An unacknowledged observation cannot grant generation, even
+                    # to a duplicate callback. The original write still owns it.
+                    raise ValueError("cache result accounting is still pending")
+                needs_recording = offer.operation_id not in state.recorded_results
+                if needs_recording:
+                    state.recording_operations.add(offer.operation_id)
+            if needs_recording:
+                try:
                     finish_cache(host, offer, result)
-                    state.recorded_results[offer.operation_id] = result
-                elif (
-                    previous.outcome,
-                    previous.resource_name,
-                    previous.total_tokens,
-                    previous.expire_time,
-                    previous.http_status,
-                ) != (
-                    result.outcome,
-                    result.resource_name,
-                    result.total_tokens,
-                    result.expire_time,
-                    result.http_status,
-                ):
-                    raise ValueError("cache result changed after accounting")
-                if (
-                    result.outcome != "ready"
-                    or entry.pending_abandon is not None
-                    or time.monotonic() >= entry.deadline_monotonic
+                    with entry.execution_lock:
+                        state.recorded_results[offer.operation_id] = result
+                finally:
+                    with entry.execution_lock:
+                        state.recording_operations.discard(offer.operation_id)
+            with entry.execution_lock:
+                if result.outcome != "ready" or not _attempt_active(
+                    self._accounting, entry, attempt_id
                 ):
                     return _encoded({"state": "unavailable"})
                 if (

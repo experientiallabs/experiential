@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -28,9 +28,36 @@ _VERTEX_PATH = re.compile(
     rf"/v1/(projects/({_SEGMENT})/locations/([a-z0-9-]+))"
     rf"/publishers/google/models/({_SEGMENT}):streamGenerateContent"
 )
+_VERTEX_CACHE_PATH = re.compile(rf"/v1/projects/({_SEGMENT})/locations/([a-z0-9-]+)/cachedContents")
 _REGION = re.compile(r"[a-z]+(?:-[a-z]+)+[0-9]+")
 _RESOURCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _POLICY = "google-explicit-text-prefix-v1"
+
+
+@dataclass(frozen=True)
+class VertexCacheProject:
+    """Host-verified identity linking an endpoint project to its resource number.
+
+    Attributes:
+        endpoint_project: Exact project ID or number in the admitted Vertex URL.
+        project_number: Canonical positive decimal project number returned by Google.
+            The host verifies this association for the selected provider account;
+            neither caller input nor a cache response establishes the association.
+    """
+
+    endpoint_project: str
+    project_number: str
+
+    def __post_init__(self) -> None:
+        """Reject malformed aliases and any attempt to remap a numeric project."""
+        if (
+            not isinstance(self.endpoint_project, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,255}", self.endpoint_project)
+            or not isinstance(self.project_number, str)
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", self.project_number)
+            or (self.endpoint_project.isdecimal() and self.endpoint_project != self.project_number)
+        ):
+            raise ValueError("Vertex cache project needs a verified endpoint and canonical number")
 
 
 @dataclass(frozen=True)
@@ -42,7 +69,8 @@ class GoogleCachePlan:
             because a Gemini API key may be in its query string.
         model: Provider model resource name included in the cache body.
         resource_prefix: Exact resource collection, including Vertex scope,
-            followed by a slash. ``apply`` accepts one identifier below it.
+            followed by a slash. Bind project-ID plans to host-verified numeric
+            scope before claiming resources. ``apply`` accepts one identifier below it.
         prefix_sha256: Canonical sorted-JSON digest of policy and resource body
             excluding TTL. Includes model, text, system instruction and tools;
             excludes generation controls, suffix, credentials and account scope.
@@ -75,6 +103,41 @@ class GoogleCachePlan:
     def generation_payload(self) -> JsonObject:
         """Return a fresh continuation body without a cached resource name."""
         return cast("JsonObject", json.loads(self._generation_payload_json))
+
+    def bind_vertex_project(self, binding: VertexCacheProject | None) -> GoogleCachePlan | None:
+        """Bind the exact numeric resource namespace without rewriting the request.
+
+        Project-ID endpoints require a host-verified mapping before any claim or
+        provider call. Numeric endpoints already name their canonical project.
+        Gemini has no project namespace and rejects an accidental Vertex binding.
+        Missing authority returns no plan; contradictory authority fails closed.
+        """
+        if self.resource_prefix == "cachedContents/":
+            if binding is not None:
+                raise ValueError("Gemini cache authority must not contain a Vertex project")
+            return self
+        match = _VERTEX_CACHE_PATH.fullmatch(urlsplit(self.create_url).path)
+        if match is None:
+            raise ValueError("Vertex cache plan does not have an exact project/location scope")
+        project, location = match[1], match[2]
+        if binding is None:
+            if not re.fullmatch(r"[1-9][0-9]{0,19}", project):
+                return None
+            number = project
+        else:
+            if binding.endpoint_project != project:
+                raise ValueError(
+                    "Vertex cache authority differs from the admitted endpoint project"
+                )
+            number = binding.project_number
+        prefix = f"projects/{number}/locations/{location}/cachedContents/"
+        if prefix == self.resource_prefix:
+            return self
+        return replace(
+            self,
+            resource_prefix=prefix,
+            prefix_sha256=sha256_json({"plan": self.prefix_sha256, "resource_prefix": prefix}),
+        )
 
     def apply(self, resource_name: str) -> JsonObject:
         """Attach one exact-scope provider resource name to a fresh continuation.

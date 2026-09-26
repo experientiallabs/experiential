@@ -107,6 +107,7 @@ jobs:
         run: |
           export PYO3_PYTHON="$PWD/.venv/bin/python"
           export PYTHONPATH="$PWD:$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+          export LD_LIBRARY_PATH="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml \
             --no-default-features \
             waterfall::attempt::google_cache::bridge_tests::real_python_control_plane_creates_and_reuses_through_bridge \

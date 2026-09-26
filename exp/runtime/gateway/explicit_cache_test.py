@@ -30,6 +30,7 @@ from exp.runtime.gateway.explicit_cache import (
     validate_cache_result,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.google_cache import VertexCacheProject
 
 _MAX_INT64 = (1 << 63) - 1
 _PLAN_DIGEST = hashlib.sha256(b"test-only exact model and prefix plan").hexdigest()
@@ -667,6 +668,14 @@ def test_result_recording_failure_keeps_pending_reservation() -> None:
         finish_cache(host, offer, _ready(offer))
     assert claim_cache(host, offer, clock=lambda: 1001) == CacheUnavailable("pending")
     assert host.reserved == offer.reservation_nano_usd
+
+
+def test_authority_requires_typed_verified_vertex_project_binding() -> None:
+    """Only an exact validated host association can authorize project-ID resources."""
+    project = VertexCacheProject("fruit-project", "123456789")
+    assert replace(_authority(), vertex_project=project).vertex_project is project
+    with pytest.raises(ValueError, match="verified project identity"):
+        replace(_authority(), vertex_project={"endpoint_project": "fruit-project"})
 
 
 def test_contracts_are_frozen_and_keep_scope_out_of_diagnostics() -> None:

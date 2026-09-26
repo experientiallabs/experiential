@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]
-struct Host {
+pub(super) struct Host {
     replies: Arc<Mutex<VecDeque<Result<Value, PublicError>>>>,
     calls: Arc<Mutex<Vec<(&'static str, Value)>>>,
 }
 
 impl Host {
-    fn new(replies: Vec<Value>) -> Self {
+    pub(super) fn new(replies: Vec<Value>) -> Self {
         Self {
             replies: Arc::new(Mutex::new(replies.into_iter().map(Ok).collect())),
             calls: Default::default(),
@@ -32,12 +32,12 @@ impl Host {
             .map(|value| value.to_string())
     }
 
-    fn calls(&self) -> Vec<(&'static str, Value)> {
+    pub(super) fn calls(&self) -> Vec<(&'static str, Value)> {
         self.calls.lock().unwrap().clone()
     }
 }
 
-fn wire(url: &str) -> DeploymentWire {
+pub(super) fn wire(url: &str) -> DeploymentWire {
     serde_json::from_value(json!({
         "provider": "google", "deployment_id": "deployment", "dialect": "gemini_generate_content",
         "url": url, "headers": {"x-goog-api-key": "test-secret", "Idempotency-Key": "generation-only"},
@@ -50,7 +50,7 @@ fn http() -> reqwest::Client {
     crate::upstream::build_client(Duration::from_secs(1)).unwrap()
 }
 
-fn expiry() -> (f64, String) {
+pub(super) fn expiry() -> (f64, String) {
     let epoch = epoch_now().floor() as u64 + 250;
     // httpdate owns calendar formatting; turn its UTC components into Google's spelling.
     let date = httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(epoch));
@@ -68,29 +68,29 @@ fn expiry() -> (f64, String) {
     )
 }
 
-fn ready(name: &str) -> Value {
-    json!({"state": "ready", "resource_name": name, "expires_at": expiry().0, "payload": {
+pub(super) fn ready(name: &str) -> Value {
+    json!({"state": "ready", "resource_name": name, "resource_prefix": "cachedContents/", "expires_at": expiry().0, "payload": {
         "cachedContent": name,
         "contents": [{"role": "user", "parts": [{"text": "suffix"}]}],
         "generationConfig": {"maxOutputTokens": 10},
     }})
 }
 
-fn claim(url: &str, expires: &(f64, String)) -> Value {
-    json!({"state": "create", "operation_id": "cache-op", "url": url,
+pub(super) fn claim(url: &str, expires: &(f64, String)) -> Value {
+    json!({"state": "create", "operation_id": "cache-op", "url": url, "resource_prefix": "cachedContents/",
         "payload": {"model": "models/gemini-test", "expireTime": expires.1,
             "contents": [{"role": "user", "parts": [{"text": "private prefix"}]}]},
         "expires_at": expires.0,
     })
 }
 
-fn response(expires: &(f64, String)) -> Value {
+pub(super) fn response(expires: &(f64, String)) -> Value {
     json!({"name": "cachedContents/test-cache", "expireTime": expires.1,
         "usageMetadata": {"totalTokenCount": 4096},
         "contents": "private provider text never forwarded", "other": "ignored"})
 }
 
-async fn execute_test(
+pub(super) async fn execute_test(
     wire: &DeploymentWire,
     host: &Host,
     policy: EndpointPolicy,
@@ -132,7 +132,9 @@ async fn request(socket: &mut tokio::net::TcpStream) -> String {
 }
 
 /// Serve an exact sequence; any implicit retry or redirect would consume another response.
-async fn server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+pub(super) async fn server(
+    responses: Vec<String>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -148,7 +150,7 @@ async fn server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<
     (format!("http://{address}"), task)
 }
 
-fn answer(status: u16, body: &str) -> String {
+pub(super) fn answer(status: u16, body: &str) -> String {
     format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
 }
 
@@ -599,6 +601,42 @@ async fn cancellation_after_create_dispatch_leaves_claim_unfinished() {
     assert_eq!(host.calls().len(), 1);
     assert_eq!(host.calls()[0].0, "prepare_explicit_cache");
     server.abort();
+}
+
+#[test]
+fn create_expiration_never_exceeds_or_drifts_from_reserved_horizon() {
+    let expires = expiry();
+    let url = "https://generativelanguage.googleapis.com/v1beta/cachedContents";
+    let endpoint = cache_endpoint(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent",
+        EndpointPolicy::Official,
+    )
+    .unwrap();
+    let mut payload = claim(url, &expires)["payload"].clone();
+    payload["expireTime"] = json!(expires.1.replace('Z', ".0005Z"));
+    assert!(!valid_create(&endpoint, url, &payload, expires.0));
+}
+
+#[tokio::test]
+async fn provider_submillisecond_expiry_extension_records_unknown() {
+    let expires = expiry();
+    let mut created = response(&expires);
+    created["expireTime"] = json!(expires.1.replace('Z', ".0005Z"));
+    let (base, task) = server(vec![answer(200, &created.to_string())]).await;
+    let original = wire(&format!(
+        "{base}/v1beta/models/gemini-test:streamGenerateContent"
+    ));
+    let host = Host::new(vec![
+        claim(&format!("{base}/v1beta/cachedContents"), &expires),
+        json!({"state":"unavailable"}),
+    ]);
+    assert!(execute_test(&original, &host, EndpointPolicy::Loopback)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(task.await.unwrap().len(), 1);
+    assert_eq!(host.calls()[1].1["outcome"], "unknown");
+    assert!(host.calls()[1].1.get("expire_time").is_none());
 }
 
 #[tokio::test]

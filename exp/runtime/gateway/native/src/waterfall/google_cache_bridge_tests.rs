@@ -14,58 +14,65 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from exp.runtime.gateway.native_explicit_cache_test import (
-    _Host, _authority, _control, _admission, _start_first, _wire, _RESOURCE,
+    _Host, _authority, _control, _vertex_control, _admission, _start_first, _wire, _RESOURCE,
 )
+from exp.runtime.models.providers.google_cache import VertexCacheProject
 
 
-def setup(base):
+def setup(base, vertex):
     """Build actual admission/accounting with a fake atomic cache-spend authority."""
     temporary = TemporaryDirectory(prefix="exp-native-cache-bridge-")
-    host = _Host(_authority())
-    control, key = _control(Path(temporary.name), host)
-    return temporary, host, control, key, base
+    authority = _authority()
+    if vertex:
+        authority = replace(authority, vertex_project=VertexCacheProject("fruit-project", "123456789"))
+    host = _Host(authority)
+    control, key = (_vertex_control if vertex else _control)(Path(temporary.name), host)
+    return temporary, host, control, key, base, vertex
 
 
 def admit(fixture):
     """Admit and reserve on the real plane before substituting loopback-only URLs."""
-    temporary, host, control, key, base = fixture
+    temporary, host, control, key, base, vertex = fixture
     admission = _admission(control, key)
     wire = dict(_wire(admission))
     assert wire["explicit_cache"] is True
-    assert wire["url"].startswith("https://generativelanguage.googleapis.com/")
+    assert wire["url"].startswith("https://aiplatform.googleapis.com/" if vertex else "https://generativelanguage.googleapis.com/")
     entry = control._accounting.entry(admission["request_id"])
     assert entry is not None and entry.explicit_cache_state is not None
     state = entry.explicit_cache_state
     binding = state.bindings[0]
     assert binding is not None
-    state.bindings = (replace(binding, plan=replace(binding.plan, create_url=base + "/v1beta/cachedContents")),)
-    wire["url"] = base + "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+    root = "/v1/projects/fruit-project/locations/global" if vertex else "/v1beta"
+    models = "/publishers/google/models/" if vertex else "/models/"
+    state.bindings = (replace(binding, plan=replace(binding.plan, create_url=base + root + "/cachedContents")),)
+    wire["url"] = base + root + models + "gemini-2.5-pro:streamGenerateContent?alt=sse"
     _start_first(control, admission)
     return admission["request_id"], json.dumps(wire)
 
 
 def assert_accounted(fixture, expected_claims):
     """Check real host callbacks recorded exactly one scoped reservation and create."""
-    temporary, host, control, key, base = fixture
+    temporary, host, control, key, base, vertex = fixture
     assert host.claim_calls == expected_claims
     assert len(host.authority_calls) == expected_claims
     assert host.record_calls == 1 and len(host.offers) == len(host.results) == 1
     offer = next(iter(host.offers.values()))
     result = next(iter(host.results.values()))
     assert result.operation_id == offer.operation_id
-    assert result.outcome == "ready" and result.resource_name == _RESOURCE
+    resource = "projects/123456789/locations/global/" + _RESOURCE if vertex else _RESOURCE
+    assert result.outcome == "ready" and result.resource_name == resource
     assert result.total_tokens == 1536 and result.expire_time == offer.expires_at
     assert host.reserved == offer.reservation_nano_usd > 0
 
 
 def cleanup(fixture):
     """Close fixture-thread SQLite connections before removing its temporary directory."""
-    temporary, host, control, key, base = fixture
+    temporary, host, control, key, base, vertex = fixture
     control.close_thread_resources("{}")
     temporary.cleanup()
 "#;
 
-fn fixture(base: &str) -> (Py<PyModule>, Py<PyAny>, Py<PyAny>) {
+fn fixture(base: &str, vertex: bool) -> (Py<PyModule>, Py<PyAny>, Py<PyAny>) {
     Python::initialize();
     Python::attach(|py| {
         let module = PyModule::from_code(
@@ -75,7 +82,11 @@ fn fixture(base: &str) -> (Py<PyModule>, Py<PyAny>, Py<PyAny>) {
             c"google_cache_bridge_fixture",
         )
         .expect("project test dependencies must be available to the embedded interpreter");
-        let fixture = module.getattr("setup").unwrap().call1((base,)).unwrap();
+        let fixture = module
+            .getattr("setup")
+            .unwrap()
+            .call1((base, vertex))
+            .unwrap();
         let control = fixture.get_item(2).unwrap().unbind();
         (module.unbind(), fixture.unbind(), control)
     })
@@ -107,7 +118,7 @@ fn assert_accounted(module: &Py<PyModule>, fixture: &Py<PyAny>, expected_claims:
 }
 
 /// Server echoes the absolute expiry supplied by the real Python create callback.
-async fn loopback() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+async fn loopback(resource: &'static str) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
@@ -120,7 +131,7 @@ async fn loopback() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
                 assert!(body.get("ttl").is_none());
                 assert!(body.get("expireTime").is_some());
                 json!({
-                    "name": "cachedContents/verified_test_resource",
+                    "name": resource,
                     "expireTime": body["expireTime"],
                     "usageMetadata": {"totalTokenCount": 1536},
                     "private_provider_text": "must never cross the accounting bridge",
@@ -145,8 +156,18 @@ async fn loopback() -> (String, tokio::task::JoinHandle<Vec<Value>>) {
 #[tokio::test]
 #[ignore = "requires project dependencies in the matching embedded Python; run with PYO3_PYTHON and PYTHONPATH"]
 async fn real_python_control_plane_creates_and_reuses_through_bridge() {
-    let (base, server) = loopback().await;
-    let (module, fixture, control) = fixture(&base);
+    exercise_bridge(false).await;
+    exercise_bridge(true).await;
+}
+
+async fn exercise_bridge(vertex: bool) {
+    let resource = if vertex {
+        "projects/123456789/locations/global/cachedContents/verified_test_resource"
+    } else {
+        "cachedContents/verified_test_resource"
+    };
+    let (base, server) = loopback(resource).await;
+    let (module, fixture, control) = fixture(&base, vertex);
     let bridge = Bridge::new(control, 1).unwrap();
     let http = crate::upstream::build_client(Duration::from_secs(1)).unwrap();
     for expected_claims in 1..=2 {
@@ -165,10 +186,7 @@ async fn real_python_control_plane_creates_and_reuses_through_bridge() {
         .expect("the real host authorizes the recorded resource");
         assert_accounted(&module, &fixture, expected_claims);
         assert!(original.upstream_payload.get("cachedContent").is_none());
-        assert_eq!(
-            cached.upstream_payload["cachedContent"],
-            "cachedContents/verified_test_resource"
-        );
+        assert_eq!(cached.upstream_payload["cachedContent"], resource);
         assert_eq!(
             cached.upstream_payload["contents"],
             json!([

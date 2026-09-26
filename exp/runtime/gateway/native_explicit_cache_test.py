@@ -39,6 +39,8 @@ from exp.runtime.gateway.native_bridge_test import _admit, _configured_pool_gate
 from exp.runtime.gateway.native_explicit_cache import CONDITIONAL_CACHE_DISCLOSURE
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import CACHE_CONTROL_NOT_FORWARDED_SUFFIX
+from exp.runtime.models.providers.google_cache import VertexCacheProject
+from exp.runtime.models.providers.vertex import VertexTokenProvider
 
 _MODEL = "gemini-2.5-pro"
 _SECRET = "dummy-google-api-key-private-canary"
@@ -138,6 +140,94 @@ def _control(
     if host is None:
         return NativeControlPlane(components), key
     return NativeControlPlane(components, explicit_cache=host), key
+
+
+def _vertex_control(root: Path, host: _Host) -> tuple[NativeControlPlane, str]:
+    """Use real Vertex admission with only OAuth credential minting replaced offline."""
+    _manager, key = _configured_gateway(
+        root,
+        provider="vertex",
+        provider_model=_MODEL,
+        base_url="https://aiplatform.googleapis.com/v1/projects/fruit-project/locations/global",
+    )
+    with mock.patch(
+        "exp.runtime.models.providers.vertex.ServiceAccountTokenProvider",
+        return_value=lambda: "dummy-vertex-bearer",
+    ):
+        components = load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "{}"})
+        control = NativeControlPlane(components, explicit_cache=host)
+
+    def token_factory(*, credentials_json: str) -> VertexTokenProvider:
+        """Keep lazy admission clients on a deterministic no-network token provider."""
+        assert credentials_json == "{}"
+        return lambda: "dummy-vertex-bearer"
+
+    for catalog in components.runtime_catalogs.values():
+        catalog._vertex_token_provider_factory = token_factory
+    return control, key
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+def test_vertex_callback_requires_mapping_and_reuses_canonical_project(
+    tmp_path: Path, mapped: bool
+) -> None:
+    """Project-ID admission claims nothing without mapping; verified reuse stays numeric."""
+    project = VertexCacheProject("fruit-project", "123456789") if mapped else None
+    host = _Host(replace(_authority(), vertex_project=project))
+    control, key = _vertex_control(tmp_path, host)
+    first = _admission(control, key)
+    assert _wire(first)["explicit_cache"] is True
+    _start_first(control, first)
+    creation = _prepare(control, first)
+    if not mapped:
+        assert creation == {"state": "unavailable"}
+        assert host.claim_calls == 0 and not host.offers
+        return
+    prefix = "projects/123456789/locations/global/cachedContents/"
+    assert creation["state"] == "create"
+    assert creation["resource_prefix"] == prefix
+    assert creation["url"] == (
+        "https://aiplatform.googleapis.com/v1/projects/fruit-project/locations/global/cachedContents"
+    )
+    assert next(iter(host.offers.values())).resource_prefix == prefix
+    result = _finish_argument(first, creation)
+    result["name"] = prefix + "verified_test_resource"
+    ready = _finish(control, result)
+    assert ready["state"] == "ready" and ready["resource_prefix"] == prefix
+    second = _admission(control, key, suffix="Count the inventory again.")
+    _start_first(control, second)
+    reused = _prepare(control, second)
+    assert reused["state"] == "ready" and reused["resource_name"] == result["name"]
+    assert host.claim_calls == 2 and host.record_calls == 1 and len(host.offers) == 1
+
+
+@pytest.mark.parametrize("foreign", ["endpoint", "resource"])
+def test_vertex_callback_rejects_foreign_host_mapping_or_resource(
+    tmp_path: Path, foreign: str
+) -> None:
+    """Neither host alias mismatch nor a provider's other project expands admission."""
+    host = _Host(
+        replace(
+            _authority(),
+            vertex_project=VertexCacheProject(
+                "other-project" if foreign == "endpoint" else "fruit-project", "123456789"
+            ),
+        )
+    )
+    control, key = _vertex_control(tmp_path, host)
+    admitted = _admission(control, key)
+    _start_first(control, admitted)
+    if foreign == "endpoint":
+        with pytest.raises(NativeBridgeError):
+            _prepare(control, admitted)
+        assert host.claim_calls == 0
+        return
+    creation = _prepare(control, admitted)
+    result = _finish_argument(admitted, creation)
+    result["name"] = "projects/987654321/locations/global/cachedContents/foreign"
+    assert _finish(control, result) == {"state": "unavailable"}
+    assert next(iter(host.results.values())).outcome == "unknown"
+    assert host.reserved > 0
 
 
 def _body(*, marked: bool = True, suffix: str = _SUFFIX) -> str:
@@ -707,6 +797,211 @@ def test_authority_failure_is_sanitized_and_cannot_retry_create(
     _assert_private(str(error.value) + repr(error.value) + error.value.public_error_json)
     assert _prepare(control, admission) == {"state": "unavailable"}
     assert host.claim_calls == host.record_calls == host.reserved == 0
+
+
+@pytest.mark.parametrize("phase", ["authority", "claim", "record"])
+def test_abandonment_finishes_while_cache_host_is_blocked(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    """Host latency cannot hold request cleanup or grant a late create/reuse permission."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    request_id = admission["request_id"]
+    assert isinstance(request_id, str)
+    argument = (
+        _finish_argument(admission, _prepare(control, admission)) if phase == "record" else None
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block() -> None:
+        """Hold only host I/O until the test has observed cancellation cleanup."""
+        entered.set()
+        assert release.wait(timeout=5)
+
+    original_authority = host.authority
+    original_claim = host.claim
+    original_record = host.record
+
+    def authority(
+        authorization: AuthorizationSnapshot,
+        deployment: ExactModelDeployment,
+        profile: GatewayWireProfile,
+    ) -> GoogleCacheAuthority | None:
+        """Pause a policy lookup before it could authorize a new reservation."""
+        result = original_authority(authorization, deployment, profile)
+        block()
+        return result
+
+    def claim(offer: CacheOffer) -> CacheClaim:
+        """Commit one durable fake reservation, then delay its acknowledgement."""
+        result = original_claim(offer)
+        block()
+        return result
+
+    def record(result: CacheResult) -> None:
+        """Commit known provider facts, then delay their acknowledgement."""
+        original_record(result)
+        block()
+
+    if phase == "authority":
+        monkeypatch.setattr(host, "authority", authority)
+    elif phase == "claim":
+        monkeypatch.setattr(host, "claim", claim)
+    else:
+        monkeypatch.setattr(host, "record", record)
+
+    def callback() -> JsonObject:
+        """Run the selected callback on a separate bridge-like worker thread."""
+        try:
+            return _prepare(control, admission) if argument is None else _finish(control, argument)
+        finally:
+            control.close_thread_resources("{}")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(callback)
+        try:
+            assert entered.wait(timeout=5)
+            control.abandon(json.dumps({"request_id": request_id}))
+            assert control._accounting.entry(request_id) is None
+        finally:
+            release.set()
+        assert pending.result(timeout=5) == {"state": "unavailable"}
+    if phase == "authority":
+        assert host.claim_calls == host.record_calls == host.reserved == 0
+    else:
+        assert host.claim_calls == 1 and len(host.offers) == 1
+        assert host.reserved == next(iter(host.offers.values())).reservation_nano_usd
+        assert host.record_calls == (1 if phase == "record" else 0)
+
+
+@pytest.mark.parametrize("phase", ["authority", "claim", "record"])
+def test_deadline_expiring_in_host_callback_cannot_authorize_cache_dispatch(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    """A late host reply cannot extend attempt authority even when cache expiry is fresh."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    request_id = admission["request_id"]
+    assert isinstance(request_id, str)
+    entry = control._accounting.entry(request_id)
+    assert entry is not None
+    argument = (
+        _finish_argument(admission, _prepare(control, admission)) if phase == "record" else None
+    )
+    original_authority = host.authority
+    original_claim = host.claim
+    original_record = host.record
+
+    def authority(
+        authorization: AuthorizationSnapshot,
+        deployment: ExactModelDeployment,
+        profile: GatewayWireProfile,
+    ) -> GoogleCacheAuthority | None:
+        """Spend the deadline while looking up policy."""
+        result = original_authority(authorization, deployment, profile)
+        entry.deadline_monotonic = time.monotonic() - 1
+        return result
+
+    def claim(offer: CacheOffer) -> CacheClaim:
+        """Spend the deadline after the durable reservation commits."""
+        result = original_claim(offer)
+        entry.deadline_monotonic = time.monotonic() - 1
+        return result
+
+    def record(result: CacheResult) -> None:
+        """Spend the deadline while acknowledging known provider facts."""
+        original_record(result)
+        entry.deadline_monotonic = time.monotonic() - 1
+
+    if phase == "authority":
+        monkeypatch.setattr(host, "authority", authority)
+    elif phase == "claim":
+        monkeypatch.setattr(host, "claim", claim)
+    else:
+        monkeypatch.setattr(host, "record", record)
+    result = _prepare(control, admission) if argument is None else _finish(control, argument)
+    assert result == {"state": "unavailable"}
+    assert host.claim_calls == (0 if phase == "authority" else 1)
+    assert host.record_calls == (1 if phase == "record" else 0)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_duplicate_finish_during_record_cannot_grant_reuse_or_change_facts(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch, changed: bool
+) -> None:
+    """Exactly one immutable observation owns a blocked write, without holding cleanup's gate."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    argument = _finish_argument(admission, _prepare(control, admission))
+    entered = threading.Event()
+    release = threading.Event()
+    original_record = host.record
+
+    def record(result: CacheResult) -> None:
+        """Block before the fake store commit so a duplicate sees unacknowledged state."""
+        entered.set()
+        assert release.wait(timeout=5)
+        original_record(result)
+
+    def finish() -> JsonObject:
+        """Run the owning callback on a separate bridge-like worker."""
+        try:
+            return _finish(control, argument)
+        finally:
+            control.close_thread_resources("{}")
+
+    monkeypatch.setattr(host, "record", record)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(finish)
+        try:
+            assert entered.wait(timeout=5)
+            duplicate = {**argument, **({"outcome": "unknown"} if changed else {})}
+            with pytest.raises(NativeBridgeError):
+                _finish(control, duplicate)
+            assert host.record_calls == 0
+        finally:
+            release.set()
+        assert pending.result(timeout=5)["state"] == "ready"
+    assert host.record_calls == 1
+    assert _finish(control, argument)["state"] == "ready"
+    assert host.record_calls == 1
+
+
+def test_record_retry_reuses_observation_after_ambiguous_acknowledgement(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retrying a committed result keeps its first observation time and cannot contradict it."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    admission = _admission(control, key)
+    _start_first(control, admission)
+    argument = _finish_argument(admission, _prepare(control, admission))
+    original_record = host.record
+    calls = 0
+
+    def record(result: CacheResult) -> None:
+        """Lose the first commit acknowledgement after the host durably stored the result."""
+        nonlocal calls
+        calls += 1
+        original_record(result)
+        if calls == 1:
+            raise RuntimeError("synthetic lost acknowledgement")
+
+    monkeypatch.setattr(host, "record", record)
+    with pytest.raises(NativeBridgeError):
+        _finish(control, argument)
+    original_result = next(iter(host.results.values()))
+    clock.now += 1
+    assert _finish(control, argument)["state"] == "ready"
+    assert calls == 2 and host.record_calls == 1
+    assert next(iter(host.results.values())) == original_result
 
 
 def test_cache_bindings_and_durable_metadata_keep_prompt_and_credentials_private(
