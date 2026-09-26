@@ -257,7 +257,7 @@ async fn run_ladder(
 /// POST one admitted payload and validate the buffered answer; the error
 /// carries whether the provider dispatch opened.
 async fn dispatch(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &ImagesAdmission,

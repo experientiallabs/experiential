@@ -163,7 +163,7 @@ async fn a_429_whose_body_stalls_never_outlives_the_header_phase_budget() {
             .expect("write");
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
-    let client = build_client(Duration::from_secs(2)).expect("client");
+    let client = build_client(Duration::from_secs(2), false).expect("client");
     let started = Instant::now();
     let failure = open_stream(
         &client,

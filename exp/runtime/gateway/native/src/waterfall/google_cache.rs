@@ -77,7 +77,7 @@ pub(super) async fn prepare(
 
 /// Keep the bridge seam injectable while the real pooled HTTP transport is exercised.
 async fn execute<F, Fut>(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     request_id: &str,
     deadline: Instant,
@@ -417,14 +417,14 @@ fn matching_create_url(expected: &Url, candidate: &str) -> bool {
 
 /// Read only bounded JSON evidence. Error bodies and headers never cross the bridge.
 async fn create(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     endpoint: &CacheEndpoint,
     payload: &Value,
     expires_at: f64,
     status: &mut Option<u16>,
 ) -> Option<Created> {
-    let mut request = http.post(endpoint.url.clone());
+    let mut request = http.post(endpoint.url.as_str()).ok()?;
     for (name, value) in &wire.headers {
         if !name.eq_ignore_ascii_case("idempotency-key")
             && !name.eq_ignore_ascii_case("content-length")

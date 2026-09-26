@@ -16,6 +16,9 @@ use crate::param_attribution::{
 };
 use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
+mod network;
+pub(crate) use network::UpstreamClient;
+
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
 /// provider 3xx can never re-send credentials to an attacker-chosen location.
@@ -23,9 +26,19 @@ use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds}
 /// `connect_timeout` bounds only the TCP+TLS connect phase; a dead lane whose
 /// host never accepts the connection fails over after this window instead of
 /// hanging on the per-deployment request timeout.
-pub fn build_client(connect_timeout: Duration) -> Result<reqwest::Client, String> {
-    client_builder(connect_timeout)
+pub fn build_client(
+    connect_timeout: Duration,
+    public_only: bool,
+) -> Result<UpstreamClient, String> {
+    let builder = client_builder(connect_timeout);
+    let builder = if public_only {
+        network::restrict(builder)
+    } else {
+        builder
+    };
+    builder
         .build()
+        .map(|inner| UpstreamClient::new(inner, public_only))
         .map_err(|error| format!("upstream client construction failed: {error}"))
 }
 
@@ -157,7 +170,7 @@ fn open_timeout_failure() -> Failure {
 /// verbatim with the signed headers instead of re-serializing `payload`.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_stream(
-    client: &reqwest::Client,
+    client: &UpstreamClient,
     url: &str,
     headers: &HashMap<String, String>,
     idempotency_key: &str,
@@ -166,7 +179,7 @@ pub async fn open_stream(
     phase_timeout: Duration,
     dialect: Dialect,
 ) -> Result<reqwest::Response, Failure> {
-    let mut request = client.post(url);
+    let mut request = client.post(url)?;
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("idempotency-key") {
             continue;

@@ -173,7 +173,7 @@ async fn exercise_bridge(vertex: bool) {
     let (base, server) = loopback(resource).await;
     let (module, fixture, control) = fixture(&base, vertex);
     let bridge = Bridge::new(control, 1).unwrap();
-    let http = crate::upstream::build_client(Duration::from_secs(1)).unwrap();
+    let http = crate::upstream::build_client(Duration::from_secs(1), false).unwrap();
     for expected_claims in 1..=2 {
         let (request_id, original) = admit(&module, &fixture);
         let cached = execute(

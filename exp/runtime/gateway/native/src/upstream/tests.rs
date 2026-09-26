@@ -65,7 +65,7 @@ async fn decision_wire_omits_all_idempotency_keys_without_changing_chat_headers(
                 .expect("write");
             String::from_utf8(request).expect("HTTP headers")
         });
-        let client = build_client(Duration::from_secs(2)).expect("client");
+        let client = build_client(Duration::from_secs(2), false).expect("client");
         open_stream(
             &client,
             &format!("http://{addr}/v1/systemone"),
@@ -151,7 +151,7 @@ async fn a_402_with_the_literal_tokenhub_body_classes_provider_quota() {
         );
         socket.write_all(response.as_bytes()).await.expect("write");
     });
-    let client = build_client(Duration::from_secs(2)).expect("client");
+    let client = build_client(Duration::from_secs(2), false).expect("client");
     let failure = open_stream(
         &client,
         &format!("http://{addr}/v1/chat/completions"),
@@ -209,7 +209,7 @@ async fn open_dialect_against_body(
         );
         socket.write_all(response.as_bytes()).await.expect("write");
     });
-    let client = build_client(Duration::from_secs(2)).expect("client");
+    let client = build_client(Duration::from_secs(2), false).expect("client");
     open_stream(
         &client,
         &format!("http://{addr}/v1/chat/completions"),
@@ -355,7 +355,7 @@ async fn a_refused_connection_names_the_transport_fault_for_the_ledger() {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     drop(listener);
-    let client = build_client(Duration::from_secs(2)).expect("client");
+    let client = build_client(Duration::from_secs(2), false).expect("client");
     let failure = open_stream(
         &client,
         &format!("http://{addr}/v1/chat/completions"),
