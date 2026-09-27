@@ -906,3 +906,39 @@ def test_removal_leaves_a_plan_added_under_the_name_meanwhile(
 
     assert removed.exit_code == 0, removed.output
     assert ProviderAuthStore().get_oauth("plan-a") == newcomer
+
+
+def test_an_unreadable_credential_file_never_blocks_removing_a_key_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key connection disables even when the shared credential file cannot be parsed."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "keyed",
+            "--provider",
+            "openai",
+            "--credential-env",
+            "OPENAI_API_KEY",
+            "--root",
+            str(root),
+        ],
+    )
+    assert added.exit_code == 0, added.output
+    store_path = ProviderAuthStore().path
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text("not json", encoding="utf-8")
+    store_path.chmod(0o600)
+
+    removed = _runner.invoke(
+        app, ["config", "gateway", "provider", "remove", "keyed", "--root", str(root)]
+    )
+
+    assert removed.exit_code == 0, removed.output
+    assert GatewayManagement(root).provider_connections() == ()

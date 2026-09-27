@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Literal
@@ -13,7 +14,12 @@ from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from exp.cli.providers.anthropic_sign_in import anthropic_paste_sign_in
 from exp.cli.providers.chatgpt_sign_in import chatgpt_browser_sign_in
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.common.auth import ProviderAuthStore, StoredCredentialKindMismatch, StoredOAuthTokens
+from exp.common.auth import (
+    ProviderAuthStore,
+    ProviderAuthStoreError,
+    StoredCredentialKindMismatch,
+    StoredOAuthTokens,
+)
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.core.locks import FileLockTimeout
 from exp.common.models import ConnectionConfig
@@ -30,6 +36,8 @@ from exp.runtime.models.providers.chatgpt_subscription import (
     chatgpt_account_claims,
     tokens_from_codex_auth_file,
 )
+
+logger = logging.getLogger(__name__)
 
 provider_app = typer.Typer(
     help="Manage role-free gateway provider connections.", no_args_is_help=True
@@ -458,6 +466,19 @@ def provider_update(
     )
 
 
+def _stored_sign_in(store: ProviderAuthStore, name: str) -> StoredOAuthTokens | None:
+    """Return the sign-in stored under ``name``, or ``None`` when there is none to forget.
+
+    An API key under the name, or a credential file that cannot be read, is not a sign-in to
+    forget and must not block disabling a connection that authenticates another way.
+    """
+    try:
+        return store.get_oauth(name)
+    except ProviderAuthStoreError as exc:
+        logger.warning("not forgetting a sign-in for %r: %s", name, exc)
+        return None
+
+
 def _remove_provider(
     name: str,
     *,
@@ -479,18 +500,19 @@ def _remove_provider(
     management = GatewayManagement(root)
     store = ProviderAuthStore()
     with usage_error(ValueError, FileLockTimeout):
-        # Any sign-in stored under the name is a plan's (an update that moved the connection
-        # off its plan kind leaves it behind too). Read it before disabling and delete exactly
-        # that pair, so a plan another process adds under the name meanwhile keeps its own.
-        signed_in: StoredOAuthTokens | None = None
-        if forget_plan_sign_in:
-            try:
-                signed_in = store.get_oauth(name)
-            except StoredCredentialKindMismatch:
-                signed_in = None
-        changed = management.disable_provider_connection(connection_id=name)
-        if changed and signed_in is not None:
-            store.replace_oauth_if(name, expected=signed_in, replacement=None)
+        if not forget_plan_sign_in:
+            changed = management.disable_provider_connection(connection_id=name)
+        else:
+            # Any sign-in stored under the name is a plan's (an update that moved the
+            # connection off its plan kind leaves it behind too). The connection's sign-in
+            # lock keeps a refresh from rotating the pair between the read and the delete,
+            # and the delete is a compare-and-swap, so a plan another process adds under the
+            # name meanwhile keeps its own.
+            with store.sign_in_lock(name):
+                signed_in = _stored_sign_in(store, name)
+                changed = management.disable_provider_connection(connection_id=name)
+                if changed and signed_in is not None:
+                    store.replace_oauth_if(name, expected=signed_in, replacement=None)
     emit_receipt(
         GatewayReceipt(
             operation=operation,

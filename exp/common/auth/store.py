@@ -15,7 +15,8 @@ import logging
 import os
 import stat
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -318,6 +319,24 @@ class ProviderAuthStore:
             )
             self._replace(records)
 
+    @contextmanager
+    def sign_in_lock(self, connection_id: str) -> Iterator[None]:
+        """Hold one connection's cross-process sign-in lock (refresh and removal share it).
+
+        Only this connection's refresh and removal wait on it; other connections and plain
+        writes never do. The wait outlasts a refresh grant's HTTP call.
+
+        Args:
+            connection_id: Exact catalog or gateway connection name.
+
+        Yields:
+            Nothing; the lock is held for the ``with`` body.
+        """
+        _validate_connection_id(connection_id)
+        lock = self._path.with_name(f"{self._path.name}.refresh-{connection_id}")
+        with file_write_lock(lock, what="plan sign-in", timeout_s=REFRESH_LOCK_TIMEOUT_S):
+            yield
+
     def refresh_oauth(
         self,
         connection_id: str,
@@ -350,11 +369,7 @@ class ProviderAuthStore:
             StoredCredentialEndpointMismatch: The stored sign-in belongs to another endpoint.
             ProviderAuthStoreError: The file exists but cannot be used, or the write failed.
         """
-        _validate_connection_id(connection_id)
-        refresh_lock = self._path.with_name(f"{self._path.name}.refresh-{connection_id}")
-        with file_write_lock(
-            refresh_lock, what="plan sign-in refresh", timeout_s=REFRESH_LOCK_TIMEOUT_S
-        ):
+        with self.sign_in_lock(connection_id):
             stored = self.get_oauth(connection_id, binding=binding)
             if stored is None:
                 return None
