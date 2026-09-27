@@ -550,6 +550,22 @@ class NativeControlPlane(
             raise _authority_error(exc) from exc
         self._control_plane_timing.record("ledger_accept_ms", ledger_accept_started)
 
+        acceptance_observed = pending_acceptance is None
+
+        def wait_for_pending_acceptance() -> None:
+            """Observe deferred acceptance before any route exit or success reply."""
+            nonlocal acceptance_observed
+            if acceptance_observed or pending_acceptance is None:
+                return
+            accept_wait_started = time.monotonic()
+            try:
+                pending_acceptance.result()
+            except Exception as exc:  # noqa: BLE001 - keep the ledger boundary sanitized.
+                raise _authority_error(exc) from exc
+            finally:
+                self._control_plane_timing.record("ledger_accept_wait_ms", accept_wait_started)
+            acceptance_observed = True
+
         if not begin_capture(
             self._capture,
             authorization,
@@ -604,6 +620,7 @@ class NativeControlPlane(
                 ):
                     raise _continuation_binding_error()
                 # No dispatchable rung remains; finalize the accepted request closed.
+                wait_for_pending_acceptance()
                 return self._escalate_accepted(
                     authorization,
                     "every certified deployment was unavailable at admission",
@@ -637,6 +654,7 @@ class NativeControlPlane(
                 resolved_wires,
             )
         except NativeDialectUnavailableError as exc:
+            wait_for_pending_acceptance()
             return self._escalate_accepted(authorization, str(exc))
         except OpenAIProtocolError as exc:
             # A continuation whose bound provider authority is no longer
@@ -645,6 +663,7 @@ class NativeControlPlane(
             # durable failure by the public status so usage and health read it
             # as a client failure and it never pages as internal; the caller
             # still receives the exact public error unchanged.
+            wait_for_pending_acceptance()
             self._accounting.finish_request_quietly(
                 authorization,
                 GatewayFailure(
@@ -665,6 +684,7 @@ class NativeControlPlane(
             except Exception:  # noqa: BLE001 - hosted policy fails closed.
                 native_route_eligible = False
             if not native_route_eligible:
+                wait_for_pending_acceptance()
                 return self._escalate_accepted(
                     authorization,
                     "host policy does not permit native execution of this route",
@@ -763,6 +783,7 @@ class NativeControlPlane(
         except NativeBridgeError:
             # The enriched fail-closed capability rejection above already
             # finished the accepted request; let it cross the boundary as-is.
+            wait_for_pending_acceptance()
             raise
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             # One shared normalizer keeps both pre-dispatch rejections
@@ -792,6 +813,7 @@ class NativeControlPlane(
                 )
             else:
                 public_error = public_failure_error(failure, param=exc.param)
+            wait_for_pending_acceptance()
             self._accounting.finish_request_quietly(authorization, failure)
             raise NativeBridgeError(public_error) from exc
         except GatewayRoutingError as exc:
@@ -799,6 +821,7 @@ class NativeControlPlane(
             # transient control-plane condition, not a bug: record it retryable
             # so it never pages as INTERNAL. The public error is already a 503.
             failure = gateway_updating_failure()
+            wait_for_pending_acceptance()
             self._accounting.finish_request_quietly(authorization, failure)
             raise _authority_error(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -823,17 +846,12 @@ class NativeControlPlane(
                     "exception_type": type(exc).__name__,
                 },
             )
+            wait_for_pending_acceptance()
             self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
         plan = deterministic.native_output_plan(policy, self._guardrail_detectors)
-        if pending_acceptance is not None:
-            accept_wait_started = time.monotonic()
-            try:
-                pending_acceptance.result()
-            except Exception as exc:  # noqa: BLE001 - keep the ledger boundary sanitized.
-                raise _authority_error(exc) from exc
-            self._control_plane_timing.record("ledger_accept_wait_ms", accept_wait_started)
+        wait_for_pending_acceptance()
         self._accounting.register(
             InflightRequest(
                 authorization=authorization,

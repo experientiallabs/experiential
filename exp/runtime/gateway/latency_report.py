@@ -45,7 +45,8 @@ from exp.runtime.gateway.latency_measure import (
 )
 
 SCHEMA_NAME = "exp.gateway.latency_report"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+DIAGNOSTICS_SCHEMA_VERSION = 2
 CAVEAT = (
     "This report measures gateway overhead against a local OpenAI-compatible "
     "mock upstream. It is not end-to-end model latency."
@@ -53,6 +54,7 @@ CAVEAT = (
 _DEFAULT_WARMUP = 10
 _DEFAULT_REQUESTS = 40
 _DEFAULT_CONCURRENCY = 8
+_DEFAULT_MAX_ACTIVE_REQUESTS = 64
 _DEFAULT_REPEATS = 3
 _DEFAULT_STREAM_WARMUP = 5
 _DEFAULT_STREAM_REQUESTS = 20
@@ -91,6 +93,7 @@ class LatencyRunConfig(ContractModel):
     warmup_requests: int = Field(ge=0)
     measured_requests: int = Field(ge=1)
     concurrency: int = Field(ge=1)
+    max_active_requests: int = Field(default=_DEFAULT_MAX_ACTIVE_REQUESTS, ge=1)
     repeats: int = Field(ge=1)
     stream_warmup_requests: int = Field(ge=0)
     stream_measured_requests: int = Field(ge=1)
@@ -128,7 +131,7 @@ class LatencyReport(ContractModel):
     """Versioned machine-readable gateway overhead report."""
 
     schema_name: Literal["exp.gateway.latency_report"] = SCHEMA_NAME
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[2] = SCHEMA_VERSION
     measured_at: datetime
     caveat: str = CAVEAT
     config: LatencyRunConfig
@@ -248,6 +251,7 @@ def render_markdown(report: LatencyReport) -> str:
             f"{config.measured_requests} requests, concurrency "
             f"{config.concurrency}, {config.repeats} runs |"
         ),
+        f"| Active-request limit | {config.max_active_requests} |",
         f"| Representative run | {run.run_index} of {len(report.runs)} (median gateway p50) |",
         f"| Measured at | {report.measured_at.isoformat()} |",
         "",
@@ -480,6 +484,7 @@ def run_latency_report(
             root=work_root,
             port=port,
             credential=mock_credential,
+            max_active_requests=config.max_active_requests,
         )
         mock_url = f"{mock.base_url}/chat/completions"
         gateway_url = f"http://127.0.0.1:{port}{CHAT_PATH}"
@@ -586,7 +591,7 @@ def _write_gateway_diagnostics(
         accounting_timings = None
     diagnostics: JsonObject = {
         "schema_name": "exp.gateway.latency_diagnostics",
-        "schema_version": 1,
+        "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
         "commit_sha": resolve_commit_sha(),
         "sampled_at": datetime.now(UTC).isoformat(),
         "config": cast(JsonObject, config.model_dump(mode="json")),
@@ -724,6 +729,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=_DEFAULT_WARMUP)
     parser.add_argument("--requests", type=int, default=_DEFAULT_REQUESTS)
     parser.add_argument("--concurrency", type=int, default=_DEFAULT_CONCURRENCY)
+    parser.add_argument("--max-active-requests", type=int, default=_DEFAULT_MAX_ACTIVE_REQUESTS)
     parser.add_argument("--repeats", type=int, default=_DEFAULT_REPEATS)
     parser.add_argument("--stream-warmup", type=int, default=_DEFAULT_STREAM_WARMUP)
     parser.add_argument("--stream-requests", type=int, default=_DEFAULT_STREAM_REQUESTS)
@@ -757,6 +763,7 @@ def main(argv: list[str] | None = None) -> int:
         warmup_requests=args.warmup,
         measured_requests=args.requests,
         concurrency=args.concurrency,
+        max_active_requests=args.max_active_requests,
         repeats=args.repeats,
         stream_warmup_requests=args.stream_warmup,
         stream_measured_requests=args.stream_requests,

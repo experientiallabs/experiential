@@ -25,6 +25,11 @@ on:
         required: false
         default: 4
         type: number
+      max_active_requests:
+        description: Maximum requests the gateway admits at once
+        required: false
+        default: 64
+        type: number
 
 permissions:
   contents: read
@@ -50,6 +55,7 @@ jobs:
           DO_NOT_TRACK: "1"
           GATEWAY_CONCURRENCY: ${{ inputs.concurrency }}
           GATEWAY_STREAM_CONCURRENCY: ${{ inputs.stream_concurrency }}
+          GATEWAY_MAX_ACTIVE_REQUESTS: ${{ inputs.max_active_requests }}
         run: |
           args=(
             --output-json gateway-latency.json
@@ -62,6 +68,9 @@ jobs:
           fi
           if [[ -n "$GATEWAY_STREAM_CONCURRENCY" ]]; then
             args+=(--stream-concurrency "$GATEWAY_STREAM_CONCURRENCY")
+          fi
+          if [[ -n "$GATEWAY_MAX_ACTIVE_REQUESTS" ]]; then
+            args+=(--max-active-requests "$GATEWAY_MAX_ACTIVE_REQUESTS")
           fi
           uv run python -m exp.runtime.gateway.latency_report "${args[@]}"
       - name: Upload the versioned latency report

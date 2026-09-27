@@ -3574,6 +3574,37 @@ def test_unkeyed_direct_chat_acceptance_overlaps_route_assembly_and_commits_befo
     control.abandon(json.dumps({"request_id": keyed_id}))
 
 
+def test_deferred_acceptance_failure_overrides_early_route_failure(tmp_path: Path) -> None:
+    """A route failure cannot hide rejection of the queued durable acceptance."""
+    _manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components)
+    acceptance = mock.Mock()
+    acceptance.result.side_effect = RuntimeError("acceptance authority changed")
+
+    with (
+        mock.patch.object(
+            control._write_ledger,  # noqa: SLF001
+            "enqueue_accept_request",
+            return_value=acceptance,
+        ),
+        mock.patch.object(
+            control,
+            "_resolve_route",
+            side_effect=GatewayRoutingError("route assembly failed"),
+        ),
+        pytest.raises(NativeBridgeError) as rejected,
+    ):
+        _admit(control, raw_key, _chat_body())
+
+    assert acceptance.result.call_count == 1
+    assert isinstance(rejected.value.__cause__, RuntimeError)
+    assert str(rejected.value.__cause__) == "acceptance authority changed"
+
+
 def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     """An ungranted alias maps to the shared 403 public error."""
     control, raw_key = _control_plane(tmp_path)

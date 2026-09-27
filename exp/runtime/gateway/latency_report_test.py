@@ -18,6 +18,7 @@ from exp.runtime.gateway.latency_measure import (
 )
 from exp.runtime.gateway.latency_report import (
     CAVEAT,
+    DIAGNOSTICS_SCHEMA_VERSION,
     SCHEMA_NAME,
     SCHEMA_VERSION,
     GatewayAddedLatency,
@@ -198,7 +199,7 @@ def test_render_markdown_states_mock_and_gateway() -> None:
     assert "Streaming time to first token" in markdown
     parsed = LatencyReport.model_validate_json(report.model_dump_json())
     assert parsed.schema_name == SCHEMA_NAME
-    assert parsed.schema_version == 1
+    assert parsed.schema_version == SCHEMA_VERSION
 
 
 def test_write_report_outputs_writes_badge_from_representative_p50(tmp_path: Path) -> None:
@@ -284,11 +285,18 @@ def test_parse_args_keeps_ci_defaults() -> None:
     assert args.warmup == config.warmup_requests
     assert args.requests == config.measured_requests
     assert args.concurrency == config.concurrency
+    assert args.max_active_requests == config.max_active_requests
     assert args.repeats == config.repeats
     assert args.stream_requests == config.stream_measured_requests
     assert args.no_stream_ttft is False
     assert args.output_badge is None
     assert args.output_diagnostics_json is None
+
+
+def test_parse_args_accepts_an_active_request_limit() -> None:
+    """The latency CLI models the server limit separately from request load."""
+    args = parse_args(["--max-active-requests", "4"])
+    assert args.max_active_requests == 4
 
 
 def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
@@ -300,6 +308,7 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
             warmup_requests=1,
             measured_requests=2,
             concurrency=1,
+            max_active_requests=1,
             repeats=1,
             stream_warmup_requests=1,
             stream_measured_requests=2,
@@ -312,6 +321,7 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
     payload = json.loads(report.model_dump_json())
     assert payload["schema_name"] == SCHEMA_NAME
     assert payload["schema_version"] == SCHEMA_VERSION
+    assert payload["config"]["max_active_requests"] == 1
     assert report.representative_run.mock_direct.failures == 0
     assert report.representative_run.gateway.failures == 0
     assert report.representative_run.gateway_ttft is not None
@@ -321,6 +331,7 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
     assert "EXP_LATENCY_MOCK_KEY" not in json.dumps(payload)
     diagnostics = json.loads(diagnostics_path.read_text())
     assert diagnostics["schema_name"] == "exp.gateway.latency_diagnostics"
+    assert diagnostics["schema_version"] == DIAGNOSTICS_SCHEMA_VERSION
     gateway_metrics = diagnostics["gateway_metrics"]
     assert set(gateway_metrics) == {
         "time_to_first_byte_ms",

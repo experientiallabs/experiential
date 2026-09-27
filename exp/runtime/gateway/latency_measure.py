@@ -486,6 +486,7 @@ def start_gateway_process(
     root: Path,
     port: int,
     credential: str,
+    max_active_requests: int = 64,
 ) -> subprocess.Popen[str]:
     """Launch the product gateway on loopback and wait until it is ready.
 
@@ -493,6 +494,7 @@ def start_gateway_process(
         root: Configured EXP root.
         port: Loopback TCP port.
         credential: Mock upstream credential placed in the child environment.
+        max_active_requests: Maximum requests admitted by the gateway at once.
 
     Returns:
         Live gateway process.
@@ -522,6 +524,8 @@ def start_gateway_process(
             "--json",
             "--graceful-timeout",
             "2",
+            "--max-active-requests",
+            str(max_active_requests),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
