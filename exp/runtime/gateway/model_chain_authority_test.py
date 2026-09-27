@@ -982,17 +982,18 @@ def test_hot_plain_preflight_fences_snapshot_paths_once_at_write_boundary(
         classification_memo=manager.classification_memo,
     )
     checked_paths: list[str] = []
-    original = authority.validate_snapshot_generation
+    original = authority.validate_snapshot_generations
 
     def count_checks(
-        root: Path, relative_path: str, generation: authority.SnapshotGeneration
+        root: Path,
+        generations: tuple[tuple[str, authority.SnapshotGeneration], ...],
     ) -> None:
-        """Keep the production fence and count its operation-scoped invocations."""
-        checked_paths.append(relative_path)
-        original(root, relative_path, generation)
+        """Keep the production fence and count its operation-scoped path checks."""
+        checked_paths.extend(relative_path for relative_path, _generation in generations)
+        original(root, generations)
 
     try:
-        with patch.object(authority, "validate_snapshot_generation", count_checks):
+        with patch.object(authority, "validate_snapshot_generations", count_checks):
             ledger.accept_request(authorization=auth)
         # One normalized snapshot plus its model-chain sidecar, each fenced once
         # inside the durable acceptance transaction.

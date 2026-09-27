@@ -79,6 +79,95 @@ def test_bounded_reader_accepts_limit_and_rejects_growth(tmp_path: Path) -> None
     assert "budget_snapshot_max_bytes" in str(error.value)
 
 
+@pytest.mark.skipif(
+    os.name == "nt"
+    or os.stat not in os.supports_dir_fd
+    or os.stat not in os.supports_follow_symlinks
+    or os.open not in os.supports_dir_fd,
+    reason="POSIX directory-descriptor sharing",
+)
+def test_batch_generation_validation_walks_sibling_parent_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached snapshot pair shares one no-follow walk for its common parent."""
+    parent = tmp_path / "catalogs"
+    parent.mkdir()
+    paths = ("catalogs/chain.json", "catalogs/chain.models.json")
+    for relative_path in paths:
+        (tmp_path / relative_path).write_bytes(b"{}")
+    generations = tuple(
+        (relative_path, snapshot_file._snapshot_generation_by_stat(tmp_path, relative_path))
+        for relative_path in paths
+    )
+    original_open = snapshot_file.os.open
+    opened: list[object] = []
+
+    def record_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        """Record secure directory opens while preserving the real descriptor behavior."""
+        opened.append(path)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(snapshot_file.os, "open", record_open)
+    monkeypatch.setattr(
+        snapshot_file.os,
+        "supports_dir_fd",
+        {*snapshot_file.os.supports_dir_fd, record_open},
+    )
+    snapshot_file.validate_snapshot_generations(tmp_path, generations)
+    assert opened.count("catalogs") == 1
+
+
+def test_batch_generation_validation_rejects_replaced_sibling(tmp_path: Path) -> None:
+    """One changed sibling invalidates the whole cached pair before SQLite writes."""
+    parent = tmp_path / "catalogs"
+    parent.mkdir()
+    paths = ("catalogs/chain.json", "catalogs/chain.models.json")
+    for relative_path in paths:
+        (tmp_path / relative_path).write_bytes(b"{}")
+    generations = tuple(
+        (relative_path, snapshot_file._snapshot_generation_by_stat(tmp_path, relative_path))
+        for relative_path in paths
+    )
+    changed = tmp_path / paths[1]
+    changed.unlink()
+    changed.write_bytes(b"[]")
+    with pytest.raises(ValueError, match="changed"):
+        snapshot_file.validate_snapshot_generations(tmp_path, generations)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow leaf stat")
+def test_batch_generation_validation_rejects_symlink_leaf(tmp_path: Path) -> None:
+    """Batch validation retains the regular-file and no-follow requirement."""
+    path = tmp_path / "snapshot.json"
+    target = tmp_path / "target.json"
+    path.write_bytes(b"{}")
+    target.write_bytes(b"{}")
+    generation = snapshot_file._snapshot_generation_by_stat(tmp_path, "snapshot.json")
+    path.unlink()
+    path.symlink_to(target)
+    with pytest.raises(ValueError, match="regular file"):
+        snapshot_file.validate_snapshot_generations(tmp_path, (("snapshot.json", generation),))
+
+
+def test_batch_generation_validation_preserves_missing_ancestor_identity(tmp_path: Path) -> None:
+    """A cached absent path stays valid only while its recorded ancestor prefix is absent."""
+    relative_path = "missing/catalogs/snapshot.json"
+    generation = snapshot_file._snapshot_generation_by_stat(tmp_path, relative_path)
+    expected = ((relative_path, generation),)
+    snapshot_file.validate_snapshot_generations(tmp_path, expected)
+    parent = tmp_path / "missing/catalogs"
+    parent.mkdir(parents=True)
+    (parent / "snapshot.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="changed"):
+        snapshot_file.validate_snapshot_generations(tmp_path, expected)
+
+
 def test_growth_after_initial_stat_still_obeys_the_read_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

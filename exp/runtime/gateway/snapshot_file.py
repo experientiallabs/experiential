@@ -281,6 +281,96 @@ def validate_snapshot_generation(
         raise ValueError("serving snapshot changed after preflight; retry the operation")
 
 
+def validate_snapshot_generations(
+    root: Path,
+    generations: tuple[tuple[str, SnapshotGeneration], ...],
+) -> None:
+    """Validate several snapshot generations while sharing sibling directory walks.
+
+    Args:
+        root: Trusted gateway directory containing the relative references.
+        generations: Relative paths and the exact generations captured at classification.
+
+    Raises:
+        ValueError: A path is unsafe, a leaf is not a regular file, or a generation changed.
+    """
+    if not generations:
+        return
+    if (
+        os.name == "nt"
+        or os.stat not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+        or os.open not in os.supports_dir_fd
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        for relative_path, generation in generations:
+            validate_snapshot_generation(root, relative_path, generation)
+        return
+
+    grouped: dict[tuple[str, ...], list[tuple[str, SnapshotGeneration]]] = {}
+    for relative_path, generation in generations:
+        relative = Path(relative_path)
+        windows = PureWindowsPath(relative_path)
+        if (
+            relative.is_absolute()
+            or windows.is_absolute()
+            or windows.drive
+            or not relative.parts
+            or any(part in (".", "..") for part in relative.parts)
+        ):
+            raise ValueError("budget catalog snapshot reference escapes gateway state")
+        grouped.setdefault(relative.parts[:-1], []).append((relative.parts[-1], generation))
+
+    root_descriptor = os.open(root.resolve(), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        root_identity = _handle_identity(root_descriptor)
+        for parent, leaves in grouped.items():
+            directories: list[int] = []
+            directory = root_descriptor
+            identities = [root_identity]
+            missing_parent = False
+            try:
+                for part in parent:
+                    try:
+                        child = os.open(
+                            part,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory,
+                        )
+                    except FileNotFoundError:
+                        missing_parent = True
+                        break
+                    directories.append(child)
+                    directory = child
+                    identities.append(_handle_identity(child))
+                for leaf, expected in leaves:
+                    if missing_parent:
+                        observed: SnapshotGeneration = (tuple(identities), None)
+                    else:
+                        try:
+                            info = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
+                        except FileNotFoundError:
+                            observed = (tuple(identities), None)
+                        else:
+                            if not stat.S_ISREG(info.st_mode):
+                                raise ValueError("budget catalog snapshot must be a regular file")
+                            leaf_identity = (info.st_dev, info.st_ino.to_bytes(16, "big"))
+                            observed = (
+                                (*identities, leaf_identity),
+                                _stat_file_stamp(info),
+                            )
+                    if observed != expected:
+                        raise ValueError(
+                            "serving snapshot changed after preflight; retry the operation"
+                        )
+            finally:
+                for descriptor in reversed(directories):
+                    os.close(descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
 def _snapshot_generation_by_stat(root: Path, relative_path: str) -> SnapshotGeneration:
     """Fence one POSIX snapshot with secure directory opens and a no-follow leaf stat."""
     relative = Path(relative_path)

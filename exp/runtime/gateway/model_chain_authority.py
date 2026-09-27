@@ -35,7 +35,7 @@ from exp.runtime.gateway.snapshot_file import (
     SnapshotSizeError,
     prepare_snapshot_file,
     read_snapshot_bytes,
-    validate_snapshot_generation,
+    validate_snapshot_generations,
 )
 from exp.runtime.gateway.stream_contracts import GatewayFailure, GatewayFailureClass
 
@@ -671,8 +671,7 @@ class SQLiteChainPreflight:
             for prepared in self.files:
                 prepared.validate_current()
             root = Path(self._database).parent
-            for relative_path, generation in self._file_generations:
-                validate_snapshot_generation(root, relative_path, generation)
+            validate_snapshot_generations(root, tuple(self._file_generations))
         except (OSError, ValueError) as exc:
             raise ModelChainAuthorityError(
                 "serving snapshot changed after preflight; retry the operation"
@@ -741,8 +740,9 @@ def prepare_sqlite_chain_authority(
                     generations, anchors = cached
                     try:
                         root = Path(database).parent
-                        for relative_path, generation in zip(sources, generations, strict=True):
-                            validate_snapshot_generation(root, relative_path, generation)
+                        validate_snapshot_generations(
+                            root, tuple(zip(sources, generations, strict=True))
+                        )
                     except (OSError, ValueError):
                         classification_memo.invalidate(key)
                     else:
