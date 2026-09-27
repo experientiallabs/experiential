@@ -160,8 +160,15 @@ The response contains `id`, the requested public `model` alias, `answers` under 
 question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
 values, not assistant text. Probabilities and confidence must be finite values from 0 to 1,
 distributions must sum to 1 within validation tolerance, the selected choice must have the highest
-probability, and a score must match the distribution's weighted zero-based index. Missing answers, mismatched types or criteria, and missing or invalid
-usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
+probability, and a score must be consistent with the distribution's weighted zero-based index.
+Scores and probabilities retain their provider values: they are never recomputed or normalized.
+Exact numeric consistency uses a `1e-6` tolerance. If the score and every probability are
+hundredth-valued, the score may instead match a unit distribution within their independently
+rounded half-hundredth intervals, clipped to `[0, 1]`. This bounded check respects the shared
+probability mass and admits closed interval endpoints because rounding ties are unspecified.
+Finer-precision inconsistent scores remain invalid. Probability totals still use the `1e-6`
+normalization check; category winners must still have the greatest published probability.
+Missing answers, mismatched types or criteria, and missing or invalid usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
 
 Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
 name, and at most 262,144 bytes for both the raw body and the normalized request. Duplicate JSON

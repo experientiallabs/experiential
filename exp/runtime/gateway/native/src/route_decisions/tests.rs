@@ -180,6 +180,123 @@ fn score_requires_exact_legend_index_set_and_expected_value() {
     assert_malformed(provider);
 }
 
+fn score_payload(probabilities: &[f64], score: f64) -> (DecisionsAdmission, Value) {
+    let mut admitted = admission();
+    let criteria: Vec<Value> = (0..probabilities.len())
+        .map(|i| json!(format!("Level {i}")))
+        .collect();
+    admitted.questions["quantity"]["criteria"] = json!(criteria);
+    let legend: Map<String, Value> = criteria
+        .into_iter()
+        .enumerate()
+        .map(|(i, value)| (i.to_string(), value))
+        .collect();
+    let probabilities: Map<String, Value> = probabilities
+        .iter()
+        .enumerate()
+        .map(|(i, value)| (i.to_string(), json!(value)))
+        .collect();
+    let mut provider = payload();
+    provider["answers"]["quantity"]["legend"] = json!(legend);
+    provider["answers"]["quantity"]["probabilities"] = json!(probabilities);
+    provider["answers"]["quantity"]["score"] = json!(score);
+    (admitted, provider)
+}
+
+#[test]
+fn independently_rounded_live_scores_preserve_provider_answers_and_usage() {
+    // Numeric values from bounded synthetic jev-1.13.0 calls, never customer data.
+    for (probabilities, score) in [
+        (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.12),
+        (vec![0.01, 0.0, 0.01, 0.07, 0.91], 3.88),
+        (
+            vec![0.84, 0.12, 0.02, 0.01, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0],
+            0.26,
+        ),
+        (
+            vec![0.0, 0.07, 0.31, 0.43, 0.15, 0.03, 0.01, 0.0, 0.0, 0.0],
+            2.78,
+        ),
+    ] {
+        let (admitted, provider) = score_payload(&probabilities, score);
+        let (public, usage) = public_decisions(provider.clone(), &admitted)
+            .expect("independently rounded score compatible with a unit distribution");
+        assert_eq!(public["answers"], provider["answers"]);
+        assert_eq!(usage.input_tokens, Some(451));
+        assert_eq!(usage.output_tokens, Some(68));
+    }
+}
+
+#[test]
+fn rounding_never_excuses_infeasible_scores_or_high_precision_disagreement() {
+    for (probabilities, score) in [
+        (vec![1.0, 0.0, 0.0, 0.0, 0.0], 0.03),
+        (vec![0.0, 0.0, 0.0, 0.0, 1.0], 3.97),
+        (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.5),
+        (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.12001),
+        (vec![0.0, 0.870001, 0.129999, 0.0, 0.0], 1.12),
+        (vec![0.33, 0.33, 0.33], 1.0),
+        (vec![0.34, 0.34, 0.34, 0.0, 0.0], 1.02),
+        (vec![0.0, 0.87, 0.13, 0.0, 0.0], -0.01),
+        (vec![0.0, 0.87, 0.13, 0.0, 0.0], 4.01),
+    ] {
+        let (admitted, provider) = score_payload(&probabilities, score);
+        let failure = public_decisions(provider, &admitted).expect_err("inconsistent score");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        assert!(!failure.retryable_same_deployment);
+        assert!(!failure.failover_eligible);
+    }
+    let (admitted, provider) = score_payload(&[0.0, 0.870001, 0.129999], 1.129999);
+    public_decisions(provider, &admitted).expect("consistent higher precision is still valid");
+}
+
+#[test]
+fn score_rounding_bounds_respect_clipping_and_shared_probability_mass() {
+    // Only half a percent may leave a unit bin, not half a percent per zero bin.
+    let (admitted, provider) = score_payload(&[1.0, 0.0, 0.0, 0.0, 0.0], 0.02);
+    public_decisions(provider, &admitted).expect("feasible clipped rounding envelope");
+    let (admitted, provider) = score_payload(&[0.5, 0.5], 0.51);
+    public_decisions(provider, &admitted).expect("closed rounding envelopes may touch");
+    let (admitted, provider) = score_payload(&[0.5, 0.5], 0.52);
+    assert!(public_decisions(provider, &admitted).is_err());
+}
+
+#[test]
+fn rounding_extrema_match_an_independent_three_bin_enumeration() {
+    for probabilities in [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.33, 0.33, 0.34],
+        [0.2, 0.3, 0.5],
+    ] {
+        // Twice as fine as the production half-cent grid: include interior and
+        // boundary candidates without sharing the greedy allocation algorithm.
+        let bins = probabilities.map(|p| (p * 400.0_f64).round() as i64);
+        let mut possible = Vec::new();
+        for a in (bins[0] - 2).max(0)..=(bins[0] + 2).min(400) {
+            for b in (bins[1] - 2).max(0)..=(bins[1] + 2).min(400) {
+                let c = 400 - a - b;
+                if c >= (bins[2] - 2).max(0) && c <= (bins[2] + 2).min(400) {
+                    possible.push(b + 2 * c);
+                }
+            }
+        }
+        let minimum = *possible.iter().min().unwrap();
+        let maximum = *possible.iter().max().unwrap();
+        for score_hundredths in 0..=200 {
+            let feasible =
+                score_hundredths * 4 + 2 >= minimum && score_hundredths * 4 - 2 <= maximum;
+            assert_eq!(
+                score_matches_distribution(score_hundredths as f64 / 100.0, &probabilities),
+                feasible,
+                "{probabilities:?}, score={score_hundredths}"
+            );
+        }
+    }
+    assert_eq!(hundredths(0.8200000000000001), Some(82));
+    assert_eq!(hundredths(0.82000001), None);
+}
+
 #[test]
 fn structured_score_levels_require_exact_deep_legend_equality() {
     let mut admitted = admission();
