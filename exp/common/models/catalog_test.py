@@ -1015,3 +1015,33 @@ def test_anthropic_inference_geography_round_trip_and_identity(tmp_path: Path) -
         ConnectionConfig(provider="openai", inference_geo="us")
     with pytest.raises(ValidationError, match="inference_geo"):
         ConnectionConfig.model_validate({"provider": "anthropic", "inference_geo": "global"})
+
+
+def test_plan_connections_bind_each_kind_to_its_one_provider() -> None:
+    """A ChatGPT plan is an openai sign-in and a Claude plan an anthropic one, and nothing else."""
+    assert ConnectionConfig(provider="openai", subscription="chatgpt").subscription == "chatgpt"
+    assert (
+        ConnectionConfig(provider="anthropic", subscription="anthropic").subscription == "anthropic"
+    )
+    with pytest.raises(ValueError, match="sign-in for provider 'anthropic'"):
+        ConnectionConfig(provider="openai", subscription="anthropic")
+    with pytest.raises(ValueError, match="omit api_key_env"):
+        ConnectionConfig(provider="openai", subscription="chatgpt", api_key_env="OPENAI_API_KEY")
+    with pytest.raises(ValueError, match="omit base_url"):
+        ConnectionConfig(
+            provider="anthropic",
+            subscription="anthropic",
+            base_url="https://example.com/v1",
+            trusted_custom_origin=True,
+        )
+
+
+def test_plan_identity_differs_from_the_api_key_origin_and_serializes_only_when_set() -> None:
+    """A plan is a different endpoint identity; API-key connections keep their exact bytes."""
+    plan = ConnectionConfig(provider="anthropic", subscription="anthropic")
+    key = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
+
+    assert plan.identity_sha256() != key.identity_sha256()
+    assert "subscription" not in key.model_dump(mode="json")
+    assert plan.model_dump(mode="json")["subscription"] == "anthropic"
+    assert ConnectionConfig.model_validate(plan.model_dump(mode="json")) == plan

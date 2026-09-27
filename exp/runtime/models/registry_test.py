@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import json
+from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
 import pytest
 
+from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, StoredOAuthTokens
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
     AssistantAction,
@@ -31,7 +35,9 @@ from exp.runtime.models.credentials import (
 from exp.runtime.models.credentials_test import AtomicEnvironment
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
 from exp.runtime.models.providers.anthropic import AnthropicClient
+from exp.runtime.models.providers.anthropic_subscription import AnthropicSubscriptionClient
 from exp.runtime.models.providers.azure import AzureClient
+from exp.runtime.models.providers.chatgpt_subscription import ChatGptSubscriptionClient
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
@@ -707,3 +713,120 @@ def test_anthropic_connection_geography_reaches_both_client_paths() -> None:
         ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
     )
     assert payload["inference_geo"] == "us"
+
+
+def test_subscription_connection_resolves_to_a_plan_client_that_signs_each_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A chatgpt plan connection needs no environment key; its client mints bearers itself."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    plan = ConnectionConfig(provider="openai", subscription="chatgpt")
+    access = _plan_jwt(exp_seconds=4_000_000_000, account="acct-plan")
+    store.put_oauth(
+        "plan",
+        StoredOAuthTokens(
+            access_token=access,
+            refresh_token="refresh",
+            expires_at_ms=4_000_000_000_000,
+            account_id="acct-plan",
+        ),
+        binding=StoredCredentialBinding(provider="openai", endpoint_sha256=plan.identity_sha256()),
+    )
+    catalog = ModelCatalog(
+        connections={"plan": plan},
+        models={
+            "codex": ModelRecord(
+                connection="plan",
+                model="gpt-5.6-sol",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=_DEFAULT_CAPABILITIES,
+            )
+        },
+        roles=ModelRoles(candidates=("codex",), incumbent="codex"),
+    )
+
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={},
+        transport_factory=lambda: ScriptedJsonTransport([]),
+        auth_store=store,
+    ).resolve("codex")
+
+    assert isinstance(resolved.client, ChatGptSubscriptionClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.url == "https://chatgpt.com/backend-api/codex/responses"
+    assert profile.headers["chatgpt-account-id"] == "acct-plan"
+    assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
+        "Authorization": f"Bearer {access}"
+    }
+    assert resolved.embedding_client is None
+
+
+def _plan_jwt(*, exp_seconds: int, account: str) -> str:
+    """Return an unsigned JWT carrying a ChatGPT account claim and ``exp``."""
+    payload = json.dumps(
+        {"exp": exp_seconds, "https://api.openai.com/auth": {"chatgpt_account_id": account}}
+    ).encode()
+    segment = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    return f"header.{segment}.signature"
+
+
+def test_claude_plan_connection_needs_the_operator_app_and_then_signs_each_dispatch() -> None:
+    """A Claude plan refuses without the operator's Anthropic app.
+
+    With one, the injected token source mints the bearer and the app's headers ride the wire
+    profile.
+    """
+    plan = ConnectionConfig(provider="anthropic", subscription="anthropic")
+    catalog = ModelCatalog(
+        connections={"claude-plan": plan},
+        models={
+            "claude": ModelRecord(
+                connection="claude-plan",
+                model="claude-sonnet-5",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=_DEFAULT_CAPABILITIES,
+            )
+        },
+        roles=ModelRoles(candidates=("claude",), incumbent="claude"),
+    )
+    tokens = StoredOAuthTokens(access_token="injected", refresh_token="r", expires_at_ms=1)
+
+    class _Source:
+        """An embedder-supplied token source."""
+
+        connection_id = "claude-plan"
+
+        def current(self) -> StoredOAuthTokens:
+            """Return the injected sign-in."""
+            return tokens
+
+    built: list[str] = []
+
+    def factory(*, connection_id: str, connection: ConnectionConfig) -> _Source:
+        """Record which connection asked for a source."""
+        built.append(f"{connection_id}:{connection.subscription}")
+        return _Source()
+
+    with pytest.raises(ModelConnectionError, match="OAuth app Anthropic issued"):
+        RuntimeModelCatalog(catalog, environment={}).resolve("claude")
+
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={
+            "EXP_ANTHROPIC_OAUTH_CLIENT_ID": "experiential-issued",
+            "EXP_ANTHROPIC_OAUTH_REDIRECT_URI": "https://platform.example.test/cb",
+            "EXP_ANTHROPIC_OAUTH_BETA": "oauth-2025-04-20",
+        },
+        transport_factory=lambda: ScriptedJsonTransport([]),
+        subscription_token_source_factory=factory,
+    ).resolve("claude")
+
+    assert isinstance(resolved.client, AnthropicSubscriptionClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert "Authorization" not in profile.headers
+    assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
+        "Authorization": "Bearer injected"
+    }
+    assert built == ["claude-plan:anthropic"]

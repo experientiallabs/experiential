@@ -72,6 +72,7 @@ from exp.runtime.gateway.native_settlement import (
     failure_from_boundary_payload,
     ledger_failure,
     settlement_metadata,
+    settlement_rate_limit,
     terminal_from_settlement,
     tool_search_requests_from_terminal,
     tool_search_requests_kwarg,
@@ -702,7 +703,7 @@ class NativeAttemptAccounting:
             with self._lock:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
-        self._record_health(entry, attempt_id, opened=opened, failure=failure)
+        self._record_health(entry, attempt_id, opened=opened, failure=failure, settlement=data)
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
             self.recovery,
@@ -809,18 +810,22 @@ class NativeAttemptAccounting:
         *,
         opened: bool,
         failure: GatewayFailure | None,
+        settlement: JsonObject | None = None,
     ) -> None:
         """Apply one settled attempt's outcome to the deployment circuits.
 
         Mirrors the executor's recording order: a successful dispatch opening
         restores admission first, then the terminal outcome either closes the
-        circuit or counts against it.
+        circuit or counts against it. A plan rung whose response reports a used-up
+        usage window is throttled until that window resets, success or not, so a
+        pool of plans rotates before the first 429.
 
         Args:
             entry: The owning in-flight request.
             attempt_id: The settled attempt.
             opened: Whether the provider dispatch opened successfully.
             failure: The terminal failure, or ``None`` for a success.
+            settlement: The settlement payload carrying the harvested rate-limit headers.
         """
         # The rung's bounded-admission slot frees with the health recording:
         # both releases are idempotent, so settle, abandon, and the sweep can
@@ -854,6 +859,9 @@ class NativeAttemptAccounting:
             self._health.failed(key, failure)
         else:
             self._health.succeeded(key)
+        exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
+        if exhausted is not None:
+            self._health.exhausted(key, exhausted)
 
     def _record_cache_fraction(
         self, entry: InflightRequest, attempt_id: str, terminal: GatewayEvent
@@ -962,7 +970,7 @@ class NativeAttemptAccounting:
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False
             return False
-        self._record_health(entry, attempt_id, opened=False, failure=failure)
+        self._record_health(entry, attempt_id, opened=False, failure=failure, settlement=settlement)
         # A retained settlement that finally lands through the sweep carries
         # the same observed usage as the direct path, so the cache-priority
         # EWMA must not depend on WHICH recovery path succeeded.

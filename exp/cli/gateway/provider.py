@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 
 import typer
+from rich.console import Console
 
 from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
+from exp.cli.providers.anthropic_sign_in import anthropic_paste_sign_in
+from exp.cli.providers.chatgpt_sign_in import chatgpt_browser_sign_in
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.common.core.artifacts import ContractModel
+from exp.common.auth import ProviderAuthStore, StoredOAuthTokens
+from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.core.locks import FileLockTimeout
 from exp.common.models import ConnectionConfig
+from exp.common.models.catalog import SubscriptionKind
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.models.credentials import connection_credential_binding
+from exp.runtime.models.providers.anthropic_subscription import (
+    AnthropicPlanError,
+    anthropic_oauth_app_from_environment,
+)
+from exp.runtime.models.providers.chatgpt_subscription import (
+    ChatGptSignInError,
+    chatgpt_account_claims,
+    tokens_from_codex_auth_file,
+)
 
 provider_app = typer.Typer(
     help="Manage role-free gateway provider connections.", no_args_is_help=True
@@ -28,6 +44,16 @@ _AZURE_API_SURFACE_OPTION = typer.Option(None, "--azure-api-surface")
 _REGION_OPTION = typer.Option(None, "--region")
 _CLEAR_CREDENTIALS_OPTION = typer.Option(False, "--clear-credentials")
 _CLEAR_REGION_OPTION = typer.Option(False, "--clear-region")
+_SUBSCRIPTION_OPTION = typer.Option(
+    None,
+    "--subscription",
+    help="Sign in with a consumer plan instead of an API key (chatgpt).",
+)
+_CODEX_AUTH_FILE_OPTION = typer.Option(
+    None,
+    "--codex-auth-file",
+    help="Import an existing Codex auth.json sign-in instead of opening the browser.",
+)
 
 
 class GatewayProviderView(ContractModel):
@@ -35,6 +61,7 @@ class GatewayProviderView(ContractModel):
 
     name: str
     provider: str
+    subscription: SubscriptionKind | None = None
     credential_env: str | None = None
     access_key_id_env: str | None = None
     bedrock_auth_mode: str | None = None
@@ -95,6 +122,7 @@ def provider_list(root: Path = ROOT_OPTION, json_output: bool = _JSON_OPTION) ->
         GatewayProviderView(
             name=name,
             provider=connection.provider,
+            subscription=connection.subscription,
             credential_env=connection.api_key_env,
             access_key_id_env=connection.aws_access_key_id_env,
             bedrock_auth_mode=connection.bedrock_auth_mode,
@@ -107,6 +135,85 @@ def provider_list(root: Path = ROOT_OPTION, json_output: bool = _JSON_OPTION) ->
         for name, connection in ((authority.connection_id, authority.config),)
     )
     emit_items("providers", items, json_output=json_output)
+
+
+def _acquire_plan_sign_in(
+    *,
+    subscription: SubscriptionKind,
+    codex_auth_file: Path | None,
+    non_interactive: bool,
+) -> StoredOAuthTokens:
+    """Obtain the plan sign-in for a subscription connection.
+
+    Args:
+        subscription: The plan kind being connected.
+        codex_auth_file: Optional Codex ``auth.json`` to import instead of the browser.
+        non_interactive: Whether a browser sign-in may be opened.
+
+    Returns:
+        The tokens to store under the connection.
+
+    Raises:
+        ValueError: No sign-in source is usable without a browser, or the source failed.
+    """
+    if subscription == "anthropic":
+        return _acquire_claude_plan_sign_in(
+            codex_auth_file=codex_auth_file, non_interactive=non_interactive
+        )
+    try:
+        if codex_auth_file is not None:
+            return tokens_from_codex_auth_file(codex_auth_file)
+        if non_interactive:
+            raise ValueError(
+                "a plan sign-in needs a browser; pass --codex-auth-file ~/.codex/auth.json to "
+                "import an existing Codex sign-in instead"
+            )
+        return chatgpt_browser_sign_in(console=Console())
+    except ChatGptSignInError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _acquire_claude_plan_sign_in(
+    *, codex_auth_file: Path | None, non_interactive: bool
+) -> StoredOAuthTokens:
+    """Obtain a Claude plan sign-in through the operator's Anthropic OAuth app.
+
+    Raises:
+        ValueError: No app is configured, the run is non-interactive, a Codex file was named,
+            or the sign-in failed.
+    """
+    if codex_auth_file is not None:
+        raise ValueError("--codex-auth-file imports a ChatGPT sign-in, not a Claude plan")
+    if non_interactive:
+        raise ValueError("a Claude plan sign-in needs the browser and a pasted redirect address")
+    try:
+        app = anthropic_oauth_app_from_environment(os.environ)
+        if app is None:
+            raise ValueError(
+                "Claude plan sign-in needs the OAuth app Anthropic issued to this operator; "
+                "set EXP_ANTHROPIC_OAUTH_CLIENT_ID and EXP_ANTHROPIC_OAUTH_REDIRECT_URI"
+            )
+        console = Console()
+        return anthropic_paste_sign_in(app, console=console, read_line=console.input)
+    except AnthropicPlanError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _upsert_connection(
+    *,
+    name: str,
+    config: ConnectionConfig,
+    root: Path,
+    replace: bool,
+) -> bool:
+    """Create or revise one connection, translating store failures to usage errors."""
+    with usage_error(ValueError, FileLockTimeout):
+        changed, _authority = GatewayManagement(root).upsert_provider_connection(
+            connection_id=name,
+            config=config,
+            replace=replace,
+        )
+    return changed
 
 
 @provider_app.command("add")
@@ -123,34 +230,66 @@ def provider_add(
         _AZURE_API_SURFACE_OPTION
     ),
     region: str | None = _REGION_OPTION,
+    subscription: SubscriptionKind | None = _SUBSCRIPTION_OPTION,
+    codex_auth_file: Path | None = _CODEX_AUTH_FILE_OPTION,
     replace: bool = typer.Option(False, "--replace"),
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
-    """Add one environment-reference-only provider connection."""
-    del non_interactive
-    with usage_error(ValueError, FileLockTimeout):
-        changed, _authority = GatewayManagement(root).upsert_provider_connection(
-            connection_id=name,
-            config=ConnectionConfig(
-                provider=provider,
-                base_url=base_url,
-                api_key_env=credential_env,
-                aws_access_key_id_env=access_key_id_env,
-                bedrock_auth_mode=bedrock_auth_mode,
-                api_version=api_version,
-                azure_api_surface=azure_api_surface,
-                region=region,
-            ),
-            replace=replace,
+    """Add one provider connection: an environment-reference-only key, or a plan sign-in.
+
+    A ``--subscription`` connection signs in through the browser (or imports a Codex
+    ``auth.json``) and stores the tokens in the user-only credential file under the
+    connection name; re-running with ``--replace`` signs in again.
+    """
+    with usage_error(ValueError):
+        if codex_auth_file is not None and subscription is None:
+            raise ValueError("--codex-auth-file requires --subscription chatgpt")
+        config = ConnectionConfig(
+            provider=provider,
+            base_url=base_url,
+            api_key_env=credential_env,
+            subscription=subscription,
+            aws_access_key_id_env=access_key_id_env,
+            bedrock_auth_mode=bedrock_auth_mode,
+            api_version=api_version,
+            azure_api_surface=azure_api_surface,
+            region=region,
         )
+        tokens = (
+            None
+            if subscription is None
+            else _acquire_plan_sign_in(
+                subscription=subscription,
+                codex_auth_file=codex_auth_file,
+                non_interactive=non_interactive,
+            )
+        )
+    changed = _upsert_connection(name=name, config=config, root=root, replace=replace)
+    data: JsonObject = {}
+    if credential_env is not None:
+        data["credential_env"] = credential_env
+    if tokens is not None and subscription is not None:
+        with usage_error(ValueError, FileLockTimeout):
+            ProviderAuthStore().put_oauth(
+                name, tokens, binding=connection_credential_binding(config)
+            )
+            plan_type = (
+                chatgpt_account_claims(tokens.access_token).plan_type
+                if subscription == "chatgpt"
+                else None
+            )
+        data["subscription"] = subscription
+        data["sign_in"] = "codex-auth-file" if codex_auth_file is not None else "browser"
+        if plan_type is not None:
+            data["plan_type"] = plan_type
     emit_receipt(
         GatewayReceipt(
             operation="provider.add",
             resource_kind="provider",
             resource_id=name,
             changed=changed,
-            data={"credential_env": credential_env} if credential_env is not None else {},
+            data=data,
         ),
         json_output=json_output,
         human=f"provider {name} configured={changed}",
@@ -199,26 +338,48 @@ def provider_update(
                 clear_credentials=clear_credentials,
             )
         )
-    provider_add(
-        name=name,
-        provider=provider,
-        root=root,
-        credential_env=updated_credential_env,
-        access_key_id_env=updated_access_key_id_env,
-        bedrock_auth_mode=updated_bedrock_auth_mode,
-        base_url=current.base_url if base_url is None and same_provider else base_url,
-        api_version=current.api_version if api_version is None and same_provider else api_version,
-        azure_api_surface=(
-            current.azure_api_surface
-            if azure_api_surface is None and same_provider and provider == "azure"
-            else azure_api_surface
+    del non_interactive
+    with usage_error(ValueError):
+        config = ConnectionConfig(
+            provider=provider,
+            base_url=current.base_url if base_url is None and same_provider else base_url,
+            api_key_env=updated_credential_env,
+            # A plan sign-in survives an update untouched; re-authenticating is
+            # 'provider add NAME --subscription chatgpt --replace'.
+            subscription=current.subscription if same_provider else None,
+            aws_access_key_id_env=updated_access_key_id_env,
+            bedrock_auth_mode=updated_bedrock_auth_mode,
+            api_version=(
+                current.api_version if api_version is None and same_provider else api_version
+            ),
+            azure_api_surface=(
+                current.azure_api_surface
+                if azure_api_surface is None and same_provider and provider == "azure"
+                else azure_api_surface
+            ),
+            region=(
+                None
+                if clear_region
+                else current.region
+                if region is None and same_provider
+                else region
+            ),
+        )
+    changed = _upsert_connection(name=name, config=config, root=root, replace=True)
+    emit_receipt(
+        GatewayReceipt(
+            operation="provider.add",
+            resource_kind="provider",
+            resource_id=name,
+            changed=changed,
+            data=(
+                {"credential_env": updated_credential_env}
+                if updated_credential_env is not None
+                else {}
+            ),
         ),
-        region=(
-            None if clear_region else current.region if region is None and same_provider else region
-        ),
-        replace=True,
-        non_interactive=non_interactive,
         json_output=json_output,
+        human=f"provider {name} configured={changed}",
     )
 
 

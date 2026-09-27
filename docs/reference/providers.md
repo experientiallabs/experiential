@@ -54,6 +54,8 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Provider | Catalog `provider` | Credential | Endpoint identity |
 |---|---|---|---|
 | OpenAI | `openai` | `api_key_env` (suggested `OPENAI_API_KEY`) | Official OpenAI origin |
+| ChatGPT plan | `openai` with `subscription = "chatgpt"` | Browser sign-in stored under the connection ID; no `api_key_env` | `https://chatgpt.com/backend-api/codex` |
+| Claude plan | `anthropic` with `subscription = "anthropic"` | Sign-in through the operator's Anthropic OAuth app; no `api_key_env` | Official Anthropic origin |
 | OpenRouter | `openrouter` | `api_key_env` (suggested `OPENROUTER_API_KEY`) | Official OpenRouter origin |
 | Anthropic | `anthropic` | `api_key_env` (suggested `ANTHROPIC_API_KEY`) | Official Anthropic origin |
 | Gemini | `gemini` | `api_key_env` (suggested `GEMINI_API_KEY`) | Official Gemini origin |
@@ -67,6 +69,45 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
+
+## Plan connections (ChatGPT and Claude)
+
+A connection may dispatch on a consumer plan instead of an API key: `subscription = "chatgpt"`
+(provider `openai`) or `subscription = "anthropic"` (provider `anthropic`). The connection names
+no credential and accepts no endpoint override. Its sign-in is an OAuth token pair stored under
+the connection ID (a `type = "oauth"` record in the user-only credential file for the local
+gateway; an embedder's own secret store when it supplies `subscription_token_source_factory`).
+The gateway mints a fresh bearer for every physical dispatch through the body-signing seam,
+refreshing five minutes ahead of expiry and persisting the rotated refresh token.
+
+Several plan connections certified into one exact-model pool are a rotating pool. Each response
+carries the plan's rolling usage windows (`x-codex-{primary,secondary}-*` for ChatGPT,
+`anthropic-ratelimit-unified-{5h,7d}-*` for Claude). The gateway reads them as a short and a
+long window, and a window at 100 percent (or a Claude `rejected` status) throttles that plan
+until the stated reset, so traffic moves to the next plan before the first 429 while sticky
+affinity keeps a conversation on one plan while it has room.
+
+```console
+exp config gateway provider add plan-a --provider openai --subscription chatgpt --root ROOT
+exp config gateway provider add plan-b --provider openai --subscription chatgpt \
+  --codex-auth-file ~/.codex/auth.json --non-interactive --root ROOT
+exp config gateway provider add claude-a --provider anthropic --subscription anthropic --root ROOT
+```
+
+A ChatGPT plan signs in through the public Codex OAuth client on its registered loopback callback
+(`localhost:1455`) or imports an existing Codex sign-in; the gateway sends its own
+`originator`. A Claude plan signs in through the OAuth application Anthropic issued to the
+OPERATOR of the gateway, configured with `EXP_ANTHROPIC_OAUTH_CLIENT_ID` and
+`EXP_ANTHROPIC_OAUTH_REDIRECT_URI` (optional: `_AUTHORIZE_URL`, `_TOKEN_URL`, `_SCOPES`, and
+`_BETA`, sent as `anthropic-beta` when the approval names one). Without that app a Claude plan
+connection refuses to resolve. The gateway never presents another client's identity: the app
+refuses Claude Code's public client ID and any `claude-code`/`claude-cli` identity header.
+
+Plan backends differ from the API-key origins. The ChatGPT backend streams only, requires provider
+storage off, and rejects `max_output_tokens`, so its wire profile drops the ceiling structurally.
+A plan rung pre-serializes its body for the per-dispatch bearer, so the engine's
+encrypted-reasoning replay repair does not run on it. Plan connections serve the gateway only;
+`exp config providers`, build, and optimize keep using API keys.
 
 ## TypeSafe SystemOne decisions
 

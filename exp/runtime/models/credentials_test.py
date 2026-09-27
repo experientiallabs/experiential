@@ -12,6 +12,7 @@ from exp.common.auth import (
     ProviderAuthStore,
     StoredCredentialBinding,
     StoredCredentialEndpointMismatch,
+    StoredOAuthTokens,
 )
 from exp.common.models import ConnectionConfig
 from exp.runtime.models.credentials import (
@@ -438,3 +439,18 @@ def test_resolution_repr_never_includes_the_secret() -> None:
     assert _SECRET not in str(resolved)
     assert resolved.value == _SECRET
     assert resolved.source == "stored"
+
+
+def test_subscription_connection_never_resolves_as_an_api_key(tmp_path: Path) -> None:
+    """A plan connection resolves no key, even with a sign-in stored under its name."""
+    plan = ConnectionConfig(provider="openai", subscription="chatgpt")
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put_oauth(
+        "plan",
+        StoredOAuthTokens(access_token="a", refresh_token="r", expires_at_ms=1),
+        binding=_binding(plan),
+    )
+
+    assert lookup_connection_credential(plan, connection_id="plan", store=store) is None
+    with pytest.raises(ModelCredentialError, match="plan sign-in and has no API key"):
+        read_connection_api_key(plan, connection_id="plan", store=store)

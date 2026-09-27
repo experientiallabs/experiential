@@ -168,6 +168,22 @@ class ModelCatalogError(ValueError):
     """A local model catalog was malformed or named a credential value."""
 
 
+SubscriptionKind = Literal["chatgpt", "anthropic"]
+"""Consumer plan a connection signs in with instead of an API key.
+
+``chatgpt`` is a ChatGPT plan reaching the Codex Responses backend; ``anthropic`` is a Claude
+plan reaching the Messages API through the OAuth application Anthropic issued to the operator.
+The connection stores no credential NAME: the sign-in lives under the connection ID and the
+gateway mints a fresh bearer per dispatch from it.
+"""
+
+SUBSCRIPTION_PROVIDERS: dict[SubscriptionKind, str] = {
+    "chatgpt": "openai",
+    "anthropic": "anthropic",
+}
+"""The one catalog provider each plan kind is a sign-in for."""
+
+
 class ConnectionConfig(ContractModel):
     """Local provider connection metadata, with an optional credential environment name only."""
 
@@ -183,6 +199,8 @@ class ConnectionConfig(ContractModel):
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
     trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
+    """Consumer plan sign-in this connection dispatches on, instead of an API key."""
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -208,6 +226,8 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.subscription is not None:
+            self._require_bare_subscription_connection()
         if self.inference_geo is not None and self.provider != "anthropic":
             raise ValueError("inference_geo is only accepted for provider='anthropic'")
         if self.provider != "azure" and self.azure_api_surface is not None:
@@ -312,6 +332,37 @@ class ConnectionConfig(ContractModel):
             raise ValueError("connection metadata must not contain credential values") from exc
         return self
 
+    def _require_bare_subscription_connection(self) -> None:
+        """Reject credential names or endpoint overrides on a plan sign-in.
+
+        Raises:
+            ValueError: The plan names another provider, or the connection also carries an
+                API-key locator or any endpoint override.
+        """
+        if self.subscription is None:
+            return
+        expected = SUBSCRIPTION_PROVIDERS[self.subscription]
+        if self.provider != expected:
+            raise ValueError(
+                f"subscription {self.subscription!r} is a sign-in for provider {expected!r}, "
+                f"not {self.provider!r}"
+            )
+        if self.api_key_env is not None or self.aws_access_key_id_env is not None:
+            raise ValueError(
+                "a subscription connection signs in through the browser and stores no "
+                "credential environment name; omit api_key_env"
+            )
+        if (
+            self.base_url is not None
+            or self.api_version is not None
+            or self.region is not None
+            or self.trusted_custom_origin
+        ):
+            raise ValueError(
+                "a subscription connection reaches its plan's fixed backend; omit base_url "
+                "and every endpoint override"
+            )
+
     def identity_sha256(self) -> Sha256:
         """Return a deterministic digest of the secret-free provider endpoint identity.
 
@@ -336,6 +387,8 @@ class ConnectionConfig(ContractModel):
             identity["region"] = self.region
         if self.trusted_custom_origin:  # endpoint identity; added only when set
             identity["trusted_custom_origin"] = True
+        if self.subscription is not None:  # a different backend than the API-key origin
+            identity["subscription"] = self.subscription
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -374,6 +427,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("bedrock_auth_mode", None)
         if not self.trusted_custom_origin:
             serialized.pop("trusted_custom_origin", None)
+        if self.subscription is None:
+            serialized.pop("subscription", None)
         return serialized
 
 

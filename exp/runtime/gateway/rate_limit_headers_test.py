@@ -130,3 +130,121 @@ class TestPayloadTolerance:
         """A well-shaped payload map parses exactly like raw headers."""
         observation = rate_limit_observation_from_payload({"retry-after": "45"})
         assert observation.retry_after_seconds == 45
+
+
+class TestPlanWindows:
+    """The ChatGPT plan backend's ``x-codex-*`` usage windows become typed observations."""
+
+    def test_both_windows_parse_primary_first(self) -> None:
+        """Percent, reset, and length ride each window; the observation is not empty."""
+        observation = rate_limit_observation(
+            {
+                "X-Codex-Primary-Used-Percent": "22",
+                "x-codex-primary-reset-after-seconds": "11511",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-secondary-used-percent": "4",
+                "x-codex-secondary-reset-after-seconds": "598311",
+                "x-codex-secondary-window-minutes": "10080",
+            }
+        )
+
+        assert [window.window for window in observation.subscription_windows] == [
+            "primary",
+            "secondary",
+        ]
+        primary = observation.subscription_window("primary")
+        assert primary is not None
+        assert (primary.used_percent, primary.reset_after_seconds, primary.window_minutes) == (
+            22,
+            11_511,
+            300,
+        )
+        assert not observation.is_empty
+        assert observation.exhausted_reset_after_seconds is None
+
+    def test_exhaustion_takes_the_longest_reset_among_spent_windows(self) -> None:
+        """A spent long window outlasts a spent short one, so its reset is the wait."""
+        observation = rate_limit_observation(
+            {
+                "x-codex-primary-used-percent": "100",
+                "x-codex-primary-reset-after-seconds": "600",
+                "x-codex-secondary-used-percent": "100",
+                "x-codex-secondary-reset-after-seconds": "80000",
+            }
+        )
+
+        assert observation.exhausted_reset_after_seconds == 80_000
+
+    def test_a_window_without_a_percent_is_absent_and_garbage_fields_stay_none(self) -> None:
+        """Only a parseable used-percent reports a window; other garbled fields degrade."""
+        observation = rate_limit_observation(
+            {
+                "x-codex-primary-used-percent": "137",
+                "x-codex-primary-reset-after-seconds": "soon",
+                "x-codex-secondary-reset-after-seconds": "600",
+            }
+        )
+
+        primary = observation.subscription_window("primary")
+        assert primary is not None
+        assert primary.used_percent == 100
+        assert primary.exhausted
+        assert primary.reset_after_seconds is None
+        assert observation.subscription_window("secondary") is None
+        assert observation.exhausted_reset_after_seconds is None
+
+    def test_payload_without_plan_headers_has_no_windows(self) -> None:
+        """API-key rungs keep an empty window tuple."""
+        assert rate_limit_observation_from_payload({"retry-after": "5"}).subscription_windows == ()
+
+
+class TestClaudePlanWindows:
+    """A Claude plan's ``anthropic-ratelimit-unified-*`` windows map onto the plan window shape."""
+
+    _NOW = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+
+    def test_fraction_utilization_and_second_resets_parse_short_window_first(self) -> None:
+        """A 0..1 utilization becomes a percent; the reset is measured from now."""
+        reset = int(self._NOW.timestamp()) + 3_600
+        observation = rate_limit_observation(
+            {
+                "anthropic-ratelimit-unified-5h-utilization": "0.42",
+                "anthropic-ratelimit-unified-5h-reset": str(reset),
+                "anthropic-ratelimit-unified-7d-utilization": "7",
+                "anthropic-ratelimit-unified-7d-reset": str(reset * 1_000),
+            },
+            now=self._NOW,
+        )
+
+        primary = observation.subscription_window("primary")
+        secondary = observation.subscription_window("secondary")
+        assert primary is not None
+        assert secondary is not None
+        assert (primary.used_percent, primary.reset_after_seconds, primary.window_minutes) == (
+            42,
+            3_600,
+            300,
+        )
+        assert (secondary.used_percent, secondary.reset_after_seconds) == (7, 3_600)
+        assert observation.exhausted_reset_after_seconds is None
+
+    def test_a_rejected_status_is_a_used_up_window_whatever_the_utilization(self) -> None:
+        """The provider's own refusal verdict rotates the plan for the stated reset."""
+        reset = int(self._NOW.timestamp()) + 90_000
+        observation = rate_limit_observation(
+            {
+                "anthropic-ratelimit-unified-7d-status": "rejected",
+                "anthropic-ratelimit-unified-7d-reset": str(reset),
+            },
+            now=self._NOW,
+        )
+
+        assert observation.exhausted_reset_after_seconds == 90_000
+
+    def test_garbage_utilization_without_a_verdict_reports_no_window(self) -> None:
+        """An unparseable utilization and no rejected status is simply absent."""
+        observation = rate_limit_observation(
+            {"anthropic-ratelimit-unified-5h-utilization": "lots"}, now=self._NOW
+        )
+
+        assert observation.subscription_windows == ()

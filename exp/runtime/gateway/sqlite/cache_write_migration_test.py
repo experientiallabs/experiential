@@ -12,6 +12,7 @@ from exp.runtime.gateway.sqlite.cache_write_migration import (
     migrate_cache_write,
 )
 from exp.runtime.gateway.sqlite.migrations import (
+    SCHEMA_VERSION,
     GatewaySchemaError,
     connect_database,
     initialize_database,
@@ -98,7 +99,7 @@ def test_both_published_v22_layouts_preserve_attempt_evidence(
         added = {"upstream_provider"} if cache_layout else set(CACHE_WRITE_COLUMNS)
         assert after.keys() - before.keys() == added
         assert all(after[column] is None for column in added)
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:

@@ -323,7 +323,12 @@ def terminal_from_settlement(
             # the provider's own Retry-After when the data plane harvested the
             # rate-limit headers; sizing the throttle window from it is what
             # lets a daily-quota reset actually suppress the rung for hours.
-            observed = settlement_rate_limit(data).retry_after_seconds
+            observation = settlement_rate_limit(data)
+            observed = observation.retry_after_seconds
+            if observed is None:
+                # A plan backend's 429 states the wait as its exhausted usage
+                # window's reset rather than a Retry-After.
+                observed = observation.exhausted_reset_after_seconds
             if observed is not None:
                 failure = failure.model_copy(update={"retry_after_seconds": observed})
         # A rejected credential or exhausted account on the customer's own

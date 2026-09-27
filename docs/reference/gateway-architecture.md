@@ -429,8 +429,12 @@ rate-limit response headers per attempt when the data plane harvests them (`retr
 OpenAI `x-ratelimit-*` and Anthropic `anthropic-ratelimit-*` families, normalized to integers),
 and a throttled settlement carrying a parseable `Retry-After` (seconds or HTTP-date) sizes that
 deployment's throttle window from it, clamped to [5s, 6h], instead of the fixed default, so a
-daily-quota reset actually suppresses the rung for the wait the provider asked for. Pools and
-rungs that author none of this keep byte-identical behavior and null disclosure columns.
+daily-quota reset actually suppresses the rung for the wait the provider asked for. A plan
+rung (`subscription = "chatgpt"` or `"anthropic"`, see the providers reference) adds its rolling
+usage windows: a window at 100 percent throttles that rung until the stated reset, success or
+not, so a pool of plans rotates before the first 429, and its bearer is minted per physical
+dispatch through `sign_dispatch`, the hook Bedrock uses for SigV4. Pools and rungs that author
+none of this keep byte-identical behavior and null disclosure columns.
 
 Under `maximize_cache_affinity`, two further per-rung fields keep provider prompt caches warm
 across spills. `sticky_spill_seconds` gives each dispatch a worker-local

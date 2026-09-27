@@ -115,6 +115,10 @@ def lookup_connection_credential(
     """
     if connection.provider == "bedrock" and connection.api_key_env is None:
         return None
+    if connection.subscription is not None:
+        # A plan sign-in is not an API key; its bearer is minted per dispatch from the
+        # connection's subscription token source.
+        return None
     values = os.environ if environment is None else environment
     if connection.api_key_env is not None:
         if isinstance(values, CredentialEnvironment):
@@ -124,7 +128,7 @@ def lookup_connection_credential(
         if env_value:
             return CredentialResolution(env_value, "environment")
     auth_store = store if store is not None else ProviderAuthStore()
-    stored = auth_store.get(connection_id, binding=_credential_binding(connection))
+    stored = auth_store.get(connection_id, binding=connection_credential_binding(connection))
     if stored:
         return CredentialResolution(stored, "stored")
     return None
@@ -174,6 +178,11 @@ def read_connection_api_key(
     """
     if connection.provider == "bedrock" and connection.api_key_env is None:
         raise ModelCredentialError("bedrock ambient authentication has no stored secret access key")
+    if connection.subscription is not None:
+        raise ModelCredentialError(
+            f"connection {connection_id!r} is a {connection.subscription} plan sign-in and has "
+            "no API key"
+        )
     return read_connection_credential(
         connection, connection_id=connection_id, environment=environment, store=store
     ).value
@@ -251,11 +260,11 @@ def resolve_or_prompt_connection_api_key(
     if not key:
         return None
     if persist:
-        auth_store.put(connection_id, key, binding=_credential_binding(connection))
+        auth_store.put(connection_id, key, binding=connection_credential_binding(connection))
     return key
 
 
-def _credential_binding(connection: ConnectionConfig) -> StoredCredentialBinding:
+def connection_credential_binding(connection: ConnectionConfig) -> StoredCredentialBinding:
     """Return the secret-free endpoint and credential-locator identity for one key.
 
     Args:

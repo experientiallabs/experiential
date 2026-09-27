@@ -16,6 +16,8 @@ from exp.common.auth.store import (
     ProviderAuthStoreError,
     StoredCredentialBinding,
     StoredCredentialEndpointMismatch,
+    StoredCredentialKindMismatch,
+    StoredOAuthTokens,
 )
 
 _BINDING = StoredCredentialBinding(provider="openai-compatible", endpoint_sha256="a" * 64)
@@ -267,3 +269,100 @@ def test_symlink_destination_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ProviderAuthStoreError, match="malformed"):
         _store(path).get("openai")
+
+
+_TOKENS = StoredOAuthTokens(
+    access_token="access-token-value",
+    refresh_token="refresh-token-value",
+    expires_at_ms=1_700_000_000_000,
+    account_id="acct-123",
+)
+
+
+def test_oauth_records_round_trip_in_the_opencode_shape(tmp_path: Path) -> None:
+    """A plan sign-in persists as a type=oauth record with access, refresh, and expiry."""
+    path = tmp_path / "auth.json"
+    _store(path).put_oauth("chatgpt-a", _TOKENS, binding=_BINDING)
+
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["chatgpt-a"] == {
+        "type": "oauth",
+        "access": "access-token-value",
+        "refresh": "refresh-token-value",
+        "expires": 1_700_000_000_000,
+        "account_id": "acct-123",
+        "provider": "openai-compatible",
+        "endpoint_sha256": "a" * 64,
+    }
+    assert _store(path).get_oauth("chatgpt-a", binding=_BINDING) == _TOKENS
+    assert _store(path).get_oauth("missing") is None
+    assert _store(path).connection_ids() == ("chatgpt-a",)
+
+
+def test_oauth_and_api_records_refuse_to_be_read_as_each_other(tmp_path: Path) -> None:
+    """A sign-in is never handed out as an API key, and a key never as a sign-in."""
+    path = tmp_path / "auth.json"
+    store = _store(path)
+    store.put_oauth("plan", _TOKENS)
+    store.put("key", _SECRET)
+
+    with pytest.raises(StoredCredentialKindMismatch, match="subscription sign-in, not an API key"):
+        store.get("plan")
+    with pytest.raises(StoredCredentialKindMismatch, match="API key, not a subscription sign-in"):
+        store.get_oauth("key")
+
+
+def test_oauth_records_enforce_the_endpoint_binding(tmp_path: Path) -> None:
+    """A sign-in saved for one endpoint identity is refused for another."""
+    path = tmp_path / "auth.json"
+    _store(path).put_oauth("plan", _TOKENS, binding=_BINDING)
+
+    with pytest.raises(StoredCredentialEndpointMismatch):
+        _store(path).get_oauth("plan", binding=_OTHER_BINDING)
+
+
+def test_put_oauth_replaces_the_pair_in_place_and_preserves_the_binding(tmp_path: Path) -> None:
+    """A refreshed pair overwrites the old one so the newest refresh token is the stored one."""
+    path = tmp_path / "auth.json"
+    store = _store(path)
+    store.put_oauth("plan", _TOKENS, binding=_BINDING)
+    rotated = StoredOAuthTokens(
+        access_token="access-2", refresh_token="refresh-2", expires_at_ms=1_800_000_000_000
+    )
+    store.put_oauth("plan", rotated)
+
+    assert store.get_oauth("plan", binding=_BINDING) == rotated
+    assert store.remove("plan") is True
+    assert store.get_oauth("plan") is None
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"type": "oauth", "access": "a", "expires": 1},
+        {"type": "oauth", "access": "a", "refresh": "", "expires": 1},
+        {"type": "oauth", "access": "a", "refresh": "r", "expires": -1},
+        {"type": "oauth", "access": "a", "refresh": "r", "expires": True},
+        {"type": "oauth", "access": "a", "refresh": "r", "expires": 1, "extra": "x"},
+        {"type": "session", "access": "a", "refresh": "r", "expires": 1},
+    ],
+)
+def test_malformed_oauth_records_fail_closed(tmp_path: Path, record: dict[str, object]) -> None:
+    """An incomplete or unknown record shape is a malformed file, never a partial sign-in."""
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps({"plan": record}), encoding="utf-8")
+
+    with pytest.raises(ProviderAuthStoreError, match="malformed"):
+        _store(path).get_oauth("plan")
+
+
+def test_oauth_tokens_redact_their_values_and_know_their_expiry_window() -> None:
+    """Token text never appears in repr or str, and the look-ahead compares in milliseconds."""
+    text = f"{_TOKENS!r} {_TOKENS!s}"
+
+    assert "access-token-value" not in text
+    assert "refresh-token-value" not in text
+    assert "[REDACTED]" in text
+    assert _TOKENS.expires_within(300, now_ms=1_700_000_000_000 - 200_000)
+    assert not _TOKENS.expires_within(300, now_ms=1_700_000_000_000 - 400_000)
+    assert _TOKENS.expires_within(0, now_ms=1_700_000_000_000)
