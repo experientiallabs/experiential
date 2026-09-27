@@ -6,6 +6,7 @@ import pytest
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import (
+    PLAN_WINDOW_MAXIMUM_SECONDS,
     DeploymentHealthKey,
     DeploymentHealthRegistry,
     health_failure_cause,
@@ -321,16 +322,23 @@ def test_exhausted_plan_window_suppresses_the_rung_for_the_stated_reset() -> Non
 
 
 def test_exhaustion_windows_are_clamped_and_never_shortened() -> None:
-    """A week-long reset is clamped to the ceiling; a shorter later report keeps the longer wait."""
+    """A weekly reset holds all week; garbage is clamped; a shorter report never shortens."""
     now = [0.0]
     registry = DeploymentHealthRegistry(clock=lambda: now[0])
     key = ("catalog", "plan-a", "connection")
 
-    registry.exhausted(key, 7 * 24 * 3_600)
-    now[0] = 6 * 3_600 - 1
-    assert registry.suppressed(key)
+    week = 7 * 24 * 3_600
+    registry.exhausted(key, week)
     now[0] = 6 * 3_600 + 1
+    assert registry.suppressed(key), "a weekly window outlives the generic Retry-After cap"
+    now[0] = week - 1
+    assert registry.suppressed(key)
+    now[0] = week + 1
     assert not registry.suppressed(key)
+
+    registry.exhausted(key, 365 * 24 * 3_600)
+    now[0] += PLAN_WINDOW_MAXIMUM_SECONDS + 1
+    assert not registry.suppressed(key), "an absurd reset is clamped to the plan ceiling"
 
     registry.exhausted(key, 1_000)
     registry.exhausted(key, 1)

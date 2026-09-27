@@ -319,8 +319,9 @@ class GatewayWireProfile:
     """Whether this rung's payload must carry no output-token ceiling.
 
     The ChatGPT plan backend rejects ``max_output_tokens`` outright (400
-    "Unsupported parameter"), so a plan rung drops the caller's ceiling
-    structurally; every API-key rung forwards it unchanged."""
+    "Unsupported parameter"). A ceiling is caller authority, so a request that
+    carries one narrows the plan rung out at admission (the route keeps any
+    API-key rung that honors it) and the payload never carries the field."""
 
     embeddings_url: str | None = None
     """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing

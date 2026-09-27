@@ -74,8 +74,9 @@ class StoredSubscriptionTokenSource:
     """Mint bearers for one connection from its sign-in in the user-only credential file.
 
     Every read goes to the file, so a sign-in refreshed by another process is picked up at
-    once. A refresh happens ahead of expiry under one lock and the rotated pair is persisted
-    before any dispatch uses it, so a burst of dispatches spends the refresh token once.
+    once. A refresh happens ahead of expiry under the file's cross-process lock and the
+    rotated pair is persisted before any dispatch uses it, so a burst of dispatches across
+    processes spends the refresh token once.
     """
 
     def __init__(
@@ -120,18 +121,39 @@ class StoredSubscriptionTokenSource:
         with self._lock:
             tokens = self._store.get_oauth(self._connection_id, binding=self._binding)
             if tokens is None:
-                raise SubscriptionSignInError(
-                    f"no plan sign-in is stored for connection {self._connection_id!r}; "
-                    f"run '{self._hint}'"
-                )
-            if not tokens.expires_within(
-                ACCESS_TOKEN_REFRESH_AHEAD_SECONDS, now_ms=self._clock_ms()
-            ):
+                raise self._missing()
+            if not self._due(tokens):
                 return tokens
-            refreshed = self._refresher(tokens)
-            self._store.put_oauth(self._connection_id, refreshed, binding=self._binding)
-            logger.info("refreshed the plan sign-in for connection %r", self._connection_id)
-            return refreshed
+            # The refresh token is single-use and other processes (a second gateway
+            # worker, the CLI) share the file, so the re-check, the grant, and the write
+            # run under the store's cross-process lock: a waiter finds the pair the
+            # first refresher wrote instead of spending the old refresh token again.
+            rotated: list[StoredOAuthTokens] = []
+
+            def refresh(stored: StoredOAuthTokens) -> StoredOAuthTokens | None:
+                if not self._due(stored):
+                    return None
+                rotated.append(self._refresher(stored))
+                return rotated[-1]
+
+            current = self._store.refresh_oauth(
+                self._connection_id, binding=self._binding, refresh=refresh
+            )
+            if current is None:
+                raise self._missing()
+            if rotated:
+                logger.info("refreshed the plan sign-in for connection %r", self._connection_id)
+            return current
+
+    def _due(self, tokens: StoredOAuthTokens) -> bool:
+        """Whether the pair expires inside the refresh-ahead window."""
+        return tokens.expires_within(ACCESS_TOKEN_REFRESH_AHEAD_SECONDS, now_ms=self._clock_ms())
+
+    def _missing(self) -> SubscriptionSignInError:
+        """The error for a connection with no stored sign-in."""
+        return SubscriptionSignInError(
+            f"no plan sign-in is stored for connection {self._connection_id!r}; run '{self._hint}'"
+        )
 
 
 def _unix_ms() -> int:

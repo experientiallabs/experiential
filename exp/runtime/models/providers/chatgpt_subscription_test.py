@@ -11,6 +11,8 @@ import pytest
 from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, StoredOAuthTokens
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, ModelMessage, ModelRequest, ModelSnapshot
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.chatgpt_subscription import (
     CHATGPT_CODEX_BASE_URL,
     CHATGPT_OAUTH_CLIENT_ID,
@@ -26,7 +28,10 @@ from exp.runtime.models.providers.chatgpt_subscription import (
     tokens_from_codex_auth_file,
     tokens_from_token_response,
 )
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
 from exp.runtime.models.providers.subscription_tokens import (
     ACCESS_TOKEN_REFRESH_AHEAD_SECONDS,
     StoredSubscriptionTokenSource,
@@ -325,3 +330,25 @@ class TestClient:
 
         with pytest.raises(ProviderCapabilityError):
             client.complete(request)
+
+
+def test_an_output_ceiling_narrows_the_plan_rung_out_instead_of_being_dropped() -> None:
+    """A caller's ceiling keeps the API-key rung; a plan-only route refuses it by name."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=32,
+        maximum_output_tokens_parameter="max_output_tokens",
+    )
+    plan = GatewayWireProfile(
+        dialect="openai_responses", url="https://plan.test", omits_output_token_limit=True
+    )
+    key = GatewayWireProfile(dialect="openai_responses", url="https://key.test")
+
+    assert compatible_generation_parameter_profile_indexes((plan, key), request) == (1,)
+    with pytest.raises(
+        ProviderParameterError, match="'max_output_tokens' is not accepted by a plan"
+    ):
+        compatible_generation_parameter_profile_indexes((plan,), request)
+    unbounded = request.model_copy(update={"maximum_output_tokens": None})
+    assert compatible_generation_parameter_profile_indexes((plan, key), unbounded) == (0, 1)

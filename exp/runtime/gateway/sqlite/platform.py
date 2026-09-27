@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from exp.common.core.artifacts import stable_id
 from exp.common.models.gateway_catalog import read_pinned_normalized_snapshot
@@ -96,6 +96,9 @@ from exp.runtime.gateway.sqlite.platform_records import (
 )
 from exp.runtime.gateway.sqlite.provider_commands import sqlite_connection_config
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+
+if TYPE_CHECKING:
+    from exp.common.models.catalog import SubscriptionKind
 
 
 class SQLiteGatewayPlatform:
@@ -479,6 +482,12 @@ class SQLiteGatewayPlatform:
                     )
                 ),
                 trusted_custom_origin=bool(row["trusted_custom_origin"]),
+                # The column's CHECK admits only the plan kinds, so the value is one.
+                subscription=(
+                    None
+                    if row["subscription"] is None
+                    else cast("SubscriptionKind", str(row["subscription"]))
+                ),
                 connection_sha256=str(row["connection_sha256"]),
                 active=bool(row["active"]) and row["active_revision_id"] == row["revision_id"],
                 created_at=_datetime(row["created_at"]),

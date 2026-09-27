@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
-from exp.common.models.catalog import BillingSource
+from exp.common.models.catalog import BillingSource, SubscriptionKind
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelDeployment,
@@ -150,6 +150,7 @@ class ProviderConnectionRevision(ContractModel):
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
     connection_sha256: Sha256
     active: bool = True
     created_at: AwareDatetime
@@ -589,6 +590,9 @@ class UpsertProviderConnectionCommand(ContractModel):
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
+    """A plan connection's kind: dispatch mints a per-request bearer from the plan
+    sign-in the runtime's token source holds, and no secret reference is carried."""
     replace: bool = False
 
 

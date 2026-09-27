@@ -15,7 +15,7 @@ import logging
 import os
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -308,6 +308,58 @@ class ProviderAuthStore:
                 binding=binding if binding is not None else preserved,
             )
             self._replace(records)
+
+    def refresh_oauth(
+        self,
+        connection_id: str,
+        *,
+        binding: StoredCredentialBinding | None,
+        refresh: Callable[[StoredOAuthTokens], StoredOAuthTokens | None],
+    ) -> StoredOAuthTokens | None:
+        """Read, refresh, and persist one sign-in under the cross-process write lock.
+
+        A refresh token is single-use, so the read, the refresh grant, and the write of the
+        rotated pair form one cycle: a second process waiting on the lock reads the pair the
+        first one wrote and finds it fresh, instead of spending the old refresh token again.
+
+        Args:
+            connection_id: Exact catalog or gateway connection name.
+            binding: Optional current endpoint identity to enforce.
+            refresh: Called with the stored pair under the lock; returns the rotated pair to
+                persist, or ``None`` when the stored pair is still good.
+
+        Returns:
+            The pair now stored, or ``None`` when the connection has no record.
+
+        Raises:
+            StoredCredentialKindMismatch: The stored record is an API key.
+            StoredCredentialEndpointMismatch: The stored sign-in belongs to another endpoint.
+            ProviderAuthStoreError: The file exists but cannot be used, or the write failed.
+        """
+        _validate_connection_id(connection_id)
+        with file_write_lock(self._path, what="provider credential file"):
+            records = self._load()
+            record = records.get(connection_id)
+            if record is None:
+                return None
+            if binding is not None and record.binding != binding:
+                raise StoredCredentialEndpointMismatch(
+                    f"stored credential for connection {connection_id!r} does not match the "
+                    f"configured {binding.provider} endpoint; run 'exp config providers'"
+                )
+            if isinstance(record, _StoredApiRecord):
+                raise StoredCredentialKindMismatch(
+                    f"stored credential for connection {connection_id!r} is an API key, not a "
+                    "subscription sign-in; remove the connection and add it again"
+                )
+            rotated = refresh(record.tokens)
+            if rotated is None:
+                return record.tokens
+            if not rotated.access_token.strip() or not rotated.refresh_token.strip():
+                raise ProviderAuthStoreError("stored sign-in tokens must be non-empty")
+            records[connection_id] = _StoredOAuthRecord(tokens=rotated, binding=record.binding)
+            self._replace(records)
+            return rotated
 
     def remove(self, connection_id: str) -> bool:
         """Delete only the stored credential for one connection.

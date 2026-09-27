@@ -82,3 +82,47 @@ def test_a_missing_sign_in_names_the_re_sign_in_command(tmp_path: Path) -> None:
 
     with pytest.raises(SubscriptionSignInError, match="provider add plan --replace"):
         source.current()
+
+
+def test_a_refresh_another_process_landed_first_is_used_not_repeated(tmp_path: Path) -> None:
+    """The locked re-check sees a pair a peer rotated after our unlocked read and spends nothing."""
+    rotations: list[StoredOAuthTokens] = []
+    near = StoredOAuthTokens(
+        access_token="a",
+        refresh_token="r",
+        expires_at_ms=_NOW_MS + int(ACCESS_TOKEN_REFRESH_AHEAD_SECONDS * 1_000) - 1,
+    )
+    peer, _store = _source(tmp_path, near, rotations)
+
+    class _PeerRefreshesAfterRead(ProviderAuthStore):
+        """A second handle on the same file whose first read is followed by the peer's refresh."""
+
+        raced = False
+
+        def get_oauth(
+            self, connection_id: str, *, binding: StoredCredentialBinding | None = None
+        ) -> StoredOAuthTokens | None:
+            tokens = super().get_oauth(connection_id, binding=binding)
+            if not self.raced:
+                self.raced = True
+                peer.current()
+            return tokens
+
+    spent: list[str] = []
+
+    def must_not_refresh(previous: StoredOAuthTokens) -> StoredOAuthTokens:
+        spent.append(previous.refresh_token)
+        raise AssertionError("the peer's pair was fresh; no second refresh may run")
+
+    ours = StoredSubscriptionTokenSource(
+        store=_PeerRefreshesAfterRead(tmp_path / "auth.json"),
+        connection_id="plan",
+        binding=_BINDING,
+        refresher=must_not_refresh,
+        re_sign_in_hint="exp config gateway provider add plan --replace",
+        clock_ms=lambda: _NOW_MS,
+    )
+
+    assert ours.current() == rotations[0]
+    assert len(rotations) == 1
+    assert spent == []

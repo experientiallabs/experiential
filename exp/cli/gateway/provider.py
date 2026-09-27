@@ -19,6 +19,7 @@ from exp.common.core.locks import FileLockTimeout
 from exp.common.models import ConnectionConfig
 from exp.common.models.catalog import SubscriptionKind
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.sqlite.provider_authority import provider_connection_revision_id
 from exp.runtime.models.credentials import connection_credential_binding
 from exp.runtime.models.providers.anthropic_subscription import (
     AnthropicPlanError,
@@ -216,6 +217,57 @@ def _upsert_connection(
     return changed
 
 
+def _activate_plan_connection(
+    *,
+    name: str,
+    config: ConnectionConfig,
+    tokens: StoredOAuthTokens,
+    root: Path,
+    replace: bool,
+) -> bool:
+    """Store a plan sign-in and activate its connection, leaving neither half on failure.
+
+    The sign-in is written before the connection turns active, so a connection is never
+    active without a usable sign-in. A connection the command may not revise is refused
+    before anything is written, and a failed activation of a NEW connection removes the
+    sign-in it just stored.
+
+    Args:
+        name: Connection name, also the credential-store key.
+        config: The plan connection's secret-free metadata.
+        tokens: The sign-in to store.
+        root: Gateway state root.
+        replace: Whether an existing connection with different metadata may be revised.
+
+    Returns:
+        Whether the connection authority changed.
+    """
+    revision = provider_connection_revision_id(name, config)
+    existing = next(
+        (
+            connection
+            for connection in GatewayManagement(root).provider_connections()
+            if connection.connection_id == name
+        ),
+        None,
+    )
+    with usage_error(ValueError):
+        if existing is not None and existing.revision_id != revision and not replace:
+            raise ValueError(
+                f"provider connection {name!r} already exists with different settings; "
+                "re-run with --replace to revise it and sign in again"
+            )
+    store = ProviderAuthStore()
+    with usage_error(ValueError, FileLockTimeout):
+        store.put_oauth(name, tokens, binding=connection_credential_binding(config))
+    try:
+        return _upsert_connection(name=name, config=config, root=root, replace=replace)
+    except BaseException:
+        if existing is None:
+            store.remove(name)
+        raise
+
+
 @provider_app.command("add")
 def provider_add(
     name: str = typer.Argument(...),
@@ -265,22 +317,23 @@ def provider_add(
                 non_interactive=non_interactive,
             )
         )
-    changed = _upsert_connection(name=name, config=config, root=root, replace=replace)
     data: JsonObject = {}
     if credential_env is not None:
         data["credential_env"] = credential_env
-    if tokens is not None and subscription is not None:
-        with usage_error(ValueError, FileLockTimeout):
-            ProviderAuthStore().put_oauth(
-                name, tokens, binding=connection_credential_binding(config)
-            )
+    if tokens is None or subscription is None:
+        changed = _upsert_connection(name=name, config=config, root=root, replace=replace)
+    else:
+        changed = _activate_plan_connection(
+            name=name, config=config, tokens=tokens, root=root, replace=replace
+        )
+        data["subscription"] = subscription
+        data["sign_in"] = "codex-auth-file" if codex_auth_file is not None else "browser"
+        with usage_error(ValueError):
             plan_type = (
                 chatgpt_account_claims(tokens.access_token).plan_type
                 if subscription == "chatgpt"
                 else None
             )
-        data["subscription"] = subscription
-        data["sign_in"] = "codex-auth-file" if codex_auth_file is not None else "browser"
         if plan_type is not None:
             data["plan_type"] = plan_type
     emit_receipt(

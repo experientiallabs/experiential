@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from click import unstyle
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from exp.cli.app import app
 from exp.common.auth import ProviderAuthStore
@@ -719,3 +719,63 @@ def test_a_claude_plan_without_the_operator_app_names_the_configuration(
     assert result.exit_code != 0
     assert "EXP_ANTHROPIC_OAUTH_CLIENT_ID" in _plain_output(result.output)
     assert GatewayManagement(root).provider_connections() == ()
+
+
+def _add_imported_plan(root: Path, auth_file: Path) -> Result:
+    """Run ``provider add plan-a`` as a ChatGPT plan imported from a Codex file."""
+    return _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--subscription",
+            "chatgpt",
+            "--codex-auth-file",
+            str(auth_file),
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+
+
+def test_a_plan_whose_sign_in_cannot_be_stored_never_becomes_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unusable credential file fails the add before the connection is written."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    store_path = ProviderAuthStore().path
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text("not json", encoding="utf-8")
+    store_path.chmod(0o600)
+
+    result = _add_imported_plan(root, _codex_auth_file(tmp_path))
+
+    assert result.exit_code != 0
+    assert GatewayManagement(root).provider_connections() == ()
+
+
+def test_a_failed_activation_removes_the_new_plan_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connection that fails to activate leaves no stored sign-in behind."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    def refuse(self: GatewayManagement, **_kwargs: object) -> tuple[bool, object]:
+        raise ValueError("authority refused the connection")
+
+    monkeypatch.setattr(GatewayManagement, "upsert_provider_connection", refuse)
+
+    result = _add_imported_plan(root, _codex_auth_file(tmp_path))
+
+    assert result.exit_code != 0
+    assert "authority refused the connection" in result.output
+    assert ProviderAuthStore().get_oauth("plan-a") is None

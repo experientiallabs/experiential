@@ -366,3 +366,32 @@ def test_oauth_tokens_redact_their_values_and_know_their_expiry_window() -> None
     assert _TOKENS.expires_within(300, now_ms=1_700_000_000_000 - 200_000)
     assert not _TOKENS.expires_within(300, now_ms=1_700_000_000_000 - 400_000)
     assert _TOKENS.expires_within(0, now_ms=1_700_000_000_000)
+
+
+def test_refresh_oauth_persists_a_rotation_and_keeps_a_fresh_pair(tmp_path: Path) -> None:
+    """The callback's pair replaces the stored one; ``None`` keeps it; no record reads ``None``."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    assert store.refresh_oauth("plan", binding=_BINDING, refresh=lambda _t: None) is None
+    store.put_oauth("plan", _TOKENS, binding=_BINDING)
+    rotated = StoredOAuthTokens(
+        access_token="a2", refresh_token="r2", expires_at_ms=2, account_id="acct-123"
+    )
+
+    assert store.refresh_oauth("plan", binding=_BINDING, refresh=lambda _t: None) == _TOKENS
+    assert store.refresh_oauth("plan", binding=_BINDING, refresh=lambda _t: rotated) == rotated
+    assert store.get_oauth("plan", binding=_BINDING) == rotated
+
+
+def test_refresh_oauth_refuses_keys_and_other_endpoints_before_refreshing(tmp_path: Path) -> None:
+    """A key record or a foreign binding fails before the single-use refresh token is spent."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put("key", _SECRET, binding=_BINDING)
+    store.put_oauth("plan", _TOKENS, binding=_BINDING)
+
+    def never(_tokens: StoredOAuthTokens) -> StoredOAuthTokens:
+        raise AssertionError("refresh must not run")
+
+    with pytest.raises(StoredCredentialKindMismatch):
+        store.refresh_oauth("key", binding=_BINDING, refresh=never)
+    with pytest.raises(StoredCredentialEndpointMismatch):
+        store.refresh_oauth("plan", binding=_OTHER_BINDING, refresh=never)

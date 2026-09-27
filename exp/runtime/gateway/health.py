@@ -35,6 +35,10 @@ _OPERATIONAL_FAILURES = {
 # skips it for the whole window.
 RETRY_AFTER_WINDOW_MINIMUM_SECONDS = 5.0
 RETRY_AFTER_WINDOW_MAXIMUM_SECONDS = 6.0 * 3_600.0
+# A plan's usage window resets on the provider's own clock, and the longest one
+# (the weekly window) can be days away. Suppression follows the stated reset up
+# to one week plus a day of slack; the ceiling only guards a garbage reset.
+PLAN_WINDOW_MAXIMUM_SECONDS = 8.0 * 24.0 * 3_600.0
 
 
 def health_failure_cause(
@@ -262,9 +266,9 @@ class DeploymentHealthRegistry:
 
         A plan rung reports its rolling usage windows on every response, so a
         window that reaches 100 percent is known BEFORE the next request would
-        429: the rung is throttled for the reset the provider stated (clamped like
-        a ``Retry-After`` window), and the waterfall moves on to the next plan in
-        the pool. A success on the same response leaves the circuit closed.
+        429: the rung is throttled until the reset the provider stated, however
+        many days away (a weekly window), and the waterfall moves on to the next
+        plan in the pool. A success on the same response leaves the circuit closed.
 
         Args:
             key: Catalog, deployment, and connection identity tuple.
@@ -273,7 +277,7 @@ class DeploymentHealthRegistry:
         now = self._clock()
         window = min(
             max(float(reset_after_seconds), RETRY_AFTER_WINDOW_MINIMUM_SECONDS),
-            RETRY_AFTER_WINDOW_MAXIMUM_SECONDS,
+            PLAN_WINDOW_MAXIMUM_SECONDS,
         )
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())

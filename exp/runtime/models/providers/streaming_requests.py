@@ -196,6 +196,18 @@ def route_generation_parameter_requests(
             ignored.append(path)
 
     if request.maximum_output_tokens is not None:
+        if any(profile.omits_output_token_limit for profile in profiles):
+            # A plan backend refuses any output ceiling, and a ceiling is caller
+            # authority: the plan rung narrows out rather than serve unbounded.
+            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            raise ProviderParameterError(
+                message=(
+                    f"The parameter {parameter!r} is not accepted by a plan account on this "
+                    "model route. Remove the ceiling or use a route with an API-key account."
+                ),
+                param=parameter,
+                code="unsupported_parameter",
+            )
         route_limits = tuple(
             profile.maximum_output_tokens
             for profile in profiles
