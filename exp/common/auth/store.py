@@ -342,7 +342,8 @@ class ProviderAuthStore:
                 rotated pair to persist, or ``None`` when the stored pair is still good.
 
         Returns:
-            The pair to dispatch with, or ``None`` when the connection has no record.
+            The pair to dispatch with, or ``None`` when the connection has no record (also
+            when the record was removed while the grant ran).
 
         Raises:
             StoredCredentialKindMismatch: The stored record is an API key.
@@ -360,8 +361,11 @@ class ProviderAuthStore:
             rotated = refresh(stored)
             if rotated is None:
                 return stored
-            self.replace_oauth_if(connection_id, expected=stored, replacement=rotated)
-            return rotated
+            if self.replace_oauth_if(connection_id, expected=stored, replacement=rotated):
+                return rotated
+            # The sign-in was replaced or removed while the grant ran: dispatch on what the
+            # file holds now (or nothing), never on the superseded account's bearer.
+            return self.get_oauth(connection_id, binding=binding)
 
     def replace_oauth_if(
         self,

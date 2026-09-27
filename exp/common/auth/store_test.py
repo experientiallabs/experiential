@@ -413,7 +413,7 @@ def test_a_refresh_in_flight_never_blocks_another_connections_write(tmp_path: Pa
 
 
 def test_a_refresh_keeps_a_sign_in_replaced_while_it_ran(tmp_path: Path) -> None:
-    """The rotated pair is written only over the pair it came from."""
+    """The rotated pair is written and served only over the pair it came from."""
     store = ProviderAuthStore(tmp_path / "auth.json")
     store.put_oauth("plan", _TOKENS, binding=_BINDING)
     newer = StoredOAuthTokens(access_token="fresh", refresh_token="fresh-r", expires_at_ms=9)
@@ -423,8 +423,15 @@ def test_a_refresh_keeps_a_sign_in_replaced_while_it_ran(tmp_path: Path) -> None
         store.put_oauth("plan", newer, binding=_BINDING)
         return rotated
 
-    assert store.refresh_oauth("plan", binding=_BINDING, refresh=grant_while_replaced) == rotated
+    assert store.refresh_oauth("plan", binding=_BINDING, refresh=grant_while_replaced) == newer
     assert store.get_oauth("plan", binding=_BINDING) == newer
+
+    def grant_while_removed(_stored: StoredOAuthTokens) -> StoredOAuthTokens:
+        store.remove("plan")
+        return rotated
+
+    store.put_oauth("plan", _TOKENS, binding=_BINDING)
+    assert store.refresh_oauth("plan", binding=_BINDING, refresh=grant_while_removed) is None
 
 
 def test_replace_oauth_if_swaps_or_removes_only_the_expected_pair(tmp_path: Path) -> None:

@@ -473,24 +473,24 @@ def _remove_provider(
         root: Gateway state root.
         operation: Receipt operation name.
         json_output: Whether to emit the receipt as JSON.
-        forget_plan_sign_in: Whether a removed plan connection's stored sign-in is deleted
-            too, so no refresh token outlives the connection it was issued for.
+        forget_plan_sign_in: Whether a sign-in stored under the removed connection's name is
+            deleted too, so no refresh token outlives the connection it was issued for.
     """
     management = GatewayManagement(root)
-    plan = forget_plan_sign_in and any(
-        connection.connection_id == name and connection.config.subscription is not None
-        for connection in management.provider_connections()
-    )
+    store = ProviderAuthStore()
     with usage_error(ValueError, FileLockTimeout):
-        changed = management.disable_provider_connection(connection_id=name)
-        if plan and changed:
-            store = ProviderAuthStore()
+        # Any sign-in stored under the name is a plan's (an update that moved the connection
+        # off its plan kind leaves it behind too). Read it before disabling and delete exactly
+        # that pair, so a plan another process adds under the name meanwhile keeps its own.
+        signed_in: StoredOAuthTokens | None = None
+        if forget_plan_sign_in:
             try:
-                stored = store.get_oauth(name)
+                signed_in = store.get_oauth(name)
             except StoredCredentialKindMismatch:
-                stored = None
-            if stored is not None:
-                store.remove(name)
+                signed_in = None
+        changed = management.disable_provider_connection(connection_id=name)
+        if changed and signed_in is not None:
+            store.replace_oauth_if(name, expected=signed_in, replacement=None)
     emit_receipt(
         GatewayReceipt(
             operation=operation,

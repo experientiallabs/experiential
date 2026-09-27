@@ -881,3 +881,28 @@ def test_a_rejected_add_leaves_a_concurrent_adds_sign_in_alone(
 
     assert result.exit_code != 0
     assert ProviderAuthStore().get_oauth("plan-a") == winner
+
+
+def test_removal_leaves_a_plan_added_under_the_name_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removal deletes exactly the sign-in it read, never one a concurrent add stored."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert _add_imported_plan(root, _codex_auth_file(tmp_path)).exit_code == 0
+    newcomer = StoredOAuthTokens(access_token="new", refresh_token="new-r", expires_at_ms=1)
+    disable = GatewayManagement.disable_provider_connection
+
+    def disable_then_race(self: GatewayManagement, *, connection_id: str) -> bool:
+        changed = disable(self, connection_id=connection_id)
+        ProviderAuthStore().put_oauth(connection_id, newcomer)
+        return changed
+
+    monkeypatch.setattr(GatewayManagement, "disable_provider_connection", disable_then_race)
+
+    removed = _runner.invoke(
+        app, ["config", "gateway", "provider", "remove", "plan-a", "--root", str(root)]
+    )
+
+    assert removed.exit_code == 0, removed.output
+    assert ProviderAuthStore().get_oauth("plan-a") == newcomer
