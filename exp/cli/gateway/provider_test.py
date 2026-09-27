@@ -11,7 +11,7 @@ from click import unstyle
 from typer.testing import CliRunner, Result
 
 from exp.cli.app import app
-from exp.common.auth import ProviderAuthStore
+from exp.common.auth import ProviderAuthStore, StoredOAuthTokens
 from exp.common.models import ConnectionConfig
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.models.credentials import connection_credential_binding
@@ -861,3 +861,23 @@ def test_removing_a_plan_connection_forgets_its_sign_in(
 
     assert removed.exit_code == 0, removed.output
     assert ProviderAuthStore().get_oauth("plan-a") is None
+
+
+def test_a_rejected_add_leaves_a_concurrent_adds_sign_in_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rollback undoes only its own write, never a sign-in another add stored meanwhile."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    winner = StoredOAuthTokens(access_token="winner", refresh_token="winner-r", expires_at_ms=1)
+
+    def lose_the_race(self: GatewayManagement, **_kwargs: object) -> tuple[bool, object]:
+        ProviderAuthStore().put_oauth("plan-a", winner)
+        raise ValueError("another add activated this connection first")
+
+    monkeypatch.setattr(GatewayManagement, "upsert_provider_connection", lose_the_race)
+
+    result = _add_imported_plan(root, _codex_auth_file(tmp_path))
+
+    assert result.exit_code != 0
+    assert ProviderAuthStore().get_oauth("plan-a") == winner

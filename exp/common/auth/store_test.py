@@ -395,3 +395,47 @@ def test_refresh_oauth_refuses_keys_and_other_endpoints_before_refreshing(tmp_pa
         store.refresh_oauth("key", binding=_BINDING, refresh=never)
     with pytest.raises(StoredCredentialEndpointMismatch):
         store.refresh_oauth("plan", binding=_OTHER_BINDING, refresh=never)
+
+
+def test_a_refresh_in_flight_never_blocks_another_connections_write(tmp_path: Path) -> None:
+    """The grant runs outside the shared file lock, so a write beside it lands at once."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put_oauth("plan", _TOKENS, binding=_BINDING)
+    rotated = StoredOAuthTokens(access_token="a2", refresh_token="r2", expires_at_ms=2)
+
+    def slow_grant(_stored: StoredOAuthTokens) -> StoredOAuthTokens:
+        store.put("other", _SECRET, binding=_BINDING)
+        return rotated
+
+    assert store.refresh_oauth("plan", binding=_BINDING, refresh=slow_grant) == rotated
+    assert store.get("other", binding=_BINDING) == _SECRET
+    assert store.get_oauth("plan", binding=_BINDING) == rotated
+
+
+def test_a_refresh_keeps_a_sign_in_replaced_while_it_ran(tmp_path: Path) -> None:
+    """The rotated pair is written only over the pair it came from."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put_oauth("plan", _TOKENS, binding=_BINDING)
+    newer = StoredOAuthTokens(access_token="fresh", refresh_token="fresh-r", expires_at_ms=9)
+    rotated = StoredOAuthTokens(access_token="a2", refresh_token="r2", expires_at_ms=2)
+
+    def grant_while_replaced(_stored: StoredOAuthTokens) -> StoredOAuthTokens:
+        store.put_oauth("plan", newer, binding=_BINDING)
+        return rotated
+
+    assert store.refresh_oauth("plan", binding=_BINDING, refresh=grant_while_replaced) == rotated
+    assert store.get_oauth("plan", binding=_BINDING) == newer
+
+
+def test_replace_oauth_if_swaps_or_removes_only_the_expected_pair(tmp_path: Path) -> None:
+    """A stale expectation leaves the record; a matching one swaps or removes it."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put_oauth("plan", _TOKENS, binding=_BINDING)
+    other = StoredOAuthTokens(access_token="x", refresh_token="y", expires_at_ms=3)
+
+    assert not store.replace_oauth_if("plan", expected=other, replacement=None)
+    assert store.get_oauth("plan", binding=_BINDING) == _TOKENS
+    assert store.replace_oauth_if("plan", expected=_TOKENS, replacement=other)
+    assert store.get_oauth("plan", binding=_BINDING) == other
+    assert store.replace_oauth_if("plan", expected=other, replacement=None)
+    assert store.get_oauth("plan") is None

@@ -235,7 +235,8 @@ def _activate_plan_connection(
     whose credential-file record is an API key (the file is shared with
     ``exp config providers``), is refused before anything is written. A failed activation
     puts back the sign-in the connection had before, or removes the new one when there was
-    none, so the still-active revision keeps dispatching on its own sign-in.
+    none, so the still-active revision keeps dispatching on its own sign-in; the undo is a
+    compare-and-swap, so it never touches a sign-in a concurrent add stored meanwhile.
 
     Args:
         name: Connection name, also the credential-store key.
@@ -274,10 +275,18 @@ def _activate_plan_connection(
     try:
         return _upsert_connection(name=name, config=config, root=root, replace=replace)
     except BaseException:
-        if existing is not None and previous is not None:
-            store.put_oauth(name, previous, binding=connection_credential_binding(existing.config))
-        else:
-            store.remove(name)
+        # Undo only this command's own write: a concurrent add that activated with its own
+        # sign-in meanwhile holds a different pair, and the swap leaves it alone.
+        store.replace_oauth_if(
+            name,
+            expected=tokens,
+            replacement=previous if existing is not None else None,
+            binding=(
+                connection_credential_binding(existing.config)
+                if existing is not None and previous is not None
+                else None
+            ),
+        )
         raise
 
 

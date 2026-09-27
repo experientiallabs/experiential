@@ -26,6 +26,10 @@ from exp.common.core.files import fsync_directory_best_effort
 from exp.common.core.locks import file_write_lock
 
 logger = logging.getLogger(__name__)
+
+# A refresh grant's HTTP call may take up to 30 s; a waiter for the same connection's refresh
+# outlasts it so it reads the rotated pair instead of timing out beside a healthy refresh.
+REFRESH_LOCK_TIMEOUT_S = 60.0
 _CONNECTION_ID_MAX = 128
 _DIRECTORY_MODE = 0o700
 _FILE_MODE = 0o600
@@ -321,20 +325,24 @@ class ProviderAuthStore:
         binding: StoredCredentialBinding | None,
         refresh: Callable[[StoredOAuthTokens], StoredOAuthTokens | None],
     ) -> StoredOAuthTokens | None:
-        """Read, refresh, and persist one sign-in under the cross-process write lock.
+        """Read, refresh, and persist one sign-in, serialized per connection across processes.
 
         A refresh token is single-use, so the read, the refresh grant, and the write of the
-        rotated pair form one cycle: a second process waiting on the lock reads the pair the
-        first one wrote and finds it fresh, instead of spending the old refresh token again.
+        rotated pair form one cycle under a lock of this connection's own: a second process
+        waiting on it reads the pair the first one wrote and finds it fresh, instead of
+        spending the old refresh token again. The grant's HTTP call runs outside the shared
+        file lock, so a slow refresh never blocks another connection's refresh or write; the
+        rotated pair is written with a compare-and-swap that keeps a sign-in someone replaced
+        meanwhile.
 
         Args:
             connection_id: Exact catalog or gateway connection name.
             binding: Optional current endpoint identity to enforce.
-            refresh: Called with the stored pair under the lock; returns the rotated pair to
-                persist, or ``None`` when the stored pair is still good.
+            refresh: Called with the stored pair under the connection's lock; returns the
+                rotated pair to persist, or ``None`` when the stored pair is still good.
 
         Returns:
-            The pair now stored, or ``None`` when the connection has no record.
+            The pair to dispatch with, or ``None`` when the connection has no record.
 
         Raises:
             StoredCredentialKindMismatch: The stored record is an API key.
@@ -342,29 +350,60 @@ class ProviderAuthStore:
             ProviderAuthStoreError: The file exists but cannot be used, or the write failed.
         """
         _validate_connection_id(connection_id)
+        refresh_lock = self._path.with_name(f"{self._path.name}.refresh-{connection_id}")
+        with file_write_lock(
+            refresh_lock, what="plan sign-in refresh", timeout_s=REFRESH_LOCK_TIMEOUT_S
+        ):
+            stored = self.get_oauth(connection_id, binding=binding)
+            if stored is None:
+                return None
+            rotated = refresh(stored)
+            if rotated is None:
+                return stored
+            self.replace_oauth_if(connection_id, expected=stored, replacement=rotated)
+            return rotated
+
+    def replace_oauth_if(
+        self,
+        connection_id: str,
+        *,
+        expected: StoredOAuthTokens,
+        replacement: StoredOAuthTokens | None,
+        binding: StoredCredentialBinding | None = None,
+    ) -> bool:
+        """Swap one sign-in only while the record still holds ``expected``.
+
+        Args:
+            connection_id: Exact catalog or gateway connection name.
+            expected: The pair the caller last saw; any other record is left untouched.
+            replacement: The pair to store, or ``None`` to remove the record.
+            binding: Endpoint identity for the replacement; ``None`` keeps the record's own.
+
+        Returns:
+            Whether the record held ``expected`` and was swapped.
+
+        Raises:
+            ProviderAuthStoreError: The replacement is invalid, or the file cannot be used.
+        """
+        _validate_connection_id(connection_id)
+        if replacement is not None and (
+            not replacement.access_token.strip() or not replacement.refresh_token.strip()
+        ):
+            raise ProviderAuthStoreError("stored sign-in tokens must be non-empty")
         with file_write_lock(self._path, what="provider credential file"):
             records = self._load()
             record = records.get(connection_id)
-            if record is None:
-                return None
-            if binding is not None and record.binding != binding:
-                raise StoredCredentialEndpointMismatch(
-                    f"stored credential for connection {connection_id!r} does not match the "
-                    f"configured {binding.provider} endpoint; run 'exp config providers'"
+            if not isinstance(record, _StoredOAuthRecord) or record.tokens != expected:
+                return False
+            if replacement is None:
+                del records[connection_id]
+            else:
+                records[connection_id] = _StoredOAuthRecord(
+                    tokens=replacement,
+                    binding=binding if binding is not None else record.binding,
                 )
-            if isinstance(record, _StoredApiRecord):
-                raise StoredCredentialKindMismatch(
-                    f"stored credential for connection {connection_id!r} is an API key, not a "
-                    "subscription sign-in; remove the connection and add it again"
-                )
-            rotated = refresh(record.tokens)
-            if rotated is None:
-                return record.tokens
-            if not rotated.access_token.strip() or not rotated.refresh_token.strip():
-                raise ProviderAuthStoreError("stored sign-in tokens must be non-empty")
-            records[connection_id] = _StoredOAuthRecord(tokens=rotated, binding=record.binding)
             self._replace(records)
-            return rotated
+            return True
 
     def remove(self, connection_id: str) -> bool:
         """Delete only the stored credential for one connection.
