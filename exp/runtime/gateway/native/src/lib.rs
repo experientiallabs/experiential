@@ -206,14 +206,8 @@ fn serve(
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
     let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
-    let callback_permits = config.callback_permits.max(1);
-    let callback_workers = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(callback_permits)
-        .min(callback_permits);
     let bridge = Arc::new(
-        Bridge::new_with_limits(control_plane, callback_permits, callback_workers)
-            .map_err(PyRuntimeError::new_err)?,
+        Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
     );
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
     let capture = capture.map(|collector| collector.inner.clone());

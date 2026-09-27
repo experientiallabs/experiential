@@ -2,8 +2,8 @@
 //!
 //! Every call crosses the boundary as one JSON string in and one JSON string
 //! out, executed on a fixed pool of long-lived worker threads under a bounded
-//! in-flight permit count. The worker count can be smaller than the permit
-//! count to bound runnable Python threads while retaining queued capacity.
+//! permit count so GIL contention stays fixed regardless of data-plane
+//! concurrency.
 //!
 //! The pool is dedicated rather than tokio's blocking pool because the
 //! control plane caches per-thread state (one SQLite connection per thread in
@@ -85,28 +85,13 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    /// Start one named worker thread per permitted call.
+    /// Start `maximum_concurrent_calls` named worker threads over one queue.
     ///
-    /// This preserves the original one-worker-per-permit behavior. Hosts that
-    /// want a smaller runnable Python pool can use [`Self::new_with_limits`].
-    #[cfg(test)]
+    /// The permit count equals the worker count, so an accepted call always
+    /// has an idle worker and never queues behind another call after its
+    /// permit is granted.
     pub fn new(object: Py<PyAny>, maximum_concurrent_calls: usize) -> Result<Self, String> {
-        Self::new_with_limits(object, maximum_concurrent_calls, maximum_concurrent_calls)
-    }
-
-    /// Start a fixed worker pool with an independent bound on in-flight calls.
-    ///
-    /// Calls acquire a permit before entering the queue, so queued and running
-    /// jobs together never exceed `maximum_concurrent_calls`. `worker_count`
-    /// controls how many jobs can invoke Python at once; excess permitted jobs
-    /// wait in the queue without creating additional OS threads.
-    pub fn new_with_limits(
-        object: Py<PyAny>,
-        maximum_concurrent_calls: usize,
-        worker_count: usize,
-    ) -> Result<Self, String> {
-        let maximum_concurrent_calls = maximum_concurrent_calls.max(1);
-        let worker_count = worker_count.max(1).min(maximum_concurrent_calls);
+        let worker_count = maximum_concurrent_calls.max(1);
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(worker_count);
@@ -122,7 +107,7 @@ impl Bridge {
         Ok(Self {
             queue: Mutex::new(Some(sender)),
             workers: Mutex::new(workers),
-            permits: Arc::new(Semaphore::new(maximum_concurrent_calls)),
+            permits: Arc::new(Semaphore::new(worker_count)),
         })
     }
 
@@ -160,9 +145,8 @@ impl Bridge {
             .await
             .map_err(|_| PublicError::internal())?;
         drop(permit_wait_timer);
-        // Latency is measured from permit grant. With fewer workers than
-        // permits, this includes bounded queue delay but excludes semaphore
-        // wait for an in-flight slot.
+        // Latency is measured from permit grant so it reflects the python
+        // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();
         let (responder, outcome) = oneshot::channel();
         let submitted = match self.queue.lock() {
@@ -387,8 +371,6 @@ class Plane:
         return argument
 
     def rendezvous(self, argument):
-        with self.lock:
-            self.call_threads.add(threading.get_ident())
         self.barrier.wait()
         return argument
 
@@ -494,26 +476,6 @@ class Plane:
         });
         assert_eq!(first.expect("first call succeeds"), "left");
         assert_eq!(second.expect("second call succeeds"), "right");
-    }
-
-    #[test]
-    fn worker_pool_can_be_smaller_than_the_in_flight_limit() {
-        let object = plane();
-        let observer = Python::attach(|py| object.clone_ref(py));
-        let bridge = Arc::new(Bridge::new_with_limits(object, 4, 2).expect("bridge starts"));
-        let (first, second, third, fourth) = block_on(async {
-            tokio::join!(
-                bridge.call("rendezvous", "first".to_string()),
-                bridge.call("rendezvous", "second".to_string()),
-                bridge.call("rendezvous", "third".to_string()),
-                bridge.call("rendezvous", "fourth".to_string()),
-            )
-        });
-        for result in [first, second, third, fourth] {
-            result.expect("queued call succeeds");
-        }
-        assert_eq!(attribute_length(&observer, "call_threads"), 2);
-        assert_eq!(bridge.permits.available_permits(), 4);
     }
 
     #[test]
