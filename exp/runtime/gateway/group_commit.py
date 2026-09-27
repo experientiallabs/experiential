@@ -852,19 +852,30 @@ class SyncGroupCommitLedger:
         """
         self._writer = writer
 
+    def enqueue_accept_request(
+        self, *, authorization: AuthorizationSnapshot
+    ) -> concurrent.futures.Future[object]:
+        """Queue durable acceptance and return its commit future to overlap route work.
+
+        Callers must observe the future before returning an admission route or
+        allowing provider dispatch. This preserves acceptance-before-response
+        semantics while letting independent route assembly overlap the writer.
+        """
+        return self._writer._enqueue_chain(
+            authorization,
+            "accept",
+            lambda connection, proof: self._writer.core.apply_accept_request(
+                connection, authorization=authorization, chain_preflight=proof
+            ),
+        )
+
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Durably persist accepted authority before route selection or dispatch.
 
         Args:
             authorization: Frozen authority and request identity.
         """
-        self._writer._enqueue_chain(
-            authorization,
-            "accept",
-            lambda connection, proof: self._writer.core.apply_accept_request(
-                connection, authorization=authorization, chain_preflight=proof
-            ),
-        ).result()
+        self.enqueue_accept_request(authorization=authorization).result()
 
     def start_attempt(
         self,

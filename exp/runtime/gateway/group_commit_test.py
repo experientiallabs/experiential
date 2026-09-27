@@ -660,6 +660,44 @@ def test_sync_facade_commits_full_lifecycle_durably_without_an_event_loop(
     assert str(request["terminal_state"]) == "completed"
 
 
+def test_sync_facade_can_enqueue_acceptance_without_waiting_for_its_commit(
+    tmp_path: Path,
+) -> None:
+    """Route work can overlap a queued acceptance while callers retain its commit future."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "overlapped-accept")
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+
+    def block_writer(connection: sqlite3.Connection) -> None:
+        """Hold the writer's current batch while acceptance is queued behind it."""
+        del connection
+        blocker_started.set()
+        assert release_blocker.wait(5)
+
+    blocker = grouped._enqueue(block_writer)
+    assert blocker_started.wait(5)
+    acceptance = facade.enqueue_accept_request(authorization=authorization)
+    assert not acceptance.done()
+    with sqlite3.connect(core.database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone() == (0,)
+    release_blocker.set()
+    blocker.result(timeout=5)
+    acceptance.result(timeout=5)
+    with sqlite3.connect(core.database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone() == (1,)
+    grouped.close()
+
+
 def test_sync_facade_raises_the_original_failure_and_stays_usable(tmp_path: Path) -> None:
     """A rolled-back sync operation re-raises to its caller; the writer keeps
     serving later operations."""

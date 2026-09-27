@@ -4,7 +4,10 @@ Rust owns sockets, streaming and normalization. Python owns authorization,
 payloads, continuations and ledger transactions. Boundaries use JSON.
 Admission returns the certified route without starting an attempt; Rust reserves
 each dispatch through ``start_attempt`` and records its durable terminal through
-``settle``. Candidate selection, health circuits and budget skipping stay here.
+``settle``. Eligible unkeyed direct Chat requests queue durable acceptance while
+route assembly runs, then wait for the commit before returning; keyed and complex
+requests retain early acceptance. Candidate selection, health circuits and budget
+skipping stay here.
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error returned to the caller.
 Requests the native path cannot serve (clients without a wire profile) return
@@ -15,6 +18,7 @@ metrics and fails the request closed with the shared internal error.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import time
@@ -477,14 +481,70 @@ class NativeControlPlane(
             continuation_context.messages = retention_request.messages
         self._control_plane_timing.record("pre_accept_policy_ms", pre_accept_started)
 
-        # The ledger accepts the logical request before route selection, so a
-        # keyed operation whose durable terminal already exists (or whose key
-        # was reused with different content) fails closed here, before
-        # learned selection can run request-time embedding or any other
-        # provider-touching work.
+        # Keyed operations must be accepted before route selection so an existing
+        # durable terminal or reused key fails closed before learned selection can
+        # run request-time embedding or other provider-touching work. A narrow
+        # unkeyed direct Chat path has no learned selector or admission-side effects;
+        # queue its durable acceptance and overlap the writer with route assembly.
+        # The commit is still required before this admission returns.
         ledger_accept_started = time.monotonic()
+        pending_acceptance: concurrent.futures.Future[object] | None = None
+        overlap_acceptance = (
+            authorization.caller_operation_sha256 is None
+            and authorization.model_chain_authority is None
+            and authorization.surface is GatewayApiSurface.CHAT_COMPLETIONS
+            and isinstance(authorization.target, DirectTarget)
+            and continuation_context is None
+            and pinned_reasoning_route is None
+            and not has_active_reasoning_content(request)
+            and self._capture is None
+            and self._guardrails is None
+            and self._native_route_eligible is None
+            and not request.tools
+            and request.tool_choice is None
+            and request.parallel_tool_calls is None
+            and not request.provider_native_tools
+            and not request.provider_server_tools
+            and request.web_search is None
+            and request.tool_search is None
+            and request.gateway is None
+            and request.previous_response_id is None
+            and request.provider_preferences is None
+            and not request.zdr_requested
+            and request.provider_output_config is None
+            and request.provider_prompt_cache_key is None
+            and request.native_tool_translation is None
+            and all(
+                message.role != "tool"
+                and message.content is not None
+                and not message.content_parts
+                and message.tool_call_id is None
+                and not message.tool_calls
+                and not message.capture_only_reasoning
+                and message.provider_specific_fields is None
+                and not message.provider_reasoning
+                and message.provider_item_id is None
+                and message.provider_output_index is None
+                and message.provider_status is None
+                and message.provider_phase is None
+                and message.provider_tool_name is None
+                and message.provider_tool_namespace is None
+                and message.provider_tool_caller is None
+                and message.provider_native_item is None
+                and message.provider_anthropic_blocks is None
+                and message.provider_anthropic_block is None
+                and not message.provider_text_blocks
+                and not message.tool_is_error
+                for message in request.messages
+            )
+        )
         try:
-            self._write_ledger.accept_request(authorization=authorization)
+            if overlap_acceptance and isinstance(self._write_ledger, SyncGroupCommitLedger):
+                pending_acceptance = self._write_ledger.enqueue_accept_request(
+                    authorization=authorization
+                )
+            else:
+                self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             self._control_plane_timing.record("ledger_accept_ms", ledger_accept_started)
             raise _authority_error(exc) from exc
@@ -767,6 +827,13 @@ class NativeControlPlane(
             raise error from exc
 
         plan = deterministic.native_output_plan(policy, self._guardrail_detectors)
+        if pending_acceptance is not None:
+            accept_wait_started = time.monotonic()
+            try:
+                pending_acceptance.result()
+            except Exception as exc:  # noqa: BLE001 - keep the ledger boundary sanitized.
+                raise _authority_error(exc) from exc
+            self._control_plane_timing.record("ledger_accept_wait_ms", accept_wait_started)
         self._accounting.register(
             InflightRequest(
                 authorization=authorization,

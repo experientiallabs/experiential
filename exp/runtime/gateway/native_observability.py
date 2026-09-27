@@ -46,6 +46,7 @@ _ADMISSION_TIMING_STAGES = (
     "sqlite_chain_snapshot_preparation_ms",
     "pre_accept_policy_ms",
     "ledger_accept_ms",
+    "ledger_accept_wait_ms",
     "route_and_register_ms",
     "response_encode_ms",
 )

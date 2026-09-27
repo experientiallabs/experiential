@@ -68,9 +68,10 @@ from exp.runtime.gateway.native_bridge import (
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_recovery import session_cache_key
+from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_stage_admission_test import Host
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
-from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
@@ -3450,6 +3451,127 @@ def test_keyed_admissions_enforce_the_durable_ledger_idempotency_rows(
     assert unavailable_payload["code"] == "idempotency_replay_unavailable"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_unkeyed_direct_chat_acceptance_overlaps_route_assembly_and_commits_before_return(
+    tmp_path: Path,
+) -> None:
+    """Simple unkeyed routing overlaps with acceptance, which is durable before return."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components)
+    database_path = manager.database_path
+    writer = components.write_ledger
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    route_entered = threading.Event()
+    original_commit = writer._commit_batch
+    original_resolve_route = control._resolve_route
+    route_request_rows: list[int] = []
+    admission_result: list[JsonObject] = []
+    errors: list[BaseException] = []
+
+    def hold_commit(connection: sqlite3.Connection, batch: list[Any]) -> None:
+        """Hold the writer after dequeue so route assembly can run concurrently."""
+        commit_entered.set()
+        if not release_commit.wait(5):
+            raise TimeoutError("controlled group commit was not released")
+        original_commit(connection, batch)
+
+    def track_route(
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        *,
+        continuation: ContinuationContext | None = None,
+    ) -> GatewayRoute:
+        """Observe durable acceptance at the moment route assembly starts."""
+        with sqlite3.connect(database_path) as connection:
+            count = int(
+                connection.execute(
+                    "SELECT count(*) FROM gateway_requests WHERE request_id = ?",
+                    (authorization.request_id,),
+                ).fetchone()[0]
+            )
+        route_request_rows.append(count)
+        route_entered.set()
+        return original_resolve_route(authorization, request, continuation=continuation)
+
+    def admit_in_thread() -> None:
+        """Capture the worker result so the test can release the controlled writer."""
+        try:
+            admission_result.append(_admit(control, raw_key, _chat_body()))
+        except BaseException as exc:  # noqa: BLE001 - asserted below.
+            errors.append(exc)
+
+    with (
+        mock.patch.object(writer, "_commit_batch", side_effect=hold_commit),
+        mock.patch.object(control, "_resolve_route", side_effect=track_route),
+    ):
+        thread = threading.Thread(target=admit_in_thread, daemon=True)
+        thread.start()
+        assert commit_entered.wait(5)
+        route_overlapped = route_entered.wait(2)
+        release_commit.set()
+        thread.join(timeout=10)
+
+    assert route_overlapped
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(admission_result) == 1
+    unkeyed = admission_result[0]
+    unkeyed_id = str(unkeyed["request_id"])
+    assert route_request_rows == [0]
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM gateway_requests WHERE request_id = ?", (unkeyed_id,)
+        ).fetchone() == (1,)
+    started = _start_first(control, unkeyed)
+    control.settle(
+        json.dumps(
+            {
+                "request_id": unkeyed_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+
+    keyed_route_rows: list[int] = []
+    original_resolve_route = control._resolve_route
+
+    def observe_keyed_route(
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        *,
+        continuation: ContinuationContext | None = None,
+    ) -> GatewayRoute:
+        """Verify keyed acceptance is committed before route selection begins."""
+        with sqlite3.connect(database_path) as connection:
+            keyed_route_rows.append(
+                int(
+                    connection.execute(
+                        "SELECT count(*) FROM gateway_requests WHERE request_id = ?",
+                        (authorization.request_id,),
+                    ).fetchone()[0]
+                )
+            )
+        return original_resolve_route(authorization, request, continuation=continuation)
+
+    with mock.patch.object(control, "_resolve_route", side_effect=observe_keyed_route):
+        keyed = _admit(control, raw_key, _chat_body(), idempotency_key="acceptance-stays-early")
+    assert keyed_route_rows == [1]
+    keyed_id = str(keyed["request_id"])
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM gateway_requests WHERE request_id = ?", (keyed_id,)
+        ).fetchone() == (1,)
+    control.abandon(json.dumps({"request_id": keyed_id}))
 
 
 def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
