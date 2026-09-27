@@ -942,3 +942,21 @@ def test_an_unreadable_credential_file_never_blocks_removing_a_key_connection(
 
     assert removed.exit_code == 0, removed.output
     assert GatewayManagement(root).provider_connections() == ()
+
+
+def test_an_unreadable_credential_file_fails_removing_a_plan_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan stays until its sign-in can be deleted, so no refresh token is stranded."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert _add_imported_plan(root, _codex_auth_file(tmp_path)).exit_code == 0
+    ProviderAuthStore().path.write_text("not json", encoding="utf-8")
+
+    removed = _runner.invoke(
+        app, ["config", "gateway", "provider", "remove", "plan-a", "--root", str(root)]
+    )
+
+    assert removed.exit_code != 0
+    assert "cannot read the sign-in" in " ".join(removed.output.split())
+    assert [c.connection_id for c in GatewayManagement(root).provider_connections()] == ["plan-a"]

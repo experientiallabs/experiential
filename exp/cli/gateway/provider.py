@@ -466,15 +466,34 @@ def provider_update(
     )
 
 
-def _stored_sign_in(store: ProviderAuthStore, name: str) -> StoredOAuthTokens | None:
+def _stored_sign_in(
+    store: ProviderAuthStore, name: str, *, is_plan: bool
+) -> StoredOAuthTokens | None:
     """Return the sign-in stored under ``name``, or ``None`` when there is none to forget.
 
-    An API key under the name, or a credential file that cannot be read, is not a sign-in to
-    forget and must not block disabling a connection that authenticates another way.
+    For a key connection, an API key under the name or a credential file that cannot be read
+    is not a sign-in to forget and must not block disabling it. For a plan connection the
+    file is where its refresh token lives, so a failed read fails the removal rather than
+    disabling the connection and leaving the token behind.
+
+    Args:
+        store: The shared credential file.
+        name: Connection name, also the credential-store key.
+        is_plan: Whether the connection being removed is a plan connection.
+
+    Raises:
+        ProviderAuthStoreError: A plan connection's sign-in could not be read.
     """
     try:
         return store.get_oauth(name)
+    except StoredCredentialKindMismatch:
+        return None
     except ProviderAuthStoreError as exc:
+        if is_plan:
+            raise ProviderAuthStoreError(
+                f"cannot read the sign-in of plan connection {name!r} ({exc}); repair the "
+                "credential file and remove it again so its refresh token is deleted"
+            ) from exc
         logger.warning("not forgetting a sign-in for %r: %s", name, exc)
         return None
 
@@ -508,8 +527,12 @@ def _remove_provider(
             # lock keeps a refresh from rotating the pair between the read and the delete,
             # and the delete is a compare-and-swap, so a plan another process adds under the
             # name meanwhile keeps its own.
+            is_plan = any(
+                connection.connection_id == name and connection.config.subscription is not None
+                for connection in management.provider_connections()
+            )
             with store.sign_in_lock(name):
-                signed_in = _stored_sign_in(store, name)
+                signed_in = _stored_sign_in(store, name, is_plan=is_plan)
                 changed = management.disable_provider_connection(connection_id=name)
                 if changed and signed_in is not None:
                     store.replace_oauth_if(name, expected=signed_in, replacement=None)
