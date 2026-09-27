@@ -234,7 +234,9 @@ fn rounding_never_excuses_infeasible_scores_or_high_precision_disagreement() {
         (vec![0.0, 0.0, 0.0, 0.0, 1.0], 3.97),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.5),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.12001),
+        (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.120000000005),
         (vec![0.0, 0.870001, 0.129999, 0.0, 0.0], 1.12),
+        (vec![1e-12, 0.87 - 1e-12, 0.13, 0.0, 0.0], 1.12),
         (vec![0.33, 0.33, 0.33], 1.0),
         (vec![0.34, 0.34, 0.34, 0.0, 0.0], 1.02),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], -0.01),
@@ -293,8 +295,15 @@ fn rounding_extrema_match_an_independent_three_bin_enumeration() {
             );
         }
     }
+    // Every permitted score hundredth survives ordinary binary representation.
+    for value in 0..=900 {
+        assert_eq!(hundredths(value as f64 / 100.0), Some(value));
+    }
     assert_eq!(hundredths(0.8200000000000001), Some(82));
     assert_eq!(hundredths(0.82000001), None);
+    assert_eq!(hundredths(1.120000000005), None);
+    assert_eq!(hundredths(1e-12), None);
+    assert_eq!(hundredths(f64::MIN_POSITIVE), None);
 }
 
 #[test]

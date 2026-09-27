@@ -190,6 +190,12 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
             cast(JsonObject, answers["quantity"])["legend"] = {"0": "wrong criteria"}
         elif selector == "inconsistent-score":
             cast(JsonObject, answers["quantity"])["score"] = 0.2
+        elif selector == "precise-score":
+            cast(JsonObject, answers["quantity"])["score"] = 1.740000000005
+        elif selector == "precise-probabilities":
+            quantity = cast(JsonObject, answers["quantity"])
+            quantity["score"] = 1.74
+            quantity["probabilities"] = {"0": 0.05 + 1e-12, "1": 0.15 - 1e-12, "2": 0.8}
         elif selector in {"rounded-low", "rounded-high"}:
             answers["quantity"] = _rounded_answer(selector)
             body["usage"] = {
@@ -615,6 +621,8 @@ def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEng
         ("wrong-probabilities", "decision"),
         ("wrong-legend", "decision"),
         ("inconsistent-score", "decision-failover"),
+        ("precise-score", "decision-failover"),
+        ("precise-probabilities", "decision-failover"),
         ("wrong-type", "decision-failover"),
     )
     for selector, alias in cases:

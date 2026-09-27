@@ -623,7 +623,11 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
 /// Recognize decimal hundredths, including their binary floating-point residue.
 fn hundredths(value: f64) -> Option<i64> {
     let scaled = value * 100.0;
-    ((scaled - scaled.round()).abs() <= 1e-9).then(|| scaled.round() as i64)
+    let rounded = scaled.round();
+    // Allow binary representation and multiplication roundoff, not extra decimal
+    // precision. A relative bound also keeps tiny nonzero bins distinct from zero.
+    let roundoff = 2.0 * f64::EPSILON * scaled.abs();
+    ((scaled - rounded).abs() <= roundoff).then_some(rounded as i64)
 }
 
 /// Extremize a weighted sum by filling the lowest or highest indices first.
