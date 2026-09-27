@@ -1034,6 +1034,9 @@ def test_plan_connections_bind_each_kind_to_its_one_provider() -> None:
             base_url="https://example.com/v1",
             trusted_custom_origin=True,
         )
+    # The plan client never sends inference_geo, so a residency constraint is refused, not dropped.
+    with pytest.raises(ValueError, match="inference_geo"):
+        ConnectionConfig(provider="anthropic", subscription="anthropic", inference_geo="us")
 
 
 def test_plan_identity_differs_from_the_api_key_origin_and_serializes_only_when_set() -> None:

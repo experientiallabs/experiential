@@ -31,15 +31,19 @@ EXHAUSTED_USED_PERCENT = 100
 
 
 class SubscriptionWindowObservation(ContractModel):
-    """One plan usage window as the ChatGPT backend reports it on every response."""
+    """One plan usage window as the provider reports it on every response.
+
+    Attributes:
+        window: Which window (the short one or the weekly one).
+        used_percent: Share of the window's allowance already spent, 0 to 100.
+        reset_after_seconds: Seconds until the window rolls over, when the provider states it.
+        window_minutes: The window's length, when the provider states it.
+    """
 
     window: SubscriptionWindowName
     used_percent: int
-    """Share of the window's allowance already spent, 0 to 100."""
     reset_after_seconds: int | None = None
-    """Seconds until the window rolls over, when the provider states it."""
     window_minutes: int | None = None
-    """The window's length, when the provider states it."""
 
     @property
     def exhausted(self) -> bool:
@@ -87,14 +91,16 @@ class RateLimitObservation(ContractModel):
 
         A plan whose short window is spent stays unusable until that window rolls over,
         and a spent long window outlasts a spent short one, so the longest reset is the
-        wait that actually reopens the rung.
+        wait that actually reopens the rung. The wait is clamped to the bounds a parsed
+        ``Retry-After`` carries (at least one second, at most ``MAXIMUM_RETRY_AFTER_SECONDS``),
+        because it stands in for one on a throttled failure.
         """
         waits = [
             item.reset_after_seconds
             for item in self.subscription_windows
             if item.exhausted and item.reset_after_seconds is not None
         ]
-        return max(waits) if waits else None
+        return min(max(max(waits), 1), MAXIMUM_RETRY_AFTER_SECONDS) if waits else None
 
 
 _EMPTY_OBSERVATION = RateLimitObservation()
@@ -202,14 +208,16 @@ def rate_limit_observation(
 def _subscription_windows(
     lowered: Mapping[str, str], *, now: datetime | None = None
 ) -> tuple[SubscriptionWindowObservation, ...]:
-    """Read the ChatGPT plan backend's ``x-codex-*`` usage windows.
+    """Read a plan's usage windows: a Claude plan's, else the ChatGPT backend's ``x-codex-*``.
 
     A window is reported only when its used-percent header parses; the reset and
     length stay ``None`` when theirs do not, so one garbled header never hides the
-    window's exhaustion.
+    window's exhaustion. The ChatGPT used-percent is a decimal (``12.5``, ``100.0``),
+    and the reset arrives as ``reset-after-seconds`` or as a ``reset-at`` unix timestamp.
 
     Args:
         lowered: Lowercased header names mapped to raw values.
+        now: Reference time for absolute reset timestamps; defaults to now (UTC).
 
     Returns:
         The windows present, primary first.
@@ -217,10 +225,10 @@ def _subscription_windows(
     claude = _claude_plan_windows(lowered, now=now)
     if claude:
         return claude
+    reference = (now if now is not None else datetime.now(UTC)).timestamp()
     windows: list[SubscriptionWindowObservation] = []
     for name in ("primary", "secondary"):
-        used_raw = lowered.get(f"x-codex-{name}-used-percent")
-        used = None if used_raw is None else _parse_count(used_raw)
+        used = _parse_percent(lowered.get(f"x-codex-{name}-used-percent"))
         if used is None:
             continue
         reset_raw = lowered.get(f"x-codex-{name}-reset-after-seconds")
@@ -228,8 +236,12 @@ def _subscription_windows(
         windows.append(
             SubscriptionWindowObservation(
                 window=name,
-                used_percent=min(used, EXHAUSTED_USED_PERCENT),
-                reset_after_seconds=None if reset_raw is None else _parse_count(reset_raw),
+                used_percent=used,
+                reset_after_seconds=(
+                    _seconds_until(lowered.get(f"x-codex-{name}-reset-at"), reference)
+                    if reset_raw is None
+                    else _parse_count(reset_raw)
+                ),
                 window_minutes=None if length_raw is None else _parse_count(length_raw),
             )
         )
@@ -249,7 +261,9 @@ def _claude_plan_windows(
 ) -> tuple[SubscriptionWindowObservation, ...]:
     """Read a Claude plan's ``anthropic-ratelimit-unified-*`` usage windows.
 
-    Utilization arrives as a fraction (``0.42``) or a percent (``42``), the reset as a unix
+    Utilization arrives as a decimal fraction (``0.42``, over ``1.0`` past the allowance) or as
+    a whole percent (``42``): a value written with a decimal point or an exponent is a fraction,
+    a bare integer a percent. The reset arrives as a unix
     timestamp in seconds or milliseconds, and the status as ``allowed``/``rejected``. A
     ``rejected`` status reads as a used-up window whatever the utilization says, because it is
     the provider's own refusal verdict.
@@ -282,17 +296,44 @@ def _claude_plan_windows(
 
 
 def _parse_fraction_percent(value: str | None) -> int | None:
-    """Parse a utilization given as a 0..1 fraction or a 0..100 percent; garbage is None."""
+    """Parse a utilization given as a decimal fraction or a whole percent; garbage is None.
+
+    The written form decides, never the magnitude: ``1.05`` (a fraction past the allowance)
+    is spent, and ``1`` (one percent) is not.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not any(marker in text for marker in ".eE"):
+        return _parse_percent(text)
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return _whole_percent(number * 100)
+
+
+def _parse_percent(value: str | None) -> int | None:
+    """Parse a used percent written as an integer or a decimal; garbage is None."""
     if value is None:
         return None
     try:
         number = float(value.strip())
     except ValueError:
         return None
-    if not math.isfinite(number) or number < 0:
+    return _whole_percent(number)
+
+
+def _whole_percent(percent: float) -> int | None:
+    """Floor one percent to a whole number capped at 100; a negative or infinite one is None.
+
+    Flooring (after shedding float noise such as ``28.999999999999996``) keeps a window at
+    99.6 percent open: only a reading of a full 100 percent, or the provider's own ``rejected``
+    verdict, suppresses a plan until its reset.
+    """
+    if not math.isfinite(percent) or percent < 0:
         return None
-    percent = number * 100 if number <= 1 else number
-    return min(round(percent), EXHAUSTED_USED_PERCENT)
+    return min(math.floor(round(percent, 6)), EXHAUSTED_USED_PERCENT)
 
 
 def _seconds_until(value: str | None, reference: float) -> int | None:

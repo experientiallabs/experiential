@@ -575,7 +575,13 @@ GrantMutationCommand = Annotated[
 
 
 class UpsertProviderConnectionCommand(ContractModel):
-    """Create or explicitly revise one provider connection."""
+    """Create or explicitly revise one provider connection.
+
+    Attributes:
+        subscription: A plan connection's kind (``None`` for a key connection); dispatch mints a
+            per-request bearer from the plan sign-in the runtime's token source holds, so no
+            secret reference is carried. The remaining fields mirror ``ConnectionConfig``.
+    """
 
     kind: Literal["upsert_provider_connection"] = "upsert_provider_connection"
     organization_id: OrganizationId
@@ -591,8 +597,6 @@ class UpsertProviderConnectionCommand(ContractModel):
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     trusted_custom_origin: bool = False
     subscription: SubscriptionKind | None = None
-    """A plan connection's kind: dispatch mints a per-request bearer from the plan
-    sign-in the runtime's token source holds, and no secret reference is carried."""
     replace: bool = False
 
 

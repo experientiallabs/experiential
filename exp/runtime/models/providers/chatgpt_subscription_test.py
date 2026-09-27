@@ -211,6 +211,22 @@ class TestGrants:
         assert refreshed.refresh_token == "refresh-old"
         assert refreshed.expires_at_ms == 1_900_000_000_000
 
+    def test_a_null_refresh_token_in_the_answer_also_keeps_the_stored_one(self) -> None:
+        """An answer that nulls the refresh token is not rotated, so the refresh succeeds."""
+
+        def endpoint(payload: JsonObject) -> JsonObject:
+            """Answer the refresh grant with an explicit null refresh token."""
+            del payload
+            return {
+                "access_token": _access(1_900_000_000),
+                "refresh_token": None,
+                "id_token": _access(1_900_000_000),
+            }
+
+        refreshed = refresh_sign_in(_tokens(refresh="refresh-old"), token_endpoint=endpoint)
+
+        assert refreshed.refresh_token == "refresh-old"
+
 
 class TestTokenSource:
     """The token source serves the stored sign-in and refreshes ahead of expiry, once."""

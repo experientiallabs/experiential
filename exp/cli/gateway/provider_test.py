@@ -779,3 +779,85 @@ def test_a_failed_activation_removes_the_new_plan_sign_in(
     assert result.exit_code != 0
     assert "authority refused the connection" in result.output
     assert ProviderAuthStore().get_oauth("plan-a") is None
+
+
+def test_a_plan_never_overwrites_an_api_key_stored_under_its_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credential file is shared with ``exp config providers``; its key survives."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    ProviderAuthStore().put("plan-a", "sk-live-key")
+
+    result = _add_imported_plan(root, _codex_auth_file(tmp_path))
+
+    assert result.exit_code != 0
+    assert "API key" in _plain_output(result.output)
+    assert ProviderAuthStore().get("plan-a") == "sk-live-key"
+    assert GatewayManagement(root).provider_connections() == ()
+
+
+def test_a_failed_replace_puts_back_the_sign_in_the_connection_had(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revision that fails to activate leaves the live connection on its own sign-in."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    added = _add_imported_plan(root, _codex_auth_file(tmp_path))
+    assert added.exit_code == 0, added.output
+    live = GatewayManagement(root).provider_connections()[0].config
+    before = ProviderAuthStore().get_oauth("plan-a", binding=connection_credential_binding(live))
+    assert before is not None
+
+    def refuse(self: GatewayManagement, **_kwargs: object) -> tuple[bool, object]:
+        raise ValueError("authority refused the connection")
+
+    monkeypatch.setattr(GatewayManagement, "upsert_provider_connection", refuse)
+    second = tmp_path / "second"
+    second.mkdir()
+    second_file = _codex_auth_file(second)
+    document = json.loads(second_file.read_text(encoding="utf-8"))
+    document["tokens"]["refresh_token"] = "refresh-second"
+    second_file.write_text(json.dumps(document), encoding="utf-8")
+    replaced = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "plan-a",
+            "--provider",
+            "openai",
+            "--subscription",
+            "chatgpt",
+            "--codex-auth-file",
+            str(second_file),
+            "--replace",
+            "--non-interactive",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert replaced.exit_code != 0
+    after = ProviderAuthStore().get_oauth("plan-a", binding=connection_credential_binding(live))
+    assert after == before
+    assert after is not None and after.refresh_token == "refresh-fixture"
+
+
+def test_removing_a_plan_connection_forgets_its_sign_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No refresh token outlives the plan connection it was issued for."""
+    root = _initialized_root(tmp_path / "root")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    added = _add_imported_plan(root, _codex_auth_file(tmp_path))
+    assert added.exit_code == 0, added.output
+
+    removed = _runner.invoke(
+        app, ["config", "gateway", "provider", "remove", "plan-a", "--root", str(root)]
+    )
+
+    assert removed.exit_code == 0, removed.output
+    assert ProviderAuthStore().get_oauth("plan-a") is None

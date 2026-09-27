@@ -13,7 +13,7 @@ from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from exp.cli.providers.anthropic_sign_in import anthropic_paste_sign_in
 from exp.cli.providers.chatgpt_sign_in import chatgpt_browser_sign_in
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.common.auth import ProviderAuthStore, StoredOAuthTokens
+from exp.common.auth import ProviderAuthStore, StoredCredentialKindMismatch, StoredOAuthTokens
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.core.locks import FileLockTimeout
 from exp.common.models import ConnectionConfig
@@ -53,7 +53,10 @@ _SUBSCRIPTION_OPTION = typer.Option(
 _CODEX_AUTH_FILE_OPTION = typer.Option(
     None,
     "--codex-auth-file",
-    help="Import an existing Codex auth.json sign-in instead of opening the browser.",
+    help=(
+        "Import an existing Codex auth.json sign-in instead of opening the browser. The "
+        "sign-in is handed over: run 'codex login' again afterwards for Codex itself."
+    ),
 )
 
 
@@ -228,9 +231,11 @@ def _activate_plan_connection(
     """Store a plan sign-in and activate its connection, leaving neither half on failure.
 
     The sign-in is written before the connection turns active, so a connection is never
-    active without a usable sign-in. A connection the command may not revise is refused
-    before anything is written, and a failed activation of a NEW connection removes the
-    sign-in it just stored.
+    active without a usable sign-in. A connection the command may not revise, or a name
+    whose credential-file record is an API key (the file is shared with
+    ``exp config providers``), is refused before anything is written. A failed activation
+    puts back the sign-in the connection had before, or removes the new one when there was
+    none, so the still-active revision keeps dispatching on its own sign-in.
 
     Args:
         name: Connection name, also the credential-store key.
@@ -251,19 +256,27 @@ def _activate_plan_connection(
         ),
         None,
     )
-    with usage_error(ValueError):
+    store = ProviderAuthStore()
+    with usage_error(ValueError, FileLockTimeout):
         if existing is not None and existing.revision_id != revision and not replace:
             raise ValueError(
                 f"provider connection {name!r} already exists with different settings; "
                 "re-run with --replace to revise it and sign in again"
             )
-    store = ProviderAuthStore()
-    with usage_error(ValueError, FileLockTimeout):
+        try:
+            previous = store.get_oauth(name)
+        except StoredCredentialKindMismatch as exc:
+            raise ValueError(
+                f"the credential file already holds an API key under {name!r}; choose another "
+                "connection name for the plan so that key is not overwritten"
+            ) from exc
         store.put_oauth(name, tokens, binding=connection_credential_binding(config))
     try:
         return _upsert_connection(name=name, config=config, root=root, replace=replace)
     except BaseException:
-        if existing is None:
+        if existing is not None and previous is not None:
+            store.put_oauth(name, previous, binding=connection_credential_binding(existing.config))
+        else:
             store.remove(name)
         raise
 
@@ -442,10 +455,33 @@ def _remove_provider(
     root: Path,
     operation: str,
     json_output: bool,
+    forget_plan_sign_in: bool = False,
 ) -> None:
-    """Remove one unreferenced provider for disable and remove commands."""
+    """Remove one unreferenced provider for disable and remove commands.
+
+    Args:
+        name: Connection name.
+        root: Gateway state root.
+        operation: Receipt operation name.
+        json_output: Whether to emit the receipt as JSON.
+        forget_plan_sign_in: Whether a removed plan connection's stored sign-in is deleted
+            too, so no refresh token outlives the connection it was issued for.
+    """
+    management = GatewayManagement(root)
+    plan = forget_plan_sign_in and any(
+        connection.connection_id == name and connection.config.subscription is not None
+        for connection in management.provider_connections()
+    )
     with usage_error(ValueError, FileLockTimeout):
-        changed = GatewayManagement(root).disable_provider_connection(connection_id=name)
+        changed = management.disable_provider_connection(connection_id=name)
+        if plan and changed:
+            store = ProviderAuthStore()
+            try:
+                stored = store.get_oauth(name)
+            except StoredCredentialKindMismatch:
+                stored = None
+            if stored is not None:
+                store.remove(name)
     emit_receipt(
         GatewayReceipt(
             operation=operation,
@@ -477,6 +513,12 @@ def provider_remove(
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
-    """Remove one unreferenced provider connection."""
+    """Remove one unreferenced provider connection, and a plan connection's stored sign-in."""
     del non_interactive
-    _remove_provider(name, root=root, operation="provider.remove", json_output=json_output)
+    _remove_provider(
+        name,
+        root=root,
+        operation="provider.remove",
+        json_output=json_output,
+        forget_plan_sign_in=True,
+    )

@@ -337,7 +337,7 @@ class ConnectionConfig(ContractModel):
 
         Raises:
             ValueError: The plan names another provider, or the connection also carries an
-                API-key locator or any endpoint override.
+                API-key locator, an inference geography, or any endpoint override.
         """
         if self.subscription is None:
             return
@@ -356,11 +356,14 @@ class ConnectionConfig(ContractModel):
             self.base_url is not None
             or self.api_version is not None
             or self.region is not None
+            or self.inference_geo is not None
             or self.trusted_custom_origin
         ):
+            # inference_geo is refused rather than ignored: the plan client never sends it,
+            # so accepting it would silently drop a data-residency constraint.
             raise ValueError(
-                "a subscription connection reaches its plan's fixed backend; omit base_url "
-                "and every endpoint override"
+                "a subscription connection reaches its plan's fixed backend; omit base_url, "
+                "inference_geo, and every endpoint override"
             )
 
     def identity_sha256(self) -> Sha256:

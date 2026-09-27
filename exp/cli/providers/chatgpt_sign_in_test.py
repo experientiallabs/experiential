@@ -82,7 +82,11 @@ def test_browser_sign_in_times_out_without_a_callback() -> None:
             token_endpoint=_never,
             callback_port=0,
         )
-    assert "Open this URL to sign in" in console.export_text()
+    printed = console.export_text().replace("\n", "")
+    assert "Open this URL to sign in" in printed
+    # The fallback URL is pasted into a browser verbatim, so it must not be HTML-escaped.
+    assert "&client_id=" in printed
+    assert "&amp;" not in printed
 
 
 def _never(payload: JsonObject) -> JsonObject:

@@ -55,7 +55,18 @@ class AnthropicPlanError(SubscriptionSignInError):
 
 
 class AnthropicOAuthApp(ContractModel):
-    """The OAuth application Anthropic issued to this gateway's operator for plan sign-in."""
+    """The OAuth application Anthropic issued to this gateway's operator for plan sign-in.
+
+    Attributes:
+        client_id: The operator's own OAuth client id (Claude Code's is refused).
+        redirect_uri: The callback registered for this client.
+        authorize_url: Authorization endpoint; defaults to Anthropic's.
+        token_url: Token endpoint; defaults to Anthropic's.
+        scopes: Scopes requested at sign-in.
+        dispatch_headers: Extra headers Anthropic asks this application to send on inference
+            (for example the ``anthropic-beta`` value named in the approval). Never a credential
+            or a header that presents the gateway as another client.
+    """
 
     client_id: str = Field(min_length=1, max_length=256)
     redirect_uri: str = Field(min_length=1, max_length=2_048)
@@ -63,8 +74,6 @@ class AnthropicOAuthApp(ContractModel):
     token_url: str = ANTHROPIC_OAUTH_TOKEN_URL
     scopes: tuple[str, ...] = DEFAULT_ANTHROPIC_PLAN_SCOPES
     dispatch_headers: dict[str, str] = Field(default_factory=dict)
-    """Extra headers Anthropic asks this application to send on inference (for example the
-    ``anthropic-beta`` value named in the approval). Never an ``Authorization`` header."""
 
     @field_validator("client_id")
     @classmethod

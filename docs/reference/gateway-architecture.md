@@ -429,34 +429,30 @@ rate-limit response headers per attempt when the data plane harvests them (`retr
 OpenAI `x-ratelimit-*` and Anthropic `anthropic-ratelimit-*` families, normalized to integers),
 and a throttled settlement carrying a parseable `Retry-After` (seconds or HTTP-date) sizes that
 deployment's throttle window from it, clamped to [5s, 6h], instead of the fixed default, so a
-daily-quota reset actually suppresses the rung for the wait the provider asked for. A plan
-rung (`subscription = "chatgpt"` or `"anthropic"`, see the providers reference) adds its rolling
-usage windows: a window at 100 percent throttles that rung until the stated reset, success or
-not, so a pool of plans rotates before the first 429, and its bearer is minted per physical
-dispatch through `sign_dispatch`, the hook Bedrock uses for SigV4. Pools and rungs that author
-none of this keep byte-identical behavior and null disclosure columns.
+daily-quota reset actually suppresses the rung for the wait the provider asked for. A plan rung
+(`subscription`, see the providers reference) also throttles until a used-up usage window resets.
+Pools and rungs that author none of this keep byte-identical behavior and null disclosure columns.
 
 Under `maximize_cache_affinity`, two further per-rung fields keep provider prompt caches warm
 across spills. `sticky_spill_seconds` gives each dispatch a worker-local
 fingerprint-to-deployment binding with that lifetime (refreshed per hit, but capped at four
 lifetimes of total age from creation so continuous hits cannot pin a long-running session to a
-pricier spill rung forever): the binding is honored
-ahead of rendezvous order on later requests, so a spilled conversation keeps serving off the rung
-holding its warm cache instead of bouncing back the moment the preferred rung stops shedding, and
-a binding whose rung is throttled or circuit-open is cleared rather than followed. The binding is
-deliberately worker-local (the serving edge's keep-alives pin a client to one worker; the
-cross-worker miss costs one cold dispatch). The binding keys on the affinity fingerprint (the
-session identity rendezvous already uses), never on a derived provider cache key: on
-OpenAI-compatible shim lanes (including Experiential Cloud's vLLM boxes) no `prompt_cache_key` is
-forwarded and the box's prefix cache is content-addressed, so gateway-side session-to-rung
-consistency is the entire cache-preservation mechanism there. `fresh_session_spill_fraction`
-reserves the top slice
-of a bounded rung for warm sessions: a request whose fingerprint holds no live binding on the
-rung sheds sideways once in-flight dispatches reach `bound * fraction` (`fresh_session_spill`),
-while warm sessions ride to the hard bound (it requires `sticky_spill_seconds`, because warm
-standing IS a live binding). A hosted composition may also exclude individual attempts from the
-cache-priority EWMA through the accounting's `cache_sample_gate` (promotion-funded replay must
-not buy fair-share weight with prefixes the promotion already made costless).
+pricier spill rung forever): the binding is honored ahead of rendezvous order on later requests,
+so a spilled conversation keeps serving off the rung holding its warm cache instead of bouncing
+back the moment the preferred rung stops shedding, and a binding whose rung is throttled or
+circuit-open is cleared rather than followed. The binding is deliberately worker-local (the
+serving edge's keep-alives pin a client to one worker; the cross-worker miss costs one cold
+dispatch). The binding keys on the affinity fingerprint (the session identity rendezvous already
+uses), never on a derived provider cache key: on OpenAI-compatible shim lanes (including
+Experiential Cloud's vLLM boxes) no `prompt_cache_key` is forwarded and the box's prefix cache is
+content-addressed, so gateway-side session-to-rung consistency is the entire cache-preservation
+mechanism there. `fresh_session_spill_fraction` reserves the top slice of a bounded rung for warm
+sessions: a request whose fingerprint holds no live binding on the rung sheds sideways once
+in-flight dispatches reach `bound * fraction` (`fresh_session_spill`), while warm sessions ride
+to the hard bound (it requires `sticky_spill_seconds`, because warm standing IS a live binding).
+A hosted composition may also exclude individual attempts from the cache-priority EWMA through
+the accounting's `cache_sample_gate` (promotion-funded replay must not buy fair-share weight with
+prefixes the promotion already made costless).
 
 A deployment's price schedule may declare a long-context tier: a whole-request premium applied
 once provider-reported input tokens reach its threshold, matching both published tier schedules

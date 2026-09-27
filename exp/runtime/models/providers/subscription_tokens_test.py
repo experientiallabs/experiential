@@ -126,3 +126,20 @@ def test_a_refresh_another_process_landed_first_is_used_not_repeated(tmp_path: P
     assert ours.current() == rotations[0]
     assert len(rotations) == 1
     assert spent == []
+
+
+def test_an_unusable_credential_file_surfaces_as_a_sign_in_error(tmp_path: Path) -> None:
+    """A malformed file or an API key under the name is a credential error, not a store error.
+
+    Gateway admission narrows past a rung only on credential errors, so a store failure must
+    not escape as a bare ``ProviderAuthStoreError``.
+    """
+    source, store = _source(tmp_path, None, [])
+    store.put("plan", "sk-api-key", binding=_BINDING)
+
+    with pytest.raises(SubscriptionSignInError, match="API key"):
+        source.current()
+
+    store.path.write_text("not json", encoding="utf-8")
+    with pytest.raises(SubscriptionSignInError, match="cannot be read"):
+        source.current()

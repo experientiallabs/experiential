@@ -18,7 +18,13 @@ import time
 from collections.abc import Callable
 from typing import Protocol
 
-from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, StoredOAuthTokens
+from exp.common.auth import (
+    ProviderAuthStore,
+    ProviderAuthStoreError,
+    StoredCredentialBinding,
+    StoredOAuthTokens,
+)
+from exp.common.core.locks import FileLockTimeout
 from exp.common.models import ConnectionConfig
 from exp.runtime.models.credentials import ModelCredentialError
 
@@ -116,7 +122,26 @@ class StoredSubscriptionTokenSource:
         """Return a sign-in good for the refresh-ahead window, refreshing and persisting first.
 
         Raises:
+            SubscriptionSignInError: No sign-in is stored, the credential file cannot be used
+                (unreadable, bound to another endpoint, an API key under this name, or its
+                lock held too long), or the refresh was refused. Store failures surface as this
+                credential error so gateway admission narrows past the rung, exactly as an
+                API-key connection's unusable credential file does.
+        """
+        try:
+            return self._current()
+        except (ProviderAuthStoreError, FileLockTimeout) as exc:
+            raise SubscriptionSignInError(
+                f"the plan sign-in for connection {self._connection_id!r} cannot be read: {exc}"
+            ) from exc
+
+    def _current(self) -> StoredOAuthTokens:
+        """Read, and when due refresh, the stored sign-in; store failures propagate.
+
+        Raises:
             SubscriptionSignInError: No sign-in is stored, or the refresh was refused.
+            ProviderAuthStoreError: The credential file cannot be used.
+            FileLockTimeout: Another holder kept the credential file lock too long.
         """
         with self._lock:
             tokens = self._store.get_oauth(self._connection_id, binding=self._binding)
@@ -131,6 +156,7 @@ class StoredSubscriptionTokenSource:
             rotated: list[StoredOAuthTokens] = []
 
             def refresh(stored: StoredOAuthTokens) -> StoredOAuthTokens | None:
+                """Rotate ``stored`` when it is still due under the lock, else keep it."""
                 if not self._due(stored):
                     return None
                 rotated.append(self._refresher(stored))

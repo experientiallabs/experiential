@@ -95,7 +95,8 @@ exp config gateway provider add claude-a --provider anthropic --subscription ant
 ```
 
 A ChatGPT plan signs in through the public Codex OAuth client on its registered loopback callback
-(`localhost:1455`) or imports an existing Codex sign-in; the gateway sends its own
+(`localhost:1455`) or imports an existing Codex sign-in. An import hands the sign-in over: the
+refresh token rotates on every use, so sign Codex in again afterwards. The gateway sends its own
 `originator`. A Claude plan signs in through the OAuth application Anthropic issued to the
 OPERATOR of the gateway, configured with `EXP_ANTHROPIC_OAUTH_CLIENT_ID` and
 `EXP_ANTHROPIC_OAUTH_REDIRECT_URI` (optional: `_AUTHORIZE_URL`, `_TOKEN_URL`, `_SCOPES`, and

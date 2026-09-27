@@ -248,3 +248,68 @@ class TestClaudePlanWindows:
         )
 
         assert observation.subscription_windows == ()
+
+    def test_the_written_form_decides_fraction_or_percent_and_floors_the_reading(self) -> None:
+        """``1.05`` is past the allowance, ``1`` is one percent, and 99.6 percent stays open."""
+        observation = rate_limit_observation(
+            {
+                "anthropic-ratelimit-unified-5h-utilization": "1.05",
+                "anthropic-ratelimit-unified-5h-reset": str(int(self._NOW.timestamp()) + 60),
+                "anthropic-ratelimit-unified-7d-utilization": "0.996",
+            },
+            now=self._NOW,
+        )
+
+        primary = observation.subscription_window("primary")
+        secondary = observation.subscription_window("secondary")
+        assert primary is not None and primary.exhausted
+        assert secondary is not None and secondary.used_percent == 99
+        assert not secondary.exhausted
+        one_percent = rate_limit_observation(
+            {"anthropic-ratelimit-unified-5h-utilization": "1"}, now=self._NOW
+        ).subscription_window("primary")
+        assert one_percent is not None and one_percent.used_percent == 1
+
+    def test_a_reset_already_past_still_waits_at_least_one_second(self) -> None:
+        """An exhausted window whose reset has passed yields the Retry-After floor, never 0."""
+        observation = rate_limit_observation(
+            {
+                "anthropic-ratelimit-unified-5h-status": "rejected",
+                "anthropic-ratelimit-unified-5h-reset": str(int(self._NOW.timestamp()) - 30),
+            },
+            now=self._NOW,
+        )
+
+        assert observation.exhausted_reset_after_seconds == 1
+
+
+class TestChatGptDecimalWindows:
+    """The ChatGPT backend states used-percent as a decimal and may state the reset as a time."""
+
+    _NOW = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+
+    def test_decimal_percent_and_reset_timestamp_exhaust_the_window(self) -> None:
+        """``100.0`` is a spent window and ``reset-at`` supplies its wait."""
+        observation = rate_limit_observation(
+            {
+                "x-codex-primary-used-percent": "12.5",
+                "x-codex-secondary-used-percent": "100.0",
+                "x-codex-secondary-reset-at": str(int(self._NOW.timestamp()) + 86_400),
+            },
+            now=self._NOW,
+        )
+
+        primary = observation.subscription_window("primary")
+        assert primary is not None and primary.used_percent == 12
+        assert observation.exhausted_reset_after_seconds == 86_400
+
+    def test_an_unbounded_reset_is_clamped_to_the_retry_after_ceiling(self) -> None:
+        """A garbage-large stated reset never outruns the Retry-After ceiling."""
+        observation = rate_limit_observation(
+            {
+                "x-codex-primary-used-percent": "100",
+                "x-codex-primary-reset-after-seconds": str(10**12),
+            }
+        )
+
+        assert observation.exhausted_reset_after_seconds == MAXIMUM_RETRY_AFTER_SECONDS

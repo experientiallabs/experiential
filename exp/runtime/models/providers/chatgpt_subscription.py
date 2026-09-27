@@ -172,8 +172,10 @@ def tokens_from_token_response(payload: JsonObject) -> StoredOAuthTokens:
 def tokens_from_codex_auth_file(path: Path) -> StoredOAuthTokens:
     """Import an existing Codex ``auth.json`` sign-in.
 
-    Only the token fields are read. The file is never modified: Codex keeps its own copy,
-    and the two refresh independently from this point on.
+    Only the token fields are read and the file is never modified, but the import HANDS the
+    sign-in over rather than sharing it: the provider rotates the refresh token on every use,
+    so once either side refreshes, the other side's copy is spent. Sign Codex in again
+    (``codex login``) after importing, or use the browser sign-in for a separate session.
 
     Args:
         path: Codex ``auth.json`` path (``~/.codex/auth.json`` by default).
@@ -291,8 +293,9 @@ def refresh_sign_in(
             "scope": "openid profile email",
         }
     )
-    if "refresh_token" not in response:
-        # A refresh answer may omit the refresh token when it is not rotated.
+    if not response.get("refresh_token"):
+        # A refresh answer may omit (or null) the refresh token when it is not rotated; the
+        # stored one stays valid then, exactly as the Claude plan refresher treats it.
         response = {**response, "refresh_token": tokens.refresh_token}
     return tokens_from_token_response(response)
 

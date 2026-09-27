@@ -15,11 +15,11 @@ use serde_json::{Map, Value};
 
 /// The closed set of forwarded rate-limit headers, lowercased. The `x-codex-*`
 /// entries are the ChatGPT plan backend's rolling usage windows (percent used,
-/// seconds to reset, window length); numbers only, never the opaque
-/// `x-codex-turn-state` or any account label. The `anthropic-ratelimit-unified-*`
+/// seconds to reset or the reset timestamp, window length); numbers only, never
+/// the opaque `x-codex-turn-state` or any account label. The `anthropic-ratelimit-unified-*`
 /// entries are a Claude plan's five-hour and weekly windows (utilization,
 /// reset time, allowed/rejected status), likewise numbers and one status word.
-const ALLOWLISTED_HEADERS: [&str; 21] = [
+const ALLOWLISTED_HEADERS: [&str; 23] = [
     "retry-after",
     "x-ratelimit-limit-requests",
     "x-ratelimit-remaining-requests",
@@ -31,9 +31,11 @@ const ALLOWLISTED_HEADERS: [&str; 21] = [
     "anthropic-ratelimit-tokens-remaining",
     "x-codex-primary-used-percent",
     "x-codex-primary-reset-after-seconds",
+    "x-codex-primary-reset-at",
     "x-codex-primary-window-minutes",
     "x-codex-secondary-used-percent",
     "x-codex-secondary-reset-after-seconds",
+    "x-codex-secondary-reset-at",
     "x-codex-secondary-window-minutes",
     "anthropic-ratelimit-unified-5h-utilization",
     "anthropic-ratelimit-unified-5h-reset",
@@ -120,13 +122,15 @@ mod tests {
         let harvested = harvest_rate_limit_headers(&headers(&[
             ("x-codex-primary-used-percent", "22"),
             ("x-codex-primary-reset-after-seconds", "11511"),
+            ("x-codex-secondary-reset-at", "1788852525"),
             ("x-codex-secondary-window-minutes", "10080"),
             ("x-codex-turn-state", "gAAAAABqn4w3"),
             ("x-codex-plan-type", "team"),
         ]))
         .unwrap();
-        assert_eq!(harvested.len(), 3);
+        assert_eq!(harvested.len(), 4);
         assert_eq!(harvested["x-codex-primary-used-percent"], "22");
+        assert_eq!(harvested["x-codex-secondary-reset-at"], "1788852525");
         assert!(!harvested.contains_key("x-codex-turn-state"));
         assert!(!harvested.contains_key("x-codex-plan-type"));
     }

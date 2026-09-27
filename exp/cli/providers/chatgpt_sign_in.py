@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import html
 import secrets
 import threading
 import webbrowser
@@ -20,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from rich.console import Console
+from rich.markup import escape
 
 from exp.common.auth import StoredOAuthTokens
 from exp.runtime.models.providers.chatgpt_subscription import (
@@ -231,7 +231,7 @@ def chatgpt_browser_sign_in(
         except (OSError, webbrowser.Error):
             opened = False
         if not opened:
-            console.print(f"[yellow]Open this URL to sign in:[/yellow] {html.escape(url)}")
+            console.print(f"[yellow]Open this URL to sign in:[/yellow] {escape(url)}")
         console.print("[dim]Approve the sign-in in your browser to continue.[/dim]")
         code = attempt.wait(timeout)
     finally:

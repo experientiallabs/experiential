@@ -73,14 +73,19 @@ class StoredOAuthTokens:
     """One connection's subscription sign-in: bearer tokens plus the access-token expiry.
 
     Secret values are omitted from ``repr`` and ``str``.
+
+    Attributes:
+        access_token: Bearer sent on each dispatch.
+        refresh_token: Single-use grant that mints the next pair.
+        expires_at_ms: Unix time in milliseconds at which ``access_token`` stops being accepted.
+        account_id: Provider account identifier the tokens belong to, when the provider issues
+            one; defaults to ``None``.
     """
 
     access_token: str
     refresh_token: str
     expires_at_ms: int
-    """Unix time in milliseconds at which ``access_token`` stops being accepted."""
     account_id: str | None = None
-    """Provider account identifier the tokens belong to, when the provider issues one."""
 
     def __repr__(self) -> str:
         """Describe the record without token values."""

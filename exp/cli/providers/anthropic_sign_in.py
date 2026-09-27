@@ -15,6 +15,7 @@ from collections.abc import Callable
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from rich.console import Console
+from rich.markup import escape
 
 from exp.common.auth import StoredOAuthTokens
 from exp.runtime.models.providers.anthropic_subscription import (
@@ -97,7 +98,7 @@ def anthropic_paste_sign_in(
     except (OSError, webbrowser.Error):
         opened = False
     if not opened:
-        console.print(f"[yellow]Open this URL to sign in:[/yellow] {url}")
+        console.print(f"[yellow]Open this URL to sign in:[/yellow] {escape(url)}")
     code = pasted_authorization_code(
         read_line("Paste the address your browser landed on: "), expected_state=state
     )
