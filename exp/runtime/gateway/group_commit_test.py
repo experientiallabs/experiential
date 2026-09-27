@@ -194,9 +194,12 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
                 assert release.wait(5)
             yield proof
 
-    def fail_fence(root: Path, relative_path: str, generation: SnapshotGeneration) -> None:
+    def fail_fence(
+        root: Path,
+        generations: tuple[tuple[str, SnapshotGeneration], ...],
+    ) -> None:
         """Refuse an actual apply fence after the real out-of-lock preparation completed."""
-        del root, relative_path, generation
+        del root, generations
         if entered.is_set():
             raise ValueError("controlled generation change")
 
@@ -215,7 +218,7 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
                     SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
             elif outcome == "refusal":
                 with (
-                    mock.patch.object(authority, "validate_snapshot_generation", fail_fence),
+                    mock.patch.object(authority, "validate_snapshot_generations", fail_fence),
                     pytest.raises(ModelChainAuthorityError),
                 ):
                     SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
