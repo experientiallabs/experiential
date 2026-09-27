@@ -15,6 +15,16 @@ on:
         options:
           - benchmark-32core
           - standard
+      concurrency:
+        description: Concurrent non-streaming requests in each measured repeat
+        required: false
+        default: 8
+        type: number
+      stream_concurrency:
+        description: Concurrent streaming requests in each measured repeat
+        required: false
+        default: 4
+        type: number
 
 permissions:
   contents: read
@@ -43,6 +53,8 @@ jobs:
           --output-json gateway-latency.json
           --output-diagnostics-json gateway-latency-diagnostics.json
           --output-badge shields/gateway-latency.json
+          --concurrency "${{ inputs.concurrency || 8 }}"
+          --stream-concurrency "${{ inputs.stream_concurrency || 4 }}"
           --github-summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the versioned latency report
         if: always()
