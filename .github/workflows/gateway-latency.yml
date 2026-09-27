@@ -48,14 +48,22 @@ jobs:
         env:
           EXP_TELEMETRY: "0"
           DO_NOT_TRACK: "1"
-        run: >-
-          uv run python -m exp.runtime.gateway.latency_report
-          --output-json gateway-latency.json
-          --output-diagnostics-json gateway-latency-diagnostics.json
-          --output-badge shields/gateway-latency.json
-          --concurrency "${{ inputs.concurrency || 8 }}"
-          --stream-concurrency "${{ inputs.stream_concurrency || 4 }}"
-          --github-summary "$GITHUB_STEP_SUMMARY"
+          GATEWAY_CONCURRENCY: ${{ inputs.concurrency }}
+          GATEWAY_STREAM_CONCURRENCY: ${{ inputs.stream_concurrency }}
+        run: |
+          args=(
+            --output-json gateway-latency.json
+            --output-diagnostics-json gateway-latency-diagnostics.json
+            --output-badge shields/gateway-latency.json
+            --github-summary "$GITHUB_STEP_SUMMARY"
+          )
+          if [[ -n "$GATEWAY_CONCURRENCY" ]]; then
+            args+=(--concurrency "$GATEWAY_CONCURRENCY")
+          fi
+          if [[ -n "$GATEWAY_STREAM_CONCURRENCY" ]]; then
+            args+=(--stream-concurrency "$GATEWAY_STREAM_CONCURRENCY")
+          fi
+          uv run python -m exp.runtime.gateway.latency_report "${args[@]}"
       - name: Upload the versioned latency report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
