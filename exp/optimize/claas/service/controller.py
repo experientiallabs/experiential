@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -108,6 +109,13 @@ class LearningController:
                     deadline = min(deadline, self._deadline)
                 async with asyncio.timeout_at(deadline):
                     await self._persist_callback()
+
+    @contextmanager
+    def hold_directory(self) -> Iterator[None]:
+        """Retain this run's ownership through outer receipt writes after compute closes."""
+        self._require_writable()
+        with self._process_lock:
+            yield
 
     async def start(self) -> RunStatus:
         """Open the runtime once, recover an unacknowledged update, then admit work."""
@@ -372,5 +380,6 @@ class LearningController:
             self._state = "failed"
             raise
         self._state = "failed" if self._failure else "closed"
+        report = RunReport(status=await self.status(), checkpoint=self.buffer.checkpoint())
         self._process_lock.release()
-        return RunReport(status=await self.status(), checkpoint=self.buffer.checkpoint())
+        return report
