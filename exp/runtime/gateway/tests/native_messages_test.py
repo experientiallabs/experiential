@@ -3184,6 +3184,7 @@ def test_sonnet_55_between_tools_survives_native_http_dispatch(
         "max_tokens": 128,
         "messages": [{"role": "user", "content": "hi"}],
         "thinking": {"type": "between_tools"},
+        "reasoning": {"exclude": True},
         "stream": stream,
     }
     if effort is not None:
@@ -3220,6 +3221,7 @@ def test_sonnet_55_between_tools_survives_native_http_dispatch(
         {"thinking": {"type": "enabled", "budget_tokens": 1024}},
         {"thinking": {"type": "between_tools"}, "output_config": {"effort": "xhigh"}},
         {"thinking": {"type": "between_tools"}, "output_config": {"effort": "max"}},
+        {"thinking": {"type": "between_tools"}, "reasoning": {"effort": "max"}},
         {"thinking": {"type": "between_tools", "display": "omitted"}},
     ),
 )

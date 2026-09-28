@@ -93,7 +93,9 @@ On the gateway's Messages endpoint, turn off up-front thinking with the type-onl
 
 Here `sonnet` is an alias configured for Sonnet 5.5 on an Anthropic Messages wire. Between-tools
 thinking works only at `low`, `medium`, or `high`; additional thinking fields, including null
-fields, are rejected. It is never translated to an effort-only request on another dialect.
+fields, are rejected. Use `output_config.effort` with this mode: the `reasoning` extension's
+depth controls are refused rather than allowed to replace it. A visibility-only `reasoning`
+object retains the mode. It is never translated to an effort-only request on another dialect.
 Use adaptive thinking for `xhigh` or `max`. `thinking.type=disabled` is rejected with a remedy
 naming `between_tools`, and explicit numeric thinking budgets are refused. The gateway's
 existing disclosed translation of bare `enabled` to `adaptive` remains available.
