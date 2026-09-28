@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hmac
 import sqlite3
 import threading
 import time
@@ -17,11 +16,9 @@ from exp.common.core.artifacts import Sha256, sha256_json
 from exp.common.sqlite.connection import persistent_connection
 from exp.runtime.gateway.auth import (
     FingerprintPepperFile,
-    GatewayAuthError,
     IssuedVirtualKey,
     fingerprint_virtual_key,
     issue_key_material,
-    key_prefix,
     utc_text,
 )
 from exp.runtime.gateway.contracts import (
@@ -55,6 +52,7 @@ from exp.runtime.gateway.sqlite.provider_authority import (
 )
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
 from exp.runtime.gateway.sqlite.request_authority import (
+    authenticate_sqlite_key,
     authorize_preflight_alias_in_transaction,
     authorize_sqlite_alias,
 )
@@ -888,80 +886,16 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
         *,
         update_last_used: bool = True,
     ) -> tuple[str, str, str]:
-        """Authenticate one key inside the caller's authority transaction.
-
-        The key's last-used timestamp is operator telemetry with deliberate
-        coarse granularity: it is rewritten at most once per refresh interval
-        so hot keys do not dirty a page and pay a durable write per request.
-
-        Args:
-            connection: Authority transaction retained through the credential read.
-            raw_key: Caller key that must never enter SQLite or logs.
-
-        Returns:
-            Organization, identity, and virtual-key IDs for active authority.
-
-        Raises:
-            InvalidVirtualKeyError: The key or its owning authority is inactive.
-        """
-        try:
-            prefix = key_prefix(raw_key)
-        except GatewayAuthError as exc:
-            raise InvalidVirtualKeyError("virtual key is invalid") from exc
-        rows = connection.execute(
-            """
-            SELECT k.organization_id, k.identity_id, k.key_id,
-                   k.fingerprint_version, k.fingerprint_sha256,
-                   k.expires_at, k.revoked_at, k.last_used_at,
-                   i.active AS identity_active,
-                   o.active AS organization_active
-            FROM virtual_keys AS k
-            JOIN identities AS i
-              ON i.organization_id = k.organization_id AND i.identity_id = k.identity_id
-            JOIN organizations AS o ON o.organization_id = k.organization_id
-            WHERE k.prefix = ?
-            """,
-            (prefix,),
-        ).fetchall()
-        now = self._clock.now()
-        selected: sqlite3.Row | None = None
-        for row in rows:
-            try:
-                pepper = self._pepper.key(int(row["fingerprint_version"]))
-            except GatewayAuthError:
-                continue
-            fingerprint = fingerprint_virtual_key(raw_key, pepper)
-            if hmac.compare_digest(fingerprint, str(row["fingerprint_sha256"])):
-                selected = row
-        if selected is None:
-            raise InvalidVirtualKeyError("virtual key is invalid")
-        expires_at = selected["expires_at"]
-        expired = expires_at is not None and datetime.fromisoformat(str(expires_at)) <= now
-        if (
-            selected["revoked_at"] is not None
-            or expired
-            or int(selected["identity_active"]) != 1
-            or int(selected["organization_active"]) != 1
-        ):
-            raise InvalidVirtualKeyError("virtual key is invalid")
-        organization_id = str(selected["organization_id"])
-        identity_id = str(selected["identity_id"])
-        key_id = str(selected["key_id"])
-        last_used = selected["last_used_at"]
-        stale = (
-            last_used is None
-            or (now - datetime.fromisoformat(str(last_used))).total_seconds()
-            >= _LAST_USED_REFRESH_SECONDS
+        """Authenticate one key inside the caller's authority transaction."""
+        return authenticate_sqlite_key(
+            connection,
+            raw_key,
+            clock=self._clock,
+            pepper_key=self._pepper.key,
+            last_used_refresh_seconds=_LAST_USED_REFRESH_SECONDS,
+            invalid_key_error=InvalidVirtualKeyError,
+            update_last_used=update_last_used,
         )
-        if stale and update_last_used:
-            connection.execute(
-                """
-                UPDATE virtual_keys SET last_used_at = ?
-                WHERE organization_id = ? AND key_id = ?
-                """,
-                (utc_text(now), organization_id, key_id),
-            )
-        return organization_id, identity_id, key_id
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

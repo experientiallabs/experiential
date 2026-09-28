@@ -26,6 +26,77 @@ from exp.runtime.gateway.model_chain_authority import (
 )
 
 
+def authenticate_sqlite_key(
+    connection: sqlite3.Connection,
+    raw_key: str,
+    *,
+    clock: GatewayClock,
+    pepper_key: Callable[[int], PepperKey],
+    last_used_refresh_seconds: float,
+    invalid_key_error: type[Exception],
+    update_last_used: bool = True,
+) -> tuple[str, str, str]:
+    """Authenticate an active SQLite virtual key and optionally refresh its coarse usage time."""
+    try:
+        prefix = key_prefix(raw_key)
+    except GatewayAuthError as exc:
+        raise invalid_key_error("virtual key is invalid") from exc
+    rows = connection.execute(
+        """
+        SELECT k.organization_id, k.identity_id, k.key_id,
+               k.fingerprint_version, k.fingerprint_sha256,
+               k.expires_at, k.revoked_at, k.last_used_at,
+               i.active AS identity_active,
+               o.active AS organization_active
+        FROM virtual_keys AS k
+        JOIN identities AS i
+          ON i.organization_id = k.organization_id AND i.identity_id = k.identity_id
+        JOIN organizations AS o ON o.organization_id = k.organization_id
+        WHERE k.prefix = ?
+        """,
+        (prefix,),
+    ).fetchall()
+    now = clock.now()
+    selected: sqlite3.Row | None = None
+    for row in rows:
+        try:
+            pepper = pepper_key(int(row["fingerprint_version"]))
+        except GatewayAuthError:
+            continue
+        fingerprint = fingerprint_virtual_key(raw_key, pepper)
+        if hmac.compare_digest(fingerprint, str(row["fingerprint_sha256"])):
+            selected = row
+    if selected is None:
+        raise invalid_key_error("virtual key is invalid")
+    expires_at = selected["expires_at"]
+    expired = expires_at is not None and datetime.fromisoformat(str(expires_at)) <= now
+    if (
+        selected["revoked_at"] is not None
+        or expired
+        or int(selected["identity_active"]) != 1
+        or int(selected["organization_active"]) != 1
+    ):
+        raise invalid_key_error("virtual key is invalid")
+    organization_id = str(selected["organization_id"])
+    identity_id = str(selected["identity_id"])
+    key_id = str(selected["key_id"])
+    last_used = selected["last_used_at"]
+    stale = (
+        last_used is None
+        or (now - datetime.fromisoformat(str(last_used))).total_seconds()
+        >= last_used_refresh_seconds
+    )
+    if stale and update_last_used:
+        connection.execute(
+            """
+            UPDATE virtual_keys SET last_used_at = ?
+            WHERE organization_id = ? AND key_id = ?
+            """,
+            (utc_text(now), organization_id, key_id),
+        )
+    return organization_id, identity_id, key_id
+
+
 def authorize_preflight_alias_in_transaction(
     connection: sqlite3.Connection,
     raw_key: str,

@@ -63,8 +63,8 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
-    _public_capability_error,
 )
+from exp.runtime.gateway.native_bridge_admission import _public_capability_error
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_recovery import session_cache_key
@@ -1981,6 +1981,7 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
     # their constructor clock; shared timer, health and group-commit time stays real.
     with (
         mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
+        mock.patch("exp.runtime.gateway.native_bridge_admission.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
     ):
