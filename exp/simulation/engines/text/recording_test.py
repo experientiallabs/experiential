@@ -977,7 +977,12 @@ def test_checkpoint_after_world_retry_restores_valid_state_and_all_prior_spend()
             _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
         ]
     )
-    resumed = _recorder(next_candidate, next_world, maximum_transition_attempts=3)
+    resumed = _recorder(
+        next_candidate,
+        next_world,
+        maximum_transition_attempts=3,
+        initial_environment_state={"private_initial": "superseded-by-transition"},
+    )
     resumed.restore(
         checkpoint, (*recorder.recorded.candidate_spans, *recorder.recorded.world_model_spans)
     )
@@ -1109,3 +1114,38 @@ def test_initial_environment_state_is_copied_and_never_candidate_visible() -> No
     }
     assert "hidden-fixture-value" not in candidate.requests[0].model_dump_json()
     assert "changed-after-construction" not in world.requests[0].model_dump_json()
+
+
+@pytest.mark.parametrize("advance_before_restore", [False, True])
+def test_zero_transition_restore_preserves_private_initial_state(
+    advance_before_restore: bool,
+) -> None:
+    """Restoring an empty prefix resets to copied initial facts without exposing them."""
+    candidate = _ScriptedClient(
+        [_response("Hello.", model=_snapshot("candidate-a")) for _ in range(3)]
+    )
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Continue.","state":{"step":1}}', model=_snapshot("world-model-a")
+            )
+            for _ in range(3)
+        ]
+    )
+    private_customer: JsonObject = {"private_preference": "hidden-fixture-value"}
+    recorder = _recorder(candidate, world, initial_environment_state={"customer": private_customer})
+    empty_checkpoint = recorder.checkpoint()
+    assert empty_checkpoint is not None
+    private_customer["private_preference"] = "changed-after-construction"
+    request = ModelRequest(messages=(ModelMessage(role="user", content="Hello."),))
+    if advance_before_restore:
+        recorder.complete(request)
+    for _ in range(2):
+        recorder.restore(empty_checkpoint, ())
+        recorder.complete(request)
+        evidence = json.loads(world.requests[-1].messages[1].content or "")
+        assert evidence["environment_state"] == {
+            "customer": {"private_preference": "hidden-fixture-value"}
+        }
+        assert "hidden-fixture-value" not in candidate.requests[-1].model_dump_json()
+        assert "changed-after-construction" not in world.requests[-1].model_dump_json()

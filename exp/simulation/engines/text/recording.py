@@ -186,7 +186,8 @@ class RecordingCandidateClient:
         self._retrieval_economics: list[OperationEconomics] = []
         self._visible_transcript: tuple[ModelMessage, ...] = ()
         self._terminal = False
-        self._environment_state: JsonObject = deepcopy(initial_environment_state or {})
+        self._initial_environment_state: JsonObject = deepcopy(initial_environment_state or {})
+        self._environment_state = deepcopy(self._initial_environment_state)
         self._pending_tools: dict[str, tuple[ToolCall, SimulatedToolResult]] = {}
         self._tool_lock = Lock()
         self._failure: TextSimulationError | None = None
@@ -687,7 +688,9 @@ class RecordingCandidateClient:
         self._transitions = [
             parse_world_model_transition(item.output) for item in checkpoint.world_model_responses
         ]
-        self._environment_state = self._transitions[-1].state if self._transitions else {}
+        self._environment_state = deepcopy(
+            self._transitions[-1].state if self._transitions else self._initial_environment_state
+        )
         self._retrieval_economics = list(checkpoint.retrieval_economics)
         self._candidate_spans = [s for s in spans if s.kind == RolloutEventKind.AGENT_MODEL_CALL]
         self._world_model_spans = [
@@ -696,10 +699,6 @@ class RecordingCandidateClient:
 
     def _check_spend_ceiling(self, *, role: str) -> None:
         """Apply the episode's overspend policy before one paid dispatch.
-
-        Reconciled actual spend is compared against the cell ceiling: in stop mode unknown
-        prior spend or a reached ceiling fails the episode closed before dispatch, and by
-        default the authorized episode logs one warning and continues.
 
         Args:
             role: Candidate, query embedding, or world-model label for safe diagnostics.
