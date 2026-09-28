@@ -1363,6 +1363,44 @@ def test_responses_decoder_rejects_malformed_agent_message_shapes(
         decode_responses({"model": "gpt-6-luna", "input": [agent_message]})
 
 
+def test_responses_sdk_probe_preserves_input_indexes_after_agent_message() -> None:
+    """SDK probe diagnostics refer to original positions after a native agent item."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "gpt-6-luna",
+                "input": [
+                    {"role": "user", "content": "Use the completed agent work."},
+                    {
+                        "type": "agent_message",
+                        "id": "amsg_fixture",
+                        "author": "/root/reviewer",
+                        "recipient": "/root",
+                        "content": [
+                            {"type": "input_text", "text": "Review result follows."},
+                            {
+                                "type": "encrypted_content",
+                                "encrypted_content": "opaque-test-fixture",
+                            },
+                        ],
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_fixture",
+                        "output": [
+                            {
+                                "type": "output_text",
+                                "text": "unsupported tool output spelling",
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+
+    assert raised.value.detail.param == "input.2.output.0.type"
+
+
 def test_responses_decoder_rejects_encrypted_content_in_ordinary_messages() -> None:
     """Opaque agent content is not accepted as a regular message content part."""
     with pytest.raises(OpenAIProtocolError) as raised:
