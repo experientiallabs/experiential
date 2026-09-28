@@ -124,7 +124,7 @@ def load_otlp_file(
     except OSError as exc:
         raise OtlpTraceFormatError(f"cannot read OTLP trace file {path}: {exc}") from exc
     try:
-        text = payload.decode("utf-8")
+        text = payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise OtlpTraceFormatError(f"OTLP trace file is not UTF-8: {path}") from exc
 

@@ -149,6 +149,8 @@ class JsonArchive:
 
     def _parse(self, stream: BinaryIO) -> None:
         """Index incremental parser events with only the current ancestor stack in memory."""
+        if stream.read(len(codecs.BOM_UTF8)) != codecs.BOM_UTF8:
+            stream.seek(0)
         stack: list[tuple[int, str | None]] = []
         for event, value in ijson.basic_parse(stream):
             if event == "map_key":
