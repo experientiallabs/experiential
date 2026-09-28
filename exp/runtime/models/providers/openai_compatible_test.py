@@ -157,6 +157,39 @@ def test_openai_compatible_request_omits_absent_top_p() -> None:
     assert "temperature" not in payload
 
 
+@pytest.mark.parametrize(
+    ("tool_choice", "with_tools"),
+    [
+        (None, False),
+        ("auto", False),
+        ("none", False),
+        (None, True),
+        ("auto", True),
+        ("none", True),
+        ("required", True),
+    ],
+)
+def test_tool_choice_requires_declared_tools_on_chat_wire(
+    tool_choice: Literal["auto", "none", "required"] | None, with_tools: bool
+) -> None:
+    """Omit choices for tool-free JSON turns while preserving choices with declared tools."""
+    payload = openai_compatible_request(
+        "fake-model",
+        ModelRequest(
+            messages=(ModelMessage(role="user", content="Return one JSON object."),),
+            tools=_request().tools if with_tools else (),
+            tool_choice=tool_choice,
+            json_object_output=True,
+        ),
+    )
+    assert payload["response_format"] == {"type": "json_object"}
+    assert ("tools" in payload) is with_tools
+    if with_tools and tool_choice is not None:
+        assert payload["tool_choice"] == tool_choice
+    else:
+        assert "tool_choice" not in payload
+
+
 def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() -> None:
     """One frozen tool response produces typed output, normalized usage, and actual model ID."""
     transport = ScriptedJsonTransport(

@@ -149,7 +149,7 @@ def openai_compatible_request(
             }
             for tool in request.tools
         ]
-    if request.tool_choice is not None:
+    if request.tools and request.tool_choice is not None:
         payload["tool_choice"] = (
             {
                 "type": "function",
