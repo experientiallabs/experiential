@@ -23,6 +23,7 @@ from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
 from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
 from exp.optimize.claas.backends.verl.rollout_configuration import rollout_config
 from exp.optimize.claas.backends.verl.server import ExactVllmHttpServer
+from exp.optimize.claas.backends.verl.signals import preserve_stop_handlers
 from exp.optimize.claas.training_contracts import ClaasTrainingSpec
 
 
@@ -46,7 +47,8 @@ class ResidentRollout:
                 "resident run mode owns a private Ray runtime; use an isolated service process"
             )
         config = rollout_config(self.settings, model, spec)
-        ray.init(address="local", num_cpus=1, num_gpus=0, include_dashboard=False)
+        with preserve_stop_handlers():
+            ray.init(address="local", num_cpus=1, num_gpus=0, include_dashboard=False)
         self._owns_ray = True
         self._previous_local_world = os.environ.get("RAY_LOCAL_WORLD_SIZE")
         os.environ["RAY_LOCAL_WORLD_SIZE"] = "1"
@@ -144,7 +146,8 @@ class ResidentRollout:
             self.server = None
         self.adapter = None
         if self._owns_ray:
-            ray.shutdown(wait_for_processes=True)
+            with preserve_stop_handlers():
+                ray.shutdown(wait_for_processes=True)
             self._owns_ray = False
             if self._previous_local_world is None:
                 os.environ.pop("RAY_LOCAL_WORLD_SIZE", None)
