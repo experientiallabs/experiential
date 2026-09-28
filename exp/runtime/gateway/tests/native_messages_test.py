@@ -1023,9 +1023,7 @@ def _engine(
     qwen_budget = variant.startswith("qwen-budget")
     qwen_model = variant.partition(":")[2] or "qwen3.8-max"
     gemini_budget = variant == "gemini-budget"
-    sonnet_55 = variant == "sonnet-55"
-    anthropic_budget = variant == "anthropic-budget"
-    anthropic_route = anthropic_budget or sonnet_55
+    anthropic_route = variant.startswith("anthropic:")
     root = tmp_path_factory.mktemp("native-messages-root")
     with _SseUpstream.payloads_lock:
         _SseUpstream.payloads.clear()
@@ -1046,10 +1044,8 @@ def _engine(
         if gemini_budget
         else "openai-compatible",
         provider_model=(
-            "claude-sonnet-5-5"
-            if sonnet_55
-            else "claude-sonnet-4-6"
-            if anthropic_budget
+            variant.partition(":")[2]
+            if anthropic_route
             else "gemini-2.5-flash"
             if gemini_budget
             else qwen_model
@@ -3170,7 +3166,9 @@ def test_chat_thinking_budget_survives_native_http_dispatch(
     assert "reasoning" not in captured[0]
 
 
-@pytest.mark.parametrize("engine", ("sonnet-55",), indirect=True)
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
+)
 @pytest.mark.parametrize("stream", (False, True))
 @pytest.mark.parametrize("effort", (None, "low", "medium", "high"))
 def test_sonnet_55_between_tools_survives_native_http_dispatch(
@@ -3213,7 +3211,9 @@ def test_sonnet_55_between_tools_survives_native_http_dispatch(
         assert captured[0].get("output_config", {}) in ({}, {"effort": "high"})
 
 
-@pytest.mark.parametrize("engine", ("sonnet-55",), indirect=True)
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
+)
 @pytest.mark.parametrize(
     "controls",
     (
@@ -3223,12 +3223,18 @@ def test_sonnet_55_between_tools_survives_native_http_dispatch(
         {"thinking": {"type": "between_tools"}, "output_config": {"effort": "max"}},
         {"thinking": {"type": "between_tools"}, "reasoning": {"effort": "max"}},
         {"thinking": {"type": "between_tools", "display": "omitted"}},
+        {
+            "messages": [
+                {"role": "user", "content": "Say a colour."},
+                {"role": "assistant", "content": "The colour is"},
+            ]
+        },
     ),
 )
-def test_sonnet_55_invalid_thinking_never_dispatches(
+def test_sonnet_55_invalid_input_never_dispatches(
     engine: _ServingEngine, controls: JsonObject
 ) -> None:
-    """Invalid mode and effort combinations fail before any upstream HTTP request."""
+    """Invalid thinking controls and assistant prefills fail before upstream dispatch."""
     with _SseUpstream.payloads_lock:
         _SseUpstream.payloads.clear()
     response = httpx.post(
@@ -3248,7 +3254,9 @@ def test_sonnet_55_invalid_thinking_never_dispatches(
         assert _SseUpstream.payloads == []
 
 
-@pytest.mark.parametrize("engine", ("anthropic-budget",), indirect=True)
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),), indirect=True
+)
 @pytest.mark.parametrize("stream", (False, True))
 @pytest.mark.parametrize("output_limit", (None, 8192))
 def test_chat_nested_budget_survives_native_http_dispatch(
@@ -3289,7 +3297,9 @@ def test_chat_nested_budget_survives_native_http_dispatch(
     assert "thinking_budget" not in captured[0]
 
 
-@pytest.mark.parametrize("engine", ("anthropic-budget",), indirect=True)
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),), indirect=True
+)
 def test_chat_nested_budget_above_rung_default_never_dispatches(engine: _ServingEngine) -> None:
     """An omitted caller cap cannot bypass the selected rung's output bound."""
     with _SseUpstream.payloads_lock:
@@ -3313,7 +3323,7 @@ def test_chat_nested_budget_above_rung_default_never_dispatches(engine: _Serving
 @pytest.mark.parametrize(
     "engine",
     (
-        "anthropic-budget",
+        pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),
         "gemini-budget",
         "qwen-budget",
         "qwen-budget:qwen3.8-27b",

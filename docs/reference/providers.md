@@ -105,6 +105,10 @@ retains its existing capability-preservation policy: it prefers a route that pre
 controls and otherwise discloses permitted substitutions, including forced tool choice to
 `auto`, rather than send a known-invalid upstream request. Use `auto` with strict tool schemas
 or structured output when schema validity is required. This does not guarantee a tool call.
+The exact model's forced-tool restriction applies on Messages, relayed OpenAI-compatible,
+and Bedrock wires alike.
+Assistant prefill is also unsupported: end the conversation with a user message. Admission
+excludes Sonnet 5.5 from a prefill request's route before dispatch and retains compatible rungs.
 
 Thinking blocks remain opaque and are replayed unchanged on their issuing wire. Keep history
 append-only: the provider binds Sonnet 5.5 blocks to their model, account, and conversation.

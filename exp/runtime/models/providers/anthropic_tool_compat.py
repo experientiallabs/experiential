@@ -62,6 +62,7 @@ _ANTHROPIC_PREFILL_REJECTING_RELEASES = (
     "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-fable-5",
     "claude-fable-5-1",
@@ -69,15 +70,13 @@ _ANTHROPIC_PREFILL_REJECTING_RELEASES = (
 """Exact releases that answer a trailing assistant turn with a 400 by name.
 
 "This model does not support assistant message prefill. The conversation
-must end with a user message." Live-verified with the house key on
-2026-09-07: every release above rejects a two-turn user/assistant prefill,
-while claude-sonnet-4-5 and claude-haiku-4-5 answer it. Entries are exact
-RELEASES matched as a whole id segment (so a dated snapshot and a Bedrock
-``anthropic.claude-opus-5-v1:0`` spelling inherit their release's rule) and
-never generation prefixes: a new point release must be probed and added
-deliberately. The ledger for the 48h to 2026-09-07 00:30 UTC carried 128
-such provider 400s across 64 orgs, each dispatched before the caller learned
-the conversation shape was the problem."""
+must end with a user message." Entries are exact releases matched as a whole
+id segment, so a dated snapshot and a Bedrock spelling inherit their release's
+rule but an unknown point release does not. Restricting known-invalid rungs
+before dispatch preserves a route's prefill-compatible alternatives.
+
+Sonnet 5.5's provider contract:
+https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide#migrating-from-sonnet-45"""
 
 
 def anthropic_rejects_assistant_prefill(model_id: str) -> bool:

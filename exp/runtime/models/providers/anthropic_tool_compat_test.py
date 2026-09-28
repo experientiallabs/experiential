@@ -16,13 +16,17 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_input_schema,
     anthropic_input_schema_reshaping,
+    anthropic_rejects_assistant_prefill,
     anthropic_rejects_forced_tool_choice,
     anthropic_strict_schema_unsupported,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import coerce_capability
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
 
@@ -69,6 +73,42 @@ def test_forced_tool_choice_rejection_is_an_exact_release_fact() -> None:
         "us.anthropic.claude-sonnet-5-5-1-v1:0",
     ):
         assert not anthropic_rejects_forced_tool_choice(model), model
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "claude-sonnet-5-5",
+        "anthropic/claude-sonnet-5.5",
+        "claude-sonnet-5-5-20260928",
+        "us.anthropic.claude-sonnet-5-5-20260928-v1:0",
+    ),
+)
+def test_sonnet_55_prefill_narrows_to_a_compatible_fallback(model_id: str) -> None:
+    """Known-invalid prefills skip Sonnet before dispatch, retaining a capable fallback."""
+    assert anthropic_rejects_assistant_prefill(model_id)
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test/v1/messages",
+        model_id=model_id,
+    )
+    fallback = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test/v1/messages",
+        model_id="claude-haiku-4-5",
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="Say a colour."),
+            GatewayMessage(role="assistant", content="The colour is"),
+        ),
+    )
+    with pytest.raises(ProviderParameterError, match="assistant prefill") as error:
+        route_generation_parameter_requests((profile,), request)
+    assert error.value.param == "messages"
+    assert compatible_generation_parameter_profile_indexes((profile, fallback), request) == (1,)
+    assert not anthropic_rejects_assistant_prefill("claude-sonnet-5-5-1")
 
 
 @pytest.mark.parametrize("named", (False, True))
