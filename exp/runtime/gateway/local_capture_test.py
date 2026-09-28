@@ -1,6 +1,11 @@
 """Local capture defaults use authenticated grants and have an explicit opt-out."""
 
+import json
+import sqlite3
+import subprocess
+import sys
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -63,9 +68,11 @@ def test_local_capture_defaults_on_for_own_provider_keys_and_ghost_disables(
     assert local_capture_configuration(tmp_path) is None
 
 
-@pytest.mark.parametrize("ghost", [False, True])
+@pytest.mark.parametrize(
+    ("ghost", "concurrent_writes"), [(False, False), (True, False), (False, True)]
+)
 def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ghost: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ghost: bool, concurrent_writes: bool
 ) -> None:
     """Drive real JSON/SSE sockets and consume durable traffic after graceful shutdown."""
     retained = None
@@ -103,8 +110,17 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
+    writers: tuple[subprocess.Popen[str], ...] = ()
+    writer_results: list[tuple[int | None, str]] = []
     try:
         _wait_ready(port, worker)
+        if concurrent_writes:
+            writers = _start_project_writers(tmp_path)
+            deadline = time.monotonic() + 15
+            while not all((tmp_path / f"{role}.ready").exists() for role in ("project", "ingest")):
+                assert time.monotonic() < deadline, "background writers did not become ready"
+                assert all(process.poll() is None for process in writers)
+                time.sleep(0.01)
         for surface in ("chat/completions", "responses", "messages"):
             for stream in (False, True):
                 body: dict[str, object] = {"model": "coding", "stream": stream}
@@ -145,6 +161,14 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
                     )
                     assert continued.status_code == 200, continued.text
     finally:
+        (tmp_path / "writers.stop").touch()
+        for process in writers:
+            try:
+                _, error = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _, error = process.communicate(timeout=5)
+            writer_results.append((process.returncode, error))
         shutdown.request_shutdown()
         worker.join(timeout=10)
         components.write_ledger.close()
@@ -153,7 +177,25 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
         provider_thread.join(timeout=5)
     assert not failures
     assert not worker.is_alive()
+    assert all(code == 0 for code, _ in writer_results), writer_results
     database = local_capture_path(tmp_path)
+    if concurrent_writes:
+        counts = {
+            role: json.loads((tmp_path / f"{role}.result").read_text())
+            for role in ("project", "ingest")
+        }
+        assert all(count > 0 for count in counts.values())
+        background = ProjectStore(tmp_path, "background-project")
+        assert background.read_review() == {"iteration": counts["project"] - 1}
+        imports = SQLiteTraceStore(database)
+        identities = imports.list_imports("background-project")
+        assert len(identities) == counts["ingest"]
+        assert {imports.read_import(identity).traces[0].task for identity in identities} == {
+            f"concurrent evidence {index}" for index in range(counts["ingest"])
+        }
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+            assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     if ghost:
         assert not database.exists()
     else:
@@ -188,3 +230,64 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
         serialized = "".join(trace.model_dump_json() for trace in result.traces)
         assert raw_key not in serialized
         assert "provider-secret" not in serialized
+
+
+def _start_project_writers(root: Path) -> tuple[subprocess.Popen[str], ...]:
+    """Start independent checkpoint and import writers sharing the live capture database.
+
+    Args:
+        root: Isolated workspace containing the live gateway's content database.
+
+    Returns:
+        Child processes stopped by the caller's writers.stop marker, with bounded lifetimes.
+    """
+    script = """
+import json
+import sys
+import time
+from pathlib import Path
+from exp.common.project import ProjectConfig, ProjectStore
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.trace_test import _trace
+
+root, role = Path(sys.argv[1]), sys.argv[2]
+project = ProjectStore(root, "background-project")
+if role == "project":
+    project.initialize(ProjectConfig(project_id="background-project"))
+imports = SQLiteTraceStore(root / "gateway" / "traffic.db")
+original = _trace()
+count = 0
+deadline = time.monotonic() + 30
+while not (root / "writers.stop").exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("concurrent capture test did not stop its writers")
+    if role == "project":
+        project.write_review({"iteration": count})
+    else:
+        trace = original.model_copy(update={"task": f"concurrent evidence {count}"})
+        imports.write_import(
+            "background-project", source_format="otlp", source=trace.source.identity,
+            traces=(trace,), metadata={},
+        )
+    count += 1
+    (root / f"{role}.ready").touch()
+    time.sleep(0.01)
+(root / f"{role}.result").write_text(json.dumps(count))
+"""
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        for role in ("project", "ingest"):
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", script, str(root), role],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+    except BaseException:
+        for process in processes:
+            process.kill()
+            process.communicate(timeout=5)
+        raise
+    return tuple(processes)

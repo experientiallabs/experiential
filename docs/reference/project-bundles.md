@@ -58,3 +58,19 @@ The bundle contains completed immutable build state only. A currently running op
 the hosting system's job record. The mutable routed-interaction journal under the Project runtime
 directory is a separate serving concern: restore does not create it, and serving may attach or
 start runtime state only after the immutable Project has been verified and restored.
+
+## Upgrading folder-based projects to 0.8
+
+Experiential 0.8 rejects project roots containing the old `project.toml` or `artifacts` layout.
+It does not delete that evidence, automatically migrate it, or run parallel readers for both
+formats. Keep the existing root and its matching Experiential release available. Use that release
+to export the selected completed Project, retain the bundle's SHA-256 digest, and restore with 0.8
+into a fresh root. Finish interrupted legacy runs with their matching release before exporting;
+the bundle does not transfer active checkpoints or in-flight request accounting.
+
+Copying only `projects/<project-id>` is insufficient for a SQLite-backed Project. A full workspace
+backup must preserve a consistent `gateway/traffic.db` snapshot and its referenced project blobs,
+along with any other local state required by the running application. Stop writers before copying
+the workspace, or use SQLite's online backup API with coordinated blob retention. Do not copy a
+live database file alone while its committed state may still be in the WAL. A completed Project
+bundle is the supported portable export for the selected immutable graph.

@@ -1,12 +1,12 @@
 # Release scope
 
-This release supports the current source and one wheel with either core dependencies or the
+Experiential 0.8.0 supports the current source and one wheel with either core dependencies or the
 optional `sft` dependency extra on their documented local paths. It claims only behavior exercised
 on the exact release checkout.
 
 ## Supported and verified
 
-- Root CLI commands are exactly `build`, `capture`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
+- Root CLI commands are exactly `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`; an invocation with no subcommand
   opens the default gateway home screen. Optimizer commands are exactly `router` and `model`.
 - `exp login` opens the Platform approval flow for Experiential Cloud, stores the returned
   organization key in the user-data credential file, and synchronizes the authenticated account's
@@ -71,6 +71,16 @@ on the exact release checkout.
 - Public Python exposes provider-free build, explicit router composition, frozen selection-only
   router load through the normal gateway application, structural text-versus-sandbox comparison,
   and managed SFT composition. No separate router HTTP or SSE implementation is shipped.
+- Project configuration versions, artifact manifests and lineage, dataset/scenario and judge
+  versions, evaluation receipts, judgments, checkpoints, and result metadata share the local
+  `<root>/gateway/traffic.db` database. Capture and ingestion keep their existing persistence
+  contracts. Files larger than 1 MiB remain digest-verified external blobs; HTML remains an export.
+  Evaluation resume pins the saved configuration and prepared inputs, and committed provider
+  responses replay without another provider call. Unresolved external calls are not guaranteed
+  exactly once.
+- Project bundles move the selected completed artifact graph. They exclude active runtime state
+  and are not full resumable-workspace backups. See [Project bundles](reference/project-bundles.md)
+  for the storage transition and backup boundary.
 - W16 router evidence uses 100 normalized traces, 50 fit tasks, 20 held-out tasks, 140 planned
   cells, 130 deterministic text simulations, and 140 deterministic judgments under one finite
   simulation and judgment budget. Observed hosted-service spend is exactly $0.00.
@@ -103,6 +113,12 @@ incremental tool-argument streaming. A direct TypeSafe success verifies that req
 reported usage, not account limits, price-invoice agreement, production availability, or latency.
 
 ## Explicitly excluded
+
+- The pre-0.8 project folder layout is not read or automatically migrated. Preserve its matching
+  release and data, then export a verified completed Project bundle and restore into a fresh root.
+  Interrupted legacy runs must finish with their matching release; bundle conversion does not
+  transfer their active checkpoints. Full native Windows project/CLI workflows are not certified
+  by the Windows wheel and gateway-snapshot checks.
 
 - System-wide Capture has not been certified against live Codex or Claude Code sessions. Their
   process trust stores and existing connections may require configuration or a restart. The
