@@ -64,6 +64,7 @@ class _Retriever:
     def __init__(self) -> None:
         """Initialize an empty ordered query log."""
         self.queries: list[RAGQuery] = []
+        self.estimated_queries: list[RAGQuery] = []
 
     def estimate_query_economics(
         self,
@@ -79,7 +80,7 @@ class _Retriever:
         Returns:
             Fixed conservative query cost.
         """
-        del query
+        self.estimated_queries.append(query)
         del reservation
         return OperationEconomics(cost_usd=NumericMeasurement(value=0.01, provenance="estimated"))
 
@@ -241,6 +242,8 @@ def _recorder(
     maximum_transition_attempts: int = 1,
     task: TaskCase | None = None,
     world_context_window: int = 100_000,
+    excluded_lineage_ids: tuple[str, ...] | None = None,
+    initial_environment_state: JsonObject | None = None,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -260,6 +263,8 @@ def _recorder(
         maximum_transition_attempts: Permitted simulator replies for the same candidate turn.
         task: Optional task carrying declared tools for observation-boundary tests.
         world_context_window: Exact world-model context ceiling for retry admission tests.
+        excluded_lineage_ids: Explicit grounding exclusions or default self-exclusion.
+        initial_environment_state: Simulator-only initial state.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -325,6 +330,8 @@ def _recorder(
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
         token_counter=_Utf8Counter(),
+        excluded_lineage_ids=excluded_lineage_ids,
+        initial_environment_state=initial_environment_state,
     )
 
 
@@ -1065,3 +1072,40 @@ def test_world_retry_without_feedback_room_reuses_full_original_request(limited_
     assert len(world.requests) == 2
     assert world.requests[1] == world.requests[0]
     assert recorder.world_model_terminal
+
+
+@pytest.mark.parametrize("exclusions", [None, (), ("another-lineage",)])
+def test_grounding_exclusions_match_retrieval_reservation_and_dispatch(
+    exclusions: tuple[str, ...] | None,
+) -> None:
+    """Evaluation excludes its own lineage; explicit training reuses fit demonstrations."""
+    candidate = _ScriptedClient([_response("I can help.", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [_response('{"message":"Done.","terminal":true}', model=_snapshot("world-model-a"))]
+    )
+    recorder = _recorder(candidate, world, excluded_lineage_ids=exclusions)
+    recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))
+    retriever = cast(_Retriever, recorder._grounded_world_model.retriever)
+    expected = (_task().lineage_group_id,) if exclusions is None else exclusions
+    assert retriever.estimated_queries
+    assert retriever.queries
+    assert all(query.excluded_lineage_ids == expected for query in retriever.estimated_queries)
+    assert all(query.excluded_lineage_ids == expected for query in retriever.queries)
+
+
+def test_initial_environment_state_is_copied_and_never_candidate_visible() -> None:
+    """Private scenario facts initialize only the world and cannot leak through shared mutation."""
+    candidate = _ScriptedClient([_response("Hello.", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [_response('{"message":"Done.","terminal":true}', model=_snapshot("world-model-a"))]
+    )
+    private: JsonObject = {"customer": {"private_preference": "hidden-fixture-value"}}
+    recorder = _recorder(candidate, world, initial_environment_state=private)
+    private["customer"] = {"private_preference": "changed-after-construction"}
+    recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Hello."),)))
+    evidence = json.loads(world.requests[0].messages[1].content or "")
+    assert evidence["environment_state"] == {
+        "customer": {"private_preference": "hidden-fixture-value"}
+    }
+    assert "hidden-fixture-value" not in candidate.requests[0].model_dump_json()
+    assert "changed-after-construction" not in world.requests[0].model_dump_json()
