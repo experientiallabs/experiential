@@ -245,8 +245,26 @@ def prepare_snapshot_file(
     maximum_bytes: int,
     *,
     read_content: bool = True,
+    defer_path_validation: bool = False,
 ) -> Iterator[PreparedSnapshotFile]:
-    """Open and bound the file, optionally reading now, while retaining the secure path proof."""
+    """Open and bound a file, optionally deferring its path fence to the consumer.
+
+    When ``defer_path_validation`` is true, the consumer must call
+    :meth:`PreparedSnapshotFile.validate_current` before relying on the retained
+    path observation. This lets a transaction owner perform the required fence
+    at its write boundary without repeating the same secure path walk beforehand.
+
+    Args:
+        root: Trusted gateway directory containing the snapshot.
+        relative_path: Unresolved descendant path to open without following links.
+        maximum_bytes: Maximum allowed size of the snapshot.
+        read_content: Whether to read the bounded content during preparation.
+        defer_path_validation: Leave the path check to the consumer's write boundary.
+            Defaults to False; retained handles and size bounds are always checked.
+
+    Yields:
+        The prepared file observation, valid only while this context is open.
+    """
     with _snapshot_observation(root, relative_path) as (stream, identities):
         prepared = PreparedSnapshotFile(root, relative_path, stream, identities, None)
         try:
@@ -254,7 +272,8 @@ def prepare_snapshot_file(
                 raise SnapshotSizeError(prepared._stamp[3], maximum_bytes)
             if read_content:
                 prepared._content = prepared.read_bytes(maximum_bytes)
-            prepared.validate_current()
+            if not defer_path_validation:
+                prepared.validate_current()
             yield prepared
         finally:
             prepared._closed = True
