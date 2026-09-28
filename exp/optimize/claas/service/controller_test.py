@@ -11,6 +11,7 @@ from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.models import AssistantAction
+from exp.common.observability.metrics import MetricRecord
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.buffer.store_test import item, result
 from exp.optimize.claas.service.configuration import RunConfiguration
@@ -24,6 +25,62 @@ from exp.optimize.claas.training_contracts import (
     TrainingResult,
 )
 from exp.optimize.claas.training_contracts_test import spec
+
+
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_metrics_observe_durable_update_without_changing_success(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, sink_fails: bool
+) -> None:
+    """An observer sees persisted acknowledgement and cannot cause duplicate optimization."""
+
+    async def run() -> None:
+        observations: list[MetricRecord] = []
+        persisted_steps: list[int] = []
+
+        class Sink:
+            def record(self, record: MetricRecord) -> None:
+                checkpoint = controller.buffer.checkpoint()
+                assert checkpoint is not None and checkpoint.step in persisted_steps
+                assert not controller._gpu.locked()
+                assert controller.buffer.status().consumed == 1
+                observations.append(record)
+                if sink_fails:
+                    raise OSError("private SDK diagnostic must not enter normal logs")
+
+        async def persist() -> None:
+            checkpoint = controller.buffer.checkpoint()
+            if checkpoint:
+                persisted_steps.append(checkpoint.step)
+
+        runtime = Runtime()
+        controller = LearningController(
+            tmp_path,
+            spec(),
+            runtime,
+            RunConfiguration(mode="burst", minimum_ready_examples=1),
+            persist=persist,
+            metrics=Sink(),
+        )
+        await controller.import_examples((item(),))
+        report = await controller.drain()
+        assert report.status.state == "closed" and report.status.failure_type is None
+        assert report.status.updates == runtime.optimizations == 1
+        assert len(observations) == 1
+        assert observations[0].step is None
+        assert observations[0].values["train/optimizer_step"] == 1
+        assert observations[0].values["train/loss"] == 0.5
+        assert observations[0].values["train/consumed_examples"] == 1
+        again = LearningController(
+            tmp_path, spec(), runtime, RunConfiguration(mode="burst"), metrics=Sink()
+        )
+        assert (await again.drain()).status.updates == 0
+        assert runtime.optimizations == 1 and len(observations) == 1
+
+    asyncio.run(run())
+    assert (
+        "Metric delivery failed after committed optimizer step 1 (OSError)" in caplog.text
+    ) == sink_fails
+    assert "private SDK diagnostic" not in caplog.text
 
 
 def test_explicit_cohort_keeps_one_policy_then_updates_exactly_once(tmp_path: Path) -> None:

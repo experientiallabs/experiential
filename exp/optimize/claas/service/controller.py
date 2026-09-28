@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +13,7 @@ from filelock import FileLock, Timeout
 
 from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
+from exp.common.observability.metrics import MetricRecord, MetricSink
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.service.configuration import (
     BatchStatus,
@@ -24,7 +26,10 @@ from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     ClaasTrainingSpec,
     TrainingExample,
+    TrainingResult,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 async def _await_cleanup[T](task: asyncio.Task[T]) -> T:
@@ -56,6 +61,7 @@ class LearningController:
         configuration: RunConfiguration,
         *,
         persist: Callable[[], Awaitable[None]] | None = None,
+        metrics: MetricSink | None = None,
     ) -> None:
         """Bind local durable state without allocating a GPU or beginning a run."""
         self.directory = directory.resolve()
@@ -88,6 +94,7 @@ class LearningController:
             self._process_lock.release()
             raise
         self._persist_callback = persist
+        self._metrics = metrics
         self._persistence = asyncio.Lock()
         self._gpu = asyncio.Lock()
         self._startup = asyncio.Lock()
@@ -332,7 +339,36 @@ class LearningController:
             self.buffer.acknowledge(batch, result)
             await self._persist()
             self._updates += 1
-            return True
+        self._report_metrics(result)
+        return True
+
+    def _report_metrics(self, result: TrainingResult) -> None:
+        """Observe an acknowledged update without changing its success or owning the sink.
+
+        The caller-owned sink performs only prompt local handoff. No provider is
+        constructed here, and metric delivery is neither part of checkpoint commit
+        nor a reason to retry optimization. Retained batch receipts support replay.
+        """
+        if self._metrics is None:
+            return
+        try:
+            self._metrics.record(
+                MetricRecord(
+                    event_id=result.checkpoint.manifest_sha256,
+                    values={
+                        **{f"train/{name}": value for name, value in result.metrics.items()},
+                        "train/optimizer_step": float(result.checkpoint.step),
+                        "train/consumed_examples": float(len(result.consumed_experience_ids)),
+                    },
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - observability cannot undo an acknowledged update
+            LOGGER.warning(
+                "Metric delivery failed after committed optimizer step %s (%s); "
+                "batch success is unchanged and its receipt remains available",
+                result.checkpoint.step,
+                type(error).__name__,
+            )
 
     def _limit_reason(self) -> str | None:
         """Name the first finite compute bound reached by this controller."""

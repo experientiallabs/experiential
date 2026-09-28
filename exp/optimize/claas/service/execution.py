@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 
+from exp.common.observability.metrics import MetricSink
 from exp.optimize.claas.service.configuration import RunReport
 from exp.optimize.claas.service.contracts import LearnerRuntimeFactory
 from exp.optimize.claas.service.controller import LearningController
@@ -18,17 +19,25 @@ async def execute_run(
     api_key: str | None = None,
     stop: asyncio.Event | None = None,
     persist: Callable[[], Awaitable[None]] | None = None,
+    metrics: MetricSink | None = None,
 ) -> RunReport:
     """Own one runtime, drain on orderly shutdown, and persist its terminal receipt.
 
     The injected factory keeps compute ownership interchangeable. External environments
     call the HTTP API themselves; this boundary does not execute simulations or deploy.
+    An optional caller-owned metric sink observes committed updates using local handoff;
+    construct and close it outside this lifecycle, without putting credentials in configuration.
     """
     if configuration.run.mode == "run" and (api_key is None or len(api_key) < 16):
         raise ValueError("set the configured authentication environment variable to a strong key")
     examples = load_examples(configuration)
     controller = LearningController(
-        configuration.directory, configuration.spec, factory, configuration.run, persist=persist
+        configuration.directory,
+        configuration.spec,
+        factory,
+        configuration.run,
+        persist=persist,
+        metrics=metrics,
     )
     with controller.hold_directory():
         stopped = stop if stop is not None else asyncio.Event()
