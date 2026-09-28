@@ -24,7 +24,7 @@ class LearnerRuntime(TrainingSession, Protocol):
         ...
 
     async def train(self, batch: TrainingBatch) -> TrainingResult:
-        """Persist an update before acknowledging it; retrying its ID is idempotent."""
+        """Persist and verify backend state and exact batch binding; retry its ID idempotently."""
         ...
 
 

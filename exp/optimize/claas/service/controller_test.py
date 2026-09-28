@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import pytest
 from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.claas.learning import FeedbackSubmission
+from exp.common.core.artifacts import sha256_json
 from exp.common.models import AssistantAction
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.buffer.store_test import item, result
@@ -217,8 +219,12 @@ class Runtime:
         self.spec = spec
         self.policy_revision = resume.policy_revision if resume else spec.initial_policy_revision
         for path in self.directory.glob("*/receipt.json"):
-            batch = TrainingBatch.model_validate_json((path.parent / "state.json").read_bytes())
-            self.receipts[batch.batch_id] = TrainingResult.model_validate_json(path.read_bytes())
+            state = json.loads((path.parent / "state.json").read_bytes())
+            receipt = TrainingResult.model_validate_json(path.read_bytes())
+            if sha256_json(state) != receipt.checkpoint.manifest_sha256:
+                raise ValueError("opaque runtime state does not match its receipt")
+            batch = TrainingBatch.model_validate(state["batch"])
+            self.receipts[batch.batch_id] = receipt
         return self
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:

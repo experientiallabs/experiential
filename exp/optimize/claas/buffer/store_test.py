@@ -1,5 +1,6 @@
 """Transactional queue, feedback, rejection, and recovery regression tests."""
 
+import json
 import shutil
 from pathlib import Path
 
@@ -131,7 +132,7 @@ def result(
     directory = root / f"opaque-{revision}"
     directory.mkdir(parents=True)
     state = {"batch": batch.model_dump(mode="json"), "step": step}
-    (directory / "state.json").write_text(batch.model_dump_json())
+    (directory / "state.json").write_text(json.dumps(state))
     receipt = TrainingResult(
         checkpoint=TrainingCheckpoint(
             scope=recipe.scope,
