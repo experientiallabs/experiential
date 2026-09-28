@@ -137,7 +137,10 @@ def test_snapshot_rejects_content_changed_during_copy(
         pytest.fail("unverified state must never reach a loader")
 
 
-@pytest.mark.parametrize("field", ["batch_id", "parent_policy_revision", "consumed_experience_ids"])
+@pytest.mark.parametrize(
+    "field",
+    ["batch_id", "parent_policy_revision", "consumed_experience_ids", "batch_sha256", "metrics"],
+)
 def test_result_verification_rejects_manifest_for_another_update(
     tmp_path: Path, field: str
 ) -> None:
@@ -152,9 +155,12 @@ def test_result_verification_rejects_manifest_for_another_update(
             "policy_history": (next_policy_revision(submitted), "policy-0"),
         }
     )
-    manifest = manifest.model_copy(
-        update={field: ("foreign",) if field == "consumed_experience_ids" else "foreign"}
-    )
+    replacement = {
+        "consumed_experience_ids": ("foreign",),
+        "batch_sha256": "0" * 64,
+        "metrics": {"loss": 1.0},
+    }.get(field, "foreign")
+    manifest = manifest.model_copy(update={field: replacement})
     manifest_path.write_text(manifest.model_dump_json())
     receipt = receipt.model_copy(
         update={

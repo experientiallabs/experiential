@@ -153,7 +153,7 @@ class TrainingSession(Protocol):
         ...
 
     async def train(self, batch: TrainingBatch) -> TrainingResult:
-        """Complete one optimizer update or fail without claiming a checkpoint."""
+        """Verify backend-owned state and its exact batch binding before returning completion."""
         ...
 
     async def checkpoint(self) -> TrainingCheckpoint:

@@ -94,13 +94,13 @@ def test_explicit_cohort_keeps_one_policy_then_updates_exactly_once(tmp_path: Pa
 
 
 @pytest.mark.parametrize("lag", [0, 2])
-def test_explicit_batch_recovers_lost_native_receipt_without_another_update(
+def test_explicit_batch_recovers_lost_opaque_receipt_without_another_update(
     tmp_path: Path, lag: int
 ) -> None:
     """A leased explicit batch recovers after restart before any new feedback can train."""
 
     async def run() -> None:
-        """Lose one native result, reopen durable state, and verify exact caller retry."""
+        """Lose one opaque backend result, reopen durable state, and verify exact caller retry."""
         runtime = Runtime()
         runtime.after_commit_error = OSError("lost acknowledgement")
         config = RunConfiguration(training_admission="explicit")
@@ -119,12 +119,14 @@ def test_explicit_batch_recovers_lost_native_receipt_without_another_update(
         await asyncio.wait_for(runtime.train_entered.wait(), 1)
         await first.close()
         assert first.batch_status("cohort-1").state == "pending"
-        second = LearningController(tmp_path, recipe, runtime, config)
+        restarted_runtime = Runtime(directory=runtime.directory)
+        second = LearningController(tmp_path, recipe, restarted_runtime, config)
         try:
             await second.start()
             completed = await second.submit_training_batch(cohort)
             assert completed.state == "completed"
-            assert runtime.optimizations == 1
+            assert runtime.optimizations == 1 and restarted_runtime.optimizations == 0
+            assert await second.submit_training_batch(cohort) == completed
         finally:
             await second.close()
 
@@ -184,7 +186,7 @@ def test_explicit_retry_wakes_a_lease_after_failed_acceptance_flush(tmp_path: Pa
 class Runtime:
     """Count distinct update calls using idempotent fixture receipts, without executing training."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, directory: Path | None = None) -> None:
         """Create explicit observations and optional train/cleanup blocking gates."""
         self.policy_revision = "policy-0"
         self.receipts: dict[str, TrainingResult] = {}
@@ -197,8 +199,14 @@ class Runtime:
         self.close_entered = asyncio.Event()
         self.close_gate: asyncio.Event | None = None
         self.after_commit_error: Exception | None = None
-        self._temporary_directory = tempfile.TemporaryDirectory()
-        self.directory = Path(self._temporary_directory.name).resolve()
+        self._temporary_directory = tempfile.TemporaryDirectory() if directory is None else None
+        resolved_directory = (
+            Path(self._temporary_directory.name).resolve()
+            if self._temporary_directory is not None
+            else directory
+        )
+        assert resolved_directory is not None
+        self.directory: Path = resolved_directory
         self.spec = spec()
 
     async def open(
@@ -208,6 +216,9 @@ class Runtime:
         self.open_count += 1
         self.spec = spec
         self.policy_revision = resume.policy_revision if resume else spec.initial_policy_revision
+        for path in self.directory.glob("*/receipt.json"):
+            batch = TrainingBatch.model_validate_json((path.parent / "state.json").read_bytes())
+            self.receipts[batch.batch_id] = TrainingResult.model_validate_json(path.read_bytes())
         return self
 
     async def generate(self, request: GenerationRequest) -> GenerationResult:
@@ -230,11 +241,12 @@ class Runtime:
         receipt = self.receipts.get(batch.batch_id)
         if receipt is None:
             self.optimizations += 1
-            history = tuple(f"policy-{index}" for index in range(self.optimizations, -1, -1))
+            step = max((result.checkpoint.step for result in self.receipts.values()), default=0) + 1
+            history = tuple(f"policy-{index}" for index in range(step, -1, -1))
             receipt = result(
                 batch,
                 self.directory,
-                step=self.optimizations,
+                step=step,
                 recipe=self.spec,
                 history=history,
             )

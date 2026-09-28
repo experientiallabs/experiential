@@ -10,17 +10,12 @@ from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import AssistantAction
-from exp.optimize.claas.backends.checkpoints import (
-    CheckpointManifest,
-    checkpoint_receipt,
-    recover_training_result,
-)
-from exp.optimize.claas.backends.checkpoints_test import checkpoint
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.service.configuration import RunConfiguration
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingSpec,
     TrainingBatch,
+    TrainingCheckpoint,
     TrainingExample,
     TrainingResult,
 )
@@ -130,35 +125,30 @@ def result(
     history: tuple[str, ...] | None = None,
     metrics: dict[str, float] | None = None,
 ) -> TrainingResult:
-    """Write a hash-complete inert checkpoint without executing optimizer training."""
+    """Publish opaque fixture state using no native trainer filenames or manifest format."""
     recipe = recipe or spec()
     revision = f"policy-{step}"
-    directory = root / f"claas-{revision}"
-    checkpoint(directory)
-    manifest_path = directory / "manifest.json"
-    manifest = CheckpointManifest.model_validate_json(manifest_path.read_bytes()).model_copy(
-        update={
-            "spec": recipe,
-            "policy_revision": revision,
-            "parent_policy_revision": batch.expected_policy_revision,
-            "policy_history": (history or (revision, batch.expected_policy_revision))[
+    directory = root / f"opaque-{revision}"
+    directory.mkdir(parents=True)
+    state = {"batch": batch.model_dump(mode="json"), "step": step}
+    (directory / "state.json").write_text(batch.model_dump_json())
+    receipt = TrainingResult(
+        checkpoint=TrainingCheckpoint(
+            scope=recipe.scope,
+            adapter_id=recipe.adapter_id,
+            policy_revision=revision,
+            policy_history=(history or (revision, batch.expected_policy_revision))[
                 : recipe.max_policy_lag + 1
             ],
-            "step": step,
-            "batch_id": batch.batch_id,
-            "batch_sha256": sha256_json(batch),
-            "consumed_experience_ids": tuple(
-                value.experience.experience_id for value in batch.examples
-            ),
-            "metrics": metrics if metrics is not None else {"loss": 0.5},
-        }
+            step=step,
+            path=str(directory),
+            manifest_sha256=sha256_json(state),
+        ),
+        consumed_experience_ids=tuple(value.experience.experience_id for value in batch.examples),
+        metrics=metrics if metrics is not None else {"loss": 0.5},
     )
-    manifest_path.write_text(manifest.model_dump_json())
-    return TrainingResult(
-        checkpoint=checkpoint_receipt(directory, manifest),
-        consumed_experience_ids=manifest.consumed_experience_ids,
-        metrics=manifest.metrics,
-    )
+    (directory / "receipt.json").write_text(receipt.model_dump_json())
+    return receipt
 
 
 def test_all_or_none_import_and_feedback_bounds(tmp_path: Path) -> None:
@@ -405,10 +395,10 @@ def test_pending_feedback_uses_latest_policy_eligibility(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("lag", [0, 1, 2])
-def test_committed_checkpoint_recovery_acknowledges_each_policy_lag_once(
+def test_opaque_checkpoint_recovery_acknowledges_each_policy_lag_once(
     tmp_path: Path, lag: int
 ) -> None:
-    """Recover immutable native-shaped state without another optimizer or stale-parent history."""
+    """Recover opaque backend state without native files or another fixture update."""
     recipe = spec().model_copy(update={"max_policy_lag": lag})
     store = ExperienceBuffer(tmp_path / "queue.sqlite", recipe, RunConfiguration())
     for step in (1, 2):
@@ -422,8 +412,10 @@ def test_committed_checkpoint_recovery_acknowledges_each_policy_lag_once(
             recipe=recipe,
             history=tuple(f"policy-{index}" for index in range(step, -1, -1)),
         )
-        recovered = recover_training_result(tmp_path, recipe, batch, "main")
-        assert recovered is not None
+        recovered = TrainingResult.model_validate_json(
+            (Path(saved.checkpoint.path) / "receipt.json").read_bytes()
+        )
+        assert not (Path(saved.checkpoint.path) / "manifest.json").exists()
         assert recovered == saved
         assert len(saved.checkpoint.policy_history) == min(step + 1, lag + 1)
         reopened = ExperienceBuffer(store.path, recipe, RunConfiguration())
@@ -437,56 +429,8 @@ def test_committed_checkpoint_recovery_acknowledges_each_policy_lag_once(
         assert status is not None and status.result == saved
 
 
-@pytest.mark.parametrize(
-    ("field", "changed"),
-    [
-        ("parent_policy_revision", "wrong-parent"),
-        ("batch_id", "wrong-batch"),
-        ("batch_sha256", "0" * 64),
-        ("metrics", {"loss": 2.0}),
-        ("consumed_experience_ids", ("wrong-response",)),
-    ],
-)
-def test_acknowledgement_binds_verified_manifest_to_exact_lease(
-    tmp_path: Path, field: str, changed: object
-) -> None:
-    """Even a rehashed structural manifest cannot substitute another parent, batch, or result."""
-    recipe = spec().model_copy(update={"max_policy_lag": 0})
-    store = ExperienceBuffer(tmp_path / "queue.sqlite", recipe, RunConfiguration())
-    store.import_examples((item(),))
-    batch = store.lease()
-    assert batch is not None
-    saved = result(batch, tmp_path, recipe=recipe)
-    path = Path(saved.checkpoint.path) / "manifest.json"
-    manifest = CheckpointManifest.model_validate_json(path.read_bytes()).model_copy(
-        update={field: changed}
-    )
-    path.write_text(manifest.model_dump_json())
-    substituted = saved.model_copy(update={"checkpoint": checkpoint_receipt(path.parent, manifest)})
-    before = store.status()
-    with pytest.raises(ValueError, match="leased batch"):
-        store.acknowledge(batch, substituted)
-    assert store.status() == before
-    assert store.inflight() == batch
-    assert store.checkpoint() is None
-
-
-def test_acknowledgement_rejects_changed_checkpoint_payload(tmp_path: Path) -> None:
-    """A matching receipt cannot acknowledge corrupted optimizer bytes."""
-    store = ExperienceBuffer(tmp_path / "queue.sqlite", spec(), RunConfiguration())
-    store.import_examples((item(),))
-    batch = store.lease()
-    assert batch is not None
-    saved = result(batch, tmp_path)
-    optimizer = Path(saved.checkpoint.path) / "verl/actor/optim_world_size_1_rank_0.pt"
-    optimizer.write_bytes(b"corrupted")
-    with pytest.raises(ValueError, match="missing or changed"):
-        store.acknowledge(batch, saved)
-    assert store.inflight() == batch and store.checkpoint() is None
-
-
 def test_acknowledgement_cannot_skip_a_checkpoint_step(tmp_path: Path) -> None:
-    """Even a matching manifest and parent cannot jump over an unacknowledged update."""
+    """An opaque result cannot jump over an unacknowledged update."""
     recipe = spec().model_copy(update={"max_policy_lag": 0})
     store = ExperienceBuffer(tmp_path / "queue.sqlite", recipe, RunConfiguration())
     store.import_examples((item(),))
@@ -499,7 +443,7 @@ def test_acknowledgement_cannot_skip_a_checkpoint_step(tmp_path: Path) -> None:
 
 
 def test_positive_lag_retains_its_immediate_parent(tmp_path: Path) -> None:
-    """Manifest parent validation cannot authorize a contradictory retained ancestry."""
+    """An opaque result cannot substitute a contradictory retained ancestry."""
     store = ExperienceBuffer(tmp_path / "queue.sqlite", spec(), RunConfiguration())
     store.import_examples((item(),))
     batch = store.lease()
@@ -508,6 +452,77 @@ def test_positive_lag_retains_its_immediate_parent(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="leased batch"):
         store.acknowledge(batch, saved)
     assert store.inflight() == batch and store.checkpoint() is None
+
+
+@pytest.mark.parametrize("lag", [0, 2])
+def test_acknowledgement_binds_current_parent_inside_transaction(tmp_path: Path, lag: int) -> None:
+    """An identical lease cannot advance a different acknowledged parent, even at zero lag."""
+    recipe = spec().model_copy(update={"max_policy_lag": lag})
+    store = ExperienceBuffer(tmp_path / "queue.sqlite", recipe, RunConfiguration())
+    store.import_examples((item(),))
+    batch = store.lease()
+    assert batch is not None
+    saved = result(batch, tmp_path, recipe=recipe)
+    other = saved.checkpoint.model_copy(
+        update={
+            "policy_revision": "another-parent",
+            "policy_history": ("another-parent",),
+            "step": 0,
+        }
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "INSERT INTO metadata VALUES ('checkpoint', ?)", (other.model_dump_json(),)
+        )
+    before = store.path.read_bytes()
+    with pytest.raises(ValueError, match="leased batch"):
+        store.acknowledge(batch, saved)
+    assert store.path.read_bytes() == before and store.inflight() == batch
+
+
+@pytest.mark.parametrize(
+    "change", ["scope", "adapter", "ids", "unchanged_revision", "history_head", "history_tail"]
+)
+def test_opaque_completion_cannot_change_lease_identity(tmp_path: Path, change: str) -> None:
+    """Backend-independent identity and complete retained ancestry stay queue-owned."""
+    store = ExperienceBuffer(tmp_path / "queue.sqlite", spec(), RunConfiguration())
+    store.import_examples((item(),))
+    first = store.lease()
+    assert first is not None
+    store.acknowledge(first, result(first, tmp_path))
+    store.import_examples((item("second", policy="policy-1"),))
+    batch = store.lease()
+    assert batch is not None
+    saved = result(batch, tmp_path, step=2, history=("policy-2", "policy-1", "policy-0"))
+    checkpoint = saved.checkpoint
+    if change == "scope":
+        checkpoint = checkpoint.model_copy(
+            update={"scope": checkpoint.scope.model_copy(update={"user_id": "other-user"})}
+        )
+    elif change == "adapter":
+        checkpoint = checkpoint.model_copy(update={"adapter_id": "other-adapter"})
+    elif change == "ids":
+        saved = saved.model_copy(update={"consumed_experience_ids": ("foreign",)})
+    elif change == "unchanged_revision":
+        checkpoint = checkpoint.model_copy(
+            update={
+                "policy_revision": "policy-1",
+                "policy_history": ("policy-1", "policy-1", "policy-0"),
+            }
+        )
+    elif change == "history_head":
+        checkpoint = checkpoint.model_copy(
+            update={"policy_history": ("foreign", "policy-1", "policy-0")}
+        )
+    else:
+        checkpoint = checkpoint.model_copy(
+            update={"policy_history": ("policy-2", "policy-1", "foreign")}
+        )
+    saved = saved.model_copy(update={"checkpoint": checkpoint})
+    before = store.path.read_bytes()
+    with pytest.raises(ValueError, match="leased batch"):
+        store.acknowledge(batch, saved)
+    assert store.path.read_bytes() == before and store.inflight() == batch
 
 
 @pytest.mark.parametrize("unavailable", ["missing", "corrupt"])
@@ -527,7 +542,7 @@ def test_completed_acknowledgement_replays_without_checkpoint_files(
     if unavailable == "missing":
         shutil.rmtree(checkpoint_root)
     else:
-        (checkpoint_root / "manifest.json").write_text("corrupted")
+        (checkpoint_root / "state.json").write_text("corrupted")
     store.acknowledge(batch, saved)
     assert store.path.read_bytes() == before
     assert store.batch_status(batch.batch_id) == completed
