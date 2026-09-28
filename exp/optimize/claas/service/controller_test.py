@@ -11,6 +11,7 @@ from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.models import AssistantAction
+from exp.common.observability.metrics import MetricRecord
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.buffer.store_test import item, result
 from exp.optimize.claas.service.configuration import RunConfiguration
@@ -24,6 +25,68 @@ from exp.optimize.claas.training_contracts import (
     TrainingResult,
 )
 from exp.optimize.claas.training_contracts_test import spec
+
+
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_metrics_observe_durable_update_without_changing_success(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, sink_fails: bool
+) -> None:
+    """An observer sees persisted acknowledgement and cannot cause duplicate optimization."""
+
+    async def run() -> None:
+        """Observe a real queue commit and ensure resume never repeats optimization."""
+        observations: list[MetricRecord] = []
+        persisted_steps: list[int] = []
+
+        class Sink:
+            """Assert persistence and ownership conditions during the observer callback."""
+
+            def record(self, record: MetricRecord) -> None:
+                """Capture the update and optionally reject its metric handoff."""
+                checkpoint = controller.buffer.checkpoint()
+                assert checkpoint is not None and checkpoint.step in persisted_steps
+                assert not controller._gpu.locked()
+                assert controller.buffer.status().consumed == 1
+                observations.append(record)
+                if sink_fails:
+                    raise OSError("private SDK diagnostic must not enter normal logs")
+
+        async def persist() -> None:
+            """Record which checkpoints passed the host persistence barrier."""
+            checkpoint = controller.buffer.checkpoint()
+            if checkpoint:
+                persisted_steps.append(checkpoint.step)
+
+        runtime = Runtime()
+        controller = LearningController(
+            tmp_path,
+            spec(),
+            runtime,
+            RunConfiguration(mode="burst", minimum_ready_examples=1),
+            persist=persist,
+            metrics=Sink(),
+        )
+        await controller.import_examples((item(),))
+        report = await controller.drain()
+        assert report.status.state == "closed" and report.status.failure_type is None
+        assert report.status.updates == runtime.optimizations == 1
+        assert len(observations) == 1
+        assert observations[0].step is None
+        assert observations[0].values["train/optimizer_step"] == 1
+        assert observations[0].values["train/loss"] == 0.5
+        assert observations[0].values["train/consumed_examples"] == 1
+        assert observations[0].values["train/acknowledgement_persisted"] == 1
+        again = LearningController(
+            tmp_path, spec(), runtime, RunConfiguration(mode="burst"), metrics=Sink()
+        )
+        assert (await again.drain()).status.updates == 0
+        assert runtime.optimizations == 1 and len(observations) == 1
+
+    asyncio.run(run())
+    assert (
+        "Metric delivery failed after committed optimizer step 1 (OSError)" in caplog.text
+    ) == sink_fails
+    assert "private SDK diagnostic" not in caplog.text
 
 
 def test_explicit_cohort_keeps_one_policy_then_updates_exactly_once(tmp_path: Path) -> None:
@@ -603,31 +666,65 @@ def test_train_trigger_during_persistence_cannot_lose_wakeup(tmp_path: Path) -> 
     asyncio.run(run())
 
 
-def test_failed_ack_flush_retries_persistence_without_second_update(tmp_path: Path) -> None:
-    """A lost persistence acknowledgement cannot turn one committed batch into two updates."""
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_failed_ack_flush_observes_committed_update_without_retry(
+    tmp_path: Path, cancel: bool, sink_fails: bool
+) -> None:
+    """Host flush failure or cancellation preserves the original error and committed metric."""
 
     async def run() -> None:
-        """Fail after the atomic queue commit, flush during cleanup, and reopen the same queue."""
+        """Fail after atomic queue commit, observe outside the locks, then reopen that queue."""
         runtime = Runtime()
         failed = False
+        flushing = asyncio.Event()
+        observations: list[MetricRecord] = []
+        original = OSError("checkpoint flush unavailable")
+
+        class Sink:
+            """Assert that reporting observes the commit without retaining optimizer locks."""
+
+            def record(self, record: MetricRecord) -> None:
+                """Retain the observed update even when local metric queueing fails."""
+                assert not first._gpu.locked() and not first._training.locked()
+                assert first.buffer.status().consumed == 1
+                observations.append(record)
+                if sink_fails:
+                    raise RuntimeError("metric queue unavailable")
 
         async def persist() -> None:
             """Lose exactly the first acknowledgement after a checkpoint enters SQLite."""
             nonlocal failed
             if first.buffer.checkpoint() is not None and not failed:
                 failed = True
-                raise OSError("checkpoint flush unavailable")
+                flushing.set()
+                if cancel:
+                    await asyncio.Event().wait()
+                raise original
 
         limits = RunConfiguration(mode="burst")
-        first = LearningController(tmp_path, spec(), runtime, limits, persist=persist)
+        first = LearningController(
+            tmp_path, spec(), runtime, limits, persist=persist, metrics=Sink()
+        )
         await first.import_examples((item(),))
-        with pytest.raises(OSError, match="flush unavailable"):
-            await first.drain()
+        task = asyncio.create_task(first.drain())
+        await asyncio.wait_for(flushing.wait(), 1)
+        if cancel:
+            task.cancel("caller cancelled host flush")
+            with pytest.raises(asyncio.CancelledError, match="caller cancelled host flush"):
+                await task
+        else:
+            with pytest.raises(OSError) as caught:
+                await task
+            assert caught.value is original
+        assert len(observations) == 1
+        assert observations[0].values["train/optimizer_step"] == 1
+        assert observations[0].values["train/acknowledgement_persisted"] == 0
         assert (await first.status()).buffer.consumed == 1
-        second = LearningController(tmp_path, spec(), runtime, limits)
+        second = LearningController(tmp_path, spec(), runtime, limits, metrics=Sink())
         report = await second.drain()
         assert report.status.buffer.consumed == 1
-        assert runtime.optimizations == 1
+        assert runtime.optimizations == 1 and len(observations) == 1
         assert runtime.open_count == 1
         assert runtime.close_count == 1
 

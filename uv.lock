@@ -1374,7 +1374,11 @@ dev = [
     { name = "ty" },
     { name = "uvicorn" },
     { name = "verl" },
+    { name = "wandb" },
     { name = "websockets" },
+]
+metrics-wandb = [
+    { name = "wandb" },
 ]
 sft = [
     { name = "tinker" },
@@ -1397,6 +1401,7 @@ requires-dist = [
     { name = "experiential", extras = ["claas-modal"], marker = "extra == 'dev'" },
     { name = "experiential", extras = ["claas-verl"], marker = "extra == 'claas-rollout'" },
     { name = "experiential", extras = ["claas-verl"], marker = "extra == 'dev'" },
+    { name = "experiential", extras = ["metrics-wandb"], marker = "extra == 'dev'" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
     { name = "fastapi", marker = "extra == 'claas'", specifier = ">=0.115,<1" },
     { name = "filelock", specifier = ">=3.12" },
@@ -1431,10 +1436,11 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'claas'", specifier = ">=0.30,<1" },
     { name = "verl", marker = "extra == 'claas-verl'", specifier = "==0.9.0" },
     { name = "vllm", marker = "sys_platform == 'linux' and extra == 'claas-rollout'", specifier = "==0.22.0" },
+    { name = "wandb", marker = "extra == 'metrics-wandb'", specifier = ">=0.30,<0.31" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=14,<16" },
     { name = "zstandard", marker = "python_full_version >= '3.13'", specifier = ">=0.23,<1" },
 ]
-provides-extras = ["claas", "claas-verl", "claas-rollout", "claas-modal", "sft", "dev"]
+provides-extras = ["metrics-wandb", "claas", "claas-verl", "claas-rollout", "claas-modal", "sft", "dev"]
 
 [[package]]
 name = "fastapi"

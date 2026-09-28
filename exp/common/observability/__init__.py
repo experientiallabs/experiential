@@ -1,4 +1,4 @@
-"""Metadata-only anonymous product telemetry."""
+"""Anonymous product telemetry and explicit caller-owned numeric experiment observations."""
 
 from exp.common.observability.telemetry import (
     BuildTelemetryStats,

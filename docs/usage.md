@@ -669,3 +669,69 @@ The local CLI supervises the entire learner POSIX session, including Ray workers
 process groups, and escalates from graceful termination to forced cleanup after the configured bounds. Modal supplies the remote hard lifetime limit.
 Neither host acknowledges an interrupted update as completed; inspect the retained queue,
 checkpoint, and host/run receipts before resuming.
+
+### Optional experiment metrics
+
+Install `experiential[metrics-wandb]` for explicit W&B reporting. Default CLaaS imports and
+runs do not initialize W&B. This is independent of anonymous product telemetry and its settings.
+Credentials stay in W&B's normal environment/authentication mechanism, never in a launch JSON.
+Start the reporter with `WANDB_ERROR_REPORTING=false` before importing this adapter or W&B.
+The adapter rejects an SDK imported earlier because its process-level diagnostic reporting state
+cannot be verified through a public API. Multiple adapter-owned runs may share this fresh reporter.
+
+```python
+from pathlib import Path
+
+from exp.common.observability.metrics import MetricRecord
+from exp.runtime.observability.wandb import WandbMetricSink
+
+with WandbMetricSink(
+    project="my-learning-project",
+    run_id="application-run-001",
+    directory=Path("./metrics"),
+    mode="offline",  # Change explicitly to "online" to upload.
+    config={"base_model": "my-model", "lora_rank": 16},
+) as metrics:
+    metrics.record(MetricRecord(
+        event_id="evaluation-001",
+        values={"eval/successes": 7, "eval/attempts": 10},
+    ))
+```
+
+The sink accepts finite numeric measurements and only caller-selected configuration. It disables
+automatic console, logger, code, Git, package, machine, and system-metric capture. The required
+reporter environment also disables SDK error reporting, which otherwise can include exception
+messages and tracebacks. W&B still exchanges normal authentication, run, and transport metadata;
+explicit-only payloads refer to experiment history and caller configuration. Workflows may
+explicitly report measured GPU usage, costs, reward, and evaluation results through this same API;
+the learner does not define scenarios, rewards, or benchmark metrics. A W&B UI stop request logs a
+warning and does not interrupt the learner.
+
+Embedded callers can pass `metrics=metrics` to `LearningController(...)` or
+`await execute_run(configuration, factory, api_key=service_api_key, metrics=metrics)`. The caller
+constructs and closes the sink. After SQLite checkpoint acknowledgement, CLaaS reports backend
+metrics under `train/`, plus `train/optimizer_step` and `train/consumed_examples`, even if the
+subsequent host persistence callback fails or is cancelled. `train/acknowledgement_persisted`
+is 1 when that callback completes and 0 when its durability is uncertain. The original lifecycle
+error still propagates; an emitted metric does not prove host-volume persistence. Delivery errors
+produce a warning without changing batch success or retrying the optimizer. Observers must hand off
+locally and return promptly. Checkpoint and batch receipts remain authoritative.
+
+`MetricRecord.step` is an optional global history sequence. Leave it unset to append automatically.
+Optimizer steps and evaluation indices belong in `values`, so different domains never compete for
+the same history position. For one explicitly ordered durable outbox, online restart with the same
+run ID initializes `metrics.next_step` from the SDK's public `starting_step`: skip older outbox rows and submit subsequent
+rows with their explicit history steps. This is a local queue cursor, not a remote acknowledgement
+or an exactly-once delivery guarantee. Keep the outbox and original evidence. Offline runs create
+separate local SDK spools; they do not resume cloud history. The sink never reuses or finishes a
+different caller's active W&B run.
+Inherited process-level config files, sweep/Launch contexts, or imported Weave integration are
+rejected before run initialization; use a separate metrics reporter process for these contexts.
+
+Initialization and final upload each default to a 30-second SDK timeout. Final-upload timeout
+raises and retains the local spool for explicit W&B recovery. When another exception is already
+active, cleanup reports its failure without replacing that exception. Metric sinks are not
+serialized into CLI launch configuration; independently hosted workflows can report their numeric
+observations and completed `/v1/train/batch` receipts without changing a running learner.
+SDK login and initialization are separate waits. The login timeout bounds
+its input prompt; these settings do not provide one hard deadline for the whole reporter process.

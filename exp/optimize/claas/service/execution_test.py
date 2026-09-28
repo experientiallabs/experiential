@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from exp.common.observability.metrics import MetricRecord
 from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
 from exp.optimize.claas.buffer.store_test import item
 from exp.optimize.claas.service.configuration import RunConfiguration, RunReport
@@ -41,11 +42,18 @@ def test_burst_import_two_updates_and_resume_empty(tmp_path: Path) -> None:
     source.write_text("\n".join(item(name).model_dump_json() for name in ("a", "b", "c")))
     config = configuration(tmp_path / "state").model_copy(update={"import_examples_path": source})
     runtime = Runtime()
-    report = asyncio.run(execute_run(config, runtime))
+    records: list[MetricRecord] = []
+
+    class Sink:
+        def record(self, record: MetricRecord) -> None:
+            records.append(record)
+
+    report = asyncio.run(execute_run(config, runtime, metrics=Sink()))
     assert report.status.state == "closed"
     assert report.status.buffer.consumed == 3
     assert runtime.optimizations == 2
     assert runtime.open_count == runtime.close_count == 1
+    assert [record.values["train/optimizer_step"] for record in records] == [1, 2]
     saved = RunReport.model_validate_json((config.directory / "run-report.json").read_bytes())
     assert saved == report
     again = Runtime()
