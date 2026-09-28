@@ -17,7 +17,6 @@ from unittest import mock
 
 import pytest
 
-import exp.runtime.gateway.native_bridge as bridge_module
 import exp.runtime.gateway.native_explicit_cache as cache_module
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -1142,8 +1141,9 @@ def test_admission_plan_failure_is_sanitized_and_finishes_accepted_request(
     host = _Host(_authority())
     control, key = _control(tmp_path, host)
     with (
-        mock.patch.object(
-            bridge_module, "bind_explicit_cache", side_effect=ValueError(_SECRET + _PREFIX)
+        mock.patch(
+            "exp.runtime.gateway.native_bridge_admission.bind_explicit_cache",
+            side_effect=ValueError(_SECRET + _PREFIX),
         ),
         mock.patch.object(
             control._accounting,

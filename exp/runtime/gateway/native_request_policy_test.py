@@ -269,9 +269,10 @@ def test_selected_only_route_plans_search_without_discarded_fallback(
     with (
         patch("exp.runtime.gateway.native_bridge.resolve_admission_route", resolve),
         patch(
-            "exp.runtime.gateway.native_bridge.dispatchable_route_profiles", return_value=profiles
+            "exp.runtime.gateway.native_bridge_admission.dispatchable_route_profiles",
+            return_value=profiles,
         ),
-        patch("exp.runtime.gateway.native_bridge.plan_web_search", search),
+        patch("exp.runtime.gateway.native_bridge_admission.plan_web_search", search),
     ):
         admitted = json.loads(
             plane.admit(
@@ -416,7 +417,7 @@ def test_selected_conditional_route_fails_even_with_an_ordinary_fallback(tmp_pat
         require_route_authority(authorization, request, selected)
     with (
         patch("exp.runtime.gateway.native_bridge.resolve_admission_route", return_value=selected),
-        patch("exp.runtime.gateway.native_bridge.plan_web_search") as search,
+        patch("exp.runtime.gateway.native_bridge_admission.plan_web_search") as search,
     ):
         with pytest.raises(NativeBridgeError) as caught:
             plane.admit(
