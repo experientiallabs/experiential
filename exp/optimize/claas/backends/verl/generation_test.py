@@ -254,3 +254,42 @@ def test_length_reasoning_does_not_bypass_original_token_validation(
             "policy-7",
             "length",
         )
+
+
+@pytest.mark.parametrize("decoder", ["hermes", "qwen35"])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize("prefix", ["visible answer", "tool"])
+def test_visible_prefix_before_unfinished_reasoning_remains_fatal(
+    tmp_path: Path,
+    decoder: Literal["hermes", "qwen35"],
+    finish_reason: Literal["stop", "length"],
+    prefix: str,
+) -> None:
+    """A sampled public prefix cannot be silently discarded by the empty-action fallback."""
+    if prefix == "tool":
+        prefix = (
+            '<tool_call>{"name":"lookup","arguments":{}}</tool_call>'
+            if decoder == "hermes"
+            else "<tool_call><function=lookup></function></tool_call>"
+        )
+    raw = prefix + "<think>unfinished reasoning"
+    model_tokenizer = tokenizer()
+    model_tokenizer.add_special_tokens(
+        {"additional_special_tokens": [AddedToken(raw, normalized=False)]}
+    )
+    response = tuple(model_tokenizer.encode(raw, add_special_tokens=False))
+    request = GenerationRequest(
+        request_id="mixed", model=spec().base_model, prompt="a", maximum_output_tokens=1
+    )
+    with pytest.raises(ValueError, match="visible output before unfinished reasoning"):
+        generation_result(
+            request,
+            (1,),
+            response,
+            (-0.25,),
+            model_tokenizer,
+            spec(),
+            ResidentVerlSettings(checkpoint_root=tmp_path, decoder=decoder),
+            "policy-7",
+            finish_reason,
+        )
