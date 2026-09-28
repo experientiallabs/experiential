@@ -34,23 +34,37 @@ jobs:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
         run: uv sync --extra dev
-      - name: Measure Experiential gateway latency against a local mock
+      - name: Compare isolated snapshot candidates on the same standard runner
         env:
           EXP_TELEMETRY: "0"
           DO_NOT_TRACK: "1"
-        run: >-
-          uv run python -m exp.runtime.gateway.latency_report
-          --output-json gateway-latency.json
-          --output-badge shields/gateway-latency.json
-          --github-summary "$GITHUB_STEP_SUMMARY"
+          BASELINE_REF: 6c90c321331a5794beebfaf694b0a0ea22edcaf0
+          PATH_REF: 06a09a3396086beeb1f633a531ed7f605b6b83c5
+          STAT_REF: fd0702d7c6d2c186dd03ab9640442555e88e9a49
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASELINE_REF" "$PATH_REF" "$STAT_REF"
+          mkdir -p .agents/comparison-reports
+          for comparison in main-1 path-1 stat-1 stat-2 path-2 main-2; do
+            case "$comparison" in
+              main-*) comparison_ref="$BASELINE_REF" ;;
+              path-*) comparison_ref="$PATH_REF" ;;
+              stat-*) comparison_ref="$STAT_REF" ;;
+            esac
+            git restore --source="$comparison_ref" -- \
+              exp/runtime/gateway/snapshot_file.py \
+              exp/runtime/gateway/model_chain_authority.py
+            GITHUB_SHA="$comparison_ref" uv run python -m exp.runtime.gateway.latency_report \
+              --output-json ".agents/comparison-reports/$comparison.json" \
+              --output-badge ".agents/comparison-reports/$comparison-badge.json"
+          done
       - name: Upload the versioned latency report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: gateway-latency-report
-          path: |
-            gateway-latency.json
-            shields/gateway-latency.json
+          path: .agents/comparison-reports/
+          include-hidden-files: true
           if-no-files-found: warn
 
   publish-badge:
