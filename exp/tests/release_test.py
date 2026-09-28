@@ -53,6 +53,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "google-auth",
         "google-re2",
         "httpx",
+        "httpx2",
         "ijson",
         "numpy",
         "openai",
