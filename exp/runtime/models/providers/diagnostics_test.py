@@ -133,6 +133,28 @@ def test_awaited_failure_and_cancellation_keep_identity() -> None:
     assert cancelled.value is cancellation and len(receipts) == 1
 
 
+@pytest.mark.parametrize("control", [asyncio.CancelledError(), KeyboardInterrupt(), SystemExit(7)])
+def test_observer_process_control_propagates_with_original_http_context(
+    control: BaseException,
+) -> None:
+    """A callback's cancellation or exit takes effect while retaining the original HTTP cause."""
+    original = sdk_error({"error": {"code": "rejected"}})
+    receipts: list[APIErrorEvidence] = []
+
+    def observer(evidence: APIErrorEvidence) -> None:
+        """Interrupt diagnostic delivery after receiving exactly one bounded receipt."""
+        receipts.append(evidence)
+        raise control
+
+    with pytest.raises(type(control)) as caught:
+        with observe_openai_errors(observer, operation="call", endpoint_role="provider"):
+            raise original
+    assert caught.value is control
+    assert control.__context__ is original
+    assert len(receipts) == 1 and receipts[0].status_code == 400
+    assert not getattr(original, "__notes__", ())
+
+
 def test_explicit_message_capture_is_bounded_and_credential_filtered() -> None:
     """Only allowlisted fields survive; no raw body, headers, URL or traceback is copied."""
     secret = "private-auth-value"
