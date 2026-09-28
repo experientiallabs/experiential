@@ -12,9 +12,10 @@ from uuid import uuid4
 from filelock import FileLock, Timeout
 
 from exp.common.claas import Experience, ExperienceProvenance
+from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.core.artifacts import sha256_json
-from exp.optimize.claas.service.configuration import BufferStatus, RunConfiguration
+from exp.optimize.claas.service.configuration import BatchStatus, BufferStatus, RunConfiguration
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingSpec,
     TrainingBatch,
@@ -357,6 +358,125 @@ class ExperienceBuffer:
         if len(rows) > 1:
             raise ValueError("buffer contains multiple in-flight batches; restore consistent state")
         return TrainingBatch.model_validate_json(rows[0][0]) if rows else None
+
+    def batch_status(self, batch_id: str) -> BatchStatus | None:
+        """Return an immutable batch's durable acceptance or completed result."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload,result FROM batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        batch = TrainingBatch.model_validate_json(row["payload"])
+        result = TrainingResult.model_validate_json(row["result"]) if row["result"] else None
+        return BatchStatus(
+            batch_id=batch.batch_id,
+            batch_sha256=sha256_json(batch),
+            expected_policy_revision=batch.expected_policy_revision,
+            response_ids=tuple(item.experience.response_id for item in batch.examples),
+            state="completed" if result else "pending",
+            result=result,
+        )
+
+    def submitted_batch(self, submission: TrainingSubmission) -> BatchStatus | None:
+        """Replay a matching submission before checking the now-current policy revision."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM batches WHERE batch_id=?", (submission.batch_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        batch = TrainingBatch.model_validate_json(row["payload"])
+        expected = tuple(
+            (item.response_id, item.training_reward, item.text) for item in submission.feedback
+        )
+        actual = tuple(
+            (item.experience.response_id, item.scalar_reward, item.text_feedback)
+            for item in batch.examples
+        )
+        if (
+            batch.expected_policy_revision != submission.expected_policy_revision
+            or actual != expected
+        ):
+            raise ValueError("batch_id already belongs to a different immutable submission")
+        return self.batch_status(submission.batch_id)
+
+    def lease_submission(self, submission: TrainingSubmission) -> BatchStatus:
+        """Atomically bind complete feedback and every selected response to one update.
+
+        Args:
+            submission: Ordered response selection, exact policy, and complete feedback.
+
+        Returns:
+            Durable acceptance, or the original receipt for an identical retry.
+
+        Raises:
+            ValueError: Identity, policy, feedback, capacity, or batch limits are invalid.
+                Every such rejection leaves all feedback and leases unchanged.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = self.submitted_batch(submission)
+            if previous is not None:
+                connection.commit()
+                return previous
+            if self.inflight() is not None:
+                raise ValueError("another batch is pending; wait for its receipt before submitting")
+            checkpoint = self.checkpoint()
+            current = (
+                checkpoint.policy_revision if checkpoint else self.spec.initial_policy_revision
+            )
+            if submission.expected_policy_revision != current:
+                raise ValueError(
+                    "submission policy is stale; collect a fresh cohort at current policy"
+                )
+            examples: list[TrainingExample] = []
+            updates: list[tuple[float | None, str | None, int, str]] = []
+            for feedback in submission.feedback:
+                row = connection.execute(
+                    "SELECT * FROM records WHERE response_id=?", (feedback.response_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("unknown response_id; generate its exact experience first")
+                if row["state"] not in {"pending_feedback", "ready"}:
+                    raise ValueError("selected response is already leased, consumed, or rejected")
+                scalar, text = feedback.training_reward, feedback.text
+                if (row["scalar_reward"] is not None and row["scalar_reward"] != scalar) or (
+                    row["text_feedback"] is not None and row["text_feedback"] != text
+                ):
+                    raise ValueError("submission conflicts with feedback already recorded")
+                experience = Experience.model_validate_json(row["experience"])
+                exact = experience.exact_tokens
+                if exact is None or exact.policy_revision != current:
+                    raise ValueError("every selected response must have the exact current policy")
+                examples.append(
+                    TrainingExample(experience=experience, scalar_reward=scalar, text_feedback=text)
+                )
+                size = self._size(row["experience"], scalar, text, row["request"], row["result"])
+                updates.append((scalar, text, size, feedback.response_id))
+            batch = TrainingBatch(
+                batch_id=submission.batch_id,
+                expected_policy_revision=current,
+                examples=tuple(examples),
+            )
+            validate_training_batch(self.spec, batch, checkpoint)
+            connection.execute(
+                "INSERT INTO batches VALUES (?, ?, NULL, ?)",
+                (batch.batch_id, batch.model_dump_json(), self.limits.maximum_update_receipt_bytes),
+            )
+            connection.executemany(
+                "UPDATE records SET scalar_reward=?, text_feedback=?, size_bytes=?, "
+                "state='inflight', rejection_reason=NULL, batch_id=? WHERE response_id=?",
+                [
+                    (scalar, text, size, batch.batch_id, identity)
+                    for scalar, text, size, identity in updates
+                ],
+            )
+            self._check_capacity(connection)
+            connection.commit()
+        status = self.batch_status(submission.batch_id)
+        assert status is not None
+        return status
 
     def lease(self, *, allowed_ids: tuple[str, ...] | None = None) -> TrainingBatch | None:
         """Freeze one bounded batch, explicitly rejecting examples that became stale."""

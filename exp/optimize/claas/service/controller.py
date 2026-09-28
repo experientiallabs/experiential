@@ -10,9 +10,15 @@ from typing import Literal
 
 from filelock import FileLock, Timeout
 
+from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.optimize.claas.buffer.store import ExperienceBuffer
-from exp.optimize.claas.service.configuration import RunConfiguration, RunReport, RunStatus
+from exp.optimize.claas.service.configuration import (
+    BatchStatus,
+    RunConfiguration,
+    RunReport,
+    RunStatus,
+)
 from exp.optimize.claas.service.contracts import LearnerRuntime, LearnerRuntimeFactory
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
@@ -56,7 +62,10 @@ class LearningController:
         self.spec = spec
         self.factory = factory
         self.configuration = configuration
-        if configuration.minimum_ready_examples > spec.max_batch_examples:
+        if (
+            configuration.training_admission == "automatic"
+            and configuration.minimum_ready_examples > spec.max_batch_examples
+        ):
             raise ValueError("minimum_ready_examples must not exceed max_batch_examples")
         self.directory.mkdir(parents=True, exist_ok=True)
         self._process_lock = FileLock(
@@ -236,13 +245,48 @@ class LearningController:
 
     async def trigger_train(self) -> RunStatus:
         """Queue a partial update without waiting for compute; inspect status for completion."""
+        if self.configuration.training_admission == "explicit":
+            raise ValueError("explicit admission requires an exact /v1/train/batch submission")
         self._require_running()
         self._force_requested = True
         self._wake.set()
         return await self.status()
 
+    async def submit_training_batch(self, submission: TrainingSubmission) -> BatchStatus:
+        """Accept an exact batch durably without waiting for its optimizer execution.
+
+        Args:
+            submission: Caller-selected responses, policy revision, and complete feedback.
+
+        Returns:
+            Original pending or completed receipt for this immutable submission.
+
+        Raises:
+            ValueError: Admission is automatic, the run is stopped, or selection is invalid.
+        """
+        if self.configuration.training_admission != "explicit":
+            raise ValueError("exact batch submission requires training_admission='explicit'")
+        previous = self.buffer.submitted_batch(submission)
+        if previous is not None:
+            await self._persist()
+            if previous.state == "pending":
+                self._wake.set()
+            return previous
+        self._require_running()
+        status = self.buffer.lease_submission(submission)
+        await self._persist()
+        self._wake.set()
+        return status
+
+    def batch_status(self, batch_id: str) -> BatchStatus:
+        """Read a durable batch receipt independently of GPU execution or current policy."""
+        status = self.buffer.batch_status(batch_id)
+        if status is None:
+            raise ValueError("unknown batch_id; submit a batch before requesting its status")
+        return status
+
     async def drain(self) -> RunReport:
-        """Drain a frozen ready snapshot, forcing partial batches, then close a burst run."""
+        """Drain automatic ready work or an explicit lease, then close a burst run."""
         if self._state == "created":
             await self.start()
         if self._state in {"closed", "failed"}:
@@ -271,7 +315,10 @@ class LearningController:
             await self._persist()
             if not force and self.buffer.status().ready < self.configuration.minimum_ready_examples:
                 return False
-            batch = self.buffer.lease(allowed_ids=allowed_ids)
+            if self.configuration.training_admission == "explicit":
+                batch = self.buffer.inflight()
+            else:
+                batch = self.buffer.lease(allowed_ids=allowed_ids)
             await self._persist()
             if batch is None:
                 return False
@@ -324,8 +371,14 @@ class LearningController:
                     return
                 force = self._force_requested
                 self._force_requested = False
-                if (self.configuration.mode == "run" or force) and await self._train_one(
-                    force=force, allowed_ids=self._burst_ids
+                explicit = self.configuration.training_admission == "explicit"
+                should_train = (
+                    self.buffer.inflight() is not None
+                    if explicit
+                    else self.configuration.mode == "run" or force
+                )
+                if should_train and await self._train_one(
+                    force=force or explicit, allowed_ids=self._burst_ids
                 ):
                     continue
                 try:

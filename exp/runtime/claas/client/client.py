@@ -18,6 +18,7 @@ from openai import OpenAI
 from openai.types.chat.completion_create_params import CompletionCreateParamsNonStreaming
 from pydantic import TypeAdapter
 
+from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import BillingSource, ModelRequest, ModelResponse, ModelSnapshot
@@ -140,6 +141,24 @@ class LearningClient:
     def trigger_train(self) -> JsonObject:
         """Request a bounded partial update; remote policy retains all limit authority."""
         return self._request("POST", "train")
+
+    def train_batch(self, submission: TrainingSubmission) -> JsonObject:
+        """Submit exact feedback once; poll batch_status for its durable optimizer result."""
+        return self._request("POST", "train/batch", submission.model_dump(mode="json"))
+
+    def batch_status(self, batch_id: str) -> JsonObject:
+        """Read acceptance or completion for one caller-owned batch retry identity."""
+        if (
+            not batch_id
+            or not batch_id[0].isalnum()
+            or len(batch_id) > 128
+            or any(
+                not (character.isascii() and (character.isalnum() or character in "._-"))
+                for character in batch_id
+            )
+        ):
+            raise ValueError("batch_id must be a path-safe training submission identity")
+        return self._request("GET", f"train/batch/{batch_id}")
 
     def drain(self) -> JsonObject:
         """Request a finite ready snapshot drain and return its explicit remaining-work report."""

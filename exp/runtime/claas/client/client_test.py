@@ -5,8 +5,39 @@ import json
 import httpx2
 import pytest
 
+from exp.common.claas.batches import TrainingSubmission
+from exp.common.claas.learning import FeedbackSubmission
 from exp.common.models import ModelMessage, ModelRequest
 from exp.runtime.claas.client import LearningClient
+
+
+def test_client_submits_exact_batch_and_reads_its_receipt() -> None:
+    """Selected response rewards and caller retry identity reach the authenticated batch API."""
+    seen: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        """Record exact request payloads without invoking a learner or provider."""
+        seen.append(request)
+        return httpx2.Response(202 if request.method == "POST" else 200, json={"state": "pending"})
+
+    submission = TrainingSubmission(
+        batch_id="cohort-1",
+        expected_policy_revision="policy-0",
+        feedback=(FeedbackSubmission(response_id="response-1", reward=-0.5),),
+    )
+    with LearningClient(
+        base_url="https://learner.test/v1",
+        api_key="local-test-key",
+        model="student",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
+    ) as client:
+        assert client.train_batch(submission) == {"state": "pending"}
+        assert client.batch_status("cohort-1") == {"state": "pending"}
+        with pytest.raises(ValueError, match="batch_id"):
+            client.batch_status("../status")
+    assert [request.url.path for request in seen] == ["/v1/train/batch", "/v1/train/batch/cohort-1"]
+    assert json.loads(seen[0].content) == submission.model_dump(mode="json")
+    assert all(request.headers["Authorization"] == "Bearer local-test-key" for request in seen)
 
 
 def test_sdk_records_response_id_and_sends_feedback_to_same_endpoint() -> None:

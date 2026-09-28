@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
+from exp.common.claas.learning import FeedbackSubmission
 from exp.common.models import AssistantAction
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.service.configuration import RunConfiguration
@@ -15,6 +17,85 @@ from exp.optimize.claas.training_contracts import (
     TrainingResult,
 )
 from exp.optimize.claas.training_contracts_test import example, spec
+
+
+def record_pending(store: ExperienceBuffer, identity: str, *, policy: str = "policy-0") -> None:
+    """Retain an original sample without assigning its eventual cohort reward."""
+    tokens = item(identity, policy=policy).experience.exact_tokens
+    assert tokens is not None
+    store.record_generation(
+        GenerationRequest(request_id=identity, model="tiny-model", prompt="question"),
+        GenerationResult(
+            response_id=identity,
+            action=AssistantAction(content="answer"),
+            exact_tokens=tokens,
+            raw_text="answer",
+        ),
+    )
+
+
+def submission(
+    *identities: str, batch_id: str = "batch-1", policy: str = "policy-0"
+) -> TrainingSubmission:
+    """Select explicit original response IDs with already-attributed centered rewards."""
+    return TrainingSubmission(
+        batch_id=batch_id,
+        expected_policy_revision=policy,
+        feedback=tuple(
+            FeedbackSubmission(response_id=identity, reward=0.5) for identity in identities
+        ),
+    )
+
+
+def test_explicit_batch_rejection_is_all_or_none_and_retry_is_immutable(tmp_path: Path) -> None:
+    """A late bad response rolls back earlier feedback; exact retries survive policy advance."""
+    recipe = spec().model_copy(update={"objective": "reinforce"})
+    store = ExperienceBuffer(tmp_path / "queue.sqlite", recipe, RunConfiguration())
+    for identity in ("one", "two", "unrelated"):
+        record_pending(store, identity)
+    before = store.status()
+    with pytest.raises(ValueError, match="unknown response"):
+        store.lease_submission(submission("one", "missing"))
+    assert store.status() == before and store.inflight() is None
+    assert store.batch_status("batch-1") is None
+    selected = submission("two", "one")
+    accepted = store.lease_submission(selected)
+    assert accepted.response_ids == ("two", "one") and accepted.state == "pending"
+    assert store.status().pending_feedback == 1
+    assert store.lease_submission(selected) == accepted
+    with pytest.raises(ValueError, match="another batch is pending"):
+        store.lease_submission(submission("one", batch_id="overlap"))
+    with pytest.raises(ValueError, match="different immutable"):
+        store.lease_submission(submission("one", "two"))
+    batch = store.inflight()
+    assert batch is not None
+    store.acknowledge(batch, result(batch, tmp_path))
+    completed = store.lease_submission(selected)
+    assert completed.state == "completed" and completed.result is not None
+    assert completed.batch_sha256 == accepted.batch_sha256
+    assert store.checkpoint() is not None
+    with pytest.raises(ValueError, match="stale"):
+        store.lease_submission(submission("unrelated", batch_id="stale"))
+    with pytest.raises(ValueError, match="exact current policy"):
+        store.lease_submission(submission("unrelated", batch_id="old-sample", policy="policy-1"))
+
+
+@pytest.mark.parametrize("limit", ["max_batch_tokens", "max_batch_examples"])
+def test_explicit_batch_never_silently_splits_selected_responses(
+    tmp_path: Path, limit: str
+) -> None:
+    """A whole selection exceeding either update bound preserves all original pending feedback."""
+    recipe = spec().model_copy(
+        update={"objective": "reinforce", limit: 4 if limit == "max_batch_tokens" else 1}
+    )
+    store = ExperienceBuffer(tmp_path / "queue.sqlite", recipe, RunConfiguration())
+    for identity in ("one", "two"):
+        record_pending(store, identity)
+    before = store.status()
+    with pytest.raises(ValueError, match=limit):
+        store.lease_submission(submission("one", "two"))
+    assert store.status() == before
+    assert store.inflight() is None and store.batch_status("batch-1") is None
 
 
 def item(identity: str = "one", *, policy: str = "policy-0", exact: bool = True) -> TrainingExample:
