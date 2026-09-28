@@ -139,11 +139,24 @@ assert saved['status']['cleanup_failure_type'] is None,saved
 assert runtime.open_count==runtime.close_count==1
 assert runtime.optimizations==0
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path / "run")],
-        env={**os.environ, "RAY_USAGE_STATS_ENABLED": "0"},
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path / "run")],
+            env={
+                **os.environ,
+                "RAY_USAGE_STATS_ENABLED": "0",
+                # Use this installed interpreter even when pytest has a `uv run` ancestor.
+                "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(
+            "CPU Ray signal regression exceeded 90 seconds. "
+            f"stdout tail: {(error.stdout or b'')[-8192:]!r}; "
+            f"stderr tail: {(error.stderr or b'')[-8192:]!r}",
+            pytrace=False,
+        )
     assert result.returncode == 0, result.stdout + result.stderr
