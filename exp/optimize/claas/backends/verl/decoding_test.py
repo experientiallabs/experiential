@@ -7,6 +7,7 @@ from exp.optimize.claas.backends.verl.decoding import (
     HermesCompletionDecoder,
     Qwen35CompletionDecoder,
     TextCompletionDecoder,
+    UnfinishedReasoningError,
 )
 
 
@@ -46,6 +47,15 @@ def test_text_decoder_is_explicit() -> None:
     """A caller deliberately selecting ordinary text receives the exact text."""
     text = "  leading and trailing  "
     assert TextCompletionDecoder().decode(text, "req").content == text
+
+
+@pytest.mark.parametrize("decoder", [HermesCompletionDecoder(), Qwen35CompletionDecoder()])
+def test_unfinished_reasoning_has_a_specific_decode_error(
+    decoder: HermesCompletionDecoder | Qwen35CompletionDecoder,
+) -> None:
+    """Only the caller with native terminal evidence may classify unfinished reasoning as length."""
+    with pytest.raises(UnfinishedReasoningError):
+        decoder.decode("<think>private unfinished reasoning", "request")
 
 
 def test_qwen35_native_xml_uses_tool_types_without_guessing() -> None:

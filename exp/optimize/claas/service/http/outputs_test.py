@@ -86,3 +86,29 @@ def test_complete_measured_usage_uses_sdk_required_breakdowns() -> None:
     assert response.usage.input_tokens_details.cache_write_tokens == 0
     assert response.usage.output_tokens_details.reasoning_tokens == 1
     assert response.usage.total_tokens == 4
+
+
+@pytest.mark.parametrize(
+    "length,content,tool,expected",
+    [
+        (True, "", False, ""),
+        (False, "", False, "raw completion"),
+        (True, "visible partial text", False, "raw completion"),
+        (True, "", True, "raw completion"),
+    ],
+)
+def test_completions_hide_only_length_results_without_a_visible_action(
+    length: bool, content: str, tool: bool, expected: str
+) -> None:
+    """Only empty length actions hide raw text; other completion behavior is unchanged."""
+    result = generated(length=length, tool=tool)
+    result = result.model_copy(
+        update={
+            "action": result.action.model_copy(update={"content": content}),
+            "raw_text": "raw completion",
+        }
+    )
+    response = Completion.model_validate(generation_response(result, request(), "completions"))
+    assert response.choices[0].text == expected
+    assert response.id == result.response_id
+    assert response.usage is not None and response.usage.completion_tokens == 2

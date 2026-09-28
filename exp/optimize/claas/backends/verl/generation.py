@@ -9,12 +9,13 @@ from transformers import PreTrainedTokenizerBase
 from exp.common.claas import ExactTokenEvidence
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import ModelMessage
+from exp.common.models import AssistantAction, ModelMessage
 from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
 from exp.optimize.claas.backends.verl.decoding import (
     HermesCompletionDecoder,
     Qwen35CompletionDecoder,
     TextCompletionDecoder,
+    UnfinishedReasoningError,
 )
 from exp.optimize.claas.training_contracts import ClaasTrainingSpec
 
@@ -139,7 +140,14 @@ def generation_result(
         "hermes": HermesCompletionDecoder,
         "qwen35": Qwen35CompletionDecoder,
     }[settings.decoder]()
-    action = decoder.decode(raw_text, request.request_id, request.tools)
+    try:
+        action = decoder.decode(raw_text, request.request_id, request.tools)
+    except UnfinishedReasoningError:
+        if finish_reason != "length":
+            raise
+        # Native length is a sampled policy failure with no completed visible action.
+        # Keep its reasoning only in raw evidence, never in executable text or tools.
+        action = AssistantAction(content="")
     # Keep parsed model mistakes as learning evidence; callers validate tools before execution.
     return GenerationResult(
         response_id=request.request_id,

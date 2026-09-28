@@ -1,6 +1,7 @@
 """Original-token provenance and prompt/action rendering with a real local tokenizer."""
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from tokenizers import AddedToken
@@ -147,7 +148,10 @@ def test_undeclared_sampled_tools_preserve_original_learning_evidence(
     assert result.response_id == request.request_id
 
 
-def test_incomplete_tool_syntax_is_not_repaired_into_an_action(tmp_path: Path) -> None:
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_incomplete_tool_syntax_is_not_repaired_into_an_action(
+    tmp_path: Path, finish_reason: Literal["stop", "length"]
+) -> None:
     """Transporting a parsed wrong name does not invent structure for an incomplete sample."""
     raw = '<tool_call>{"name":"lookup","arguments":{}}'
     model_tokenizer = tokenizer()
@@ -168,4 +172,85 @@ def test_incomplete_tool_syntax_is_not_repaired_into_an_action(tmp_path: Path) -
             spec(),
             ResidentVerlSettings(checkpoint_root=tmp_path, decoder="hermes"),
             "policy-0",
+            finish_reason,
+        )
+
+
+@pytest.mark.parametrize("decoder", ["hermes", "qwen35"])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_unfinished_reasoning_requires_native_length_to_retain_evidence(
+    tmp_path: Path,
+    decoder: Literal["hermes", "qwen35"],
+    finish_reason: Literal["stop", "length"],
+) -> None:
+    """Identical sampled reasoning is a retained length failure only with that native reason."""
+    raw = "<think>private unfinished reasoning"
+    model_tokenizer = tokenizer()
+    model_tokenizer.add_special_tokens(
+        {"additional_special_tokens": [AddedToken(raw, normalized=False)]}
+    )
+    response = tuple(model_tokenizer.encode(raw, add_special_tokens=False))
+    request = GenerationRequest(
+        request_id="reasoning", model=spec().base_model, prompt="a", maximum_output_tokens=1
+    )
+    settings = ResidentVerlSettings(checkpoint_root=tmp_path, decoder=decoder)
+    if finish_reason == "stop":
+        with pytest.raises(ValueError, match="ended inside reasoning"):
+            generation_result(
+                request,
+                (1,),
+                response,
+                (-0.25,),
+                model_tokenizer,
+                spec(),
+                settings,
+                "policy-7",
+                finish_reason,
+            )
+        return
+    result = generation_result(
+        request,
+        (1,),
+        response,
+        (-0.25,),
+        model_tokenizer,
+        spec(),
+        settings,
+        "policy-7",
+        finish_reason,
+    )
+    assert result.action == AssistantAction(content="")
+    assert result.finish_reason == "length"
+    assert result.response_id == request.request_id
+    assert result.raw_text == raw
+    assert result.exact_tokens.prompt_token_ids == (1,)
+    assert result.exact_tokens.response_token_ids == response
+    assert result.exact_tokens.response_logprobs == (-0.25,)
+    assert result.exact_tokens.policy_revision == "policy-7"
+
+
+@pytest.mark.parametrize("probabilities", [(-0.25, -0.5), (float("nan"),)])
+def test_length_reasoning_does_not_bypass_original_token_validation(
+    tmp_path: Path, probabilities: tuple[float, ...]
+) -> None:
+    """Recognized truncated reasoning still needs valid original probability evidence."""
+    raw = "<think>private unfinished reasoning"
+    model_tokenizer = tokenizer()
+    model_tokenizer.add_special_tokens(
+        {"additional_special_tokens": [AddedToken(raw, normalized=False)]}
+    )
+    request = GenerationRequest(
+        request_id="reasoning", model=spec().base_model, prompt="a", maximum_output_tokens=1
+    )
+    with pytest.raises(ValueError, match="response_logprobs"):
+        generation_result(
+            request,
+            (1,),
+            tuple(model_tokenizer.encode(raw)),
+            probabilities,
+            model_tokenizer,
+            spec(),
+            ResidentVerlSettings(checkpoint_root=tmp_path, decoder="hermes"),
+            "policy-7",
+            "length",
         )

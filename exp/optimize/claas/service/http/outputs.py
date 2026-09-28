@@ -73,7 +73,9 @@ def generation_response(
                 "choices": [
                     {
                         "index": 0,
-                        "text": result.raw_text,
+                        "text": ""
+                        if not finished and action.content == "" and not action.tool_calls
+                        else result.raw_text,
                         "finish_reason": result.finish_reason,
                         "logprobs": None,
                     }

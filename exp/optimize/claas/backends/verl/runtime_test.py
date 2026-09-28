@@ -6,11 +6,87 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from tokenizers import AddedToken
+from verl.workers.rollout.replica import TokenOutput
 
+from exp.common.claas.generation import GenerationRequest
 from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
-from exp.optimize.claas.backends.verl.runtime import ResidentVerlRuntime
+from exp.optimize.claas.backends.verl.decoding import UnfinishedReasoningError
+from exp.optimize.claas.backends.verl.native_test import tokenizer
+from exp.optimize.claas.backends.verl.runtime import ResidentVerlRuntime, Rollout
 from exp.optimize.claas.training_contracts import ClaasTrainingError, TrainingBatch, TrainingResult
 from exp.optimize.claas.training_contracts_test import job, spec
+
+
+@pytest.mark.parametrize("outcome", ["length", "stop", "missing", "engine"])
+def test_native_generation_reason_gates_retention_and_runtime_failure(
+    tmp_path: Path, outcome: str
+) -> None:
+    """Only observed length keeps unfinished reasoning and leaves the resident runtime usable."""
+
+    async def exercise() -> None:
+        """Inject only the engine boundary while driving the real runtime and decoder."""
+        settings = ResidentVerlSettings(checkpoint_root=tmp_path, decoder="hermes")
+        runtime = ResidentVerlRuntime(spec(), settings)
+        model_tokenizer = tokenizer()
+        raw = "<think>private unfinished reasoning"
+        model_tokenizer.add_special_tokens(
+            {"additional_special_tokens": [AddedToken(raw, normalized=False)]}
+        )
+        runtime.trainer.tokenizer = model_tokenizer
+        response = model_tokenizer.encode(raw, add_special_tokens=False)
+        engine_error = RuntimeError("engine failed before a terminal result")
+
+        class SampledRollout:
+            """Expose only the inert native output and close boundary used by this test."""
+
+            async def generate(
+                self, prompt: tuple[int, ...], maximum: int, request_id: str, step: int
+            ) -> TokenOutput:
+                """Supply native metadata without claiming that this fixture sampled on a GPU."""
+                assert prompt == (1,) and maximum == 1
+                if outcome == "engine":
+                    raise engine_error
+                return TokenOutput(
+                    token_ids=response,
+                    log_probs=[-0.25],
+                    stop_reason="completed",
+                    extra_fields={} if outcome == "missing" else {"finish_reason": outcome},
+                )
+
+            async def close(self) -> None:
+                """Close the inert fixture without any runtime or GPU resource."""
+
+        runtime._rollout = cast(Rollout, SampledRollout())
+        request = GenerationRequest(
+            request_id="reasoning", model=spec().base_model, prompt="a", maximum_output_tokens=1
+        )
+        try:
+            if outcome == "length":
+                result = await runtime.generate(request)
+                assert result.finish_reason == "length" and result.action.content == ""
+                assert result.raw_text == raw
+                assert not runtime._failed
+                repeated = await runtime.generate(request)
+                assert repeated.exact_tokens == result.exact_tokens
+                assert repeated.action == result.action
+            else:
+                expected = {
+                    "engine": RuntimeError,
+                    "stop": UnfinishedReasoningError,
+                    "missing": ClaasTrainingError,
+                }[outcome]
+                with pytest.raises(expected) as caught:
+                    await runtime.generate(request)
+                if outcome == "engine":
+                    assert caught.value is engine_error
+                assert runtime._failed
+                with pytest.raises(ClaasTrainingError, match="failed"):
+                    await runtime.generate(request)
+        finally:
+            await runtime.close()
+
+    asyncio.run(exercise())
 
 
 def test_cancellation_joins_native_failure_before_releasing_ownership(tmp_path: Path) -> None:
