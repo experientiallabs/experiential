@@ -15,7 +15,6 @@ from exp.common.claas import Experience, ExperienceProvenance
 from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.core.artifacts import sha256_json
-from exp.optimize.claas.backends.checkpoints import verify_checkpoint
 from exp.optimize.claas.service.configuration import BatchStatus, BufferStatus, RunConfiguration
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingSpec,
@@ -549,8 +548,6 @@ class ExperienceBuffer:
         """Commit checkpoint and consumed identities together, permitting only exact retry."""
         checkpoint = result.checkpoint
         expected_ids = tuple(item.experience.experience_id for item in batch.examples)
-        previous = self.checkpoint()
-        previous_step = previous.step if previous else 0
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -570,20 +567,24 @@ class ExperienceBuffer:
                     raise ValueError("training batch already has a different acknowledgement")
                 connection.commit()
                 return
-            manifest = verify_checkpoint(checkpoint, self.spec)
+            prior_row = connection.execute(
+                "SELECT value FROM metadata WHERE key='checkpoint'"
+            ).fetchone()
+            previous = TrainingCheckpoint.model_validate_json(prior_row[0]) if prior_row else None
+            previous_step = previous.step if previous else 0
+            parent = previous.policy_revision if previous else self.spec.initial_policy_revision
+            history = previous.policy_history if previous else (parent,)
+            expected_history = (checkpoint.policy_revision, *history)[
+                : self.spec.max_policy_lag + 1
+            ]
             if (
                 result.consumed_experience_ids != expected_ids
                 or checkpoint.scope != self.spec.scope
                 or checkpoint.adapter_id != self.spec.adapter_id
-                or manifest.parent_policy_revision != batch.expected_policy_revision
-                or manifest.batch_id != batch.batch_id
-                or manifest.batch_sha256 != sha256_json(batch)
-                or manifest.consumed_experience_ids != expected_ids
-                or manifest.metrics != result.metrics
-                or (
-                    self.spec.max_policy_lag > 0
-                    and checkpoint.policy_history[1:2] != (manifest.parent_policy_revision,)
-                )
+                or batch.expected_policy_revision != parent
+                or checkpoint.policy_revision == parent
+                or checkpoint.policy_revision in history
+                or checkpoint.policy_history != expected_history
             ):
                 raise ValueError(
                     "training result differs from its leased batch or checkpoint lineage"
