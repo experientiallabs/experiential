@@ -31,6 +31,7 @@ from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPrefe
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
 from exp.runtime.openai_protocol.native_tools import NativeResponseTool
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
+from exp.runtime.openai_protocol.responses_agent_message import _AgentMessageInput
 from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
 
 
@@ -927,6 +928,7 @@ _ResponsesOutputItem = Annotated[
     | _ResponseFunctionOutput
     | _ResponseReasoningItem
     | _AdditionalToolsItem
+    | _AgentMessageInput
     | _CustomToolCall
     | _CustomToolCallOutput
     | _HostedToolItemEcho,

@@ -3425,9 +3425,7 @@ def test_output_config_discloses_on_routes_that_cannot_honor_it() -> None:
 
 
 def test_native_items_reemit_verbatim_natively_and_translate_on_a_foreign_route() -> None:
-    """Codex-native input items forward byte-for-byte on native Responses
-    rungs at their exact position; on any foreign rung they are translated to
-    ordinary tool-call messages so the turn serves instead of being rejected."""
+    """A custom tool item forwards natively and translates to a foreign tool call."""
     native_item: JsonObject = {
         "type": "custom_tool_call",
         "id": "ctc_1",
@@ -3451,8 +3449,8 @@ def test_native_items_reemit_verbatim_natively_and_translate_on_a_foreign_route(
     chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
     public, _provider = route_generation_parameter_requests((responses,), request)
     assert public.ignored_parameters == ()
-    # A foreign rung translates the custom_tool_call history to a function
-    # tool-call message instead of rejecting the turn.
+    # This custom_tool_call has a lossless function-tool representation on a
+    # foreign rung, so the turn translates instead of rejecting the item.
     _public, provider = route_generation_parameter_requests((responses, chat), request)
     converted = provider.messages[-1]
     assert converted.provider_native_item is None

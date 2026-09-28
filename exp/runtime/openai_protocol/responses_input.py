@@ -42,8 +42,13 @@ class ReplayedFunctionCall:
 
 @dataclass(frozen=True)
 class ReplayedNativeItem:
-    """One Codex-native input item carried byte-for-byte (tool namespaces,
-    freeform tool calls and their outputs)."""
+    """One validated Codex-native item kept at its original Responses input position.
+
+    Attributes:
+        index: Original index in the caller's Responses input list.
+        role: Canonical role used to keep surrounding history in order.
+        item: Validated raw item forwarded unchanged on a native Responses route.
+    """
 
     index: int
     role: Literal["developer", "assistant", "tool"]
@@ -158,7 +163,13 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
             # Native items break the assistant segment and keep their exact
             # position; the payload builder re-emits them verbatim.
             flush_segment()
-            messages.append(GatewayMessage(role=item.role, provider_native_item=item.item))
+            messages.append(
+                GatewayMessage(
+                    role=item.role,
+                    provider_native_item=item.item,
+                    provider_native_item_index=item.index,
+                )
+            )
         elif isinstance(item, ReplayedMessage) and item.message.role != "assistant":
             flush_segment()
             messages.append(item.message)

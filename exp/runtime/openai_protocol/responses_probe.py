@@ -144,9 +144,14 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
         # requires reasoning `content` to be an array while Codex echoes an
         # explicit null that the provider accepts (both captured
         # 2026-08-29). The strict wire model owns those contracts, so the
-        # official probe sees a normalized item.
+        # official probe sees a normalized item. It also does not yet define
+        # the documented `agent_message` input item; the strict wire model
+        # validates that item before this probe, so it is omitted from the
+        # SDK cross-check while all other input items remain checked.
         adapted: list[JsonValue] = []
         for index, entry in enumerate(cast("list[JsonValue]", raw)):
+            if isinstance(entry, dict) and entry.get("type") == "agent_message":
+                continue
             if isinstance(entry, dict):
                 entry = official_message_content(official_image_details(entry, f"input.{index}"))
             if (

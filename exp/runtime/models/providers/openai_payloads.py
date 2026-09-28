@@ -61,8 +61,12 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     input MESSAGE loses the output-only ``status`` OpenAI rejects on it, and
     an item carrying a foreign ``id`` loses the id (a reasoning item with a
     foreign id is dropped whole: without its encrypted content the provider
-    has nothing to resume from, and the id alone is refused).
+    has nothing to resume from, and the id alone is refused). Multi-agent
+    ``agent_message`` items are returned unchanged because their optional ID
+    and opaque content must stay exactly as supplied.
     """
+    if item.get("type") == "agent_message":
+        return item
     shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
     if isinstance(item_id, str) and item_id.startswith(_FOREIGN_ITEM_ID_PREFIX):
@@ -120,9 +124,10 @@ def openai_responses_stream_payload(
     for message in request.messages:
         if message.provider_native_item is not None:
             # Codex-native input items (tool namespaces, freeform tool
-            # history, hosted tool echoes) re-emit byte-for-byte at their
-            # position; route admission already required every rung to speak
-            # this wire. The one exception is an input MESSAGE carrying the
+            # history, hosted tool echoes, and multi-agent messages) re-emit
+            # byte-for-byte at their position; route admission already
+            # required every rung to speak this wire. The one exception is an
+            # input MESSAGE carrying the
             # output-only ``status`` a client copied from a prior response:
             # the input-message schema has no such field and OpenAI answers
             # 400 "Unknown parameter: 'input[N].status'". Hosted tool items

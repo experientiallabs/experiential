@@ -769,11 +769,12 @@ def route_generation_parameter_requests(
         provider_updates["provider_server_tools"] = ()
         if clear_tool_choice:
             provider_updates["tool_choice"] = None
-    # Codex native Responses tool declarations/history serve verbatim only on a
-    # native Responses rung; a foreign wire gets them translated to function
-    # tools (namespaces hoisted, custom tools as one ``input`` function; hosted
-    # web_search/tool_search dropped with disclosure). The inverse mapping rides
-    # on the provider request so the response path re-shapes tool calls back.
+    # Codex Responses tools and translatable history serve verbatim only on a
+    # native Responses rung; foreign wires receive function-tool translations
+    # where a lossless representation exists. Opaque agent messages are
+    # rejected by ``convert_native_history`` before foreign dispatch. The
+    # inverse mapping rides on the provider request so the response path
+    # re-shapes translated tool calls back.
     native_history_present = any(
         message.provider_native_item is not None
         or any(call.provider_namespace is not None for call in message.tool_calls)
