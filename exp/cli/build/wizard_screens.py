@@ -55,6 +55,7 @@ class WizardBuildPlan:
     held_out_tasks: int
     build_estimate_usd: float | None
     build_reused: bool
+    trace_import_id: str | None = None
 
 
 def select_workflow(*, console: Console) -> WizardWorkflowSelection:

@@ -19,7 +19,7 @@ def load_build_traces(
     source: str,
     identity: str | None = None,
     dry_run: bool = False,
-) -> TraceNormalizationResult:
+) -> tuple[TraceNormalizationResult, str | None]:
     """Save a declared corpus once and load its exact evidence for scenario mining.
 
     Source parsing and SQLite publication stream before mining materializes the
@@ -34,7 +34,7 @@ def load_build_traces(
         dry_run: Keep the imported evidence in temporary storage only.
 
     Returns:
-        Complete normalized evidence restored from the exact published import.
+        Complete normalized evidence and its durable import ID, or None for a temporary dry run.
 
     Raises:
         ValueError: Source selection is invalid, no traces qualify, or storage fails.
@@ -71,4 +71,7 @@ def load_build_traces(
                 normalized=normalized,
             )
             assert receipt is not None
-            return read_ingested_traces(storage_root, receipt.import_id)
+            return (
+                read_ingested_traces(storage_root, receipt.import_id),
+                None if dry_run else receipt.import_id,
+            )

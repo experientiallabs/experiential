@@ -232,6 +232,7 @@ def run_build_wizard(
                 estimate=plan.build_estimate_usd,
                 maximum_build_cost_usd=max(maximum_build_cost_usd, build_estimate or 0.0),
                 provider_spend_authorized=True,
+                trace_import_id=plan.trace_import_id,
                 progress=progress,
             )
     else:
@@ -515,7 +516,7 @@ def _prepare_new_build(
         _validated_role_snapshots,
     )
 
-    normalized = load_build_traces(project, root=root, path=trace_path, source=source)
+    normalized, import_id = load_build_traces(project, root=root, path=trace_path, source=source)
     catalog = _configure_build_providers(
         root,
         project,
@@ -540,6 +541,7 @@ def _prepare_new_build(
         ProjectConfig(
             project_id=project,
             trace_source=source,
+            trace_import_id=import_id,
             models=selected,
             retrieval=ProjectRetrievalConfiguration(top_k=top_k),
             budgets=ProjectBudgetConfiguration(
@@ -564,6 +566,7 @@ def _prepare_new_build(
     tasks = completed.artifacts.mining.tasks
     return WizardBuildPlan(
         trace_path=trace_path,
+        trace_import_id=import_id,
         source=source,
         catalog=catalog,
         selected=selected,
@@ -617,6 +620,7 @@ def _completed_build_plan(
     tasks = load_task_set(store.artifacts, config.build.task_set.artifact_id).tasks
     return WizardBuildPlan(
         trace_path=None,
+        trace_import_id=config.trace_import_id,
         source=config.trace_source,
         catalog=catalog,
         selected=selected,

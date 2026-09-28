@@ -295,7 +295,7 @@ def build(
             else:
                 assert trace_file is not None
                 path = _resolve_trace_file(trace_file)
-                normalized = load_build_traces(
+                normalized, import_id = load_build_traces(
                     project, root=root, path=path, source=source, identity=identity, dry_run=dry_run
                 )
             record_count = len(normalized.traces) + len(normalized.issues)

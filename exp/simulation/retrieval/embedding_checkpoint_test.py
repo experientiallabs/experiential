@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,8 @@ from filelock import FileLock
 from exp.common.core.artifacts import SourceIdentity, canonical_json_bytes, sha256_json
 from exp.common.progress import ProgressEvent
 from exp.common.project import ArtifactStore, ProjectPaths, artifact_input
+from exp.common.project.database import content_database_path
+from exp.common.project.records import ProjectRecords
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest import TraceNormalizationResult, persist_trace_dataset
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
@@ -43,7 +46,9 @@ _CREATED_AT = datetime(2026, 9, 24, tzinfo=UTC)
 def _checkpoint(project: Path, *, chunk_bytes: int = 2_048) -> RAGEmbeddingCheckpoint:
     """Create a checkpoint under the deterministic local model identity."""
     return RAGEmbeddingCheckpoint(
-        project, default_rag_embedder().snapshot, maximum_chunk_bytes=chunk_bytes
+        ProjectPaths(project, "checkpoint"),
+        default_rag_embedder().snapshot,
+        maximum_chunk_bytes=chunk_bytes,
     )
 
 
@@ -66,9 +71,9 @@ def test_saved_chunks_are_reused_without_storing_input_text(tmp_path: Path) -> N
     assert fresh.get_or_embed((text,), _never_embed) == ((1.0, 0.0),)
     assert text.encode() not in first.path.read_bytes()
     with closing(sqlite3.connect(first.path)) as connection:
-        assert connection.execute("SELECT text_sha256 FROM vectors").fetchall() == [
-            (hashlib.sha256(text.encode()).hexdigest(),)
-        ]
+        assert connection.execute(
+            "SELECT substr(record_id, 8) FROM project_state_records WHERE record_id LIKE 'vector/%'"
+        ).fetchall() == [(hashlib.sha256(text.encode()).hexdigest(),)]
 
 
 @pytest.mark.parametrize("changed", ["connection_sha256", "model_id", "revision"])
@@ -81,8 +86,11 @@ def test_changed_model_connection_or_revision_cannot_reuse_vectors(
     snapshot = default_rag_embedder().snapshot.model_copy(
         update={changed: "f" * 64 if changed == "connection_sha256" else "other"}
     )
-    second = RAGEmbeddingCheckpoint(tmp_path, snapshot, maximum_chunk_bytes=2_048)
-    assert second.path != first.path
+    second = RAGEmbeddingCheckpoint(
+        ProjectPaths(tmp_path, "checkpoint"), snapshot, maximum_chunk_bytes=2_048
+    )
+    assert second.path == first.path
+    assert second.records.namespace != first.records.namespace
     assert second.load(("same text",)) == {}
     assert _checkpoint(tmp_path, chunk_bytes=512).load(("same text",)) == {}
 
@@ -92,22 +100,25 @@ def test_corrupt_saved_data_fails_before_provider_dispatch(tmp_path: Path, corru
     """A corrupt checkpoint cannot silently trigger paid replacement calls or enter an index."""
     checkpoint = _checkpoint(tmp_path)
     checkpoint.get_or_embed(("fixture",), _constant)
-    with closing(sqlite3.connect(checkpoint.path)) as connection, connection:
-        if corruption == "digest":
-            connection.execute("UPDATE vectors SET checksum = 'incorrect'")
-        elif corruption == "vector":
-            payload = b'{"values":[2.0,0.0]}'
-            key = hashlib.sha256(b"fixture").hexdigest()
-            checksum = hashlib.sha256(
-                checkpoint.identity.encode() + key.encode() + payload
-            ).hexdigest()
-            connection.execute("UPDATE vectors SET vector = ?, checksum = ?", (payload, checksum))
+    key = f"vector/{hashlib.sha256(b'fixture').hexdigest()}"
+    if corruption in {"digest", "schema"}:
+        with closing(sqlite3.connect(checkpoint.path)) as connection, connection:
+            if corruption == "digest":
+                connection.execute("UPDATE project_state_records SET sha256=?", ("0" * 64,))
+            else:
+                connection.execute("DROP TABLE project_artifact_inputs")
+    else:
+        record_id = key if corruption == "vector" else "metadata"
+        payload = checkpoint.records.read(record_id)
+        assert payload is not None
+        saved = json.loads(payload)
+        if corruption == "vector":
+            saved["embedding"] = {"values": [2.0, 0.0]}
         elif corruption == "dimensions":
-            connection.execute("UPDATE metadata SET dimensions = 3")
-        elif corruption == "identity":
-            connection.execute("UPDATE metadata SET identity = 'other'")
+            saved["dimensions"] = 3
         else:
-            connection.execute("PRAGMA user_version = 999")
+            saved["identity"] = "other"
+        checkpoint.records.write(record_id, canonical_json_bytes(saved))
     with pytest.raises(RAGEmbeddingCheckpointError):
         _checkpoint(tmp_path).get_or_embed(("fixture",), _never_embed)
 
@@ -117,8 +128,23 @@ def test_failed_batch_validation_preserves_all_earlier_checkpoints(tmp_path: Pat
     checkpoint = _checkpoint(tmp_path)
     checkpoint.get_or_embed(("first",), _constant)
     with pytest.raises(ValueError, match="inconsistent dimensions"):
-        checkpoint.get_or_embed(("second",), lambda texts: ((1.0, 0.0, 0.0),))
-    assert _checkpoint(tmp_path).load(("first", "second")) == {"first": (1.0, 0.0)}
+        checkpoint.get_or_embed(("second", "third"), lambda texts: ((1.0, 0.0), (1.0, 0.0, 0.0)))
+    assert _checkpoint(tmp_path).load(("first", "second", "third")) == {"first": (1.0, 0.0)}
+
+
+def test_provider_dispatch_does_not_hold_the_shared_database_writer(tmp_path: Path) -> None:
+    """Another thread commits project progress while an embedding provider is executing."""
+    checkpoint = _checkpoint(tmp_path)
+    sibling = ProjectRecords(tmp_path, "sibling", "progress")
+
+    def embed(texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        """Commit independent state during the provider callback, then return unit vectors."""
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(sibling.write, "step", b"completed").result(timeout=1.0)
+        return _constant(texts)
+
+    assert checkpoint.get_or_embed(("fixture",), embed) == ((1.0, 0.0),)
+    assert sibling.read("step") == b"completed"
 
 
 def test_query_only_embedding_stays_memory_only(
@@ -141,8 +167,14 @@ def test_progress_never_reports_a_batch_before_its_commit(tmp_path: Path) -> Non
     def observe(event: ProgressEvent) -> None:
         """Check actual durable rows at the instant progress reaches the caller."""
         assert event.completed is not None
+        if not checkpoint.path.exists():
+            assert event.completed == 0
+            counts.append(event.completed)
+            return
         with closing(sqlite3.connect(checkpoint.path)) as connection:
-            saved = connection.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
+            saved = connection.execute(
+                "SELECT COUNT(*) FROM project_state_records WHERE record_id LIKE 'vector/%'"
+            ).fetchone()[0]
             assert saved == event.completed
         counts.append(event.completed)
 
@@ -165,7 +197,7 @@ def test_contended_checkpoint_reports_retry_without_dispatch(
     checkpoint = _checkpoint(tmp_path)
     checkpoint.load(())
     monkeypatch.setattr(embedding_checkpoint, "_LOCK_TIMEOUT_SECONDS", 0)
-    with FileLock(checkpoint.path.with_suffix(".lock")):
+    with FileLock(checkpoint.lock_path):
         with pytest.raises(RAGEmbeddingCheckpointError, match="retry after it finishes"):
             checkpoint.get_or_embed(("fixture",), _never_embed)
 
@@ -340,18 +372,21 @@ def test_loopback_build_resumes_successful_batches_after_process_restart(tmp_pat
             assert process.exitcode == 0
             assert result.read_text() == expected
             if expected == "transport-failure":
-                database = next(
-                    (store.project_directory / "runtime" / "rag-embeddings").glob("*.sqlite3")
-                )
-                with closing(sqlite3.connect(database)) as connection:
-                    assert connection.execute("SELECT COUNT(*) FROM vectors").fetchone()[0] == 100
+                with closing(sqlite3.connect(content_database_path(root))) as connection:
+                    assert (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM project_state_records "
+                            "WHERE record_id LIKE 'vector/%'"
+                        ).fetchone()[0]
+                        == 100
+                    )
     assert len(state.requests) == 4
     assert state.requests[1] == state.requests[2]
     successful = [text for batch in state.successful for text in batch]
     assert len(successful) == 240
     assert len(set(successful)) == len(successful)
-    indexes = (store.project_directory / "artifacts").glob("trace-rag-*")
-    assert len([path for path in indexes if path.is_dir()]) == 2
+    indexes = [key for key in store.list_ids() if key.startswith("trace-rag-")]
+    assert len(indexes) == 2
 
 
 def test_two_build_processes_share_completed_batches_without_duplicate_calls(

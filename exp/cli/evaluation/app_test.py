@@ -173,7 +173,11 @@ def test_cell_contention_pauses_with_resume_command_and_no_failed_evidence(
         lambda *args, **kwargs: TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None),
     )
     before = len(state.completion_calls), len(state.embedding_calls)
-    rollouts_before = tuple(project.paths.project_directory.glob("artifacts/*/rollout.json"))
+    rollouts_before = tuple(
+        key
+        for key in project.artifacts.list_ids()
+        if project.artifacts.read(key).manifest.artifact_type == "rollout"
+    )
     result = CliRunner().invoke(
         app,
         [
@@ -190,12 +194,17 @@ def test_cell_contention_pauses_with_resume_command_and_no_failed_evidence(
     assert result.exit_code == 0, result.output
     assert "Paused" in result.output
     assert "Completed work saved" in result.output
-    assert f"--resume {run.run_id}" in result.output
+    assert f"--resume {run.run_id}" in " ".join(result.output.split())
     saved = load_run(project, run.run_id)
     assert saved.status == "paused"
     assert saved.report_id is None
     assert (
-        tuple(project.paths.project_directory.glob("artifacts/*/rollout.json")) == rollouts_before
+        tuple(
+            key
+            for key in project.artifacts.list_ids()
+            if project.artifacts.read(key).manifest.artifact_type == "rollout"
+        )
+        == rollouts_before
     )
     assert before == (len(state.completion_calls), len(state.embedding_calls))
 

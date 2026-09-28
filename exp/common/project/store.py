@@ -66,6 +66,11 @@ class ArtifactStore:
         self._paths = paths
 
     @property
+    def paths(self) -> ProjectPaths:
+        """Return the explicit root and project identity owning this artifact store."""
+        return self._paths
+
+    @property
     def project_directory(self) -> Path:
         """Return the project-owned local state directory for durable coordination records.
 

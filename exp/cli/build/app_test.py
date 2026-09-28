@@ -1454,6 +1454,7 @@ def test_build_stores_traces_and_mines_a_reusable_twenty_scenario_set(tmp_path: 
     project = ProjectStore(root, "support")
     selected = project.load_project().build
     assert selected is not None
+    assert project.load_project().trace_import_id == imports[0]
     dataset = load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id)
     assert dataset.traces == imported.traces
     task_set = load_task_set(project.artifacts, selected.task_set.artifact_id)
@@ -1473,7 +1474,9 @@ def test_build_stores_traces_and_mines_a_reusable_twenty_scenario_set(tmp_path: 
     assert len(load_task_set(project.artifacts, successor.task_set.artifact_id).tasks) == 21
     assert load_task_set(project.artifacts, selected.task_set.artifact_id) == task_set
     assert load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id) == dataset
-    assert len(SQLiteTraceStore(trace_database_path(root)).list_imports("support")) == 2
+    successor_imports = SQLiteTraceStore(trace_database_path(root)).list_imports("support")
+    assert len(successor_imports) == 2
+    assert project.load_project().trace_import_id == successor_imports[-1]
     assert read_ingested_traces(root, imports[0]) == imported
 
 
@@ -1507,6 +1510,7 @@ def test_build_from_gateway_mines_only_the_selected_identity(tmp_path: Path) -> 
     project = ProjectStore(root, "support")
     selected = project.load_project().build
     assert selected is not None
+    assert project.load_project().trace_import_id == imports[0]
     dataset = load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id)
     assert dataset.traces == imported.traces
     assert dataset.traces[0].tools[0].name == "lookup"

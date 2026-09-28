@@ -129,7 +129,7 @@ def persist_trace_rag(
         maximum_chunk_bytes=chunk_bytes,
         progress=progress,
         checkpoint=RAGEmbeddingCheckpoint(
-            store.project_directory, binding.snapshot, maximum_chunk_bytes=chunk_bytes
+            store.paths, binding.snapshot, maximum_chunk_bytes=chunk_bytes
         ),
     )
     report(progress, "RAG")

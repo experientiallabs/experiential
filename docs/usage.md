@@ -351,6 +351,11 @@ Evaluation runs pin configuration and prepared inputs; progress updates cannot r
 Checkpoint intents commit before provider dispatch so ambiguous completion never authorizes an
 automatic duplicate call.
 
+Embedding batches and evaluation request receipts use the same database. Embedding coordination
+locks serialize duplicate build work without holding a SQLite transaction across provider calls.
+Successful response artifacts settle atomically with request charges; unresolved evaluation calls
+retain their conservative reservations. A new judging pass retains the previous completed receipt.
+
 Large payloads remain digest-addressed files under `projects/PROJECT/blobs`, referenced by database
 records. HTML reports remain generated exports. Copying a project folder alone is not a backup:
 preserve a consistent SQLite backup and its referenced blobs together. Selected completed build

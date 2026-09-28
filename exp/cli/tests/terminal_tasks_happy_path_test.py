@@ -241,6 +241,8 @@ def _calibrate_arguments(
         "--root",
         str(root),
         "--yes",
+        "--maximum-input-tokens",
+        "128000",
         "--approve",
         "--non-interactive",
         *labels,
@@ -318,7 +320,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
-    assert "command estimate $0.74 exceeds the $0.50 budget" in refused_text
+    assert "command estimate $2.17 exceeds the $0.50 budget" in refused_text
     assert "$0.50" in refused_text
     assert "interactive terminal to proceed, or use --yes" in refused_text
     assert "missing labels" not in refused_text
@@ -352,7 +354,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     resumed_text = " ".join(unstyle(resumed.output).replace("│", " ").split())
     assert "review progress: 1/5 distinct trace lineages complete" in resumed_text
     assert "Trace 1 of 5" not in resumed.output
-    assert "Trace 2 of 5" in resumed.output
+    assert "Trace 2 of 5" in resumed.output, resumed.output
     assert "--approve" in resumed_text
     assert sum(client.calls for client in _RuntimeCatalog.judge_clients) == _SAMPLE_SIZE - 1
     drafted = _drafted_labels(store)

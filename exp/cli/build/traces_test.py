@@ -27,7 +27,9 @@ def test_build_preserves_credential_variable_names_in_retrieved_documentation(
     documentation = "Create Boltz(api_key=os.environ['BOLTZ_API_KEY']); set BRAINTRUST_API_KEY."
     source.write_text(source.read_text().replace("Acme is a company.", documentation))
     root = tmp_path / "state"
-    normalized = load_build_traces("powerset", root=root, path=source, source="chat-json")
+    normalized, import_id = load_build_traces(
+        "powerset", root=root, path=source, source="chat-json"
+    )
     store = ArtifactStore(ProjectPaths(root=root, project_id="powerset"))
 
     built = build_task_set(
@@ -49,19 +51,23 @@ def test_build_file_evidence_matches_saved_import_and_deduplicates(
     source = _source(tmp_path)
     root = tmp_path / "state"
     expected = load_trace_source("chat-json", source)
-    result = load_build_traces(
+    result, import_id = load_build_traces(
         "powerset", root=root, path=source, source="chat-json", dry_run=dry_run
     )
     assert result == expected
     assert len(result.traces) == 20 and len(result.issues) == 1
     if dry_run:
+        assert import_id is None
         assert not root.exists()
         return
     store = SQLiteTraceStore(trace_database_path(root))
     imports = store.list_imports("powerset")
-    assert len(imports) == 1
+    assert imports == (import_id,)
     assert read_ingested_traces(root, imports[0]) == result
-    assert load_build_traces("powerset", root=root, path=source, source="chat-json") == result
+    assert load_build_traces("powerset", root=root, path=source, source="chat-json") == (
+        result,
+        import_id,
+    )
     assert store.list_imports("powerset") == imports
     source.unlink()
     assert read_ingested_traces(root, imports[0]) == expected
@@ -76,15 +82,16 @@ def test_build_gateway_evidence_preserves_identity_and_exact_snapshot(
     root = tmp_path / "state"
     _database(source, (_experience("developer"), _experience("other")))
     expected = load_gateway_capture(source, identity_id="developer")
-    result = load_build_traces(
+    result, import_id = load_build_traces(
         "powerset", root=root, path=source, source="gateway", identity="developer", dry_run=dry_run
     )
     assert result == expected and len(result.traces) == 1
     if dry_run:
+        assert import_id is None
         assert not root.exists()
     else:
         imports = SQLiteTraceStore(trace_database_path(root)).list_imports("powerset")
-        assert len(imports) == 1
+        assert imports == (import_id,)
         assert read_ingested_traces(root, imports[0]) == expected
 
 
