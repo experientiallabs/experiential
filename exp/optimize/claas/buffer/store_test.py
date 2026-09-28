@@ -1,5 +1,6 @@
 """Transactional queue, feedback, rejection, and recovery regression tests."""
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -507,3 +508,29 @@ def test_positive_lag_retains_its_immediate_parent(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="leased batch"):
         store.acknowledge(batch, saved)
     assert store.inflight() == batch and store.checkpoint() is None
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "corrupt"])
+def test_completed_acknowledgement_replays_without_checkpoint_files(
+    tmp_path: Path, unavailable: str
+) -> None:
+    """An exact completed retry returns durable evidence without reauthorizing absent artifacts."""
+    store = ExperienceBuffer(tmp_path / "queue.sqlite", spec(), RunConfiguration())
+    store.import_examples((item(),))
+    batch = store.lease()
+    assert batch is not None
+    saved = result(batch, tmp_path)
+    store.acknowledge(batch, saved)
+    completed = store.batch_status(batch.batch_id)
+    before = store.path.read_bytes()
+    checkpoint_root = Path(saved.checkpoint.path)
+    if unavailable == "missing":
+        shutil.rmtree(checkpoint_root)
+    else:
+        (checkpoint_root / "manifest.json").write_text("corrupted")
+    store.acknowledge(batch, saved)
+    assert store.path.read_bytes() == before
+    assert store.batch_status(batch.batch_id) == completed
+    with pytest.raises(ValueError, match="different acknowledgement"):
+        store.acknowledge(batch, saved.model_copy(update={"metrics": {"loss": 99.0}}))
+    assert store.path.read_bytes() == before

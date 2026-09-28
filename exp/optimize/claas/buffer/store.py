@@ -551,22 +551,6 @@ class ExperienceBuffer:
         expected_ids = tuple(item.experience.experience_id for item in batch.examples)
         previous = self.checkpoint()
         previous_step = previous.step if previous else 0
-        manifest = verify_checkpoint(checkpoint, self.spec)
-        if (
-            result.consumed_experience_ids != expected_ids
-            or checkpoint.scope != self.spec.scope
-            or checkpoint.adapter_id != self.spec.adapter_id
-            or manifest.parent_policy_revision != batch.expected_policy_revision
-            or manifest.batch_id != batch.batch_id
-            or manifest.batch_sha256 != sha256_json(batch)
-            or manifest.consumed_experience_ids != expected_ids
-            or manifest.metrics != result.metrics
-            or (
-                self.spec.max_policy_lag > 0
-                and checkpoint.policy_history[1:2] != (manifest.parent_policy_revision,)
-            )
-        ):
-            raise ValueError("training result differs from its leased batch or checkpoint lineage")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -586,6 +570,24 @@ class ExperienceBuffer:
                     raise ValueError("training batch already has a different acknowledgement")
                 connection.commit()
                 return
+            manifest = verify_checkpoint(checkpoint, self.spec)
+            if (
+                result.consumed_experience_ids != expected_ids
+                or checkpoint.scope != self.spec.scope
+                or checkpoint.adapter_id != self.spec.adapter_id
+                or manifest.parent_policy_revision != batch.expected_policy_revision
+                or manifest.batch_id != batch.batch_id
+                or manifest.batch_sha256 != sha256_json(batch)
+                or manifest.consumed_experience_ids != expected_ids
+                or manifest.metrics != result.metrics
+                or (
+                    self.spec.max_policy_lag > 0
+                    and checkpoint.policy_history[1:2] != (manifest.parent_policy_revision,)
+                )
+            ):
+                raise ValueError(
+                    "training result differs from its leased batch or checkpoint lineage"
+                )
             if checkpoint.step != previous_step + 1:
                 raise ValueError("training checkpoint does not advance exactly one update")
             connection.execute(
