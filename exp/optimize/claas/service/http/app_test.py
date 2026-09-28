@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import httpx
 import pytest
@@ -159,16 +159,23 @@ class WireRuntime(Runtime):
         )
 
 
-class UndeclaredToolRuntime(Runtime):
-    """Supply a sampled wrong tool name while exposing its unchanged fixture token evidence."""
+class SampledRuntime(Runtime):
+    """Decode an original fixture sample through the real generation persistence boundary."""
 
     request: GenerationRequest | None = None
     sample: GenerationResult | None = None
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        raw_text: str = '<tool_call>{"name":"functions.missing","arguments":{}}</tool_call>',
+        finish_reason: Literal["stop", "length"] = "stop",
+    ) -> None:
         """Bind one local response vocabulary without downloading or initializing a model."""
         super().__init__()
-        self.raw_text = '<tool_call>{"name":"functions.missing","arguments":{}}</tool_call>'
+        self.raw_text = raw_text
+        self.finish_reason = finish_reason
         self.tokenizer = PreTrainedTokenizerFast(
             tokenizer_object=Tokenizer(
                 WordLevel(
@@ -185,25 +192,25 @@ class UndeclaredToolRuntime(Runtime):
         """Decode the original fixture sample through the production result constructor."""
         self.generate_count += 1
         self.request = request
-        prompt = tuple(
-            self.tokenizer.encode(request.messages[-1].content or "", add_special_tokens=False)
-        )
+        text = request.prompt if request.prompt is not None else request.messages[-1].content or ""
+        prompt = tuple(self.tokenizer.encode(text, add_special_tokens=False))
         self.sample = generation_result(
             request,
             prompt,
-            (2, 3),
-            (-0.25, -0.5),
+            (2,) if self.finish_reason == "length" else (2, 3),
+            (-0.25,) if self.finish_reason == "length" else (-0.25, -0.5),
             self.tokenizer,
             spec(),
             self.settings,
             self.policy_revision,
+            self.finish_reason,
         )
         return self.sample
 
 
 def test_undeclared_tool_sdk_persistence_replay_and_feedback(tmp_path: Path) -> None:
     """An incorrect sampled action keeps its identity and tokens through delayed scalar feedback."""
-    runtime = UndeclaredToolRuntime(tmp_path / "checkpoints")
+    runtime = SampledRuntime(tmp_path / "checkpoints")
     recipe = spec().model_copy(update={"objective": "reinforce"})
     limits = RunConfiguration(training_admission="explicit")
     controller = LearningController(tmp_path, recipe, runtime, limits)
@@ -250,6 +257,92 @@ def test_undeclared_tool_sdk_persistence_replay_and_feedback(tmp_path: Path) -> 
     example = batch.examples[0]
     assert example.scalar_reward == -0.5
     assert example.experience.response_id == first.id
+    assert example.experience.response == runtime.sample.model_dump(mode="json")
+    assert example.experience.exact_tokens == runtime.sample.exact_tokens
+
+
+@pytest.mark.parametrize("protocol", ["chat", "responses", "completions"])
+def test_length_reasoning_sdk_persistence_replay_and_feedback(
+    tmp_path: Path, protocol: Literal["chat", "responses", "completions"]
+) -> None:
+    """HTTP retains truncated reasoning privately and exposes a durable length failure."""
+    raw = "<think>private unfinished reasoning"
+    runtime = SampledRuntime(tmp_path / "checkpoints", raw_text=raw, finish_reason="length")
+    recipe = spec().model_copy(update={"objective": "reinforce"})
+    limits = RunConfiguration(training_admission="explicit")
+    controller = LearningController(tmp_path, recipe, runtime, limits)
+    with (
+        serve(create_app(controller, api_key=_KEY)) as base_url,
+        OpenAI(base_url=base_url, api_key=_KEY, max_retries=0) as sdk,
+    ):
+
+        def request_sample() -> JsonObject:
+            """Repeat the same SDK operation with one persistent idempotency key."""
+            headers = {"Idempotency-Key": "reasoning-length"}
+            if protocol == "chat":
+                result = sdk.chat.completions.create(
+                    model="adapter-1",
+                    messages=[{"role": "user", "content": "look up the record"}],
+                    max_completion_tokens=1,
+                    extra_headers=headers,
+                )
+            elif protocol == "responses":
+                result = sdk.responses.create(
+                    model="adapter-1",
+                    input="look up the record",
+                    max_output_tokens=1,
+                    extra_headers=headers,
+                )
+            else:
+                result = sdk.completions.create(
+                    model="adapter-1",
+                    prompt="look up the record",
+                    max_tokens=1,
+                    extra_headers=headers,
+                )
+            return cast(JsonObject, result.model_dump(mode="json"))
+
+        first = request_sample()
+        assert request_sample() == first
+        assert runtime.generate_count == 1
+        assert "private unfinished reasoning" not in str(first)
+        if protocol == "responses":
+            assert first["status"] == "incomplete"
+            assert first["incomplete_details"] == {"reason": "max_output_tokens"}
+        else:
+            choices = first["choices"]
+            assert isinstance(choices, list) and isinstance(choices[0], dict)
+            assert choices[0]["finish_reason"] == "length"
+            if protocol == "completions":
+                assert choices[0]["text"] == ""
+            else:
+                message = choices[0]["message"]
+                assert isinstance(message, dict) and message["content"] == ""
+                assert message["tool_calls"] is None
+            usage = first["usage"]
+            assert isinstance(usage, dict) and usage["completion_tokens"] == 1
+        assert runtime.sample is not None and runtime.request is not None
+        persisted = controller.buffer.replay(runtime.request)
+        assert persisted == runtime.sample
+        assert persisted is not None and persisted.raw_text == raw
+        assert runtime.tokenizer.decode([2], skip_special_tokens=False) == raw
+        assert persisted.action == AssistantAction(content="")
+        assert persisted.exact_tokens.response_token_ids == (2,)
+        assert persisted.exact_tokens.response_logprobs == (-0.25,)
+        with httpx.Client(headers=_HEADERS) as client:
+            feedback = client.post(
+                base_url + "/feedback", json={"response_id": first["id"], "reward": -0.5}
+            )
+        assert feedback.status_code == 200
+        assert feedback.json()["buffer"]["ready"] == 1 and feedback.json()["updates"] == 0
+    assert runtime.optimizations == 0
+    reopened = ExperienceBuffer(tmp_path / "experiences.sqlite", recipe, limits)
+    assert reopened.replay(runtime.request) == runtime.sample
+    batch = reopened.lease()
+    assert batch is not None and len(batch.examples) == 1
+    example = batch.examples[0]
+    assert example.scalar_reward == -0.5
+    assert example.experience.response_id == first["id"]
     assert example.experience.response == runtime.sample.model_dump(mode="json")
     assert example.experience.exact_tokens == runtime.sample.exact_tokens
 

@@ -18,6 +18,10 @@ class _ToolPayload(ContractModel):
     arguments: JsonObject
 
 
+class UnfinishedReasoningError(ValueError):
+    """The native reasoning block has no closing marker or executable public action."""
+
+
 class TextCompletionDecoder:
     """Treat the entire completion as ordinary assistant text."""
 
@@ -44,7 +48,11 @@ class HermesCompletionDecoder:
         if "</think>" in visible:
             visible = visible.split("</think>", 1)[1]
         elif "<think>" in visible:
-            raise ValueError("completion ended inside reasoning; increase the token budget")
+            if visible.split("<think>", 1)[0].strip():
+                raise ValueError("completion contains visible output before unfinished reasoning")
+            raise UnfinishedReasoningError(
+                "completion ended inside reasoning; increase the token budget"
+            )
         blocks = list(re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", visible, re.DOTALL))
         remainder = re.sub(r"<tool_call>\s*.*?\s*</tool_call>", "", visible, flags=re.DOTALL)
         if "<tool_call" in remainder or "</tool_call" in remainder:
@@ -78,7 +86,11 @@ class Qwen35CompletionDecoder:
         """Parse complete native calls without guessing a different tool format."""
         visible = text.split("</think>", 1)[1] if "</think>" in text else text
         if "<think>" in visible:
-            raise ValueError("completion ended inside reasoning; increase the token budget")
+            if visible.split("<think>", 1)[0].strip():
+                raise ValueError("completion contains visible output before unfinished reasoning")
+            raise UnfinishedReasoningError(
+                "completion ended inside reasoning; increase the token budget"
+            )
         pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
         blocks = list(re.finditer(pattern, visible, re.DOTALL))
         remainder = re.sub(pattern, "", visible, flags=re.DOTALL)
