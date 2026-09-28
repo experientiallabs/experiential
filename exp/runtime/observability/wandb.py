@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import sys
 from pathlib import Path
 from threading import Lock
 from types import TracebackType
 from typing import Literal
 
-import wandb
-
 from exp.common.core.artifacts import JsonObject, assert_secret_free, canonical_json_bytes
 from exp.common.observability.metrics import MetricRecord
+
+# Error reporting is process-scoped and captured by SDK initialization. A preloaded
+# SDK has no public getter for that initialization state, so require a fresh reporter.
+_SDK_SAFE_AT_IMPORT = (
+    os.environ.get("WANDB_ERROR_REPORTING", "").lower() == "false" and "wandb" not in sys.modules
+)
+import wandb  # noqa: E402 - observe SDK absence before importing this optional provider
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +35,8 @@ class WandbMetricSink:
     The SDK queues ``record`` locally. Neither success nor ``next_step`` proves remote
     delivery, and resuming cannot promise exactly-once metric delivery after a crash.
     Keep a durable local outbox and its domain receipts when replay matters.
+    Set ``WANDB_ERROR_REPORTING=false`` before importing this adapter in a fresh
+    reporter process. An SDK imported earlier has unverifiable telemetry state.
 
     Attributes:
         next_step: Next global history position for this sink, independent of any
@@ -65,6 +73,14 @@ class WandbMetricSink:
         Raises:
             ValueError: Configuration is invalid or includes a known credential field.
         """
+        if (
+            not _SDK_SAFE_AT_IMPORT
+            or os.environ.get("WANDB_ERROR_REPORTING", "").lower() != "false"
+        ):
+            raise ValueError(
+                "start a fresh metrics reporter with WANDB_ERROR_REPORTING=false before "
+                "importing this adapter or W&B; preloaded SDK reporting state is unsupported"
+            )
         if not project.strip() or not run_id.strip():
             raise ValueError("W&B project and run_id must be explicit nonempty names")
         if mode not in {"online", "offline"}:
@@ -135,9 +151,9 @@ class WandbMetricSink:
                 raise ValueError(
                     "W&B did not open the requested reporting mode; check authentication"
                 )
-            # The official property retrieves the resumed next history step with
-            # its own finite 30-second SDK wait. Later writes use our local counter.
-            self._next_step = self._run.step
+            # The SDK's public starting_step is restored from remote history.
+            # Run.step may still be zero before the first log on a resumed run.
+            self._next_step = self._run.starting_step
         except BaseException:
             try:
                 self._run.finish(exit_code=1)

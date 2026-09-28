@@ -1,5 +1,6 @@
 """Verify explicit egress, history ordering, bounded cleanup, and real offline SDK recording."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,14 +10,19 @@ from typing import cast
 import pytest
 import wandb
 
+import exp.runtime.observability.wandb as adapter
 from exp.common.core.artifacts import SecretBoundaryError
 from exp.common.observability.metrics import MetricRecord
 from exp.runtime.observability.wandb import WandbMetricSink
 
 
 class FakeRun:
+    """Record SDK calls without making provider requests."""
+
     def __init__(self) -> None:
-        self.step = 7
+        """Start with an existing history position and configurable cleanup behavior."""
+        self.step = 0
+        self.starting_step = 7
         self.disabled = False
         self.offline = False
         self.url = "https://wandb.ai/example/project/runs/fixture"
@@ -25,19 +31,25 @@ class FakeRun:
         self.close_error: Exception | None = None
 
     def log(self, values: dict[str, float], *, step: int, commit: bool) -> None:
+        """Retain exactly the payload, history position, and commit flag submitted."""
         self.records.append((values, step, commit))
 
     def finish(self, *, exit_code: int = 0) -> None:
+        """Count ownership cleanup and optionally simulate upload failure."""
         self.finish_calls += 1
         if self.close_error:
             raise self.close_error
 
 
 def fake_sdk(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeRun, dict[str, object]]:
+    """Replace only SDK boundaries and retain explicit initialization arguments."""
+    monkeypatch.setenv("WANDB_ERROR_REPORTING", "false")
+    monkeypatch.setattr(adapter, "_SDK_SAFE_AT_IMPORT", True)
     run = FakeRun()
     captured: dict[str, object] = {}
 
     def initialize(**arguments: object) -> wandb.Run:
+        """Return the instrumented run and capture its selected destination settings."""
         captured.update(arguments)
         return cast(wandb.Run, run)
 
@@ -50,6 +62,7 @@ def fake_sdk(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeRun, dict[str, object
 def test_explicit_payload_history_and_privacy_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Verify ordered numeric egress, explicit run ownership, and capture suppression."""
     run, arguments = fake_sdk(monkeypatch)
     with WandbMetricSink(
         project="project", run_id="fixture", directory=tmp_path, config={"lora_rank": 16}
@@ -85,6 +98,7 @@ def test_explicit_payload_history_and_privacy_settings(
 def test_bad_config_rejected_before_sdk_or_directory_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Reject unsafe configuration before allocating reporter state."""
     _, captured = fake_sdk(monkeypatch)
     directory = tmp_path / "not-created"
     with pytest.raises(SecretBoundaryError):
@@ -102,6 +116,7 @@ def test_bad_config_rejected_before_sdk_or_directory_creation(
 def test_global_config_is_rejected_before_run_egress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Refuse inherited configuration without mutating the existing SDK session."""
     _, captured = fake_sdk(monkeypatch)
     inherited = wandb.Settings(config_paths=["unrelated-private-config.yaml"])
     monkeypatch.setattr(wandb, "setup", lambda: SimpleNamespace(settings=inherited))
@@ -113,6 +128,7 @@ def test_global_config_is_rejected_before_run_egress(
 def test_online_auth_failure_does_not_create_a_disabled_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Require actual online admission instead of accepting disabled fallback."""
     run, captured = fake_sdk(monkeypatch)
     monkeypatch.setattr(wandb, "login", lambda *, timeout, force: False)
     with pytest.raises(ValueError, match="authentication failed"):
@@ -128,6 +144,7 @@ def test_online_auth_failure_does_not_create_a_disabled_success(
 def test_mutation_is_revalidated_and_cleanup_cannot_replace_caller_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Revalidate mutable values and preserve caller failures through SDK cleanup."""
     run, _ = fake_sdk(monkeypatch)
     sink = WandbMetricSink(project="p", run_id="r", directory=tmp_path)
     record = MetricRecord(event_id="r", values={"loss": 1})
@@ -143,9 +160,9 @@ def test_mutation_is_revalidated_and_cleanup_cannot_replace_caller_failure(
 
 
 def test_offline_sdk_writes_real_history_without_provider_access(tmp_path: Path) -> None:
+    """Use the real offline SDK to prove separate spools and existing-run isolation."""
     script = """
 import pathlib, sys
-import wandb
 from exp.common.observability.metrics import MetricRecord
 from exp.runtime.observability.wandb import WandbMetricSink
 directory=pathlib.Path(sys.argv[1])
@@ -172,7 +189,11 @@ assert b'train/loss' not in existing
 
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", script, str(tmp_path)],
+        env={**os.environ, "WANDB_ERROR_REPORTING": "false"},
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert result.returncode == 0, result.stderr
     files = list(tmp_path.glob("wandb/offline-run-*/files/*"))
@@ -183,3 +204,36 @@ assert b'train/loss' not in existing
         for file in directory.rglob("*")
         if file.is_file()
     ]
+
+
+@pytest.mark.parametrize("unsafe", ["unset", "preloaded", "changed"])
+def test_uncertain_sdk_reporting_state_fails_before_run_creation(
+    tmp_path: Path, unsafe: str
+) -> None:
+    """Reject late opt-outs, preloaded SDK state, and changes after safe adapter import."""
+    script = """
+import os, pathlib, sys
+mode = sys.argv[2]
+if mode == 'unset':
+    os.environ.pop('WANDB_ERROR_REPORTING', None)
+if mode == 'preloaded':
+    import wandb
+from exp.runtime.observability.wandb import WandbMetricSink
+os.environ['WANDB_ERROR_REPORTING'] = 'true' if mode == 'changed' else 'false'
+directory = pathlib.Path(sys.argv[1]) / 'not-created'
+try:
+    WandbMetricSink(project='p', run_id='r', directory=directory, mode='offline')
+except ValueError as error:
+    assert 'fresh metrics reporter' in str(error)
+else:
+    raise AssertionError('unsafe SDK admission unexpectedly succeeded')
+assert not directory.exists()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), unsafe],
+        env={**os.environ, "WANDB_ERROR_REPORTING": "false"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr

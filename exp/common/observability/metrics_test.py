@@ -13,11 +13,13 @@ from exp.common.observability.metrics import MetricRecord
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), "1", True, {"text": "prompt"}])
 def test_metrics_require_explicit_finite_numeric_values(value: object) -> None:
+    """Reject invalid numeric payloads before any provider adapter can observe them."""
     with pytest.raises(ValidationError):
         MetricRecord.model_validate({"event_id": "sample-1", "values": {"train/loss": value}})
 
 
 def test_domain_axes_do_not_require_a_shared_history_step() -> None:
+    """Keep optimizer and evaluation axes independent of global history ordering."""
     record = MetricRecord(
         event_id="update-1", values={"train/loss": -0.5, "train/optimizer_step": 1}
     )
@@ -29,6 +31,7 @@ def test_domain_axes_do_not_require_a_shared_history_step() -> None:
 
 
 def test_default_metric_and_controller_imports_do_not_load_wandb() -> None:
+    """Keep provider dependencies absent from the default learner import path."""
     command = (
         "import json,sys; "
         "import exp.common.observability.metrics; "

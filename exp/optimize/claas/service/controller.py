@@ -316,38 +316,50 @@ class LearningController:
 
     async def _train_one(self, *, force: bool, allowed_ids: tuple[str, ...] | None = None) -> bool:
         """Serialize lease, optimizer execution, and atomic checkpoint acknowledgement."""
-        async with self._training, self._gpu:
-            if self._state not in {"starting", "running"} or self._limit_reason() is not None:
-                return False
-            await self._persist()
-            if not force and self.buffer.status().ready < self.configuration.minimum_ready_examples:
-                return False
-            if self.configuration.training_admission == "explicit":
-                batch = self.buffer.inflight()
-            else:
-                batch = self.buffer.lease(allowed_ids=allowed_ids)
-            await self._persist()
-            if batch is None:
-                return False
-            runtime = self._require_runtime()
-            async with asyncio.timeout_at(self._deadline):
-                result = await runtime.train(batch)
-            if runtime.policy_revision != result.checkpoint.policy_revision:
-                raise ClaasTrainingError(
-                    "runtime did not select its acknowledged optimizer revision"
-                )
-            self.buffer.acknowledge(batch, result)
-            await self._persist()
-            self._updates += 1
-        self._report_metrics(result)
-        return True
+        acknowledged: TrainingResult | None = None
+        persistence_confirmed = False
+        try:
+            async with self._training, self._gpu:
+                if self._state not in {"starting", "running"} or self._limit_reason() is not None:
+                    return False
+                await self._persist()
+                if (
+                    not force
+                    and self.buffer.status().ready < self.configuration.minimum_ready_examples
+                ):
+                    return False
+                if self.configuration.training_admission == "explicit":
+                    batch = self.buffer.inflight()
+                else:
+                    batch = self.buffer.lease(allowed_ids=allowed_ids)
+                await self._persist()
+                if batch is None:
+                    return False
+                runtime = self._require_runtime()
+                async with asyncio.timeout_at(self._deadline):
+                    result = await runtime.train(batch)
+                if runtime.policy_revision != result.checkpoint.policy_revision:
+                    raise ClaasTrainingError(
+                        "runtime did not select its acknowledged optimizer revision"
+                    )
+                self.buffer.acknowledge(batch, result)
+                acknowledged = result
+                await self._persist()
+                persistence_confirmed = True
+                self._updates += 1
+            return True
+        finally:
+            if acknowledged is not None:
+                self._report_metrics(acknowledged, persistence_confirmed=persistence_confirmed)
 
-    def _report_metrics(self, result: TrainingResult) -> None:
+    def _report_metrics(self, result: TrainingResult, *, persistence_confirmed: bool) -> None:
         """Observe an acknowledged update without changing its success or owning the sink.
 
         The caller-owned sink performs only prompt local handoff. No provider is
         constructed here, and metric delivery is neither part of checkpoint commit
-        nor a reason to retry optimization. Retained batch receipts support replay.
+        nor a reason to retry optimization. A locally committed update is still
+        observed when host persistence raises or is cancelled; its persistence flag
+        distinguishes that uncertainty. Retained batch receipts support replay.
         """
         if self._metrics is None:
             return
@@ -359,6 +371,7 @@ class LearningController:
                         **{f"train/{name}": value for name, value in result.metrics.items()},
                         "train/optimizer_step": float(result.checkpoint.step),
                         "train/consumed_examples": float(len(result.consumed_experience_ids)),
+                        "train/acknowledgement_persisted": float(persistence_confirmed),
                     },
                 )
             )
