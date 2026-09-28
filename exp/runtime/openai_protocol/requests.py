@@ -873,6 +873,11 @@ def _response_input_messages(
             )
         elif isinstance(item, _ResponseReasoningItem):
             if item.encrypted_content is None:
+                if item.id is None:
+                    raise invalid_field(
+                        f"input.{index}.id",
+                        "A reasoning input item requires an id or encrypted_content.",
+                    )
                 # A store=true flow replays reasoning by item id alone (the
                 # SDK marks encrypted_content optional); only the issuing
                 # native Responses wire can resolve the id, so the item is

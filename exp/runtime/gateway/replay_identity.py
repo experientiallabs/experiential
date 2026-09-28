@@ -68,6 +68,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
             for block in message.provider_reasoning:
                 serialized = block.model_dump(mode="json")
                 if isinstance(block, EncryptedReasoningBlock):
+                    if block.id is None:
+                        serialized.pop("id", None)
                     serialized["output_index"] = block.output_index
                     serialized["status"] = block.status
                 blocks.append(serialized)

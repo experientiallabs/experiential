@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from collections.abc import Callable
 from typing import cast
 
@@ -25,7 +26,10 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
-from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.gateway.replay_identity import (
+    canonical_request_sha256,
+    provider_replay_authority,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
@@ -1208,13 +1212,52 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
     ]
 
 
-def test_responses_decoder_rejects_reasoning_without_item_id() -> None:
-    """Opaque reasoning replay requires the provider-issued item identity."""
+def test_responses_decoder_accepts_encrypted_reasoning_without_item_id() -> None:
+    """Encrypted reasoning remains replayable when the client omits its item ID."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-reasoning",
+                    "status": "completed",
+                }
+            ],
+        }
+    )
+
+    block = decoded.request.messages[0].provider_reasoning[0]
+    assert isinstance(block, EncryptedReasoningBlock)
+    assert block.id is None
+    authority = provider_replay_authority(decoded.request)
+    assert authority is not None
+    authority_json = json.dumps(authority)
+    assert '"encrypted_content": "opaque-reasoning"' in authority_json
+    assert '"id": null' not in authority_json
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        decoded.request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    assert payload["input"] == [
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "opaque-reasoning",
+        }
+    ]
+
+
+def test_responses_decoder_rejects_reasoning_without_id_or_encrypted_content() -> None:
+    """A reasoning input still needs a usable ID or its encrypted replay payload."""
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_responses(
             {
                 "model": "coding",
-                "input": [{"type": "reasoning", "summary": [], "encrypted_content": "blob=="}],
+                "input": [{"type": "reasoning", "summary": []}],
             }
         )
 

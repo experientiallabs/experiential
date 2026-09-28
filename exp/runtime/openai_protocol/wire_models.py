@@ -725,7 +725,8 @@ class _ResponseReasoningItem(_WireModel):
 
     Attributes:
         type: Required reasoning-item discriminator.
-        id: Required nonempty provider item handle, at most 256 characters.
+        id: Optional nonempty provider item handle, at most 256 characters. The encrypted
+            payload can be replayed without it.
         encrypted_content: Optional nonempty opaque payload; native routes may resolve the id alone.
         summary: Display-only summary parts, empty by default and dropped from provider history.
         content: Optional display-only reasoning parts; explicit null is accepted and dropped.
@@ -733,7 +734,7 @@ class _ResponseReasoningItem(_WireModel):
     """
 
     type: Literal["reasoning"]
-    id: str = Field(min_length=1, max_length=256)
+    id: str | None = Field(default=None, min_length=1, max_length=256)
     encrypted_content: str | None = Field(default=None, min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
     content: tuple[_ReasoningTextPart, ...] | None = None

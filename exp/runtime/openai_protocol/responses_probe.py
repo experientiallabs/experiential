@@ -176,13 +176,17 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                 if item.get("id") is not None and "status" not in item:
                     item["status"] = "completed"
                 adapted.append(item)
-            elif (
-                isinstance(entry, dict)
-                and entry.get("type") == "reasoning"
-                and "content" in entry
-                and entry.get("content") is None
-            ):
-                adapted.append({key: value for key, value in entry.items() if key != "content"})
+            elif isinstance(entry, dict) and entry.get("type") == "reasoning":
+                item = dict(entry)
+                if item.get("id") is None:
+                    # The official SDK requires an output-item ID on every
+                    # reasoning input, while encrypted_content alone is
+                    # sufficient for provider replay. This synthetic ID is
+                    # used only by the SDK validation probe.
+                    item["id"] = PROBE_OUTPUT_ITEM_ID
+                if item.get("content") is None:
+                    item.pop("content", None)
+                adapted.append(item)
             else:
                 adapted.append(entry)
         probe["input"] = adapted
