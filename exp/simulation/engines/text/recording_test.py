@@ -17,6 +17,7 @@ from exp.common.models import (
     EmbeddingCostReservation,
     ModelCapabilities,
     ModelCatalog,
+    ModelDecodeStatus,
     ModelFinishReason,
     ModelMessage,
     ModelRecord,
@@ -442,6 +443,36 @@ def test_empty_candidate_response_is_preserved_without_retrieval_cost(
     )
 
 
+@pytest.mark.parametrize("reason", list(ModelFinishReason))
+def test_sampled_decode_failure_is_recorded_before_any_world_dispatch(
+    reason: ModelFinishReason,
+) -> None:
+    """A typed policy failure retains its evidence without executing an empty action."""
+    response = _response("", model=_snapshot("candidate-a"), finish_reason=reason).model_copy(
+        update={"decode_status": ModelDecodeStatus.UNFINISHED_REASONING}
+    )
+    candidate, world = _ScriptedClient([response]), _ScriptedClient([])
+    recorder = _recorder(candidate, world)
+    with pytest.raises(TextSimulationError) as error:
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))
+    assert error.value.stop_reason == StopReason.FAILURE
+    assert error.value.failure.details == {
+        "phase": "candidate_decode",
+        "decode_status": "unfinished_reasoning",
+    }
+    assert world.requests == [] and len(candidate.requests) == 1
+    assert recorder.recorded.world_model_spans == ()
+    assert recorder.recorded.retrieved_transition_ids == ()
+    assert recorder.recorded.candidate_spans[0].payload["response"] == {
+        "output": {"content": "", "tool_calls": []},
+        "finish_reason": reason.value,
+        "decode_status": "unfinished_reasoning",
+    }
+    assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.1, provenance="observed"
+    )
+
+
 def test_recorder_persists_estimated_cost_for_native_candidate_and_world_usage() -> None:
     """Price production-shaped candidate and world responses before rollout persistence."""
     candidate_snapshot = _snapshot("candidate-a")
@@ -672,6 +703,7 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
     assert length.recorded.candidate_spans[0].payload["response"] == {
         "output": {"content": "unfinished response", "tool_calls": []},
         "finish_reason": "length",
+        "decode_status": "parsed",
     }
 
 

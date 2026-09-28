@@ -25,6 +25,7 @@ from exp.common.models import (
     CompletionCostReservation,
     EmbeddingCostReservation,
     ModelCapabilities,
+    ModelDecodeStatus,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
@@ -902,7 +903,15 @@ def _require_response_identity(
 
 
 def _require_complete_response(response: ModelResponse, *, role: str) -> None:
-    """Turn an explicit provider length stop into a durable failed simulation cell."""
+    """Retain sampled action failures before any simulator or retrieval dispatch."""
+    if response.decode_status != ModelDecodeStatus.PARSED:
+        raise _text_failure(
+            StopReason.FAILURE,
+            FailureCode.VALIDATION,
+            f"{role} emitted unfinished reasoning without a public action",
+            phase=f"{role.replace(' ', '_')}_decode",
+            decode_status=response.decode_status,
+        )
     if response.finish_reason == ModelFinishReason.LENGTH:
         raise _text_failure(
             StopReason.LENGTH,
@@ -971,20 +980,9 @@ def _text_failure(
     phase: str,
     exception_type: str | None = None,
     retryable: bool = False,
+    decode_status: ModelDecodeStatus | None = None,
 ) -> TextSimulationError:
-    """Build one non-secret structured simulator failure with a stable phase label.
-
-    Args:
-        stop_reason: Terminal classification recorded with the failed episode.
-        code: Structured failure code persisted with the evidence.
-        message: Non-secret operator-facing failure description.
-        phase: Stable simulator phase label persisted in the failure details.
-        exception_type: Optional exception class name retained for diagnostics.
-        retryable: Whether resume may supersede this failure with a fresh attempt.
-
-    Returns:
-        One artifact-safe terminal simulator error.
-    """
+    """Build one non-secret structured simulator failure with a stable phase label."""
     return TextSimulationError(
         stop_reason,
         StructuredFailure(
@@ -993,6 +991,9 @@ def _text_failure(
             retryable=retryable,
             exception_type=exception_type,
             attribution=FailureAttribution.MODEL,
-            details={"phase": phase},
+            details={
+                "phase": phase,
+                **({"decode_status": decode_status.value} if decode_status is not None else {}),
+            },
         ),
     )

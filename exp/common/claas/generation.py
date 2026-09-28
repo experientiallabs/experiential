@@ -9,7 +9,7 @@ from pydantic import AwareDatetime, Field, field_serializer, model_validator
 
 from exp.common.claas.contracts import ExactTokenEvidence, Identifier
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models import AssistantAction, ModelMessage
+from exp.common.models import AssistantAction, ModelDecodeStatus, ModelMessage
 from exp.common.tasks import ToolSchema
 
 
@@ -94,6 +94,7 @@ class GenerationResult(ContractModel):
     raw_text: str
     created_at: AwareDatetime = Field(default_factory=_created_at)
     finish_reason: Literal["stop", "length"] = "stop"
+    decode_status: ModelDecodeStatus = ModelDecodeStatus.PARSED
     cached_input_tokens: int | None = Field(default=None, strict=True, ge=0)
     cache_write_input_tokens: int | None = Field(default=None, strict=True, ge=0)
     reasoning_output_tokens: int | None = Field(default=None, strict=True, ge=0)
@@ -107,6 +108,10 @@ class GenerationResult(ContractModel):
     def _validate_usage_details(self) -> GenerationResult:
         """Keep optional measured usage breakdowns within the original token counts."""
         _validate_action(self.action)
+        if self.decode_status != ModelDecodeStatus.PARSED and (
+            self.action.content != "" or self.action.tool_calls
+        ):
+            raise ValueError("unfinished reasoning requires empty visible content and no tools")
         prompt = len(self.exact_tokens.prompt_token_ids)
         response = len(self.exact_tokens.response_token_ids)
         if (

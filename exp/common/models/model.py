@@ -398,6 +398,13 @@ class ModelFinishReason(StrEnum):
     LENGTH = "length"
 
 
+class ModelDecodeStatus(StrEnum):
+    """Action decoding outcome, independent of the engine's native stop reason."""
+
+    PARSED = "parsed"
+    UNFINISHED_REASONING = "unfinished_reasoning"
+
+
 class ModelResponse(ContractModel):
     """A completed model response with resolved identity and operation accounting."""
 
@@ -405,6 +412,16 @@ class ModelResponse(ContractModel):
     model: ModelSnapshot
     economics: OperationEconomics
     finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED
+    decode_status: ModelDecodeStatus = ModelDecodeStatus.PARSED
+
+    @model_validator(mode="after")
+    def _validate_decoded_action(self) -> ModelResponse:
+        """An unfinished private reasoning sample cannot expose an executable action."""
+        if self.decode_status != ModelDecodeStatus.PARSED and (
+            self.output.content != "" or self.output.tool_calls
+        ):
+            raise ValueError("unfinished reasoning requires empty visible content and no tools")
+        return self
 
     @classmethod
     def completed(

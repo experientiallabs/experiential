@@ -28,7 +28,7 @@ from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import AssistantAction, ToolCall
+from exp.common.models import AssistantAction, ModelDecodeStatus, ToolCall
 from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
 from exp.optimize.claas.backends.verl.generation import generation_result
 from exp.optimize.claas.buffer.store import ExperienceBuffer
@@ -262,12 +262,15 @@ def test_undeclared_tool_sdk_persistence_replay_and_feedback(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("protocol", ["chat", "responses", "completions"])
-def test_length_reasoning_sdk_persistence_replay_and_feedback(
-    tmp_path: Path, protocol: Literal["chat", "responses", "completions"]
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_unfinished_reasoning_sdk_persistence_replay_and_feedback(
+    tmp_path: Path,
+    protocol: Literal["chat", "responses", "completions"],
+    finish_reason: Literal["stop", "length"],
 ) -> None:
-    """HTTP retains truncated reasoning privately and exposes a durable length failure."""
+    """All SDK surfaces replay exact private evidence and report action failure independently."""
     raw = "<think>private unfinished reasoning"
-    runtime = SampledRuntime(tmp_path / "checkpoints", raw_text=raw, finish_reason="length")
+    runtime = SampledRuntime(tmp_path / "checkpoints", raw_text=raw, finish_reason=finish_reason)
     recipe = spec().model_copy(update={"objective": "reinforce"})
     limits = RunConfiguration(training_admission="explicit")
     controller = LearningController(tmp_path, recipe, runtime, limits)
@@ -278,26 +281,26 @@ def test_length_reasoning_sdk_persistence_replay_and_feedback(
 
         def request_sample() -> JsonObject:
             """Repeat the same SDK operation with one persistent idempotency key."""
-            headers = {"Idempotency-Key": "reasoning-length"}
+            headers = {"Idempotency-Key": "reasoning-failure"}
             if protocol == "chat":
                 result = sdk.chat.completions.create(
                     model="adapter-1",
                     messages=[{"role": "user", "content": "look up the record"}],
-                    max_completion_tokens=1,
+                    max_completion_tokens=2,
                     extra_headers=headers,
                 )
             elif protocol == "responses":
                 result = sdk.responses.create(
                     model="adapter-1",
                     input="look up the record",
-                    max_output_tokens=1,
+                    max_output_tokens=2,
                     extra_headers=headers,
                 )
             else:
                 result = sdk.completions.create(
                     model="adapter-1",
                     prompt="look up the record",
-                    max_tokens=1,
+                    max_tokens=2,
                     extra_headers=headers,
                 )
             return cast(JsonObject, result.model_dump(mode="json"))
@@ -306,13 +309,16 @@ def test_length_reasoning_sdk_persistence_replay_and_feedback(
         assert request_sample() == first
         assert runtime.generate_count == 1
         assert "private unfinished reasoning" not in str(first)
+        assert first["claas_decode_status"] == "unfinished_reasoning"
         if protocol == "responses":
-            assert first["status"] == "incomplete"
-            assert first["incomplete_details"] == {"reason": "max_output_tokens"}
+            assert first["status"] == ("incomplete" if finish_reason == "length" else "completed")
+            assert first["incomplete_details"] == (
+                {"reason": "max_output_tokens"} if finish_reason == "length" else None
+            )
         else:
             choices = first["choices"]
             assert isinstance(choices, list) and isinstance(choices[0], dict)
-            assert choices[0]["finish_reason"] == "length"
+            assert choices[0]["finish_reason"] == finish_reason
             if protocol == "completions":
                 assert choices[0]["text"] == ""
             else:
@@ -320,15 +326,23 @@ def test_length_reasoning_sdk_persistence_replay_and_feedback(
                 assert isinstance(message, dict) and message["content"] == ""
                 assert message["tool_calls"] is None
             usage = first["usage"]
-            assert isinstance(usage, dict) and usage["completion_tokens"] == 1
+            assert isinstance(usage, dict) and usage["completion_tokens"] == (
+                1 if finish_reason == "length" else 2
+            )
         assert runtime.sample is not None and runtime.request is not None
         persisted = controller.buffer.replay(runtime.request)
         assert persisted == runtime.sample
         assert persisted is not None and persisted.raw_text == raw
         assert runtime.tokenizer.decode([2], skip_special_tokens=False) == raw
         assert persisted.action == AssistantAction(content="")
-        assert persisted.exact_tokens.response_token_ids == (2,)
-        assert persisted.exact_tokens.response_logprobs == (-0.25,)
+        assert persisted.decode_status is ModelDecodeStatus.UNFINISHED_REASONING
+        assert persisted.finish_reason == finish_reason
+        assert persisted.exact_tokens.response_token_ids == (
+            (2,) if finish_reason == "length" else (2, 3)
+        )
+        assert persisted.exact_tokens.response_logprobs == (
+            (-0.25,) if finish_reason == "length" else (-0.25, -0.5)
+        )
         with httpx.Client(headers=_HEADERS) as client:
             feedback = client.post(
                 base_url + "/feedback", json={"response_id": first["id"], "reward": -0.5}

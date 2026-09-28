@@ -7,7 +7,7 @@ import pytest
 from tokenizers import AddedToken
 
 from exp.common.claas.generation import GenerationRequest
-from exp.common.models import AssistantAction, ModelMessage, ToolCall
+from exp.common.models import AssistantAction, ModelDecodeStatus, ModelMessage, ToolCall
 from exp.common.tasks import ToolSchema
 from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
 from exp.optimize.claas.backends.verl.generation import _message, generation_result, prompt_ids
@@ -178,12 +178,12 @@ def test_incomplete_tool_syntax_is_not_repaired_into_an_action(
 
 @pytest.mark.parametrize("decoder", ["hermes", "qwen35"])
 @pytest.mark.parametrize("finish_reason", ["stop", "length"])
-def test_unfinished_reasoning_requires_native_length_to_retain_evidence(
+def test_unfinished_reasoning_retains_decode_failure_separately_from_native_reason(
     tmp_path: Path,
     decoder: Literal["hermes", "qwen35"],
     finish_reason: Literal["stop", "length"],
 ) -> None:
-    """Identical sampled reasoning is a retained length failure only with that native reason."""
+    """A sampled action failure preserves STOP or LENGTH without inventing token exhaustion."""
     raw = "<think>private unfinished reasoning"
     model_tokenizer = tokenizer()
     model_tokenizer.add_special_tokens(
@@ -194,20 +194,6 @@ def test_unfinished_reasoning_requires_native_length_to_retain_evidence(
         request_id="reasoning", model=spec().base_model, prompt="a", maximum_output_tokens=1
     )
     settings = ResidentVerlSettings(checkpoint_root=tmp_path, decoder=decoder)
-    if finish_reason == "stop":
-        with pytest.raises(ValueError, match="ended inside reasoning"):
-            generation_result(
-                request,
-                (1,),
-                response,
-                (-0.25,),
-                model_tokenizer,
-                spec(),
-                settings,
-                "policy-7",
-                finish_reason,
-            )
-        return
     result = generation_result(
         request,
         (1,),
@@ -220,7 +206,8 @@ def test_unfinished_reasoning_requires_native_length_to_retain_evidence(
         finish_reason,
     )
     assert result.action == AssistantAction(content="")
-    assert result.finish_reason == "length"
+    assert result.finish_reason == finish_reason
+    assert result.decode_status is ModelDecodeStatus.UNFINISHED_REASONING
     assert result.response_id == request.request_id
     assert result.raw_text == raw
     assert result.exact_tokens.prompt_token_ids == (1,)

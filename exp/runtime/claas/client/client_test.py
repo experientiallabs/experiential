@@ -7,7 +7,8 @@ import pytest
 
 from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.learning import FeedbackSubmission
-from exp.common.models import ModelMessage, ModelRequest
+from exp.common.core.artifacts import JsonValue
+from exp.common.models import ModelDecodeStatus, ModelFinishReason, ModelMessage, ModelRequest
 from exp.runtime.claas.client import LearningClient
 
 
@@ -80,6 +81,7 @@ def test_sdk_records_response_id_and_sends_feedback_to_same_endpoint() -> None:
         replay = recorder.complete_idempotent(request, idempotency_key="retry-me")
         assert replay.output == first.output
         assert first.output.content == "done"
+        assert first.decode_status is ModelDecodeStatus.PARSED
         assert recorder.response_ids == ("response-one",)
         assert client.submit_feedback("response-one", text="Use the tool") == {"state": "running"}
         assert client.status() == {"state": "running"}
@@ -133,3 +135,85 @@ def test_local_loopback_and_https_endpoints_remain_supported(base_url: str) -> N
     """Loopback development and encrypted hosted runs can still construct the official SDK."""
     with LearningClient(base_url=base_url, api_key="local-test-key", model="student"):
         pass
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_decode_status_and_native_reason_survive_sdk_normalization(finish_reason: str) -> None:
+    """A parsed blank and a sampled failure remain distinct without relabeling native STOP."""
+    status = "unfinished_reasoning"
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        """Return one explicit learner status through the official SDK's extension support."""
+        return httpx2.Response(
+            200,
+            json={
+                "id": "response-one",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "student",
+                "claas_decode_status": status,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            },
+        )
+
+    with LearningClient(
+        base_url="http://localhost:8000/v1",
+        api_key="local-test-key",
+        model="student",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
+    ) as client:
+        recorder = client.model_client()
+        request = ModelRequest(messages=(ModelMessage(role="user", content="task"),))
+        failed = recorder.complete_idempotent(request, idempotency_key="same-key")
+        replay = recorder.complete_idempotent(request, idempotency_key="same-key")
+        assert failed.output == replay.output and failed.output.content == ""
+        assert failed.decode_status is ModelDecodeStatus.UNFINISHED_REASONING
+        assert replay.decode_status == failed.decode_status
+        assert failed.finish_reason == (
+            ModelFinishReason.LENGTH if finish_reason == "length" else ModelFinishReason.COMPLETED
+        )
+        assert failed.economics.usage is not None and failed.economics.usage.output_tokens == 3
+        assert recorder.response_ids == ("response-one",)
+        status = "parsed"
+        assert recorder.complete(request).decode_status is ModelDecodeStatus.PARSED
+
+
+@pytest.mark.parametrize("status", [None, "unknown", False])
+def test_explicit_invalid_learner_decode_status_is_a_protocol_failure(status: JsonValue) -> None:
+    """An explicitly invalid status cannot silently turn an unknown action into a parsed one."""
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        """Return an otherwise valid SDK response with ambiguous decoding provenance."""
+        payload = {
+            "id": "response-one",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "student",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        payload["claas_decode_status"] = status
+        return httpx2.Response(200, json=payload)
+
+    with LearningClient(
+        base_url="http://localhost:8000/v1",
+        api_key="local-test-key",
+        model="student",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
+    ) as client:
+        recorder = client.model_client()
+        with pytest.raises(ValueError, match="ModelDecodeStatus"):
+            recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="task"),)))
+        assert recorder.response_ids == ()

@@ -11,6 +11,7 @@ from exp.common.models import (
     BillingSource,
     Embedding,
     ModelCapabilities,
+    ModelDecodeStatus,
     ModelFinishReason,
     ModelMessage,
     ModelRequest,
@@ -30,6 +31,37 @@ from exp.common.models.content import ImageContentPart, TextContentPart, VideoCo
 from exp.common.tasks import ToolSchema
 
 _CAPABILITIES_DIGEST = "a" * 64
+
+
+@pytest.mark.parametrize("reason", list(ModelFinishReason))
+@pytest.mark.parametrize("content,tool", [("", False), ("visible", False), ("", True)])
+def test_decode_failure_requires_an_empty_public_action(
+    reason: ModelFinishReason, content: str, tool: bool
+) -> None:
+    """Malformed typed metadata cannot hide an executable action or invent a native reason."""
+    payload = {
+        "output": AssistantAction(
+            content=content,
+            tool_calls=(ToolCall(call_id="call", name="lookup", arguments={}),) if tool else (),
+        ),
+        "model": ModelSnapshot(
+            provider="claas",
+            model_id="student",
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            capabilities_sha256="a" * 64,
+            connection_sha256="b" * 64,
+        ),
+        "economics": OperationEconomics(),
+        "finish_reason": reason,
+        "decode_status": ModelDecodeStatus.UNFINISHED_REASONING,
+    }
+    if content or tool:
+        with pytest.raises(ValueError, match="empty visible content and no tools"):
+            ModelResponse.model_validate(payload)
+    else:
+        result = ModelResponse.model_validate(payload)
+        assert result.finish_reason == reason
+        assert ModelResponse.model_validate_json(result.model_dump_json()) == result
 
 
 def test_actions_need_payload_and_measurements_are_finite() -> None:

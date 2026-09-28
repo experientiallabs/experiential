@@ -21,7 +21,13 @@ from pydantic import TypeAdapter
 from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import JsonObject, sha256_json
-from exp.common.models import BillingSource, ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.models import (
+    BillingSource,
+    ModelDecodeStatus,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+)
 from exp.runtime.claas.client.wire import chat_payload
 from exp.runtime.models.providers.openai_compatible import openai_compatible_response
 
@@ -208,6 +214,14 @@ class RecordingModelClient:
             response.model_dump(mode="json"),
             configured_model=self.client.snapshot,
             latency_seconds=monotonic() - started,
+        )
+        status = (response.model_extra or {}).get("claas_decode_status", ModelDecodeStatus.PARSED)
+        normalized = ModelResponse(
+            output=normalized.output,
+            model=normalized.model,
+            economics=normalized.economics,
+            finish_reason=normalized.finish_reason,
+            decode_status=ModelDecodeStatus(status),
         )
         if not response.id:
             raise ValueError(

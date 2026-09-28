@@ -5,7 +5,7 @@ import pytest
 from exp.common.claas.contracts import ExactTokenEvidence
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import AssistantAction, ModelMessage, ToolCall
+from exp.common.models import AssistantAction, ModelDecodeStatus, ModelMessage, ToolCall
 from exp.common.models.content import ImageContentPart
 
 
@@ -20,6 +20,43 @@ def test_generation_requires_one_input_kind() -> None:
             prompt="hello",
             messages=(ModelMessage(role="user", content="hello"),),
         )
+
+
+@pytest.mark.parametrize("content,tool", [("", False), ("visible", False), ("", True)])
+def test_unfinished_reasoning_contract_preserves_private_evidence_only(
+    content: str, tool: bool
+) -> None:
+    """Only a non-executable action may accompany a typed decode failure."""
+    tokens = ExactTokenEvidence(
+        model_id="student",
+        model_revision="base",
+        policy_revision="policy",
+        tokenizer_id="tokenizer",
+        tokenizer_revision="revision",
+        prompt_token_ids=(1,),
+        response_token_ids=(2,),
+        response_logprobs=(-0.1,),
+        sampling_temperature=1,
+        sampling_top_p=1,
+        sampling_top_k=None,
+    )
+    payload = {
+        "response_id": "sample",
+        "raw_text": "<think>private reasoning",
+        "exact_tokens": tokens,
+        "action": AssistantAction(
+            content=content,
+            tool_calls=(ToolCall(call_id="call", name="lookup", arguments={}),) if tool else (),
+        ),
+        "decode_status": ModelDecodeStatus.UNFINISHED_REASONING,
+    }
+    if content or tool:
+        with pytest.raises(ValueError, match="empty visible content and no tools"):
+            GenerationResult.model_validate(payload)
+    else:
+        result = GenerationResult.model_validate(payload)
+        assert result.finish_reason == "stop" and result.exact_tokens == tokens
+        assert GenerationResult.model_validate_json(result.model_dump_json()) == result
 
 
 def test_generation_persistence_preserves_exact_tool_argument_strings() -> None:
