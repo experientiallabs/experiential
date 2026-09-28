@@ -35,7 +35,7 @@ add_deferred_typer(
     module="exp.cli.optimize.app",
     attr="optimize_app",
     help="Optimize supported frozen project artifacts.",
-    known_names=("router", "model"),
+    known_names=("router", "model", "claas"),
 )
 app.command("eval", help="Evaluate models on a project and inspect saved results.")(evaluate)
 app.command("build", help="Import traces, mine scenarios, and build a grounded world model.")(build)
