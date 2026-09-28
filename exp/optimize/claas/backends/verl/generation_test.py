@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from tokenizers import AddedToken
 
 from exp.common.claas.generation import GenerationRequest
 from exp.common.models import AssistantAction, ModelMessage, ToolCall
@@ -102,3 +103,69 @@ def test_tool_syntax_special_tokens_survive_visible_decoding(tmp_path: Path) -> 
     )
     assert result.raw_text == rendered
     assert result.exact_tokens.response_token_ids == response
+
+
+@pytest.mark.parametrize("include_declared_call", [False, True])
+def test_undeclared_sampled_tools_preserve_original_learning_evidence(
+    tmp_path: Path, include_declared_call: bool
+) -> None:
+    """A model's wrong tool name remains an unchanged sampled action for caller feedback."""
+    raw = '<tool_call>{"name":"functions.missing","arguments":{"key":"value"}}</tool_call>'
+    if include_declared_call:
+        raw = '<tool_call>{"name":"lookup","arguments":{}}</tool_call>\n' + raw
+    model_tokenizer = tokenizer()
+    model_tokenizer.add_special_tokens(
+        {"additional_special_tokens": [AddedToken(raw, normalized=False)]}
+    )
+    response = tuple(model_tokenizer.encode(raw, add_special_tokens=False)) + (7,)
+    logprobs = tuple(-0.25 - index for index in range(len(response)))
+    request = GenerationRequest(
+        request_id="sample-1",
+        model=spec().base_model,
+        messages=(ModelMessage(role="user", content="look up the record"),),
+        tools=(ToolSchema(name="lookup", description="Find a record", input_schema={}),),
+        maximum_output_tokens=8,
+    )
+    result = generation_result(
+        request,
+        (1, 2),
+        response,
+        logprobs,
+        model_tokenizer,
+        spec(),
+        ResidentVerlSettings(checkpoint_root=tmp_path, decoder="hermes"),
+        "policy-7",
+    )
+    expected = ["lookup", "functions.missing"] if include_declared_call else ["functions.missing"]
+    assert [call.name for call in result.action.tool_calls] == expected
+    assert result.action.tool_calls[-1].arguments == {"key": "value"}
+    assert result.raw_text == raw
+    assert result.exact_tokens.prompt_token_ids == (1, 2)
+    assert result.exact_tokens.response_token_ids == response
+    assert result.exact_tokens.response_logprobs == logprobs
+    assert result.exact_tokens.policy_revision == "policy-7"
+    assert result.response_id == request.request_id
+
+
+def test_incomplete_tool_syntax_is_not_repaired_into_an_action(tmp_path: Path) -> None:
+    """Transporting a parsed wrong name does not invent structure for an incomplete sample."""
+    raw = '<tool_call>{"name":"lookup","arguments":{}}'
+    model_tokenizer = tokenizer()
+    model_tokenizer.add_special_tokens(
+        {"additional_special_tokens": [AddedToken(raw, normalized=False)]}
+    )
+    response = tuple(model_tokenizer.encode(raw, add_special_tokens=False))
+    request = GenerationRequest(
+        request_id="incomplete", model=spec().base_model, prompt="a", maximum_output_tokens=8
+    )
+    with pytest.raises(ValueError, match="incomplete tool call"):
+        generation_result(
+            request,
+            (1,),
+            response,
+            tuple(-1.0 for _ in response),
+            model_tokenizer,
+            spec(),
+            ResidentVerlSettings(checkpoint_root=tmp_path, decoder="hermes"),
+            "policy-0",
+        )

@@ -20,12 +20,18 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.responses import ResponseFunctionToolCall, ResponseInputParam
 from openai.types.responses.function_tool_param import FunctionToolParam
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ToolCall
+from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
+from exp.optimize.claas.backends.verl.generation import generation_result
+from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.service.configuration import RunConfiguration
 from exp.optimize.claas.service.controller import LearningController
 from exp.optimize.claas.service.controller_test import Runtime
@@ -151,6 +157,101 @@ class WireRuntime(Runtime):
                 "finish_reason": "length" if request.prompt is not None else "stop",
             }
         )
+
+
+class UndeclaredToolRuntime(Runtime):
+    """Supply a sampled wrong tool name while exposing its unchanged fixture token evidence."""
+
+    request: GenerationRequest | None = None
+    sample: GenerationResult | None = None
+
+    def __init__(self, directory: Path) -> None:
+        """Bind one local response vocabulary without downloading or initializing a model."""
+        super().__init__()
+        self.raw_text = '<tool_call>{"name":"functions.missing","arguments":{}}</tool_call>'
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel(
+                    {"[UNK]": 0, "look up the record": 1, self.raw_text: 2, "[EOS]": 3},
+                    unk_token="[UNK]",
+                )
+            ),
+            unk_token="[UNK]",
+            eos_token="[EOS]",
+        )
+        self.settings = ResidentVerlSettings(checkpoint_root=directory, decoder="hermes")
+
+    async def generate(self, request: GenerationRequest) -> GenerationResult:
+        """Decode the original fixture sample through the production result constructor."""
+        self.generate_count += 1
+        self.request = request
+        prompt = tuple(
+            self.tokenizer.encode(request.messages[-1].content or "", add_special_tokens=False)
+        )
+        self.sample = generation_result(
+            request,
+            prompt,
+            (2, 3),
+            (-0.25, -0.5),
+            self.tokenizer,
+            spec(),
+            self.settings,
+            self.policy_revision,
+        )
+        return self.sample
+
+
+def test_undeclared_tool_sdk_persistence_replay_and_feedback(tmp_path: Path) -> None:
+    """An incorrect sampled action keeps its identity and tokens through delayed scalar feedback."""
+    runtime = UndeclaredToolRuntime(tmp_path / "checkpoints")
+    recipe = spec().model_copy(update={"objective": "reinforce"})
+    limits = RunConfiguration(training_admission="explicit")
+    controller = LearningController(tmp_path, recipe, runtime, limits)
+    app = create_app(controller, api_key=_KEY)
+    with serve(app) as base_url, OpenAI(base_url=base_url, api_key=_KEY, max_retries=0) as sdk:
+        first = sdk.chat.completions.create(
+            model="adapter-1",
+            messages=[{"role": "user", "content": "look up the record"}],
+            tools=[{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+            extra_headers={"Idempotency-Key": "incorrect-action"},
+        )
+        replay = sdk.chat.completions.create(
+            model="adapter-1",
+            messages=[{"role": "user", "content": "look up the record"}],
+            tools=[{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+            extra_headers={"Idempotency-Key": "incorrect-action"},
+        )
+        assert first.model_dump() == replay.model_dump()
+        assert runtime.generate_count == 1
+        calls = first.choices[0].message.tool_calls
+        assert calls is not None and calls[0].type == "function"
+        assert calls[0].function.name == "functions.missing"
+        assert runtime.sample is not None and runtime.request is not None
+        persisted = controller.buffer.replay(runtime.request)
+        assert persisted is not None
+        assert persisted == runtime.sample
+        assert persisted.exact_tokens == runtime.sample.exact_tokens
+        assert persisted.exact_tokens.prompt_token_ids == (1,)
+        assert persisted.exact_tokens.response_token_ids == (2, 3)
+        assert persisted.exact_tokens.response_logprobs == (-0.25, -0.5)
+        assert runtime.tokenizer.decode([2], skip_special_tokens=False) == persisted.raw_text
+        with httpx.Client(headers=_HEADERS) as client:
+            feedback = client.post(
+                base_url + "/feedback", json={"response_id": first.id, "reward": -0.5}
+            )
+        assert feedback.status_code == 200
+        assert feedback.json()["buffer"]["ready"] == 1
+        assert feedback.json()["updates"] == 0
+    assert runtime.optimizations == 0
+    reopened = ExperienceBuffer(tmp_path / "experiences.sqlite", recipe, limits)
+    assert reopened.replay(runtime.request) == runtime.sample
+    batch = reopened.lease()
+    assert batch is not None and len(batch.examples) == 1
+    example = batch.examples[0]
+    assert example.scalar_reward == -0.5
+    assert example.experience.response_id == first.id
+    assert example.experience.response == runtime.sample.model_dump(mode="json")
+    assert example.experience.exact_tokens == runtime.sample.exact_tokens
 
 
 def test_official_sdk_all_surfaces_retry_and_tool_history(tmp_path: Path) -> None:
