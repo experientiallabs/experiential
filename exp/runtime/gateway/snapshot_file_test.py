@@ -79,6 +79,64 @@ def test_bounded_reader_accepts_limit_and_rejects_growth(tmp_path: Path) -> None
     assert "budget_snapshot_max_bytes" in str(error.value)
 
 
+@pytest.mark.skipif(
+    os.name == "nt"
+    or os.stat not in os.supports_dir_fd
+    or os.stat not in os.supports_follow_symlinks,
+    reason="POSIX no-follow metadata validation",
+)
+@pytest.mark.parametrize("fallback", [False, True])
+def test_prepared_validation_avoids_reopening_unchanged_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: bool
+) -> None:
+    """Metadata validation avoids leaf streams; unsupported systems keep secure opens."""
+    directory = tmp_path / "snapshots"
+    directory.mkdir()
+    (directory / "plain.json").write_bytes(b"{}")
+    original = snapshot_file.os.fdopen
+    opened: list[int] = []
+
+    def record_open(descriptor: int, mode: str) -> BinaryIO:
+        """Count leaf streams while preserving their actual descriptor ownership."""
+        opened.append(descriptor)
+        assert mode == "rb"
+        return original(descriptor, "rb")
+
+    with snapshot_file.prepare_snapshot_file(tmp_path, "snapshots/plain.json", 1024) as prepared:
+        monkeypatch.setattr(snapshot_file.os, "fdopen", record_open)
+        if fallback:
+            monkeypatch.setattr(snapshot_file.os, "supports_follow_symlinks", set())
+        prepared.validate_current()
+        assert len(opened) == int(fallback)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows retained handles prevent path substitution")
+@pytest.mark.parametrize("mutation", ["leaf_symlink", "parent_symlink", "fifo"])
+def test_prepared_validation_rejects_nonregular_path_substitution(
+    tmp_path: Path, mutation: str
+) -> None:
+    """A retained regular file cannot authorize a symlink or special file at its path."""
+    directory = tmp_path / "snapshots"
+    directory.mkdir()
+    path = directory / "plain.json"
+    path.write_bytes(b"{}")
+    with snapshot_file.prepare_snapshot_file(tmp_path, "snapshots/plain.json", 1024) as prepared:
+        if mutation == "parent_symlink":
+            original = tmp_path / "original"
+            directory.rename(original)
+            directory.symlink_to(original, target_is_directory=True)
+        else:
+            path.unlink()
+            if mutation == "leaf_symlink":
+                target = tmp_path / "target"
+                target.write_bytes(b"{}")
+                path.symlink_to(target)
+            else:
+                os.mkfifo(path)
+        with pytest.raises((OSError, ValueError)):
+            prepared.validate_current()
+
+
 def test_growth_after_initial_stat_still_obeys_the_read_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
