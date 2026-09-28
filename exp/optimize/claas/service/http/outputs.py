@@ -10,6 +10,7 @@ from openai.types.responses import Response
 
 from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ModelDecodeStatus
 from exp.optimize.claas.service.http.inputs import ProtocolName
 
 
@@ -74,7 +75,8 @@ def generation_response(
                     {
                         "index": 0,
                         "text": ""
-                        if not finished and action.content == "" and not action.tool_calls
+                        if result.decode_status != ModelDecodeStatus.PARSED
+                        or (not finished and action.content == "" and not action.tool_calls)
                         else result.raw_text,
                         "finish_reason": result.finish_reason,
                         "logprobs": None,
@@ -134,7 +136,10 @@ def generation_response(
                 "incomplete_details": None if finished else {"reason": "max_output_tokens"},
             }
         )
-    return cast(JsonObject, envelope.model_dump(mode="json", exclude_unset=True))
+    payload = cast(JsonObject, envelope.model_dump(mode="json", exclude_unset=True))
+    if result.decode_status != ModelDecodeStatus.PARSED:
+        payload["claas_decode_status"] = result.decode_status.value
+    return payload
 
 
 def _response_usage(result: GenerationResult) -> JsonObject | None:

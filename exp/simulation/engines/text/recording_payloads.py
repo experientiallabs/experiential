@@ -93,6 +93,7 @@ def model_span(
         "response": {
             "output": response.output.model_dump(mode="json", exclude_none=True),
             "finish_reason": response.finish_reason.value,
+            "decode_status": response.decode_status.value,
         },
     }
     payload = redact_json(payload_value, redacted_field_names)

@@ -10,8 +10,8 @@ from tokenizers import AddedToken
 from verl.workers.rollout.replica import TokenOutput
 
 from exp.common.claas.generation import GenerationRequest
+from exp.common.models import ModelDecodeStatus
 from exp.optimize.claas.backends.verl.configuration import ResidentVerlSettings
-from exp.optimize.claas.backends.verl.decoding import UnfinishedReasoningError
 from exp.optimize.claas.backends.verl.native_test import tokenizer
 from exp.optimize.claas.backends.verl.runtime import ResidentVerlRuntime, Rollout
 from exp.optimize.claas.training_contracts import ClaasTrainingError, TrainingBatch, TrainingResult
@@ -22,7 +22,7 @@ from exp.optimize.claas.training_contracts_test import job, spec
 def test_native_generation_reason_gates_retention_and_runtime_failure(
     tmp_path: Path, outcome: str
 ) -> None:
-    """Only observed length keeps unfinished reasoning and leaves the resident runtime usable."""
+    """Retain sampled decode failures while missing metadata and engine errors stay fatal."""
 
     async def exercise() -> None:
         """Inject only the engine boundary while driving the real runtime and decoder."""
@@ -62,10 +62,13 @@ def test_native_generation_reason_gates_retention_and_runtime_failure(
             request_id="reasoning", model=spec().base_model, prompt="a", maximum_output_tokens=1
         )
         try:
-            if outcome == "length":
+            if outcome in {"stop", "length"}:
                 result = await runtime.generate(request)
-                assert result.finish_reason == "length" and result.action.content == ""
+                assert result.finish_reason == outcome and result.action.content == ""
+                assert result.decode_status is ModelDecodeStatus.UNFINISHED_REASONING
                 assert result.raw_text == raw
+                assert result.exact_tokens.response_token_ids == tuple(response)
+                assert result.exact_tokens.response_logprobs == (-0.25,)
                 assert not runtime._failed
                 repeated = await runtime.generate(request)
                 assert repeated.exact_tokens == result.exact_tokens
@@ -73,7 +76,6 @@ def test_native_generation_reason_gates_retention_and_runtime_failure(
             else:
                 expected = {
                     "engine": RuntimeError,
-                    "stop": UnfinishedReasoningError,
                     "missing": ClaasTrainingError,
                 }[outcome]
                 with pytest.raises(expected) as caught:

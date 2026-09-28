@@ -576,6 +576,18 @@ standard returned response ID. `/v1/train` schedules an update and returns immed
 `/v1/status` reports queue and update state, while `/v1/drain` waits for a bounded ready snapshot.
 All routes require the bearer credential.
 
+A sampled leading reasoning block without a closing marker is retained as
+`decode_status="unfinished_reasoning"`, with its original native `stop` or `length` reason.
+All three APIs return its durable response ID and an empty public action, with the
+`claas_decode_status` extension. Private raw reasoning and exact tokens stay in the buffer.
+The extension is omitted for parsed actions; `LearningClient` treats its absence as `parsed`
+for ordinary or older endpoints, but rejects an explicitly invalid status. Its model client
+preserves the status in `ModelResponse`. Text simulation records the evidence and stops at
+`candidate_decode` before retrieval or world execution. A normal blank `stop` remains valid.
+Callers may submit feedback on the failed sample; no reward, retry, or token-budget increase
+is inferred. Engine errors, missing native metadata, mixed visible prefixes and malformed tool
+syntax remain errors.
+
 Feedback may arrive later as `success=True/False`, scalar `reward` in [-1, 1], or `text`.
 SDPO waits for text, REINFORCE waits for a scalar, and `hybrid` waits for both. Sparse missing
 signals remain pending; absence is never converted into a zero reward. Exact duplicate feedback
