@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.core.locks import FileLockTimeout, file_write_lock
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.simulation.engines.text import leases
@@ -30,7 +31,7 @@ def test_completed_rollout_release_timeout_defers_to_safe_reaping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A cleanup lock timeout cannot discard a completed rollout or authorize replay."""
-    store = TextCellLeaseStore(tmp_path, clock=lambda: _TIME)
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
 
     def acquire(*, completed: bool) -> TextCellLeaseClaim:
         """Admit or reap the same exact cell without changing its durable identity."""
@@ -59,10 +60,10 @@ def test_completed_rollout_release_timeout_defers_to_safe_reaping(
         with caplog.at_level(logging.WARNING):
             store.release(claim.lease)
     assert "after immutable rollout persistence" in caplog.text
-    assert (tmp_path / "simulation-leases" / "lease-a.json").is_file()
+    assert store._records.read("lease-a") is not None
     completed = acquire(completed=True)
     assert completed.state == TextCellLeaseState.COMPLETED
-    assert not (tmp_path / "simulation-leases" / "lease-a.json").exists()
+    assert store._records.read("lease-a") is None
 
 
 @pytest.mark.parametrize("operation", ["release", "dispatch_intent"])
@@ -70,7 +71,7 @@ def test_local_workers_queue_before_the_cross_process_admission_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     """Slow spend reconciliation cannot make local cleanup poll the cross-process lock."""
-    store = TextCellLeaseStore(tmp_path, clock=lambda: _TIME)
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
 
     def acquire(suffix: str, spend: Callable[[], float]) -> TextCellLeaseClaim:
         """Reserve one independent bounded cell under the shared ledger."""
@@ -134,9 +135,7 @@ def test_local_workers_queue_before_the_cross_process_admission_lock(
             finish_reconciliation.set()
         assert admission.result(timeout=5).state == TextCellLeaseState.OWNED
         cleanup.result(timeout=5)
-    assert (tmp_path / "simulation-leases" / "lease-a.json").exists() == (
-        operation == "dispatch_intent"
-    )
+    assert (store._records.read("lease-a") is not None) == (operation == "dispatch_intent")
 
 
 def test_dispatch_intent_blocks_replay_until_rollout_is_durable(
@@ -193,7 +192,7 @@ def test_dispatch_intent_blocks_replay_until_rollout_is_durable(
     assert blocked.state == TextCellLeaseState.CONTENDED
     assert blocked.retryable
     assert completed.state == TextCellLeaseState.COMPLETED
-    assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
+    assert store._records.list_ids() == ()
 
 
 def test_expired_dead_paid_claim_is_recovered_as_stale_without_replay(tmp_path: Path) -> None:
@@ -299,7 +298,7 @@ def test_live_paid_claim_returns_retryable_contention_at_finite_deadline(
     assert blocked.state == TextCellLeaseState.CONTENDED
     assert blocked.retryable
     assert elapsed[0] == pytest.approx(0.05)
-    assert len(tuple((project.project_directory / "simulation-leases").glob("*.json"))) == 1
+    assert len(contender._records.list_ids()) == 1
 
 
 def test_cancelled_paid_claim_wait_returns_retryable_contention_without_a_lease(
@@ -323,7 +322,7 @@ def test_cancelled_paid_claim_wait_returns_retryable_contention_without_a_lease(
 
     assert cancelled.state == TextCellLeaseState.CONTENDED
     assert cancelled.retryable
-    assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
+    assert store._records.list_ids() == ()
 
 
 @pytest.mark.parametrize("local", [False, True])
@@ -359,7 +358,7 @@ def test_admission_lock_wait_obeys_the_same_finite_deadline(tmp_path: Path, loca
 
     assert blocked.state == TextCellLeaseState.CONTENDED
     assert elapsed < 0.5
-    assert tuple(lease_directory.glob("*.json")) == ()
+    assert store._records.list_ids() == ()
 
 
 def test_completed_one_dollar_reservation_reaps_before_actual_ten_cent_spend(
@@ -397,8 +396,7 @@ def test_completed_one_dollar_reservation_reaps_before_actual_ten_cent_spend(
     assert second.state == TextCellLeaseState.OWNED
     assert second.lease is not None
     assert second.lease.reserved_cost_usd == pytest.approx(0.9)
-    lease_paths = tuple((project.project_directory / "simulation-leases").glob("*.json"))
-    assert tuple(path.name for path in lease_paths) == ("lease-b.json",)
+    assert store._records.list_ids() == ("lease-b",)
 
 
 def test_finite_budget_contender_waits_until_whole_run_reservation_releases(
@@ -482,7 +480,7 @@ def test_crash_after_rollout_artifact_recovers_completed_and_clears_reservation(
     )
 
     assert recovered.state == TextCellLeaseState.COMPLETED
-    assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
+    assert store._records.list_ids() == ()
 
 
 def test_budget_contender_waits_for_active_claim_before_proven_over_budget_block(
@@ -532,7 +530,7 @@ def test_budget_contender_waits_for_active_claim_before_proven_over_budget_block
     assert elapsed[0] > 0
     assert blocked.state == TextCellLeaseState.BUDGET_BLOCKED
     assert blocked.observed_spend_usd == 1.1
-    assert tuple((project.project_directory / "simulation-leases").glob("*.json")) == ()
+    assert contender._records.list_ids() == ()
 
 
 def test_default_admission_warns_and_owns_after_spend_reaches_the_ceiling(
@@ -566,8 +564,8 @@ def test_default_admission_warns_and_owns_after_spend_reaches_the_ceiling(
     assert any("authorized" in record.message for record in caplog.records)
 
 
-def test_stale_tombstone_rejects_symlink_swap_without_touching_victim(tmp_path: Path) -> None:
-    """A lease swapped after safe read cannot redirect tombstone bytes outside the lease dir."""
+def test_stale_tombstone_refuses_changed_database_record(tmp_path: Path) -> None:
+    """Compare-and-replace refuses to overwrite changed evidence and rolls back the transaction."""
     project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
     original = TextCellLeaseStore(project.project_directory, clock=lambda: _TIME)
     original.acquire(
@@ -580,22 +578,24 @@ def test_stale_tombstone_rejects_symlink_swap_without_touching_victim(tmp_path: 
         rollout_completed=lambda _rollout_id: False,
         observed_spend_usd=lambda: 0.0,
     )
-    lease_path = project.project_directory / "simulation-leases" / "lease-a.json"
-    victim = tmp_path / "victim.txt"
-    victim.write_text("do not overwrite", encoding="utf-8")
+    original_bytes = original._records.read("lease-a")
+    assert original_bytes is not None
 
-    def swap_to_symlink(_pid: int) -> bool:
-        lease_path.unlink()
-        lease_path.symlink_to(victim)
+    def change_claim(_pid: int) -> bool:
+        """Inject a different exact claim between validation and conditional replacement."""
+        changed = leases.TextCellLease.model_validate_json(original_bytes).model_copy(
+            update={"binding_sha256": "b" * 64}
+        )
+        original._records.write("lease-a", canonical_json_bytes(changed))
         return False
 
     recovery = TextCellLeaseStore(
         project.project_directory,
         clock=lambda: _TIME + timedelta(minutes=16),
-        owner_alive=swap_to_symlink,
+        owner_alive=change_claim,
     )
 
-    with pytest.raises(TextCellLeaseError, match="cannot be mutated safely"):
+    with pytest.raises(TextCellLeaseError, match="changed before mutation"):
         recovery.acquire(
             lease_id="lease-a",
             resolution_id="resolution-a",
@@ -607,8 +607,7 @@ def test_stale_tombstone_rejects_symlink_swap_without_touching_victim(tmp_path: 
             observed_spend_usd=lambda: 0.0,
         )
 
-    assert victim.read_text(encoding="utf-8") == "do not overwrite"
-    assert lease_path.is_symlink()
+    assert original._records.read("lease-a") == original_bytes
 
 
 def test_parallel_cell_reservations_share_but_never_duplicate_remaining_budget(
@@ -616,7 +615,10 @@ def test_parallel_cell_reservations_share_but_never_duplicate_remaining_budget(
 ) -> None:
     """Two bounded attempts may overlap; a third cannot claim already reserved dollars."""
     store = TextCellLeaseStore(
-        tmp_path, clock=lambda: _TIME, wait_timeout_seconds=0.001, poll_interval_seconds=0.001
+        tmp_path / "projects" / "project-a",
+        clock=lambda: _TIME,
+        wait_timeout_seconds=0.001,
+        poll_interval_seconds=0.001,
     )
 
     def acquire(suffix: str) -> TextCellLeaseClaim:

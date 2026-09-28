@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from exp.common.core.artifacts import stable_id
 from exp.common.models.gateway_catalog import read_pinned_normalized_snapshot
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,
@@ -63,7 +64,6 @@ from exp.runtime.gateway.platform import (
 )
 from exp.runtime.gateway.snapshot_integrity import refuse_self_inconsistent_snapshot
 from exp.runtime.gateway.sqlite.alias_activation import reactivate_alias_revision
-from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.platform_records import (
     alias_record as _alias_record,
 )

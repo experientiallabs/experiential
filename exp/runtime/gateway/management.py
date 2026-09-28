@@ -16,6 +16,7 @@ from exp.common.models import (
     ModelCatalog,
     load_model_catalog,
 )
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, ProjectTarget
 from exp.runtime.gateway.model_chain_authority import (
@@ -24,7 +25,6 @@ from exp.runtime.gateway.model_chain_authority import (
     serving_snapshot_limit,
 )
 from exp.runtime.gateway.sqlite import key_delivery
-from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionAuthority,
     ProviderConnectionBinding,

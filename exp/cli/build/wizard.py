@@ -22,6 +22,7 @@ from exp.cli.build.providers import (
 from exp.cli.build.providers import (
     require_replay_role_overrides as _require_replay_role_overrides,
 )
+from exp.cli.build.source import project_for_build
 from exp.cli.build.traces import load_build_traces
 from exp.cli.build.wizard_screens import (
     WizardBuildPlan,
@@ -452,7 +453,7 @@ def _completed_replay(
         ValueError: Existing immutable router evidence is corrupt or ambiguous.
     """
     store = ProjectStore(root, project)
-    if not store.paths.project_toml.exists():
+    if not store.exists():
         return None
     state = read_review_state(store)
     if state is None:
@@ -509,7 +510,6 @@ def _prepare_new_build(
     """
     from exp.cli.build.app import (
         _embedding_cost_ceiling,
-        _project_store,
         _reuse_completed_grounded_artifacts,
         _selected_roles,
         _validated_role_snapshots,
@@ -535,7 +535,7 @@ def _prepare_new_build(
     world_snapshot, embedder_snapshot, embedder_capabilities = _validated_role_snapshots(
         runtime, selected
     )
-    store = _project_store(
+    store = project_for_build(
         root,
         ProjectConfig(
             project_id=project,
@@ -599,7 +599,7 @@ def _completed_build_plan(
         Verified completed-build plan, or ``None`` before grounded selection.
     """
     store = ProjectStore(root, project)
-    if not store.paths.project_toml.exists() or not store.model_catalog_path.exists():
+    if not store.exists() or not store.model_catalog_path.exists():
         return None
     config = store.load_project()
     if config.build is None or config.models is None or config.trace_source is None:

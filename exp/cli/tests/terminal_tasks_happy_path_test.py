@@ -41,6 +41,7 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
+from exp.common.project.testing import RawArtifact
 from exp.common.rollouts import RolloutArtifact
 from exp.common.traces import load_trace_dataset
 from exp.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
@@ -263,7 +264,9 @@ def _rollout_payloads(store: ProjectStore) -> tuple[tuple[RolloutArtifact, str],
         record = store.artifacts.read(artifact_id)
         if record.manifest.artifact_type != "rollout":
             continue
-        text = (record.directory / "rollout.json").read_text(encoding="utf-8")
+        text = (
+            RawArtifact(store.artifacts._paths, record.manifest.artifact_id) / "rollout.json"
+        ).read_text(encoding="utf-8")
         payloads.append((RolloutArtifact.model_validate_json(text), text))
     return tuple(payloads)
 

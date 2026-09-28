@@ -21,6 +21,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.common.project.manifests import file_digest
+from exp.common.project.testing import RawArtifact
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.router.capability import (
     RouterRuntimeCapabilityError,
@@ -162,7 +163,7 @@ def test_capability_loader_rejects_unsupported_canonical_schema(
             "files": (file_digest("capabilities.json", payload),),
         }
     )
-    artifact_directory = paths.artifact_directory(contract.capability_contract_id)
+    artifact_directory = RawArtifact(paths, contract.capability_contract_id)
     (artifact_directory / "capabilities.json").write_bytes(payload)
     (artifact_directory / "manifest.json").write_bytes(canonical_json_bytes(manifest))
 

@@ -8,7 +8,7 @@ import pytest
 from exp.cli.build.app import _build_grounded_artifacts
 from exp.common.models import ModelCatalog
 from exp.common.progress import ProgressEvent
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, write_project_config
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.evaluation.export import export_report, load_report_evidence
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
@@ -103,7 +103,11 @@ def test_twenty_scenarios_repeats_persist_report_and_exact_resume(tmp_path: Path
     assert "__DATA__" not in html_path.read_text()
     assert list_runs(project)[0] == saved
     before = len(state.completion_calls), len(state.embedding_calls)
+    current = project.load_project()
+    write_project_config(project.paths, current.model_copy(update={"build": None, "models": None}))
     replay = execute_run(project, saved, runtime, provider_spend_consented=True)
+    assert project.load_project().build is None
+    write_project_config(project.paths, current)
     assert replay.report == result.report
     assert before == (len(state.completion_calls), len(state.embedding_calls))
     fresh = prepare_run(project, catalog, defaults, code_revision=_REVISION)
@@ -162,6 +166,9 @@ def test_interrupted_parallel_run_resumes_without_repeating_paid_cells(tmp_path:
     assert saved.status == "interrupted"
     candidate_calls = sum(alias.startswith("candidate") for alias, _ in state.completion_calls)
     assert 0 < candidate_calls < 40
+    write_project_config(
+        project.paths, project.load_project().model_copy(update={"build": None, "models": None})
+    )
     result = execute_run(project, saved, runtime, provider_spend_consented=True)
     assert result.report.compared_cells == 20
     assert sum(alias.startswith("candidate") for alias, _ in state.completion_calls) == 40

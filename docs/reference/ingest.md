@@ -47,8 +47,9 @@ do not import runtime or simulation code. Gateway capture and protocol adapters 
 
 The ingestion stage writes canonical traces and provenance into the same SQLite content database as
 local gateway capture. Source files stay at the caller's path. The database owns normalized trace
-records, immutable imports, ordered import membership and project associations. It does not yet
-own the other project-folder artifacts. The lower-level Python import API does not require an
+records, immutable imports, ordered import membership and project associations. The same database
+also owns project configuration, immutable dataset/scenario and judge versions, evaluation runs,
+checkpoints, judgments, and result metadata. The lower-level Python import API does not require an
 existing project configuration; the build command also prepares project state and scenarios.
 
 Canonical content is hashed independently of per-import source provenance, so overlapping exports
@@ -126,6 +127,9 @@ and binds the grounded world model under the configured spend ceiling. Exact rep
 reuse their saved evidence and completed indexes. Source imports and scenario artifacts remain
 immutable, preserving the evidence pinned by earlier evaluations. Preparation alone produces no
 evaluation or HTML report; those are outputs of running and judging candidate rollouts.
+
+Select an exact stored corpus with `exp build PROJECT --import-id IMPORT_ID --root ROOT`.
+The build pins that import in its configuration and does not reread the original source.
 
 ## Authorized PostHog HogQL pull
 

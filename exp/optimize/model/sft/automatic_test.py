@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import shutil
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
@@ -39,6 +37,7 @@ from exp.optimize.model.sft.composition import (
     write_sft_model_optimization_config,
 )
 from exp.optimize.model.sft.contracts import SFTBuildSpec
+from exp.optimize.model.sft.run_manifest import sft_run_records
 from exp.optimize.model.sft.runtime_source_test import _accept, _complete, _request
 from exp.optimize.model.sft.selection import (
     SFTModelOptimizationSelectionError,
@@ -249,8 +248,8 @@ def test_unchanged_prefix_reuses_snapshot_dataset_config_and_pointer_bytes(
         code_revision="automatic-sft-test",
     )
     artifact_ids = bootstrap.store.artifacts.list_ids()
-    pointer_path = latest_sft_model_optimization_path(bootstrap.store)
-    pointer_bytes = pointer_path.read_bytes()
+    latest_sft_model_optimization_path(bootstrap.store)
+    pointer_bytes = bootstrap.store.records.read("latest-sft-model")
 
     replay = prepare_runtime_sft_model_optimization(
         bootstrap.store,
@@ -264,7 +263,7 @@ def test_unchanged_prefix_reuses_snapshot_dataset_config_and_pointer_bytes(
     assert replay.dataset == first.dataset
     assert replay.config == first.config
     assert bootstrap.store.artifacts.list_ids() == artifact_ids
-    assert pointer_path.read_bytes() == pointer_bytes
+    assert bootstrap.store.records.read("latest-sft-model") == pointer_bytes
 
 
 def test_appended_interaction_creates_new_graph_without_mutating_old_artifacts(
@@ -371,9 +370,12 @@ def test_run_acceptance_rejects_an_advanced_journal_before_manifest_write(
     assert len(refreshed.dataset.rows) == 2
     assert manifest.dataset_id == refreshed.dataset.dataset.dataset_id
     assert (
-        sft_model_optimization_output_dir(bootstrap.store, refreshed.config.config_id)
-        / "manifest.json"
-    ).is_file()
+        sft_run_records(
+            bootstrap.store,
+            sft_model_optimization_output_dir(bootstrap.store, refreshed.config.config_id),
+        ).read("manifest.json")
+        is not None
+    )
 
 
 def test_run_acceptance_holds_journal_lock_through_w13_manifest_commit(
@@ -419,7 +421,9 @@ def test_run_acceptance_holds_journal_lock_through_w13_manifest_commit(
         assert writer_started.wait(timeout=1.0)
         assert not writer_finished.wait(timeout=0.05)
         manifest = original_initialize(*args, **kwargs)
-        manifest_committed_before_writer.append((output_dir / "manifest.json").is_file())
+        manifest_committed_before_writer.append(
+            sft_run_records(bootstrap.store, output_dir).read("manifest.json") is not None
+        )
         assert not writer_finished.is_set()
         return manifest
 
@@ -561,13 +565,15 @@ def test_copied_w13_acceptance_cannot_authorize_another_selected_config(
             ),
             expected_current=None,
         )
-    pointer_path = run_manifest_module.automatic_sft_acceptance_path(bootstrap.store)
-    pointer_bytes = pointer_path.read_bytes()
+    run_manifest_module.automatic_sft_acceptance_path(bootstrap.store)
+    pointer_bytes = bootstrap.store.records.read("automatic-sft-acceptance")
+    assert pointer_bytes is not None
     bootstrap_config_input = artifact_input(
         bootstrap.store.artifacts.read(bootstrap.config.config_id).manifest
     )
-    pointer_path.write_bytes(
-        canonical_json_bytes(selected_a.model_copy(update={"config": bootstrap_config_input}))
+    bootstrap.store.records.write(
+        "automatic-sft-acceptance",
+        canonical_json_bytes(selected_a.model_copy(update={"config": bootstrap_config_input})),
     )
     with pytest.raises(AutomaticSFTPreparationError, match="pointer differs"):
         prepare_runtime_sft_model_optimization(
@@ -575,7 +581,7 @@ def test_copied_w13_acceptance_cannot_authorize_another_selected_config(
             created_at=_TIME + timedelta(hours=2),
             code_revision="automatic-sft-test",
         )
-    pointer_path.write_bytes(pointer_bytes)
+    bootstrap.store.records.write("automatic-sft-acceptance", pointer_bytes)
     alias_prefix_b = "alternate-trained"
     config_b = create_sft_model_optimization_config(
         bootstrap.store,
@@ -603,8 +609,9 @@ def test_copied_w13_acceptance_cannot_authorize_another_selected_config(
         expected_current=latest_a.config,
     )
     output_b = sft_model_optimization_output_dir(bootstrap.store, config_b.config_id)
-    output_b.mkdir(parents=True)
-    shutil.copyfile(output_a / "manifest.json", output_b / "manifest.json")
+    copied = sft_run_records(bootstrap.store, output_a).read("manifest.json")
+    assert copied is not None
+    sft_run_records(bootstrap.store, output_b).write("manifest.json", copied)
 
     with pytest.raises(AutomaticSFTPreparationError, match="incomplete"):
         prepare_runtime_sft_model_optimization(
@@ -701,20 +708,11 @@ def test_automatic_acceptance_pointer_rejects_broken_and_live_symlinks_before_wr
         assert not external_target.exists()
 
 
-@pytest.mark.parametrize("target_exists", [False, True])
-def test_automatic_acceptance_pointer_replaces_a_symlink_swapped_at_write_boundary(
+def test_automatic_acceptance_pointer_rolls_back_if_commit_is_interrupted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    target_exists: bool,
 ) -> None:
-    """Replace a raced pointer link itself without following or changing its target.
-
-    Args:
-        tmp_path: Pytest-owned project and external target directory.
-        monkeypatch: Pytest mutation helper used at the exact atomic-replace boundary.
-        target_exists: Whether the raced redirect names an existing external file.
-    """
+    """An interrupted pointer commit cannot leave newly selected consent behind."""
     bootstrap = _bootstrap(tmp_path)
     _append_completed(bootstrap.store, key="first", minute=1)
     prepared = prepare_runtime_sft_model_optimization(
@@ -722,39 +720,23 @@ def test_automatic_acceptance_pointer_replaces_a_symlink_swapped_at_write_bounda
         created_at=_TIME + timedelta(hours=1),
         code_revision="automatic-sft-test",
     )
-    pointer_path = run_manifest_module.automatic_sft_acceptance_path(bootstrap.store)
-    external_target = tmp_path / "raced-external-automatic-acceptance.json"
-    original_external_bytes = b"raced external pointer must remain unchanged"
-    if target_exists:
-        external_target.write_bytes(original_external_bytes)
-    real_replace = os.replace
+    write = bootstrap.store.records.write
 
-    def swap_pointer_before_replace(source: str | Path, destination: str | Path) -> None:
-        """Install the adversarial link immediately before the production replace.
+    def interrupted_write(key: str, payload: bytes, *, exclusive: bool = False) -> None:
+        """Fail after the nested SQL mutation and before the enclosing transaction commits."""
+        write(key, payload, exclusive=exclusive)
+        if key == "automatic-sft-acceptance":
+            raise OSError("interrupted consent commit")
 
-        Args:
-            source: Exclusive sibling staging path.
-            destination: Canonical acceptance pointer path.
-        """
-        if Path(destination) == pointer_path:
-            pointer_path.symlink_to(external_target)
-        real_replace(source, destination)
-
-    monkeypatch.setattr(os, "replace", swap_pointer_before_replace)
-    accept_runtime_sft_model_optimization(
-        bootstrap.store,
-        prepared,
-        created_at=_TIME + timedelta(hours=1),
-        code_revision="automatic-sft-test",
-    )
-
-    assert pointer_path.is_file()
-    assert not pointer_path.is_symlink()
-    assert run_manifest_module.load_automatic_sft_acceptance_selection(bootstrap.store) is not None
-    if target_exists:
-        assert external_target.read_bytes() == original_external_bytes
-    else:
-        assert not external_target.exists()
+    monkeypatch.setattr(bootstrap.store.records, "write", interrupted_write)
+    with pytest.raises(OSError, match="interrupted consent commit"):
+        accept_runtime_sft_model_optimization(
+            bootstrap.store,
+            prepared,
+            created_at=_TIME + timedelta(hours=1),
+            code_revision="automatic-sft-test",
+        )
+    assert bootstrap.store.records.read("automatic-sft-acceptance") is None
 
 
 def test_empty_or_incomplete_journal_fails_without_materializing_runtime_artifacts(
@@ -810,7 +792,7 @@ def test_corrupt_latest_pointer_fails_closed_before_new_materialization(tmp_path
         code_revision="automatic-sft-test",
     )
     original_ids = bootstrap.store.artifacts.list_ids()
-    latest_sft_model_optimization_path(bootstrap.store).write_text("{not-json", encoding="utf-8")
+    bootstrap.store.records.write("latest-sft-model", b"{not-json")
 
     with pytest.raises(AutomaticSFTPreparationError, match="pointer is invalid"):
         prepare_runtime_sft_model_optimization(
@@ -988,16 +970,18 @@ def test_latest_pointer_rejects_symlink_and_wrong_project(tmp_path: Path) -> Non
     pointer = load_latest_sft_model_optimization(bootstrap.store)
     assert pointer is not None
     target = tmp_path / "redirected-latest.json"
-    target.write_bytes(path.read_bytes())
-    path.unlink()
+    payload = bootstrap.store.records.read("latest-sft-model")
+    assert payload is not None
+    target.write_bytes(payload)
     path.symlink_to(target)
 
     with pytest.raises(SFTModelOptimizationSelectionError, match="not a safe file"):
         load_latest_sft_model_optimization(bootstrap.store)
 
     path.unlink()
-    path.write_bytes(
-        canonical_json_bytes(pointer.model_copy(update={"project_id": "another-project"}))
+    bootstrap.store.records.write(
+        "latest-sft-model",
+        canonical_json_bytes(pointer.model_copy(update={"project_id": "another-project"})),
     )
     with pytest.raises(SFTModelOptimizationSelectionError, match="another project"):
         load_latest_sft_model_optimization(bootstrap.store)
@@ -1025,7 +1009,7 @@ def test_latest_pointer_rejects_symlinked_coordination_directory_for_read_and_wr
     external_directory = tmp_path / "external-model-optimization"
     coordination_directory.rename(external_directory)
     coordination_directory.symlink_to(external_directory, target_is_directory=True)
-    external_pointer_bytes = (external_directory / path.name).read_bytes()
+    external_pointer_bytes = bootstrap.store.records.read("latest-sft-model")
 
     with pytest.raises(SFTModelOptimizationSelectionError, match="directory is not safe"):
         load_latest_sft_model_optimization(bootstrap.store)
@@ -1042,7 +1026,7 @@ def test_latest_pointer_rejects_symlinked_coordination_directory_for_read_and_wr
             created_at=_TIME + timedelta(hours=2),
             code_revision="automatic-sft-test",
         )
-    assert (external_directory / path.name).read_bytes() == external_pointer_bytes
+    assert bootstrap.store.records.read("latest-sft-model") == external_pointer_bytes
 
 
 def test_latest_pointer_rejects_model_alias_prefix_rewrite(tmp_path: Path) -> None:
@@ -1058,12 +1042,13 @@ def test_latest_pointer_rejects_model_alias_prefix_rewrite(tmp_path: Path) -> No
         created_at=_TIME + timedelta(hours=1),
         code_revision="automatic-sft-test",
     )
-    path = latest_sft_model_optimization_path(bootstrap.store)
+    latest_sft_model_optimization_path(bootstrap.store)
     pointer = load_latest_sft_model_optimization(bootstrap.store)
     assert pointer is not None
     artifact_ids = bootstrap.store.artifacts.list_ids()
-    path.write_bytes(
-        canonical_json_bytes(pointer.model_copy(update={"model_alias_prefix": "attacker-prefix"}))
+    bootstrap.store.records.write(
+        "latest-sft-model",
+        canonical_json_bytes(pointer.model_copy(update={"model_alias_prefix": "attacker-prefix"})),
     )
 
     with pytest.raises(SFTModelOptimizationSelectionError, match="does not derive"):
@@ -1095,12 +1080,12 @@ def test_latest_pointer_rejects_unsupported_canonical_schema_versions(
         created_at=_TIME + timedelta(hours=1),
         code_revision="automatic-sft-test",
     )
-    path = latest_sft_model_optimization_path(bootstrap.store)
+    latest_sft_model_optimization_path(bootstrap.store)
     pointer = load_latest_sft_model_optimization(bootstrap.store)
     assert pointer is not None
     payload = pointer.model_dump(mode="json", exclude_none=False)
     payload["schema_version"] = schema_version
-    path.write_bytes(canonical_json_bytes(payload))
+    bootstrap.store.records.write("latest-sft-model", canonical_json_bytes(payload))
 
     with pytest.raises(SFTModelOptimizationSelectionError, match="pointer is invalid"):
         load_latest_sft_model_optimization(bootstrap.store)

@@ -483,7 +483,7 @@ def test_new_project_setup_can_cancel_without_changing_catalog_or_paid_work(
     assert result.exit_code == 1
     assert "Providers" in unstyle(result.output)
     assert (root / "models.toml").read_bytes() == before
-    assert not wizard.ProjectStore(root, "new-project").paths.project_toml.exists()
+    assert not wizard.ProjectStore(root, "new-project").exists()
     assert not lister.requests and not state.embedding_calls and not state.completion_calls
 
 
@@ -529,7 +529,7 @@ def test_completed_build_rejects_changed_roles_before_saving_shared_catalog(
     assert built.exit_code == 0, built.output
     catalog_before = (root / "models.toml").read_bytes()
     store = wizard.ProjectStore(root, "powerset")
-    project_before = store.paths.project_toml.read_bytes()
+    project_before = store.load_project()
     embedding_calls = tuple(state.embedding_calls)
 
     result = _RUNNER.invoke(app, ["build", "powerset"], input="\n\n\n/candidate\n1\n\n\n\ny\n")
@@ -537,7 +537,7 @@ def test_completed_build_rejects_changed_roles_before_saving_shared_catalog(
     assert result.exit_code == 2, result.output
     assert "role overrides differ" in unstyle(result.output)
     assert (root / "models.toml").read_bytes() == catalog_before
-    assert store.paths.project_toml.read_bytes() == project_before
+    assert store.load_project() == project_before
     assert tuple(state.embedding_calls) == embedding_calls
     assert not state.completion_calls
 
@@ -1017,6 +1017,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
         estimate: float,
         maximum_build_cost_usd: float,
         provider_spend_authorized: bool,
+        trace_import_id: str | None = None,
         progress: build_command.ProgressHook | None = None,
     ) -> build_command.GroundedBuildCompletion:
         """Record both adapters using the shared typed execution seam.
@@ -1049,6 +1050,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             estimate=estimate,
             maximum_build_cost_usd=maximum_build_cost_usd,
             provider_spend_authorized=provider_spend_authorized,
+            trace_import_id=trace_import_id,
             progress=progress,
         )
 

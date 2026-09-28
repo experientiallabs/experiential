@@ -32,7 +32,7 @@ def require_replay_role_overrides(
         ValueError: A supplied override differs from the selected completed-build role.
     """
     store = ProjectStore(root, project)
-    if not store.paths.project_toml.exists():
+    if not store.exists():
         return
     config = store.load_project()
     if config.build is None or config.models is None:
@@ -87,7 +87,7 @@ def configure_build_providers(
         ValueError: Confirmed roles conflict with an existing immutable build.
     """
     store = ProjectStore(root, project)
-    saved = store.load_project().models if store.paths.project_toml.exists() else None
+    saved = store.load_project().models if store.exists() else None
 
     def validate_roles(setup: ProviderSetup) -> None:
         """Reject incompatible project roles before writing the shared catalog."""

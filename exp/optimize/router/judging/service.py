@@ -898,7 +898,7 @@ def write_lineage_split(
         held_out_lineage_ids=held_out,
         assignments=assignments,
     )
-    if store.paths.artifact_directory(split_id).exists():
+    if store.artifacts.exists(split_id):
         existing, _ = read_artifact_json(
             store,
             artifact_id=split_id,

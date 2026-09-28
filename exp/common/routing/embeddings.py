@@ -419,8 +419,7 @@ def persist_router_embeddings(
         reservation=reservation,
         feature_digests=feature_digests,
     )
-    destination = store.project_directory / "artifacts" / embedding_set_id
-    if destination.exists():
+    if store.exists(embedding_set_id):
         existing = load_frozen_embedding_set(store, embedding_set_id)
         if (
             not isinstance(existing, ReservedFrozenEmbeddingSet)

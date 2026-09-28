@@ -35,6 +35,8 @@ from exp.common.project import (
     ArtifactStoreError,
     ProjectPaths,
 )
+from exp.common.project.database import project_connection
+from exp.common.project.testing import RawArtifact
 from exp.common.routing import RouterFeatureExtractor, RoutingDecision
 from exp.common.traces import load_trace_dataset
 from exp.runtime.router.economics import (
@@ -316,12 +318,8 @@ def _artifact_bytes(store: ArtifactStore, artifact_id: str) -> dict[str, bytes]:
     Returns:
         Mapping from relative file paths to exact bytes.
     """
-    directory = store.read(artifact_id).directory
-    return {
-        path.relative_to(directory).as_posix(): path.read_bytes()
-        for path in sorted(directory.rglob("*"))
-        if path.is_file()
-    }
+    stored = store.read(artifact_id)
+    return {**stored.payloads, "manifest.json": canonical_json_bytes(stored.manifest)}
 
 
 def test_identical_replay_and_later_append_preserve_old_snapshot(tmp_path: Path) -> None:
@@ -469,7 +467,9 @@ def test_loader_rejects_forged_snapshot_provenance(
         created_at=_TIME + timedelta(minutes=1),
         code_revision="test-revision",
     )
-    directory = store.read(exported.snapshot.snapshot_id).directory
+    directory = RawArtifact(
+        store._paths, store.read(exported.snapshot.snapshot_id).manifest.artifact_id
+    )
     snapshot_path = directory / "runtime-trace-snapshot.json"
     manifest_path = directory / "manifest.json"
     snapshot = json.loads(snapshot_path.read_bytes())
@@ -520,7 +520,9 @@ def test_loader_rejects_reidentified_noncanonical_snapshot_constants(
         created_at=_TIME + timedelta(minutes=1),
         code_revision="test-revision",
     )
-    directory = store.read(exported.snapshot.snapshot_id).directory
+    directory = RawArtifact(
+        store._paths, store.read(exported.snapshot.snapshot_id).manifest.artifact_id
+    )
     snapshot_path = directory / "runtime-trace-snapshot.json"
     manifest_path = directory / "manifest.json"
     snapshot = json.loads(snapshot_path.read_bytes())
@@ -544,7 +546,13 @@ def test_loader_rejects_reidentified_noncanonical_snapshot_constants(
     snapshot_entry["sha256"] = hashlib.sha256(snapshot_payload).hexdigest()
     snapshot_entry["size_bytes"] = len(snapshot_payload)
     manifest_path.write_bytes(canonical_json_bytes(manifest))
-    directory.rename(directory.parent / forged_id)
+    with project_connection(store._paths.root, write=True) as connection:
+        connection.execute("PRAGMA defer_foreign_keys=ON")
+        for table in ("project_artifacts", "project_artifact_inputs", "project_artifact_files"):
+            connection.execute(
+                f"UPDATE {table} SET artifact_id=? WHERE project_id=? AND artifact_id=?",
+                (forged_id, store._paths.project_id, exported.snapshot.snapshot_id),
+            )
 
     with pytest.raises(ArtifactCorruptionError, match="invalid envelope"):
         load_runtime_trace_snapshot(store, forged_id)
@@ -582,7 +590,9 @@ def test_dataset_replay_rejects_envelope_fields_outside_its_identity(
         created_at=_TIME + timedelta(minutes=1),
         code_revision="test-revision",
     )
-    directory = store.read(exported.dataset.dataset_id).directory
+    directory = RawArtifact(
+        store._paths, store.read(exported.dataset.dataset_id).manifest.artifact_id
+    )
     dataset_path = directory / "trace-dataset.json"
     manifest_path = directory / "manifest.json"
     dataset = json.loads(dataset_path.read_bytes())

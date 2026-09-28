@@ -609,7 +609,7 @@ def write_production_rollout(
         candidate_economics=OperationEconomics(usage=_combined_usage(trace)),
     )
     try:
-        if store.paths.artifact_directory(artifact_id).exists():
+        if store.artifacts.exists(artifact_id):
             existing, pointer = read_artifact_json(
                 store,
                 artifact_id=artifact_id,

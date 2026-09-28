@@ -21,6 +21,7 @@ from exp.common.evaluations import (
 from exp.common.evaluations.build_test import _candidate, _money, _snapshot, _task
 from exp.common.models import Embedding
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
+from exp.common.project.testing import RawArtifact
 from exp.common.routing import RouterFeatureExtractor
 from exp.common.routing.bank import (
     CandidateEvidenceCount,
@@ -226,7 +227,9 @@ def test_persisted_bank_detects_sidecar_mutation(tmp_path: Path) -> None:
     assert loaded_manifest == manifest
     assert np.array_equal(loaded.scores, bank.scores)
     stored = store.read(manifest.bank_artifact_id)
-    (stored.directory / "bank.npz").write_bytes(payload + b"mutation")
+    (RawArtifact(store._paths, stored.manifest.artifact_id) / "bank.npz").write_bytes(
+        payload + b"mutation"
+    )
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
         load_knn_bank(store, manifest.bank_artifact_id, expected_sha256=digest)
 

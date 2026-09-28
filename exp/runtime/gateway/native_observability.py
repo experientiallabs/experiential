@@ -15,6 +15,7 @@ from collections.abc import Callable
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.discovery import (
     public_model_list,
     public_model_object,
@@ -29,7 +30,6 @@ from exp.runtime.gateway.native_accounting import (
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
-from exp.runtime.gateway.sqlite.migrations import close_idle_connections
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
 

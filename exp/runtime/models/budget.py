@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import math
-import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from pathlib import Path
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.project import ProjectStore
+from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
 
 
 class SpendLimitReached(BaseException):
@@ -36,14 +36,15 @@ class RequestBudget:
     Every request belongs to a deterministic cell/attempt/role/ordinal coordinate. Replaying
     that coordinate returns its saved response only if the exact request digest matches.
     Unknown crash or failure charges retain their full reservation and never replay silently.
-    No credentials or request bodies are saved. Response payloads stay in the local run directory.
+    No credentials or request bodies are saved. Response payloads are immutable project artifacts,
+    with large files referenced from SQLite.
     """
 
-    def __init__(self, directory: Path, *, identity: str, maximum_cost_usd: float) -> None:
+    def __init__(self, project: ProjectStore, *, identity: str, maximum_cost_usd: float) -> None:
         """Bind a local ledger to immutable execution identity and explicit authorization.
 
         Args:
-            directory: Private local runtime directory owning response receipts.
+            project: Owner of the shared SQLite accounting records and response artifacts.
             identity: Digest of immutable models, tasks, prompts, prices and execution settings.
             maximum_cost_usd: Total approved allowance, including completed and unknown calls.
 
@@ -52,47 +53,14 @@ class RequestBudget:
         """
         if not math.isfinite(maximum_cost_usd) or maximum_cost_usd <= 0:
             raise ValueError("spending limit must be finite and positive")
-        directory.mkdir(parents=True, exist_ok=True)
-        self._path = directory / "requests.sqlite3"
+        self._store = RequestBudgetStore(project, identity)
         self._limit = maximum_cost_usd
         self._condition = threading.Condition()
         self._active: set[str] = set()
         self._scope: ContextVar[tuple[str, dict[str, int]] | None] = ContextVar(
             f"request-budget-{identity}", default=None
         )
-        with self._connect() as db:
-            db.execute("CREATE TABLE IF NOT EXISTS identity (digest TEXT NOT NULL)")
-            row = db.execute("SELECT digest FROM identity").fetchone()
-            if row is None:
-                db.execute("INSERT INTO identity VALUES (?)", (identity,))
-            elif row[0] != identity:
-                raise ValueError("saved request ledger belongs to different execution settings")
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS requests ("
-                "key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
-                "charge REAL NOT NULL, response TEXT, state TEXT NOT NULL)"
-            )
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS authorizations ("
-                "created_at TEXT DEFAULT CURRENT_TIMESTAMP, limit_usd REAL NOT NULL)"
-            )
-            db.execute("INSERT INTO authorizations (limit_usd) VALUES (?)", (self._limit,))
-        self._path.chmod(0o600)
-
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        """Serialize accounting transactions; release the database before provider I/O."""
-        db = sqlite3.connect(self._path, timeout=30)
-        try:
-            db.execute("PRAGMA synchronous=FULL")
-            db.execute("BEGIN IMMEDIATE")
-            yield db
-            db.commit()
-        except BaseException:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        self._store.authorize(self._limit)
 
     @contextmanager
     def scope(self, identity: str) -> Iterator[None]:
@@ -106,8 +74,7 @@ class RequestBudget:
     @property
     def accounted_usd(self) -> float:
         """Return completed charges plus conservative reservations for unknown dispatches."""
-        with self._connect() as db:
-            return float(db.execute("SELECT COALESCE(SUM(charge), 0) FROM requests").fetchone()[0])
+        return self._store.total()
 
     def accounted_requests(self, coordinates: Sequence[tuple[str, str, int]]) -> float:
         """Sum distinct saved charges for exact scope, role, and ordinal coordinates.
@@ -127,18 +94,10 @@ class RequestBudget:
                 for scope, role, ordinal in coordinates
             }
         )
-        charges = []
-        with self._connect() as db:
-            for offset in range(0, len(keys), 500):
-                batch = keys[offset : offset + 500]
-                placeholders = ",".join("?" for _ in batch)
-                charges.extend(
-                    row[0]
-                    for row in db.execute(
-                        f"SELECT charge FROM requests WHERE key IN ({placeholders})", batch
-                    )
-                )
-        return math.fsum(charges)
+        with self._store.transaction():
+            return math.fsum(
+                receipt.charge for key in keys if (receipt := self._store.read(key)) is not None
+            )
 
     def call[ResultT](
         self,
@@ -188,15 +147,14 @@ class RequestBudget:
             if not math.isfinite(cost) or cost < 0 or cost > maximum_cost_usd + 1e-9:
                 raise ValueError("provider charge exceeds the admitted request reservation")
             payload = encode(result)
-            with self._condition, self._connect() as db:
-                db.execute(
-                    "UPDATE requests SET charge=?, response=?, state='complete' WHERE key=?",
-                    (cost, payload, key),
-                )
+            with self._condition:
+                self._store.complete(key, cost, payload)
             return result
         except BaseException:
-            with self._connect() as db:
-                db.execute("UPDATE requests SET state='unknown' WHERE key=?", (key,))
+            with self._store.transaction():
+                receipt = self._store.read(key)
+                if receipt is not None and receipt.state == "pending":
+                    self._store.write(key, receipt.model_copy(update={"state": "unknown"}))
             raise
         finally:
             with self._condition:
@@ -220,27 +178,25 @@ class RequestBudget:
         """
         with self._condition:
             while True:
-                with self._connect() as db:
-                    row = db.execute(
-                        "SELECT fingerprint, response, state FROM requests WHERE key=?", (key,)
-                    ).fetchone()
+                with self._store.transaction():
+                    row = self._store.read(key)
                     if row is not None:
-                        if row[0] != fingerprint:
+                        if row.fingerprint != fingerprint:
                             raise ValueError(
                                 "saved provider request changed; start a new evaluation"
                             )
-                        if row[2] != "complete":
+                        if row.state != "complete":
                             raise ValueError(
                                 "saved provider dispatch has unresolved spend; not replayed"
                             )
-                        return str(row[1])
-                    spent = float(
-                        db.execute("SELECT COALESCE(SUM(charge), 0) FROM requests").fetchone()[0]
-                    )
+                        return self._store.response(row)
+                    spent = self._store.total()
                     if spent + maximum <= self._limit + 1e-9:
-                        db.execute(
-                            "INSERT INTO requests VALUES (?, ?, ?, NULL, 'pending')",
-                            (key, fingerprint, maximum),
+                        self._store.write(
+                            key,
+                            RequestReceipt(
+                                fingerprint=fingerprint, charge=maximum, state="pending"
+                            ),
                         )
                         self._active.add(key)
                         return None

@@ -420,7 +420,7 @@ def test_hosted_workflow_preserves_mixed_billing_sources_without_private_aliases
         entries=swapped,
     )
     write_project_config(
-        prepared.paths.project_toml,
+        prepared.paths,
         ProjectConfig.model_validate(
             {
                 **current.model_dump(mode="python"),
@@ -957,7 +957,7 @@ def test_bundle_restore_rejects_same_project_semantic_pointer_swaps(
     elif selection_name == "router_policy":
         update.update(router_report=None)
     malicious = ProjectConfig.model_validate({**current.model_dump(mode="python"), **update})
-    write_project_config(primary.paths.project_toml, malicious)
+    write_project_config(primary.paths, malicious)
     bundle = export_project_bundle(
         primary,
         tmp_path / f"swapped-{selection_name}.exp.zip",
@@ -1021,7 +1021,7 @@ def test_bundle_restore_rejects_calibration_with_forged_semantic_identity(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "forged-calibration.exp.zip",
@@ -1109,7 +1109,7 @@ def test_bundle_restore_rejects_policy_from_another_execution_contract(
             "router_report": None,
         }
     )
-    write_project_config(primary.paths.project_toml, malicious)
+    write_project_config(primary.paths, malicious)
     bundle = export_project_bundle(
         primary,
         tmp_path / f"swapped-execution-{variant}.exp.zip",
@@ -1191,7 +1191,7 @@ def test_bundle_restore_rejects_grounded_build_from_another_model_setup(
             "router_report": None,
         }
     )
-    write_project_config(primary.paths.project_toml, malicious)
+    write_project_config(primary.paths, malicious)
     bundle = export_project_bundle(
         primary,
         tmp_path / "swapped-grounded-build.exp.zip",
@@ -1323,7 +1323,7 @@ def test_bundle_restore_rejects_rag_with_inconsistent_retrieval_identity(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "alternate-lineage-split.exp.zip",
@@ -1398,7 +1398,7 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, dropped_config)
+    write_project_config(prepared.paths, dropped_config)
     dropped_bundle = export_project_bundle(
         prepared,
         tmp_path / "dropped-build-spend.exp.zip",
@@ -1411,7 +1411,7 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
             expected_sha256=dropped_bundle.sha256,
         )
 
-    write_project_config(prepared.paths.project_toml, current)
+    write_project_config(prepared.paths, current)
     report_ledger = load_provider_spend_ledger(
         prepared.artifacts,
         current.router_report.spend_ledger,
@@ -1451,7 +1451,7 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
             ),
         }
     )
-    write_project_config(prepared.paths.project_toml, changed_config)
+    write_project_config(prepared.paths, changed_config)
     changed_bundle = export_project_bundle(
         prepared,
         tmp_path / "changed-fit-spend.exp.zip",
@@ -1565,7 +1565,7 @@ def test_bundle_restore_rejects_same_policy_report_from_another_evaluation(
             ),
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "wrong-held-out-evaluation.exp.zip",
@@ -1725,7 +1725,7 @@ def test_bundle_restore_rejects_fit_evaluation_with_held_out_scope(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "fit-with-held-out-scope.exp.zip",
@@ -1833,7 +1833,7 @@ def test_bundle_restore_rejects_report_evaluation_with_fit_scope(
             ),
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "held-out-with-fit-scope.exp.zip",

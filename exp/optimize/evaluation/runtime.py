@@ -173,7 +173,7 @@ def run_prepared_model_evaluation(
         },
     )
     ledger = RequestBudget(
-        project.paths.runtime_directory / "evaluation-requests" / ledger_identity,
+        project,
         identity=ledger_identity,
         maximum_cost_usd=budget.maximum_cost_usd,
     )

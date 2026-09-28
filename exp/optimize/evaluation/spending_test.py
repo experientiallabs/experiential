@@ -16,7 +16,7 @@ from exp.common.models import (
     Usage,
     completion_cost_reservation,
 )
-from exp.common.project import artifact_input
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact
 from exp.optimize.evaluation.spending import BudgetedCompletion
 from exp.optimize.router.composition_test import _completion_reservation
@@ -70,7 +70,9 @@ def test_budgeted_completion_accepts_only_the_configured_served_identity(
     if drift is not None:
         served = served.model_copy(update={drift: "c" * 64 if "sha256" in drift else "other"})
     client = _Client(served)
-    budget = RequestBudget(tmp_path, identity="served-pin", maximum_cost_usd=100)
+    budget = RequestBudget(
+        ProjectStore(tmp_path, "budget-test"), identity="served-pin", maximum_cost_usd=100
+    )
     wrapper = BudgetedCompletion(
         client, budget, reservation, role="assistant", served_model_id="served-name"
     )
@@ -150,7 +152,9 @@ def test_pairwise_budget_resume_preserves_reverse_probe_identity(tmp_path: Path)
 
     def execute(limit: float) -> ModelResponse:
         """Reconstruct both adapters as a fresh process would after increasing its allowance."""
-        budget = RequestBudget(tmp_path / "budget", identity="pairwise", maximum_cost_usd=limit)
+        budget = RequestBudget(
+            ProjectStore(tmp_path, "pairwise-budget"), identity="pairwise", maximum_cost_usd=limit
+        )
         adapter = TemplateJudgeClient(
             BudgetedCompletion(client, budget, reservation, role="judge"),
             setup.prompt_template,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -19,12 +18,15 @@ from exp.common.core.artifacts import (
 from exp.common.core.locks import file_write_lock
 from exp.common.models import NumericMeasurement
 from exp.common.project import ProjectStore
+from exp.common.project.records import ProjectRecords
 from exp.optimize.model.sft.contracts import SFTDatasetArtifact
 from exp.optimize.model.sft.provider_resources import validate_provider_resource_id
 from exp.optimize.model.sft.run_manifest import (
     _read_model,
     _write_new_json,
     load_or_create_manifest,
+    sft_run_lock_path,
+    sft_run_records,
     validate_run_inputs,
     verified_training_inputs,
 )
@@ -126,13 +128,13 @@ def train_tinker_sft(
     """
     dataset, dataset_input = verified_training_inputs(store, dataset_id)
     validate_run_inputs(dataset, created_at=created_at, code_revision=code_revision)
-    manifest_path = output_dir / _MANIFEST_FILE
+    manifest_path = sft_run_lock_path(store, output_dir)
     with file_write_lock(manifest_path, what="the Tinker SFT run"):
         return _train_locked(
             dataset=dataset,
             dataset_input=dataset_input,
             spec=spec,
-            output_dir=output_dir,
+            state=sft_run_records(store, output_dir),
             backend=backend,
             created_at=created_at,
             code_revision=code_revision,
@@ -144,7 +146,7 @@ def _train_locked(
     dataset: SFTDatasetArtifact,
     dataset_input: ArtifactInput,
     spec: TinkerSFTSpec,
-    output_dir: Path,
+    state: ProjectRecords,
     backend: TrainerBackend,
     created_at: datetime,
     code_revision: str,
@@ -153,19 +155,19 @@ def _train_locked(
         dataset=dataset,
         dataset_input=dataset_input,
         spec=spec,
-        output_dir=output_dir,
+        state=state,
         created_at=created_at,
         code_revision=code_revision,
     )
-    events = _read_events(output_dir, manifest.run_id)
-    _assert_no_ambiguous_step_intent(output_dir, manifest.run_id, events)
-    _assert_no_ambiguous_checkpoint_intent(output_dir, manifest.run_id, events)
+    events = _read_events(state, manifest.run_id)
+    _assert_no_ambiguous_step_intent(state, manifest.run_id, events)
+    _assert_no_ambiguous_checkpoint_intent(state, manifest.run_id, events)
     _assert_no_uncheckpointed_completed_steps(events)
     train_examples = tuple(row.example for row in dataset.rows if row.partition == "train")
     expected_schedule = _expected_schedule(train_examples, spec)
     _validate_event_schedule(events, expected_schedule)
     completed = _load_completed_result(
-        output_dir,
+        state,
         manifest,
         events,
         dataset=dataset,
@@ -174,10 +176,10 @@ def _train_locked(
     )
     if completed is not None:
         return completed
-    existing_model = _load_model(output_dir, manifest)
+    existing_model = _load_model(state, manifest)
     if existing_model is not None:
         _validate_model_lineage(
-            output_dir,
+            state,
             existing_model,
             events,
             manifest=manifest,
@@ -186,7 +188,7 @@ def _train_locked(
             expected_schedule=expected_schedule,
         )
         return _write_terminal_result(
-            output_dir=output_dir,
+            state=state,
             manifest=manifest,
             model=existing_model,
             events=events,
@@ -219,7 +221,7 @@ def _train_locked(
     attempt_id = _next_attempt_id(events)
     if latest_checkpoint is not None:
         _append_event(
-            output_dir,
+            state,
             TinkerSFTResumeEvent(
                 run_id=manifest.run_id,
                 attempt_id=attempt_id,
@@ -227,7 +229,7 @@ def _train_locked(
                 resumed_from_step=latest_checkpoint.step,
             ),
         )
-        events = (*events, _read_last_event(output_dir))
+        events = (*events, _read_last_event(state))
     datums = session.render_examples(train_examples)
     _validate_rendered_datums(datums, train_examples)
     schedule = _build_schedule(datums, spec)
@@ -240,7 +242,8 @@ def _train_locked(
             current_cost=current_cost,
         )
         _write_new_json(
-            _step_intent_path(output_dir, attempt_id, step),
+            state,
+            _step_intent_key(attempt_id, step),
             TinkerSFTStepIntent(
                 run_id=manifest.run_id,
                 attempt_id=attempt_id,
@@ -269,7 +272,7 @@ def _train_locked(
             cost_usd=batch_result.cost_usd,
             cumulative_cost_usd=current_cost,
         )
-        _append_event(output_dir, metric)
+        _append_event(state, metric)
         events = (*events, metric)
         if upper_bound is not None and batch_result.cost_usd is not None:
             if batch_result.cost_usd.value > upper_bound.value:
@@ -285,7 +288,7 @@ def _train_locked(
         if must_checkpoint:
             checkpoint = _save_checkpoint(
                 session=session,
-                output_dir=output_dir,
+                state=state,
                 manifest=manifest,
                 events=events,
                 attempt_id=attempt_id,
@@ -298,7 +301,7 @@ def _train_locked(
         raise TinkerSFTError("completed Tinker SFT training has no final durable checkpoint")
     model = _save_or_load_terminal_model(
         session=session,
-        output_dir=output_dir,
+        state=state,
         manifest=manifest,
         final_checkpoint=final_checkpoint,
         events=events,
@@ -307,7 +310,7 @@ def _train_locked(
         expected_schedule=expected_schedule,
     )
     return _write_terminal_result(
-        output_dir=output_dir,
+        state=state,
         manifest=manifest,
         model=model,
         events=events,
@@ -317,14 +320,8 @@ def _train_locked(
     )
 
 
-def _read_events(output_dir: Path, run_id: ArtifactId) -> tuple[TinkerSFTEvent, ...]:
-    path = output_dir / _EVENTS_FILE
-    if not path.exists():
-        return ()
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise TinkerSFTResumeError(f"cannot read Tinker SFT events at {path}: {exc}") from exc
+def _read_events(state: ProjectRecords, run_id: ArtifactId) -> tuple[TinkerSFTEvent, ...]:
+    lines = b"".join(state.events()).decode("utf-8").splitlines()
     events: list[TinkerSFTEvent] = []
     for number, line in enumerate(lines, start=1):
         if not line:
@@ -440,7 +437,7 @@ def _next_attempt_id(events: Sequence[TinkerSFTEvent]) -> int:
 def _save_checkpoint(
     *,
     session: TrainerSession,
-    output_dir: Path,
+    state: ProjectRecords,
     manifest: TinkerSFTRunManifest,
     events: Sequence[TinkerSFTEvent],
     attempt_id: int,
@@ -460,7 +457,7 @@ def _save_checkpoint(
         checkpoint_name=checkpoint_name,
     )
     _write_new_json(
-        _checkpoint_intent_path(output_dir, checkpoint_id), intent, "Tinker SFT checkpoint intent"
+        state, _checkpoint_intent_key(checkpoint_id), intent, "Tinker SFT checkpoint intent"
     )
     state_path = validate_provider_resource_id(
         session.save_state(checkpoint_name), label="checkpoint state"
@@ -474,14 +471,14 @@ def _save_checkpoint(
         metric_count=step,
         cumulative_cost_usd=cumulative_cost_usd,
     )
-    _append_event(output_dir, checkpoint)
+    _append_event(state, checkpoint)
     return checkpoint
 
 
 def _save_or_load_terminal_model(
     *,
     session: TrainerSession,
-    output_dir: Path,
+    state: ProjectRecords,
     manifest: TinkerSFTRunManifest,
     final_checkpoint: TinkerSFTCheckpoint,
     events: Sequence[TinkerSFTEvent],
@@ -489,10 +486,10 @@ def _save_or_load_terminal_model(
     dataset_input: ArtifactInput,
     expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTModelArtifact:
-    existing_model = _load_model(output_dir, manifest)
+    existing_model = _load_model(state, manifest)
     if existing_model is not None:
         _validate_model_lineage(
-            output_dir,
+            state,
             existing_model,
             events,
             manifest=manifest,
@@ -501,9 +498,9 @@ def _save_or_load_terminal_model(
             expected_schedule=expected_schedule,
         )
         return existing_model
-    intent_path = output_dir / _MODEL_INTENT_FILE
-    if intent_path.exists():
-        intent = _read_model(intent_path, TinkerSFTModelIntent, "Tinker SFT model intent")
+    intent_path = _MODEL_INTENT_FILE
+    if state.read(intent_path) is not None:
+        intent = _read_model(state, intent_path, TinkerSFTModelIntent, "Tinker SFT model intent")
         if intent.run_id != manifest.run_id:
             raise TinkerSFTResumeError("Tinker SFT model intent names a different run")
         raise TinkerSFTResumeError(
@@ -512,6 +509,7 @@ def _save_or_load_terminal_model(
         )
     model_name = f"{manifest.run_id}-final"
     _write_new_json(
+        state,
         intent_path,
         TinkerSFTModelIntent(
             run_id=manifest.run_id,
@@ -542,7 +540,7 @@ def _save_or_load_terminal_model(
         dataset_id=manifest.dataset_id,
         dataset_manifest_sha256=dataset_input.sha256,
         dataset_build_sha256=manifest.dataset_build_sha256,
-        events_sha256=_events_sha256(output_dir),
+        events_sha256=_events_sha256(state),
         final_checkpoint_id=final_checkpoint.checkpoint_id,
         final_checkpoint_state_path=final_checkpoint.state_path,
         sampling_handle=sampling_handle,
@@ -550,13 +548,13 @@ def _save_or_load_terminal_model(
         training_metric_count=len(effective_metrics),
         total_cost_usd=_total_cost(effective_metrics),
     )
-    _write_new_json(output_dir / _MODEL_FILE, model, "Tinker SFT model artifact")
+    _write_new_json(state, _MODEL_FILE, model, "Tinker SFT model artifact")
     return model
 
 
 def _write_terminal_result(
     *,
-    output_dir: Path,
+    state: ProjectRecords,
     manifest: TinkerSFTRunManifest,
     model: TinkerSFTModelArtifact,
     events: Sequence[TinkerSFTEvent],
@@ -565,7 +563,7 @@ def _write_terminal_result(
     expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTResult:
     existing = _load_completed_result(
-        output_dir,
+        state,
         manifest,
         events,
         dataset=dataset,
@@ -605,19 +603,19 @@ def _write_terminal_result(
         dataset_build_sha256=manifest.dataset_build_sha256,
         model_id=model.model_id,
         model_sha256=model_sha256,
-        events_sha256=_events_sha256(output_dir),
+        events_sha256=_events_sha256(state),
         final_checkpoint_id=final_checkpoint.checkpoint_id,
         training_step_count=final_checkpoint.step,
         training_metric_count=len(effective_metrics),
         checkpoint_count=sum(isinstance(event, TinkerSFTCheckpoint) for event in events),
         total_cost_usd=_total_cost(effective_metrics),
     )
-    _write_new_json(output_dir / _RESULT_FILE, result, "Tinker SFT result")
+    _write_new_json(state, _RESULT_FILE, result, "Tinker SFT result")
     return result
 
 
 def _load_completed_result(
-    output_dir: Path,
+    state: ProjectRecords,
     manifest: TinkerSFTRunManifest,
     events: Sequence[TinkerSFTEvent],
     *,
@@ -625,10 +623,10 @@ def _load_completed_result(
     dataset_input: ArtifactInput,
     expected_schedule: Sequence[_ExpectedBatch],
 ) -> TinkerSFTResult | None:
-    path = output_dir / _RESULT_FILE
-    if not path.exists():
+    path = _RESULT_FILE
+    if state.read(path) is None:
         return None
-    result = _read_model(path, TinkerSFTResult, "Tinker SFT result")
+    result = _read_model(state, path, TinkerSFTResult, "Tinker SFT result")
     if result.run_id != manifest.run_id:
         raise TinkerSFTResumeError("Tinker SFT result names a different run")
     if result.dataset_id != manifest.dataset_id:
@@ -643,13 +641,13 @@ def _load_completed_result(
         dataset=dataset,
         dataset_input=dataset_input,
     )
-    model = _load_model(output_dir, manifest)
+    model = _load_model(state, manifest)
     if model is None:
         raise TinkerSFTResumeError("Tinker SFT result exists without its model artifact")
     if result.model_id != model.model_id or result.model_sha256 != sha256_json(model):
         raise TinkerSFTResumeError("Tinker SFT result does not match its model artifact")
     _validate_model_lineage(
-        output_dir,
+        state,
         model,
         events,
         manifest=manifest,
@@ -661,7 +659,7 @@ def _load_completed_result(
     if final_checkpoint is None or result.final_checkpoint_id != final_checkpoint.checkpoint_id:
         raise TinkerSFTResumeError("Tinker SFT result does not match its final checkpoint event")
     effective_metrics = _metrics_at_checkpoint(events, final_checkpoint)
-    if result.events_sha256 != _events_sha256(output_dir):
+    if result.events_sha256 != _events_sha256(state):
         raise TinkerSFTResumeError("Tinker SFT result does not hash the current event log")
     if result.events_sha256 != model.events_sha256:
         raise TinkerSFTResumeError("Tinker SFT result and model name different event logs")
@@ -678,11 +676,13 @@ def _load_completed_result(
     return result
 
 
-def _load_model(output_dir: Path, manifest: TinkerSFTRunManifest) -> TinkerSFTModelArtifact | None:
-    path = output_dir / _MODEL_FILE
-    if not path.exists():
+def _load_model(
+    state: ProjectRecords, manifest: TinkerSFTRunManifest
+) -> TinkerSFTModelArtifact | None:
+    path = _MODEL_FILE
+    if state.read(path) is None:
         return None
-    model = _read_model(path, TinkerSFTModelArtifact, "Tinker SFT model artifact")
+    model = _read_model(state, path, TinkerSFTModelArtifact, "Tinker SFT model artifact")
     if model.run_id != manifest.run_id:
         raise TinkerSFTResumeError("Tinker SFT model artifact names a different run")
     if model.dataset_id != manifest.dataset_id:
@@ -730,7 +730,7 @@ def _validate_dataset_lineage(
 
 
 def _validate_model_lineage(
-    output_dir: Path,
+    state: ProjectRecords,
     model: TinkerSFTModelArtifact,
     events: Sequence[TinkerSFTEvent],
     *,
@@ -752,7 +752,7 @@ def _validate_model_lineage(
     final_checkpoint = _latest_checkpoint(events)
     if final_checkpoint is None:
         raise TinkerSFTResumeError("Tinker SFT model artifact has no durable checkpoint event")
-    if model.events_sha256 != _events_sha256(output_dir):
+    if model.events_sha256 != _events_sha256(state):
         raise TinkerSFTResumeError("Tinker SFT model artifact does not hash the current event log")
     if model.final_checkpoint_id != final_checkpoint.checkpoint_id:
         raise TinkerSFTResumeError("Tinker SFT model artifact names a different final checkpoint")
@@ -774,26 +774,23 @@ def _validate_model_lineage(
         raise TinkerSFTResumeError("Tinker SFT event chain does not exactly complete the schedule")
 
 
-def _events_sha256(output_dir: Path) -> str:
-    path = output_dir / _EVENTS_FILE
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        raise TinkerSFTResumeError(f"Tinker SFT event log is required at {path}: {exc}") from exc
+def _events_sha256(state: ProjectRecords) -> str:
+    """Hash exact canonical event bytes in committed execution order."""
+    payload = b"".join(state.events())
     if not payload:
         raise TinkerSFTResumeError("Tinker SFT event log is empty")
     return hashlib.sha256(payload).hexdigest()
 
 
 def _assert_no_ambiguous_checkpoint_intent(
-    output_dir: Path, run_id: ArtifactId, events: Sequence[TinkerSFTEvent]
+    state: ProjectRecords, run_id: ArtifactId, events: Sequence[TinkerSFTEvent]
 ) -> None:
     checkpoint_ids = {
         event.checkpoint_id for event in events if isinstance(event, TinkerSFTCheckpoint)
     }
     intent_ids: set[ArtifactId] = set()
-    for path in output_dir.glob("*.checkpoint-intent.json"):
-        intent = _read_model(path, TinkerSFTCheckpointIntent, "Tinker SFT checkpoint intent")
+    for path in (key for key in state.list_ids() if key.endswith(".checkpoint-intent.json")):
+        intent = _read_model(state, path, TinkerSFTCheckpointIntent, "Tinker SFT checkpoint intent")
         if intent.run_id != run_id:
             raise TinkerSFTResumeError("Tinker SFT checkpoint intent names a different run")
         if intent.checkpoint_id not in checkpoint_ids:
@@ -807,7 +804,7 @@ def _assert_no_ambiguous_checkpoint_intent(
 
 
 def _assert_no_ambiguous_step_intent(
-    output_dir: Path, run_id: ArtifactId, events: Sequence[TinkerSFTEvent]
+    state: ProjectRecords, run_id: ArtifactId, events: Sequence[TinkerSFTEvent]
 ) -> None:
     metrics = {
         (event.attempt_id, event.step): event
@@ -815,8 +812,8 @@ def _assert_no_ambiguous_step_intent(
         if isinstance(event, TinkerSFTMetric)
     }
     intent_keys: set[tuple[int, int]] = set()
-    for path in output_dir.glob("*.step-intent.json"):
-        intent = _read_model(path, TinkerSFTStepIntent, "Tinker SFT optimizer-step intent")
+    for path in (key for key in state.list_ids() if key.endswith(".step-intent.json")):
+        intent = _read_model(state, path, TinkerSFTStepIntent, "Tinker SFT optimizer-step intent")
         if intent.run_id != run_id:
             raise TinkerSFTResumeError("Tinker SFT optimizer-step intent names a different run")
         metric = metrics.get((intent.attempt_id, intent.step))
@@ -835,31 +832,27 @@ def _assert_no_ambiguous_step_intent(
         raise TinkerSFTResumeError("Tinker SFT completed metric is missing its pre-dispatch intent")
 
 
-def _step_intent_path(output_dir: Path, attempt_id: int, step: int) -> Path:
-    return output_dir / f"attempt-{attempt_id}-step-{step}.step-intent.json"
+def _step_intent_key(attempt_id: int, step: int) -> str:
+    """Return the stable database record key for a scheduled optimizer step."""
+    return f"attempt-{attempt_id}-step-{step}.step-intent.json"
 
 
-def _checkpoint_intent_path(output_dir: Path, checkpoint_id: ArtifactId) -> Path:
-    return output_dir / f"{checkpoint_id}.checkpoint-intent.json"
+def _checkpoint_intent_key(checkpoint_id: ArtifactId) -> str:
+    """Return the stable database record key for a checkpoint dispatch."""
+    return f"{checkpoint_id}.checkpoint-intent.json"
 
 
-def _append_event(output_dir: Path, event: TinkerSFTEvent) -> None:
+def _append_event(state: ProjectRecords, event: TinkerSFTEvent) -> None:
+    """Durably append one immutable execution event with exact canonical bytes."""
     assert_secret_free(event)
-    path = output_dir / _EVENTS_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = canonical_json_bytes(event) + b"\n"
-    with path.open("ab") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
+    state.append(sha256_json(event), payload)
 
 
-def _read_last_event(output_dir: Path) -> TinkerSFTEvent:
+def _read_last_event(state: ProjectRecords) -> TinkerSFTEvent:
     events = _read_events(
-        output_dir,
-        _read_model(
-            output_dir / _MANIFEST_FILE, TinkerSFTRunManifest, "Tinker SFT manifest"
-        ).run_id,
+        state,
+        _read_model(state, _MANIFEST_FILE, TinkerSFTRunManifest, "Tinker SFT manifest").run_id,
     )
     if not events:
         raise TinkerSFTResumeError("Tinker SFT resume event was not persisted")

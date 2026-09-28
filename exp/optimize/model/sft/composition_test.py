@@ -28,10 +28,12 @@ from exp.optimize.model.sft.composition import (
     sft_model_optimization_output_dir,
     write_sft_model_optimization_config,
 )
+from exp.optimize.model.sft.run_manifest import sft_run_records
 from exp.optimize.model.sft.training import TinkerSFTOptimizer
 from exp.optimize.model.sft.training_contracts import TinkerSFTSpec
 from exp.optimize.model.sft.training_test import (
     _TIME,
+    _delete_record,
     _FakeBackend,
     _persisted_dataset,
     _spec,
@@ -117,7 +119,12 @@ def test_composition_trains_only_the_persisted_dataset_and_registers_after_verif
     assert catalog.models["trained"].connection == "tinker"
     assert catalog.models["trained"].model == completed.model.sampling_handle
     assert backend.open_resume_paths == [None]
-    assert (sft_model_optimization_output_dir(store, config.config_id) / "result.json").is_file()
+    assert (
+        sft_run_records(store, sft_model_optimization_output_dir(store, config.config_id)).read(
+            "result.json"
+        )
+        is not None
+    )
 
 
 def test_completed_run_is_verified_then_idempotently_reused_without_opening_backend(
@@ -181,7 +188,7 @@ def test_resume_uses_only_a_durable_checkpoint_before_catalog_registration(tmp_p
         code_revision="w14m-test",
     )
     for name in ("model.json", "model-intent.json", "result.json"):
-        (output_dir / name).unlink()
+        _delete_record(sft_run_records(store, output_dir), name)
     resumed_backend = _FakeBackend()
 
     preflight = preflight_sft_model_optimization(
@@ -309,7 +316,7 @@ def test_model_only_completed_w13_recovers_before_budget_estimation(tmp_path: Pa
         created_at=_TIME,
         code_revision="w14m-test",
     )
-    (output_dir / "result.json").unlink()
+    _delete_record(sft_run_records(prepared.store, output_dir), "result.json")
     verifier_probe = _FakeBackend(conservative_cost_per_batch=None)
 
     preflight = preflight_sft_model_optimization(
@@ -320,7 +327,7 @@ def test_model_only_completed_w13_recovers_before_budget_estimation(tmp_path: Pa
     )
 
     assert preflight.completed_result is not None
-    assert (output_dir / "result.json").is_file()
+    assert sft_run_records(prepared.store, output_dir).read("result.json") is not None
     assert verifier_probe.cost_calls == 0
     assert verifier_probe.open_resume_paths == []
     assert verifier_probe.train_calls == 0

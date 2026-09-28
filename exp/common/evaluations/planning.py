@@ -302,8 +302,7 @@ def _build_evaluation_plan(
         fidelity_protocol_sha256=fidelity_protocol_sha256,
         cells=cells,
     )
-    plan_destination = store.project_directory / "artifacts" / plan.plan_id
-    if plan_destination.exists():
+    if store.exists(plan.plan_id):
         existing, _input = read_evaluation_plan(store, plan.plan_id)
         replay = plan.model_copy(update={"created_at": existing.created_at})
         if existing != replay:

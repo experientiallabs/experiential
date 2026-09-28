@@ -12,6 +12,7 @@ from exp.common.core.artifacts import ArtifactEnvelope
 from exp.common.judging import Judgment, Rubric
 from exp.common.models import AssistantAction, ModelCatalog, ModelRequest, ModelResponse, Usage
 from exp.common.project import ArtifactManifest
+from exp.common.project.records import ProjectRecords
 from exp.common.rollouts import RolloutArtifact
 from exp.optimize.evaluation.judging_resume import (
     prepare_judging_revision,
@@ -20,6 +21,7 @@ from exp.optimize.evaluation.judging_resume import (
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import (
     EvaluationDefaults,
+    EvaluationRun,
     execute_run,
     load_run,
     prepare_run,
@@ -325,6 +327,9 @@ def test_judging_recovery_can_exceed_original_quote_under_approved_allowance(
     first = execute_run(project, run, runtime, provider_spend_consented=True)
     assert first.report.compared_cells == 0
     assert first.simulation_cost_usd == 0
+    completed = load_run(project, run.run_id)
+    with pytest.raises(ValueError, match="completed evaluation metadata is immutable"):
+        save_run(project, completed.model_copy(update={"report_id": "rewritten-report"}))
     before = Counter(alias for alias, _ in state.completion_calls)
     revision = prepare_judging_revision(
         project,
@@ -341,3 +346,11 @@ def test_judging_recovery_can_exceed_original_quote_under_approved_allowance(
     assert result.report.compared_cells == 3
     assert result.judge_cost_usd > run.prepared.cost.maximum_cost_usd
     assert result.judge_cost_usd < resumed.spending_limit_usd
+    history = tuple(
+        EvaluationRun.model_validate_json(payload)
+        for payload in ProjectRecords(
+            project.paths.root, project.paths.project_id, "evaluation-runs"
+        ).events()
+    )
+    assert history == (completed, load_run(project, run.run_id))
+    assert history[0].project_config_sha256 == history[1].project_config_sha256

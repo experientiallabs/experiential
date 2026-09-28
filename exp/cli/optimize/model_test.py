@@ -37,6 +37,7 @@ from exp.optimize.model.sft import (
     sft_model_optimization_output_dir,
     write_sft_model_optimization_config,
 )
+from exp.optimize.model.sft.run_manifest import MANIFEST_FILE, sft_run_records
 from exp.optimize.model.sft.runtime_source_test import _complete, _request
 from exp.optimize.model.sft.selection import load_latest_sft_model_optimization
 from exp.optimize.model.sft.training_test import _TIME, _FakeBackend, _persisted_dataset, _spec
@@ -999,9 +1000,12 @@ def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
     )
     assert len(accepted_dataset.rows) == 1
     assert (
-        sft_model_optimization_output_dir(configured.store, accepted_config.config_id)
-        / "manifest.json"
-    ).is_file()
+        sft_run_records(
+            configured.store,
+            sft_model_optimization_output_dir(configured.store, accepted_config.config_id),
+        ).read(MANIFEST_FILE)
+        is not None
+    )
     _complete(
         RuntimeInteractionJournal(configured.store.paths),
         key="completion-after-acceptance",

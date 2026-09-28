@@ -14,6 +14,7 @@ from pydantic import Field, model_validator
 
 from exp.common.config.settings import GatewayResourceSettings
 from exp.common.core.artifacts import ContractModel, stable_id
+from exp.common.sqlite.connection import persistent_connection
 from exp.runtime.gateway.attempt_costs import (
     LONG_CONTEXT_TIER_MARGIN_PERCENT as LONG_CONTEXT_TIER_MARGIN_PERCENT,
 )
@@ -30,7 +31,7 @@ from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
 )
-from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
+from exp.runtime.gateway.sqlite.migrations import initialize_database
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 __all__ = ["MAXIMUM_NANO_USD"]
