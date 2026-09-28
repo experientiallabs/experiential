@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -92,7 +93,10 @@ def test_explicit_cohort_keeps_one_policy_then_updates_exactly_once(tmp_path: Pa
     asyncio.run(run())
 
 
-def test_explicit_batch_recovers_lost_native_receipt_without_another_update(tmp_path: Path) -> None:
+@pytest.mark.parametrize("lag", [0, 2])
+def test_explicit_batch_recovers_lost_native_receipt_without_another_update(
+    tmp_path: Path, lag: int
+) -> None:
     """A leased explicit batch recovers after restart before any new feedback can train."""
 
     async def run() -> None:
@@ -100,7 +104,7 @@ def test_explicit_batch_recovers_lost_native_receipt_without_another_update(tmp_
         runtime = Runtime()
         runtime.after_commit_error = OSError("lost acknowledgement")
         config = RunConfiguration(training_admission="explicit")
-        recipe = spec().model_copy(update={"objective": "reinforce"})
+        recipe = spec().model_copy(update={"objective": "reinforce", "max_policy_lag": lag})
         first = LearningController(tmp_path, recipe, runtime, config)
         await first.start()
         generated = await first.generate(
@@ -193,13 +197,16 @@ class Runtime:
         self.close_entered = asyncio.Event()
         self.close_gate: asyncio.Event | None = None
         self.after_commit_error: Exception | None = None
-        self.directory = Path("/unused")
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.directory = Path(self._temporary_directory.name).resolve()
+        self.spec = spec()
 
     async def open(
         self, spec: ClaasTrainingSpec, resume: TrainingCheckpoint | None = None, *, mode: RunMode
     ) -> Runtime:
         """Record one factory allocation while retaining committed idempotency receipts."""
         self.open_count += 1
+        self.spec = spec
         self.policy_revision = resume.policy_revision if resume else spec.initial_policy_revision
         return self
 
@@ -223,12 +230,13 @@ class Runtime:
         receipt = self.receipts.get(batch.batch_id)
         if receipt is None:
             self.optimizations += 1
-            receipt = result(batch, self.directory, step=self.optimizations)
             history = tuple(f"policy-{index}" for index in range(self.optimizations, -1, -1))
-            receipt = receipt.model_copy(
-                update={
-                    "checkpoint": receipt.checkpoint.model_copy(update={"policy_history": history})
-                }
+            receipt = result(
+                batch,
+                self.directory,
+                step=self.optimizations,
+                recipe=self.spec,
+                history=history,
             )
             self.receipts[batch.batch_id] = receipt
         self.policy_revision = receipt.checkpoint.policy_revision
