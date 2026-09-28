@@ -83,6 +83,7 @@ from exp.runtime.models.providers.openai_payloads import (
 )
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
+    require_between_tools_support,
     shape_anthropic_thinking_config,
 )
 from exp.runtime.models.providers.server_tools import (
@@ -164,6 +165,7 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
+    require_between_tools_support(profiles, request)
     if request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
         require_chat_logprobs(profiles, request)
     require_responses_logprobs(profiles, request)

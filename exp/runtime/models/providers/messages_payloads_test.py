@@ -99,7 +99,7 @@ def _capability(exc_info: pytest.ExceptionInfo[ProviderCapabilityError]) -> str:
 
 
 @pytest.mark.parametrize("choice", ("required", GatewayNamedToolChoice(name="lookup")))
-@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5"))
+@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"))
 def test_model_declines_a_forced_tool_choice_before_dispatch(
     choice: str | GatewayNamedToolChoice, model_id: str
 ) -> None:

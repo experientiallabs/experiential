@@ -22,11 +22,12 @@ _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES = (
     "claude-fable-5-1",
     "claude-mythos-5-1",
     "claude-opus-5-5",
+    "claude-sonnet-5-5",
 )
 """Exact point releases whose ``tool_choice`` ``any``/``tool`` return a 400 by name.
 
-Fable 5.1, Mythos 5.1 and Opus 5.5 reject forced tool use with or without
-thinking. Manual budgeted thinking also excludes forced tools; the payload
+Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 reject forced tool use with or
+without thinking. Manual budgeted thinking also excludes forced tools; the payload
 builder checks that independent per-request constraint. Older adaptive
 releases can force tools, so entries are exact releases rather than generation
 prefixes. A new point release must have its own verified contract. A dated

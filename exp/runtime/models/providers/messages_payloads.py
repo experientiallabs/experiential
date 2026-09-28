@@ -325,7 +325,7 @@ def anthropic_messages_stream_payload(
                 )
         payload["thinking"] = thinking
         if (
-            request.provider_thinking_config.get("type") == "adaptive"
+            request.provider_thinking_config.get("type") in {"adaptive", "between_tools"}
             and supports_reasoning
             and not budgeted_only
             and effective_reasoning_effort is not None

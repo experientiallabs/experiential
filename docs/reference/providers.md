@@ -70,6 +70,46 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
 
+## Claude Sonnet 5.5
+
+The exact `claude-sonnet-5-5` release uses adaptive thinking with a `high` default effort.
+Its supported effort levels are `low`, `medium`, `high`, `xhigh`, and `max`. Discovery keeps
+Sonnet 5's defaults separate. The published window is 1,000,000 tokens and synchronous output
+is bounded at 128,000 tokens. Base prices per million tokens are $2 input, $10 output, $0.20
+cache reads, $2.50 five-minute cache writes, and $4 one-hour cache writes; a hosted deployment
+must author its complete schedule rather than infer it from the provider name.
+
+On the gateway's Messages endpoint, turn off up-front thinking with the type-only object:
+
+```json
+{
+  "model": "sonnet",
+  "max_tokens": 512,
+  "thinking": {"type": "between_tools"},
+  "output_config": {"effort": "high"},
+  "messages": [{"role": "user", "content": "Summarize this in one sentence."}]
+}
+```
+
+Here `sonnet` is an alias configured for Sonnet 5.5 on an Anthropic Messages wire. Between-tools
+thinking works only at `low`, `medium`, or `high`; additional thinking fields, including null
+fields, are rejected. It is never translated to an effort-only request on another dialect.
+Use adaptive thinking for `xhigh` or `max`. `thinking.type=disabled` is rejected with a remedy
+naming `between_tools`, and explicit numeric thinking budgets are refused. The gateway's
+existing disclosed translation of bare `enabled` to `adaptive` remains available.
+
+Sonnet 5.5 does not support forced tool choice or non-default sampling controls. The gateway
+retains its existing capability-preservation policy: it prefers a route that preserves caller
+controls and otherwise discloses permitted substitutions, including forced tool choice to
+`auto`, rather than send a known-invalid upstream request. Use `auto` with strict tool schemas
+or structured output when schema validity is required. This does not guarantee a tool call.
+
+Thinking blocks remain opaque and are replayed unchanged on their issuing wire. Keep history
+append-only: the provider binds Sonnet 5.5 blocks to their model, account, and conversation.
+The gateway does not claim support for new provider beta features merely because this model
+supports them. See the official [model specifications](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
+and [migration contract](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5).
+
 ## Plan connections (ChatGPT and Claude)
 
 A connection may dispatch on a consumer plan instead of an API key: `subscription = "chatgpt"`

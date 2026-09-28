@@ -1364,7 +1364,7 @@ def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
         (GatewayApiSurface.MESSAGES, GatewayNamedToolChoice(name="lookup")),
     ),
 )
-@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5"))
+@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"))
 def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
     surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice, model_id: str
 ) -> None:
