@@ -29,6 +29,8 @@ if sys.platform != "win32":
 
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENTS = frozenset(
@@ -255,7 +257,7 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
 
 
 def _assert_core_requirements(metadata: str) -> None:
-    """Check unconditional SDK dependencies and Python-gated Capture dependencies."""
+    """Check SDK requirements, the HTTPX2 security floor and Python-gated Capture."""
     _assert_allowed_requirements(metadata)
     requirements: dict[str, str] = {}
     for name, marker in _metadata_requirements(metadata):
@@ -267,6 +269,13 @@ def _assert_core_requirements(metadata: str) -> None:
     for name, marker in requirements.items():
         expected = 'python_version>="3.13"' if name in REQUIRED_CAPTURE_REQUIREMENTS else ""
         assert marker == expected, f"unexpected dependency marker for {name}: {marker!r}"
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for value in headers.get_all("Requires-Dist", []):
+        requirement = Requirement(re.sub(r"\s+", " ", value))
+        if requirement.name.casefold() == "httpx2" and requirement.marker is None:
+            assert requirement.specifier == SpecifierSet(">=2.12,<3"), (
+                f"unexpected HTTPX2 security constraint: {requirement.specifier}"
+            )
 
 
 def test_core_dependency_markers_preserve_sdk_python_312() -> None:

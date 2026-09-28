@@ -844,7 +844,7 @@ source = { directory = "exp/runtime/gateway/native" }
 [[package]]
 name = "exp-mitmproxy"
 version = "12.2.3.post2"
-source = { git = "https://github.com/experientiallabs/mitmproxy?rev=ee6a86cc67214add9bca4b938408d80a14833ecc#ee6a86cc67214add9bca4b938408d80a14833ecc" }
+source = { git = "https://github.com/experientiallabs/mitmproxy?rev=31f5f5aaf4faba93e7e5ba9f7657ef9b1caf16d8#31f5f5aaf4faba93e7e5ba9f7657ef9b1caf16d8" }
 dependencies = [
     { name = "aioquic" },
     { name = "argon2-cffi" },
@@ -945,7 +945,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.2" },
     { name = "cryptography", marker = "python_full_version >= '3.13'", specifier = ">=50.0.1,<51" },
     { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
-    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy?rev=ee6a86cc67214add9bca4b938408d80a14833ecc" },
+    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy?rev=31f5f5aaf4faba93e7e5ba9f7657ef9b1caf16d8" },
     { name = "exp-mitmproxy-rs", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy_rs?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
     { name = "filelock", specifier = ">=3.12" },
