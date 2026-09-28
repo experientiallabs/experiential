@@ -583,6 +583,34 @@ is idempotent; conflicting changes require a new experience. Only complete ready
 The durable buffer retains original student token IDs, sampled log probabilities, tokenizer and
 policy identities. Arbitrary provider traces cannot be imported as if they were exact RL samples.
 
+To finish and score several episodes before updating, configure a resident run with
+`"training_admission": "explicit"`. Collect responses at one policy revision, then submit all
+selected feedback together. The application owns reward attribution and any reward centering:
+
+```python
+from exp.common.claas.batches import TrainingSubmission
+from exp.common.claas.learning import FeedbackSubmission
+
+accepted = learner.train_batch(TrainingSubmission(
+    batch_id="update-001",
+    expected_policy_revision=policy_revision,
+    feedback=tuple(
+        FeedbackSubmission(response_id=response_id, reward=reward)
+        for response_id, reward in scored_responses
+    ),
+))
+receipt = learner.batch_status("update-001")
+# Poll until receipt["state"] == "completed" to read its checkpoint and metrics.
+```
+
+`POST /v1/train/batch` returns 202 after durable acceptance. An identical batch ID replays its
+receipt even after the policy advances. Conflicting reuse, stale policies, overlapping selections,
+and oversized batches fail before feedback changes. Configure batch token/example limits for the
+whole selection: one accepted batch means one optimizer update, with native microbatch accumulation.
+Explicit admission disables automatic and partial updates. Ordinary `/v1/train` is rejected;
+`/v1/drain` finishes an accepted batch without selecting additional ready records. The default
+`"automatic"` admission retains response-driven training. Neither mode defines episodes or rewards.
+
 For a later training-only burst, use `"mode": "burst"` with the same immutable recipe/state,
 then import `TrainingExample` JSONL if needed:
 

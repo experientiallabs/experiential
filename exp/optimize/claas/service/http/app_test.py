@@ -21,7 +21,9 @@ from openai.types.chat import ChatCompletionAssistantMessageParam
 from openai.types.responses import ResponseFunctionToolCall, ResponseInputParam
 from openai.types.responses.function_tool_param import FunctionToolParam
 
+from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
+from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ToolCall
 from exp.optimize.claas.service.configuration import RunConfiguration
@@ -39,6 +41,67 @@ _TOOL: FunctionToolParam = {
     "parameters": {},
     "strict": False,
 }
+
+
+def test_explicit_batch_http_acceptance_is_nonblocking_and_receipt_is_durable(
+    tmp_path: Path,
+) -> None:
+    """The HTTP boundary returns one exact lease before training and replays its final receipt."""
+
+    async def run() -> None:
+        """Generate through the API, block the optimizer, and poll the same immutable batch."""
+        runtime = WireRuntime()
+        runtime.train_gate = asyncio.Event()
+        controller = LearningController(
+            tmp_path,
+            spec().model_copy(update={"objective": "reinforce"}),
+            runtime,
+            RunConfiguration(training_admission="explicit", minimum_ready_examples=1),
+        )
+        await controller.start()
+        app = create_app(controller, api_key=_KEY, manage_lifecycle=False)
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test", headers=_HEADERS
+            ) as client:
+                feedback: list[FeedbackSubmission] = []
+                for index in range(2):
+                    response = await client.post(
+                        "/v1/completions", json={"model": "tiny-model", "prompt": str(index)}
+                    )
+                    assert response.status_code == 200
+                    feedback.append(
+                        FeedbackSubmission(response_id=response.json()["id"], reward=index - 0.5)
+                    )
+                submission = TrainingSubmission(
+                    batch_id="cohort-1",
+                    expected_policy_revision="policy-0",
+                    feedback=tuple(feedback),
+                )
+                body = submission.model_dump(mode="json")
+                accepted = await asyncio.wait_for(client.post("/v1/train/batch", json=body), 0.25)
+                assert accepted.status_code == 202 and accepted.json()["state"] == "pending"
+                await asyncio.wait_for(runtime.train_entered.wait(), 1)
+                repeated = await asyncio.wait_for(client.post("/v1/train/batch", json=body), 0.25)
+                assert repeated.json() == accepted.json()
+                pending = await client.get("/v1/train/batch/cohort-1")
+                assert pending.json() == accepted.json()
+                assert (await client.post("/v1/train")).status_code == 400
+                runtime.train_gate.set()
+                for _ in range(100):
+                    completed = await client.get("/v1/train/batch/cohort-1")
+                    if completed.json()["state"] == "completed":
+                        break
+                    await asyncio.sleep(0.001)
+                assert completed.json()["result"]["checkpoint"]["policy_revision"] == "policy-1"
+                replay = await client.post("/v1/train/batch", json=body)
+                assert replay.json() == completed.json()
+                assert runtime.optimizations == 1
+        finally:
+            runtime.train_gate.set()
+            await controller.close()
+
+    asyncio.run(run())
 
 
 @contextmanager

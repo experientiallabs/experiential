@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import Lock
@@ -124,6 +125,8 @@ class RecordingCandidateClient:
         redacted_field_names: frozenset[str],
         clock: Callable[[], datetime],
         token_counter: TokenCounter,
+        excluded_lineage_ids: tuple[str, ...] | None = None,
+        initial_environment_state: JsonObject | None = None,
     ) -> None:
         """Bind one task, two independent model clients, and strict simulation boundaries.
 
@@ -146,11 +149,17 @@ class RecordingCandidateClient:
             redacted_field_names: Project fields redacted before events persist.
             clock: Time source used to order emitted spans deterministically in tests.
             token_counter: Full-request counter used before every provider call.
+            excluded_lineage_ids: Grounding exclusions; None excludes this task lineage.
+                Training may explicitly pass () to reuse its own fit demonstrations.
+            initial_environment_state: Private starting state, never sent to the candidate.
         """
         if maximum_transition_attempts < 1:
             raise ValueError("maximum_transition_attempts must be positive")
         self._maximum_transition_attempts = maximum_transition_attempts
         self._task = task
+        self._excluded_lineage_ids = (
+            (task.lineage_group_id,) if excluded_lineage_ids is None else excluded_lineage_ids
+        )
         self._candidate = candidate
         self._world_model = world_model
         self._grounded_world_model = grounded_world_model
@@ -177,7 +186,8 @@ class RecordingCandidateClient:
         self._retrieval_economics: list[OperationEconomics] = []
         self._visible_transcript: tuple[ModelMessage, ...] = ()
         self._terminal = False
-        self._environment_state: JsonObject = {}
+        self._initial_environment_state: JsonObject = deepcopy(initial_environment_state or {})
+        self._environment_state = deepcopy(self._initial_environment_state)
         self._pending_tools: dict[str, tuple[ToolCall, SimulatedToolResult]] = {}
         self._tool_lock = Lock()
         self._failure: TextSimulationError | None = None
@@ -447,7 +457,7 @@ class RecordingCandidateClient:
                 task=self._task.instruction,
                 initial_context=self._task.initial_context,
                 action=action,
-                excluded_lineage_ids=(self._task.lineage_group_id,),
+                excluded_lineage_ids=self._excluded_lineage_ids,
                 top_k=self._grounded_world_model.artifact.top_k,
             )
             for action in candidate_rag_actions(candidate_response.output)
@@ -470,7 +480,7 @@ class RecordingCandidateClient:
                 task=self._task,
                 visible_messages=candidate_request.messages,
                 candidate_response=candidate_response.output,
-                excluded_lineage_ids=(self._task.lineage_group_id,),
+                excluded_lineage_ids=self._excluded_lineage_ids,
                 state=self._environment_state,
                 maximum_output_tokens=min(
                     self._maximum_output_tokens,
@@ -678,7 +688,9 @@ class RecordingCandidateClient:
         self._transitions = [
             parse_world_model_transition(item.output) for item in checkpoint.world_model_responses
         ]
-        self._environment_state = self._transitions[-1].state if self._transitions else {}
+        self._environment_state = deepcopy(
+            self._transitions[-1].state if self._transitions else self._initial_environment_state
+        )
         self._retrieval_economics = list(checkpoint.retrieval_economics)
         self._candidate_spans = [s for s in spans if s.kind == RolloutEventKind.AGENT_MODEL_CALL]
         self._world_model_spans = [
@@ -687,10 +699,6 @@ class RecordingCandidateClient:
 
     def _check_spend_ceiling(self, *, role: str) -> None:
         """Apply the episode's overspend policy before one paid dispatch.
-
-        Reconciled actual spend is compared against the cell ceiling: in stop mode unknown
-        prior spend or a reached ceiling fails the episode closed before dispatch, and by
-        default the authorized episode logs one warning and continues.
 
         Args:
             role: Candidate, query embedding, or world-model label for safe diagnostics.

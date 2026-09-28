@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import TypeAdapter, ValidationError
 
+from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import JsonObject
 from exp.optimize.claas.service.controller import LearningController
@@ -160,6 +161,18 @@ def create_app(
         """Request an asynchronous update, including a ready partial batch."""
         status = await controller.trigger_train()
         return JSONResponse(status.model_dump(mode="json"), status_code=202)
+
+    @app.post("/v1/train/batch", status_code=202)
+    async def train_batch(request: Request) -> JSONResponse:
+        """Accept all selected feedback atomically and queue exactly one optimizer update."""
+        submission = TrainingSubmission.model_validate(await read_body(request))
+        status = await controller.submit_training_batch(submission)
+        return JSONResponse(status.model_dump(mode="json"), status_code=202)
+
+    @app.get("/v1/train/batch/{batch_id}")
+    async def batch_status(batch_id: str) -> JSONResponse:
+        """Read the original batch receipt without waiting for GPU execution."""
+        return JSONResponse(controller.batch_status(batch_id).model_dump(mode="json"))
 
     @app.post("/v1/drain")
     async def drain() -> JSONResponse:

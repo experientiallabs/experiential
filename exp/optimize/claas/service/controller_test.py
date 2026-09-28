@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.claas.batches import TrainingSubmission
 from exp.common.claas.generation import GenerationRequest, GenerationResult
+from exp.common.claas.learning import FeedbackSubmission
 from exp.common.models import AssistantAction
 from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.buffer.store_test import item, result
@@ -22,6 +24,157 @@ from exp.optimize.claas.training_contracts import (
     TrainingResult,
 )
 from exp.optimize.claas.training_contracts_test import spec
+
+
+def test_explicit_cohort_keeps_one_policy_then_updates_exactly_once(tmp_path: Path) -> None:
+    """Thirty-two actions from sixteen episodes form one update, excluding a ready tail."""
+
+    async def run() -> None:
+        """Exercise durable admission and idempotent retries while the optimizer is blocked."""
+        runtime = Runtime()
+        runtime.train_gate = asyncio.Event()
+        controller = LearningController(
+            tmp_path,
+            spec().model_copy(update={"objective": "reinforce"}),
+            runtime,
+            RunConfiguration(training_admission="explicit", minimum_ready_examples=1),
+        )
+        await controller.start()
+        try:
+            feedback: list[FeedbackSubmission] = []
+            for episode in range(16):
+                reward = float(episode < 8) - 0.5
+                for turn in range(2):
+                    generated = await controller.generate(
+                        GenerationRequest(
+                            request_id=f"episode-{episode}-turn-{turn}",
+                            model="tiny-model",
+                            prompt="question",
+                        )
+                    )
+                    assert generated.exact_tokens.policy_revision == "policy-0"
+                    feedback.append(
+                        FeedbackSubmission(response_id=generated.response_id, reward=reward)
+                    )
+            tail = await controller.generate(
+                GenerationRequest(request_id="tail", model="tiny-model", prompt="question")
+            )
+            await controller.submit_feedback(tail.response_id, scalar_reward=1.0)
+            await asyncio.sleep(0)
+            assert runtime.optimizations == 0 and not runtime.train_entered.is_set()
+            assert (await controller.drain()).status.updates == 0
+            with pytest.raises(ValueError, match="exact /v1/train/batch"):
+                await controller.trigger_train()
+            cohort = TrainingSubmission(
+                batch_id="cohort-1", expected_policy_revision="policy-0", feedback=tuple(feedback)
+            )
+            accepted = await controller.submit_training_batch(cohort)
+            assert accepted.state == "pending" and len(accepted.response_ids) == 32
+            await asyncio.wait_for(runtime.train_entered.wait(), 1)
+            assert await asyncio.wait_for(controller.submit_training_batch(cohort), 0.1) == accepted
+            assert controller.batch_status("cohort-1") == accepted
+            runtime.train_gate.set()
+            for _ in range(100):
+                if controller.batch_status("cohort-1").state == "completed":
+                    break
+                await asyncio.sleep(0.001)
+            completed = controller.batch_status("cohort-1")
+            assert completed.state == "completed"
+            assert await controller.submit_training_batch(cohort) == completed
+            report = await controller.drain()
+            assert report.status.updates == runtime.optimizations == 1
+            assert report.status.buffer.consumed == 32 and report.status.buffer.ready == 1
+            assert report.checkpoint is not None and report.checkpoint.policy_revision == "policy-1"
+        finally:
+            runtime.train_gate.set()
+            await controller.close()
+
+    asyncio.run(run())
+
+
+def test_explicit_batch_recovers_lost_native_receipt_without_another_update(tmp_path: Path) -> None:
+    """A leased explicit batch recovers after restart before any new feedback can train."""
+
+    async def run() -> None:
+        """Lose one native result, reopen durable state, and verify exact caller retry."""
+        runtime = Runtime()
+        runtime.after_commit_error = OSError("lost acknowledgement")
+        config = RunConfiguration(training_admission="explicit")
+        recipe = spec().model_copy(update={"objective": "reinforce"})
+        first = LearningController(tmp_path, recipe, runtime, config)
+        await first.start()
+        generated = await first.generate(
+            GenerationRequest(request_id="one", model="tiny-model", prompt="question")
+        )
+        cohort = TrainingSubmission(
+            batch_id="cohort-1",
+            expected_policy_revision="policy-0",
+            feedback=(FeedbackSubmission(response_id=generated.response_id, reward=0.5),),
+        )
+        await first.submit_training_batch(cohort)
+        await asyncio.wait_for(runtime.train_entered.wait(), 1)
+        await first.close()
+        assert first.batch_status("cohort-1").state == "pending"
+        second = LearningController(tmp_path, recipe, runtime, config)
+        try:
+            await second.start()
+            completed = await second.submit_training_batch(cohort)
+            assert completed.state == "completed"
+            assert runtime.optimizations == 1
+        finally:
+            await second.close()
+
+    asyncio.run(run())
+
+
+def test_explicit_retry_wakes_a_lease_after_failed_acceptance_flush(tmp_path: Path) -> None:
+    """Retry a failed persistence acknowledgement without leaving its accepted lease idle."""
+
+    async def run() -> None:
+        """Fail once after durable admission while the background worker is waiting."""
+        runtime = Runtime()
+        fail_next = False
+
+        async def persist() -> None:
+            """Inject one host flush failure without affecting shutdown or retry."""
+            nonlocal fail_next
+            if fail_next:
+                fail_next = False
+                raise OSError("acceptance flush failed")
+
+        controller = LearningController(
+            tmp_path,
+            spec().model_copy(update={"objective": "reinforce"}),
+            runtime,
+            RunConfiguration(training_admission="explicit"),
+            persist=persist,
+        )
+        await controller.start()
+        try:
+            generated = await controller.generate(
+                GenerationRequest(request_id="one", model="tiny-model", prompt="question")
+            )
+            await asyncio.sleep(0)
+            cohort = TrainingSubmission(
+                batch_id="cohort-1",
+                expected_policy_revision="policy-0",
+                feedback=(FeedbackSubmission(response_id=generated.response_id, reward=0.5),),
+            )
+            fail_next = True
+            with pytest.raises(OSError, match="acceptance flush failed"):
+                await controller.submit_training_batch(cohort)
+            assert controller.batch_status("cohort-1").state == "pending"
+            assert not runtime.train_entered.is_set()
+            accepted = await controller.submit_training_batch(cohort)
+            assert accepted.state == "pending"
+            await asyncio.wait_for(runtime.train_entered.wait(), 1)
+            await controller.drain()
+            assert controller.batch_status("cohort-1").state == "completed"
+            assert runtime.optimizations == 1
+        finally:
+            await controller.close()
+
+    asyncio.run(run())
 
 
 class Runtime:
