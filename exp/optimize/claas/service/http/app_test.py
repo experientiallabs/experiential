@@ -26,6 +26,7 @@ from exp.common.claas.generation import GenerationRequest, GenerationResult
 from exp.common.claas.learning import FeedbackSubmission
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ToolCall
+from exp.optimize.claas.buffer.store import ExperienceBuffer
 from exp.optimize.claas.service.configuration import RunConfiguration
 from exp.optimize.claas.service.controller import LearningController
 from exp.optimize.claas.service.controller_test import Runtime
@@ -151,6 +152,77 @@ class WireRuntime(Runtime):
                 "finish_reason": "length" if request.prompt is not None else "stop",
             }
         )
+
+
+class UndeclaredToolRuntime(Runtime):
+    """Supply a sampled wrong tool name while exposing its unchanged fixture token evidence."""
+
+    request: GenerationRequest | None = None
+    sample: GenerationResult | None = None
+
+    async def generate(self, request: GenerationRequest) -> GenerationResult:
+        """Return an uncorrected model action without executing any tool."""
+        result = await super().generate(request)
+        self.request = request
+        self.sample = result.model_copy(
+            update={
+                "response_id": request.request_id,
+                "raw_text": '<tool_call>{"name":"functions.missing","arguments":{}}</tool_call>',
+                "action": AssistantAction(
+                    tool_calls=(ToolCall(call_id="wrong-call", name="functions.missing"),)
+                ),
+            }
+        )
+        return self.sample
+
+
+def test_undeclared_tool_sdk_persistence_replay_and_feedback(tmp_path: Path) -> None:
+    """An incorrect sampled action keeps its identity and tokens through delayed scalar feedback."""
+    runtime = UndeclaredToolRuntime()
+    recipe = spec().model_copy(update={"objective": "reinforce"})
+    limits = RunConfiguration(training_admission="explicit")
+    controller = LearningController(tmp_path, recipe, runtime, limits)
+    app = create_app(controller, api_key=_KEY)
+    with serve(app) as base_url, OpenAI(base_url=base_url, api_key=_KEY, max_retries=0) as sdk:
+        first = sdk.chat.completions.create(
+            model="adapter-1",
+            messages=[{"role": "user", "content": "look up the record"}],
+            tools=[{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+            extra_headers={"Idempotency-Key": "incorrect-action"},
+        )
+        replay = sdk.chat.completions.create(
+            model="adapter-1",
+            messages=[{"role": "user", "content": "look up the record"}],
+            tools=[{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+            extra_headers={"Idempotency-Key": "incorrect-action"},
+        )
+        assert first.model_dump() == replay.model_dump()
+        assert runtime.generate_count == 1
+        calls = first.choices[0].message.tool_calls
+        assert calls is not None and calls[0].type == "function"
+        assert calls[0].function.name == "functions.missing"
+        assert runtime.sample is not None and runtime.request is not None
+        persisted = controller.buffer.replay(runtime.request)
+        assert persisted is not None
+        assert persisted == runtime.sample
+        assert persisted.exact_tokens == runtime.sample.exact_tokens
+        with httpx.Client(headers=_HEADERS) as client:
+            feedback = client.post(
+                base_url + "/feedback", json={"response_id": first.id, "reward": -0.5}
+            )
+        assert feedback.status_code == 200
+        assert feedback.json()["buffer"]["ready"] == 1
+        assert feedback.json()["updates"] == 0
+    assert runtime.optimizations == 0
+    reopened = ExperienceBuffer(tmp_path / "experiences.sqlite", recipe, limits)
+    assert reopened.replay(runtime.request) == runtime.sample
+    batch = reopened.lease()
+    assert batch is not None and len(batch.examples) == 1
+    example = batch.examples[0]
+    assert example.scalar_reward == -0.5
+    assert example.experience.response_id == first.id
+    assert example.experience.response == runtime.sample.model_dump(mode="json")
+    assert example.experience.exact_tokens == runtime.sample.exact_tokens
 
 
 def test_official_sdk_all_surfaces_retry_and_tool_history(tmp_path: Path) -> None:

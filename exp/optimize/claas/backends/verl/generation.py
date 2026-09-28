@@ -140,8 +140,7 @@ def generation_result(
         "qwen35": Qwen35CompletionDecoder,
     }[settings.decoder]()
     action = decoder.decode(raw_text, request.request_id, request.tools)
-    if {call.name for call in action.tool_calls} - {tool.name for tool in request.tools}:
-        raise ValueError("student emitted an undeclared tool")
+    # Keep parsed model mistakes as learning evidence; callers validate tools before execution.
     return GenerationResult(
         response_id=request.request_id,
         action=action,
