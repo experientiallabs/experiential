@@ -15,6 +15,7 @@ from exp.common.models import (
     structured_json_text,
 )
 from exp.common.tasks import TaskCase
+from exp.simulation.engines.text.protocol_feedback import transition_validation_feedback
 from exp.simulation.retrieval import RAGAction, RAGMatch
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
@@ -86,7 +87,16 @@ class TextWorldModelTransition(ContractModel):
 
 
 class TextWorldModelProtocolError(ValueError):
-    """The world model did not return the pinned text-transition JSON contract."""
+    """The world model did not return the pinned text-transition JSON contract.
+
+    Attributes:
+        generic_reason: Content-free protocol reason usable when detailed feedback cannot fit.
+    """
+
+    def __init__(self, reason: str, *, schema_feedback: str | None = None) -> None:
+        """Retain the generic reason separately from optional bounded schema diagnostics."""
+        self.generic_reason = reason
+        super().__init__(reason if schema_feedback is None else f"{reason}. {schema_feedback}")
 
 
 def build_world_model_request(
@@ -184,7 +194,8 @@ def parse_world_model_transition(output: AssistantAction) -> TextWorldModelTrans
         transition = TextWorldModelTransition.model_validate(value)
     except ValidationError as exc:
         raise TextWorldModelProtocolError(
-            "world-model transition has invalid message, tool_results, state, or terminal fields"
+            "world-model transition has invalid message, tool_results, state, or terminal fields",
+            schema_feedback=transition_validation_feedback(exc),
         ) from exc
     if not transition.message and not transition.tool_results and not transition.terminal:
         raise TextWorldModelProtocolError(

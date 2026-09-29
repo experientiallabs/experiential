@@ -23,14 +23,16 @@ def world_retry_request(
     action: AssistantAction,
     reason: str,
     *,
+    generic_reason: str | None = None,
     capabilities: ModelCapabilities,
     reservation: CompletionCostReservation | None,
     token_counter: TokenCounter,
 ) -> ModelRequest:
     """Add format feedback only when it fits the original context and input reservation.
 
-    With no room for feedback, the next simulator attempt uses the admitted original request.
-    No evidence is removed and the original output allowance remains available.
+    When detailed feedback cannot fit, try its shorter generic protocol reason under the same
+    limits. With no room for either correction, use the admitted original request. No evidence
+    is removed, no dispatch is added, and the original output allowance remains available.
     """
     corrected = retry_world_model_request(request, action, reason)
     context = capabilities.context_window_tokens
@@ -40,7 +42,13 @@ def world_retry_request(
     ceiling = context - output
     if reservation is not None:
         ceiling = min(ceiling, reservation.maximum_input_tokens)
-    return corrected if 0 <= token_counter.count(corrected) <= ceiling else request
+    if 0 <= token_counter.count(corrected) <= ceiling:
+        return corrected
+    if generic_reason is not None and generic_reason != reason:
+        generic = retry_world_model_request(request, action, generic_reason)
+        if 0 <= token_counter.count(generic) <= ceiling:
+            return generic
+    return request
 
 
 def bounded_candidate_request(

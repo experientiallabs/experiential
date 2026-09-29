@@ -524,8 +524,7 @@ class RecordingCandidateClient:
     ) -> TextWorldModelTransition:
         """Retry invalid simulator replies without repeating the candidate or retrieval.
 
-        Each attempt passes normal context and spend admission and retains its raw response.
-        Correction messages stay private to the simulator and never enter the visible transcript.
+        Each attempt retains its raw response; admitted corrections stay private to the simulator.
         """
         attempt = prepared
         for number in range(self._maximum_transition_attempts):
@@ -547,6 +546,7 @@ class RecordingCandidateClient:
                         prepared.request,
                         prepared.action,
                         str(exc),
+                        generic_reason=exc.generic_reason,
                         capabilities=self._world_model.capabilities,
                         reservation=self._world_model_request,
                         token_counter=self._token_counter,
