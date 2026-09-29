@@ -23,6 +23,7 @@ from exp.runtime.gateway.reasoning_carrier import (
     HUNYUAN_SCHEME,
     MAXIMUM_REASONING_CARRIER_BYTES,
     ReasoningCarrierAuthority,
+    ReasoningCarrierTurnChangedError,
     parse_reasoning_content_carrier,
     reasoning_carrier_authority,
     reasoning_history_sha256,
@@ -244,13 +245,15 @@ def test_carrier_rejects_cross_route_or_credential_authority(
         tool_calls=_tool_calls("call-one"),
         content="hidden",
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as refused:
         unseal_reasoning_content(
             parse_reasoning_content_carrier(carrier),
             changed,
             assistant_content=None,
             tool_calls=_tool_calls("call-one"),
         )
+    # Authority drift is a refusal, never the droppable edited-turn outcome.
+    assert not isinstance(refused.value, ReasoningCarrierTurnChangedError)
 
 
 def test_carrier_rejects_tampering_retagging_and_turn_changes() -> None:
@@ -273,26 +276,40 @@ def test_carrier_rejects_tampering_retagging_and_turn_changes() -> None:
     retagged = f"{FIREWORKS_REASONING_CONTENT_PREFIX}{retagged_deployment}:{envelope}"
 
     for candidate in (tampered, retagged):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as refused:
             unseal_reasoning_content(
                 parse_reasoning_content_carrier(candidate),
                 authority,
                 assistant_content="visible assistant text",
                 tool_calls=_tool_calls("call-one", raw_arguments='{ "q" : "x" }'),
             )
-    with pytest.raises(ValueError):
+        assert not isinstance(refused.value, ReasoningCarrierTurnChangedError)
+    with pytest.raises(ReasoningCarrierTurnChangedError):
         unseal_reasoning_content(
             parsed,
             authority,
             assistant_content="changed assistant text",
             tool_calls=_tool_calls("call-one", raw_arguments='{ "q" : "x" }'),
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(ReasoningCarrierTurnChangedError):
         unseal_reasoning_content(
             parsed,
             authority,
             assistant_content="visible assistant text",
             tool_calls=_tool_calls("call-one", raw_arguments='{"q":"y"}'),
+        )
+    # OpenCode's tool-call repair: a schema-invalid call is echoed as a call to
+    # its ``invalid`` tool carrying the original name and the validation error.
+    with pytest.raises(ReasoningCarrierTurnChangedError):
+        unseal_reasoning_content(
+            parsed,
+            authority,
+            assistant_content="visible assistant text",
+            tool_calls=_tool_calls(
+                "call-one",
+                name="invalid",
+                raw_arguments='{"tool":"lookup","error":"Invalid input"}',
+            ),
         )
 
 
@@ -394,7 +411,7 @@ def test_carrier_rejects_a_different_nonempty_conversation_prefix() -> None:
         content="hidden",
     )
 
-    with pytest.raises(ValueError, match="authority or tool-call identity changed"):
+    with pytest.raises(ReasoningCarrierTurnChangedError, match="conversation prefix changed"):
         unseal_reasoning_content(
             parse_reasoning_content_carrier(carrier),
             authority,
@@ -457,7 +474,7 @@ def test_later_carrier_binds_earlier_authenticated_reasoning() -> None:
         content="later hidden state",
     )
 
-    with pytest.raises(ValueError, match="authority or tool-call identity changed"):
+    with pytest.raises(ReasoningCarrierTurnChangedError, match="conversation prefix changed"):
         unseal_reasoning_content(
             parse_reasoning_content_carrier(carrier),
             authority,

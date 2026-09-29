@@ -310,6 +310,20 @@ def seal_reasoning_content(
     return carrier
 
 
+class ReasoningCarrierTurnChangedError(ValueError):
+    """An authentic carrier no longer matches the assistant turn it arrived on.
+
+    The AEAD tag and every authority claim verified, so the gateway issued this
+    carrier under the current route and credential, but the caller's echo of the
+    turn (its tool-call ids, names, or arguments, its visible text, or the
+    conversation prefix beneath it) differs from what was sealed. Clients edit
+    their own history legitimately: OpenCode rewrites a tool call whose arguments
+    fail schema validation into a call to its ``invalid`` tool before echoing it.
+    Admission drops such a carrier instead of refusing the request; its plaintext
+    is never revealed, so nothing unverified reaches the provider.
+    """
+
+
 def unseal_reasoning_content(
     block: SealedReasoningContentBlock,
     authority: ReasoningCarrierAuthority,
@@ -360,16 +374,19 @@ def unseal_reasoning_content(
             "content",
         },
     )
+    if actual != expected:
+        raise ValueError("reasoning carrier authority changed")
     if (
-        actual != expected
-        or claims.tool_call_ids != tool_call_ids
+        claims.tool_call_ids != tool_call_ids
         or claims.issuing_turn_sha256 != _issuing_turn_sha256(assistant_content, tool_calls)
         or (
             history_prefix
             and claims.issuing_history_sha256 != reasoning_history_sha256(history_prefix)
         )
     ):
-        raise ValueError("reasoning carrier authority or tool-call identity changed")
+        raise ReasoningCarrierTurnChangedError(
+            "reasoning carrier tool-call identity or conversation prefix changed"
+        )
     if len(claims.content.encode("utf-8")) > MAXIMUM_REASONING_CONTENT_BYTES:
         raise ValueError("reasoning content exceeds the authenticated carrier bound")
     return (

@@ -317,6 +317,16 @@ spilling sideways to a stripped fallback: only a real failover-eligible failure 
 rung moves the ladder past it. A continuation
 whose sealed carriers all precede the latest user message carries no active reasoning and routes
 as a plain request; a single-rung pool has no fallback and surfaces the failure as before.
+A carrier that authenticates (its AEAD tag and every authority claim verify) but arrives on an
+EDITED turn (a different tool-call id, name, or argument value, different visible text, or a
+changed conversation prefix beneath it) is dropped rather than refused, and disclosed as
+`messages.reasoning_content->dropped(assistant_turn_changed)` in `ignored_parameters`: clients
+legitimately rewrite their own history (OpenCode echoes a schema-invalid tool call as a call to its
+`invalid` tool), and no retry could repair the session, while dropping never reveals the plaintext.
+A later carrier sealed over the dropped turn's reasoning fails its prefix binding and drops the
+same way; an earlier intact carrier still unseals and pins. A carrier that fails authentication or
+whose authority changed (tamper, retagging, credential rotation, another tenant's or route's
+carrier) is still refused as `messages.reasoning_content`.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
