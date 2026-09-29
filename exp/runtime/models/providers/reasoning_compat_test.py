@@ -1,5 +1,7 @@
 """Tests for model-specific reasoning effort normalization."""
 
+from dataclasses import replace
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -125,7 +127,14 @@ def test_opus_55_thinking_rule_does_not_claim_unknown_releases(model_id: str) ->
 
 
 @pytest.mark.parametrize(
-    "model_id", ("claude-opus-5", "claude-opus-5-5", "claude-sonnet-5", "claude-fable-5-1")
+    "model_id",
+    (
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+    ),
 )
 def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None:
     """A catalog default does not opt an unspecified request into reasoning."""
@@ -141,7 +150,9 @@ def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None
     assert "output_config" not in payload
 
 
-@pytest.mark.parametrize("model_id", ("claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"))
+@pytest.mark.parametrize(
+    "model_id", ("claude-opus-5", "claude-sonnet-5", "claude-sonnet-5-5", "claude-fable-5-1")
+)
 def test_adaptive_only_models_refuse_explicit_numeric_thinking_budgets(model_id: str) -> None:
     """Mode translation cannot erase the caller's hard thinking-token bound."""
     profile = _anthropic_profile(model_id)
@@ -159,7 +170,7 @@ def test_adaptive_only_models_refuse_explicit_numeric_thinking_budgets(model_id:
 
 
 @pytest.mark.parametrize("display", ("summarized", "omitted", "updates"))
-@pytest.mark.parametrize("model_id", ("claude-opus-5-5", "claude-fable-5-1"))
+@pytest.mark.parametrize("model_id", ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"))
 def test_bare_enabled_translation_preserves_display(model_id: str, display: str) -> None:
     """Changing thinking mode preserves the caller's independent display control."""
     profile = _anthropic_profile(model_id)
@@ -203,6 +214,209 @@ def test_bare_enabled_with_impossible_explicit_cap_refuses(cap: int) -> None:
     with pytest.raises(ProviderParameterError) as error:
         route_generation_parameter_requests((profile,), request)
     assert error.value.param == "thinking.budget_tokens"
+    assert coerce_generation_parameters((profile,), request) is None
+
+
+_SONNET_55_IDS = (
+    "claude-sonnet-5-5",
+    "claude-sonnet-5.5",
+    "anthropic/claude-sonnet-5.5",
+    "anthropic.claude-sonnet-5-5-v1:0",
+    "claude-sonnet-5-5-20260928",
+    "claude-sonnet-5-5@20260928",
+    "us.anthropic.claude-sonnet-5-5-20260928-v1:0",
+)
+
+
+@pytest.mark.parametrize("model_id", _SONNET_55_IDS)
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high", "xhigh", "max"))
+def test_sonnet_55_rejects_disabled_thinking(model_id: str, effort: ReasoningEffort | None) -> None:
+    """Every spelling refuses the unsupported off switch without coercion."""
+    test_unsupported_thinking_off_is_never_coerced(model_id, effort)
+
+
+@pytest.mark.parametrize("model_id", _SONNET_55_IDS)
+def test_sonnet_55_efforts_and_default_are_exact(model_id: str) -> None:
+    """The new release uses high by default and preserves every supported effort."""
+    expected = ("low", "medium", "high", "xhigh", "max")
+    assert supported_reasoning_efforts(model_id, "anthropic_adaptive") == expected
+    assert default_reasoning_effort(model_id, "anthropic_adaptive") == "high"
+    if model_id.startswith("anthropic/"):
+        assert supported_reasoning_efforts(model_id, "reasoning") == expected
+        assert default_reasoning_effort(model_id, "reasoning") == "high"
+    for effort in expected:
+        assert anthropic_reasoning_effort(model_id, effort) == effort
+    for effort in ("none", "minimal", "ultra"):
+        with pytest.raises(UnsupportedReasoningEffortError):
+            anthropic_reasoning_effort(model_id, effort)
+
+
+@pytest.mark.parametrize(
+    "model_id", ("claude-sonnet-5", "claude-sonnet-5-50", "claude-sonnet-5-5-1")
+)
+def test_sonnet_55_rules_never_claim_other_releases(model_id: str) -> None:
+    """Generation support does not inherit the exact release's off rule or default."""
+    test_valid_thinking_off_reaches_native_payload(model_id, "low")
+    assert default_reasoning_effort(model_id, "anthropic_adaptive") == "medium"
+
+
+@pytest.mark.parametrize("model_id", _SONNET_55_IDS)
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high"))
+def test_between_tools_reaches_native_payload_unchanged(
+    model_id: str, effort: ReasoningEffort | None
+) -> None:
+    """The lowest Sonnet 5.5 mode is forwarded, never rewritten as disabled."""
+    profile = _anthropic_profile(model_id)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize briefly."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "between_tools"},
+        reasoning_effort=effort,
+        provider_output_config=None if effort is None else {"effort": effort},
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["thinking"] == {"type": "between_tools"}
+    assert not public.ignored_parameters
+    if effort is None:
+        assert "output_config" not in payload
+    else:
+        assert payload["output_config"] == {"effort": effort}
+
+
+@pytest.mark.parametrize(
+    ("request_effort", "output_config", "profile_effort", "required", "accepted"),
+    (
+        (None, None, "high", False, True),
+        (None, None, "xhigh", False, True),
+        (None, None, "high", True, True),
+        (None, None, "xhigh", True, False),
+        (None, None, "max", True, False),
+        ("low", None, "max", True, True),
+        ("xhigh", None, "high", False, False),
+        ("max", None, "high", False, False),
+        ("low", {"effort": "xhigh"}, "high", False, False),
+        ("low", {"effort": "max"}, "high", False, False),
+        ("xhigh", {"effort": "low"}, "high", False, True),
+        (None, {"effort": "medium"}, "max", True, True),
+        (None, {"effort": "unknown"}, "high", False, False),
+        (None, {"effort": None}, "high", False, False),
+    ),
+)
+def test_between_tools_validates_the_effort_that_reaches_the_wire(
+    request_effort: ReasoningEffort | None,
+    output_config: JsonObject | None,
+    profile_effort: str,
+    required: bool,
+    accepted: bool,
+) -> None:
+    """Verbatim output config wins, then caller effort, required pin, native high."""
+    profile = replace(
+        _anthropic_profile("claude-sonnet-5-5"),
+        reasoning_effort=profile_effort,
+        reasoning_effort_required=required,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "between_tools"},
+        reasoning_effort=request_effort,
+        provider_output_config=output_config,
+    )
+    if accepted:
+        _, provider = route_generation_parameter_requests((profile,), request)
+        payload = dialect_stream_payload(profile, provider)
+        assert payload["thinking"] == {"type": "between_tools"}
+        expected_effort = request_effort or (profile_effort if required else None)
+        if output_config is not None:
+            expected_effort = output_config["effort"]
+        if expected_effort is not None:
+            assert payload["output_config"] == {"effort": expected_effort}
+    else:
+        with pytest.raises(ProviderParameterError) as error:
+            route_generation_parameter_requests((profile,), request)
+        assert error.value.param == (
+            "output_config.effort" if output_config is not None else request.caller_effort_parameter
+        )
+        assert coerce_generation_parameters((profile,), request) is None
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "claude-sonnet-5",
+        "claude-opus-5-5",
+        "claude-haiku-4-5",
+        "claude-sonnet-5-50",
+        "claude-sonnet-5-5-1",
+    ),
+)
+def test_between_tools_rejects_unsupported_releases(model_id: str) -> None:
+    """An unproven model cannot silently forward or translate the mode."""
+    profile = _anthropic_profile(model_id)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize."),),
+        provider_thinking_config={"type": "between_tools"},
+    )
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests((profile,), request)
+    assert error.value.param == "thinking.type"
+    assert coerce_generation_parameters((profile,), request) is None
+
+
+@pytest.mark.parametrize("mixed", (False, True))
+@pytest.mark.parametrize("effort", (None, "low", "none"))
+def test_between_tools_cannot_drop_or_translate_on_foreign_wires(
+    mixed: bool, effort: ReasoningEffort | None
+) -> None:
+    """Foreign and heterogeneous routes keep a typed refusal even beside effort."""
+    foreign = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://relay.test/chat/completions",
+        model_id="anthropic/claude-sonnet-5.5",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="high",
+    )
+    profiles = (_anthropic_profile("claude-sonnet-5-5"), foreign) if mixed else (foreign,)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize."),),
+        provider_thinking_config={"type": "between_tools"},
+        reasoning_effort=effort,
+    )
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests(profiles, request)
+    assert error.value.param == (
+        request.caller_effort_parameter if mixed and effort == "none" else "thinking.type"
+    )
+    assert coerce_generation_parameters(profiles, request) is None
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"display": "omitted"},
+        {"display": None},
+        {"budget_tokens": 1024},
+        {"block_binding": {}},
+        {"unknown": True},
+    ),
+)
+def test_between_tools_refuses_any_extra_field_at_shaping(extra: JsonObject) -> None:
+    """Internal callers cannot bypass the type-only contract with a raw config."""
+    profile = _anthropic_profile("claude-sonnet-5-5")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize."),),
+        provider_thinking_config={"type": "between_tools", **extra},
+    )
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests((profile,), request)
+    assert error.value.param == f"thinking.{next(iter(extra))}"
     assert coerce_generation_parameters((profile,), request) is None
 
 

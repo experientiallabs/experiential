@@ -67,6 +67,7 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_reasoning import CHANGED_TURN_CARRIER_DROPPED
 from exp.runtime.gateway.native_recovery import session_cache_key
 from exp.runtime.gateway.native_stage_admission_test import Host
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
@@ -520,10 +521,148 @@ def _admit_started(
     return _flatten_started(control, admission)
 
 
-def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
+def _seal_settled_tool_turn(
+    control: NativeControlPlane,
+    started: JsonObject,
+    *,
+    content: str,
+    call_id: str,
+    name: str,
+    raw_arguments: str,
+) -> str:
+    """Seal one started attempt's tool turn, settle it, and return the carrier."""
+    carrier = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": started["request_id"],
+                    "route_depth": started["route_depth"],
+                    "route_sha256": started["fireworks_reasoning_route_sha256"],
+                    "content": content,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": call_id, "name": name, "raw_arguments": raw_arguments}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": started["request_id"],
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [name],
+                "failure": None,
+            }
+        )
+    )
+    return carrier
+
+
+def _carrier_tool_turn(carrier: str, call_id: str, name: str, arguments: str) -> list[JsonObject]:
+    """Return one echoed assistant tool turn and its tool result."""
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": carrier,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": "done"},
+    ]
+
+
+def test_client_repaired_tool_call_drops_only_its_carrier_and_what_binds_to_it(
     tmp_path: Path,
 ) -> None:
-    """A second replica decrypts the exact turn while tamper and rotation fail closed."""
+    """An OpenCode-repaired tool call no longer ends the session.
+
+    OpenCode rewrites a tool call whose arguments fail schema validation into a
+    call to its ``invalid`` tool and echoes that call beside the carrier sealed
+    for the original one (production, glm-5.3 on Fireworks, 2026-09-28). The
+    edited turn's carrier is dropped and disclosed; an earlier intact carrier
+    still unseals and pins the issuing rung. When the EARLIER turn is the edited
+    one, the later carrier, whose prefix binds the earlier plaintext, drops too.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.fireworks.ai/inference/v1",
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fireworks-secret"})
+    )
+    first_hidden = "first turn private reasoning"
+    second_hidden = "second turn private reasoning"
+    first_carrier = _seal_settled_tool_turn(
+        control,
+        _admit_started(control, raw_key, _chat_body()),
+        content=first_hidden,
+        call_id="call-one",
+        name="lookup",
+        raw_arguments="{}",
+    )
+    first_turn = _carrier_tool_turn(first_carrier, "call-one", "lookup", "{}")
+    user: JsonObject = {"role": "user", "content": "hi"}
+    second_started = _admit_started(
+        control, raw_key, json.dumps({"model": "coding", "messages": [user, *first_turn]})
+    )
+    assert second_started["route_reason"] == "reasoning_continuation"
+    second_carrier = _seal_settled_tool_turn(
+        control,
+        second_started,
+        content=second_hidden,
+        call_id="call-two",
+        name="bash",
+        raw_arguments='{"command":42}',
+    )
+
+    repaired = _carrier_tool_turn(
+        second_carrier, "call-two", "invalid", '{"tool":"bash","error":"Invalid input"}'
+    )
+    served = _admit(
+        control,
+        raw_key,
+        json.dumps({"model": "coding", "messages": [user, *first_turn, *repaired]}),
+    )
+    assert served["route_reason"] == "reasoning_continuation"
+    assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
+    route = cast("list[JsonObject]", served["route"])
+    messages = cast(
+        "list[JsonObject]", cast("JsonObject", route[0]["upstream_payload"])["messages"]
+    )
+    assert messages[1]["reasoning_content"] == first_hidden
+    assert "reasoning_content" not in messages[3]
+    assert second_hidden not in json.dumps(route)
+
+    edited_first = _carrier_tool_turn(first_carrier, "call-one", "lookup", '{"q":"edited"}')
+    intact_second = _carrier_tool_turn(second_carrier, "call-two", "bash", '{"command":42}')
+    cascaded = _admit(
+        control,
+        raw_key,
+        json.dumps({"model": "coding", "messages": [user, *edited_first, *intact_second]}),
+    )
+    assert cascaded["route_reason"] == "direct"
+    assert cascaded["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
+    cascaded_route = json.dumps(cascaded["route"])
+    assert first_hidden not in cascaded_route
+    assert second_hidden not in cascaded_route
+    assert "reasoning_content" not in cascaded_route
+
+
+def test_fireworks_carrier_round_trip_drops_edited_turns_and_rejects_credential_rotation(
+    tmp_path: Path,
+) -> None:
+    """A second replica decrypts the exact turn; an edited turn drops, rotation fails closed."""
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.fireworks.ai/inference/v1",
@@ -605,20 +744,19 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     organization, identity = str(continued["caller_scope"]).split(":", maxsplit=1)
     assert organization and identity == "default"
 
+    # An authentic carrier echoed beneath an edited prompt or on an edited tool
+    # call is dropped, never unsealed: the request is served as if the caller had
+    # not replayed that turn's thinking, and the drop is disclosed.
     transplanted = json.loads(continuation_body)
     transplanted["messages"][0]["content"] = "Use this carrier under a different prompt"
-    with pytest.raises(NativeBridgeError) as transplanted_error:
-        _admit(replica, raw_key, json.dumps(transplanted))
-    assert (
-        json.loads(transplanted_error.value.public_error_json)["param"]
-        == "messages.reasoning_content"
-    )
-
     modified_turn = json.loads(continuation_body)
     modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
-    with pytest.raises(NativeBridgeError) as modified:
-        _admit(replica, raw_key, json.dumps(modified_turn))
-    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+    for edited in (transplanted, modified_turn):
+        served = _admit(replica, raw_key, json.dumps(edited))
+        assert served["route_reason"] == "direct"
+        assert hidden not in json.dumps(served["route"])
+        assert "reasoning_content" not in json.dumps(served["route"])
+        assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
 
     rotated = NativeControlPlane(
         load_gateway_components(
@@ -746,12 +884,13 @@ def test_hunyuan_tool_turn_reasoning_round_trips_as_a_sealed_carrier(
     assert messages[1]["reasoning_content"] == hidden
     assert "reasoning_history" not in payload
 
-    # A tampered tool turn fails closed at the carrier authority.
+    # An edited tool turn never unseals: the carrier is dropped and disclosed.
     modified_turn = json.loads(continuation_body)
     modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
-    with pytest.raises(NativeBridgeError) as modified:
-        _admit(replica, raw_key, json.dumps(modified_turn))
-    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+    served = _admit(replica, raw_key, json.dumps(modified_turn))
+    assert served["route_reason"] == "direct"
+    assert hidden not in json.dumps(served["route"])
+    assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
 
 
 @pytest.mark.parametrize("thinking", ["", "The user wants a directory listing; ls is the command."])
@@ -6713,11 +6852,13 @@ def test_hunyuan_tool_turn_redacted_carrier_round_trips_on_messages(tmp_path: Pa
     assert isinstance(first_call, dict)
     assert first_call["id"] == "call-one"
 
-    # A tampered tool turn fails closed at the carrier authority, as on Chat.
+    # An edited tool turn drops its carrier, as on Chat.
     tampered = json.loads(body)
     tampered["messages"][1]["content"][1]["input"] = {"tampered": True}
-    with pytest.raises(NativeBridgeError):
-        _admit(control, raw_key, json.dumps(tampered), surface="messages")
+    served = _admit(control, raw_key, json.dumps(tampered), surface="messages")
+    assert served["route_reason"] == "direct"
+    assert "reasoning_content" not in _payload_messages(served)[1]
+    assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
 
 
 def test_claude_code_tool_continuation_with_trailing_system_reminder_serves_on_messages(

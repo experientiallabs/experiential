@@ -12,7 +12,13 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayNamedToolChoice,
+    GatewayRequest,
+)
+from exp.runtime.models.providers.anthropic_tool_compat import anthropic_rejects_forced_tool_choice
 from exp.runtime.models.providers.base import SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.fireworks import (
@@ -134,6 +140,17 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    if (
+        provider_request.tools
+        and (
+            provider_request.tool_choice == "required"
+            or isinstance(provider_request.tool_choice, GatewayNamedToolChoice)
+        )
+        and anthropic_rejects_forced_tool_choice(profile.model_id)
+    ):
+        # The release restriction also applies through relays and Bedrock. Raising
+        # here lets admission select a capable rung or disclose its auto coercion.
+        raise ProviderCapabilityError(capability="forced_tool_choice")
     require_thinking_budget_support(profile, provider_request)
     budget = thinking_budget_value(provider_request)
     provider_request = budgeted_provider_request(profile, provider_request)

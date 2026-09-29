@@ -158,8 +158,19 @@ def resolve_reasoning_channels(
             output_config=output_config,
             disclosures=(),
         )
-    if thinking is not None and thinking.get("type") == "disabled":
-        if (
+    if thinking is not None and thinking.get("type") in ("between_tools", "disabled"):
+        if thinking.get("type") == "between_tools":
+            if (
+                reasoning.enabled is not None
+                or reasoning.effort is not None
+                or reasoning.max_tokens is not None
+            ):
+                raise invalid_field(
+                    "reasoning",
+                    "The reasoning extension cannot override between-tools thinking. Remove its "
+                    "depth controls and use output_config.effort to choose low, medium or high.",
+                )
+        elif (
             reasoning.enabled is not False
             and reasoning.effort != "none"
             and (

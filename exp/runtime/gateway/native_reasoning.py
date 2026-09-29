@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
@@ -16,6 +17,7 @@ from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import resolve_route_profiles, select_route_deployments
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
+    ReasoningCarrierTurnChangedError,
     parse_reasoning_carrier_tool_calls,
     reasoning_carrier_authority,
     reasoning_history_sha256,
@@ -25,6 +27,14 @@ from exp.runtime.gateway.reasoning_carrier import (
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.openai_protocol.errors import public_failure_error
+
+_logger = logging.getLogger(__name__)
+
+CHANGED_TURN_CARRIER_DROPPED = "messages.reasoning_content->dropped(assistant_turn_changed)"
+"""Disclosure for an authentic carrier whose echoed assistant turn no longer matches.
+
+The request is served without that turn's preserved thinking (and without any later
+carrier bound to it), exactly as if the caller had not replayed it."""
 
 
 def has_active_reasoning_content(request: GatewayRequest) -> bool:
@@ -190,6 +200,7 @@ def _process_reasoning_history(
     routes: dict[str, tuple[GatewayRoute, ReasoningCarrierAuthority]] = {}
     messages = list(request.messages)
     pinned: GatewayRoute | None = None
+    dropped = False
     for index, message in enumerate(messages):
         if index <= last_user:
             continue
@@ -246,14 +257,33 @@ def _process_reasoning_history(
             cached = (route, authority)
             routes[carrier.deployment_hint] = cached
         route, authority = cached
-        block, _claims = unseal_reasoning_content(
-            carrier,
-            authority,
-            assistant_content=message.content,
-            tool_calls=message.tool_calls,
-            history_prefix=tuple(messages[:index]) if verify_history else (),
-            scheme=scheme,
-        )
+        try:
+            block, _claims = unseal_reasoning_content(
+                carrier,
+                authority,
+                assistant_content=message.content,
+                tool_calls=message.tool_calls,
+                history_prefix=tuple(messages[:index]) if verify_history else (),
+                scheme=scheme,
+            )
+        except ReasoningCarrierTurnChangedError as exc:
+            # The caller edited its own turn; refusing would end a session no
+            # client-side retry can repair. Dropping the carrier leaves the edited
+            # turn unaccompanied, so a later carrier sealed over this one's
+            # plaintext fails its prefix binding and is dropped the same way.
+            messages[index] = message.model_copy(update={"provider_reasoning": ()})
+            dropped = True
+            _logger.warning(
+                "reasoning carrier dropped",
+                extra={
+                    "operation": "native_reasoning_continuation",
+                    "reason": str(exc),
+                    "request_id": authorization.request_id,
+                    "alias": authorization.alias,
+                    "deployment_id": carrier.deployment_hint,
+                },
+            )
+            continue
         if reveal:
             messages[index] = message.model_copy(update={"provider_reasoning": (block,)})
         if pinned is not None and pinned.deployment != route.deployment:
@@ -265,7 +295,12 @@ def _process_reasoning_history(
         for index, message in enumerate(messages)
     ):
         raise ValueError("decrypted reasoning history requires a sealed active carrier")
-    return request.model_copy(update={"messages": tuple(messages)}), pinned
+    updates: dict[str, object] = {"messages": tuple(messages)}
+    if dropped:
+        updates["ignored_parameters"] = tuple(
+            dict.fromkeys((*request.ignored_parameters, CHANGED_TURN_CARRIER_DROPPED))
+        )
+    return request.model_copy(update=updates), pinned
 
 
 def seal_reasoning_carrier_content(accounting: NativeAttemptAccounting, argument: str) -> str:

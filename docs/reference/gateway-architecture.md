@@ -290,33 +290,32 @@ that author no schedule keep byte-identical behavior; the hosted platform's reco
 authoring for house GPT lanes, whose traffic is cache-heavy, is a schedule of three redials from a
 500 ms base capped at 8 s beside its existing 0.5 threshold.
 
-A reasoning continuation (a Chat request replaying a gateway-sealed `reasoning_content` carrier
-on an assistant tool turn after the latest user message) resolves as `route_reason:
-reasoning_continuation`: the carrier is authenticated against the exact deployment and credential
-that sealed it, and that issuing rung dispatches first with the unsealed reasoning replayed, so
-the model's thinking continues across the tool call. The rung is NOT the whole ladder. The pool's
-other certified rungs follow in pool order as failover fallbacks, and every one of them is frozen
-at admission from the request with the post-user-boundary sealed reasoning removed: only the
-issuing rung's credential can unseal a carrier (each provider's carrier is AEAD domain-separated
-to its own credential, a non-carrier rung yields no authority, and the payload builders reject a
-block sealed for another route by name), so the fallback keeps the messages, visible text, tool
-calls and tool results and drops just that turn's thinking. A failover-eligible operational
-failure on the issuing rung (a throttle after the pool's `throttle_redial` budget is spent there,
-provider quota, unavailability, transport) therefore advances to the next rung exactly like any
-last-rung failure, and that attempt is recorded with `route_reason:
-reasoning_continuation_failover`; a caller error (`invalid_request`, a refusal without the
-opt-in) still surfaces without touching a fallback. The stated loss on a failover is the model's
-thinking continuity across that tool call and the issuing provider's prompt cache for the turn,
-never correctness of the visible conversation. Because its fallbacks run without the reasoning,
-the issuing rung gets the full `throttle_redial` budget (rule 2 above, beside the sticky rung),
-affinity or cache-marker reordering never demotes it from first position while it is
-dispatchable, and a rung dispatch-policy shed of the issuing rung (its authored per-worker
-`requests_per_minute`, `tokens_per_minute` or `concurrency_bound`, which trip under ordinary
-load) force-admits it as `saturated_overflow` exactly as a one-rung ladder did instead of
-spilling sideways to a stripped fallback: only a real failover-eligible failure on the pinned
-rung moves the ladder past it. A continuation
-whose sealed carriers all precede the latest user message carries no active reasoning and routes
-as a plain request; a single-rung pool has no fallback and surfaces the failure as before.
+A reasoning continuation (a Chat request replaying a gateway-sealed `reasoning_content` carrier on
+an assistant tool turn after the latest user message) resolves as `route_reason:
+reasoning_continuation`: the carrier authenticates against the exact deployment and credential that
+sealed it, and that issuing rung dispatches first with the unsealed reasoning replayed, so the
+model's thinking continues across the tool call. The pool's other certified rungs follow in pool
+order as failover fallbacks, each frozen at admission with the post-user-boundary sealed reasoning
+removed: only the issuing rung's credential can unseal a carrier (each provider's carrier is AEAD
+domain-separated to its own credential, a non-carrier rung yields no authority, and the payload
+builders reject a block sealed for another route by name), so a fallback keeps the messages,
+visible text, tool calls and tool results and drops just that turn's thinking. A failover-eligible
+operational failure on the issuing rung (a throttle after the pool's `throttle_redial` budget is
+spent there, provider quota, unavailability, transport) advances to the next rung like any
+last-rung failure, recorded as `route_reason: reasoning_continuation_failover`; a caller error
+(`invalid_request`, a refusal without the opt-in) surfaces without touching a fallback. The stated
+loss is thinking continuity and the issuing provider's prompt cache for the turn, never the visible
+conversation. The issuing rung gets the full `throttle_redial` budget (rule 2 above), affinity or
+cache-marker reordering never demotes it while dispatchable, and a dispatch-policy shed of it (its
+authored per-worker `requests_per_minute`, `tokens_per_minute` or `concurrency_bound`) force-admits
+it as `saturated_overflow` instead of spilling to a stripped fallback. A continuation whose sealed
+carriers all precede the latest user message carries no active reasoning and routes as a plain
+request; a single-rung pool has no fallback. A carrier that authenticates but arrives on an EDITED
+turn (a changed tool-call id, name or argument, visible text, or conversation prefix; OpenCode echoes
+a schema-invalid tool call as a call to its `invalid` tool) is dropped unrevealed, never refused,
+and disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`; a later carrier
+sealed over it fails its prefix binding and drops too, while an earlier intact one still pins.
+Authentication or authority failures (tamper, retagging, credential rotation) are still refused.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on

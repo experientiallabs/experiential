@@ -236,14 +236,18 @@ class _Metadata(AnthropicWireModel):
 
 
 class _ThinkingConfig(AnthropicWireModel):
-    """Extended-thinking configuration validated closed, then forwarded verbatim."""
+    """Extended-thinking configuration validated closed, then forwarded verbatim.
 
-    type: Literal["enabled", "disabled", "adaptive"]
+    Attributes:
+        type: Requested mode, validated against the selected model at admission.
+        budget_tokens: Positive manual thinking budget, only valid with enabled.
+        display: Optional provider display disposition. Between-tools thinking
+            accepts no fields besides type, including explicitly null fields.
+    """
+
+    type: Literal["enabled", "disabled", "adaptive", "between_tools"]
     budget_tokens: int | None = Field(default=None, gt=0)
     display: str | None = Field(default=None, max_length=64)
-    """Display disposition, forwarded verbatim (Claude Code sends "omitted";
-    accepted live without a beta, 2026-08-30). Bounded but deliberately not
-    enumerated: the value set is an evolving provider surface."""
 
     @model_validator(mode="after")
     def _require_budget_only_when_enabled(self) -> _ThinkingConfig:
@@ -256,6 +260,8 @@ class _ThinkingConfig(AnthropicWireModel):
         its default depth. Rejecting it here made every such session die at
         the gateway (Harbor, 2026-09-11).
         """
+        if self.type == "between_tools" and self.model_fields_set != {"type"}:
+            raise ValueError("thinking between_tools accepts only the type field")
         if self.type != "enabled" and self.budget_tokens is not None:
             raise ValueError("thinking.budget_tokens is valid only when thinking is enabled")
         return self

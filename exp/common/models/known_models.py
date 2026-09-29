@@ -589,6 +589,19 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
         maximum_output_tokens=128_000,
         adaptive_reasoning=True,
     ),
+    # https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+    "claude-sonnet-5-5": replace(
+        _anthropic_chat(
+            input_usd=2.0,
+            cached_input_usd=0.2,
+            cache_write_usd=2.5,
+            output_usd=10.0,
+            context_window_tokens=1_000_000,
+            maximum_output_tokens=128_000,
+            adaptive_reasoning=True,
+        ),
+        reasoning_effort="high",
+    ),
     "claude-sonnet-5": _anthropic_chat(
         input_usd=2.0,
         cached_input_usd=0.2,

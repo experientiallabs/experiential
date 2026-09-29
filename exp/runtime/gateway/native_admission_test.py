@@ -52,6 +52,7 @@ from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.requests import decode_chat
@@ -1334,9 +1335,7 @@ def _forced_choice_request(
 def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
     surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
 ) -> None:
-    """fable-5-1 declines ``any``/``tool`` by name, so a waterfall with an
-    aggregator rung serves the caller's forced choice VERBATIM on that rung
-    and discloses nothing."""
+    """A known refusing release narrows out while an opaque shim preserves forced tools."""
     deployments = (
         _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
         _deployment("shim", gateway=_TOOL_CAPABLE),
@@ -1345,7 +1344,7 @@ def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
     accounting = _CoercionCounter()
     narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
-        _fable_and_shim_wires(),
+        _fable_and_shim_wires(shim_model="provider-model-exact"),
         _forced_choice_request(surface, choice),
         accounting=cast(NativeAttemptAccounting, accounting),
         authorization=route.snapshot.authorization,
@@ -1364,7 +1363,7 @@ def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
         (GatewayApiSurface.MESSAGES, GatewayNamedToolChoice(name="lookup")),
     ),
 )
-@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5"))
+@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"))
 def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
     surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice, model_id: str
 ) -> None:
@@ -1384,6 +1383,60 @@ def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
     assert public.tool_choice == "auto"
     assert public.ignored_parameters == ("tool_choice->auto",)
     assert accounting.recorded == 1
+
+
+@pytest.mark.parametrize("choice", ("required", GatewayNamedToolChoice(name="lookup")))
+@pytest.mark.parametrize("bedrock", (False, True))
+def test_sonnet_55_forced_choice_is_disclosed_across_provider_wires(
+    choice: Literal["required"] | GatewayNamedToolChoice, bedrock: bool
+) -> None:
+    """The model's forced-tool refusal applies to relays and Bedrock during admission."""
+    client = cast(NativeWireClient, object())
+    if bedrock:
+        deployments = (_deployment("bedrock", provider="bedrock", gateway=_TOOL_CAPABLE),)
+        wires = (
+            (
+                GatewayWireProfile(
+                    dialect="bedrock_converse_stream",
+                    url="https://bedrock.test",
+                    model_id="anthropic.claude-sonnet-5-5-v1:0",
+                ),
+                client,
+            ),
+        )
+    else:
+        deployments = (
+            _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
+            _deployment("shim", gateway=_TOOL_CAPABLE),
+        )
+        wires = _fable_and_shim_wires(
+            native_model="claude-sonnet-5-5", shim_model="anthropic/claude-sonnet-5.5"
+        )
+    route = _mixed_route("maximize_availability", deployments)
+    accounting = _CoercionCounter()
+    narrowed, wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        _forced_choice_request(GatewayApiSurface.MESSAGES, choice).model_copy(
+            update={"maximum_output_tokens": 256}
+        ),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.deployments == deployments
+    assert provider.tool_choice == "auto"
+    assert public.ignored_parameters == ("tool_choice->auto",)
+    assert accounting.recorded == 1
+    for profile, _client in wires_out:
+        payload = dialect_stream_payload(profile, provider)
+        if bedrock:
+            tool_config = payload["toolConfig"]
+            assert isinstance(tool_config, dict)
+            assert "toolChoice" not in tool_config
+        elif profile.dialect == "anthropic_messages":
+            assert payload["tool_choice"] == {"type": "auto"}
+        else:
+            assert payload["tool_choice"] == "auto"
 
 
 _MAX_ITEMS_SCHEMA: JsonObject = {
