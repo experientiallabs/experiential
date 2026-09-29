@@ -36,6 +36,7 @@ from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.engines.text.prompt import retry_world_model_request
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TextSimulationError,
@@ -1159,6 +1160,57 @@ def test_world_retry_without_feedback_room_reuses_full_original_request(limited_
     assert len(world.requests) == 2
     assert world.requests[1] == world.requests[0]
     assert recorder.world_model_terminal
+
+
+@pytest.mark.parametrize("limited_by", ["context", "reservation"])
+def test_recorder_keeps_generic_correction_when_schema_detail_exceeds_admission(
+    limited_by: str,
+) -> None:
+    """The actual retry loop retains useful generic feedback without adding a dispatch."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="question"),))
+    candidate_response = _response("answer", model=_snapshot("candidate-a"))
+    invalid = _response('{"message":"hi","extra":true}', model=_snapshot("world-model-a"))
+    baseline_world = _ScriptedClient([invalid])
+    baseline = _recorder(_ScriptedClient([candidate_response]), baseline_world)
+    with pytest.raises(TextSimulationError):
+        baseline.complete(request)
+    expected = retry_world_model_request(
+        baseline_world.requests[0],
+        candidate_response.output,
+        "world-model transition has invalid message, tool_results, state, or terminal fields",
+    )
+    ceiling = _Utf8Counter().count(expected)
+    responses = [
+        invalid,
+        _response('{"message":"done","terminal":true}', model=_snapshot("world-model-a")),
+    ]
+    world = _ScriptedClient(
+        [
+            response.model_copy(
+                update={
+                    "economics": response.economics.model_copy(
+                        update={"cost_usd": None, "provider_attempts": 1}
+                    )
+                }
+            )
+            for response in responses
+        ]
+    )
+    candidate = _ScriptedClient([candidate_response])
+    recorder = _recorder(
+        candidate,
+        world,
+        maximum_transition_attempts=3,
+        world_context_window=ceiling + 16_000 if limited_by == "context" else 100_000,
+        world_request=_completion_reservation("world-model-a", maximum_input_tokens=ceiling)
+        if limited_by == "reservation"
+        else None,
+    )
+    recorder.complete(request)
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 2
+    assert world.requests[1] == expected
+    assert recorder.recorded.transitions[0].message == "done"
 
 
 @pytest.mark.parametrize("exclusions", [None, (), ("another-lineage",)])
