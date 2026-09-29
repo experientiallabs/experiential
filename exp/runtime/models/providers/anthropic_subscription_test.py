@@ -11,6 +11,8 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, ModelSnapshot
 from exp.runtime.models.providers.anthropic_subscription import (
     ANTHROPIC_OAUTH_TOKEN_URL,
+    CLAUDE_CODE_OAUTH_BETA,
+    CLAUDE_CODE_OAUTH_REDIRECT_URI,
     AnthropicOAuthApp,
     AnthropicPlanError,
     AnthropicSubscriptionClient,
@@ -84,8 +86,46 @@ class TestOAuthApp:
         assert app.scopes == ("user:inference",)
         assert app.token_url == ANTHROPIC_OAUTH_TOKEN_URL
         assert app.dispatch_headers == {"anthropic-beta": "oauth-2025-04-20"}
+        assert app.shared_client is False
         with pytest.raises(AnthropicPlanError, match="invalid"):
             anthropic_oauth_app_from_environment({"EXP_ANTHROPIC_OAUTH_CLIENT_ID": "ours"})
+
+    def test_shared_client_mode_presents_as_claude_code(self) -> None:
+        """Owner-approved mode: Claude Code's client, callback, and beta; no redirect needed."""
+        app = anthropic_oauth_app_from_environment(
+            {
+                "EXP_ANTHROPIC_OAUTH_CLIENT_ID": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "EXP_ANTHROPIC_OAUTH_SHARED_CLIENT": "1",
+            }
+        )
+        assert app is not None
+        assert app.shared_client is True
+        assert app.client_id == "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        assert app.redirect_uri == CLAUDE_CODE_OAUTH_REDIRECT_URI
+        assert app.dispatch_headers == {"anthropic-beta": CLAUDE_CODE_OAUTH_BETA}
+
+    def test_shared_client_mode_refuses_another_id_and_credentials(self) -> None:
+        """The shared mode names Claude Code's client only, and never carries a credential."""
+        with pytest.raises(ValueError, match="must be its own"):
+            AnthropicOAuthApp(
+                client_id="ours",
+                redirect_uri=CLAUDE_CODE_OAUTH_REDIRECT_URI,
+                shared_client=True,
+            )
+        with pytest.raises(ValueError, match="credential"):
+            AnthropicOAuthApp(
+                client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                redirect_uri=CLAUDE_CODE_OAUTH_REDIRECT_URI,
+                dispatch_headers={"Authorization": "Bearer x"},
+                shared_client=True,
+            )
+        with pytest.raises(ValueError, match="another client"):
+            AnthropicOAuthApp(
+                client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                redirect_uri=CLAUDE_CODE_OAUTH_REDIRECT_URI,
+                dispatch_headers={"User-Agent": "claude-code/1.0"},
+                shared_client=True,
+            )
 
 
 class TestGrants:
