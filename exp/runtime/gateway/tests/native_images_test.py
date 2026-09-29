@@ -216,6 +216,17 @@ def _terminal_attempts(base: str, state: str) -> int:
     return 0
 
 
+def _wait_terminal_attempts(base: str, state: str, expected: int) -> None:
+    """Wait for exact terminal accounting before another shared-fixture request begins."""
+    deadline = time.monotonic() + 5.0
+    while True:
+        actual = _terminal_attempts(base, state)
+        if actual >= expected or time.monotonic() >= deadline:
+            assert actual == expected
+            return
+        time.sleep(0.01)
+
+
 def _post(engine: _ServingEngine, body: JsonObject, **headers: str) -> httpx.Response:
     return httpx.post(
         f"{engine.base}/v1/images/generations",
@@ -296,28 +307,36 @@ def test_chat_alias_and_streaming_are_refused_with_field_errors(engine: _Serving
 
 def test_provider_client_error_relays_the_parameter(engine: _ServingEngine) -> None:
     """A provider 400 reaches the caller as a 400 naming the rejected field."""
+    failed_before = _terminal_attempts(engine.base, "failed")
     response = _post(engine, {"model": "painter", "prompt": "reject-param"})
     assert response.status_code == 400
     error = response.json()["error"]
     assert error["param"] == "size"
     assert "Supported values are" in error["message"]
+    _wait_terminal_attempts(engine.base, "failed", failed_before + 1)
 
 
 @pytest.mark.parametrize(
-    ("prompt", "expected_fragment"),
+    ("prompt", "expected_fragment", "maximum_attempts"),
     [
-        ("unbilled", "malformed response"),
-        ("short-count", "malformed response"),
-        ("server-error", "provider service failed"),
+        ("unbilled", "malformed response", 1),
+        ("short-count", "malformed response", 1),
+        ("server-error", "provider service failed", 2),
     ],
 )
 def test_unbillable_or_failing_provider_answers_fail_closed(
-    engine: _ServingEngine, prompt: str, expected_fragment: str
+    engine: _ServingEngine, prompt: str, expected_fragment: str, maximum_attempts: int
 ) -> None:
     """No usage, a missing image, or a 5xx never hands the caller an unaccounted image."""
     failed_before = _terminal_attempts(engine.base, "failed")
+    with _ImagesUpstream.payloads_lock:
+        dispatches_before = len(_ImagesUpstream.payloads)
     response = _post(engine, {"model": "painter", "prompt": prompt, "n": 2})
     assert response.status_code == 502, response.text
     assert response.json()["error"]["code"] == "all_routes_failed"
     assert expected_fragment in response.json()["error"]["message"]
-    assert _terminal_attempts(engine.base, "failed") == failed_before + 1
+    with _ImagesUpstream.payloads_lock:
+        dispatches = len(_ImagesUpstream.payloads) - dispatches_before
+    # A retryable 5xx may use both allowed attempts while the deployment is healthy.
+    assert 1 <= dispatches <= maximum_attempts
+    _wait_terminal_attempts(engine.base, "failed", failed_before + dispatches)
