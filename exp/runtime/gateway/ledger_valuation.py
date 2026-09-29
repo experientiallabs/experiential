@@ -68,8 +68,9 @@ def estimated_cost_nano_usd(
 
     Cache reads and writes are disjoint input subsets; one-hour writes are a
     subset of all writes. Clamp reads, then writes, to remaining input. A missing
-    rate or TTL breakdown for observed writes preserves unknown cost. Reasoning
-    is an output subset. Price each remainder at its base rate exactly once.
+    rate preserves unknown cost. An absent TTL split is priceable only when both
+    authored write rates are identical, so every possible split has the same cost.
+    Reasoning is an output subset. Price each remainder at its base rate exactly once.
 
     Rates are nano-USD per million tokens, so the sum of ``tokens * rate`` is divided by one
     million and rounded half-up at one nano-USD. This is the ONE rounding rule of the ledger:
@@ -101,7 +102,13 @@ def estimated_cost_nano_usd(
         usage.cache_creation_input_tokens or 0, usage.input_tokens - cached_input_tokens
     )
     if cache_creation and usage.cache_creation_1h_input_tokens is None:
-        return None
+        if (
+            cache_creation_input_rate is None
+            or cache_creation_input_rate != cache_creation_1h_input_rate
+        ):
+            return None
+        # The split is unobserved, not zero. Equal rates make this decomposition
+        # cost-invariant without writing a made-up TTL into provider usage.
     hour_creation = min(usage.cache_creation_1h_input_tokens or 0, cache_creation)
     reasoning_tokens = min(usage.reasoning_tokens or 0, usage.output_tokens)
     dimensions = (

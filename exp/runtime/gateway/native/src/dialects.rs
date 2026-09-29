@@ -445,6 +445,7 @@ pub struct Normalizer {
     // opted into its response metadata. First non-empty value wins; a label
     // only (bounded, printable ASCII), never content.
     upstream_provider: Option<String>,
+    pub(crate) service_tier: crate::service_tier::ServiceTierObservation,
     chat_logprobs: bool,
     responses_logprobs: bool,
 }
@@ -492,6 +493,7 @@ impl Normalizer {
             anthropic_stopped_tools: BTreeSet::new(),
             dropped_cut_call: false,
             upstream_provider: None,
+            service_tier: crate::service_tier::ServiceTierObservation::default(),
             chat_logprobs: false,
             responses_logprobs: false,
         }

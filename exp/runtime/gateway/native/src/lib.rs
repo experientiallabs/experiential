@@ -43,6 +43,7 @@ mod route_messages;
 mod route_responses;
 mod route_responses_ws;
 mod server;
+mod service_tier;
 mod settlement;
 mod sse;
 mod stop_sequences;

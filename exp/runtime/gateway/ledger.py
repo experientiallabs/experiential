@@ -26,6 +26,8 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
     GatewayFailure,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_errors import (
@@ -39,6 +41,13 @@ from exp.runtime.gateway.ledger_errors import (
 )
 from exp.runtime.gateway.ledger_errors import (
     IdempotencyReplayUnavailableError as IdempotencyReplayUnavailableError,
+)
+from exp.runtime.gateway.ledger_service_tiers import (
+    long_context_values,
+    reconcile_tier_receipt,
+    record_tier_admission,
+    settle_tier,
+    tier_usage_cost,
 )
 from exp.runtime.gateway.ledger_usage import (
     BillingSourceUsage,
@@ -270,6 +279,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably mark a provider dispatch before starting network work.
 
@@ -310,6 +320,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 fallback_reason=fallback_reason,
                 dispatch_reason=dispatch_reason,
                 preferred_deployment=preferred_deployment,
+                service_tier=service_tier,
             )
 
     def apply_start_attempt(
@@ -328,6 +339,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Run the dispatch reservation inside the caller's open write transaction.
 
@@ -456,41 +468,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 prices.cache_creation_1h_input_nano_usd_per_million_tokens,
                 prices.output_nano_usd_per_million_tokens,
                 prices.reasoning_nano_usd_per_million_tokens,
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.input_threshold_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.cached_input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.cache_creation_input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.cache_creation_1h_input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.output_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.reasoning_nano_usd_per_million_tokens
-                ),
+                *long_context_values(prices),
                 route_reason,
                 fallback_reason,
                 dispatch_reason,
@@ -518,6 +496,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 maximum_cost_nano_usd,
             ),
         )
+        record_tier_admission(connection, attempt_id, service_tier)
         require_attempt_budget(
             connection,
             organization_id=snapshot.authorization.organization_id,
@@ -550,6 +529,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
         tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -585,6 +565,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 upstream_provider=upstream_provider,
                 web_search_requests=web_search_requests,
                 tool_search_requests=tool_search_requests,
+                service_tier=service_tier,
             )
 
     def apply_finish_attempt(
@@ -604,6 +585,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
         tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -650,11 +632,21 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             raise GatewayLedgerError("attempt does not exist")
         current_state = str(row["state"])
         if current_state != "dispatched":
-            if current_state == state:
+            if current_state == state or (
+                current_state == "unknown_after_crash" and service_tier is not None
+            ):
+                reconcile_tier_receipt(connection, attempt_id, service_tier, terminal_event, usage)
                 return
             raise GatewayLedgerError("attempt is already settled with another terminal state")
-        cost = observed_usage_cost(row, usage, terminal_event)
-        budget_settlement = budget_settlement_nano_usd(row, cost, usage, terminal_event)
+        tier = settle_tier(connection, attempt_id, service_tier)
+        cost = (
+            observed_usage_cost(row, usage, terminal_event)
+            if tier is None
+            else tier_usage_cost(tier, usage, terminal_event)
+        )
+        budget_settlement = (
+            budget_settlement_nano_usd(row, cost, usage, terminal_event) if tier is None else cost
+        )
         usage_source = usage_source_label(
             usage, estimated=terminal_event is not None and terminal_event.usage_estimated
         )

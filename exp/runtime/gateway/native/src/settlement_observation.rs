@@ -98,6 +98,7 @@ pub(crate) struct Observed {
     pub terminal: Option<Event>,
     pub first_token_at: Option<SystemTime>,
     pub streamed_output: StreamedOutput,
+    pub service_tier: crate::service_tier::ServiceTierObservation,
 }
 
 impl Default for Observed {
@@ -112,6 +113,7 @@ impl Default for Observed {
             terminal: None,
             first_token_at: None,
             streamed_output: StreamedOutput::default(),
+            service_tier: crate::service_tier::ServiceTierObservation::default(),
         }
     }
 }
@@ -189,6 +191,14 @@ impl Observation {
         if observed.first_token_at.is_none() {
             observed.first_token_at = at;
         }
+    }
+
+    /// Retain the normalizer's cumulative tier verdict before delivery can suspend.
+    pub(crate) fn record_service_tier(&self, tier: &crate::service_tier::ServiceTierObservation) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .service_tier = tier.clone();
     }
 
     pub(crate) fn snapshot(&self) -> Observed {

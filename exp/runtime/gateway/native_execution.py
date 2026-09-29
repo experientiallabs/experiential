@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
+    GatewayServiceTierAdmission,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.execution_resolution import (
@@ -186,6 +187,7 @@ class InflightRequest:
     active_attempt_id: str | None = None
     # Every reserved attempt's route depth, for health recording at settle.
     attempt_depths: dict[str, int] = field(default_factory=dict)
+    attempt_service_tiers: dict[str, GatewayServiceTierAdmission] = field(default_factory=dict)
     estimated_cache_fractions: dict[str, float] = field(default_factory=dict)
     # The exact settlement the data plane could not land; the sweep replays it
     # verbatim so a completed outcome and its usage are never downgraded.
@@ -282,17 +284,10 @@ def deployment_priced_for_service_tier(
 ) -> ExactModelDeployment:
     """Reprice one deployment for a requested flex/priority processing tier.
 
-    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
-    the tier to its provider and carries a pass-through card for it, the card's
-    rates replace the base schedule on a copy used only for THIS reservation, so
-    the ceiling, the stored per-token rates, and settlement all bill the tier
-    transparently. ``forwards_tier`` is the admission-time forwarding decision
-    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
-    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
-    wire would strip the tier (non-tier dialect, tier disabled): such a depth
-    runs the provider's base schedule, so it must bill the base schedule too. No
-    tier, no forwarding, or no card returns the deployment unchanged. The copy
-    stays Python-side and never crosses the native boundary.
+    The admitted card is frozen beside the standard card; settlement selects
+    between them from upstream evidence rather than assuming the requested tier.
+    No tier, no forwarding, or no card returns the deployment unchanged. The
+    copy stays Python-side and never crosses the native boundary.
     """
     if not forwards_tier:
         return deployment

@@ -38,6 +38,8 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
     GatewayUsage,
 )
 from exp.runtime.gateway.ledger import AttemptRejectedError
@@ -210,6 +212,7 @@ class _RecordingLedger:
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
         del snapshot, fallback_reason
@@ -254,6 +257,7 @@ class _RecordingLedger:
         upstream_provider: str | None = None,
         web_search_requests: int | None = None,
         tool_search_requests: int | None = None,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart.
 
@@ -2076,6 +2080,7 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
             fallback_reason: str | None = None,
             dispatch_reason: str | None = None,
             preferred_deployment: ExactModelDeployment | None = None,
+            service_tier: GatewayServiceTierAdmission | None = None,
         ) -> str:
             """Record the reserved input rate, then reserve as the base fake does."""
             self.reserved_input_micro.append(
@@ -3844,6 +3849,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> str:
         """Delay the existing typed ledger method without changing reservation semantics."""
         result = original(

@@ -256,21 +256,10 @@ def prepare_route_requests(
     affinity, health or request state.
     """
     require_native_model_stage_contract(route)
-    # flex/priority are the tiers we price as an OPT-IN pass-through, so they
-    # fail CLOSED before any reservation when no rung can BILL the requested one:
-    # a BYOK rung forwards any tier (customer pays the provider directly, no
-    # platform card needed), while a house rung must carry a per-tier card for
-    # THIS tier (`forwards_tier`). A model carded for flex only therefore rejects
-    # a priority request instead of forwarding it and silently billing the base
-    # rate while the provider charges the priority premium (underbill). Every
-    # OTHER tier (auto/default carry no price; scale and any future value) is
-    # never rejected here — a non-billable candidate simply strips it at payload
-    # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
-    # A rung whose declared context window cannot hold the prompt plus the
-    # requested output budget is dropped HERE, before a reservation or a
-    # provider call (the provider would only 400 it back, after a round trip,
-    # with an opaque message); the request falls to a rung that can hold it
-    # and is refused only when none can.
+    # Priced house tiers require a card for that exact tier; BYOK needs only
+    # wire support. Explicit priority keeps those candidates ahead of standard
+    # lanes. Flex and BYOK-only routes retain their disclosed coercion policy.
+    # Narrow impossible context windows before reserving or calling a provider.
     chat_indexes = tuple(
         index
         for index, (profile, _client) in enumerate(resolved_wires)
@@ -291,7 +280,12 @@ def prepare_route_requests(
 
     if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
-        if not any(profile.forwards_tier(tier) for profile, _client in resolved_wires):
+        tier_indexes = tuple(
+            index
+            for index, (profile, _client) in enumerate(resolved_wires)
+            if profile.forwards_tier(tier)
+        )
+        if not tier_indexes:
             raise ProviderCapabilityError(
                 capability="service_tier",
                 detail=(
@@ -299,6 +293,13 @@ def prepare_route_requests(
                     "Remove service_tier, or choose a model with tiered pricing enabled."
                 ),
             )
+
+        if tier == "priority" and any(
+            not profile.billing_customer_managed and profile.forwards_tier(tier)
+            for profile, _client in resolved_wires
+        ):
+            route = select_route_deployments(route, tier_indexes)
+            resolved_wires = tuple(resolved_wires[index] for index in tier_indexes)
 
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = ()

@@ -3369,9 +3369,7 @@ def test_non_default_values_of_accepted_no_op_fields_stay_named_rejections(
 
 
 def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values() -> None:
-    """Doubleword's tier passthrough (PR #728): valid tiers land on the
-    carrier for BYOK forwarding; unknown values (including Anthropic's
-    'fast', which is a speed selector, not an OpenAI tier) reject by name."""
+    """Valid tiers land on the carrier; Fast normalizes before provider forwarding."""
     chat = decode_chat(
         {
             "model": "coding",
@@ -3389,7 +3387,7 @@ def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values
             {
                 "model": "coding",
                 "messages": [{"role": "user", "content": "x"}],
-                "service_tier": "fast",
+                "service_tier": "turbo",
             },
             decode_chat,
         ),

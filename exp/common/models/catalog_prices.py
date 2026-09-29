@@ -48,7 +48,8 @@ class GatewayServiceTierPrices(ContractModel):
     OpenAI's ``service_tier`` reprices the WHOLE request (``flex`` discounted,
     ``priority`` premium): these rates replace the base schedule for every
     dimension at cost, no markup. ``None`` on a dimension is unknown exactly as
-    on the base schedule (never the base rate). v1 bills the REQUESTED tier.
+    on the base schedule (never the base rate). Its own long-context schedule
+    applies independently of the standard processing schedule.
     """
 
     input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
@@ -57,6 +58,7 @@ class GatewayServiceTierPrices(ContractModel):
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    long_context: GatewayLongContextTier | None = None
 
 
 class GatewayTokenPrices(ContractModel):
@@ -113,7 +115,7 @@ class GatewayTokenPrices(ContractModel):
             tier: Requested provider processing tier.
 
         Returns:
-            The tier card as a whole-request schedule without long-context pricing,
+            The tier card as a complete schedule with its own long-context pricing,
             or this schedule when no configured tier card applies.
         """
         card = self.service_tier(tier)
@@ -126,5 +128,5 @@ class GatewayTokenPrices(ContractModel):
             cache_creation_1h_input_nano_usd_per_million_tokens=card.cache_creation_1h_input_nano_usd_per_million_tokens,
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
-            long_context=None,
+            long_context=card.long_context,
         )

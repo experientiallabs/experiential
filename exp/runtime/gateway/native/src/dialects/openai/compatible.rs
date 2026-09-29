@@ -161,6 +161,7 @@ impl Normalizer {
             ))]);
         }
         let mut events = Vec::new();
+        self.service_tier.observe(payload.get("service_tier"));
         // An aggregator names the upstream that serves the stream on each
         // chunk (OpenRouter `provider`, opted in by its metadata header); the
         // first label is kept for settlement so a zero-data-retention

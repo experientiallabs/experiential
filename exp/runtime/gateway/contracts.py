@@ -27,9 +27,7 @@ from exp.common.models.gateway_catalog import (
 from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
 from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
-from exp.runtime.gateway.reasoning_blocks import (
-    EncryptedReasoningBlock as EncryptedReasoningBlock,
-)
+from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock as EncryptedReasoningBlock
 from exp.runtime.gateway.reasoning_blocks import (
     ExposedReasoningContentBlock as ExposedReasoningContentBlock,
 )
@@ -45,10 +43,14 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import (
     SealedReasoningContentBlock as SealedReasoningContentBlock,
 )
-from exp.runtime.gateway.reasoning_blocks import (
-    ThinkingBlock as ThinkingBlock,
-)
+from exp.runtime.gateway.reasoning_blocks import ThinkingBlock as ThinkingBlock
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy, RequestedRouteId
+from exp.runtime.gateway.service_tiers import (
+    GatewayServiceTierAdmission as GatewayServiceTierAdmission,
+)
+from exp.runtime.gateway.service_tiers import (
+    GatewayServiceTierSettlement as GatewayServiceTierSettlement,
+)
 from exp.runtime.gateway.stream_contracts import (
     ChoiceLogprobs as ChoiceLogprobs,
 )
