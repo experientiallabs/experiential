@@ -15,6 +15,7 @@ from exp.common.models import (
     structured_json_text,
 )
 from exp.common.tasks import TaskCase
+from exp.simulation.engines.text.protocol_feedback import transition_validation_feedback
 from exp.simulation.retrieval import RAGAction, RAGMatch
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
@@ -185,6 +186,7 @@ def parse_world_model_transition(output: AssistantAction) -> TextWorldModelTrans
     except ValidationError as exc:
         raise TextWorldModelProtocolError(
             "world-model transition has invalid message, tool_results, state, or terminal fields"
+            f". {transition_validation_feedback(exc)}"
         ) from exc
     if not transition.message and not transition.tool_results and not transition.terminal:
         raise TextWorldModelProtocolError(

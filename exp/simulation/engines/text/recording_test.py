@@ -969,6 +969,56 @@ def test_world_retry_exhaustion_is_invalid_and_retains_each_paid_response() -> N
     assert recorder.checkpoint() is None
 
 
+@pytest.mark.parametrize("valid_final", [False, True])
+def test_private_schema_feedback_preserves_exact_retry_budget_and_rejected_evidence(
+    valid_final: bool,
+) -> None:
+    """Only a separately valid reply can be delivered within the existing three attempts."""
+    rejected = [
+        _response(
+            '{"message":"hi","private-extra":"private-value"}', model=_snapshot("world-model-a")
+        ),
+        _response('{"message":17}', model=_snapshot("world-model-a")),
+    ]
+    last = _response(
+        '{"message":"done","terminal":true}' if valid_final else '{"message":17}',
+        model=_snapshot("world-model-a"),
+    )
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient([*rejected, last])
+    recorder = _recorder(candidate, world, maximum_transition_attempts=3)
+    request = ModelRequest(messages=(ModelMessage(role="user", content="question"),))
+    if valid_final:
+        recorder.complete(request)
+        checkpoint = recorder.checkpoint()
+        assert checkpoint is not None
+        assert checkpoint.invalid_world_model_responses == tuple(rejected)
+        assert recorder.recorded.transitions[0].message == "done"
+    else:
+        with pytest.raises(TextSimulationError, match="string_type at \\$\\.message") as raised:
+            recorder.complete(request)
+        assert raised.value.failure.details["phase"] == "world_model_protocol"
+        assert recorder.recorded.transitions == ()
+        assert recorder.visible_transcript == ()
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 3
+    assert len(recorder.recorded.world_model_spans) == 3
+    assert recorder.recorded.world_model_economics.cost_usd is not None
+    assert recorder.recorded.world_model_economics.cost_usd.value == pytest.approx(0.3)
+    assert "extra_forbidden at $.<extra-field>" in (world.requests[1].messages[-1].content or "")
+    assert "string_type at $.message" in (world.requests[2].messages[-1].content or "")
+    for retry in world.requests[1:]:
+        assert retry.messages[:-1] == world.requests[0].messages
+        assert (
+            retry.model_copy(update={"messages": world.requests[0].messages}) == world.requests[0]
+        )
+        assert "private-extra" not in (retry.messages[-1].content or "")
+        assert "private-value" not in (retry.messages[-1].content or "")
+    assert all(
+        "Schema errors" not in (message.content or "") for message in recorder.visible_transcript
+    )
+
+
 def test_world_retry_checks_spend_before_another_dispatch() -> None:
     """Protocol retries honor the cell's existing stop-on-overspend contract."""
     candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
