@@ -27,8 +27,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayRefusalReason,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
     GatewayUsage,
 )
+from exp.runtime.gateway.native_service_tiers import settlement_kwarg
 from exp.runtime.gateway.rate_limit_headers import (
     RateLimitObservation,
     rate_limit_observation_from_payload,
@@ -488,10 +491,14 @@ class SettlementMetadata(TypedDict):
     ratelimit_limit_tokens: int | None
     ratelimit_remaining_tokens: int | None
     upstream_provider: NotRequired[str | None]
+    service_tier: NotRequired[GatewayServiceTierSettlement]
 
 
 def settlement_metadata(
-    data: JsonObject | None, settle: Callable[..., object]
+    data: JsonObject | None,
+    settle: Callable[..., object],
+    *,
+    service_tier: GatewayServiceTierAdmission | None = None,
 ) -> SettlementMetadata:
     """Project original observations while withholding unsupported host keywords."""
     observed = settlement_rate_limit(data)
@@ -505,6 +512,7 @@ def settlement_metadata(
     }
     if accepts_keyword(settle, "upstream_provider"):
         fields["upstream_provider"] = upstream_provider_from_settlement(data)
+    fields.update(settlement_kwarg(service_tier, {} if data is None else data))
     return fields
 
 

@@ -9,7 +9,7 @@ from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.runtime.gateway.budgets import settle_attempt_budgets
 from exp.runtime.gateway.contracts import GatewayEvent, GatewayUsage
 from exp.runtime.gateway.ledger_errors import GatewayLedgerError
-from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd
+from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd, usage_source_label
 from exp.runtime.gateway.service_tiers import (
     GatewayServiceTierAdmission,
     GatewayServiceTierSettlement,
@@ -98,10 +98,9 @@ def reconcile_tier_receipt(
     if receipt != admission.settlement(served=receipt.served, resolution=receipt.resolution):
         raise GatewayLedgerError("service-tier receipt differs from the admitted schedules")
     previous = row["service_tier_settlement"]
-    if previous is not None:
-        prior = GatewayServiceTierSettlement.model_validate_json(previous)
-        if prior.resolution == "confirmed" and prior != receipt:
-            raise GatewayLedgerError("service-tier receipt differs from the settled tier")
+    prior = None if previous is None else GatewayServiceTierSettlement.model_validate_json(previous)
+    if prior is not None and prior.resolution == "confirmed" and prior != receipt:
+        raise GatewayLedgerError("service-tier receipt differs from the settled tier")
     if receipt.resolution != "confirmed":
         return
     fields = (
@@ -112,6 +111,19 @@ def reconcile_tier_receipt(
         "cache_creation_1h_input_tokens",
         "reasoning_tokens",
     )
+    # A committed safe hold is already acknowledged, even without a priceable meter.
+    # Only identical durable evidence is a no-op; a new receipt still owes validation.
+    if (
+        prior == receipt
+        and row["budget_settled_nano_usd"] is None
+        and all(
+            row[field] == (None if usage is None else getattr(usage, field)) for field in fields
+        )
+        and row["usage_source"]
+        == usage_source_label(usage, estimated=terminal is not None and terminal.usage_estimated)
+        and tier_usage_cost(receipt, usage, terminal) is None
+    ):
+        return
     crash_meter = (
         row["state"] == "unknown_after_crash"
         and row["usage_source"] == "unknown"

@@ -62,7 +62,7 @@ from exp.runtime.gateway.native_rung_policy import (
     reserve_rung_slot,
     shed_keeps_rung,
 )
-from exp.runtime.gateway.native_service_tiers import admission_kwarg, settlement_kwarg, tier_ceiling
+from exp.runtime.gateway.native_service_tiers import admission_kwarg, tier_ceiling
 from exp.runtime.gateway.native_settlement import (
     all_routes_throttled_failure,
     all_routes_unavailable_failure,
@@ -661,9 +661,7 @@ class NativeAttemptAccounting:
     def settle(self, argument: str) -> str:
         """Durably settle one previously reserved attempt exactly once.
 
-        Finalizing settlement closes the request; a non-finalizing settlement
-        closes only its attempt so the waterfall can reserve another dispatch.
-        Health circuits record every settled outcome.
+        Finalization closes the request; otherwise the waterfall continues. Health records both.
 
         Args:
             argument: JSON request/attempt identity, outcome, optional usage/failure,
@@ -673,9 +671,8 @@ class NativeAttemptAccounting:
             An empty JSON object; repeated settlement is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the
-                in-flight entry is kept so a retried settlement (from the
-                data plane or the deadline sweep) can still reach the ledger.
+            NativeBridgeError: The terminal write failed; the retained entry lets either
+                the data plane or the deadline sweep retry the original settlement.
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
@@ -695,8 +692,11 @@ class NativeAttemptAccounting:
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                **settlement_metadata(data, self._finish_attempt),
-                **settlement_kwarg(entry.attempt_service_tiers.get(attempt_id), data),
+                **settlement_metadata(
+                    data,
+                    self._finish_attempt,
+                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -705,9 +705,7 @@ class NativeAttemptAccounting:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
-            # The exact settlement is retained so a retry (from the data
-            # plane or the timer sweep) lands the ORIGINAL outcome and usage,
-            # never a downgraded cancellation.
+            # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
@@ -956,7 +954,7 @@ class NativeAttemptAccounting:
         finalize: bool,
         settlement: JsonObject | None = None,
     ) -> bool:
-        """Land one swept settlement from its retained payload; keep the entry to retry on failure.
+        """Replay the retained settlement, keeping it for another retry on failure.
 
         Returns:
             Whether the swept terminal write reached the ledger.
@@ -967,7 +965,11 @@ class NativeAttemptAccounting:
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                **settlement_metadata(settlement, self._finish_attempt),
+                **settlement_metadata(
+                    settlement,
+                    self._finish_attempt,
+                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -979,9 +981,7 @@ class NativeAttemptAccounting:
             self._accounting_healthy = False
             return False
         self._record_health(entry, attempt_id, opened=False, failure=failure, settlement=settlement)
-        # A retained settlement that finally lands through the sweep carries
-        # the same observed usage as the direct path, so the cache-priority
-        # EWMA must not depend on WHICH recovery path succeeded.
+        # Cache-priority observations must not depend on which settlement path succeeds.
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
             self.recovery,

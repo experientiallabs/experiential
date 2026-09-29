@@ -1121,8 +1121,6 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
 @pytest.mark.parametrize("mode", ["maximize_availability", "maximize_cache"])
 def test_priority_house_card_excludes_standard_only_lead(mode: str) -> None:
     """Explicit Fast never silently executes on an unconfigured leading house rung."""
-    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
-
     gateway = GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
     )

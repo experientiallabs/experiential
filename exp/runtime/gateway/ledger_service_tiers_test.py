@@ -186,6 +186,80 @@ def test_tier_receipt_survives_reopen_and_holds_unknown(tmp_path: Path, served: 
             ).fetchone() == (1, 20, 20)
 
 
+@pytest.mark.parametrize("missing", ["usage", "rate", "ttl"])
+def test_confirmed_unpriceable_receipt_replay_preserves_hold(tmp_path: Path, missing: str) -> None:
+    """An acknowledged hold remains idempotent even when a confirmed tier cannot be priced."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=1000,
+        strict_unknown_cost=True,
+    )
+    auth = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=_request("held receipt"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=auth)
+    admission = GatewayServiceTierAdmission(
+        requested="priority",
+        standard_prices=GatewayTokenPrices(),
+        requested_prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=2_000_000,
+            output_nano_usd_per_million_tokens=None if missing == "rate" else 4_000_000,
+            cache_creation_input_nano_usd_per_million_tokens=2_500_000,
+            cache_creation_1h_input_nano_usd_per_million_tokens=4_000_000,
+        ),
+    )
+    attempt = ledger.start_attempt(
+        snapshot=_execution(auth),
+        deployment=_deployment(billing_source=BillingSource.HOST_MANAGED),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=300,
+        service_tier=admission,
+    )
+    receipt = admission.settlement(served="priority", resolution="confirmed")
+    usage = (
+        None
+        if missing == "usage"
+        else GatewayUsage(
+            input_tokens=10,
+            output_tokens=5,
+            cache_creation_input_tokens=5 if missing == "ttl" else None,
+        )
+    )
+    terminal = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0, usage=usage)
+    ledger.finish_attempt(
+        attempt_id=attempt, terminal_event=terminal, failure=None, service_tier=receipt
+    )
+    ledger = SQLiteAttemptLedger(store.database_path, clock=clock)
+    ledger.finish_attempt(
+        attempt_id=attempt, terminal_event=terminal, failure=None, service_tier=receipt
+    )
+    with pytest.raises(GatewayLedgerError, match="durable usage"):
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=terminal.model_copy(
+                update={"usage": GatewayUsage(input_tokens=11, output_tokens=5)}
+            ),
+            failure=None,
+            service_tier=receipt,
+        )
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_monthly_budgets"
+        ).fetchone() == (300, 0)
+        assert connection.execute(
+            "SELECT estimated_cost_nano_usd, budget_settled_nano_usd FROM gateway_attempts"
+        ).fetchone() == (None, None)
+
+
 @pytest.mark.parametrize("served", ["default", "priority"])
 def test_lost_settlement_after_crash_recovers_billing_not_delivery(
     tmp_path: Path, served: str

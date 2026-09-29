@@ -146,6 +146,8 @@ class InflightRequest:
     facts the terminal settlement consumes.
 
     Attributes:
+        attempt_service_tiers: Frozen pricing authority keyed by physical attempt, initially
+            empty; untiered and customer-managed attempts have no entry.
         recovery_observed_at: First validated terminal receipt epoch per reserved attempt;
             retries never renew cache residency or failure cooldowns.
         recovery_observation_lock: Serializes recovery observation timestamps and effects
