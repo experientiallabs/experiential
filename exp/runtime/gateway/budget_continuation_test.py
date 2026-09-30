@@ -30,6 +30,7 @@ from exp.runtime.gateway.contracts import (
     ExecutionSnapshot,
     GatewayEvent,
     GatewayEventKind,
+    GatewayServiceTierAdmission,
     GatewayUsage,
 )
 from exp.runtime.gateway.model_plan import model_execution_snapshot
@@ -63,6 +64,7 @@ class ScopedLedger(_RecordingLedger):
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> str:
         """Deny each B provider from the same atomic-style immutable scope."""
         assert isinstance(snapshot, ExecutionSnapshot)

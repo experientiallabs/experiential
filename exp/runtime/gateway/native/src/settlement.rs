@@ -453,6 +453,7 @@ impl AttemptGuard {
             self.web_search_requests,
             self.tool_search_requests,
         );
+        let argument = tier_provenance(argument, &observed.service_tier);
         let argument = disconnect_provenance(
             argument,
             self.dispatched,
@@ -553,6 +554,12 @@ impl AttemptGuard {
 /// instead of settling a caller's disconnect as unknown. Its absence means
 /// the data plane predates the field, and the control plane keeps the
 /// unknown policy.
+fn tier_provenance(argument: String, tier: &crate::service_tier::ServiceTierObservation) -> String {
+    let mut payload: Value = serde_json::from_str(&argument).expect("locally encoded settlement");
+    payload["service_tier"] = json!(tier);
+    compact_json(&payload)
+}
+
 fn disconnect_provenance(
     argument: String,
     dispatched: bool,
@@ -650,7 +657,7 @@ impl Drop for AttemptGuard {
             // settlements identify only genuinely dispatched cancellation.
             let observed = self.observation.snapshot();
             disconnect_provenance(
-                argument,
+                tier_provenance(argument, &observed.service_tier),
                 self.dispatched,
                 self.dispatched && observed.terminal.is_none(),
                 &observed.streamed_output,

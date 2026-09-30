@@ -38,6 +38,8 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
     GatewayUsage,
 )
 from exp.runtime.gateway.ledger import AttemptRejectedError
@@ -181,6 +183,7 @@ class _RecordingLedger:
         self.started: list[JsonObject] = []
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
+        self.service_tiers: list[GatewayServiceTierSettlement | None] = []
         self.upstream_providers: list[str | None] = []
         self.first_token_times: list[datetime | None] = []
         self.web_search_requests: list[int | None] = []
@@ -210,6 +213,7 @@ class _RecordingLedger:
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
         del snapshot, fallback_reason
@@ -254,6 +258,7 @@ class _RecordingLedger:
         upstream_provider: str | None = None,
         web_search_requests: int | None = None,
         tool_search_requests: int | None = None,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart.
 
@@ -266,6 +271,7 @@ class _RecordingLedger:
         self.web_search_requests.append(web_search_requests)
         self.tool_search_requests.append(tool_search_requests)
         self.terminal_events.append(terminal_event)
+        self.service_tiers.append(service_tier)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1
             raise RuntimeError("scripted terminal-write failure")
@@ -394,6 +400,57 @@ def test_attempt_token_and_money_reservations_use_the_frozen_payload_bound(
     assert row["maximum_cost_nano_usd"] == maximum_attempt_cost_nano_usd(
         entry.request.model_copy(update={"maximum_output_tokens": frozen_bound}), deployment
     )
+
+
+@pytest.mark.parametrize("served", ("priority", "default", None))
+@pytest.mark.parametrize("retry", ("direct", "explicit", "sweep"))
+def test_service_tier_evidence_survives_every_settlement_path(
+    served: Literal["priority", "default"] | None, retry: str
+) -> None:
+    """Recovery binds the original observation to the same immutable attempt cards."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    attempt_id = str(started["attempt_id"])
+    admission = GatewayServiceTierAdmission(
+        requested="priority",
+        standard_prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=1_000_000,
+            output_nano_usd_per_million_tokens=2_000_000,
+        ),
+        requested_prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=2_000_000,
+            output_nano_usd_per_million_tokens=4_000_000,
+        ),
+    )
+    entry.attempt_service_tiers[attempt_id] = admission
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": attempt_id,
+        "outcome": "completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "finalize": True,
+        "service_tier": {
+            "served": served,
+            "resolution": "missing" if served is None else "confirmed",
+        },
+    }
+    encoded = json.dumps(payload)
+    if retry != "direct":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        assert entry.pending_settlement == payload
+    if retry == "sweep":
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    expected = admission.settlement(
+        served=served, resolution="missing" if served is None else "confirmed"
+    )
+    assert ledger.service_tiers[-1] == expected
+    assert registry.entry(entry.authorization.request_id) is None
+    registry.settle(encoded)
+    assert len(ledger.finished) == 1
 
 
 @pytest.mark.parametrize("partial_usage", (False, True))
@@ -2076,6 +2133,7 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
             fallback_reason: str | None = None,
             dispatch_reason: str | None = None,
             preferred_deployment: ExactModelDeployment | None = None,
+            service_tier: GatewayServiceTierAdmission | None = None,
         ) -> str:
             """Record the reserved input rate, then reserve as the base fake does."""
             self.reserved_input_micro.append(
@@ -3844,6 +3902,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> str:
         """Delay the existing typed ledger method without changing reservation semantics."""
         result = original(

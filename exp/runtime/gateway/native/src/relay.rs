@@ -331,6 +331,7 @@ impl UpstreamRelay {
 
     fn queue_events(&mut self, events: Vec<Event>) {
         if let Some(observation) = &self.observation {
+            observation.record_service_tier(&self.normalizer.service_tier);
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
             if let Some(usage) = self.normalizer.observed_usage() {

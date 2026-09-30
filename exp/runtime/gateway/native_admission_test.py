@@ -1118,6 +1118,46 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
         )
 
 
+@pytest.mark.parametrize("mode", ["maximize_availability", "maximize_cache"])
+def test_priority_house_card_excludes_standard_only_lead(mode: str) -> None:
+    """Explicit Fast never silently executes on an unconfigured leading house rung."""
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        mode,
+        (_deployment("standard", gateway=gateway), _deployment("priority", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://standard.test"), client),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://priority.test",
+                service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"priority"}),
+            ),
+            client,
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="priority",
+    )
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(deployment.deployment_id for deployment in narrowed.deployments) == ("priority",)
+    assert provider.service_tier == "priority"
+
+
 def test_tier_priced_host_lane_admits_the_named_tier() -> None:
     """A host rung whose model carries per-tier pricing forwards the tier, so a
     flex request is admitted (not rejected)."""

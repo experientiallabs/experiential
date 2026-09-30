@@ -13,6 +13,8 @@ from exp.runtime.gateway.contracts import (
     ExecutionSnapshot,
     GatewayEvent,
     GatewayFailure,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
 )
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore
@@ -48,6 +50,7 @@ class SyncWriteLedger(Protocol):
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably mark one provider dispatch before network work."""
         ...
@@ -68,6 +71,7 @@ class SyncWriteLedger(Protocol):
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
         tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Durably settle one attempt exactly once.
 

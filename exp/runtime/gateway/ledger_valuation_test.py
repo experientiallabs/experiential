@@ -127,6 +127,37 @@ def test_malformed_subset_counts_clamp_to_their_totals() -> None:
     assert cost == 40
 
 
+@pytest.mark.parametrize(
+    "write_rate,hour_rate,expected",
+    [
+        (2_500_000, 2_500_000, 310),
+        (0, 0, 160),
+        (2_500_000, 5_000_000, None),
+        (2_500_000, None, None),
+        (None, 2_500_000, None),
+        (None, None, None),
+    ],
+)
+def test_unobserved_write_ttl_requires_equal_known_rates(
+    write_rate: int | None, hour_rate: int | None, expected: int | None
+) -> None:
+    """An equal-rate schedule needs no invented TTL; unequal or unknown rates stay unknown."""
+    usage = GatewayUsage(input_tokens=100, output_tokens=10, cache_creation_input_tokens=60)
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=2_000_000,
+            cached_input_rate=200_000,
+            cache_creation_input_rate=write_rate,
+            cache_creation_1h_input_rate=hour_rate,
+            output_rate=8_000_000,
+            reasoning_rate=None,
+        )
+        == expected
+    )
+    assert usage.cache_creation_1h_input_tokens is None
+
+
 def test_cache_write_prices_at_its_surcharge_rate() -> None:
     """Cache-write tokens bill at their own rate, disjoint from cache-read."""
     fresh = GatewayUsage(input_tokens=1_000, output_tokens=10)

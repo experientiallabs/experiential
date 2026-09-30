@@ -7,9 +7,15 @@ Anthropic asks that application to send come from :class:`AnthropicOAuthApp`, su
 operator (``EXP_ANTHROPIC_OAUTH_*`` for the local gateway, or the embedder's configuration).
 Without one, a plan connection refuses to resolve.
 
-The gateway never presents another client's identity. :class:`AnthropicOAuthApp` rejects Claude
-Code's public client ID and any ``claude-code``/``claude-cli`` identity header, so a plan
-connection is always this operator's application acting for the signed-in user.
+The gateway never presents another client's identity by default. :class:`AnthropicOAuthApp`
+rejects Claude Code's public client ID and any ``claude-code``/``claude-cli`` identity header, so
+a plan connection is always this operator's application acting for the signed-in user. The one
+exception is the owner-approved shared-client mode (``shared_client=True``, 2026-09-29): before
+Anthropic issues the operator its own app, the operator may deliberately present as Claude
+Code's public client, exactly as Claude Code does, with the paste-code flow and the same beta
+header. In that mode the client ID must be Claude Code's (any other foreign ID is still
+refused) and the dispatch headers may carry that client's beta value, but credentials remain
+refused.
 
 Bearers are minted per physical dispatch through the body-signing seam (the same timing as
 ChatGPT plans and Bedrock SigV4), refreshed ahead of expiry by the connection's token source.
@@ -39,11 +45,17 @@ from exp.runtime.models.providers.transport import JsonHttpTransport
 ANTHROPIC_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 ANTHROPIC_OAUTH_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 DEFAULT_ANTHROPIC_PLAN_SCOPES: tuple[str, ...] = ("user:profile", "user:inference")
+# Claude Code's public OAuth client and the paste-code callback its authorization ends on.
+# The shared-client mode (owner-approved, 2026-09-29) presents as this client until Anthropic
+# issues the operator's own application.
+CLAUDE_CODE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_CODE_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+CLAUDE_CODE_OAUTH_BETA = "oauth-2025-04-20"
 _TOKEN_ENDPOINT_TIMEOUT_SECONDS = 30.0
 _ENVIRONMENT_PREFIX = "EXP_ANTHROPIC_OAUTH_"
 # Identities that belong to other clients. An operator app carrying one would present this
 # gateway as that client, which the operator's approval does not cover.
-_FOREIGN_CLIENT_IDS = frozenset({"9d1c250a-e61b-44d9-88ed-5944d1962f5e"})
+_FOREIGN_CLIENT_IDS = frozenset({CLAUDE_CODE_OAUTH_CLIENT_ID})
 _FOREIGN_IDENTITY_MARKERS = ("claude-code", "claude-cli", "claude_code")
 
 AnthropicTokenEndpoint = Callable[[str, JsonObject], JsonObject]
@@ -66,6 +78,9 @@ class AnthropicOAuthApp(ContractModel):
         dispatch_headers: Extra headers Anthropic asks this application to send on inference
             (for example the ``anthropic-beta`` value named in the approval). Never a credential
             or a header that presents the gateway as another client.
+        shared_client: Owner-approved mode (2026-09-29) presenting as Claude Code's public
+            client until Anthropic issues the operator its own app: the client ID must then be
+            Claude Code's, and its beta header is allowed. Off by default.
     """
 
     client_id: str = Field(min_length=1, max_length=256)
@@ -74,26 +89,34 @@ class AnthropicOAuthApp(ContractModel):
     token_url: str = ANTHROPIC_OAUTH_TOKEN_URL
     scopes: tuple[str, ...] = DEFAULT_ANTHROPIC_PLAN_SCOPES
     dispatch_headers: dict[str, str] = Field(default_factory=dict)
+    shared_client: bool = False
 
     @field_validator("client_id")
     @classmethod
     def _refuse_foreign_client(cls, value: str) -> str:
-        """Refuse another client's public ID."""
-        if value.strip().lower() in _FOREIGN_CLIENT_IDS:
-            raise ValueError(
-                "that is Claude Code's OAuth client ID; configure the client ID Anthropic "
-                "issued to this operator"
-            )
+        """Refuse another client's public ID.
+
+        Claude Code's own ID passes the field check so the shared-client mode can select it
+        (the model validator then insists it is exactly that mode).
+        """
         return value.strip()
 
     @model_validator(mode="after")
     def _refuse_foreign_identity(self) -> AnthropicOAuthApp:
-        """Refuse headers that would present the gateway as another client."""
+        """Refuse headers that would present the gateway as another client.
+
+        In the shared-client mode the presentation IS Claude Code, so the marker check is
+        deliberately narrowed to the ``user-agent`` header alone; credentials stay refused.
+        """
         for name, value in self.dispatch_headers.items():
             lowered = name.lower()
             if lowered in {"authorization", "x-api-key"}:
                 raise ValueError("dispatch_headers must not carry a credential")
-            if lowered == "user-agent" or any(
+            if lowered == "user-agent":
+                raise ValueError(
+                    f"dispatch header {name!r} would present the gateway as another client"
+                )
+            if not self.shared_client and any(
                 marker in value.lower() for marker in _FOREIGN_IDENTITY_MARKERS
             ):
                 raise ValueError(
@@ -102,6 +125,15 @@ class AnthropicOAuthApp(ContractModel):
         for url in (self.authorize_url, self.token_url):
             if not url.startswith("https://"):
                 raise ValueError("Anthropic OAuth endpoints must be https URLs")
+        if self.client_id == CLAUDE_CODE_OAUTH_CLIENT_ID and not self.shared_client:
+            raise ValueError(
+                "that is Claude Code's OAuth client ID; configure the client ID Anthropic "
+                "issued to this operator, or set shared_client for the approved shared mode"
+            )
+        if self.shared_client and self.client_id != CLAUDE_CODE_OAUTH_CLIENT_ID:
+            raise ValueError(
+                "shared_client mode presents as Claude Code; the client ID must be its own"
+            )
         return self
 
 
@@ -112,6 +144,9 @@ def anthropic_oauth_app_from_environment(
 
     ``CLIENT_ID`` and ``REDIRECT_URI`` are required together; ``AUTHORIZE_URL``, ``TOKEN_URL``,
     ``SCOPES`` (space separated) and ``BETA`` (sent as ``anthropic-beta``) are optional.
+    ``SHARED_CLIENT=1`` selects the owner-approved shared-client mode (2026-09-29): the app
+    presents as Claude Code's public client, whose authorization ends on a paste-code page, so
+    ``REDIRECT_URI`` may stay empty and defaults to Claude Code's callback.
 
     Args:
         environment: Process environment or an explicit mapping.
@@ -125,9 +160,18 @@ def anthropic_oauth_app_from_environment(
     client_id = environment.get(f"{_ENVIRONMENT_PREFIX}CLIENT_ID", "").strip()
     if not client_id:
         return None
-    redirect_uri = environment.get(f"{_ENVIRONMENT_PREFIX}REDIRECT_URI", "").strip()
+    shared = environment.get(f"{_ENVIRONMENT_PREFIX}SHARED_CLIENT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    redirect_uri = environment.get(f"{_ENVIRONMENT_PREFIX}REDIRECT_URI", "").strip() or (
+        CLAUDE_CODE_OAUTH_REDIRECT_URI if shared else ""
+    )
     scopes = environment.get(f"{_ENVIRONMENT_PREFIX}SCOPES", "").split()
-    beta = environment.get(f"{_ENVIRONMENT_PREFIX}BETA", "").strip()
+    beta = environment.get(f"{_ENVIRONMENT_PREFIX}BETA", "").strip() or (
+        CLAUDE_CODE_OAUTH_BETA if shared else ""
+    )
     try:
         return AnthropicOAuthApp(
             client_id=client_id,
@@ -138,6 +182,7 @@ def anthropic_oauth_app_from_environment(
             or ANTHROPIC_OAUTH_TOKEN_URL,
             scopes=tuple(scopes) or DEFAULT_ANTHROPIC_PLAN_SCOPES,
             dispatch_headers={"anthropic-beta": beta} if beta else {},
+            shared_client=shared,
         )
     except ValueError as exc:
         raise AnthropicPlanError(

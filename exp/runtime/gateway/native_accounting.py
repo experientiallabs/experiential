@@ -16,7 +16,6 @@ from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
-    maximum_attempt_cost_nano_usd,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -63,6 +62,7 @@ from exp.runtime.gateway.native_rung_policy import (
     reserve_rung_slot,
     shed_keeps_rung,
 )
+from exp.runtime.gateway.native_service_tiers import admission_kwarg, tier_ceiling
 from exp.runtime.gateway.native_settlement import (
     all_routes_throttled_failure,
     all_routes_unavailable_failure,
@@ -81,6 +81,7 @@ from exp.runtime.gateway.native_settlement import (
 )
 from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
+from exp.runtime.gateway.service_tiers import tier_admission
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
@@ -472,6 +473,13 @@ class NativeAttemptAccounting:
                 )
                 self._health.release_probe(keys[candidate])
                 break
+            tier = tier_admission(
+                route.deployments[candidate].gateway.prices,
+                getattr(entry.request, "service_tier", None),
+                forwards_tier=candidate < len(entry.tier_forwarded_by_depth)
+                and entry.tier_forwarded_by_depth[candidate],
+                customer_managed=route.deployments[candidate].billing_source == "customer_managed",
+            )
             deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
@@ -534,9 +542,10 @@ class NativeAttemptAccounting:
                     deployment=deployment,
                     attempt_ordinal=entry.total_attempts,
                     route_depth=candidate,
-                    maximum_cost_nano_usd=maximum_attempt_cost_nano_usd(
-                        reservation_request, deployment, input_tokens=reserved_input_tokens
+                    maximum_cost_nano_usd=tier_ceiling(
+                        reservation_request, deployment, tier, input_tokens=reserved_input_tokens
                     ),
+                    **admission_kwarg(tier),
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
                     route_reason=route.attempt_route_reason(route.deployments[candidate]),
@@ -625,6 +634,8 @@ class NativeAttemptAccounting:
                 entry.total_attempts += 1
                 entry.active_attempt_id = attempt_id
                 entry.attempt_depths[attempt_id] = candidate
+                if tier is not None:
+                    entry.attempt_service_tiers[attempt_id] = tier
             return json.dumps(
                 {"attempt_id": attempt_id, "route_depth": candidate},
                 separators=(",", ":"),
@@ -650,25 +661,18 @@ class NativeAttemptAccounting:
     def settle(self, argument: str) -> str:
         """Durably settle one previously reserved attempt exactly once.
 
-        A finalizing settlement also terminalizes the request and removes the
-        in-flight entry; a non-finalizing one (a failed precommit dispatch
-        with a successor still possible) closes only the attempt so the
-        waterfall can reserve its next dispatch. Deployment-health circuits
-        record every settled outcome, restoring admission first when the
-        dispatch had opened.
+        Finalization closes the request; otherwise the waterfall continues. Health records both.
 
         Args:
-            argument: JSON object with ``request_id``, ``attempt_id``,
-                ``outcome``, optional ``usage``, ``tool_names``, ``failure``,
-                ``finalize`` (default true), and ``opened`` (default false).
+            argument: JSON request/attempt identity, outcome, optional usage/failure,
+                finalization flag, and witnessed provider metadata.
 
         Returns:
             An empty JSON object; repeated settlement is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the
-                in-flight entry is kept so a retried settlement (from the
-                data plane or the deadline sweep) can still reach the ledger.
+            NativeBridgeError: The terminal write failed; the retained entry lets either
+                the data plane or the deadline sweep retry the original settlement.
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
@@ -688,7 +692,11 @@ class NativeAttemptAccounting:
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                **settlement_metadata(data, self._finish_attempt),
+                **settlement_metadata(
+                    data,
+                    self._finish_attempt,
+                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -697,9 +705,7 @@ class NativeAttemptAccounting:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
-            # The exact settlement is retained so a retry (from the data
-            # plane or the timer sweep) lands the ORIGINAL outcome and usage,
-            # never a downgraded cancellation.
+            # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
@@ -948,7 +954,7 @@ class NativeAttemptAccounting:
         finalize: bool,
         settlement: JsonObject | None = None,
     ) -> bool:
-        """Land one swept settlement from its retained payload; keep the entry to retry on failure.
+        """Replay the retained settlement, keeping it for another retry on failure.
 
         Returns:
             Whether the swept terminal write reached the ledger.
@@ -959,7 +965,11 @@ class NativeAttemptAccounting:
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                **settlement_metadata(settlement, self._finish_attempt),
+                **settlement_metadata(
+                    settlement,
+                    self._finish_attempt,
+                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -971,9 +981,7 @@ class NativeAttemptAccounting:
             self._accounting_healthy = False
             return False
         self._record_health(entry, attempt_id, opened=False, failure=failure, settlement=settlement)
-        # A retained settlement that finally lands through the sweep carries
-        # the same observed usage as the direct path, so the cache-priority
-        # EWMA must not depend on WHICH recovery path succeeded.
+        # Cache-priority observations must not depend on which settlement path succeeds.
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
             self.recovery,

@@ -867,10 +867,10 @@ Gemini uses `responseMimeType: "application/json"` without a schema. Anthropic/B
 best-effort system instruction, disclosed as `response_format->instruction(json_object)`.
 Every wire receives a counted JSON-object instruction; native format fields are retained.
 No empty schema is synthesized. Use `json_schema` when a supported route must enforce a shape.
-A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
-only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
-directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
-bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
+Chat and Responses normalize `service_tier: "fast"` to `priority`; BYOK forwarding and auto/default behavior stay unchanged.
+Host tiers require enabled cards; priority selects eligible rungs, never a standard-only lead. Admission freezes standard and requested schedules, including long-context/cache writes, and reserves the larger bound.
+Hosts persist `GatewayServiceTierAdmission` and validate `GatewayServiceTierSettlement` against it, never against live catalog or provider-authored prices.
+Settlement prices the served tier (Responses terminal evidence, not its created echo); missing, unknown or conflicting evidence holds the reservation without charging or releasing it. Anthropic's own
 `service_tier` stays a recorded Messages-surface rejection. A caller top-level `provider` object (OpenRouter's routing-preference shape) is accepted on all three surfaces, Messages included (Anthropic SDKs send it through `extra_body`); exactly one key changes gateway behavior: `provider: {"zdr": true}` DEMANDS zero-data-retention routing for that request, carried as `GatewayRequest.zdr_requested` and `AuthorizationSnapshot.zdr_requested`. A host that publishes provider data-retention postures applies the same posture filter as its organization-level `require_zdr` (natively ZDR rungs first, then an OpenRouter rung dispatched under `provider: {"zdr": true, "data_collection": "deny"}` plus `X-OpenRouter-Metadata: enabled`, flagged through `ExecutionSnapshot.zdr_constrained_deployment_ids`), answers `x-gateway-zdr: true`, and refuses with a 403 naming the excluded providers when no rung qualifies; the demand only tightens and never loosens an organization policy, and the local gateway (no postures) refuses it with a 403 on `provider.zdr`.
 The rest of the object (`data_collection`, `order`, `only`, ...) forwards to OpenRouter rungs verbatim (tightened when the rung is constrained) and is dropped on every other wire (`openai_responses`, `anthropic_messages`, `gemini_generate_content`, `bedrock_converse_stream`, and non-OpenRouter `openai_compatible` rungs), which have no such field. On `maximize_cache` pools, a cache-marked request dispatches
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
