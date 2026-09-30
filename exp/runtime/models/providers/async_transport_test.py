@@ -263,3 +263,41 @@ def test_async_transport_names_connection_failures_without_exposing_secrets(meth
     message = asyncio.run(scenario())
     assert "ConnectError" in message
     assert canary not in message
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_async_transport_rejects_invalid_headers_without_retaining_the_value(method: str) -> None:
+    """Async header validation fails safely before HTTPX constructs a request."""
+    invalid_value = "Bearer private-header-canary-\u201d"
+    reached: list[bool] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Record any request that incorrectly passes header validation."""
+        reached.append(True)
+        return httpx.Response(200, json={})
+
+    async def scenario() -> ProviderTransportError:
+        """Run one invalid request and return the sanitized transport error."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            transport = HttpxAsyncJsonTransport(client)
+            with pytest.raises(ProviderTransportError, match="valid printable ASCII") as captured:
+                if method == "get":
+                    await transport.get(
+                        "https://provider.test/v1/models",
+                        headers={"Authorization": invalid_value},
+                        timeout_seconds=1,
+                    )
+                else:
+                    await transport.post(
+                        "https://provider.test/v1/embeddings",
+                        headers={"Authorization": invalid_value},
+                        payload={},
+                        timeout_seconds=1,
+                    )
+            return captured.value
+
+    error = asyncio.run(scenario())
+    assert invalid_value not in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert reached == []
