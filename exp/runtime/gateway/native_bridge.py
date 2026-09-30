@@ -103,7 +103,7 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_explicit_cache import (
     NativeExplicitCacheMixin,
     bind_explicit_cache,
-    validate_explicit_cache_host,
+    validate_cache_hosts,
 )
 from exp.runtime.gateway.native_images import NativeImagesMixin
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
@@ -236,14 +236,8 @@ class NativeControlPlane(
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
-        if explicit_cache is not None and automatic_cache is not None:
-            raise ValueError("choose one explicit or automatic cache host")
-        if automatic_cache is not None and not callable(
-            getattr(automatic_cache, "select_prefix", None)
-        ):
-            raise ValueError("automatic cache host must implement select_prefix")
         self._automatic_cache = automatic_cache
-        self._explicit_cache = validate_explicit_cache_host(automatic_cache or explicit_cache)
+        self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
         self._capture = capture
         # The optional batch lane: hosts without it leave every batch route
         # answering the uniform not-enabled error below.

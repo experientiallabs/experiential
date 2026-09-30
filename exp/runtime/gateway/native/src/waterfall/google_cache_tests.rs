@@ -19,7 +19,11 @@ impl Host {
         }
     }
 
-    async fn call(&self, method: &'static str, argument: String) -> Result<String, PublicError> {
+    pub(super) async fn call(
+        &self,
+        method: &'static str,
+        argument: String,
+    ) -> Result<String, PublicError> {
         self.calls
             .lock()
             .unwrap()
@@ -46,7 +50,7 @@ pub(super) fn wire(url: &str) -> DeploymentWire {
     })).unwrap()
 }
 
-fn http() -> crate::upstream::UpstreamClient {
+pub(super) fn http() -> crate::upstream::UpstreamClient {
     crate::upstream::build_client(Duration::from_secs(1), false).unwrap()
 }
 

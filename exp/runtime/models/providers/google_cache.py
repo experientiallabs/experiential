@@ -292,7 +292,7 @@ def build_automatic_google_cache_plans(
         or request.provider_native_tools
         or request.web_search is not None
         or request.tool_search is not None
-        or any(tool.cache_control is not None for tool in request.tools)
+        or request.tools
         or not _payload_matches(request, upstream_payload)
     ):
         return ()

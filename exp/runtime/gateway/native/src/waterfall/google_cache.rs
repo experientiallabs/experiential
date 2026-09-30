@@ -141,12 +141,17 @@ where
             // The free preflight uses only this exact prefix at the admitted endpoint.
             // On failure no create has been sent, so its reservation can be released.
             let valid = valid_create(&endpoint, &url, &payload, expires_at);
+            let preflight_budget = deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(Duration::from_secs(3))
+                .min(Duration::from_secs(5));
             let no_create = measure_tokens
                 && (!valid
+                    || preflight_budget.is_zero()
                     || minimum_tokens == 0
                     || !matches!(
                         tokio::time::timeout(
-                            deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(5)),
+                            preflight_budget,
                             count_tokens(http, wire, &payload),
                         ).await,
                         Ok(Some(tokens)) if tokens >= minimum_tokens

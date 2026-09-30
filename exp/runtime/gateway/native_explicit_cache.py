@@ -7,6 +7,7 @@ creator; unknown claims remain the host's durable accounting responsibility.
 
 from __future__ import annotations
 
+import importlib
 import json
 import time
 from collections.abc import Sequence
@@ -513,3 +514,18 @@ class NativeExplicitCacheMixin:
                 return _ready_payload(binding.plan, ready)
         except Exception:  # noqa: BLE001 - sanitize host failures without releasing reservations.
             raise _boundary_failure() from None
+
+
+def validate_cache_hosts(
+    explicit: ExplicitCacheHost | None, automatic: AutomaticCacheHost | None
+) -> ExplicitCacheHost | None:
+    """Choose exactly one valid host before admission can plan paid resources."""
+    if explicit is not None and automatic is not None:
+        raise ValueError("choose one explicit or automatic cache host")
+    if automatic is not None and not callable(getattr(automatic, "select_prefix", None)):
+        raise ValueError("automatic cache host must implement select_prefix")
+    if automatic is not None:
+        native = importlib.import_module("exp_gateway_native")
+        if getattr(native, "AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION", None) != 1:
+            raise ValueError("automatic caching requires the matching native cache contract")
+    return validate_explicit_cache_host(automatic or explicit)

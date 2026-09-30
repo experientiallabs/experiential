@@ -191,3 +191,34 @@ async fn automatic_preflight_counts_only_prefix_and_skips_below_minimum() {
         }
     }
 }
+
+#[tokio::test]
+async fn short_deadline_skips_preflight_and_acknowledges_no_create() {
+    let expires = expiry();
+    let (base, task) = server(vec![]).await;
+    let path = "/v1/projects/fruit-project/locations/us";
+    let original = wire(&format!(
+        "{base}{path}/publishers/google/models/gemini-test:streamGenerateContent"
+    ));
+    let mut create = claim(&format!("{base}{path}/cachedContents"), &expires);
+    create["resource_prefix"] = json!("projects/123456789/locations/us/cachedContents/");
+    create["payload"]["model"] =
+        json!("projects/fruit-project/locations/us/publishers/google/models/gemini-test");
+    create["measure_tokens"] = json!(true);
+    create["minimum_tokens"] = json!(4096);
+    let host = Host::new(vec![create, json!({"state":"unavailable"})]);
+    let result = execute(
+        &http(),
+        &original,
+        "request",
+        Instant::now() + Duration::from_secs(2),
+        false,
+        EndpointPolicy::Loopback,
+        |method, argument| host.call(method, argument),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!(host.calls()[1].1["outcome"], "not_created");
+    assert!(task.await.unwrap().is_empty());
+}

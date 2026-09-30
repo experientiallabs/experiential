@@ -160,7 +160,12 @@ def _vertex_control(
         components = load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "{}"})
         if automatic:
             assert isinstance(host, _AutomaticHost)
-            control = NativeControlPlane(components, automatic_cache=host)
+            with mock.patch.object(
+                cache_module.importlib,
+                "import_module",
+                return_value=SimpleNamespace(AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION=1),
+            ):
+                control = NativeControlPlane(components, automatic_cache=host)
         else:
             control = NativeControlPlane(components, explicit_cache=host)
 
@@ -1246,3 +1251,15 @@ def test_automatic_first_seen_repeat_create_reuse_and_no_create(
     )
     assert denied["state"] == "unavailable"
     assert host.results[str(fresh["operation_id"])].outcome == "not_created"
+
+
+@pytest.mark.parametrize("version", [None, 0, 2])
+def test_automatic_host_requires_matching_native_contract(version: int | None) -> None:
+    """Older or unknown native wheels cannot ignore the automatic token preflight."""
+    with mock.patch.object(
+        cache_module.importlib,
+        "import_module",
+        return_value=SimpleNamespace(AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION=version),
+    ):
+        with pytest.raises(ValueError, match="matching native cache contract"):
+            cache_module.validate_cache_hosts(None, _AutomaticHost())

@@ -746,3 +746,20 @@ def test_automatic_cache_skips_unsupported_or_explicit_shapes(shape: str) -> Non
     elif shape == "gemini":
         profile = _profile()
     assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
+
+
+def test_automatic_plain_function_tools_are_excluded() -> None:
+    """Unmarked function definitions must not become provider-held automatic resources."""
+    request = _request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="user", content="Fictional fruit context. " * 1000),
+                GatewayMessage(role="user", content="Count oranges."),
+            ),
+            "tools": (GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        }
+    )
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+    assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
