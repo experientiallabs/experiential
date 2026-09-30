@@ -7,6 +7,7 @@ base owns: constructor validation, the authenticated header set including the pe
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import ClassVar
 
@@ -21,13 +22,17 @@ from exp.common.models import (
     ModelResponse,
     ModelSnapshot,
 )
+from exp.runtime.gateway.contracts import GatewayFailureClass
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.base import (
     DEFAULT_TIMEOUT_SECONDS,
     MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
     GatewayWireProfile,
     ProviderHttpClient,
+    _run_sync,
     completion_timeout_seconds,
 )
+from exp.runtime.models.providers.errors import normalized_provider_failure
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     JsonHttpTransport,
@@ -121,6 +126,19 @@ def _client(
         base_url=base_url,
         transport=transport,
     )
+
+
+def test_sync_runner_exposes_a_typed_provider_deadline() -> None:
+    """A stalled compatibility call retains the provider timeout contract."""
+
+    async def stalled_operation() -> None:
+        """Remain pending until the compatibility deadline cancels the operation."""
+        await asyncio.sleep(3600)
+
+    with pytest.raises(ProviderDeadlineExceeded, match="provider request deadline exceeded") as exc:
+        _run_sync(stalled_operation(), timeout_seconds=0.01)
+
+    assert normalized_provider_failure(exc.value).failure_class is GatewayFailureClass.TIMEOUT
 
 
 def test_rejects_an_empty_api_key_naming_the_concrete_client() -> None:

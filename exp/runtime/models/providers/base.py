@@ -22,6 +22,7 @@ from exp.common.models import (
 from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
+    ProviderDeadlineExceeded,
     RequestDeadline,
     as_async_transport,
     post_json_async,
@@ -715,6 +716,7 @@ def _run_sync[ResultT](
         The completed operation result.
 
     Raises:
+        ProviderDeadlineExceeded: The compatibility deadline expires before completion.
         RuntimeError: Called from an event-loop thread, where the async method is required.
     """
     try:
@@ -740,6 +742,17 @@ async def _wait_for[ResultT](
 
     Returns:
         The provider result before timeout.
+
+    Raises:
+        ProviderDeadlineExceeded: The compatibility deadline expires before completion.
     """
-    async with asyncio.timeout(timeout_seconds):
-        return await operation
+    timeout = asyncio.timeout(timeout_seconds)
+    try:
+        async with timeout:
+            return await operation
+    except ProviderDeadlineExceeded:
+        raise
+    except TimeoutError as exc:
+        if not timeout.expired():
+            raise
+        raise ProviderDeadlineExceeded("provider request deadline exceeded") from exc

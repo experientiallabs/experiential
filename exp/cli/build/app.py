@@ -57,6 +57,7 @@ from exp.runtime.models import (
     RuntimeModelCatalog,
 )
 from exp.runtime.models.preflight import preflight_capabilities
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from exp.simulation.engines.text.errors import SimulationContentionError
@@ -239,7 +240,7 @@ def build(
             ValueError,
         ) as exc:
             raise typer.BadParameter(str(exc)) from exc
-        except ProviderTransportError as exc:
+        except (ProviderDeadlineExceeded, ProviderTransportError) as exc:
             _console.print(f"[red]error[/red] a provider request failed: {exc}")
             _console.print(
                 "Completed embedding batches and finished steps are saved. Run exp build again "

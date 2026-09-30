@@ -51,6 +51,7 @@ from exp.optimize.router.automatic.service_test import (
     _ProviderState,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.simulation.build import ProjectBuild
 
 _RUNNER = CliRunner()
@@ -1275,6 +1276,35 @@ def test_bare_build_dispatches_wizard_without_required_trace_option(
     help_text = unstyle(help_result.output)
     assert "interactive" in help_text
     assert "wizard" not in help_text.casefold()
+
+
+def test_bare_build_reports_provider_deadline_with_resume_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out provider call gets the durable-build recovery message.
+
+    Args:
+        monkeypatch: Pytest patch fixture replacing terminal and wizard boundaries.
+    """
+    monkeypatch.setattr("exp.cli.build.app.can_prompt", lambda _console: True)
+
+    def fail_with_deadline(*_args: object, **_kwargs: object) -> None:
+        """Simulate one provider call exhausting its request-wide deadline.
+
+        Raises:
+            ProviderDeadlineExceeded: Always, to exercise build recovery output.
+        """
+        raise ProviderDeadlineExceeded("provider request deadline exceeded")
+
+    monkeypatch.setattr(wizard, "run_build_wizard", fail_with_deadline)
+
+    result = _RUNNER.invoke(app, ["build", "support"])
+
+    output = " ".join(unstyle(result.output).split())
+    assert result.exit_code == 1
+    assert "a provider request failed: provider request deadline exceeded" in output
+    assert "Run exp build again to resume" in output
+    assert "Traceback" not in output
 
 
 def test_invalid_traces_fail_before_provider_discovery(

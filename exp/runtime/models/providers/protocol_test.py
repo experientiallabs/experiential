@@ -31,7 +31,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
-from exp.runtime.models.providers.async_transport import RequestDeadline
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -86,6 +86,24 @@ class _AsyncClient:
         return _response()
 
 
+class _StalledAsyncClient:
+    """Async client that remains pending until its caller cancels it."""
+
+    async def complete_async(
+        self,
+        request: ModelRequest,
+        *,
+        deadline: RequestDeadline | None = None,
+        idempotency_key: str | None = None,
+    ) -> ModelResponse:
+        """Wait beyond the adapter deadline after validating compatibility inputs."""
+        assert request == _request()
+        assert deadline is not None
+        assert idempotency_key is None
+        await asyncio.sleep(3600)
+        return _response()
+
+
 class _BlockingClient:
     """Sync client that blocks until a test-controlled release event."""
 
@@ -109,6 +127,14 @@ def test_sync_adapter_preserves_existing_model_client_callers() -> None:
     adapter = SyncModelClientAdapter(_AsyncClient(), timeout_seconds=1)
 
     assert adapter.complete(_request()).output.content == "ok"
+
+
+def test_sync_adapter_exposes_a_typed_provider_deadline() -> None:
+    """A stalled async client surfaces the shared provider deadline error."""
+    adapter = SyncModelClientAdapter(_StalledAsyncClient(), timeout_seconds=0.01)
+
+    with pytest.raises(ProviderDeadlineExceeded, match="provider request deadline exceeded"):
+        adapter.complete(_request())
 
 
 def test_sync_adapter_refuses_to_block_an_event_loop() -> None:
