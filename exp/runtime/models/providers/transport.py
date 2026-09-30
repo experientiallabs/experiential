@@ -33,6 +33,31 @@ class ProviderTransportError(RuntimeError):
         self.status_code = status_code
 
 
+def _provider_request_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Copy one outbound header map after enforcing HTTPX string encoding safety.
+
+    Args:
+        headers: Provider request headers that may include a credential.
+
+    Returns:
+        A detached mapping containing only printable ASCII names and values.
+
+    Raises:
+        ProviderTransportError: A header name or value cannot be encoded safely.
+    """
+    copied = dict(headers)
+    if any(
+        not name
+        or not name.isascii()
+        or not name.isprintable()
+        or not value.isascii()
+        or any(not character.isprintable() for character in value)
+        for name, value in copied.items()
+    ):
+        raise ProviderTransportError("provider request headers are not valid printable ASCII")
+    return copied
+
+
 class JsonHttpTransport:
     """Sends one JSON request without imposing a provider SDK on callers."""
 
@@ -195,8 +220,9 @@ class HttpxJsonTransport(JsonHttpTransport):
         Raises:
             ProviderTransportError: The request fails or the response is not a JSON object.
         """
+        request_headers = _provider_request_headers(headers)
         try:
-            response = self._client.get(url, headers=dict(headers), timeout=timeout_seconds)
+            response = self._client.get(url, headers=request_headers, timeout=timeout_seconds)
         except httpx.TimeoutException as exc:
             raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
@@ -225,10 +251,11 @@ class HttpxJsonTransport(JsonHttpTransport):
         Raises:
             ProviderTransportError: The request fails or the response is not a JSON object.
         """
+        request_headers = _provider_request_headers(headers)
         try:
             response = self._client.post(
                 url,
-                headers=dict(headers),
+                headers=request_headers,
                 json=payload,
                 timeout=timeout_seconds,
             )

@@ -87,6 +87,57 @@ def test_transport_names_network_failures_without_exposing_secrets(
     )
 
 
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_transport_rejects_invalid_headers_without_retaining_the_value(method: str) -> None:
+    """Header validation raises a content-safe transport error before HTTPX encoding."""
+    invalid_value = "Bearer private-header-canary-\u201d"
+    reached: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record any request that incorrectly passes header validation."""
+        reached.append(True)
+        return httpx.Response(200, json={})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        transport = HttpxJsonTransport(client)
+        with pytest.raises(ProviderTransportError, match="valid printable ASCII") as captured:
+            if method == "get":
+                transport.get(
+                    "https://provider.test/v1/models",
+                    headers={"Authorization": invalid_value},
+                    timeout_seconds=1,
+                )
+            else:
+                transport.post(
+                    "https://provider.test/v1/embeddings",
+                    headers={"Authorization": invalid_value},
+                    payload={},
+                    timeout_seconds=1,
+                )
+
+    assert invalid_value not in repr(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert reached == []
+
+
+def test_transport_preserves_an_empty_non_secret_header_value() -> None:
+    """Printable-ASCII validation retains HTTPX support for empty header values."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Echo whether the empty optional header reached the request boundary."""
+        return httpx.Response(200, json={"empty": request.headers["X-Optional"] == ""})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        response = HttpxJsonTransport(client).get(
+            "https://provider.test/v1/models",
+            headers={"X-Optional": ""},
+            timeout_seconds=1,
+        )
+
+    assert response.body == {"empty": True}
+
+
 def test_get_json_returns_the_first_success_body_for_one_attempt() -> None:
     """A success status is decoded once without any additional attempt."""
     transport = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"data": []})])

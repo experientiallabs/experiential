@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -14,6 +15,7 @@ from exp.runtime.models.providers.listing import (
     ProviderListingError,
 )
 from exp.runtime.models.providers.transport import (
+    HttpxJsonTransport,
     JsonHttpResponse,
     JsonHttpTransport,
     ProviderTransportError,
@@ -598,6 +600,25 @@ def test_listing_rejects_an_invalid_credential_without_retrying() -> None:
         _lister(transport).list_models(ProviderEndpoint(provider="openai", api_key="bad-key"))
 
     assert len(transport.requests) == 1
+
+
+def test_listing_translates_an_invalid_header_credential_without_exposing_it() -> None:
+    """Discovery keeps its public error contract when a credential cannot form a header."""
+    invalid_value = "private-listing-canary-\u201d"
+    reached: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record any request that incorrectly passes header validation."""
+        reached.append(True)
+        return httpx.Response(200, json={"data": []})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        lister = _lister(HttpxJsonTransport(client))
+        with pytest.raises(ProviderListingError, match="model listing failed") as captured:
+            lister.list_models(ProviderEndpoint(provider="openai", api_key=invalid_value))
+
+    assert invalid_value not in repr(captured.value)
+    assert reached == []
 
 
 def test_listing_retries_a_timeout_then_reports_it_without_response_content() -> None:

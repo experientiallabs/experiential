@@ -21,6 +21,7 @@ from exp.runtime.models.providers.transport import (
     RecordedRequest,
     RetryClassification,
     RetryPolicy,
+    _provider_request_headers,
     classify_retry,
     provider_ssl_context,
     transport_error_message,
@@ -277,11 +278,12 @@ class HttpxAsyncJsonTransport:
         Raises:
             ProviderTransportError: The request or response body fails safely.
         """
+        request_headers = _provider_request_headers(headers)
         try:
             client = self._client if self._client is not None else _pooled_client()
             response = await client.get(
                 url,
-                headers=dict(headers),
+                headers=request_headers,
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
@@ -312,11 +314,12 @@ class HttpxAsyncJsonTransport:
         Raises:
             ProviderTransportError: The request or response body fails safely.
         """
+        request_headers = _provider_request_headers(headers)
         try:
             client = self._client if self._client is not None else _pooled_client()
             response = await client.post(
                 url,
-                headers=dict(headers),
+                headers=request_headers,
                 json=payload,
                 timeout=timeout_seconds,
             )

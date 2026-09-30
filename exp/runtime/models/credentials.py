@@ -89,6 +89,39 @@ class CredentialResolution:
         return self.__repr__()
 
 
+def _validated_connection_credential(
+    connection: ConnectionConfig,
+    *,
+    connection_id: str,
+    resolution: CredentialResolution,
+) -> CredentialResolution:
+    """Require header-safe credentials except for locally parsed Vertex JSON.
+
+    Args:
+        connection: Secret-free provider connection metadata.
+        connection_id: Exact catalog or gateway connection name.
+        resolution: Credential and source to validate without exposing its value.
+
+    Returns:
+        The unchanged valid resolution, including any dispatch receipt.
+
+    Raises:
+        ModelCredentialError: A header credential contains non-ASCII or control characters.
+    """
+    value = resolution.value
+    if connection.provider == "vertex" or (value.isascii() and value.isprintable()):
+        return resolution
+    if resolution.source == "environment" and connection.api_key_env is not None:
+        location = f"credential in environment variable {connection.api_key_env!r}"
+    elif resolution.source == "stored":
+        location = f"stored credential for connection {connection_id!r}"
+    else:
+        location = f"credential for connection {connection_id!r}"
+    raise ModelCredentialError(
+        f"{location} contains a non-ASCII or control character; paste the key again as plain text"
+    )
+
+
 def lookup_connection_credential(
     connection: ConnectionConfig,
     *,
@@ -111,6 +144,7 @@ def lookup_connection_credential(
         The resolved secret and source, or ``None`` when neither source has a value.
 
     Raises:
+        ModelCredentialError: A non-Vertex credential cannot form a safe HTTP header.
         ProviderAuthStoreError: The local credential file exists but cannot be used.
     """
     if connection.provider == "bedrock" and connection.api_key_env is None:
@@ -123,14 +157,28 @@ def lookup_connection_credential(
     if connection.api_key_env is not None:
         if isinstance(values, CredentialEnvironment):
             resolved = values.resolve_credential(connection.api_key_env)
-            return resolved if resolved is not None and resolved.value.strip() else None
+            if resolved is None or not resolved.value.strip():
+                return None
+            return _validated_connection_credential(
+                connection,
+                connection_id=connection_id,
+                resolution=resolved,
+            )
         env_value = (values.get(connection.api_key_env) or "").strip()
         if env_value:
-            return CredentialResolution(env_value, "environment")
+            return _validated_connection_credential(
+                connection,
+                connection_id=connection_id,
+                resolution=CredentialResolution(env_value, "environment"),
+            )
     auth_store = store if store is not None else ProviderAuthStore()
     stored = auth_store.get(connection_id, binding=connection_credential_binding(connection))
     if stored:
-        return CredentialResolution(stored, "stored")
+        return _validated_connection_credential(
+            connection,
+            connection_id=connection_id,
+            resolution=CredentialResolution(stored, "stored"),
+        )
     return None
 
 
@@ -241,6 +289,7 @@ def resolve_or_prompt_connection_api_key(
         The resolved or pasted key, or ``None`` when the operator skips the provider.
 
     Raises:
+        ModelCredentialError: A non-Vertex credential cannot form a safe HTTP header.
         ProviderAuthStoreError: The local credential file exists but cannot be used.
     """
     auth_store = store if store is not None else ProviderAuthStore()
@@ -259,6 +308,11 @@ def resolve_or_prompt_connection_api_key(
     key = pasted.strip()
     if not key:
         return None
+    key = _validated_connection_credential(
+        connection,
+        connection_id=connection_id,
+        resolution=CredentialResolution(key, "prompt"),
+    ).value
     if persist:
         auth_store.put(connection_id, key, binding=connection_credential_binding(connection))
     return key

@@ -73,6 +73,7 @@ def test_atomic_environment_returns_same_receipt_and_never_falls_back(tmp_path: 
 
 _SECRET = "sk-resolver-stored-secret"
 _ENV_SECRET = "sk-resolver-env-secret"
+_INVALID_HEADER_SECRET = "sk-resolver-secret-0123456789\u201d"
 
 
 def _openai(env_name: str = "OPENAI_API_KEY") -> ConnectionConfig:
@@ -137,6 +138,68 @@ def test_empty_environment_falls_through_to_the_store(tmp_path: Path) -> None:
     assert resolved is not None
     assert resolved.value == _SECRET
     assert resolved.source == "stored"
+
+
+@pytest.mark.parametrize(
+    "invalid_value", [_INVALID_HEADER_SECRET, "sk-resolver-secret-control\x00"]
+)
+def test_environment_rejects_an_invalid_header_credential_without_exposing_it(
+    invalid_value: str,
+) -> None:
+    """An invalid environment credential fails before it reaches an HTTP header."""
+    with pytest.raises(ModelCredentialError, match="OPENAI_API_KEY") as captured:
+        lookup_connection_credential(
+            _openai(),
+            connection_id="openai",
+            environment={"OPENAI_API_KEY": invalid_value},
+        )
+
+    assert invalid_value not in repr(captured.value)
+
+
+def test_atomic_environment_rejects_an_invalid_header_credential() -> None:
+    """The receipt-preserving resolver path enforces the same header contract."""
+    environment = AtomicEnvironment(
+        CredentialResolution(_INVALID_HEADER_SECRET, "environment", receipt=None)
+    )
+
+    with pytest.raises(ModelCredentialError, match="OPENAI_API_KEY") as captured:
+        lookup_connection_credential(_openai(), connection_id="openai", environment=environment)
+
+    assert _INVALID_HEADER_SECRET not in repr(captured.value)
+
+
+def test_stored_credential_rejects_an_invalid_header_value(tmp_path: Path) -> None:
+    """An invalid stored credential names its connection without revealing the value."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put("openai", _INVALID_HEADER_SECRET, binding=_binding(_openai()))
+
+    with pytest.raises(ModelCredentialError, match="connection 'openai'") as captured:
+        lookup_connection_credential(_openai(), connection_id="openai", environment={}, store=store)
+
+    assert _INVALID_HEADER_SECRET not in repr(captured.value)
+
+
+def test_vertex_service_account_json_keeps_its_non_header_credential_contract() -> None:
+    """Vertex JSON remains valid because only its minted token reaches a header."""
+    credential = '{\n  "type": "service_account", "project_id": "caf\u00e9"\n}'
+    connection = ConnectionConfig(
+        provider="vertex",
+        base_url=(
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/fixture/"
+            "locations/us-central1"
+        ),
+        api_key_env="VERTEX_CREDENTIALS",
+    )
+
+    resolved = lookup_connection_credential(
+        connection,
+        connection_id="vertex",
+        environment={"VERTEX_CREDENTIALS": credential},
+    )
+
+    assert resolved is not None
+    assert resolved.value == credential.strip()
 
 
 def test_fresh_resolver_reads_the_store_written_by_another_instance(tmp_path: Path) -> None:
@@ -343,6 +406,27 @@ def test_empty_prompt_skips_the_connection(tmp_path: Path) -> None:
     )
 
     assert api_key is None
+    assert store.get("openai") is None
+
+
+def test_prompt_rejects_an_invalid_header_credential_before_persisting(tmp_path: Path) -> None:
+    """A malformed pasted key is never saved and never appears in its error."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+
+    def invalid_prompt() -> str:
+        """Return one secret that cannot form a provider header."""
+        return _INVALID_HEADER_SECRET
+
+    with pytest.raises(ModelCredentialError, match="connection 'openai'") as captured:
+        resolve_or_prompt_connection_api_key(
+            _openai(),
+            connection_id="openai",
+            environment={},
+            store=store,
+            prompt=invalid_prompt,
+        )
+
+    assert _INVALID_HEADER_SECRET not in repr(captured.value)
     assert store.get("openai") is None
 
 
