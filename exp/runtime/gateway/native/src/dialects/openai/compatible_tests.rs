@@ -917,3 +917,27 @@ fn writes_within_reads_terminal_usage_event_settles_the_separated_legs() {
     assert_eq!(usage.cache_creation_input_tokens, Some(10663));
     assert!(events.iter().any(Event::is_terminal));
 }
+
+#[test]
+fn writes_within_reads_accepts_a_cache_covering_the_whole_prompt() {
+    // Live OpenRouter google-vertex/us stream: the cache spanned every prompt token.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer.set_cache_writes_within_reads(true);
+    feed_usage(
+        &mut normalizer,
+        json!({
+            "prompt_tokens": 13304, "completion_tokens": 4, "total_tokens": 13308,
+            "prompt_tokens_details": {"cached_tokens": 13304, "cache_write_tokens": 13304}
+        }),
+    )
+    .expect("a whole-prompt cache write is valid");
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens
+        ),
+        (Some(13304), Some(0), Some(13304))
+    );
+}
