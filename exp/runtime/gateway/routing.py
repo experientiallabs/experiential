@@ -55,6 +55,17 @@ class GatewayRoutingError(ValueError):
     """An authorized target cannot resolve inside its frozen catalog snapshot."""
 
 
+class ReasoningCarrierIssuerUnavailableError(GatewayRoutingError):
+    """A carrier's issuing deployment is no longer in the caller's current route.
+
+    The route changed under an open conversation (a lane closed on exhausted
+    credit, a route removed or reordered out of the chain), so the rung whose
+    credential sealed the carrier cannot be dialled. Nothing about the caller's
+    request is wrong and no retry can repair it: admission drops the carrier
+    unrevealed instead of refusing, exactly as a failover rung runs without it.
+    """
+
+
 REASONING_CONTINUATION_ROUTE_REASON = "reasoning_continuation"
 """Route reason of a request whose active sealed reasoning pins its issuing rung first."""
 
@@ -450,7 +461,7 @@ class CatalogRouteResolver:
                 view.catalog, authorization, root_pool, chains=view.chains, pools=view.pools
             )
             if deployment_id not in plan.deployment_ids:
-                raise GatewayRoutingError(
+                raise ReasoningCarrierIssuerUnavailableError(
                     "reasoning carrier deployment is not reachable in current authority"
                 )
             stage = plan.stage_for_depth(plan.deployment_ids.index(deployment_id))

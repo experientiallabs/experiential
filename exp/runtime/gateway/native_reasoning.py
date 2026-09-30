@@ -25,10 +25,17 @@ from exp.runtime.gateway.reasoning_carrier import (
     seal_reasoning_content,
     unseal_reasoning_content,
 )
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.routing import GatewayRoute, ReasoningCarrierIssuerUnavailableError
 from exp.runtime.openai_protocol.errors import public_failure_error
 
 _logger = logging.getLogger(__name__)
+
+UNAVAILABLE_ISSUER_CARRIER_DROPPED = (
+    "messages.reasoning_content->dropped(issuing_route_unavailable)"
+)
+"""Disclosure for a carrier whose issuing rung left the caller's route since it was sealed.
+
+The request is served on the current route without that turn's preserved thinking."""
 
 CHANGED_TURN_CARRIER_DROPPED = "messages.reasoning_content->dropped(assistant_turn_changed)"
 """Disclosure for an authentic carrier whose echoed assistant turn no longer matches.
@@ -200,7 +207,7 @@ def _process_reasoning_history(
     routes: dict[str, tuple[GatewayRoute, ReasoningCarrierAuthority]] = {}
     messages = list(request.messages)
     pinned: GatewayRoute | None = None
-    dropped = False
+    disclosures: set[str] = set()
     for index, message in enumerate(messages):
         if index <= last_user:
             continue
@@ -230,10 +237,19 @@ def _process_reasoning_history(
             raise ValueError("reasoning carrier prefix names no known provider scheme")
         cached = routes.get(carrier.deployment_hint)
         if cached is None:
-            route = components.routes.resolve_deployment_hint(
-                authorization,
-                carrier.deployment_hint,
-            )
+            try:
+                route = components.routes.resolve_deployment_hint(
+                    authorization,
+                    carrier.deployment_hint,
+                )
+            except ReasoningCarrierIssuerUnavailableError as exc:
+                # Only the issuing rung's credential can unseal the carrier, and
+                # that rung is gone from the route, so the thinking cannot be
+                # replayed anywhere; serving without it is what a failover does.
+                messages[index] = message.model_copy(update={"provider_reasoning": ()})
+                disclosures.add(UNAVAILABLE_ISSUER_CARRIER_DROPPED)
+                _log_dropped_carrier(authorization, carrier.deployment_hint, exc)
+                continue
             # The carrier authenticates against the issuing rung alone; the
             # route's failover fallbacks (which dispatch without this
             # reasoning) are resolved later, at admission, where a dead one
@@ -272,17 +288,8 @@ def _process_reasoning_history(
             # turn unaccompanied, so a later carrier sealed over this one's
             # plaintext fails its prefix binding and is dropped the same way.
             messages[index] = message.model_copy(update={"provider_reasoning": ()})
-            dropped = True
-            _logger.warning(
-                "reasoning carrier dropped",
-                extra={
-                    "operation": "native_reasoning_continuation",
-                    "reason": str(exc),
-                    "request_id": authorization.request_id,
-                    "alias": authorization.alias,
-                    "deployment_id": carrier.deployment_hint,
-                },
-            )
+            disclosures.add(CHANGED_TURN_CARRIER_DROPPED)
+            _log_dropped_carrier(authorization, carrier.deployment_hint, exc)
             continue
         if reveal:
             messages[index] = message.model_copy(update={"provider_reasoning": (block,)})
@@ -296,11 +303,27 @@ def _process_reasoning_history(
     ):
         raise ValueError("decrypted reasoning history requires a sealed active carrier")
     updates: dict[str, object] = {"messages": tuple(messages)}
-    if dropped:
+    if disclosures:
         updates["ignored_parameters"] = tuple(
-            dict.fromkeys((*request.ignored_parameters, CHANGED_TURN_CARRIER_DROPPED))
+            dict.fromkeys((*request.ignored_parameters, *sorted(disclosures)))
         )
     return request.model_copy(update=updates), pinned
+
+
+def _log_dropped_carrier(
+    authorization: AuthorizationSnapshot, deployment_id: str, reason: Exception
+) -> None:
+    """Name one dropped carrier for operators; the caller sees only the disclosure."""
+    _logger.warning(
+        "reasoning carrier dropped",
+        extra={
+            "operation": "native_reasoning_continuation",
+            "reason": str(reason),
+            "request_id": authorization.request_id,
+            "alias": authorization.alias,
+            "deployment_id": deployment_id,
+        },
+    )
 
 
 def seal_reasoning_carrier_content(accounting: NativeAttemptAccounting, argument: str) -> str:

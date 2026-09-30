@@ -310,12 +310,12 @@ cache-marker reordering never demotes it while dispatchable, and a dispatch-poli
 authored per-worker `requests_per_minute`, `tokens_per_minute` or `concurrency_bound`) force-admits
 it as `saturated_overflow` instead of spilling to a stripped fallback. A continuation whose sealed
 carriers all precede the latest user message carries no active reasoning and routes as a plain
-request; a single-rung pool has no fallback. A carrier that authenticates but arrives on an EDITED
-turn (a changed tool-call id, name or argument, visible text, or conversation prefix; OpenCode echoes
-a schema-invalid tool call as a call to its `invalid` tool) is dropped unrevealed, never refused,
-and disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`; a later carrier
-sealed over it fails its prefix binding and drops too, while an earlier intact one still pins.
-Authentication or authority failures (tamper, retagging, credential rotation) are still refused.
+request; a single-rung pool has no fallback. An authentic carrier on an EDITED turn (changed tool
+call, visible text or prefix; OpenCode echoes a schema-invalid call as its `invalid` tool) drops
+unrevealed, disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`, as does one
+whose issuing rung left the route (a lane closed on exhausted credit): `issuing_route_unavailable`.
+A later carrier sealed over a dropped turn fails its prefix binding and drops too; an earlier intact
+one still pins. Authentication or authority failures (tamper, rotation) are still refused.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on

@@ -67,7 +67,10 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
-from exp.runtime.gateway.native_reasoning import CHANGED_TURN_CARRIER_DROPPED
+from exp.runtime.gateway.native_reasoning import (
+    CHANGED_TURN_CARRIER_DROPPED,
+    UNAVAILABLE_ISSUER_CARRIER_DROPPED,
+)
 from exp.runtime.gateway.native_recovery import session_cache_key
 from exp.runtime.gateway.native_stage_admission_test import Host
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
@@ -1533,6 +1536,80 @@ def _reasoning_failover_pool(
         }
     )
     return control, raw_key, body, cast("list[JsonObject]", initial["route"])
+
+
+def test_carrier_whose_issuing_rung_left_the_route_drops_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """A lane closed under an open conversation serves the next turn without its thinking.
+
+    Production 2026-09-30 01:49Z: the house Tencent account ran out, the catalog
+    closed its lane and republished glm-5.3 without the issuing rung, and the
+    OpenCode session's next turn was refused as an inauthentic continuation. The
+    carrier is untouched and no client retry could repair that, so admission now
+    drops it unrevealed, routes on the current pool, and discloses the drop.
+    """
+    from datetime import UTC, datetime
+
+    from exp.common.models import GatewayEquivalenceCertification
+    from exp.runtime.gateway.catalog_authority import (
+        upsert_certified_pool,
+        upsert_singleton_deployment,
+    )
+
+    _control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    # Re-certify the pool without the issuing rung (beta plus a new gamma), the
+    # shape a closed house lane publishes: the carrier's deployment is gone.
+    upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gamma",
+        connection_name="beta-provider",
+        provider_model="gamma-model-exact",
+        exact_model_id="model-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    _catalog, normalized, _snapshot = snapshot_current_catalog(tmp_path)
+    normalized, snapshot, _changed = upsert_certified_pool(
+        tmp_path,
+        pool_id="coding",
+        exact_model_id="model-revision-exact",
+        deployment_aliases=("beta", "gamma"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="certification-pool-without-issuer",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="b" * 64,
+            certified_at=datetime(2026, 9, 30, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=True,
+    )
+    GatewayManagement(tmp_path).activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-issuer-closed",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"}
+        )
+    )
+
+    served = _admit(control, raw_key, body)
+
+    route = cast("list[JsonObject]", served["route"])
+    assert [wire["deployment_id"] for wire in route] == ["beta", "gamma"]
+    assert served["route_reason"] == "direct"
+    assert served["ignored_parameters"] == [UNAVAILABLE_ISSUER_CARRIER_DROPPED]
+    assert "private reasoning only the issuing rung can unseal" not in json.dumps(route)
+    assert "reasoning_content" not in json.dumps(route[0]["upstream_payload"])
 
 
 def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list[tuple[int, str]]:
