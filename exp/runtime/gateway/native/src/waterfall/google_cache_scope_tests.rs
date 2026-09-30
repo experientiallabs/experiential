@@ -268,3 +268,24 @@ fn only_request_shaped_cache_rejections_redial_plain() {
         )));
     }
 }
+
+#[test]
+fn refused_overlay_settles_without_opening_the_deployment_circuit() {
+    // An evicted gateway-chosen resource answers 404; settling that as a missing
+    // model would open the rung's circuit for every other request.
+    let refused = overlay_refusal(Failure::new(
+        FailureClass::ProviderNotFound,
+        "cachedContent not found",
+    ));
+    assert_eq!(refused.failure_class, FailureClass::InvalidRequest);
+    assert_eq!(refused.safe_message, "cachedContent not found");
+    for class in [
+        FailureClass::InvalidRequest,
+        FailureClass::UnsupportedCapability,
+    ] {
+        assert_eq!(
+            overlay_refusal(Failure::new(class, "refused")).failure_class,
+            class
+        );
+    }
+}

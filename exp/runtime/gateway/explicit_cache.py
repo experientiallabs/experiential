@@ -254,7 +254,7 @@ class CacheResult:
         _scope(self.operation_id, "operation_id")
         _timestamp(self.observed_at, "observed_at")
         if self.outcome not in {"ready", "unknown", "rejected", "not_created"}:
-            raise ValueError("cache result outcome must be ready, unknown or rejected")
+            raise ValueError("cache result outcome must be ready, unknown, rejected or not_created")
         if self.resource_name is not None:
             _scope(self.resource_name, "resource_name")
         if self.total_tokens is not None:
@@ -328,6 +328,8 @@ class ExplicitCacheHost(Protocol):
         contradictory observations, and never overwrite a settled ready resource
         with an ambiguous retry. Rejected releases budget only with positive
         no-resource/no-spend evidence, not merely an HTTP error classification.
+        Not_created is that evidence for an automatic preflight that sent no create
+        HTTP, so its reservation may be released and its cache key claimed again.
         Ready describes resource usability, not complete billing evidence. A host
         whose published schedule requires create_time must retain its full hold
         when that optional provider fact is None, never substitute local time.
@@ -337,7 +339,12 @@ class ExplicitCacheHost(Protocol):
 
 @dataclass(frozen=True)
 class CachePrefix:
-    """Content-free candidate after exact project binding, without spending authority."""
+    """Content-free candidate after exact project binding, without spending authority.
+
+    Attributes:
+        prefix_sha256: Scoped digest of the bound cache resource body, never content.
+        prefix_bytes: Positive serialized resource size, at most the 10 MiB prefix limit.
+    """
 
     prefix_sha256: str
     prefix_bytes: int

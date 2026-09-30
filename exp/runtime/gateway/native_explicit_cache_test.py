@@ -1293,3 +1293,36 @@ def test_automatic_cache_failures_fall_back_to_plain_generation(
     assert _finish(control, ready) == {"state": "unavailable"}
     assert host.results == {}
     assert "cachedContent" not in json.dumps(_wire(third)["upstream_payload"])
+
+
+class _ObservedAutomaticHost(_AutomaticHost):
+    """Record durable selection calls while keeping the fixture's repeat policy.
+
+    Attributes:
+        selections: Request identifiers of every selection call, in order.
+    """
+
+    def __init__(self) -> None:
+        """Start with no observed selections."""
+        super().__init__()
+        self.selections: list[str] = []
+
+    def select_prefix(
+        self, authority: GoogleCacheAuthority, request_id: str, candidates: tuple[CachePrefix, ...]
+    ) -> str | None:
+        """Record the call, then apply the fixture's repeat policy."""
+        self.selections.append(request_id)
+        return super().select_prefix(authority, request_id, candidates)
+
+
+def test_automatic_selection_skips_the_host_when_no_candidate_binds(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """A project-ID endpoint without a verified number offers the host nothing to select."""
+    host = _ObservedAutomaticHost()
+    host.authority_value = replace(_authority(), vertex_project=None)
+    control, key = _vertex_control(tmp_path, host, automatic=True)
+    first = _automatic_admission(control, key, "First question?")
+    _start_first(control, first)
+    assert _prepare(control, first) == {"state": "unavailable"}
+    assert host.selections == [] and host.claim_calls == 0

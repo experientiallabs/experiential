@@ -92,6 +92,17 @@ pub(super) fn plain_redial_after(failure: &Failure) -> bool {
     )
 }
 
+/// Settle a refused automatic overlay without judging the deployment's health.
+/// A 404 for an evicted or expired gateway-chosen resource says nothing about the
+/// rung, so it must not open the deployment circuit the way a missing model does.
+/// The plain re-dial reports the rung's own failure if the refusal was not the cache.
+pub(super) fn overlay_refusal(mut failure: Failure) -> Failure {
+    if failure.failure_class == FailureClass::ProviderNotFound {
+        failure.failure_class = FailureClass::InvalidRequest;
+    }
+    failure
+}
+
 /// The client never asked for an automatic cache, so its failure must never fail
 /// the request: generation proceeds on the plain wire. Any claimed-but-unrecorded
 /// create stays an expiring host hold and is never reused.
@@ -494,7 +505,25 @@ async fn count_tokens(
         + ":countTokens";
     url.set_path(&path);
     url.set_query(None);
-    let mut request = http.post(url.as_str()).ok()?;
+    let request = wire_headers(http.post(url.as_str()).ok()?, wire);
+    let mut body = serde_json::Map::new();
+    for key in ["systemInstruction", "contents", "tools", "toolConfig"] {
+        if let Some(value) = payload.get(key) {
+            body.insert(key.to_string(), value.clone());
+        }
+    }
+    let response = request.json(&body).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    bounded_json(response).await?.get("totalTokens")?.as_u64()
+}
+
+/// Attach the admitted wire's authenticated headers, minus per-body framing and idempotency.
+fn wire_headers(
+    mut request: reqwest::RequestBuilder,
+    wire: &DeploymentWire,
+) -> reqwest::RequestBuilder {
     for (name, value) in &wire.headers {
         if !name.eq_ignore_ascii_case("idempotency-key")
             && !name.eq_ignore_ascii_case("content-length")
@@ -503,27 +532,25 @@ async fn count_tokens(
             request = request.header(name, value);
         }
     }
-    let mut body = serde_json::Map::new();
-    for key in ["systemInstruction", "contents", "tools", "toolConfig"] {
-        if let Some(value) = payload.get(key) {
-            body.insert(key.to_string(), value.clone());
-        }
-    }
-    let mut response = request.json(&body).send().await.ok()?;
-    if !response.status().is_success() {
+    request
+}
+
+/// Read one bounded successful JSON body; oversized or malformed evidence is absent.
+async fn bounded_json(mut response: reqwest::Response) -> Option<Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAXIMUM_RESPONSE_BYTES as u64)
+    {
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.ok()? {
-        if bytes.len().saturating_add(chunk.len()) > MAXIMUM_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > MAXIMUM_RESPONSE_BYTES {
             return None;
         }
-        bytes.extend_from_slice(&chunk);
+        body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()?
-        .get("totalTokens")?
-        .as_u64()
+    serde_json::from_slice(&body).ok()
 }
 
 /// Read only bounded JSON evidence. Error bodies and headers never cross the bridge.
@@ -535,33 +562,14 @@ async fn create(
     expires_at: f64,
     status: &mut Option<u16>,
 ) -> Option<Created> {
-    let mut request = http.post(endpoint.url.as_str()).ok()?;
-    for (name, value) in &wire.headers {
-        if !name.eq_ignore_ascii_case("idempotency-key")
-            && !name.eq_ignore_ascii_case("content-length")
-            && !name.eq_ignore_ascii_case("content-type")
-        {
-            request = request.header(name, value);
-        }
-    }
+    let request = wire_headers(http.post(endpoint.url.as_str()).ok()?, wire);
     // ctx.http is built by upstream::build_client with redirect::none and retry::never.
-    let mut response = request.json(payload).send().await.ok()?;
+    let response = request.json(payload).send().await.ok()?;
     *status = Some(response.status().as_u16());
-    if !response.status().is_success()
-        || response
-            .content_length()
-            .is_some_and(|length| length > MAXIMUM_RESPONSE_BYTES as u64)
-    {
+    if !response.status().is_success() {
         return None;
     }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if body.len().saturating_add(chunk.len()) > MAXIMUM_RESPONSE_BYTES {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let body: Value = serde_json::from_slice(&body).ok()?;
+    let body = bounded_json(response).await?;
     let name = body.get("name")?.as_str()?;
     let expire_time = body.get("expireTime")?.as_str()?;
     let actual_expiry = expiry_epoch(expire_time)?;

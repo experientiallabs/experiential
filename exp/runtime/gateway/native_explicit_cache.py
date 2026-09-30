@@ -68,6 +68,8 @@ class NativeCacheBinding:
         deployment: Frozen route deployment used to resolve host authority.
         profile: Exact provider endpoint and credential headers, never logged.
         plan: Exact marked prefix and generation continuation, retained privately.
+            For automatic bindings this is only a placeholder until the host selects.
+        automatic_plans: Gateway-offered whole-message prefixes, empty for marked caches.
     """
 
     deployment: ExactModelDeployment
@@ -186,7 +188,8 @@ class _CacheFinish(_CacheBoundary):
 
     Attributes:
         operation_id: Reserved cache operation identifier, at most 128 characters.
-        outcome: Ready or unknown; HTTP failure does not prove absence of spend.
+        outcome: Ready, unknown or not_created; HTTP failure does not prove absence
+            of spend, while not_created proves an automatic preflight sent no create.
         http_status: Optional observed HTTP status, without headers or body.
         name: Optional exact resource name, at most 1024 characters.
         expire_time: Optional absolute provider expiration, at most 64 characters.
@@ -326,6 +329,8 @@ class NativeExplicitCacheMixin:
                     if (bound := candidate.bind_vertex_project(authority.vertex_project))
                     is not None
                 )
+                if not plans:
+                    return _encoded({"state": "unavailable"})
                 chosen = selector.select_prefix(
                     authority,
                     selected.request_id,

@@ -32,6 +32,8 @@ _VERTEX_CACHE_PATH = re.compile(rf"/v1/projects/({_SEGMENT})/locations/([a-z0-9-
 _REGION = re.compile(r"[a-z]+(?:-[a-z]+)+[0-9]+")
 _RESOURCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _POLICY = "google-explicit-text-prefix-v1"
+_AUTOMATIC_MINIMUM_PREFIX_BYTES = 4096
+_AUTOMATIC_MAXIMUM_PREFIX_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -320,12 +322,23 @@ def build_automatic_google_cache_plans(
     system_count = sum(m.role == "system" for m in request.messages)
     first = max(0, system_count - 1)
     plans: list[GoogleCachePlan] = []
+    # Cached text alone lower-bounds each resource body, so stop before copying
+    # the whole payload for prefixes that cannot fit the byte ceiling.
+    cached_text_bytes = sum(len((m.content or "").encode()) for m in request.messages[:first])
     for index in range(first, min(len(request.messages) - 1, first + 8)):
+        cached_text_bytes += len((request.messages[index].content or "").encode())
+        if cached_text_bytes > _AUTOMATIC_MAXIMUM_PREFIX_BYTES:
+            break
         plan = _plan_at_checkpoint(
             endpoint, request, upstream_payload, index, len(request.messages[index].content or "")
         )
         # Bound transient plan copying; bytes are not a provider token count.
-        if plan is not None and 4096 <= plan.conservative_input_bound <= 262144:
+        if (
+            plan is not None
+            and _AUTOMATIC_MINIMUM_PREFIX_BYTES
+            <= plan.conservative_input_bound
+            <= _AUTOMATIC_MAXIMUM_PREFIX_BYTES
+        ):
             plans.append(plan)
     return tuple(plans)
 

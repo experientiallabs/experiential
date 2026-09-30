@@ -20,6 +20,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.models.providers import google_cache as google_cache_module
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.google_cache import (
     GoogleCachePlan,
@@ -763,3 +764,40 @@ def test_automatic_plain_function_tools_are_excluded() -> None:
         f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
     )
     assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
+
+
+def test_automatic_cache_stops_before_copying_prefixes_past_the_byte_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A huge early message cannot make every later boundary copy the whole payload."""
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+    request = _request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="user", content="Fictional fruit context. " * 400),
+                GatewayMessage(role="user", content="a" * 262145),
+                GatewayMessage(role="user", content="Batch 1"),
+                GatewayMessage(role="user", content="Count fruit."),
+            )
+        }
+    )
+    real = google_cache_module._plan_at_checkpoint
+    calls: list[int] = []
+
+    def counted(
+        endpoint: tuple[str, str, str],
+        request: GatewayRequest,
+        upstream_payload: JsonObject,
+        message_index: int,
+        offset: int,
+    ) -> GoogleCachePlan | None:
+        """Record each attempted checkpoint before building its real plan."""
+        calls.append(message_index)
+        return real(endpoint, request, upstream_payload, message_index, offset)
+
+    monkeypatch.setattr(google_cache_module, "_plan_at_checkpoint", counted)
+    plans = build_automatic_google_cache_plans(profile, request, _payload(request))
+    assert calls == [0]
+    assert len(plans) == 1

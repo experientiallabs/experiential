@@ -149,11 +149,16 @@ pub(super) async fn run_attempt(
         {
             Ok(response) => response,
             Err(failure) => {
-                if repair.repair_after(&failure)
-                    || (automatic_overlay && google_cache::plain_redial_after(&failure))
-                {
+                if repair.repair_after(&failure) {
                     return AttemptEnd::Repair {
                         failure,
+                        usage: None,
+                        tool_names: Vec::new(),
+                    };
+                }
+                if automatic_overlay && google_cache::plain_redial_after(&failure) {
+                    return AttemptEnd::Repair {
+                        failure: google_cache::overlay_refusal(failure),
                         usage: None,
                         tool_names: Vec::new(),
                     };
