@@ -53,9 +53,21 @@ def _validate_response(payload: str) -> None:
         except ValidationError:
             assert_text_secret_free(payload)
         else:
+            _validate_response_keys(value)
             assert_secret_free(value)
     except SecretBoundaryError as exc:
         raise ArtifactStoreError("provider response violates the secret boundary") from exc
+
+
+def _validate_response_keys(value: JsonValue) -> None:
+    """Reject credential references and environment-variable names in nested JSON keys."""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            assert_text_secret_free(key)
+            _validate_response_keys(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _validate_response_keys(nested)
 
 
 class RequestReceipt(ContractModel):
