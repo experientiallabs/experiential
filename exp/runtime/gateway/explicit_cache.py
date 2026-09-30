@@ -227,6 +227,7 @@ class CacheResult:
         outcome: Ready means provider acceptance with validated resource facts;
             rejected requires positive evidence of no resource and no spend;
             unknown covers timeouts, transport failures and ambiguous responses.
+            not_created proves preflight stopped before any create HTTP was sent.
         observed_at: Finite nonnegative Unix observation time, not retry time.
         resource_name: Optional observed resource, required for ready outcomes.
         total_tokens: Optional provider-measured input count, required for ready.
@@ -240,7 +241,7 @@ class CacheResult:
     """
 
     operation_id: str
-    outcome: Literal["ready", "unknown", "rejected"]
+    outcome: Literal["ready", "unknown", "rejected", "not_created"]
     observed_at: float
     resource_name: str | None = None
     total_tokens: int | None = None
@@ -252,7 +253,7 @@ class CacheResult:
         """Require typed observation facts without inventing missing provider evidence."""
         _scope(self.operation_id, "operation_id")
         _timestamp(self.observed_at, "observed_at")
-        if self.outcome not in {"ready", "unknown", "rejected"}:
+        if self.outcome not in {"ready", "unknown", "rejected", "not_created"}:
             raise ValueError("cache result outcome must be ready, unknown or rejected")
         if self.resource_name is not None:
             _scope(self.resource_name, "resource_name")
@@ -330,6 +331,40 @@ class ExplicitCacheHost(Protocol):
         Ready describes resource usability, not complete billing evidence. A host
         whose published schedule requires create_time must retain its full hold
         when that optional provider fact is None, never substitute local time.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class CachePrefix:
+    """Content-free candidate after exact project binding, without spending authority."""
+
+    prefix_sha256: str
+    prefix_bytes: int
+
+    def __post_init__(self) -> None:
+        """Reject malformed fingerprints and unbounded candidate sizes."""
+        _digest(self.prefix_sha256, "prefix_sha256")
+        _integer(self.prefix_bytes, "prefix_bytes", minimum=1)
+        if self.prefix_bytes > _MAXIMUM_PREFIX_BYTES:
+            raise ValueError("automatic cache prefix exceeds the size limit")
+
+
+class AutomaticCacheHost(ExplicitCacheHost, Protocol):
+    """Opt-in host that recognizes repeated exact prefixes without retaining content."""
+
+    def select_prefix(
+        self,
+        authority: GoogleCacheAuthority,
+        request_id: str,
+        candidates: tuple[CachePrefix, ...],
+    ) -> str | None:
+        """Select one candidate digest after durable, request-deduplicated observation.
+
+        Scope observations to the full tenant, key, deployment, credential and
+        endpoint authority. No repeat means no selection. Choose only an offered
+        digest and enforce configured funding and retention policy again at claim.
+        A process-local observation may never authorize a duplicate paid creation.
         """
         ...
 
@@ -527,6 +562,18 @@ def validate_cache_result(offer: CacheOffer, result: CacheResult) -> CacheResult
             or (result.http_status is not None and not 200 <= result.http_status < 300)
         ):
             raise ValueError("ready cache result requires complete accepted resource facts")
+    elif result.outcome == "not_created":
+        if any(
+            value is not None
+            for value in (
+                result.resource_name,
+                result.total_tokens,
+                result.expire_time,
+                result.create_time,
+                result.http_status,
+            )
+        ):
+            raise ValueError("not-created proof cannot include create response facts")
     elif result.outcome == "rejected":
         if (
             result.resource_name is not None

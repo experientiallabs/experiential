@@ -26,6 +26,7 @@ from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.explicit_cache import (
     CacheClaim,
     CacheOffer,
+    CachePrefix,
     CacheReady,
     CacheResult,
     ExplicitCacheHost,
@@ -142,7 +143,9 @@ def _control(
     return NativeControlPlane(components, explicit_cache=host), key
 
 
-def _vertex_control(root: Path, host: _Host) -> tuple[NativeControlPlane, str]:
+def _vertex_control(
+    root: Path, host: _Host, *, automatic: bool = False
+) -> tuple[NativeControlPlane, str]:
     """Use real Vertex admission with only OAuth credential minting replaced offline."""
     _manager, key = _configured_gateway(
         root,
@@ -155,7 +158,11 @@ def _vertex_control(root: Path, host: _Host) -> tuple[NativeControlPlane, str]:
         return_value=lambda: "dummy-vertex-bearer",
     ):
         components = load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "{}"})
-        control = NativeControlPlane(components, explicit_cache=host)
+        if automatic:
+            assert isinstance(host, _AutomaticHost)
+            control = NativeControlPlane(components, automatic_cache=host)
+        else:
+            control = NativeControlPlane(components, explicit_cache=host)
 
     def token_factory(*, credentials_json: str) -> VertexTokenProvider:
         """Keep lazy admission clients on a deterministic no-network token provider."""
@@ -1156,3 +1163,86 @@ def test_admission_plan_failure_is_sanitized_and_finishes_accepted_request(
     _assert_private(str(error.value) + repr(error.value) + error.value.public_error_json)
     finished.assert_called_once()
     assert host.authority_calls == [] and host.claim_calls == host.record_calls == 0
+
+
+class _AutomaticHost(_Host):
+    """Select only a repeated digest under the exact authority in an offline fixture."""
+
+    def __init__(self) -> None:
+        """Use a verified fictional account and retain only prefix metadata."""
+        super().__init__(
+            replace(_authority(), vertex_project=VertexCacheProject("fruit-project", "123456789"))
+        )
+        self.seen: dict[tuple[str, str, str], str] = {}
+
+    def select_prefix(
+        self, authority: GoogleCacheAuthority, request_id: str, candidates: tuple[CachePrefix, ...]
+    ) -> str | None:
+        """Choose the longest repeat without seeing or retaining prompt text."""
+        chosen = None
+        with self.lock:
+            for candidate in sorted(candidates, key=lambda value: value.prefix_bytes):
+                key = (authority.tenant_scope, authority.credential_scope, candidate.prefix_sha256)
+                previous = self.seen.get(key)
+                if previous is not None and previous != request_id:
+                    chosen = candidate.prefix_sha256
+                self.seen[key] = request_id
+        return chosen
+
+
+def _automatic_admission(control: NativeControlPlane, key: str, suffix: str) -> JsonObject:
+    """Decode actual unmarked Chat input with a repeated whole-message prefix."""
+    return _admit(
+        control,
+        key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "system", "content": _SYSTEM},
+                    {"role": "user", "content": _PREFIX},
+                    {"role": "user", "content": suffix},
+                ],
+            }
+        ),
+    )
+
+
+def test_automatic_first_seen_repeat_create_reuse_and_no_create(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """The normal input remains intact until a durable host authorizes a reused prefix."""
+    host = _AutomaticHost()
+    control, key = _vertex_control(tmp_path, host, automatic=True)
+    first = _automatic_admission(control, key, "First question?")
+    _start_first(control, first)
+    assert _prepare(control, first)["state"] == "unavailable"
+    second = _automatic_admission(control, key, "Second question?")
+    _start_first(control, second)
+    creation = _prepare(control, second)
+    assert creation["state"] == "create"
+    assert creation["measure_tokens"] is True
+    assert host.authority_value is not None
+    assert creation["minimum_tokens"] == host.authority_value.minimum_input_tokens
+    ready = _finish_argument(second, creation)
+    ready["name"] = "projects/123456789/locations/global/cachedContents/example"
+    result = _finish(control, ready)
+    assert result["state"] == "ready"
+    third = _automatic_admission(control, key, "Third question?")
+    _start_first(control, third)
+    reused = _prepare(control, third)
+    assert reused["state"] == "ready"
+    assert "Third question?" in json.dumps(reused["payload"])
+    assert "cachedContent" not in json.dumps(_wire(third)["upstream_payload"])
+    # A distinct prefix gets a new reservation. Preflight failure proves no create.
+    host.offers.clear()
+    fourth = _automatic_admission(control, key, "Fourth question?")
+    _start_first(control, fourth)
+    fresh = _prepare(control, fourth)
+    assert fresh["state"] == "create"
+    denied = _finish(
+        control,
+        {**_selector(fourth), "operation_id": fresh["operation_id"], "outcome": "not_created"},
+    )
+    assert denied["state"] == "unavailable"
+    assert host.results[str(fresh["operation_id"])].outcome == "not_created"

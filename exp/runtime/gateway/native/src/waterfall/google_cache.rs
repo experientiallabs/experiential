@@ -28,6 +28,10 @@ enum Preparation {
         url: String,
         payload: Value,
         expires_at: f64,
+        #[serde(default)]
+        measure_tokens: bool,
+        #[serde(default)]
+        minimum_tokens: u64,
     },
 }
 
@@ -124,6 +128,8 @@ where
             url,
             payload,
             expires_at,
+            measure_tokens,
+            minimum_tokens,
         } => {
             let endpoint = bind_resource_prefix(endpoint, &resource_prefix)?;
             // The host persists an unknown claim before returning create. Dropping this
@@ -132,7 +138,21 @@ where
                 return Err(internal());
             }
             let mut status = None;
-            let created = if valid_create(&endpoint, &url, &payload, expires_at)
+            // The free preflight uses only this exact prefix at the admitted endpoint.
+            // On failure no create has been sent, so its reservation can be released.
+            let valid = valid_create(&endpoint, &url, &payload, expires_at);
+            let no_create = measure_tokens
+                && (!valid
+                    || minimum_tokens == 0
+                    || !matches!(
+                        tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(5)),
+                            count_tokens(http, wire, &payload),
+                        ).await,
+                        Ok(Some(tokens)) if tokens >= minimum_tokens
+                    ));
+            let created = if !no_create
+                && valid
                 && wire.timeout_seconds.is_finite()
                 && wire.timeout_seconds > 0.0
             {
@@ -157,7 +177,7 @@ where
                 "request_id": request_id,
                 "deployment_id": wire.deployment_id,
                 "operation_id": operation_id,
-                "outcome": if created.is_some() { "ready" } else { "unknown" },
+                "outcome": if no_create { "not_created" } else if created.is_some() { "ready" } else { "unknown" },
             });
             if let Some(status) = status {
                 finish["http_status"] = json!(status);
@@ -256,6 +276,10 @@ fn cache_endpoint(generation_url: &str, policy: EndpointPolicy) -> Option<CacheE
     let studio = official && host == "generativelanguage.googleapis.com";
     let vertex = official
         && (host == "aiplatform.googleapis.com"
+            || matches!(
+                host,
+                "aiplatform.us.rep.googleapis.com" | "aiplatform.eu.rep.googleapis.com"
+            )
             || host
                 .strip_suffix("-aiplatform.googleapis.com")
                 .is_some_and(|region| {
@@ -295,6 +319,16 @@ fn cache_endpoint(generation_url: &str, policy: EndpointPolicy) -> Option<CacheE
         && identifier(parts[4])
         && parts[5..8] == ["publishers", "google", "models"]
     {
+        if !loopback {
+            let expected = match parts[4] {
+                "global" => "aiplatform.googleapis.com".to_string(),
+                "us" | "eu" => format!("aiplatform.{}.rep.googleapis.com", parts[4]),
+                region => format!("{region}-aiplatform.googleapis.com"),
+            };
+            if host != expected {
+                return None;
+            }
+        }
         let prefix = format!(
             "projects/{}/locations/{}/cachedContents/",
             parts[2], parts[4]
@@ -413,6 +447,52 @@ fn matching_create_url(expected: &Url, candidate: &str) -> bool {
     }
     candidate.set_query(expected.query());
     candidate == *expected
+}
+
+/// Count the exact Vertex prefix without creating a resource or retaining response content.
+async fn count_tokens(
+    http: &crate::upstream::UpstreamClient,
+    wire: &DeploymentWire,
+    payload: &Value,
+) -> Option<u64> {
+    let mut url = Url::parse(&wire.url).ok()?;
+    let path = url
+        .path()
+        .strip_suffix(":streamGenerateContent")?
+        .to_string()
+        + ":countTokens";
+    url.set_path(&path);
+    url.set_query(None);
+    let mut request = http.post(url.as_str()).ok()?;
+    for (name, value) in &wire.headers {
+        if !name.eq_ignore_ascii_case("idempotency-key")
+            && !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case("content-type")
+        {
+            request = request.header(name, value);
+        }
+    }
+    let mut body = serde_json::Map::new();
+    for key in ["systemInstruction", "contents", "tools", "toolConfig"] {
+        if let Some(value) = payload.get(key) {
+            body.insert(key.to_string(), value.clone());
+        }
+    }
+    let mut response = request.json(&body).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > MAXIMUM_RESPONSE_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("totalTokens")?
+        .as_u64()
 }
 
 /// Read only bounded JSON evidence. Error bodies and headers never cross the bridge.

@@ -220,6 +220,18 @@ def build_google_cache_plan(
     ):
         return None
 
+    return _plan_at_checkpoint(endpoint, request, upstream_payload, message_index, offset)
+
+
+def _plan_at_checkpoint(
+    endpoint: tuple[str, str, str],
+    request: GatewayRequest,
+    upstream_payload: JsonObject,
+    message_index: int,
+    offset: int,
+) -> GoogleCachePlan | None:
+    """Move only a verified prefix, preserving the native continuation exactly."""
+    system_count = sum(message.role == "system" for message in request.messages)
     create_url, model, resource_prefix = endpoint
     generation = cast("JsonObject", json.loads(canonical_json_bytes(upstream_payload)))
     resource: JsonObject = {"model": model}
@@ -255,6 +267,67 @@ def build_google_cache_plan(
         _create_payload_json=resource_json,
         _generation_payload_json=canonical_json_bytes(generation),
     )
+
+
+def build_automatic_google_cache_plans(
+    profile: GatewayWireProfile,
+    request: GatewayRequest,
+    upstream_payload: JsonObject,
+) -> tuple[GoogleCachePlan, ...]:
+    """Offer bounded whole-message Vertex prefixes without adding caller markers.
+
+    Only leading plain system/user messages qualify, with at least one original
+    user message left uncached. History, media, explicit hints and native carriers
+    retain ordinary generation. Up to eight early message boundaries are offered;
+    the host selects a repeated prefix using content-free scoped fingerprints.
+    Generation settings and output schemas remain outside every cache resource.
+    No token eligibility, spending authority or repeated-use claim is inferred here.
+    """
+    if (
+        profile.dialect != "gemini_generate_content"
+        or profile.signs_request_body
+        or cache_markers(request)
+        or request.provider_cache_control is not None
+        or request.provider_server_tools
+        or request.provider_native_tools
+        or request.web_search is not None
+        or request.tool_search is not None
+        or any(tool.cache_control is not None for tool in request.tools)
+        or not _payload_matches(request, upstream_payload)
+    ):
+        return ()
+    endpoint = _cache_endpoint(profile)
+    if endpoint is None or endpoint[2] == "cachedContents/":
+        return ()
+    started = False
+    for message in request.messages:
+        if (
+            message.role not in {"system", "user"}
+            or not message.content
+            or message.content_parts
+            or message.tool_calls
+            or message.cache_control is not None
+            or message.provider_text_blocks
+            or message.provider_reasoning
+            or message.provider_native_item is not None
+            or message.provider_anthropic_block is not None
+            or message.provider_anthropic_blocks is not None
+            or message.provider_item_id is not None
+            or (started and message.role == "system")
+        ):
+            return ()
+        started = started or message.role == "user"
+    system_count = sum(m.role == "system" for m in request.messages)
+    first = max(0, system_count - 1)
+    plans: list[GoogleCachePlan] = []
+    for index in range(first, min(len(request.messages) - 1, first + 8)):
+        plan = _plan_at_checkpoint(
+            endpoint, request, upstream_payload, index, len(request.messages[index].content or "")
+        )
+        # Bound transient plan copying; bytes are not a provider token count.
+        if plan is not None and 4096 <= plan.conservative_input_bound <= 262144:
+            plans.append(plan)
+    return tuple(plans)
 
 
 def _five_minute_marker(marker: JsonObject) -> bool:
@@ -305,6 +378,8 @@ def _cache_endpoint(profile: GatewayWireProfile) -> tuple[str, str, str] | None:
     scope, location, model_id = match[1], match[3], match[4]
     if location == "global":
         host = "aiplatform.googleapis.com"
+    elif location in {"us", "eu"}:
+        host = f"aiplatform.{location}.rep.googleapis.com"
     elif _REGION.fullmatch(location):
         host = f"{location}-aiplatform.googleapis.com"
     else:

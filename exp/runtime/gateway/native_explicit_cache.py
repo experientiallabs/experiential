@@ -27,8 +27,10 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.explicit_cache import (
+    AutomaticCacheHost,
     CacheCreator,
     CacheOffer,
+    CachePrefix,
     CacheReady,
     CacheResult,
     ExplicitCacheHost,
@@ -42,7 +44,11 @@ from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, Nativ
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import CACHE_CONTROL_NOT_FORWARDED_SUFFIX
-from exp.runtime.models.providers.google_cache import GoogleCachePlan, build_google_cache_plan
+from exp.runtime.models.providers.google_cache import (
+    GoogleCachePlan,
+    build_automatic_google_cache_plans,
+    build_google_cache_plan,
+)
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.openai_protocol.errors import public_failure_error
 
@@ -66,6 +72,7 @@ class NativeCacheBinding:
     deployment: ExactModelDeployment
     profile: GatewayWireProfile
     plan: GoogleCachePlan
+    automatic_plans: tuple[GoogleCachePlan, ...] = ()
 
 
 @dataclass(repr=False)
@@ -106,6 +113,8 @@ def bind_explicit_cache(
     provider_request: GatewayRequest,
     public_request: GatewayRequest,
     wire_route: list[JsonObject],
+    *,
+    automatic: bool = False,
 ) -> tuple[NativeCacheState | None, GatewayRequest]:
     """Retain pure plans without reserving or contacting any provider at admission.
 
@@ -122,14 +131,27 @@ def bind_explicit_cache(
         payload = wire.get("upstream_payload")
         plan = (
             build_google_cache_plan(profile, provider_request, payload)
-            if isinstance(payload, dict) and not wire.get("zdr_constrained")
+            if isinstance(payload, dict) and not wire.get("zdr_constrained") and not automatic
             else None
         )
-        bindings.append(None if plan is None else NativeCacheBinding(deployment, profile, plan))
+        candidates = (
+            build_automatic_google_cache_plans(profile, provider_request, payload)
+            if automatic
+            and plan is None
+            and isinstance(payload, dict)
+            and not wire.get("zdr_constrained")
+            else ()
+        )
+        plan = plan or (candidates[0] if candidates else None)
+        bindings.append(
+            None if plan is None else NativeCacheBinding(deployment, profile, plan, candidates)
+        )
         if plan is not None:
             wire["explicit_cache"] = True
     if not any(binding is not None for binding in bindings):
         return None, public_request
+    if automatic:
+        return NativeCacheState(tuple(bindings)), public_request
     disclosures = public_request.ignored_parameters
     if all(binding is not None for binding in bindings):
         disclosures = tuple(
@@ -171,7 +193,7 @@ class _CacheFinish(_CacheBoundary):
     """
 
     operation_id: str = Field(min_length=1, max_length=128)
-    outcome: str = Field(pattern=r"^(ready|unknown)$")
+    outcome: str = Field(pattern=r"^(ready|unknown|not_created)$")
     http_status: int | None = Field(default=None, ge=100, le=599)
     name: str | None = Field(default=None, max_length=1024)
     expire_time: str | None = Field(default=None, max_length=64)
@@ -184,6 +206,7 @@ class _Plane(Protocol):
 
     _accounting: NativeAttemptAccounting
     _explicit_cache: ExplicitCacheHost | None
+    _automatic_cache: AutomaticCacheHost | None
 
 
 def _attempt_active(
@@ -290,6 +313,27 @@ class NativeExplicitCacheMixin:
             # Host I/O must not own the execution gate: abandon must be able to
             # finish the generation reservation even while a cache transaction hangs.
             authority = host.authority(entry.authorization, binding.deployment, binding.profile)
+            if authority is not None and binding.automatic_plans:
+                selector = self._automatic_cache
+                if selector is None:
+                    raise ValueError("automatic prefix selection is not configured")
+                plans = tuple(
+                    bound
+                    for candidate in binding.automatic_plans
+                    if (bound := candidate.bind_vertex_project(authority.vertex_project))
+                    is not None
+                )
+                chosen = selector.select_prefix(
+                    authority,
+                    selected.request_id,
+                    tuple(CachePrefix(p.prefix_sha256, p.conservative_input_bound) for p in plans),
+                )
+                if chosen is None:
+                    return _encoded({"state": "unavailable"})
+                matches = [p for p in plans if p.prefix_sha256 == chosen]
+                if len(matches) != 1:
+                    raise ValueError("host selected an unoffered prefix")
+                binding = replace(binding, plan=matches[0])
             with entry.execution_lock:
                 if not _attempt_active(self._accounting, entry, attempt_id):
                     return _encoded({"state": "unavailable"})
@@ -344,6 +388,8 @@ class NativeExplicitCacheMixin:
                         "url": binding.plan.create_url,
                         "payload": payload,
                         "expires_at": offer.expires_at,
+                        "measure_tokens": bool(binding.automatic_plans),
+                        "minimum_tokens": authority.minimum_input_tokens,
                     }
                 )
         except Exception:  # noqa: BLE001 - sanitize host failures without releasing reservations.
@@ -388,6 +434,23 @@ class NativeExplicitCacheMixin:
                     observed_at=observed_at,
                     http_status=selected.http_status,
                 )
+                if selected.outcome == "not_created":
+                    if not binding.automatic_plans or any(
+                        value is not None
+                        for value in (
+                            selected.name,
+                            selected.http_status,
+                            selected.total_tokens,
+                            selected.expire_time,
+                            selected.create_time,
+                        )
+                    ):
+                        raise ValueError("no-create proof is only valid for an automatic preflight")
+                    result = CacheResult(
+                        operation_id=offer.operation_id,
+                        outcome="not_created",
+                        observed_at=observed_at,
+                    )
                 if selected.outcome == "ready":
                     try:
                         result = CacheResult(

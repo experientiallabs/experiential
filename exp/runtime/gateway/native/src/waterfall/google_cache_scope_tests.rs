@@ -119,3 +119,75 @@ async fn project_id_create_records_only_the_host_verified_numeric_resource() {
         assert!(requests[0].starts_with(&format!("POST {path}/cachedContents ")));
     }
 }
+
+#[test]
+fn jurisdictional_host_matches_exact_location() {
+    for location in ["us", "eu"] {
+        let url = format!("https://aiplatform.{location}.rep.googleapis.com/v1/projects/fruit-project/locations/{location}/publishers/google/models/gemini-test:streamGenerateContent?alt=sse");
+        assert!(cache_endpoint(&url, EndpointPolicy::Official).is_some());
+        assert!(cache_endpoint(
+            &url.replace(&format!("/locations/{location}/"), "/locations/global/"),
+            EndpointPolicy::Official
+        )
+        .is_none());
+        assert!(cache_endpoint(
+            &url.replace(".googleapis.com", ".googleapis.com.evil.test"),
+            EndpointPolicy::Official
+        )
+        .is_none());
+    }
+}
+
+#[tokio::test]
+async fn automatic_preflight_counts_only_prefix_and_skips_below_minimum() {
+    for tokens in [4095, 6000] {
+        let expires = expiry();
+        let prefix = "projects/123456789/locations/us/cachedContents/";
+        let name = format!("{prefix}test-cache");
+        let response =
+            json!({"name":name,"expireTime":expires.1,"usageMetadata":{"totalTokenCount":tokens}});
+        let mut replies = vec![answer(200, &json!({"totalTokens": tokens}).to_string())];
+        if tokens >= 4096 {
+            replies.push(answer(200, &response.to_string()));
+        }
+        let (base, task) = server(replies).await;
+        let path = "/v1/projects/fruit-project/locations/us";
+        let original = wire(&format!(
+            "{base}{path}/publishers/google/models/gemini-test:streamGenerateContent?alt=sse"
+        ));
+        let mut create = claim(&format!("{base}{path}/cachedContents"), &expires);
+        create["resource_prefix"] = json!(prefix);
+        create["measure_tokens"] = json!(true);
+        create["minimum_tokens"] = json!(4096);
+        create["payload"]["model"] =
+            json!("projects/fruit-project/locations/us/publishers/google/models/gemini-test");
+        let mut accepted = ready(&name);
+        accepted["resource_prefix"] = json!(prefix);
+        let host = Host::new(vec![
+            create,
+            if tokens >= 4096 {
+                accepted
+            } else {
+                json!({"state":"unavailable"})
+            },
+        ]);
+        let result = execute_test(&original, &host, EndpointPolicy::Loopback)
+            .await
+            .unwrap();
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with(&format!(
+            "POST {path}/publishers/google/models/gemini-test:countTokens "
+        )));
+        assert!(!requests[0].contains("expireTime"));
+        assert!(!requests[0].contains("generation-only"));
+        assert!(!requests[0].contains("prefix and suffix"));
+        if tokens < 4096 {
+            assert!(result.is_none());
+            assert_eq!(host.calls()[1].1["outcome"], "not_created");
+            assert_eq!(requests.len(), 1);
+        } else {
+            assert_eq!(result.unwrap().upstream_payload["cachedContent"], name);
+            assert!(requests[1].starts_with(&format!("POST {path}/cachedContents ")));
+        }
+    }
+}
