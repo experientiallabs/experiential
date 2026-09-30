@@ -930,8 +930,7 @@ _ResponsesOutputItem = Annotated[
     | _ResponseReasoningItem
     | _AdditionalToolsItem
     | _AgentMessageInput
-    | _CustomToolCall
-    | _CustomToolCallOutput
+    | (_CustomToolCall | _CustomToolCallOutput)
     | _HostedToolItemEcho,
     Field(discriminator="type"),
 ]
