@@ -7,19 +7,53 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import Field, JsonValue, TypeAdapter, ValidationError
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
+    SecretBoundaryError,
+    assert_secret_free,
     canonical_json_bytes,
     stable_id,
 )
+from exp.common.project.errors import ArtifactStoreError
 from exp.common.project.manifests import artifact_input
 from exp.common.project.records import ProjectRecords
 from exp.common.project.store import ProjectStore
 from exp.common.release_revision import installed_release_revision
+
+_JSON_VALUE = TypeAdapter(JsonValue)
+
+
+class _Response(ContractModel):
+    """Exact encoded provider output retained as data rather than credential configuration.
+
+    Attributes:
+        payload: Original encoded response, without normalization or redaction.
+    """
+
+    payload: str
+
+
+def _validate_response(payload: str) -> None:
+    """Reject actual secrets and structured credential fields without rejecting prose.
+
+    Args:
+        payload: Encoded response, which may be arbitrary text or serialized JSON.
+
+    Raises:
+        ArtifactStoreError: The response contains a secret value or credential field.
+    """
+    try:
+        value = _JSON_VALUE.validate_json(payload)
+    except ValidationError:
+        value = payload
+    try:
+        assert_secret_free(value)
+    except SecretBoundaryError as exc:
+        raise ArtifactStoreError("provider response violates the secret boundary") from exc
 
 
 class RequestReceipt(ContractModel):
@@ -115,15 +149,16 @@ class RequestBudgetStore:
             previous = self.read(key)
             if previous is None or previous.state != "pending":
                 raise ValueError("provider request does not have a pending reservation")
+            _validate_response(payload)
             manifest = self._project.artifacts.write(
                 artifact_id=stable_id("request-response", {"budget": self._identity, "key": key}),
                 artifact_type="provider-response",
                 envelope=ArtifactEnvelope(
-                    schema_version=1,
+                    schema_version=2,
                     created_at=datetime.now(UTC),
                     code_revision=installed_release_revision(),
                 ),
-                files={"response.txt": payload.encode("utf-8")},
+                files={"response.json": canonical_json_bytes(_Response(payload=payload))},
             )
             self.write(
                 key,
@@ -154,6 +189,11 @@ class RequestBudgetStore:
         stored = self._project.artifacts.read(pointer.artifact_id)
         if artifact_input(stored.manifest) != pointer:
             raise ValueError("saved provider response identity changed")
-        return self._project.artifacts.read_bytes(pointer.artifact_id, "response.txt").decode(
-            "utf-8"
-        )
+        if stored.manifest.schema_version == 1:
+            return self._project.artifacts.read_bytes(pointer.artifact_id, "response.txt").decode(
+                "utf-8"
+            )
+        if stored.manifest.schema_version != 2:
+            raise ValueError("saved provider response schema is unsupported")
+        payload = self._project.artifacts.read_bytes(pointer.artifact_id, "response.json")
+        return _Response.model_validate_json(payload).payload
