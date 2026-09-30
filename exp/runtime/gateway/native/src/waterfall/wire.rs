@@ -78,6 +78,11 @@ pub struct DeploymentWire {
     /// no such control: the relay serializes the turn to one tool call.
     #[serde(default)]
     pub serialize_tool_calls: bool,
+    /// This rung's provider reports Chat Completions cache writes as a subset
+    /// of cache reads: it created the cache and read the written tokens back
+    /// in the same call. Usage normalization separates the two legs.
+    #[serde(default)]
+    pub cache_writes_within_reads: bool,
     /// Codex native-tool inversion map for this request (provider-facing
     /// mangled name -> origin name, namespace, is-custom). Empty unless the
     /// request carried translated Codex native tools; see

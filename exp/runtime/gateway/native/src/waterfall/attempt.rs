@@ -196,6 +196,7 @@ pub(super) async fn run_attempt(
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_probability_output(ctx.chat_logprobs, &wire.upstream_payload);
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
+        relay.set_cache_writes_within_reads(wire.cache_writes_within_reads);
         relay.set_native_tool_translation(wire.native_tool_translation.clone());
         relay.set_tool_search_tool_name(ctx.tool_search.map(|search| search.tool_name.clone()));
         if !wire.model_id.is_empty() {

@@ -132,6 +132,23 @@ impl Observation {
         })))
     }
 
+    /// Replace the meter with a normalizer's latest cumulative report when
+    /// that report may lower a field (see `Normalizer::meter_replaces_earlier`);
+    /// merging by maximum would restore a count the normalizer moved. A queued
+    /// terminal still fixes the meter, and a report without token counts is
+    /// no observation.
+    pub(crate) fn replace_usage(&self, usage: &Usage) {
+        let mut observed = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if observed.terminal.is_none()
+            && (usage.input_tokens.is_some() || usage.output_tokens.is_some())
+        {
+            observed.usage = Some(usage.clone());
+        }
+    }
+
     /// Remember normalized facts before public delivery can suspend or fail.
     pub(crate) fn record(&self, event: &Event) {
         let mut observed = self

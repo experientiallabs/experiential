@@ -21,6 +21,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        cache_writes_within_reads: false,
         image_output: false,
         model_id: String::new(),
         billing_customer_managed: false,

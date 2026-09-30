@@ -335,7 +335,11 @@ impl UpstreamRelay {
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
             if let Some(usage) = self.normalizer.observed_usage() {
-                observation.record(&Event::Usage(usage.clone()));
+                if self.normalizer.meter_replaces_earlier() {
+                    observation.replace_usage(usage);
+                } else {
+                    observation.record(&Event::Usage(usage.clone()));
+                }
             }
             for event in &events {
                 match event {
@@ -425,6 +429,12 @@ impl UpstreamRelay {
         S: Into<String>,
     {
         self.normalizer.set_request_words(words);
+    }
+
+    /// Carry the rung's cache-write accounting into usage normalization.
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.normalizer
+            .set_cache_writes_within_reads(writes_within_reads);
     }
 
     /// Carry the Codex native-tool inversion map (see
