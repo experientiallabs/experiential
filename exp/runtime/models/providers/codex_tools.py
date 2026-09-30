@@ -20,6 +20,9 @@ declarations into ordinary function tools the provider understands:
   representation and are dropped with disclosure (mirroring the Anthropic
   server-tool drop).
 
+A multi-agent ``agent_message`` carries opaque encrypted content without a
+tool-call representation, so a foreign route rejects it before dispatch.
+
 A translation :class:`NativeToolMapping` rides on the provider request only
 (never the canonical/public request, so replay identity does not drift) and is
 inverted on the response path so the caller sees the tool-call shape it
@@ -381,7 +384,8 @@ def convert_native_history(
     ``GatewayMessage.provider_native_item``. On a foreign wire these become
     ordinary assistant tool calls (with the same mangled names the declarations
     used) and tool results. ``additional_tools`` items are dropped: their tools
-    are declared on this turn's ``tools`` array.
+    are declared on this turn's ``tools`` array. An ``agent_message`` carries
+    opaque encrypted content and is rejected before foreign dispatch.
 
     Args:
         messages: The decoded messages that may carry native items.
@@ -390,6 +394,10 @@ def convert_native_history(
 
     Returns:
         The converted message tuple and any drop disclosures.
+
+    Raises:
+        ProviderParameterError: The history contains opaque agent content that a foreign
+            provider cannot preserve.
     """
     _reserve_plain_history(messages, mapping)
     calls_by_id: dict[str, ToolCall | None] = {}
@@ -435,7 +443,12 @@ def convert_native_history(
                 else message
             )
             continue
-        replacement, disclosure = _convert_history_item(item, mapping, tool_search_name)
+        replacement, disclosure = _convert_history_item(
+            item,
+            mapping,
+            tool_search_name,
+            input_index=message.provider_native_item_index,
+        )
         if replacement is not None:
             converted.append(replacement)
         if disclosure is not None and disclosure not in disclosures:
@@ -444,14 +457,31 @@ def convert_native_history(
 
 
 def _convert_history_item(
-    item: JsonObject, mapping: NativeToolMapping, tool_search_name: str
+    item: JsonObject,
+    mapping: NativeToolMapping,
+    tool_search_name: str,
+    *,
+    input_index: int | None = None,
 ) -> tuple[GatewayMessage | None, str | None]:
     """Translate one history item with the declaration's full-origin name allocation.
 
     Return the provider message and optional omission disclosure, using the same custom
     and namespace origin mapping as the declared tools.
+
+    Raises:
+        ProviderParameterError: The item contains opaque agent content unsupported by this wire.
     """
     item_type = item.get("type")
+    if item_type == "agent_message":
+        raise ProviderParameterError(
+            message=(
+                "The input item 'agent_message' carries opaque encrypted content and is "
+                "supported only by a native OpenAI Responses route. Choose a native OpenAI "
+                "Responses route or remove the item."
+            ),
+            param=f"input.{input_index}.type" if input_index is not None else "input",
+            code="unsupported_parameter",
+        )
     if item_type == "additional_tools":
         return None, "input.additional_tools->dropped(declared_inline)"
     if item_type == "custom_tool_call":

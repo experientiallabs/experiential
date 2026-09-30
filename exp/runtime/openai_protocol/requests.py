@@ -86,6 +86,7 @@ from exp.runtime.openai_protocol.web_search import (
 from exp.runtime.openai_protocol.wire_models import (
     HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
+    _AgentMessageInput,
     _AssistantToolCall,
     _ChatRequest,
     _ChatTool,
@@ -854,7 +855,11 @@ def _response_input_messages(
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(
+        if isinstance(item, _AgentMessageInput):
+            replayed.append(
+                ReplayedNativeItem(index=index, role="assistant", item=raw_items[index])
+            )
+        elif isinstance(
             item,
             (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput, _HostedToolItemEcho),
         ):

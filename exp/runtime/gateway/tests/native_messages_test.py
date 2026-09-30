@@ -2482,6 +2482,46 @@ def test_encrypted_reasoning_include_rejects_non_responses_routes(
     assert body["error"]["code"] == "unsupported_parameter"
 
 
+def test_responses_agent_message_rejects_non_native_routes_before_dispatch(
+    engine: _ServingEngine,
+) -> None:
+    """An opaque agent item fails closed before a foreign provider receives a request."""
+    agent_message: JsonObject = {
+        "type": "agent_message",
+        "id": "amsg_fixture",
+        "author": "/root/reviewer",
+        "recipient": "/root",
+        "content": [
+            {"type": "input_text", "text": "Review result follows."},
+            {"type": "encrypted_content", "encrypted_content": "opaque-test-fixture"},
+        ],
+        "agent": {"agent_name": "/root"},
+    }
+    with _SseUpstream.payloads_lock:
+        dispatched_before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "Use the completed agent work."},
+                agent_message,
+            ],
+        },
+        timeout=30.0,
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["param"] == "input.1.type"
+    assert error["code"] == "unsupported_parameter"
+    assert "native OpenAI Responses route" in error["message"]
+    assert "opaque-test-fixture" not in response.text
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == dispatched_before
+
+
 def _responses_result(
     response: httpx.Response, *, stream: bool
 ) -> tuple[JsonObject, list[JsonObject]]:
@@ -2730,6 +2770,59 @@ def test_provider_400_keeps_the_generic_message_for_a_body_dump(
     assert "4711" not in json.dumps(rejected.json())
     assert rejected.json()["error"]["message"] == (
         "provider rejected the request: unknown_parameter"
+    )
+
+
+@pytest.mark.parametrize(
+    "agent_message_id",
+    ("amsg_fixture", "item_fixture", None),
+    ids=("id-present", "foreign-looking-id", "id-omitted"),
+)
+def test_native_openai_responses_replays_codex_agent_message_without_rewriting(
+    responses_engine: _ServingEngine, agent_message_id: str | None
+) -> None:
+    """Native Responses replay preserves agent IDs, content, attribution, and item order."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    agent_message: JsonObject = {
+        "type": "agent_message",
+        "author": "/root/reviewer",
+        "recipient": "/root",
+        "content": [
+            {"type": "input_text", "text": "Review result follows."},
+            {"type": "encrypted_content", "encrypted_content": "opaque-test-fixture"},
+        ],
+        "agent": {"agent_name": "/root"},
+    }
+    if agent_message_id is not None:
+        agent_message["id"] = agent_message_id
+    first_message = {"role": "user", "content": "Use the completed agent work."}
+    last_message = {"role": "user", "content": "Keep this item after the agent message."}
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": [first_message, agent_message, last_message],
+        },
+        timeout=30.0,
+    )
+
+    assert response.status_code == 200, response.text
+    with _ResponsesUpstream.payloads_lock:
+        upstream = tuple(_ResponsesUpstream.payloads)
+    assert len(upstream) == 1
+    replayed = cast(list[JsonObject], upstream[0]["input"])
+    assert len(replayed) == 3
+    assert replayed[0]["content"] == first_message["content"]
+    assert replayed[1] == agent_message
+    assert replayed[2]["content"] == last_message["content"]
+    assert ("id" in replayed[1]) is (agent_message_id is not None)
+    replayed_content = cast(list[JsonObject], replayed[1]["content"])
+    assert [part["type"] for part in replayed_content] == ["input_text", "encrypted_content"]
+    assert (
+        cast(str, replayed_content[1]["encrypted_content"]).encode("utf-8")
+        == b"opaque-test-fixture"
     )
 
 

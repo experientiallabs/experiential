@@ -1251,6 +1251,180 @@ def test_responses_decoder_accepts_encrypted_reasoning_without_item_id() -> None
     ]
 
 
+def test_responses_decoder_accepts_codex_agent_message_with_opaque_content() -> None:
+    """Codex agent messages retain their ordered content as one native item."""
+    agent_message: JsonObject = {
+        "type": "agent_message",
+        "id": "amsg_fixture",
+        "author": "/root/reviewer",
+        "recipient": "/root",
+        "content": [
+            {"type": "input_text", "text": "Review result follows."},
+            {"type": "encrypted_content", "encrypted_content": "opaque-test-fixture"},
+        ],
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-6-luna",
+            "input": [
+                {"role": "user", "content": "Use the completed agent work."},
+                agent_message,
+            ],
+        }
+    )
+
+    assert len(decoded.request.messages) == 2
+    assert decoded.request.messages[0].content == "Use the completed agent work."
+    replayed = decoded.request.messages[1].provider_native_item
+    assert replayed is not None
+    assert replayed == agent_message
+    parts = cast(list[JsonObject], replayed["content"])
+    assert cast(str, parts[1]["encrypted_content"]).encode("utf-8") == b"opaque-test-fixture"
+
+
+def test_responses_decoder_accepts_codex_agent_message_without_optional_id() -> None:
+    """The decoded raw item preserves the Codex client's omitted item ID."""
+    agent_message: JsonObject = {
+        "type": "agent_message",
+        "author": "/root/reviewer",
+        "recipient": "/root",
+        "content": [{"type": "encrypted_content", "encrypted_content": "opaque-test-fixture"}],
+        "agent": {"agent_name": "/root"},
+    }
+    decoded = decode_responses({"model": "gpt-6-luna", "input": [agent_message]})
+
+    replayed = decoded.request.messages[0].provider_native_item
+    assert replayed == agent_message
+    assert replayed is not None and "id" not in replayed
+    assert replayed["agent"] == {"agent_name": "/root"}
+
+
+def test_responses_agent_message_preserves_optional_agent_attribution() -> None:
+    """An optional documented agent attribution remains part of the native item."""
+    agent_message: JsonObject = {
+        "type": "agent_message",
+        "id": "amsg_attributed",
+        "author": "/root/reviewer",
+        "recipient": "/root",
+        "content": [{"type": "encrypted_content", "encrypted_content": "opaque-test-fixture"}],
+        "agent": {"agent_name": "/root"},
+    }
+    decoded = decode_responses({"model": "gpt-6-luna", "input": [agent_message]})
+
+    assert decoded.request.messages[0].provider_native_item == agent_message
+
+
+@pytest.mark.parametrize(
+    "agent_message",
+    (
+        {
+            "type": "agent_message",
+            "id": "amsg_missing_author",
+            "recipient": "/root",
+            "content": [{"type": "input_text", "text": "hello"}],
+        },
+        {
+            "type": "agent_message",
+            "id": "amsg_extra_field",
+            "author": "/root/reviewer",
+            "recipient": "/root",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "status": "completed",
+        },
+        {
+            "type": "agent_message",
+            "id": "amsg_unknown_part",
+            "author": "/root/reviewer",
+            "recipient": "/root",
+            "content": [{"type": "output_text", "text": "hello"}],
+        },
+        {
+            "type": "agent_message",
+            "id": "amsg_missing_ciphertext",
+            "author": "/root/reviewer",
+            "recipient": "/root",
+            "content": [{"type": "encrypted_content"}],
+        },
+        {
+            "type": "agent_message",
+            "id": "amsg_extra_attribution",
+            "author": "/root/reviewer",
+            "recipient": "/root",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "agent": {"agent_name": "/root", "other": "unsupported"},
+        },
+    ),
+)
+def test_responses_decoder_rejects_malformed_agent_message_shapes(
+    agent_message: JsonObject,
+) -> None:
+    """The closed agent-message contract rejects undocumented fields and parts."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "gpt-6-luna", "input": [agent_message]})
+
+
+def test_responses_sdk_probe_preserves_input_indexes_after_agent_message() -> None:
+    """SDK probe diagnostics refer to original positions after a native agent item."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "gpt-6-luna",
+                "input": [
+                    {"role": "user", "content": "Use the completed agent work."},
+                    {
+                        "type": "agent_message",
+                        "id": "amsg_fixture",
+                        "author": "/root/reviewer",
+                        "recipient": "/root",
+                        "content": [
+                            {"type": "input_text", "text": "Review result follows."},
+                            {
+                                "type": "encrypted_content",
+                                "encrypted_content": "opaque-test-fixture",
+                            },
+                        ],
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_fixture",
+                        "output": [
+                            {
+                                "type": "output_text",
+                                "text": "unsupported tool output spelling",
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+
+    assert raised.value.detail.param == "input.2.output.0.type"
+
+
+def test_responses_decoder_rejects_encrypted_content_in_ordinary_messages() -> None:
+    """Opaque agent content is not accepted as a regular message content part."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "gpt-6-luna",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "encrypted_content",
+                                "encrypted_content": "opaque-test-fixture",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    assert raised.value.detail.param == "input.0.content.0.type"
+
+
 def test_responses_decoder_rejects_reasoning_without_id_or_encrypted_content() -> None:
     """A reasoning input still needs a usable ID or its encrypted replay payload."""
     with pytest.raises(OpenAIProtocolError) as raised:

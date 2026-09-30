@@ -150,6 +150,11 @@ class GatewayMessage(ContractModel):
         capture_only_reasoning: Caller-visible copies accompanying sealed replay.
             Empty by default; excluded from serialization, provider dispatch and
             replay authority. Only content capture consumes this evidence.
+        provider_native_item: Validated Responses-native item retained for ordered replay.
+            Agent messages keep opaque encrypted content and require a native
+            Responses route.
+        provider_native_item_index: Original Responses input index for a native
+            item received from caller input, excluded from serialization.
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
@@ -224,19 +229,7 @@ class GatewayMessage(ContractModel):
     :func:`canonical_request_sha256`.
     """
     provider_native_item: JsonObject | None = Field(default=None, exclude=True)
-    """One verbatim OpenAI Responses input item the gateway carries opaquely.
-
-    Codex ships tool definitions and freeform tool history as native input
-    items (``additional_tools``, ``custom_tool_call``,
-    ``custom_tool_call_output``), and hosted-tool turns echo their
-    provider-executed items (``web_search_call``, ``mcp_call``,
-    ``code_interpreter_call``, their outputs, ...); every such shape exists
-    on no other wire, so the item is validated shallowly at decode and
-    re-emitted byte-for-byte at its position on native Responses rungs only.
-    A message carrying it carries nothing else. Excluded from serialization
-    like the other carriers so item-free digests are unperturbed; a present
-    item joins replay identity through :func:`canonical_request_sha256`.
-    """
+    provider_native_item_index: int | None = Field(default=None, ge=0, exclude=True)
     provider_anthropic_blocks: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
     """The caller's assistant content blocks in their ORIGINAL order, when a
     thinking block is among them.
