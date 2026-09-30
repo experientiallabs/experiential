@@ -10,6 +10,7 @@ from exp.common.models import ModelCapabilities, ModelClient, ModelRequest, Mode
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.models.providers.async_transport import (
+    ProviderDeadlineExceeded,
     RequestDeadline,
     run_then_close_pooled_client,
 )
@@ -63,6 +64,7 @@ class SyncModelClientAdapter:
             The completed response from the async provider.
 
         Raises:
+            ProviderDeadlineExceeded: The compatibility deadline expires before completion.
             RuntimeError: Called from an event-loop thread, where callers must await directly.
         """
         try:
@@ -76,8 +78,16 @@ class SyncModelClientAdapter:
     async def _complete(self, request: ModelRequest) -> ModelResponse:
         """Apply the configured total deadline to one async provider completion."""
         deadline = RequestDeadline.after(self._timeout_seconds)
-        async with asyncio.timeout(self._timeout_seconds):
-            return await self._client.complete_async(request, deadline=deadline)
+        timeout = asyncio.timeout(self._timeout_seconds)
+        try:
+            async with timeout:
+                return await self._client.complete_async(request, deadline=deadline)
+        except ProviderDeadlineExceeded:
+            raise
+        except TimeoutError as exc:
+            if not timeout.expired():
+                raise
+            raise ProviderDeadlineExceeded("provider request deadline exceeded") from exc
 
 
 class BoundedSyncModelClientAdapter:
