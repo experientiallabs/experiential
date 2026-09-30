@@ -15,6 +15,7 @@ from exp.common.core.artifacts import (
     ContractModel,
     SecretBoundaryError,
     assert_secret_free,
+    assert_text_secret_free,
     canonical_json_bytes,
     stable_id,
 )
@@ -38,7 +39,7 @@ class _Response(ContractModel):
 
 
 def _validate_response(payload: str) -> None:
-    """Reject actual secrets and structured credential fields without rejecting prose.
+    """Validate encoded output using its matching structured or plain-text boundary.
 
     Args:
         payload: Encoded response, which may be arbitrary text or serialized JSON.
@@ -47,11 +48,12 @@ def _validate_response(payload: str) -> None:
         ArtifactStoreError: The response contains a secret value or credential field.
     """
     try:
-        value = _JSON_VALUE.validate_json(payload)
-    except ValidationError:
-        value = payload
-    try:
-        assert_secret_free(value)
+        try:
+            value = _JSON_VALUE.validate_json(payload)
+        except ValidationError:
+            assert_text_secret_free(payload)
+        else:
+            assert_secret_free(value)
     except SecretBoundaryError as exc:
         raise ArtifactStoreError("provider response violates the secret boundary") from exc
 

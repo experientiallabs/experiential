@@ -15,9 +15,9 @@ from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
 @pytest.mark.parametrize(
     "payload",
     [
-        "The company sells password management and authorization software.",
+        '{"output": "The company sells password management and authorization software."}',
         '{"output": {"text": "The company sells password management software."}}',
-        "Set OPENAI_API_KEY in the environment. Do not share the secret.",
+        '{"output": "Set OPENAI_API_KEY in the environment. Do not share the secret."}',
     ],
 )
 def test_response_prose_replays_without_treating_credential_words_as_values(
@@ -43,6 +43,10 @@ def test_response_prose_replays_without_treating_credential_words_as_values(
         '{"output": "\\u0073k-' + "sensitive" * 4 + '"}',
         '{"configuration": {"credential_ref": "local-credential"}}',
         '{"api_key": "a-value-without-a-known-prefix"}',
+        "credential_ref=local-credential",
+        "OPENAI_API_KEY=a-value-without-a-known-prefix",
+        "password=a-value-without-a-known-prefix",
+        '{"api_key": "malformed-json"',
     ],
 )
 def test_secret_response_rejected_without_settling_or_persisting(
