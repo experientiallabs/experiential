@@ -1263,3 +1263,33 @@ def test_automatic_host_requires_matching_native_contract(version: int | None) -
     ):
         with pytest.raises(ValueError, match="matching native cache contract"):
             cache_module.validate_cache_hosts(None, _AutomaticHost())
+
+
+def test_automatic_cache_failures_fall_back_to_plain_generation(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """A cache the client never asked for can fail without failing the request."""
+    host = _AutomaticHost()
+    control, key = _vertex_control(tmp_path, host, automatic=True)
+    first = _automatic_admission(control, key, "First question?")
+    assert _wire(first)["automatic_cache"] is True
+    _start_first(control, first)
+    assert _prepare(control, first)["state"] == "unavailable"
+    # A failed authority lookup answers unavailable instead of a 502.
+    host.fail_authority = True
+    second = _automatic_admission(control, key, "Second question?")
+    _start_first(control, second)
+    assert _prepare(control, second) == {"state": "unavailable"}
+    assert host.claim_calls == 0
+    host.fail_authority = False
+    # A failed result write never lets the unrecorded resource be used.
+    third = _automatic_admission(control, key, "Third question?")
+    _start_first(control, third)
+    creation = _prepare(control, third)
+    assert creation["state"] == "create"
+    host.fail_record = True
+    ready = _finish_argument(third, creation)
+    ready["name"] = "projects/123456789/locations/global/cachedContents/example"
+    assert _finish(control, ready) == {"state": "unavailable"}
+    assert host.results == {}
+    assert "cachedContent" not in json.dumps(_wire(third)["upstream_payload"])
