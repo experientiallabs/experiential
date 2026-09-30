@@ -125,12 +125,12 @@ class AnthropicOAuthApp(ContractModel):
         for url in (self.authorize_url, self.token_url):
             if not url.startswith("https://"):
                 raise ValueError("Anthropic OAuth endpoints must be https URLs")
-        if self.client_id.lower() == CLAUDE_CODE_OAUTH_CLIENT_ID and not self.shared_client:
+        if self.client_id == CLAUDE_CODE_OAUTH_CLIENT_ID and not self.shared_client:
             raise ValueError(
                 "that is Claude Code's OAuth client ID; configure the client ID Anthropic "
                 "issued to this operator, or set shared_client for the approved shared mode"
             )
-        if self.shared_client and self.client_id.lower() != CLAUDE_CODE_OAUTH_CLIENT_ID:
+        if self.shared_client and self.client_id != CLAUDE_CODE_OAUTH_CLIENT_ID:
             raise ValueError(
                 "shared_client mode presents as Claude Code; the client ID must be its own"
             )
