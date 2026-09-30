@@ -278,18 +278,19 @@ def build_automatic_google_cache_plans(
 ) -> tuple[GoogleCachePlan, ...]:
     """Offer bounded whole-message Vertex prefixes without adding caller markers.
 
-    Only leading plain system/user messages qualify, with at least one original
-    user message left uncached. History, media, explicit hints and native carriers
-    retain ordinary generation. Up to eight early message boundaries are offered;
-    the host selects a repeated prefix using content-free scoped fingerprints.
+    Only leading plain system/user text messages qualify, with at least one
+    original user message left uncached. History, media, tools and native carriers
+    retain ordinary generation. Caller cache hints on text (block or top-level
+    ``cache_control``) are ignored rather than disqualifying: they only change cost,
+    the native wire drops them, and the gateway already caches the whole-message
+    prefix they would mark. Up to eight early message boundaries are offered; the
+    host selects which prefix to cache using content-free scoped fingerprints.
     Generation settings and output schemas remain outside every cache resource.
     No token eligibility, spending authority or repeated-use claim is inferred here.
     """
     if (
         profile.dialect != "gemini_generate_content"
         or profile.signs_request_body
-        or cache_markers(request)
-        or request.provider_cache_control is not None
         or request.provider_server_tools
         or request.provider_native_tools
         or request.web_search is not None
@@ -308,8 +309,6 @@ def build_automatic_google_cache_plans(
             or not message.content
             or message.content_parts
             or message.tool_calls
-            or message.cache_control is not None
-            or message.provider_text_blocks
             or message.provider_reasoning
             or message.provider_native_item is not None
             or message.provider_anthropic_block is not None

@@ -22,6 +22,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers import google_cache as google_cache_module
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.google_cache import (
     GoogleCachePlan,
     VertexCacheProject,
@@ -713,9 +714,9 @@ def test_jurisdictional_endpoint_requires_exact_host_and_location(location: str)
         assert build_google_cache_plan(_profile(invalid), _request(), _payload(_request())) is None
 
 
-@pytest.mark.parametrize("shape", ["marked", "history", "single", "oversized", "gemini"])
-def test_automatic_cache_skips_unsupported_or_explicit_shapes(shape: str) -> None:
-    """Automatic selection neither overrides caller markers nor invents message boundaries."""
+@pytest.mark.parametrize("shape", ["history", "single", "oversized", "gemini"])
+def test_automatic_cache_skips_unsupported_shapes(shape: str) -> None:
+    """Automatic selection never invents message boundaries or caches history."""
 
     profile = _profile(
         f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
@@ -801,3 +802,28 @@ def test_automatic_cache_stops_before_copying_prefixes_past_the_byte_ceiling(
     plans = build_automatic_google_cache_plans(profile, request, _payload(request))
     assert calls == [0]
     assert len(plans) == 1
+
+
+def test_automatic_cache_ignores_caller_text_markers() -> None:
+    """A marked request caches exactly like its unmarked twin instead of opting out."""
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/"
+        f"publishers/google/models/{_MODEL}:streamGenerateContent?alt=sse"
+    )
+    marked = _request()
+    assert cache_markers(marked)
+    plain = marked.model_copy(
+        update={
+            "messages": tuple(
+                GatewayMessage(role=m.role, content=m.content) for m in marked.messages
+            )
+        }
+    )
+    assert not cache_markers(plain)
+    for request in (
+        marked,
+        marked.model_copy(update={"provider_cache_control": {"type": "ephemeral"}}),
+    ):
+        plans = build_automatic_google_cache_plans(profile, request, _payload(request))
+        twins = build_automatic_google_cache_plans(profile, plain, _payload(plain))
+        assert plans and [p.prefix_sha256 for p in plans] == [p.prefix_sha256 for p in twins]
