@@ -40,6 +40,10 @@ pub struct DeploymentWire {
     /// The host still reserves and settles each cache operation separately.
     #[serde(default)]
     pub explicit_cache: bool,
+    /// Gateway-selected automatic prefix cache the client never asked for. Any
+    /// cache failure then falls back to the plain generation instead of failing it.
+    #[serde(default)]
+    pub automatic_cache: bool,
     pub timeout_seconds: f64,
     /// Structured payload the data plane serializes itself; null for
     /// body-signing dialects, whose route entry carries `upstream_body`.

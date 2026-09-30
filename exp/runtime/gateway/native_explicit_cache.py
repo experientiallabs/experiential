@@ -149,6 +149,8 @@ def bind_explicit_cache(
         )
         if plan is not None:
             wire["explicit_cache"] = True
+            if candidates:
+                wire["automatic_cache"] = True
     if not any(binding is not None for binding in bindings):
         return None, public_request
     if automatic:
@@ -396,6 +398,9 @@ class NativeExplicitCacheMixin:
         except Exception:  # noqa: BLE001 - sanitize host failures without releasing reservations.
             # A host exception or failed serialization after claim must never
             # trigger another create. The durable host retains the reservation.
+            if self._automatic_cache is not None:
+                # The client never asked for this cache: generate without it.
+                return _encoded({"state": "unavailable"})
             raise _boundary_failure() from None
 
     def finish_explicit_cache(self: _Plane, argument: str) -> str:
@@ -513,6 +518,10 @@ class NativeExplicitCacheMixin:
                     return _encoded({"state": "unavailable"})
                 return _ready_payload(binding.plan, ready)
         except Exception:  # noqa: BLE001 - sanitize host failures without releasing reservations.
+            if self._automatic_cache is not None:
+                # An unrecorded resource is never used; the host hold expires with it
+                # and the request continues on its plain generation.
+                return _encoded({"state": "unavailable"})
             raise _boundary_failure() from None
 
 

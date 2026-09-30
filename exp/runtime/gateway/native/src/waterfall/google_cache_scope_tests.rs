@@ -224,3 +224,47 @@ async fn short_deadline_skips_preflight_and_acknowledges_no_create() {
     assert_eq!(host.calls()[1].1["outcome"], "not_created");
     assert!(task.await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn automatic_cache_failure_falls_back_to_the_plain_generation() {
+    // A malformed host reply is an accounting failure: explicit (client-marked)
+    // caching fails the attempt, automatic caching must dispatch the plain wire.
+    let host = super::tests::Host::new(vec![json!({"state": "bogus"})]);
+    let explicit = super::tests::wire("https://generativelanguage.googleapis.com/v1beta/models/gemini:streamGenerateContent?alt=sse");
+    let failed = super::tests::execute_test(&explicit, &host, EndpointPolicy::Official).await;
+    assert!(failed.is_err());
+    assert!(fail_open(&explicit, failed).is_err());
+
+    let mut automatic = explicit.clone();
+    automatic.automatic_cache = true;
+    let host = super::tests::Host::new(vec![json!({"state": "bogus"})]);
+    let failed = super::tests::execute_test(&automatic, &host, EndpointPolicy::Official).await;
+    assert!(failed.is_err());
+    assert!(matches!(fail_open(&automatic, failed), Ok(None)));
+    // Success and deliberate unavailability pass through untouched.
+    assert!(matches!(fail_open(&automatic, Ok(None)), Ok(None)));
+}
+
+#[test]
+fn only_request_shaped_cache_rejections_redial_plain() {
+    for class in [
+        FailureClass::InvalidRequest,
+        FailureClass::ProviderNotFound,
+        FailureClass::UnsupportedCapability,
+    ] {
+        assert!(plain_redial_after(&Failure::new(
+            class,
+            "cachedContent rejected"
+        )));
+    }
+    for class in [
+        FailureClass::Throttled,
+        FailureClass::Timeout,
+        FailureClass::ProviderInternal,
+    ] {
+        assert!(!plain_redial_after(&Failure::new(
+            class,
+            "upstream trouble"
+        )));
+    }
+}

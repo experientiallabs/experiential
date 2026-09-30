@@ -67,7 +67,7 @@ pub(super) async fn prepare(
     wire: &DeploymentWire,
     repaired: bool,
 ) -> Result<Option<DeploymentWire>, Failure> {
-    execute(
+    let prepared = execute(
         ctx.http,
         wire,
         ctx.request_id,
@@ -76,7 +76,33 @@ pub(super) async fn prepare(
         EndpointPolicy::Official,
         |method, argument| ctx.bridge.call(method, argument),
     )
-    .await
+    .await;
+    fail_open(wire, prepared)
+}
+
+/// Whether a refused dial of an automatic cache overlay should re-dial plain.
+/// Only request-shaped rejections qualify; throttles and outages keep the
+/// ordinary ladder, since the plain body would fail the same way.
+pub(super) fn plain_redial_after(failure: &Failure) -> bool {
+    matches!(
+        failure.failure_class,
+        FailureClass::InvalidRequest
+            | FailureClass::ProviderNotFound
+            | FailureClass::UnsupportedCapability
+    )
+}
+
+/// The client never asked for an automatic cache, so its failure must never fail
+/// the request: generation proceeds on the plain wire. Any claimed-but-unrecorded
+/// create stays an expiring host hold and is never reused.
+fn fail_open(
+    wire: &DeploymentWire,
+    prepared: Result<Option<DeploymentWire>, Failure>,
+) -> Result<Option<DeploymentWire>, Failure> {
+    match prepared {
+        Err(_) if wire.automatic_cache => Ok(None),
+        other => other,
+    }
 }
 
 /// Keep the bridge seam injectable while the real pooled HTTP transport is exercised.

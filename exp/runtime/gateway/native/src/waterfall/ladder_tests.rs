@@ -278,6 +278,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         model_id: "gpt-test".to_string(),
         billing_customer_managed: false,
         explicit_cache: false,
+        automatic_cache: false,
         timeout_seconds: 10.0,
         upstream_payload: json!({
             "model": "gpt-test",
