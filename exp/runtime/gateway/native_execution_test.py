@@ -922,6 +922,7 @@ def test_wire_entry_marks_openrouter_gemini_cache_writes_within_reads() -> None:
 
     assert flag("openai_compatible", "google/gemini-3.1-flash-lite") is True
     assert flag("openai_compatible", "anthropic/claude-opus-5") is False
+    assert flag("openai_responses", "google/gemini-3.1-flash-lite") is False
     assert flag("openai_compatible", "google/gemini-3.1-flash-lite", route.deployment) is False
 
 

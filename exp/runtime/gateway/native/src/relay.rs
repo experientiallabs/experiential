@@ -335,7 +335,11 @@ impl UpstreamRelay {
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
             if let Some(usage) = self.normalizer.observed_usage() {
-                observation.record(&Event::Usage(usage.clone()));
+                if self.normalizer.meter_replaces_earlier() {
+                    observation.replace_usage(usage);
+                } else {
+                    observation.record(&Event::Usage(usage.clone()));
+                }
             }
             for event in &events {
                 match event {

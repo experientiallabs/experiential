@@ -827,11 +827,21 @@ fn writes_within_reads_rung_separates_the_written_tokens_from_the_read_leg() {
 fn writes_within_reads_coalesces_sparse_reports_before_separating() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
     normalizer.set_cache_writes_within_reads(true);
+    // A write without a covering read count is the ordinary disjoint shape: it
+    // fits input, so it settles as a plain write rather than failing the stream.
     feed_usage(
         &mut normalizer,
         json!({"prompt_tokens": 11933, "prompt_tokens_details": {"cache_write_tokens": 10663}}),
     )
-    .expect_err("a write without its covering read count cannot be placed");
+    .expect("an uncovered write that fits input settles disjointly");
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.cached_input_tokens.unwrap_or(0),
+            usage.cache_creation_input_tokens
+        ),
+        (0, Some(10663))
+    );
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
     normalizer.set_cache_writes_within_reads(true);
     feed_usage(
@@ -853,9 +863,9 @@ fn writes_within_reads_still_rejects_impossible_reports() {
         // Reads above the input total.
         json!({"prompt_tokens": 100, "completion_tokens": 1,
                "prompt_tokens_details": {"cached_tokens": 101, "cache_write_tokens": 0}}),
-        // Writes that were not read back.
+        // Writes that were not read back and do not fit input disjointly either.
         json!({"prompt_tokens": 100, "completion_tokens": 1,
-               "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 41}}),
+               "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 61}}),
         // Writes alone above the input total.
         json!({"prompt_tokens": 100, "completion_tokens": 1,
                "prompt_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 101}}),

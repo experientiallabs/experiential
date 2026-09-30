@@ -54,8 +54,8 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import (
-    OPENROUTER_PROVIDER_ID,
     openrouter_cache_writes_within_reads,
+    openrouter_chat_wire,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
@@ -928,8 +928,7 @@ def deployment_wire_entry(
         # reads (the creating call reads the written prefix back); the data
         # plane separates the two legs before settlement.
         "cache_writes_within_reads": (
-            deployment.provider == OPENROUTER_PROVIDER_ID
-            and profile.dialect == "openai_compatible"
+            openrouter_chat_wire(deployment.provider, profile.dialect)
             and openrouter_cache_writes_within_reads(profile.model_id)
         ),
         # Codex native tools translated to function tools on a foreign wire;

@@ -41,9 +41,9 @@ from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
 from exp.runtime.models.providers.logprobs import require_chat_logprobs, require_responses_logprobs
 from exp.runtime.models.providers.openrouter_routing import (
-    OPENROUTER_PROVIDER_ID,
     constrain_openrouter_zero_data_retention,
     forward_provider_preferences,
+    openrouter_chat_wire,
     openrouter_metadata_headers,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
@@ -120,7 +120,9 @@ def build_rung_dispatch(
     upstream_payload = image_aware_stream_payload(
         profile, rung_request, capabilities, deployment.provider
     )
-    if rung_request.provider_preferences is not None and _openrouter_wire(deployment, profile):
+    if rung_request.provider_preferences is not None and openrouter_chat_wire(
+        deployment.provider, profile.dialect
+    ):
         # The caller's routing preferences reach the one wire that defines
         # them; every other dialect's builder never emits the field.
         upstream_payload = forward_provider_preferences(
@@ -205,14 +207,9 @@ def zdr_constrained_dispatch(
             wire, so no request field can express the constraint; the request
             fails closed rather than dispatching to a retaining upstream.
     """
-    if not _openrouter_wire(deployment, profile):
+    if not openrouter_chat_wire(deployment.provider, profile.dialect):
         raise ProviderCapabilityError(capability=ZDR_CONSTRAINT_CAPABILITY)
     return (
         constrain_openrouter_zero_data_retention(upstream_payload),
         openrouter_metadata_headers(dict(profile.headers)),
     )
-
-
-def _openrouter_wire(deployment: ExactModelDeployment, profile: GatewayWireProfile) -> bool:
-    """Whether this rung is OpenRouter's Chat Completions wire (the only ``provider`` field)."""
-    return deployment.provider == OPENROUTER_PROVIDER_ID and profile.dialect == "openai_compatible"

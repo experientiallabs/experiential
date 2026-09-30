@@ -208,10 +208,20 @@ impl Normalizer {
 
     /// Select the rung's Chat Completions cache-write accounting: when set,
     /// reported cache writes are a subset of reported cache reads (see
-    /// `OpenAiUsageAccumulator`).
+    /// `OpenAiUsageAccumulator`). Only a Chat Completions normalizer honours
+    /// it; every other dialect keeps disjoint cache accounting.
     pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
-        self.openai_usage
-            .set_writes_within_reads(writes_within_reads);
+        self.openai_usage.set_writes_within_reads(
+            writes_within_reads && self.dialect == Dialect::OpenAiCompatible,
+        );
+    }
+
+    /// Whether the latest normalized meter replaces earlier ones instead of
+    /// merging by maximum. A writes-within-reads accumulator already coalesces
+    /// every report and lowers the read leg once a write arrives, so a
+    /// max-merge would restore the read tokens it moved to the write leg.
+    pub(crate) fn meter_replaces_earlier(&self) -> bool {
+        self.openai_usage.writes_within_reads()
     }
 
     /// Classify a provider failure and retain bounded detail; exact relay verdicts
@@ -660,12 +670,7 @@ impl Normalizer {
         if self.terminal {
             return Ok(Vec::new());
         }
-        // A writes-within-reads Chat rung's accumulator already coalesces every
-        // report and lowers the read leg once a write arrives, so its latest
-        // normalized meter replaces the earlier one instead of merging by maximum.
-        let previous_usage = if self.dialect == Dialect::OpenAiCompatible
-            && self.openai_usage.writes_within_reads()
-        {
+        let previous_usage = if self.meter_replaces_earlier() {
             None
         } else {
             self.usage.clone()

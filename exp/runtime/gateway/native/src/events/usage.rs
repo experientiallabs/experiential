@@ -170,6 +170,8 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
 /// `cache_write_tokens` over the same prefix) reports writes as a subset of
 /// reads; its counts are normalized to the disjoint contract, so written
 /// tokens leave the read leg and are priced once at the cache-write rate.
+/// The provider bills both legs for those tokens, so that rung's authored
+/// cache-write rate must be its write rate plus its read rate.
 #[derive(Clone, Default)]
 pub(crate) struct OpenAiUsageAccumulator {
     reported: Usage,
@@ -358,12 +360,10 @@ fn cache_subsets(
         "cache_write_tokens",
         "cache_write_tokens",
     )?;
-    if writes_within_reads {
-        if let (Some(reads), Some(writes)) = (reads, writes) {
-            if writes > reads {
-                return Err(WRITES_EXCEED_READS.to_string());
-            }
-        }
+    // A write not covered by its read count is reported the ordinary disjoint
+    // way; it must then fit input like any other rung. Usage arrives after the
+    // content already streamed, so a placeable report never fails the stream.
+    if writes_within_reads && writes.unwrap_or(0) <= reads.unwrap_or(0) {
         if input_tokens.is_some_and(|input| reads.unwrap_or(0) > input) {
             return Err("cache read tokens exceed total input tokens".to_string());
         }
@@ -376,9 +376,6 @@ fn cache_subsets(
     Ok((reads, writes))
 }
 
-const WRITES_EXCEED_READS: &str =
-    "cache write tokens exceed the cache read tokens they were read back from";
-
 /// Move tokens written and read back in one call out of the read leg, so the
 /// coalesced counts satisfy the disjoint contract every settlement prices.
 /// A write without a covering read count cannot be placed and is malformed.
@@ -387,10 +384,11 @@ fn separate_written_reads(usage: &mut Usage) -> Result<(), String> {
     if writes == 0 {
         return Ok(());
     }
-    let reads = usage
-        .cached_input_tokens
-        .ok_or("cache write tokens need the cache read count they were read back from")?;
-    usage.cached_input_tokens = Some(reads.checked_sub(writes).ok_or(WRITES_EXCEED_READS)?);
+    // Uncovered writes are the disjoint shape: leave them for the ordinary check.
+    let Some(reads) = usage.cached_input_tokens.filter(|reads| *reads >= writes) else {
+        return Ok(());
+    };
+    usage.cached_input_tokens = Some(reads - writes);
     Ok(())
 }
 
