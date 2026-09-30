@@ -1,6 +1,8 @@
 //! Verified Vertex project aliases bind the response namespace, never the create destination.
 
-use super::tests::{answer, claim, execute_test, expiry, ready, response, server, wire, Host};
+use super::tests::{
+    answer, claim, execute_test, expiry, http, ready, response, server, wire, Host,
+};
 use super::*;
 
 #[test]
