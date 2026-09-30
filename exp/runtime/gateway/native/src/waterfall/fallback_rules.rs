@@ -173,6 +173,7 @@ mod tests {
             reasoning_output_exposed: false,
             stop_sequences: Vec::new(),
             serialize_tool_calls: false,
+            cache_writes_within_reads: false,
             image_output: false,
             idempotency_key: "op".to_string(),
             time_to_first_byte_base_seconds: None,

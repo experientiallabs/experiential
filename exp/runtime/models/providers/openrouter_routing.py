@@ -29,6 +29,9 @@ OPENROUTER_METADATA_HEADER: Final = "X-OpenRouter-Metadata"
 OPENROUTER_METADATA_ENABLED: Final = "enabled"
 """Opt-in response metadata: the selected endpoint's provider rides the body."""
 
+GOOGLE_MODEL_PREFIX: Final = "google/"
+"""OpenRouter's namespace for Google's Gemini models."""
+
 ZDR_PROVIDER_PREFERENCES: Final[JsonObject] = {"zdr": True, "data_collection": "deny"}
 """The strict values the constraint forces onto ``payload["provider"]``."""
 
@@ -104,3 +107,21 @@ def openrouter_metadata_headers(headers: dict[str, str]) -> dict[str, str]:
         A new mapping with ``X-OpenRouter-Metadata: enabled`` added.
     """
     return {**headers, OPENROUTER_METADATA_HEADER: OPENROUTER_METADATA_ENABLED}
+
+
+def openrouter_cache_writes_within_reads(model_id: str) -> bool:
+    """Whether OpenRouter reports this model's cache writes inside its cache reads.
+
+    OpenRouter serves ``cache_control`` on Gemini models with Google explicit
+    caching: the call that creates the cache also reads the written prefix
+    back, so its usage reports the same tokens under both ``cached_tokens``
+    and ``cache_write_tokens`` (and bills both legs). Every other model family
+    OpenRouter caches reports disjoint read and write slices of input.
+
+    Args:
+        model_id: The OpenRouter model id the rung dispatches.
+
+    Returns:
+        True for Google models, whose cache writes are a subset of cache reads.
+    """
+    return model_id.startswith(GOOGLE_MODEL_PREFIX)

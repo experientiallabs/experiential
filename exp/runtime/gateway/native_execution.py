@@ -53,6 +53,10 @@ from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.openrouter_routing import (
+    OPENROUTER_PROVIDER_ID,
+    openrouter_cache_writes_within_reads,
+)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
 if TYPE_CHECKING:
@@ -920,6 +924,14 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # OpenRouter's Gemini rungs report cache writes as a subset of cache
+        # reads (the creating call reads the written prefix back); the data
+        # plane separates the two legs before settlement.
+        "cache_writes_within_reads": (
+            deployment.provider == OPENROUTER_PROVIDER_ID
+            and profile.dialect == "openai_compatible"
+            and openrouter_cache_writes_within_reads(profile.model_id)
+        ),
         # Codex native tools translated to function tools on a foreign wire;
         # the data plane inverts the tool-call responses back to the native
         # (namespaced / custom) shape the caller declared. Empty on native

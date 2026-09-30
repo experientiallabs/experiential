@@ -290,6 +290,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        cache_writes_within_reads: false,
         image_output: false,
         idempotency_key: format!("op-{deployment_id}"),
         time_to_first_byte_base_seconds: None,

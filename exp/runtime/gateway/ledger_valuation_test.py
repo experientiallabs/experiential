@@ -443,3 +443,35 @@ def test_cache_write_nano_usd_rounding_and_overflow_are_bounded() -> None:
             output_rate=None,
             reasoning_rate=None,
         )
+
+
+def test_openrouter_gemini_cache_write_call_prices_at_openrouter_bill() -> None:
+    """Separated OpenRouter Gemini write-call legs reproduce OpenRouter's own charge.
+
+    OpenRouter reported 11,933 prompt tokens with 10,663 both read from and
+    written to a new Gemini cache and billed 1,531,065.83 nano-USD of prompt
+    (``upstream_inference_prompt_cost`` 0.0015310658333) plus 14,850 of
+    output. The data plane settles that as 1,270 fresh plus 10,663 written
+    tokens with no separate read leg, so a written token's rate is OpenRouter's
+    cache-write rate plus its cache-read rate. No TTL split is reported, so the
+    five-minute and one-hour write rates must be equal to price the leg.
+    """
+    written_and_read = 83_333_333 + 27_500_000
+    usage = GatewayUsage(
+        input_tokens=11_933,
+        cached_input_tokens=0,
+        cache_creation_input_tokens=10_663,
+        output_tokens=9,
+    )
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=275_000_000,
+            cached_input_rate=27_500_000,
+            cache_creation_input_rate=written_and_read,
+            cache_creation_1h_input_rate=written_and_read,
+            output_rate=1_650_000_000,
+            reasoning_rate=1_650_000_000,
+        )
+        == 1_545_916
+    )

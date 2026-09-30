@@ -206,6 +206,14 @@ impl Normalizer {
         self.request_words = words.into_iter().map(Into::into).collect();
     }
 
+    /// Select the rung's Chat Completions cache-write accounting: when set,
+    /// reported cache writes are a subset of reported cache reads (see
+    /// `OpenAiUsageAccumulator`).
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.openai_usage
+            .set_writes_within_reads(writes_within_reads);
+    }
+
     /// Classify a provider failure and retain bounded detail; exact relay verdicts
     /// require the raw envelope sentence, never a metadata-derived replacement.
     fn provider_stream_failure(
@@ -652,7 +660,16 @@ impl Normalizer {
         if self.terminal {
             return Ok(Vec::new());
         }
-        let previous_usage = self.usage.clone();
+        // A writes-within-reads Chat rung's accumulator already coalesces every
+        // report and lowers the read leg once a write arrives, so its latest
+        // normalized meter replaces the earlier one instead of merging by maximum.
+        let previous_usage = if self.dialect == Dialect::OpenAiCompatible
+            && self.openai_usage.writes_within_reads()
+        {
+            None
+        } else {
+            self.usage.clone()
+        };
         let result = match self.dialect {
             Dialect::OpenAiResponses => self.feed_openai_responses(frame),
             Dialect::AnthropicMessages => self.feed_anthropic(frame),

@@ -427,6 +427,12 @@ impl UpstreamRelay {
         self.normalizer.set_request_words(words);
     }
 
+    /// Carry the rung's cache-write accounting into usage normalization.
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.normalizer
+            .set_cache_writes_within_reads(writes_within_reads);
+    }
+
     /// Carry the Codex native-tool inversion map (see
     /// `codex_native_inversion`); applied to every tool-call event this relay
     /// yields. Empty leaves every event untouched.

@@ -908,6 +908,23 @@ def test_throttle_disposition_names_each_branch_and_only_those() -> None:
     )
 
 
+def test_wire_entry_marks_openrouter_gemini_cache_writes_within_reads() -> None:
+    """Only an OpenRouter Chat rung dispatching a Google model reports writes inside reads."""
+    route = _route()
+    deployment = route.deployment.model_copy(update={"provider": "openrouter"})
+
+    def flag(dialect: str, model_id: str, rung: ExactModelDeployment = deployment) -> object:
+        """Return the wire entry's cache accounting flag for one rung shape."""
+        profile = GatewayWireProfile(
+            dialect=dialect, url="https://provider.test", model_id=model_id
+        )
+        return deployment_wire_entry(route, rung, profile, {})["cache_writes_within_reads"]
+
+    assert flag("openai_compatible", "google/gemini-3.1-flash-lite") is True
+    assert flag("openai_compatible", "anthropic/claude-opus-5") is False
+    assert flag("openai_compatible", "google/gemini-3.1-flash-lite", route.deployment) is False
+
+
 def test_wire_entry_carries_the_tool_call_serialization_flag() -> None:
     """A rung emulating parallel_tool_calls=false tells the data plane to serialize."""
     route = _route()

@@ -8,6 +8,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_METADATA_HEADER,
     constrain_openrouter_zero_data_retention,
+    openrouter_cache_writes_within_reads,
     openrouter_metadata_headers,
 )
 
@@ -70,3 +71,10 @@ def test_metadata_headers_add_the_opt_in_and_keep_the_rest() -> None:
         "X-Title": "t",
         OPENROUTER_METADATA_HEADER: "enabled",
     }
+
+
+def test_only_google_models_report_cache_writes_within_reads() -> None:
+    """Gemini explicit caching reads the written prefix back; other families write disjointly."""
+    assert openrouter_cache_writes_within_reads("google/gemini-3.1-flash-lite")
+    assert not openrouter_cache_writes_within_reads("anthropic/claude-opus-5")
+    assert not openrouter_cache_writes_within_reads("openai/gpt-5.6")
