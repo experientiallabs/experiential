@@ -37,25 +37,74 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the running build; main
+# pushes, releases, and replays each keep their own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
+  native-targets:
+    # The four cross-platform wheels only change when the crate does, and
+    # macOS bills 10x and Windows 2x the Linux rate. Pull requests and main
+    # pushes that leave the crate alone build only the linux-x86_64 wheel that
+    # `build` smokes. Releases and replays always build every target.
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - name: Detect native crate changes
+        id: native
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # Any lookup failure builds every target (fail closed).
+          if [ "${GITHUB_EVENT_NAME}" = pull_request ]; then
+            files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+              --paginate -q '.[].filename')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          else
+            # Compare lists at most 300 files; a list that long builds everything.
+            files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
+              -q '.files[].filename')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+            if [ "$(printf '%s\n' "${files}" | grep -c .)" -ge 300 ]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          if printf '%s\n' "${files}" \
+            | grep -qE '^(exp/runtime/gateway/native/|\.github/workflows/python-package\.yml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Select wheel targets
+        id: targets
+        env:
+          NATIVE_CHANGED: ${{ steps.native.outputs.changed || 'true' }}
+        run: |
+          # macos-x86_64 is cross-compiled from the arm runner; macos-13 (the
+          # last intel runner) is being retired and queues for hours.
+          all='[
+            {"runner": "ubuntu-latest", "target": "linux-x86_64"},
+            {"runner": "ubuntu-24.04-arm", "target": "linux-aarch64"},
+            {"runner": "macos-14", "target": "macos-x86_64", "cargo-target": "x86_64-apple-darwin"},
+            {"runner": "macos-14", "target": "macos-arm64"},
+            {"runner": "windows-latest", "target": "windows-x86_64"}
+          ]'
+          if [ "${NATIVE_CHANGED}" = true ]; then
+            targets="${all}"
+          else
+            targets="$(printf '%s' "${all}" | jq -c 'map(select(.target == "linux-x86_64"))')"
+          fi
+          echo "matrix=$(printf '%s' "${targets}" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+
   native-wheels:
+    needs: native-targets
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            target: linux-x86_64
-          - runner: ubuntu-24.04-arm
-            target: linux-aarch64
-          # Cross-compiled from the arm runner; macos-13 (the last intel
-          # runner) is being retired and queues for hours.
-          - runner: macos-14
-            target: macos-x86_64
-            cargo-target: x86_64-apple-darwin
-          - runner: macos-14
-            target: macos-arm64
-          - runner: windows-latest
-            target: windows-x86_64
+      matrix: ${{ fromJSON(needs.native-targets.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Resolve the latest published release

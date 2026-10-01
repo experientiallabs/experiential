@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the running gate; main
+# pushes and manual runs each keep their own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   gate:
     runs-on: ubuntu-latest
@@ -155,6 +161,66 @@ jobs:
           uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
             exp/tests/release_test.py -k "not installed_wheel"
 
+  darwin-scope:
+    # The macOS evidence job is the most expensive check here (macOS bills 10x)
+    # while few pull requests touch what it covers. The Linux gate still runs
+    # the Capture suites on every PR, and main pushes always run the macOS job.
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - name: Does this pull request touch the Darwin evidence scope
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" != pull_request ]; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate \
+            -q '.[] | {filename, patch}' > files.jsonl || {
+            echo "could not list the pull request's files; running the macOS job" >&2
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          SCOPE = re.compile(
+              r"^(exp/runtime/capture/|exp/cli/capture/|exp/runtime/environments/"
+              r"|exp/runtime/router/|exp/optimize/router/|exp/simulation/"
+              r"|\.github/workflows/gate\.yml$)"
+          )
+          MANIFESTS = {"pyproject.toml", "uv.lock"}
+          # Every release bumps both manifests; only a dependency change matters here.
+          VERSION_ONLY = re.compile(r'^[+-](version = "[^"]*"|\s*"exp-gateway-native>=[^"]*",.*)$')
+
+          def needs_macos(changed: dict) -> bool:
+              name = changed["filename"]
+              if SCOPE.match(name):
+                  return True
+              if name not in MANIFESTS:
+                  return False
+              patch = changed.get("patch")
+              if not patch:  # GitHub omits very large patches
+                  return True
+              lines = [
+                  line
+                  for line in patch.splitlines()
+                  if line[:1] in "+-" and not line.startswith(("+++", "---"))
+              ]
+              return not all(VERSION_ONLY.match(line) for line in lines)
+
+          with open("files.jsonl") as handle:
+              required = any(needs_macos(json.loads(line)) for line in handle if line.strip())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"required={str(required).lower()}\n")
+          PY
+
   windows-snapshot-authority:
     name: Windows snapshot authority
     runs-on: windows-latest
@@ -214,6 +280,8 @@ jobs:
           path: windows-snapshot-authority.xml
 
   w16-darwin-evidence:
+    needs: darwin-scope
+    if: needs.darwin-scope.outputs.required == 'true'
     runs-on: macos-latest
     env:
       UV_PYTHON: "3.13"
