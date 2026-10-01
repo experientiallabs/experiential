@@ -1,5 +1,6 @@
 """Project-scoped provider receipts and accounting in the shared content database."""
 
+import json
 import math
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     SecretBoundaryError,
+    assert_prose_secret_free,
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
@@ -49,25 +51,47 @@ def _validate_response(payload: str) -> None:
     """
     try:
         try:
-            value = _JSON_VALUE.validate_json(payload)
-        except ValidationError:
+            value = _response_json(payload)
+        except (json.JSONDecodeError, ValidationError):
             assert_text_secret_free(payload)
         else:
-            _validate_response_keys(value)
+            _validate_response_values(value)
             assert_secret_free(value)
     except SecretBoundaryError as exc:
         raise ArtifactStoreError("provider response violates the secret boundary") from exc
 
 
-def _validate_response_keys(value: JsonValue) -> None:
-    """Reject credential references and environment-variable names in nested JSON keys."""
+def _response_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    """Reject duplicate keys before parsing can discard any retained response content."""
+    value: dict[str, JsonValue] = {}
+    for key, nested in pairs:
+        if key in value:
+            raise SecretBoundaryError("provider responses cannot contain duplicate JSON keys")
+        value[key] = nested
+    return value
+
+
+def _response_json(payload: str) -> JsonValue:
+    """Decode a response without silently discarding duplicate object members."""
+    return _JSON_VALUE.validate_python(json.loads(payload, object_pairs_hook=_response_object))
+
+
+def _validate_response_values(value: JsonValue) -> None:
+    """Check credential fields and assignments, including JSON encoded inside string leaves."""
     if isinstance(value, dict):
         for key, nested in value.items():
             assert_text_secret_free(key)
-            _validate_response_keys(nested)
+            _validate_response_values(nested)
     elif isinstance(value, list):
         for nested in value:
-            _validate_response_keys(nested)
+            _validate_response_values(nested)
+    elif isinstance(value, str):
+        assert_prose_secret_free(value)
+        try:
+            nested = _response_json(value)
+        except (json.JSONDecodeError, ValidationError):
+            return
+        _validate_response_values(nested)
 
 
 class RequestReceipt(ContractModel):

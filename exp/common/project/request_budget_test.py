@@ -1,5 +1,6 @@
 """Request accounting, response integrity and atomic settlement across project restarts."""
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
         '{"output": "The company sells password management and authorization software."}',
         '{"output": {"text": "The company sells password management software."}}',
         '{"output": "Set OPENAI_API_KEY in the environment. Do not share the secret."}',
+        '{"output": "The product includes password management: resets and vaults."}',
+        json.dumps({"output": json.dumps({"text": "password management software"})}),
     ],
 )
 def test_response_prose_replays_without_treating_credential_words_as_values(
@@ -50,6 +53,16 @@ def test_response_prose_replays_without_treating_credential_words_as_values(
         "OPENAI_API_KEY=a-value-without-a-known-prefix",
         "password=a-value-without-a-known-prefix",
         '{"api_key": "malformed-json"',
+        '{"output": {"content": "OPENAI_API_KEY=arbitrary-value"}}',
+        '{"output": ["password = arbitrary-value"]}',
+        '{"output": "api key: arbitrary-value"}',
+        json.dumps({"output": '"CUSTOM_AUTH_TOKEN": "arbitrary-value"'}),
+        json.dumps(json.dumps({"api_key": "arbitrary-value"})),
+        json.dumps({"output": '{"\\u0061pi_key":"arbitrary-value"}'}),
+        '{"output":{"api_key":"arbitrary-value"},"output":"safe"}',
+        '{"output":"sk-' + "sensitive" * 4 + '","output":"safe"}',
+        '{"output":[{"text":"first","text":"last"}]}',
+        '{"output":"first","\\u006futput":"last"}',
     ],
 )
 def test_secret_response_rejected_without_settling_or_persisting(

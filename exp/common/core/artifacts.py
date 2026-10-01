@@ -68,6 +68,7 @@ _SECRET_REFERENCE_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_SECRET_ASSIGNMENT_SUFFIX_PATTERN = re.compile(r"[\s\"'`]*[:=]")
 SECRET_REDACTION_PLACEHOLDER = "[REDACTED]"
 _SECRET_REDACTION_PATTERNS = (
     *(pattern for _, pattern in _SECRET_VALUE_RULES),
@@ -364,6 +365,28 @@ def assert_text_secret_free(value: str) -> None:
     """
     if _SECRET_REFERENCE_PATTERN.search(value) or _SECRET_ENVIRONMENT_NAME_PATTERN.search(value):
         raise SecretBoundaryError("immutable artifacts cannot contain credential references")
+    if _has_secret_value(value):
+        raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
+
+
+def assert_prose_secret_free(value: str) -> None:
+    """Allow credential terminology in prose while rejecting assignments and secret values.
+
+    Credential terms immediately followed by a colon or equals sign remain prohibited,
+    including ambiguous prose, because the assigned value may lack a recognizable token prefix.
+
+    Args:
+        value: Decoded prose about to enter an immutable artifact.
+
+    Raises:
+        SecretBoundaryError: The prose assigns a credential or includes a secret-like value.
+    """
+    for pattern in (_SECRET_REFERENCE_PATTERN, _SECRET_ENVIRONMENT_NAME_PATTERN):
+        for match in pattern.finditer(value):
+            if _SECRET_ASSIGNMENT_SUFFIX_PATTERN.match(value, match.end()):
+                raise SecretBoundaryError(
+                    "immutable artifacts cannot contain credential assignments"
+                )
     if _has_secret_value(value):
         raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
 

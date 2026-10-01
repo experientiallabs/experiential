@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
     SecretBoundaryError,
     SourceIdentity,
     StructuredFailure,
+    assert_prose_secret_free,
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
@@ -172,6 +173,35 @@ def test_structured_evidence_preserves_public_credential_variable_names(content:
     assert_secret_free({"messages": [{"role": "tool", "content": content}]})
     with pytest.raises(SecretBoundaryError, match="secret-like"):
         assert_secret_free({"content": content + " = sk-abcdefghijklmnopqrstuvwxyz123456"})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The company sells password management and authorization software.",
+        "Set OPENAI_API_KEY in the environment. Do not share the secret.",
+        "Password management: resets and vaults.",
+    ],
+)
+def test_prose_allows_credential_mentions(content: str) -> None:
+    """Credential vocabulary is ordinary prose when it does not assign a value."""
+    assert_prose_secret_free(content)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "export OPENAI_API_KEY=arbitrary-value",
+        '"CUSTOM_AUTH_TOKEN": "arbitrary-value"',
+        "password = arbitrary-value",
+        "api key: arbitrary-value",
+        "Use sk-abcdefghijklmnopqrstuvwxyz123456 to connect.",
+    ],
+)
+def test_prose_rejects_credential_assignments_and_values(content: str) -> None:
+    """Unrecognized credential values and known token prefixes remain prohibited."""
+    with pytest.raises(SecretBoundaryError):
+        assert_prose_secret_free(content)
 
 
 def test_artifact_file_paths_reject_nonportable_components() -> None:
