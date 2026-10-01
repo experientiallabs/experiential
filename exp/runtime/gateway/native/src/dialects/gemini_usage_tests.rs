@@ -513,6 +513,9 @@ fn reads_of_this_attempts_own_cache_settle_as_writes_read_back() {
     assert_eq!(usage.input_tokens, Some(11_933));
     assert_eq!(usage.cache_creation_input_tokens, Some(10_663));
     assert_eq!(usage.cached_input_tokens, Some(0));
+    // The fixed five-minute horizon is an observed zero one-hour split, so
+    // settlement never leaves these writes unpriced for an unknown TTL.
+    assert_eq!(usage.cache_creation_1h_input_tokens, Some(0));
     // A later cumulative report keeps the split instead of restoring the read leg.
     normalizer
         .observe_gemini_usage(&json!({"promptTokenCount":11_933,"candidatesTokenCount":12,"cachedContentTokenCount":10_663}))
@@ -546,8 +549,12 @@ fn reads_of_this_attempts_own_cache_settle_as_writes_read_back() {
         .unwrap();
     let usage = reuse.observed_usage().unwrap();
     assert_eq!(
-        (usage.cached_input_tokens, usage.cache_creation_input_tokens),
-        (Some(10_663), None)
+        (
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_creation_1h_input_tokens
+        ),
+        (Some(10_663), None, None)
     );
 
     // Other dialects ignore the Gemini-only carrier.

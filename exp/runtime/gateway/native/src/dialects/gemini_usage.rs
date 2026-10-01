@@ -102,14 +102,17 @@ impl Normalizer {
         }
         // Reads of the cache this attempt created are writes read back in-call:
         // they leave the read leg (settlement keeps reads and writes disjoint).
+        // The gateway's automatic cache has a fixed five-minute horizon, so the
+        // observed one-hour split is zero: settlement prices the writes at the
+        // five-minute write rate instead of leaving an unknown TTL unpriced.
         let writes = self.gemini_cache_writes.map(|written| written.min(cache));
         self.usage = Some(Usage {
             input_tokens: Some(fields.input),
             output_tokens: Some(output),
             cached_input_tokens: Some(cache - writes.unwrap_or(0)),
             cache_creation_input_tokens: writes,
+            cache_creation_1h_input_tokens: writes.map(|_| 0),
             reasoning_tokens: fields.thoughts,
-            ..Usage::default()
         });
         Ok(())
     }
