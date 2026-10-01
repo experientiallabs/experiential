@@ -44,6 +44,12 @@ pub struct DeploymentWire {
     /// cache failure then falls back to the plain generation instead of failing it.
     #[serde(default)]
     pub automatic_cache: bool,
+    /// Prompt tokens this attempt's own automatic create wrote into the cache
+    /// its generation reads. Usage then reports them as cache writes read back
+    /// in the same call (OpenRouter's shape), priced at the lane's write rate.
+    /// Set only on the overlaid wire, never by the host.
+    #[serde(skip)]
+    pub automatic_cache_written_tokens: Option<u64>,
     pub timeout_seconds: f64,
     /// Structured payload the data plane serializes itself; null for
     /// body-signing dialects, whose route entry carries `upstream_body`.

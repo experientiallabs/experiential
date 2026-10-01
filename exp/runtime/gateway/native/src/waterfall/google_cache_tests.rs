@@ -172,10 +172,13 @@ async fn default_off_and_ineligible_paths_make_no_callback_or_http() {
         .is_none());
     let minimal: DeploymentWire = serde_json::from_value(json!({
         "provider":"google", "deployment_id":"deployment", "dialect":"gemini_generate_content",
-        "url":"invalid", "headers":{}, "timeout_seconds":1.0, "idempotency_key":"op"
+        "url":"invalid", "headers":{}, "timeout_seconds":1.0, "idempotency_key":"op",
+        "automatic_cache_written_tokens": 999
     }))
     .unwrap();
     assert!(!minimal.explicit_cache);
+    // Only this attempt's own create sets the write count; the host cannot.
+    assert_eq!(minimal.automatic_cache_written_tokens, None);
     original.explicit_cache = true;
     original.upstream_body = Some("signed".into());
     assert!(execute_test(&original, &host, EndpointPolicy::Official)
@@ -249,6 +252,20 @@ async fn reused_payload_is_a_private_overlay_and_repair_sees_it() {
         crate::replay_repair::AttemptRepair::begin(&overlaid, None, &mut repaired, "request");
     assert_eq!(repair.payload()["cachedContent"], "cachedContents/reused");
     assert_eq!(host.calls().len(), 1);
+
+    // Reusing an automatic cache another request created is an ordinary read.
+    let host = Host::new(vec![ready("cachedContents/reused")]);
+    let mut automatic = original.clone();
+    automatic.automatic_cache = true;
+    let reused = execute_test(&automatic, &host, EndpointPolicy::Official)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reused.upstream_payload["cachedContent"],
+        "cachedContents/reused"
+    );
+    assert_eq!(reused.automatic_cache_written_tokens, None);
 }
 
 #[tokio::test]
@@ -271,6 +288,8 @@ async fn creation_records_only_allowlisted_evidence_before_cached_generation() {
         .await
         .unwrap()
         .unwrap();
+    // A client-marked (explicit) cache never reports gateway-created writes.
+    assert_eq!(overlaid.automatic_cache_written_tokens, None);
     assert_eq!(
         host.calls()[1],
         (

@@ -23,6 +23,9 @@ pub(in crate::dialects) struct StreamState {
     pub(super) finish: Option<Event>,
     pub(super) finished_at: Option<Instant>,
     fields: MeterFields,
+    // Largest publishable reported cache count; kept apart from the published
+    // meter, whose read leg may be lowered by this attempt's own cache writes.
+    cache: u64,
     pending_cache: BTreeSet<u64>,
 }
 
@@ -77,11 +80,7 @@ impl Normalizer {
         self.gemini
             .reserve_pending_cache(reported_cache, fields.input)?;
         self.gemini.fields = fields;
-        let mut cache = self
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.cached_input_tokens)
-            .unwrap_or(0);
+        let mut cache = self.gemini.cache;
         // Promote actual observed subsets, never a clamped pending maximum.
         // Removing reconciled entries bounds state to distinct unresolved counts.
         while let Some(value) = self.gemini.pending_cache.first().copied() {
@@ -96,16 +95,24 @@ impl Normalizer {
         } else {
             self.gemini.pending_cache.insert(reported_cache);
         }
+        self.gemini.cache = cache;
         // An empty baseline is not evidence that pending output had zero input.
         if fields.input == 0 && !self.gemini.pending_cache.is_empty() {
             return Ok(());
         }
+        // Reads of the cache this attempt created are writes read back in-call:
+        // they leave the read leg (settlement keeps reads and writes disjoint).
+        // The gateway's automatic cache has a fixed five-minute horizon, so the
+        // observed one-hour split is zero: settlement prices the writes at the
+        // five-minute write rate instead of leaving an unknown TTL unpriced.
+        let writes = self.gemini_cache_writes.map(|written| written.min(cache));
         self.usage = Some(Usage {
             input_tokens: Some(fields.input),
             output_tokens: Some(output),
-            cached_input_tokens: Some(cache),
+            cached_input_tokens: Some(cache - writes.unwrap_or(0)),
+            cache_creation_input_tokens: writes,
+            cache_creation_1h_input_tokens: writes.map(|_| 0),
             reasoning_tokens: fields.thoughts,
-            ..Usage::default()
         });
         Ok(())
     }

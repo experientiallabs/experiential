@@ -500,3 +500,65 @@ fn malformed_or_partial_trailer_keeps_the_declared_finish_and_best_meter() {
         Some((7, 2, 3)),
     );
 }
+
+#[test]
+fn reads_of_this_attempts_own_cache_settle_as_writes_read_back() {
+    // The attempt created a 10,663-token cache and its generation read it back.
+    let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+    normalizer.set_gemini_cache_writes(Some(10_663));
+    normalizer
+        .observe_gemini_usage(&json!({"promptTokenCount":11_933,"candidatesTokenCount":9,"cachedContentTokenCount":10_663}))
+        .unwrap();
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(usage.input_tokens, Some(11_933));
+    assert_eq!(usage.cache_creation_input_tokens, Some(10_663));
+    assert_eq!(usage.cached_input_tokens, Some(0));
+    // The fixed five-minute horizon is an observed zero one-hour split, so
+    // settlement never leaves these writes unpriced for an unknown TTL.
+    assert_eq!(usage.cache_creation_1h_input_tokens, Some(0));
+    // A later cumulative report keeps the split instead of restoring the read leg.
+    normalizer
+        .observe_gemini_usage(&json!({"promptTokenCount":11_933,"candidatesTokenCount":12,"cachedContentTokenCount":10_663}))
+        .unwrap();
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.output_tokens
+        ),
+        (Some(0), Some(10_663), Some(12))
+    );
+
+    // Never more writes than the provider reported reading.
+    let mut short = Normalizer::new(Dialect::GeminiGenerateContent);
+    short.set_gemini_cache_writes(Some(10_663));
+    short
+        .observe_gemini_usage(&json!({"promptTokenCount":11_933,"cachedContentTokenCount":4_000}))
+        .unwrap();
+    let usage = short.observed_usage().unwrap();
+    assert_eq!(
+        (usage.cached_input_tokens, usage.cache_creation_input_tokens),
+        (Some(0), Some(4_000))
+    );
+
+    // A reused cache (not created by this attempt) stays an ordinary read.
+    let mut reuse = Normalizer::new(Dialect::GeminiGenerateContent);
+    reuse
+        .observe_gemini_usage(&json!({"promptTokenCount":11_933,"cachedContentTokenCount":10_663}))
+        .unwrap();
+    let usage = reuse.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_creation_1h_input_tokens
+        ),
+        (Some(10_663), None, None)
+    );
+
+    // Other dialects ignore the Gemini-only carrier.
+    let mut chat = Normalizer::new(Dialect::OpenAiCompatible);
+    chat.set_gemini_cache_writes(Some(5));
+    assert_eq!(chat.gemini_cache_writes, None);
+}

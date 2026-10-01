@@ -166,6 +166,7 @@ mod tests {
             billing_customer_managed: tokens.is_some(),
             explicit_cache: false,
             automatic_cache: false,
+            automatic_cache_written_tokens: None,
             timeout_seconds: 60.0,
             upstream_payload: Value::Null,
             upstream_body: None,

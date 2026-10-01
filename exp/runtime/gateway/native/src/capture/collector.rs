@@ -859,6 +859,9 @@ impl Collector {
     }
 
     /// Reserve actual retained byte capacity across all concurrent response taps.
+    // `fetch_update` is renamed `try_update` in newer toolchains; keep the stable
+    // name so every supported toolchain builds with warnings denied.
+    #[allow(deprecated)]
     pub(crate) fn reserve_body(&self, bytes: usize) -> bool {
         self.body_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {

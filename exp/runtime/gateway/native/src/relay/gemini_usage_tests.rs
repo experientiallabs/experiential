@@ -203,3 +203,49 @@ async fn gemini_post_finish_transport_break_keeps_completed_and_known_usage() {
     .await;
     assert!(matches!(&events[1], Event::Usage(u) if u.cached_input_tokens == Some(3)));
 }
+
+#[tokio::test]
+async fn gemini_own_cache_writes_reach_settlement_without_restoring_the_read_leg() {
+    // Cumulative reports of this attempt's own 3-token cache: the settlement
+    // observation max-merges each report, so the read leg must stay lowered
+    // and the write leg must never exceed the reported reads or input.
+    let source = stream::iter([
+        frame(json!({"usageMetadata":{"promptTokenCount":7,"cachedContentTokenCount":2}})),
+        finish(true),
+        trailer(),
+    ]);
+    let now = Instant::now();
+    let observation = crate::settlement::Observation::default();
+    let mut relay = UpstreamRelay::from_stream(
+        source.boxed(),
+        Dialect::GeminiGenerateContent,
+        now + Duration::from_secs(5),
+    );
+    relay.set_observation(observation.clone());
+    relay.set_gemini_cache_writes(Some(3));
+    let events = drain(
+        &mut relay,
+        now + Duration::from_secs(5),
+        Duration::from_secs(2),
+    )
+    .await;
+    let legs = |usage: &Usage| {
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_creation_1h_input_tokens,
+        )
+    };
+    let reported: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Usage(usage) => Some(legs(usage)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported, vec![(Some(7), Some(0), Some(3), Some(0))]);
+    let settled = observation.snapshot().usage.unwrap();
+    assert_eq!(legs(&settled), (Some(7), Some(0), Some(3), Some(0)));
+    assert_eq!(settled.output_tokens, Some(2));
+}
