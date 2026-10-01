@@ -137,30 +137,22 @@ jobs:
         run: >-
           uv run pytest -q -k "not live"
           exp/optimize/model/sft/tinker_test.py
-      - name: non-live tests
-        # The three slowest areas (~83% of test time) run in gate-shards, in
-        # parallel with this job; keep these --ignore dirs equal to its matrix paths.
-        run: >-
-          uv run pytest -n 4 --dist worksteal -q -k "not live"
-          exp
-          --ignore=exp/optimize/router
-          --ignore=exp/runtime/gateway
-          --ignore=exp/optimize/evaluation
-          --ignore=exp/optimize/model/sft/tinker_test.py
-          --ignore=exp/simulation/tests/comparison_evidence_test.py
-          --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
 
   gate-shards:
-    # Standard runners are free on this public repository, so splitting the
-    # slowest test areas off the gate job halves its wall clock at no cost.
+    # Standard runners are free on this public repository, so running the
+    # non-live suite as parallel shards beside the lint/cargo gate job cuts
+    # the critical path at no cost.
     name: gate tests (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # Balanced on measured test time; each shard is ~2-3 minutes of tests on
-        # four workers. A path a shard ignores must be another shard's path.
+        # four workers. A path a shard ignores must be another shard's path, or
+        # run by a dedicated step (Tinker in gate, the evidence suites on macOS).
         include:
+          - name: rest
+            paths: exp --ignore=exp/optimize/router --ignore=exp/runtime/gateway --ignore=exp/optimize/evaluation --ignore=exp/optimize/model/sft/tinker_test.py --ignore=exp/simulation/tests/comparison_evidence_test.py --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
           - name: router-hosted
             paths: exp/optimize/router/hosted_test.py exp/optimize/router/automatic
           - name: router

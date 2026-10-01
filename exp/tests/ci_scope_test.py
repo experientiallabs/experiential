@@ -90,18 +90,21 @@ def test_unchanged_crate_builds_only_the_wheel_that_build_smokes(
     assert "linux-x86_64" in targets
 
 
-def test_gate_shards_cover_exactly_the_directories_the_gate_job_skips() -> None:
-    """A path dropped from one list but not the other would silently stop running."""
-    gate, shards = (WORKFLOWS / "gate.yml").read_text().split("\n  gate-shards:\n", 1)
-    run = gate.split("      - name: non-live tests\n", 1)[1]
-    skipped = {
-        arg.removeprefix("--ignore=")
-        for arg in run.split()
-        if arg.startswith("--ignore=") and (ROOT / arg.removeprefix("--ignore=")).is_dir()
-    }
+# Run by their own steps: Tinker in the gate job, the evidence suites on macOS.
+DEDICATED_TEST_FILES = {
+    "exp/optimize/model/sft/tinker_test.py",
+    "exp/optimize/router/tests/composition_evidence_test.py",
+    "exp/simulation/tests/comparison_evidence_test.py",
+}
+
+
+def test_gate_shards_together_run_the_whole_non_live_suite() -> None:
+    """A path one shard ignores must run in another, or the suite silently shrinks."""
+    text = (WORKFLOWS / "gate.yml").read_text()
+    shards = text.split("\n  gate-shards:\n", 1)[1].split("\n  sdk-python312:\n", 1)[0]
     shard_args = [
         line.split("paths: ", 1)[1].split()
-        for line in shards.split("\n  sdk-python312:\n", 1)[0].splitlines()
+        for line in shards.splitlines()
         if line.strip().startswith("paths: ")
     ]
     selected = [{arg for arg in args if not arg.startswith("-")} for args in shard_args]
@@ -109,11 +112,11 @@ def test_gate_shards_cover_exactly_the_directories_the_gate_job_skips() -> None:
         {arg.removeprefix("--ignore=") for arg in args if arg.startswith("--ignore=")}
         for args in shard_args
     ]
-    assert {path for paths in selected for path in paths if path in skipped} == skipped
+    assert sum("exp" in paths for paths in selected) == 1, "one shard owns the whole tree"
     for index, paths in enumerate(ignored):
         others = set().union(*(other for i, other in enumerate(selected) if i != index))
-        assert paths <= others, paths - others
+        assert paths - DEDICATED_TEST_FILES <= others, paths - DEDICATED_TEST_FILES - others
     for paths in selected:
-        for path in paths:
-            assert (ROOT / path).exists(), path
-            assert any(path == root or path.startswith(f"{root}/") for root in skipped), path
+        assert all((ROOT / path).exists() for path in paths), paths
+    assert "tinker_test.py" in text.split("\n  gate-shards:\n", 1)[0]
+    assert "\n      - name: non-live tests\n" not in text.split("\n  gate-shards:\n", 1)[0]
