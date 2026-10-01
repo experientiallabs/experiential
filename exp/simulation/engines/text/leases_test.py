@@ -31,6 +31,130 @@ _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
 
 
+def test_cancelled_local_waiter_leaves_before_metadata_unlock(tmp_path: Path) -> None:
+    """Cancellation abandons local queuing without needing the current writer to finish."""
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
+    cancelled = threading.Event()
+    waiting = threading.Event()
+    probes = [0]
+
+    def cancellation_requested() -> bool:
+        """Mark that the waiting caller has reached its cooperative cancellation boundary."""
+        probes[0] += 1
+        if probes[0] == 1:
+            return False
+        waiting.set()
+        return cancelled.is_set()
+
+    def acquire() -> TextCellLeaseClaim:
+        """Attempt an independent cell while the local metadata turn is occupied."""
+        return store.acquire(
+            lease_id="lease-a",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id="rollout-a",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=None,
+            rollout_completed=lambda _: False,
+            observed_spend_usd=lambda: None,
+            cancelled=cancellation_requested,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with store._admission_lock:
+            follower = pool.submit(acquire)
+            assert waiting.wait(timeout=5)
+            cancelled.set()
+            assert follower.result(timeout=5).state == TextCellLeaseState.CONTENDED
+    assert store._records.read("lease-a") is None
+
+
+def test_local_queue_wait_does_not_exhaust_foreign_owner_deadline(tmp_path: Path) -> None:
+    """A follower can observe completion after spending longer than its deadline queued locally."""
+    owner = threading.get_ident()
+    elapsed = [0.0]
+    clock_calls = [0]
+    queued = threading.Event()
+    complete = [False]
+
+    def monotonic() -> float:
+        """Expose the follower's pre-queue timestamp before advancing the test clock."""
+        value = elapsed[0]
+        if threading.get_ident() != owner:
+            clock_calls[0] += 1
+            if clock_calls[0] == 2:
+                queued.set()
+        return value
+
+    def sleep(seconds: float) -> None:
+        """Complete the live owner's work on the first actual follower poll."""
+        elapsed[0] += seconds
+        complete[0] = True
+
+    store = TextCellLeaseStore(
+        tmp_path / "projects" / "project-a",
+        clock=lambda: _TIME,
+        monotonic=monotonic,
+        sleep=sleep,
+        wait_timeout_seconds=0.05,
+    )
+
+    def acquire() -> TextCellLeaseClaim:
+        """Follow the same stable claim using the normal durable admission path."""
+        return store.acquire(
+            lease_id="lease-a",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id="rollout-a",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=None,
+            rollout_completed=lambda _: complete[0],
+            observed_spend_usd=lambda: None,
+        )
+
+    original = acquire()
+    assert original.state == TextCellLeaseState.OWNED
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with store._admission_lock:
+            follower = pool.submit(acquire)
+            assert queued.wait(timeout=5)
+            elapsed[0] = 1.0
+        assert follower.result(timeout=5).state == TextCellLeaseState.COMPLETED
+    assert complete[0]
+    assert original.lease is not None
+    store.release(original.lease)
+
+
+def test_independent_claims_do_not_scan_sibling_rollouts(tmp_path: Path) -> None:
+    """Request-budgeted cells check their own evidence without quadratic sibling scans."""
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
+    checked: list[str] = []
+
+    def completed(rollout_id: str) -> bool:
+        """Record exact immutable artifacts consulted during admission."""
+        checked.append(rollout_id)
+        return False
+
+    claims = [
+        store.acquire(
+            lease_id=f"lease-{index}",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id=f"rollout-{index}",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=None,
+            rollout_completed=completed,
+            observed_spend_usd=lambda: None,
+        )
+        for index in range(16)
+    ]
+    assert all(claim.state == TextCellLeaseState.OWNED for claim in claims)
+    assert checked == [f"rollout-{index}" for index in range(16)]
+    for claim in claims:
+        assert claim.lease is not None
+        store.release(claim.lease)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Unix native-lock fallback")
 @pytest.mark.parametrize("operation", ["claim", "probe"])
 def test_unsupported_flock_rejects_soft_ownership_without_changing_claim(
@@ -565,9 +689,8 @@ def test_cancelled_paid_claim_wait_returns_retryable_contention_without_a_lease(
     assert store._records.list_ids() == ()
 
 
-@pytest.mark.parametrize("local", [False, True])
-def test_admission_lock_wait_obeys_the_same_finite_deadline(tmp_path: Path, local: bool) -> None:
-    """A hung local or cross-process lock cannot bypass the lease acquisition deadline."""
+def test_cross_process_admission_obeys_the_finite_deadline(tmp_path: Path) -> None:
+    """A foreign metadata lock cannot bypass the bounded lease acquisition deadline."""
     project = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
     lease_directory = project.project_directory / "simulation-leases"
     lease_directory.mkdir(parents=True)
@@ -579,11 +702,7 @@ def test_admission_lock_wait_obeys_the_same_finite_deadline(tmp_path: Path, loca
     )
 
     started = time.monotonic()
-    with (
-        store._admission_lock
-        if local
-        else file_write_lock(lease_directory / "admission", what="test admission holder")
-    ):
+    with file_write_lock(lease_directory / "admission", what="test admission holder"):
         blocked = store.acquire(
             lease_id="lease-a",
             resolution_id="resolution-a",

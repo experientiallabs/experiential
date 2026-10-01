@@ -514,7 +514,7 @@ class WorldModelSimulator:
             bindings: Exact per-cell bindings for the resolution.
 
         Returns:
-            Pending cells with stale-recovery cells first, otherwise in plan order.
+            Stale-recovery cells first, then remaining cells interleaved across models.
         """
         pins = self._pins(resolution_input)
         recovery: list[EvaluationCell] = []
@@ -527,7 +527,7 @@ class WorldModelSimulator:
                 recovery.append(cell)
             else:
                 rest.append(cell)
-        return (*recovery, *rest)
+        return (*recovery, *dispatch.interleave_models(rest))
 
     def _execute_and_persist_cell(
         self,
