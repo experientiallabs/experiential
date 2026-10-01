@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityField,
     CompatibilityManifest,
 )
 from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.openai_protocol.errors import unsupported_field
 
 
 def _field(
@@ -299,15 +301,6 @@ its internal shape is an evolving provider surface, so it is validated only
 as an object and round-trips verbatim like ``namespace``.
 """
 
-RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
-    "message": frozenset(),
-    "function_call": frozenset(),
-    "function_call_output": frozenset(),
-    "reasoning": frozenset(),
-}
-"""Echoable input-item fields consciously rejected with a named 400."""
-
-
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
     "messages": "validated_and_forwarded_to_cache_capable_adapters",
     "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
@@ -388,3 +381,20 @@ def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityD
         Field path to disposition mapping.
     """
     return {field.field_path: field.disposition for field in manifest.fields}
+
+
+def validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
+    """Reject unsupported and unknown top-level fields before decoding.
+
+    Args:
+        payload: Raw request body.
+        manifest: Compatibility manifest of the request's surface.
+
+    Raises:
+        OpenAIProtocolError: A field is unsupported or absent from the manifest.
+    """
+    decisions = disposition_map(manifest)
+    for field in payload:
+        disposition = decisions.get(field)
+        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
+            raise unsupported_field(field)

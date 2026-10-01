@@ -319,42 +319,6 @@ def translate_native_tools(request: GatewayRequest) -> NativeToolTranslation:
     return NativeToolTranslation(tools=tuple(tools), disclosures=disclosures, mapping=mapping)
 
 
-def invert_tool_call(
-    name: str, raw_arguments: str, mapping: NativeToolMapping
-) -> tuple[str, str | None, bool, str | None]:
-    """Invert one foreign-wire tool call back to its native Codex shape.
-
-    Args:
-        name: The provider-facing (possibly mangled) tool name.
-        raw_arguments: The provider's raw JSON arguments string.
-        mapping: The translation mapping carried on the request.
-
-    Returns:
-        ``(origin_name, namespace, is_custom, custom_input)``. ``custom_input``
-        is the unwrapped freeform text for a custom tool (else ``None``). If the
-        name is unknown to the mapping it is returned unchanged as a plain
-        function call.
-    """
-    resolved = mapping.resolve(name)
-    if resolved is None:
-        return name, None, False, None
-    origin_name, namespace, is_custom = resolved
-    if not is_custom:
-        return origin_name, namespace, False, None
-    # Custom tool: unwrap the {"input": "..."} wrapper back to freeform text.
-    custom_input: str | None = None
-    try:
-        parsed = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError):
-        parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get(_CUSTOM_INPUT_PROPERTY), str):
-        custom_input = parsed[_CUSTOM_INPUT_PROPERTY]
-    else:
-        # Guard: a model that ignored the wrapper still round-trips its raw text.
-        custom_input = raw_arguments
-    return origin_name, namespace, True, custom_input
-
-
 def _reserve_plain_history(messages: Sequence[GatewayMessage], mapping: NativeToolMapping) -> None:
     """Reserve all genuine plain history names before allocating native aliases."""
     for message in messages:

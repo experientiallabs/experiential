@@ -63,7 +63,6 @@ from exp.runtime.anthropic_protocol.server_tools import (
     require_served_server_tool_types,
 )
 from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
-from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -82,7 +81,7 @@ from exp.runtime.models.providers.cache_policy import (
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
-from exp.runtime.openai_protocol.manifest import disposition_map
+from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
 
@@ -384,7 +383,7 @@ def _decode(
     anthropic_beta: str | None,
 ) -> DecodedGatewayRequest:
     """Validate ``payload`` against ``wire`` and build the canonical request."""
-    _validate_manifest(payload)
+    validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
@@ -555,15 +554,6 @@ def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
             if disclosure not in dropped:
                 dropped.append(disclosure)
     return tuple(forwarded), tuple(dropped)
-
-
-def _validate_manifest(payload: JsonObject) -> None:
-    """Reject unsupported and unknown top-level fields before decoding."""
-    decisions = disposition_map(MESSAGES_MANIFEST)
-    for field in payload:
-        disposition = decisions.get(field)
-        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
-            raise unsupported_field(field)
 
 
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:

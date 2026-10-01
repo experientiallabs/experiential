@@ -22,9 +22,8 @@ from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 from exp.runtime.openai_protocol.streaming import (
     ChatSseEncoder,
     ResponsesSseEncoder,
-    encode_chat_events,
-    encode_responses_events,
 )
+from exp.runtime.openai_protocol.streaming_support import encode_events
 
 
 class _SdkHarness:
@@ -67,7 +66,7 @@ class _SdkHarness:
                     client_request_id=request.headers.get("x-client-request-id"),
                 )
                 self.responder_calls += 1
-                frames = encode_chat_events(
+                frames = encode_events(
                     ChatSseEncoder(
                         request_id=f"request-{self.requests}",
                         model=decoded.alias,
@@ -83,7 +82,7 @@ class _SdkHarness:
                     client_request_id=request.headers.get("x-client-request-id"),
                 )
                 self.responder_calls += 1
-                frames = encode_responses_events(
+                frames = encode_events(
                     ResponsesSseEncoder(
                         request_id=f"request-{self.requests}",
                         model=decoded.alias,

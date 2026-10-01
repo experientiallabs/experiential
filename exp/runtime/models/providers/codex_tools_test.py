@@ -18,7 +18,6 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.codex_tools import (
     NativeToolMapping,
     convert_native_history,
-    invert_tool_call,
     translate_native_tools,
 )
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
@@ -120,39 +119,6 @@ def test_mangled_name_collision_is_suffixed() -> None:
         "close_agent",
         "multi_agent_v1",
         False,
-    )
-
-
-def test_invert_custom_unwraps_input() -> None:
-    mapping = NativeToolMapping()
-    mapping.record("apply_patch", "apply_patch", None, True)
-    name, ns, custom, text = invert_tool_call(
-        "apply_patch", '{"input": "*** Begin Patch"}', mapping
-    )
-    assert (name, ns, custom, text) == ("apply_patch", None, True, "*** Begin Patch")
-
-
-def test_invert_custom_guards_malformed_arguments() -> None:
-    mapping = NativeToolMapping()
-    mapping.record("apply_patch", "apply_patch", None, True)
-    # not a JSON object with a string input -> raw text passes through, no crash
-    name, ns, custom, text = invert_tool_call("apply_patch", "raw patch text", mapping)
-    assert (name, custom, text) == ("apply_patch", True, "raw patch text")
-
-
-def test_invert_namespaced_function_restores_namespace() -> None:
-    mapping = NativeToolMapping()
-    mapping.record("multi_agent_v1__close_agent", "close_agent", "multi_agent_v1", False)
-    name, ns, custom, text = invert_tool_call("multi_agent_v1__close_agent", "{}", mapping)
-    assert (name, ns, custom, text) == ("close_agent", "multi_agent_v1", False, None)
-
-
-def test_invert_unknown_name_is_plain_function() -> None:
-    assert invert_tool_call("something", "{}", NativeToolMapping()) == (
-        "something",
-        None,
-        False,
-        None,
     )
 
 
