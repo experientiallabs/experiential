@@ -8,6 +8,8 @@ Python applications can set `RuntimeModelCatalog(catalog, http_timeout_seconds=1
 when a custom HTTP transport performs durable work around dispatch. This finite, positive
 timeout covers the entire client operation, including the injected transport. Its default
 is 60 seconds; completion requests keep a longer output-derived allowance when needed.
+Values above the operating system's `threading.TIMEOUT_MAX` are rejected before resolution,
+so configured timeouts remain representable in Python and native dispatch.
 `with_catalog()` preserves the setting. A transport that needs a shorter network deadline
 must enforce that deadline separately. Bedrock, Tinker, and native-only TypeSafe execution
 retain their own timeout policies.

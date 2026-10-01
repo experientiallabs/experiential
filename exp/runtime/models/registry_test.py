@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 from pathlib import Path
+from threading import TIMEOUT_MAX
 from typing import Literal
 from uuid import uuid4
 
@@ -70,14 +72,17 @@ _DEFAULT_CAPABILITIES = ModelCapabilities(
 )
 
 
-@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan"), True])
+@pytest.mark.parametrize(
+    "timeout",
+    [0.0, -1.0, float("inf"), float("nan"), True, 1e20, math.nextafter(TIMEOUT_MAX, math.inf)],
+)
 def test_runtime_rejects_invalid_http_timeout_before_resolution(timeout: float) -> None:
     """Invalid explicit deadlines fail before credentials or transports are resolved."""
     with pytest.raises(ValueError, match="http_timeout_seconds must be finite and positive"):
         RuntimeModelCatalog(_catalog(), environment={}, http_timeout_seconds=timeout)
 
 
-@pytest.mark.parametrize("timeout", [None, 120.0])
+@pytest.mark.parametrize("timeout", [None, 120.0, TIMEOUT_MAX])
 @pytest.mark.parametrize(
     ("provider", "base_url"),
     [

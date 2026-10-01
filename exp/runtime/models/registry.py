@@ -7,6 +7,7 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
+from threading import TIMEOUT_MAX
 from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
@@ -195,7 +196,8 @@ class RuntimeModelCatalog:
             http_timeout_seconds: Finite positive request-timeout floor for HTTP completion
                 and embedding clients, including injected transport work. Completions retain
                 their output-derived allowance when larger. Defaults to 60 seconds; does not
-                configure Bedrock, Tinker, or native-only TypeSafe execution.
+                configure Bedrock, Tinker, or native-only TypeSafe execution. Cannot exceed
+                the operating system's ``threading.TIMEOUT_MAX`` representation limit.
             tinker_sampler_factory: Optional deterministic test override for completed-handle
                 sampling. Omit it to use the runtime-owned Tinker SDK construction seam.
             bedrock_runtime_factory: Optional deterministic Bedrock runtime factory used by tests.
@@ -206,8 +208,12 @@ class RuntimeModelCatalog:
             isinstance(http_timeout_seconds, bool)
             or not math.isfinite(http_timeout_seconds)
             or http_timeout_seconds <= 0
+            or http_timeout_seconds > TIMEOUT_MAX
         ):
-            raise ValueError("http_timeout_seconds must be finite and positive")
+            raise ValueError(
+                "http_timeout_seconds must be finite and positive; "
+                f"choose a value no greater than threading.TIMEOUT_MAX ({TIMEOUT_MAX:g} seconds)"
+            )
         self._catalog = catalog
         self._environment = os.environ if environment is None else environment
         self._transport_factory = transport_factory
