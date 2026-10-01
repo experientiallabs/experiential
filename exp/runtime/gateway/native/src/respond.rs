@@ -242,8 +242,7 @@ pub(crate) fn latin1_bytes(value: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Build one exact HTTP response from a stored keyed result, mirroring the
-/// python engine's `_cached_response`.
+/// Build one exact HTTP response from a stored keyed result.
 pub(crate) fn cached_response(cached: &CachedResponse) -> Response {
     let mut builder = Response::builder()
         .status(
@@ -263,8 +262,7 @@ pub(crate) fn cached_response(cached: &CachedResponse) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Append one frame while it remains within the replay capture ceiling,
-/// mirroring the python engine's `capture_frame`.
+/// Append one frame while it remains within the replay capture ceiling.
 pub(crate) fn capture_frame(buffer: &mut Vec<u8>, data: &[u8], replayable: bool) -> bool {
     capture_frame_bounded(buffer, data, replayable, STREAM_REPLAY_CAPTURE_BYTES)
 }
@@ -383,8 +381,7 @@ pub(crate) async fn settle_stream_end(
 /// Close one stream that reached a terminal outcome: publish the keyed
 /// capture (or abandon it), then flush the withheld terminal frames.
 ///
-/// Mirrors the python engine's `_stream_body` tail: a keyed stream that
-/// cannot be retained (capture overflow or a rejected publication) ends
+/// A keyed stream that cannot be retained (capture overflow or a rejected publication) ends
 /// without its terminal frames, so the caller observes a truncated stream
 /// rather than an unreplayable success, and every waiting duplicate fails
 /// closed instead of hanging.

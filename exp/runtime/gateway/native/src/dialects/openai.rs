@@ -1,5 +1,5 @@
 //! OpenAI frame mappings: the Responses SSE dialect and the Chat-Completions
-//! compatible dialect, mirroring the python event mappers.
+//! compatible dialect.
 
 use serde_json::Value;
 

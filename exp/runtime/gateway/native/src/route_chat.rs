@@ -640,7 +640,7 @@ async fn respond_from_chat_events(
     }
     if let Some(mut owner) = lease.take() {
         // Publish the exact response body and headers, then answer from the
-        // stored copy, matching the python engine's `_cached_response`.
+        // stored copy (`respond::cached_response`).
         let mut sorted = headers.clone();
         sorted.sort();
         let cached = CachedResponse {

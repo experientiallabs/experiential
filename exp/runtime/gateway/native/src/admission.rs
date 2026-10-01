@@ -204,7 +204,7 @@ impl Admission {
     }
 }
 
-/// Commit-independent headers, mirroring `commit_independent_headers`,
+/// Headers every admitted response carries whatever rung serves it,
 /// including the caller's echoed request identity when one was supplied.
 pub(crate) fn commit_independent(
     admission: &Admission,
@@ -224,7 +224,7 @@ pub(crate) fn commit_independent(
     headers
 }
 
-/// Commit-dependent headers, mirroring `commit_dependent_headers`: the
+/// Headers that depend on the committed rung: the
 /// deployment identity and route depth that actually served the request.
 pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
     let served = admission.route.get(depth);

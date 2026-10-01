@@ -173,7 +173,7 @@ impl Normalizer {
         let terminal = match finish_reason.as_str() {
             "STOP" | "FINISH_REASON_UNSPECIFIED" => Event::Completed,
             "MAX_TOKENS" => Event::Incomplete,
-            // The python mapper's refusal signal table: safety, copyright,
+            // The refusal signal table: safety, copyright,
             // and sensitive-information stops are content-free refusals. The
             // finish token names the category (RECITATION, SPII, SAFETY), so
             // the caller sees which policy declined without any provider prose.
@@ -193,7 +193,7 @@ impl Normalizer {
 
     /// Expand one complete Gemini function call into the canonical tool-call
     /// lifecycle, assigning the deterministic local call-ID fallback and the
-    /// canonical compact JSON argument text the python mapper produces.
+    /// canonical compact JSON argument text.
     fn gemini_tool_events(&mut self, value: &Value) -> Result<Vec<Event>, Failure> {
         let call = value
             .as_object()
@@ -319,7 +319,6 @@ mod gemini_tests {
     #[test]
     fn gemini_golden_stream_normalizes_text_tools_usage_and_completion() {
         // Golden fixture: raw provider bytes in, exact canonical events out.
-        // `native_dialect_parity_test.py` holds the python-mapper comparison.
         let chunks = [
             sse(&json!({"candidates": [{"content": {"parts": [{"text": "Hel"}]}}]})),
             sse(&json!({"candidates": [{"content": {"parts": [

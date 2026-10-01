@@ -154,7 +154,7 @@ enum AttemptEnd {
         refusal_eligible: bool,
         /// Withheld refusal deltas plus the failing terminal, flushed
         /// outward only when the ladder is exhausted with a non-refusal
-        /// failure (the python executor's `withheld_non_refusal_failure`).
+        /// failure.
         exhaustion_flush: Vec<Event>,
         usage: Option<Usage>,
         tool_names: Vec<String>,

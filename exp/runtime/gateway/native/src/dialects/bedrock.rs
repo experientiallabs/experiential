@@ -1,5 +1,4 @@
-//! Bedrock ConverseStream frame mapping, mirroring the python
-//! `BedrockProviderStream._decode` mapper, plus its golden-fixture tests.
+//! Bedrock ConverseStream frame mapping, plus its golden-fixture tests.
 
 use serde_json::{Map, Value};
 
@@ -34,12 +33,11 @@ fn bedrock_exception_detail(frame: &crate::sse::SseEvent) -> Option<String> {
 }
 
 impl Normalizer {
-    /// Normalize one Bedrock ConverseStream frame, mirroring the python
-    /// `BedrockProviderStream._decode` mapper: tool calls stream as indexed
+    /// Normalize one Bedrock ConverseStream frame: tool calls stream as indexed
     /// content blocks, `messageStop` retains the stop reason, and the trailing
     /// `metadata` frame flushes usage and maps the retained reason to the
     /// shared terminal outcome. Service exceptions arrive as their own frames
-    /// and map to the python mapper's failure classes.
+    /// and map to the failure classes below.
     pub(super) fn feed_bedrock(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -386,7 +384,6 @@ mod bedrock_tests {
     #[test]
     fn bedrock_golden_stream_normalizes_text_tools_usage_and_completion() {
         // Golden fixture: raw provider bytes in, exact canonical events out.
-        // `native_dialect_parity_test.py` holds the python-mapper comparison.
         let chunks = vec![
             event("messageStart", &json!({"role": "assistant"})),
             event(
@@ -519,7 +516,7 @@ mod bedrock_tests {
     }
 
     #[test]
-    fn bedrock_stop_reasons_map_to_the_python_terminal_table() {
+    fn bedrock_stop_reasons_map_to_the_terminal_table() {
         for (reason, expected) in [
             ("end_turn", json!({"kind": "completed"})),
             ("stop_sequence", json!({"kind": "completed"})),
@@ -570,7 +567,7 @@ mod bedrock_tests {
     }
 
     #[test]
-    fn bedrock_exception_frames_map_to_python_failure_classes() {
+    fn bedrock_exception_frames_map_to_failure_classes() {
         for (name, class) in [
             ("throttlingException", "throttled"),
             ("modelTimeoutException", "timeout"),
