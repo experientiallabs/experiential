@@ -123,11 +123,23 @@ class HostedRouterWorkflowSetup(ContractModel):
 
 
 class HostedRouterWorkflowOptions(ContractModel):
-    """Bounded noninteractive controls below the Project-owned spend ceiling."""
+    """Bounded noninteractive controls below the Project-owned spend ceiling.
+
+    Attributes:
+        maximum_judgments: Positive durable judgment ceiling, default 100.
+        maximum_router_feature_tokens: Router feature input ceiling, default 8,192.
+        maximum_retrieval_query_tokens: Optional aggregate query ceiling; omission derives it
+            from world input capacity while each chunk obeys embedding input capacity.
+        maximum_judge_input_tokens: Judge input ceiling, default 32,768.
+        maximum_judge_output_tokens: Judge output reservation, default 4,096.
+        simulation_maximum_output_tokens: Per-call output reservation, default 16,000.
+        maximum_concurrency: Simultaneous rollout allowance, default one.
+        seed: Reproducible execution seed, default zero.
+    """
 
     maximum_judgments: int = Field(default=100, gt=0)
     maximum_router_feature_tokens: int = Field(default=8_192, gt=0)
-    maximum_retrieval_query_tokens: int = Field(default=32_768, gt=0)
+    maximum_retrieval_query_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_input_tokens: int = Field(default=32_768, gt=0)
     maximum_judge_output_tokens: int = Field(default=4_096, ge=4_096)
     simulation_maximum_output_tokens: int = Field(default=16_000, gt=0)

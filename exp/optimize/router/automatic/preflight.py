@@ -57,6 +57,7 @@ from exp.optimize.router.automatic.reservations import (
     plan_automatic_router_cost,
     remaining_simulation_budget,
     retrieval_embedding_reservation,
+    retrieval_query_input_limit,
     router_feature_reservation,
     simulation_completion_reservations,
     simulation_input_token_estimate,
@@ -257,22 +258,29 @@ def preflight_automatic_router(
         options.maximum_router_feature_tokens,
         options.router_embedding_maximum_attempts,
     )
+    query_limit = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias=world_alias,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
+        configured_limit=options.maximum_retrieval_query_tokens,
+    )
     query_reservation = retrieval_embedding_reservation(
         problems,
         catalog,
         embedder_alias,
         embedder,
-        options.maximum_retrieval_query_tokens,
+        query_limit,
         options.router_embedding_maximum_attempts,
     )
     world_model_top_k = _world_model_retrieval_count(problems, project, completed)
     estimated_input_tokens = (
         None
-        if world_model_top_k is None
+        if world_model_top_k is None or query_limit is None
         else simulation_input_token_estimate(
             traces,
             retrieved_transition_count=world_model_top_k,
-            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+            maximum_retrieval_query_tokens=query_limit,
             maximum_output_tokens=options.simulation_maximum_output_tokens,
         )
     )
@@ -462,7 +470,6 @@ def simulation_configuration_sha256(
 _BOUNDED_OPTION_FIELDS = (
     "maximum_model_calls",
     "maximum_router_feature_tokens",
-    "maximum_retrieval_query_tokens",
     "router_embedding_maximum_attempts",
     "completion_maximum_attempts",
     "simulation_maximum_output_tokens",
@@ -480,9 +487,15 @@ def _validate_positive_options(options: AutomaticRouterOptions) -> tuple[str, ..
     Returns:
         Actionable option problems.
     """
-    return tuple(
+    problems = tuple(
         f"{name} must be positive" for name in _BOUNDED_OPTION_FIELDS if getattr(options, name) <= 0
     )
+    if (
+        options.maximum_retrieval_query_tokens is not None
+        and options.maximum_retrieval_query_tokens <= 0
+    ):
+        problems += ("maximum_retrieval_query_tokens must be positive",)
+    return problems
 
 
 def _capture[T](problems: list[str], label: str, operation: Callable[[], T]) -> T | None:

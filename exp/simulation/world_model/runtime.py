@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from exp.common.core.artifacts import (
     ArtifactInput,
@@ -13,6 +13,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import (
     AssistantAction,
+    ModelCapabilities,
     ModelClient,
     ModelMessage,
     ModelRequest,
@@ -20,6 +21,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
+from exp.simulation.engines.text.packing import pack_world_model_request
 from exp.simulation.engines.text.prompt import (
     TextWorldModelTransition,
     build_world_model_request,
@@ -27,6 +29,7 @@ from exp.simulation.engines.text.prompt import (
     parse_world_model_transition,
     validate_transition_action,
 )
+from exp.simulation.engines.text.tokens import TokenCounter
 from exp.simulation.retrieval import (
     RAGMatch,
     RAGQuery,
@@ -56,6 +59,39 @@ class PreparedGroundedWorldModelCall:
     request: ModelRequest
     matches: tuple[RAGMatch, ...]
     action: AssistantAction
+
+    def fit_context(
+        self,
+        capabilities: ModelCapabilities,
+        token_counter: TokenCounter,
+        maximum_input_tokens: int | None = None,
+    ) -> PreparedGroundedWorldModelCall:
+        """Pack optional examples and bind provenance to the unchanged request allowance.
+
+        Args:
+            capabilities: Frozen world-model context and output capacity.
+            token_counter: Full-request input counter used by dispatch admission.
+            maximum_input_tokens: Optional stricter frozen input reservation.
+
+        Returns:
+            Request with only whole included examples in its matching provenance.
+        """
+        context = capabilities.context_window_tokens
+        output = self.request.maximum_output_tokens
+        if context is None or output is None:
+            return self
+        ceiling = context - output
+        if maximum_input_tokens is not None:
+            ceiling = min(ceiling, maximum_input_tokens)
+        request, identifiers = pack_world_model_request(
+            self.request, maximum_input_tokens=ceiling, token_counter=token_counter
+        )
+        matches = tuple(
+            match for match in self.matches if match.transition.transition_id in identifiers
+        )
+        if tuple(match.transition.transition_id for match in matches) != identifiers:
+            raise ValueError("packed world-model examples differ from retrieved provenance")
+        return replace(self, request=request, matches=matches)
 
 
 @dataclass(frozen=True)

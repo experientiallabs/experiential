@@ -38,6 +38,7 @@ from exp.common.traces.ingest.dataset import (
 from exp.optimize.router.automatic.attribution import resolve_router_observed_attributions
 from exp.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
+    retrieval_query_input_limit,
     simulation_completion_reservations,
     simulation_input_token_estimate,
 )
@@ -415,7 +416,13 @@ def _router_stage_reservations(
         catalog,
         embedder.alias,
         embedder.model,
-        options.maximum_retrieval_query_tokens,
+        retrieval_query_input_limit(
+            problems,
+            catalog=catalog,
+            world_alias=world_model.alias,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+            configured_limit=options.maximum_retrieval_query_tokens,
+        ),
         RetryPolicy().maximum_attempts,
     )
     if len(candidate_requests) != len(candidates) or world_request is None or retrieval is None:

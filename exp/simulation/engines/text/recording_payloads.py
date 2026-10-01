@@ -13,6 +13,7 @@ from exp.common.models import (
     ModelResponse,
 )
 from exp.common.rollouts import RolloutEventKind, RolloutSpan
+from exp.simulation.engines.text.packing import pack_world_model_request
 from exp.simulation.engines.text.prompt import retry_world_model_request
 from exp.simulation.engines.text.redaction import redact_json
 from exp.simulation.engines.text.tokens import TokenCounter
@@ -27,10 +28,10 @@ def world_retry_request(
     reservation: CompletionCostReservation | None,
     token_counter: TokenCounter,
 ) -> ModelRequest:
-    """Add format feedback only when it fits the original context and input reservation.
+    """Add format feedback when required content fits the original input reservation.
 
     With no room for feedback, the next simulator attempt uses the admitted original request.
-    No evidence is removed and the original output allowance remains available.
+    Optional examples may be omitted whole; required evidence and output allowance are retained.
     """
     corrected = retry_world_model_request(request, action, reason)
     context = capabilities.context_window_tokens
@@ -40,6 +41,9 @@ def world_retry_request(
     ceiling = context - output
     if reservation is not None:
         ceiling = min(ceiling, reservation.maximum_input_tokens)
+    corrected, _ = pack_world_model_request(
+        corrected, maximum_input_tokens=ceiling, token_counter=token_counter
+    )
     return corrected if 0 <= token_counter.count(corrected) <= ceiling else request
 
 

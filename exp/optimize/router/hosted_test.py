@@ -708,7 +708,7 @@ def test_hosted_preflight_reserves_full_simulation_before_build_dispatch(tmp_pat
         update={
             "budgets": ProjectBudgetConfiguration(
                 maximum_build_cost_usd=Decimal("5.000000"),
-                maximum_provider_cost_usd=Decimal("10.000000"),
+                maximum_provider_cost_usd=Decimal("0.010000"),
             )
         }
     )

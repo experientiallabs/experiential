@@ -41,6 +41,7 @@ from exp.simulation.engines.text.recording import (
     _require_response_identity,
 )
 from exp.simulation.retrieval import RAGMatch, RAGQuery, TraceRAGRetriever
+from exp.simulation.retrieval.contracts import RAGAction, RAGObservation, RAGTransition
 from exp.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_PROMPT_VERSION,
@@ -61,9 +62,10 @@ class _ScriptedClient:
 
 
 class _Retriever:
-    def __init__(self) -> None:
+    def __init__(self, matches: tuple[RAGMatch, ...] = ()) -> None:
         """Initialize an empty ordered query log."""
         self.queries: list[RAGQuery] = []
+        self.matches = matches
 
     def estimate_query_economics(
         self,
@@ -93,7 +95,7 @@ class _Retriever:
             Empty deterministic result set.
         """
         self.queries.append(query)
-        return ()
+        return self.matches
 
 
 def _snapshot(name: str) -> ModelSnapshot:
@@ -241,6 +243,7 @@ def _recorder(
     maximum_transition_attempts: int = 1,
     task: TaskCase | None = None,
     world_context_window: int = 100_000,
+    retrieval_matches: tuple[RAGMatch, ...] = (),
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -260,6 +263,7 @@ def _recorder(
         maximum_transition_attempts: Permitted simulator replies for the same candidate turn.
         task: Optional task carrying declared tools for observation-boundary tests.
         world_context_window: Exact world-model context ceiling for retry admission tests.
+        retrieval_matches: Whole observed examples returned by the scripted retriever.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -274,7 +278,7 @@ def _recorder(
     )
     if candidate_served_model_id is not None:
         candidate = replace(candidate, served_model_id=candidate_served_model_id)
-    retriever = cast(TraceRAGRetriever, _Retriever())
+    retriever = cast(TraceRAGRetriever, _Retriever(retrieval_matches))
     serving_input = ArtifactInput(artifact_id="serving-rag", sha256="c" * 64)
     world_model = _resolved(
         "world-model-a",
@@ -356,6 +360,63 @@ def _completion_reservation(
 class _Utf8Counter:
     def count(self, request: ModelRequest) -> int:
         return len(request.model_dump_json().encode("utf-8"))
+
+
+def _grounding_example(identifier: str, size: int) -> RAGMatch:
+    """Create a complete observed transition with a controllable optional payload size."""
+    return RAGMatch(
+        score=1.0,
+        transition=RAGTransition(
+            transition_id=identifier,
+            trace_id=f"trace-{identifier}",
+            lineage_id=f"lineage-{identifier}",
+            action_span_id="action",
+            observation_span_id="observation",
+            task="Observed request",
+            initial_context={"original": True},
+            action=RAGAction(kind="message", content="Observed action"),
+            observation=RAGObservation(kind="message", content="é" * size),
+            key_text="observed-key",
+            key_sha256="f" * 64,
+        ),
+    )
+
+
+def test_world_context_packs_whole_examples_and_records_only_dispatched_grounding() -> None:
+    """An oversized optional example must not invalidate a required prompt that fits."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response("bad", model=_snapshot("world-model-a")),
+            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+        ]
+    )
+    recorder = _recorder(
+        candidate,
+        world,
+        maximum_transition_attempts=2,
+        world_context_window=24_000,
+        retrieval_matches=(_grounding_example("oversized", 30_000), _grounding_example("fits", 50)),
+        world_model_json_object_output=True,
+    )
+    request = ModelRequest(messages=(ModelMessage(role="user", content="Required question"),))
+    recorder.complete(request)
+
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 2
+    for sent in world.requests:
+        evidence = json.loads(sent.messages[1].content or "")
+        assert [example["transition_id"] for example in evidence["grounded_examples"]] == ["fits"]
+        assert evidence["task"]["instruction"] == _task().instruction
+        assert evidence["task"]["initial_context"] == _task().initial_context
+        assert evidence["visible_conversation"][0]["content"] == "Required question"
+        assert evidence["candidate_response"]["content"] == "answer"
+        assert evidence["environment_state"] == {}
+        assert sent.maximum_output_tokens == 16_000
+        assert sent.json_object_output
+        assert _Utf8Counter().count(sent) + sent.maximum_output_tokens <= 24_000
+    assert "invalid" in (world.requests[1].messages[-1].content or "")
+    assert recorder.recorded.retrieved_transition_ids == (("fits",), ("fits",))
 
 
 @pytest.mark.parametrize("json_output", [False, True])

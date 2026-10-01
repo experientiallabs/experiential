@@ -37,6 +37,7 @@ from exp.optimize.router.automatic.provisional import (
 )
 from exp.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
+    retrieval_query_input_limit,
     simulation_completion_reservations,
     simulation_input_token_estimate,
 )
@@ -68,7 +69,8 @@ class ModelEvaluationOptions(ContractModel):
         maximum_judge_input_tokens: Optional input ceiling; omission uses the judge context
             capacity minus its output reservation.
         maximum_judge_output_tokens: Positive judge output reservation, default 8,192.
-        maximum_retrieval_query_tokens: Positive per-query embedding limit, default 32,768.
+        maximum_retrieval_query_tokens: Optional aggregate query limit; omission uses the world
+            model's input capacity. Lossless chunks separately obey embedding input capacity.
         seed: Reproducible scenario seed, default zero.
     """
 
@@ -79,7 +81,7 @@ class ModelEvaluationOptions(ContractModel):
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_input_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_output_tokens: int = Field(default=8_192, gt=0)
-    maximum_retrieval_query_tokens: int = Field(default=32_768, gt=0)
+    maximum_retrieval_query_tokens: int | None = Field(default=None, gt=0)
     seed: int = 0
 
 
@@ -259,6 +261,16 @@ def prepare_model_evaluation(
             options.maximum_rollout_output_tokens, capabilities.context_window_tokens
         )
     maximum_output_tokens = options.maximum_output_tokens or max(output_budgets.values())
+    problems: list[str] = []
+    query_limit = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias=world.model_alias,
+        maximum_output_tokens=maximum_output_tokens,
+        configured_limit=options.maximum_retrieval_query_tokens,
+    )
+    if query_limit is None:
+        raise ValueError("evaluation retrieval capacity is incomplete: " + "; ".join(problems))
     report(progress, "Loading traces for cost estimates")
     traces = load_trace_dataset(project.artifacts, completed.trace_dataset.artifact_id).traces
     input_estimates: dict[str, int | None] = {}
@@ -267,14 +279,13 @@ def prepare_model_evaluation(
         input_estimates[alias] = simulation_input_token_estimate(
             traces,
             retrieved_transition_count=world.top_k,
-            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+            maximum_retrieval_query_tokens=query_limit,
             maximum_output_tokens=min(maximum_output_tokens, output_budget),
         )
         report(progress, "Estimating model costs", completed=index, total=len(output_budgets))
     if any(value is None for value in input_estimates.values()):
         raise ValueError("evaluation requires captured source traces for a cost estimate")
     attempts = RetryPolicy().maximum_attempts
-    problems: list[str] = []
     requests, world_request = simulation_completion_reservations(
         problems,
         catalog=catalog,
@@ -292,7 +303,7 @@ def prepare_model_evaluation(
         catalog,
         embedder_alias,
         embedder,
-        options.maximum_retrieval_query_tokens,
+        query_limit,
         attempts,
     )
     if problems or world_request is None or retrieval is None:

@@ -547,6 +547,11 @@ class RecordingCandidateClient:
         self, prepared: PreparedGroundedWorldModelCall, candidate_ended_at: datetime
     ) -> TextWorldModelTransition:
         """Admit, record and validate one simulator reply, including rejected reply costs."""
+        prepared = prepared.fit_context(
+            self._world_model.capabilities,
+            self._token_counter,
+            self._world_model_request.maximum_input_tokens if self._world_model_request else None,
+        )
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,

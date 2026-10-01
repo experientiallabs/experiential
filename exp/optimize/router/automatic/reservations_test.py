@@ -31,6 +31,7 @@ from exp.optimize.router.automatic.reservations import (
     completion_reservation_from_catalog,
     median_trace_token_estimate,
     plan_automatic_router_cost,
+    retrieval_query_input_limit,
     simulation_input_token_estimate,
 )
 from exp.optimize.router.automatic.service_test import _catalog as _service_catalog
@@ -292,7 +293,7 @@ def test_simulation_input_estimate_sums_explicit_deterministic_components() -> N
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
-    assert estimate == 6 * median + _QUERY_TOKENS + _OUTPUT_TOKENS + 4_096
+    assert estimate == 6 * median + min(median, _QUERY_TOKENS) + _OUTPUT_TOKENS + 4_096
     assert (
         simulation_input_token_estimate(
             (),
@@ -344,6 +345,39 @@ def test_completion_reservation_prices_from_trace_estimate_and_admits_to_context
         reservation.estimated_maximum_call_cost_usd
         < reservation.absolute_maximum_call_cost_usd() / 5
     )
+
+
+@pytest.mark.parametrize("configured_limit", [None, 32_768, 900_000])
+@pytest.mark.parametrize("published_output", [None, 393_216])
+def test_query_capacity_derivation_preserves_explicit_limits(
+    configured_limit: int | None, published_output: int | None
+) -> None:
+    """Aggregate query admission follows world capacity only when the user omits a ceiling."""
+    catalog = _catalog()
+    record = catalog.models["world"]
+    assert record.capabilities is not None
+    catalog.models["world"] = record.model_copy(
+        update={
+            "capabilities": record.capabilities.model_copy(
+                update={
+                    "context_window_tokens": 1_048_576,
+                    "maximum_output_tokens": published_output,
+                }
+            )
+        }
+    )
+    problems: list[str] = []
+    derived = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias="world",
+        maximum_output_tokens=1_000_000,
+        configured_limit=configured_limit,
+    )
+    assert derived == (
+        configured_limit if configured_limit is not None else 1_048_576 - (published_output or 0)
+    )
+    assert not problems
 
 
 def test_completion_reservation_bounds_episode_estimates_to_request_capacity() -> None:
