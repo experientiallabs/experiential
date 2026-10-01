@@ -75,6 +75,8 @@ def require_spend_consent(
     answer. An estimate above any budget warns and offers the same explicit confirmation,
     defaulting to no. ``--yes`` or a recorded confirmation authorizes the displayed estimate
     even above the configured budget; it does not change the saved budget for future commands.
+    Uncapped execution always requires ``--yes`` or explicit confirmation, even when its
+    estimate is below the automatic threshold.
 
     An undefined estimate (``None``) means the catalog carries no pricing for a selected model,
     so no ceiling comparison is possible. EXP reports the cost as undefined honestly instead of
@@ -93,7 +95,7 @@ def require_spend_consent(
         previously_confirmed: Whether immutable command state records an earlier confirmation.
         additional_budgets: Component budgets to review together with the command total.
         cost_is_upper_bound: Whether the displayed estimate is an enforced allowance. False
-            labels uncapped execution honestly without changing warning or consent thresholds.
+            labels uncapped execution honestly and always requires explicit confirmation.
 
     Returns:
         True when execution is authorized, or False after an interactive decline.
@@ -126,9 +128,14 @@ def require_spend_consent(
             continue
         cost = _cost_decimal(component.estimated_cost_usd, label=f"{component.name} estimate")
         if cost > limit:
+            threshold = (
+                f"{_format_usd(limit)} budget"
+                if cost_is_upper_bound
+                else f"configured {_format_usd(limit)} warning threshold"
+            )
             warnings.append(
                 f"[yellow]warning[/yellow] {escape(component.name)} estimate "
-                f"{_format_usd(cost)} exceeds the {_format_usd(limit)} budget."
+                f"{_format_usd(cost)} exceeds the {threshold}."
             )
     if warnings:
         return _confirm_over_budget(
@@ -140,10 +147,16 @@ def require_spend_consent(
             non_interactive=non_interactive,
             cost_is_upper_bound=cost_is_upper_bound,
         )
-    if estimate <= budget / Decimal(2) or yes or previously_confirmed:
+    if yes or previously_confirmed or (cost_is_upper_bound and estimate <= budget / Decimal(2)):
         return True
     if non_interactive or not can_prompt(console):
-        _refuse_noninteractive(console, command=command, estimate=estimate, budget=budget)
+        _refuse_noninteractive(
+            console,
+            command=command,
+            estimate=estimate,
+            budget=budget,
+            cost_is_upper_bound=cost_is_upper_bound,
+        )
     prompt = (
         f"Authorize {command} to spend up to {_format_usd(estimate)}?"
         if cost_is_upper_bound
@@ -301,15 +314,24 @@ def _refuse_noninteractive(
     command: str,
     estimate: Decimal,
     budget: Decimal,
+    cost_is_upper_bound: bool,
 ) -> NoReturn:
-    """Exit when an above-half estimate has no deterministic confirmation.
+    """Exit when the invocation requires confirmation and no terminal is available.
 
     Args:
         console: Command-owned output console.
         command: Complete command identity.
         estimate: Conservative invocation estimate.
         budget: Configured per-command ceiling.
+        cost_is_upper_bound: Whether the displayed cost is an enforced allowance.
     """
+    if not cost_is_upper_bound:
+        console.print(
+            "authorization: execution has no spending limit and requires explicit confirmation. "
+            "This session cannot prompt; re-run with --yes after reviewing "
+            f"{escape(command)} (estimated {_format_usd(estimate)}, no spending limit)."
+        )
+        raise typer.Exit(NO_CONSENT_EXIT_CODE)
     console.print(
         "authorization: this estimate requires explicit confirmation because it exceeds 50% "
         "of the configured budget. This session cannot prompt; re-run with --yes after "

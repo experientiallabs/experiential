@@ -292,8 +292,8 @@ def run_prepared_model_evaluation(
             spending_limit_usd=budget.maximum_cost_usd,
             judge_spend=judge_spend,
         ),
-        # Semantic execution bounds stay frozen across allowance increases. The request
-        # ledger enforces the smaller approved amount before every paid dispatch.
+        # Semantic execution bounds stay frozen across allowance changes. The request
+        # ledger independently enforces an enabled aggregate cap before every paid dispatch.
         budget=budget.model_copy(update={"maximum_cost_usd": max(quote.maximum_cost_usd, 1e-12)}),
         created_at=created_at,
         code_revision=code_revision,

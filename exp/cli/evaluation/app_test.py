@@ -109,6 +109,61 @@ def test_unbuilt_project_requires_build_before_setup(tmp_path: Path) -> None:
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("interactive", [False, True])
+def test_uncapped_launch_requires_yes_or_the_reviewed_start_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive: bool
+) -> None:
+    """A reviewed Start authorizes once; a cheap noninteractive estimate authorizes nothing."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(models=("candidate-a", "candidate-b")),
+        code_revision=_REVISION,
+    )
+    set_maximum_command_cost_usd(1_000, project.paths.root)
+    assert run.spending_limit_usd is None
+    assert run.prepared.cost.estimated_cost_usd < 500
+    monkeypatch.setattr(flow, "can_prompt", lambda console: interactive)
+    monkeypatch.setattr(consent, "can_prompt", lambda console: False)
+    reviewed: list[str] = []
+    constructed: list[ModelCatalog] = []
+
+    def choose(*args: object, **kwargs: object) -> PickerResult:
+        """Record the explicit Start action after the no-limit review is displayed."""
+        del args, kwargs
+        reviewed.append("start")
+        return PickerResult(values=("start",))
+
+    def runtime(catalog: ModelCatalog) -> RuntimeModelCatalog:
+        """Stop at the actual provider-construction boundary without making any call."""
+        constructed.append(catalog)
+        raise ValueError("authorized provider boundary")
+
+    monkeypatch.setattr(flow, "choose_one", choose)
+    monkeypatch.setattr(flow, "RuntimeModelCatalog", runtime)
+    before = len(state.completion_calls), len(state.embedding_calls), state.credential_resolutions
+    result = CliRunner().invoke(
+        app, ["eval", "support", "--root", str(project.paths.root), "--resume", run.run_id]
+    )
+    assert result.exit_code != 0
+    if interactive:
+        assert reviewed == ["start"]
+        assert len(constructed) == 1
+        assert "authorized provider boundary" in result.output
+    else:
+        assert reviewed == constructed == []
+        assert "no spending limit and requires explicit confirmation" in " ".join(
+            result.output.split()
+        )
+        assert "--yes" in result.output
+    assert before == (
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    )
+
+
 def test_execution_shows_progress_before_runtime_initialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

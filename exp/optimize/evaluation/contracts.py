@@ -63,7 +63,8 @@ class EvaluationBudget(ContractModel):
 
     Attributes:
         maximum_cost_usd: Optional positive finite provider-spend ceiling. None removes only
-            the aggregate cap; per-request token and cost reservations remain enforced.
+            the aggregate cap for catalog-backed execution; per-request reservations remain
+            enforced. Direct evaluate_models callers supply a finite simulation envelope.
         maximum_judgments: Positive ceiling on durable cell judgments.
     """
 

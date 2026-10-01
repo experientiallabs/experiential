@@ -176,11 +176,13 @@ def run_evaluation(
             _console.print(f"exp eval {project} --root {root} --resume {run.run_id}", markup=False)
             return
         while True:
+            reviewed = False
             if interactive and not yes:
                 selected_run = _review(store, run)
                 if selected_run is None:
                     return
                 run = selected_run
+                reviewed = True
             if not require_spend_consent(
                 _console,
                 root=root,
@@ -192,6 +194,7 @@ def run_evaluation(
                 ),
                 command=f"exp eval {project} --resume {run.run_id}",
                 non_interactive=not interactive,
+                previously_confirmed=reviewed and run.spending_limit_usd is None,
                 cost_is_upper_bound=run.spending_limit_usd is not None,
             ):
                 return

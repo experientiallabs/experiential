@@ -11,7 +11,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
-from exp.runtime.gateway.web_search.backend_fixture_test import (
+from exp.runtime.gateway.tests.web_search_backend_fixture_test import (
     FailingWebSearchBackend,
     StaticWebSearchBackend,
 )

@@ -87,7 +87,8 @@ def evaluate_models(
         project: Project with immutable mined tasks and a grounded world model.
         setup: Frozen workers, simulation protocol and persisted judge evidence.
         services: Runtime simulator and judge, using the same engines as router optimization.
-        budget: Optional aggregate provider-spend limit and finite judgment-count ceiling.
+        budget: Finite simulation execution envelope and judgment-count ceiling. Use
+            run_prepared_model_evaluation to derive the envelope from catalog metadata.
         created_at: Stable run timestamp. Replay adopts the persisted plan's timestamp.
         code_revision: Exact producer revision.
         progress: Optional observer for real simulation, judgment and report progress.
@@ -99,6 +100,12 @@ def evaluate_models(
     Raises:
         ValueError: Inputs drift, historical cells are supplied, or evidence/budget gates fail.
     """
+    if budget.maximum_cost_usd is None:
+        raise ValueError(
+            "evaluate_models requires a finite simulation execution envelope. "
+            "Use run_prepared_model_evaluation with maximum_cost_usd=None to derive that "
+            "envelope from the catalog without an aggregate spending limit."
+        )
     spending_limit = (
         budget.maximum_cost_usd
         if services.spending_limit_usd == "execution_budget"

@@ -262,16 +262,16 @@ def test_over_budget_noninteractive_without_consent_explains_how_to_proceed(tmp_
     assert "interactive terminal to proceed, or use --yes" in _flat(buffer)
 
 
-@pytest.mark.parametrize("estimate", [15.0, 35.0])
+@pytest.mark.parametrize("estimate", [0.0, 10.0, 15.0, 35.0])
 def test_uncapped_estimate_is_never_presented_as_an_enforced_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None, estimate: float
 ) -> None:
-    """Both consent branches keep the estimate visible without promising a spending ceiling."""
+    """Every uncapped estimate requires explicit consent without promising a spending ceiling."""
     root = tmp_path / ".exp"
     set_maximum_command_cost_usd(20.0, root)
     answer = _Answer(True)
     monkeypatch.setattr(consent_module, "Confirm", answer)
-    console, _ = _console(terminal=True)
+    console, buffer = _console(terminal=True)
     assert require_spend_consent(
         console,
         root=root,
@@ -284,6 +284,37 @@ def test_uncapped_estimate_is_never_presented_as_an_enforced_limit(
     assert f"estimated ${estimate:.2f}, no spending limit" in answer.asked[0]
     assert "up to" not in answer.asked[0]
     assert answer.defaults == [False]
+    if estimate > 20:
+        assert "exceeds the configured $20.00 warning threshold" in _flat(buffer)
+        assert "budget" not in _flat(buffer)
+
+
+@pytest.mark.parametrize("yes,previously_confirmed", [(False, False), (True, False), (False, True)])
+def test_uncapped_noninteractive_call_requires_explicit_authority(
+    tmp_path: Path, yes: bool, previously_confirmed: bool
+) -> None:
+    """A zero estimate alone cannot authorize uncapped noninteractive execution."""
+    console, _ = _console(terminal=False)
+
+    def authorize() -> bool:
+        """Exercise the actual shared confirmation boundary with no prompt available."""
+        return require_spend_consent(
+            console,
+            root=tmp_path,
+            yes=yes,
+            previously_confirmed=previously_confirmed,
+            estimated_cost_usd=0,
+            command="exp eval support",
+            non_interactive=True,
+            cost_is_upper_bound=False,
+        )
+
+    if yes or previously_confirmed:
+        assert authorize()
+    else:
+        with pytest.raises(typer.Exit) as caught:
+            authorize()
+        assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
 
 
 @pytest.mark.parametrize("accepted", [False, True])

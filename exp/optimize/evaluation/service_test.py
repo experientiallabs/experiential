@@ -46,6 +46,28 @@ class _Judge(_RouterTestJudge):
     model: ModelSnapshot = _snapshot("judge-model")
 
 
+def test_direct_evaluation_requires_a_finite_execution_envelope_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    """The low-level API points uncapped callers to the catalog-backed envelope builder."""
+    project, setup = _prepared(tmp_path)
+    factory = _SimulatorFactory()
+    judge = _Judge()
+    before = project.artifacts.list_ids()
+    with pytest.raises(ValueError, match="run_prepared_model_evaluation.*maximum_cost_usd=None"):
+        evaluate_models(
+            project,
+            setup,
+            services=EvaluationServices(factory, judge, spending_limit_usd=None),
+            budget=EvaluationBudget(maximum_judgments=100),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert factory.log == []
+    assert judge.calls == 0
+    assert project.artifacts.list_ids() == before
+
+
 @pytest.mark.parametrize("concurrent_admission", [False, True])
 def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
     tmp_path: Path,

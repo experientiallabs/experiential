@@ -332,13 +332,17 @@ calls. The quote and result exclude earlier trace mining and grounding costs; a 
 those separately before offering a complete trace-to-report price. Credit conversion, promotions,
 identity authorization and job persistence remain hosting responsibilities.
 
-Aggregate evaluation spending limits are off by default. The estimate remains visible and paid
-execution still requires consent. Every request keeps a finite token and retry-inclusive cost
+Catalog-backed evaluations and `exp eval` have no aggregate spending limit by default. The
+estimate remains visible and uncapped execution requires an explicit Start action or `--yes`.
+Every request keeps a finite token and retry-inclusive cost
 reservation; completed charges, unknown-dispatch holds and exact response replay remain durable
 with or without an aggregate cap. In the launch review, select Spending limit to set a positive
 dollar amount or enter `none` to remove it. Changing that limit does not change the frozen plan.
 `EvaluationServices` uses the execution budget when its spending limit is omitted; explicitly
-passing `spending_limit_usd=None` disables only that aggregate limit.
+passing `spending_limit_usd=None` disables only that aggregate limit, not a simulator's own
+execution bound. The lower-level `evaluate_models` API still requires an explicit finite
+simulation envelope. Use `run_prepared_model_evaluation` to derive that envelope automatically
+from the catalog and frozen request limits while leaving aggregate spending uncapped.
 
 Judges use their declared context capacity minus the output reservation. Full visible task and
 tool evidence is retained; a transcript that exceeds that capacity is excluded with an explicit
