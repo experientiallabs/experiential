@@ -15,6 +15,7 @@ from exp.common.project import ArtifactStore
 from exp.common.project.paths import ProjectPaths
 from exp.common.tasks import TaskSet, ToolSchema
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces.ingest.vendor_trace import SYNTHETIC_TIME_ATTRIBUTE
 from exp.simulation.mining.descriptors import HashingDescriptorEmbedder, routing_descriptor
 from exp.simulation.mining.lineage import assign_source_lineages
 from exp.simulation.mining.service import MiningSpec, mine_tasks, persist_task_set
@@ -329,6 +330,38 @@ def test_semantic_duplicate_lineages_are_unioned_before_partition() -> None:
         ("trace-2",),
     ]
     assert len(result.tasks) == 2
+    assert len({task.partition for task in result.tasks}) == 1
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_synthetic_trace_boundaries_preserve_duplicate_leakage_exclusions(exact: bool) -> None:
+    """Missing measured timing never separates exact or semantic duplicate evidence."""
+    first = _trace(1, task="Cancel a reservation")
+    second = _trace(2, task=first.task if exact else "Please cancel this booking").model_copy(
+        update={"initial_context": first.initial_context}
+    )
+    traces = tuple(
+        trace.model_copy(
+            update={
+                "conversation_id": None,
+                "spans": tuple(
+                    span.model_copy(
+                        update={"attributes": {**span.attributes, SYNTHETIC_TIME_ATTRIBUTE: True}}
+                    )
+                    for span in trace.spans
+                ),
+            }
+        )
+        for trace in (first, second)
+    )
+
+    result = mine_tasks(traces, embedder=SameVectorEmbedder())
+
+    assert len({item.lineage_group_id for item in result.lineage_assignments}) == 2
+    assert len(result.analysis.leakage_groups) == 1
+    assert [edge.kind for edge in result.analysis.edges] == ["exact" if exact else "semantic"]
+    assert len(result.tasks) == (1 if exact else 2)
+    assert len({task.lineage_group_id for task in result.tasks}) == 1
     assert len({task.partition for task in result.tasks}) == 1
 
 
