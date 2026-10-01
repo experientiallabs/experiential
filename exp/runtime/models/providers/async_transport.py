@@ -375,12 +375,15 @@ class SyncJsonTransportAdapter:
         Returns:
             The legacy transport response.
         """
-        operation = asyncio.to_thread(
-            self._transport.get,
-            url,
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-        )
+        deadline = RequestDeadline.after(timeout_seconds)
+
+        def dispatch() -> JsonHttpResponse:
+            """Recheck the original deadline after the worker leaves its queue."""
+            return self._transport.get(
+                url, headers=headers, timeout_seconds=deadline.attempt_timeout()
+            )
+
+        operation = asyncio.to_thread(dispatch)
         return await asyncio.wait_for(operation, timeout=timeout_seconds)
 
     async def post(
@@ -402,13 +405,18 @@ class SyncJsonTransportAdapter:
         Returns:
             The legacy transport response.
         """
-        operation = asyncio.to_thread(
-            self._transport.post,
-            url,
-            headers=headers,
-            payload=payload,
-            timeout_seconds=timeout_seconds,
-        )
+        deadline = RequestDeadline.after(timeout_seconds)
+
+        def dispatch() -> JsonHttpResponse:
+            """Do not start paid work whose deadline expired while queued."""
+            return self._transport.post(
+                url,
+                headers=headers,
+                payload=payload,
+                timeout_seconds=deadline.attempt_timeout(),
+            )
+
+        operation = asyncio.to_thread(dispatch)
         return await asyncio.wait_for(operation, timeout=timeout_seconds)
 
 

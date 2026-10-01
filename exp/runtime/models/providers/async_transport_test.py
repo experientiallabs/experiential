@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.models.providers import async_transport
 from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ProviderDeadlineExceeded,
     RequestDeadline,
     ScriptedAsyncJsonTransport,
+    SyncJsonTransportAdapter,
     post_json_async,
     run_with_retry_async,
 )
@@ -21,6 +25,7 @@ from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     ProviderTransportError,
     RetryPolicy,
+    ScriptedJsonTransport,
     is_known_unbilled_failure,
 )
 
@@ -47,6 +52,57 @@ class _RetryClock:
         """Advance the injected clock without waiting on wall time."""
         self.sleeps.append(seconds)
         self.now += seconds
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+@pytest.mark.parametrize("queued_seconds", [0.4, 1.1])
+def test_sync_transport_queue_consumes_the_original_deadline(
+    monkeypatch: pytest.MonkeyPatch, method: str, queued_seconds: float
+) -> None:
+    """A queued sync dispatch gets only remaining time and cannot start after expiry."""
+    clock = _RetryClock()
+    timeouts: list[float] = []
+    wire = ScriptedJsonTransport()
+
+    def dispatch(
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        payload: JsonObject | None = None,
+    ) -> JsonHttpResponse:
+        """Record actual dispatch only after the adapter admits its queued work."""
+        del url, headers, payload
+        timeouts.append(timeout_seconds)
+        return JsonHttpResponse(200, {"ok": True})
+
+    async def queued[**P](
+        function: Callable[P, JsonHttpResponse], *args: P.args, **kwargs: P.kwargs
+    ) -> JsonHttpResponse:
+        """Run the worker after a deterministic delay without sleeping in the test."""
+        clock.now += queued_seconds
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(async_transport, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(asyncio, "to_thread", queued)
+    monkeypatch.setattr(wire, method, dispatch)
+    adapter = SyncJsonTransportAdapter(wire)
+
+    async def scenario() -> JsonHttpResponse:
+        """Exercise the public adapter entrypoint with a one-second total bound."""
+        if method == "get":
+            return await adapter.get("https://provider.test", headers={}, timeout_seconds=1.0)
+        return await adapter.post(
+            "https://provider.test", headers={}, payload={}, timeout_seconds=1.0
+        )
+
+    if queued_seconds > 1:
+        with pytest.raises(ProviderDeadlineExceeded):
+            asyncio.run(scenario())
+        assert timeouts == []
+    else:
+        assert asyncio.run(scenario()).status_code == 200
+        assert timeouts == pytest.approx([1.0 - queued_seconds])
 
 
 def test_real_http_retry_after_waits_long_enough_to_admit() -> None:

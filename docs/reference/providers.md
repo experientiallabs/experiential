@@ -4,6 +4,14 @@ Experiential resolves models from a secret-free `.exp/models.toml` catalog. `Run
 only construction service. Provider names do not imply capabilities or prices. Every completion or
 embedding alias must declare the protocol features and token prices it uses.
 
+Python applications can set `RuntimeModelCatalog(catalog, http_timeout_seconds=120.0)`
+when a custom HTTP transport performs durable work around dispatch. This finite, positive
+timeout covers the entire client operation, including the injected transport. Its default
+is 60 seconds; completion requests keep a longer output-derived allowance when needed.
+`with_catalog()` preserves the setting. A transport that needs a shorter network deadline
+must enforce that deadline separately. Bedrock, Tinker, and native-only TypeSafe execution
+retain their own timeout policies.
+
 Configure connections with `exp config providers` or the first `exp build` on a clean checkout.
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with

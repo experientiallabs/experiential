@@ -39,8 +39,12 @@ from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityE
 from exp.runtime.models.providers import async_transport
 from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.anthropic_subscription import AnthropicSubscriptionClient
-from exp.runtime.models.providers.async_transport import HttpxAsyncJsonTransport
+from exp.runtime.models.providers.async_transport import (
+    HttpxAsyncJsonTransport,
+    ScriptedAsyncJsonTransport,
+)
 from exp.runtime.models.providers.azure import AzureClient
+from exp.runtime.models.providers.base import ProviderHttpClient
 from exp.runtime.models.providers.chatgpt_subscription import ChatGptSubscriptionClient
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.tinker_sampling import (
@@ -49,6 +53,7 @@ from exp.runtime.models.providers.tinker_sampling import (
     TinkerSampler,
 )
 from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
     ProviderTransportError,
     ScriptedJsonTransport,
     is_known_unbilled_failure,
@@ -63,6 +68,99 @@ _DEFAULT_CAPABILITIES = ModelCapabilities(
     context_window_tokens=128_000,
     maximum_output_tokens=16_000,
 )
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan"), True])
+def test_runtime_rejects_invalid_http_timeout_before_resolution(timeout: float) -> None:
+    """Invalid explicit deadlines fail before credentials or transports are resolved."""
+    with pytest.raises(ValueError, match="http_timeout_seconds must be finite and positive"):
+        RuntimeModelCatalog(_catalog(), environment={}, http_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("timeout", [None, 120.0])
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", None),
+        ("anthropic", None),
+        ("gemini", None),
+        ("openrouter", None),
+        ("openai-compatible", "https://models.example.test/v1"),
+        ("azure", "https://resource.example.test"),
+    ],
+)
+def test_runtime_preserves_http_timeout_in_resolved_wire_profile(
+    provider: str, base_url: str | None, timeout: float | None
+) -> None:
+    """Default and explicit bounds survive resolution and catalog replacement."""
+    catalog = _catalog(
+        provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None
+    )
+    if timeout is None:
+        runtime = RuntimeModelCatalog(
+            catalog,
+            environment={"FIXTURE_API_KEY": "fixture-key"},
+            transport_factory=ScriptedJsonTransport,
+        )
+    else:
+        runtime = RuntimeModelCatalog(
+            catalog,
+            environment={"FIXTURE_API_KEY": "fixture-key"},
+            transport_factory=ScriptedJsonTransport,
+            http_timeout_seconds=timeout,
+        )
+    for selected in (runtime, runtime.with_catalog(catalog)):
+        client = selected.resolve("fixture-model").client
+        assert isinstance(client, ProviderHttpClient)
+        assert client.gateway_wire_profile().timeout_seconds == (timeout or 60.0)
+
+
+def test_embedding_call_uses_explicit_runtime_http_timeout() -> None:
+    """An embedding dispatch receives the configured bound, including after catalog replacement."""
+    wire = ScriptedAsyncJsonTransport(
+        [
+            JsonHttpResponse(
+                200,
+                {
+                    "model": "fixture-model",
+                    "data": [{"index": 0, "embedding": [0.3, 0.7]}],
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                },
+            )
+        ]
+    )
+    catalog = _catalog(provider="openai-compatible", base_url="https://models.example.test/v1")
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=lambda: wire,
+        http_timeout_seconds=120.0,
+    ).with_catalog(catalog)
+    client = runtime.resolve("fixture-model").embedding_client
+    assert client is not None
+    assert len(client.embed(("a short retrieval query",))) == 1
+    assert len(wire.requests) == 1
+    assert 119.0 < wire.timeouts[0] <= 120.0
+
+
+def test_vertex_maas_uses_explicit_runtime_http_timeout() -> None:
+    """The separate Vertex OpenAI constructor preserves the same configured bound."""
+    catalog = _catalog(
+        provider="vertex",
+        base_url="https://aiplatform.googleapis.com/v1/projects/test/locations/global",
+    )
+    catalog.models["fixture-model"] = catalog.models["fixture-model"].model_copy(
+        update={"model": "deepseek-ai/deepseek-v3.2-maas"}
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        vertex_token_provider_factory=lambda credentials_json: lambda: "fixture-bearer",
+        http_timeout_seconds=123.0,
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, ProviderHttpClient)
+    assert client.gateway_wire_profile().timeout_seconds == 123.0
 
 
 def test_native_vertex_retains_atomic_source_receipt_across_bearer_refresh_and_rotation() -> None:
@@ -95,12 +193,16 @@ def test_native_vertex_retains_atomic_source_receipt_across_bearer_refresh_and_r
         },
     )
     runtime = RuntimeModelCatalog(
-        catalog, environment=environment, vertex_token_provider_factory=factory
+        catalog,
+        environment=environment,
+        vertex_token_provider_factory=factory,
+        http_timeout_seconds=123.0,
     )
     deployment = normalize_gateway_catalog(catalog).deployments[0]
     resolved = runtime.resolve("gemini-test")
     original = _resolved_wire_profile(deployment, resolved)
     assert original.credential_receipt is first
+    assert original.timeout_seconds == 123.0
     assert original.headers["authorization"] == "Bearer token-one"
     tokens["source-one"] = "token-one-refreshed"
     refreshed = _resolved_wire_profile(deployment, resolved)
@@ -333,6 +435,7 @@ def test_azure_foundry_routes_a_known_anthropic_model_over_the_native_messages_w
         catalog,
         environment={"FIXTURE_API_KEY": "foundry-secret"},
         transport_factory=ScriptedJsonTransport,
+        http_timeout_seconds=123.0,
     )
 
     resolved = runtime.resolve("opus")
@@ -340,6 +443,7 @@ def test_azure_foundry_routes_a_known_anthropic_model_over_the_native_messages_w
     assert isinstance(resolved.client, AnthropicClient)
     profile = resolved.client.gateway_wire_profile()
     assert profile.dialect == "anthropic_messages"
+    assert profile.timeout_seconds == 123.0
     assert profile.url == "https://silen-resource.services.ai.azure.com/anthropic/v1/messages"
     assert profile.headers["Authorization"] == "Bearer foundry-secret"
     assert "x-api-key" not in profile.headers
@@ -808,11 +912,13 @@ def test_subscription_connection_resolves_to_a_plan_client_that_signs_each_dispa
         environment={},
         transport_factory=lambda: ScriptedJsonTransport([]),
         auth_store=store,
+        http_timeout_seconds=123.0,
     ).resolve("codex")
 
     assert isinstance(resolved.client, ChatGptSubscriptionClient)
     profile = resolved.client.gateway_wire_profile()
     assert profile.url == "https://chatgpt.com/backend-api/codex/responses"
+    assert profile.timeout_seconds == 123.0
     assert profile.headers["chatgpt-account-id"] == "acct-plan"
     assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
         "Authorization": f"Bearer {access}"
@@ -878,11 +984,13 @@ def test_claude_plan_connection_needs_the_operator_app_and_then_signs_each_dispa
         },
         transport_factory=lambda: ScriptedJsonTransport([]),
         subscription_token_source_factory=factory,
+        http_timeout_seconds=123.0,
     ).resolve("claude")
 
     assert isinstance(resolved.client, AnthropicSubscriptionClient)
     profile = resolved.client.gateway_wire_profile()
     assert profile.headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert profile.timeout_seconds == 123.0
     assert "Authorization" not in profile.headers
     assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
         "Authorization": "Bearer injected"
