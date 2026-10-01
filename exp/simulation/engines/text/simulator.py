@@ -658,6 +658,7 @@ class WorldModelSimulator:
             self._leases.release(claim.lease)
             raise
         except BaseException:
+            self._leases.abandon(claim.lease)
             raise
         self._leases.release(claim.lease)
         return persisted
@@ -924,7 +925,7 @@ class WorldModelSimulator:
         *,
         attempt: int = 0,
     ) -> RolloutArtifact:
-        """Record a non-replayed crash recovery outcome for an ambiguous expired paid-cell claim.
+        """Record a non-replayed recovery outcome for an abandoned paid-cell claim.
 
         The stale claim's whole-ceiling budget barrier persists into the failure evidence so
         later spend reconciliation charges the exact durable reservation instead of aborting
@@ -939,7 +940,8 @@ class WorldModelSimulator:
         failure = StructuredFailure(
             code=FailureCode.BUDGET,
             message=(
-                "a prior paid-cell claim expired after its owner exited; EXP will not replay it"
+                "a prior paid-cell execution ended before its rollout was saved; "
+                "EXP will not replay it"
             ),
             attribution=FailureAttribution.MODEL,
             details=details,

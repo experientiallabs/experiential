@@ -1,6 +1,8 @@
 """Adversarial durability tests for text simulation paid-cell claims."""
 
 import logging
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -25,6 +27,146 @@ from exp.simulation.engines.text.leases import (
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+
+
+@pytest.mark.parametrize(
+    "follower_time",
+    [datetime(2020, 1, 1, 0, 0, 1, tzinfo=UTC), _TIME],
+    ids=["unexpired", "expired"],
+)
+def test_crashed_owner_recovers_even_when_its_pid_is_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, follower_time: datetime
+) -> None:
+    """Kernel ownership protects a live cell and releases it after abrupt process death."""
+    project = tmp_path / "projects" / "project-a"
+    ready = tmp_path / "owner-ready"
+    script = """
+import os, sys
+from datetime import UTC, datetime
+from pathlib import Path
+from exp.simulation.engines.text.leases import TextCellLeaseStore
+store = TextCellLeaseStore(Path(sys.argv[1]), clock=lambda: datetime(2020, 1, 1, tzinfo=UTC))
+claim = store.acquire(
+    lease_id='lease-a', resolution_id='resolution-a', simulation_id='simulation-a',
+    rollout_id='rollout-a', binding_sha256='a' * 64, maximum_cost_usd=1.0,
+    observed_spend_usd=lambda: 0.0, rollout_completed=lambda _: False,
+)
+assert claim.state.value == 'owned'
+Path(sys.argv[2]).write_text(str(os.getpid()))
+sys.stdin.read()
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(project), str(ready)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as owner:
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and owner.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert ready.exists(), "lease owner did not reach its dispatch boundary"
+            follower = TextCellLeaseStore(
+                project,
+                clock=lambda: follower_time,
+                wait_timeout_seconds=0.01,
+                poll_interval_seconds=0.001,
+            )
+
+            def acquire() -> TextCellLeaseClaim:
+                """Follow the exact durable claim without dispatching a provider."""
+                return follower.acquire(
+                    lease_id="lease-a",
+                    resolution_id="resolution-a",
+                    simulation_id="simulation-a",
+                    rollout_id="rollout-a",
+                    binding_sha256=_DIGEST,
+                    maximum_cost_usd=1.0,
+                    observed_spend_usd=lambda: 0.0,
+                    rollout_completed=lambda _: False,
+                )
+
+            assert acquire().state == TextCellLeaseState.CONTENDED
+            owner.kill()
+            owner.wait(timeout=10)
+            monkeypatch.setattr(leases.os, "kill", lambda _pid, _signal: None)
+            recovered = acquire()
+            assert recovered.state == TextCellLeaseState.STALE
+            assert recovered.lease is not None
+            assert recovered.lease.owner_pid == int(ready.read_text())
+            assert recovered.lease.reserved_cost_usd == 1.0
+            assert recovered.lease.unknown_spend_blocks_budget
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait(timeout=10)
+
+
+def test_abandoned_execution_retains_claim_and_unknown_spend(tmp_path: Path) -> None:
+    """A stopped cell is recoverable immediately without releasing ambiguous paid dollars."""
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
+
+    def acquire() -> TextCellLeaseClaim:
+        """Acquire the same claim before and after its execution is abandoned."""
+        return store.acquire(
+            lease_id="lease-a",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id="rollout-a",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            reservation_cost_usd=0.2,
+            observed_spend_usd=lambda: 0.0,
+            rollout_completed=lambda _: False,
+        )
+
+    first = acquire()
+    assert first.lease is not None
+    before = store._records.read("lease-a")
+    store.abandon(first.lease)
+    assert store._records.read("lease-a") == before
+    assert store.stale_recovery_pending("lease-a")
+    recovered = acquire()
+    assert recovered.state == TextCellLeaseState.STALE
+    assert recovered.lease is not None
+    assert recovered.lease.reserved_cost_usd == 1.0
+    assert recovered.lease.unknown_spend_blocks_budget
+
+
+def test_unsupported_active_owner_protocol_fails_closed_without_changing_claim(
+    tmp_path: Path,
+) -> None:
+    """An unknown ownership protocol cannot imply that a paid owner is dead."""
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
+    claim = store.acquire(
+        lease_id="lease-a",
+        resolution_id="resolution-a",
+        simulation_id="simulation-a",
+        rollout_id="rollout-a",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        observed_spend_usd=lambda: 0.0,
+        rollout_completed=lambda _: False,
+    )
+    assert claim.lease is not None
+    unsupported = claim.lease.model_copy(update={"owner_id": "unknown-ownership"})
+    encoded = canonical_json_bytes(unsupported)
+    store._records.write("lease-a", encoded)
+    with pytest.raises(TextCellLeaseError, match="start a fresh evaluation"):
+        store.stale_recovery_pending("lease-a")
+    assert store._records.read("lease-a") == encoded
+    other = store.acquire(
+        lease_id="lease-b",
+        resolution_id="resolution-b",
+        simulation_id="simulation-b",
+        rollout_id="rollout-b",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        observed_spend_usd=lambda: 0.0,
+        rollout_completed=lambda _: False,
+    )
+    assert other.state == TextCellLeaseState.OWNED
 
 
 def test_completed_rollout_release_timeout_defers_to_safe_reaping(

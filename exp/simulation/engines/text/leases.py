@@ -17,9 +17,16 @@ from pathlib import Path
 from typing import Self
 from uuid import uuid4
 
+from filelock import FileLock, Timeout
 from pydantic import AwareDatetime, Field, ValidationError, field_validator, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
+from exp.common.core.artifacts import (
+    ArtifactId,
+    ContractModel,
+    Sha256,
+    canonical_json_bytes,
+    stable_id,
+)
 from exp.common.core.locks import DEFAULT_LOCK_TIMEOUT_S, FileLockTimeout, file_write_lock
 from exp.common.project.database import project_connection
 from exp.common.project.records import ProjectRecordError, ProjectRecords
@@ -31,6 +38,7 @@ _LEASE_SUFFIX = ".json"
 _DEFAULT_STALE_AFTER_SECONDS = 15 * 60
 _DEFAULT_POLL_INTERVAL_SECONDS = 0.02
 _DEFAULT_WAIT_TIMEOUT_SECONDS = 10.0
+_OWNER_PROTOCOL = "kernel-lock-v1:"
 
 
 class TextCellLeaseError(RuntimeError):
@@ -55,7 +63,24 @@ class TextCellLeaseStatus(StrEnum):
 
 
 class TextCellLease(ContractModel):
-    """One durable exclusive claim made before any provider call in a cell."""
+    """One durable exclusive claim made before any provider call in a cell.
+
+    Attributes:
+        lease_id: Stable identity for the exact cell and attempt.
+        resolution_id: Frozen model-resolution identity.
+        simulation_id: Simulation whose cells share one spend boundary.
+        rollout_id: Expected immutable outcome for this attempt.
+        binding_sha256: Digest of the frozen cell binding.
+        maximum_cost_usd: Optional shared simulation spending ceiling.
+        reserved_cost_usd: Concrete reservation retained until spend is reconciled.
+        owner_id: Ownership protocol and unique nonce identifying the live kernel lock.
+        owner_pid: Diagnostic process number, never the default liveness authority.
+        claimed_at: Time the exclusive claim was created.
+        expires_at: Recorded deadline used by explicit process-liveness test overrides.
+        status: Active ownership or an abandoned-attempt tombstone.
+        unknown_spend_blocks_budget: Whether ambiguous paid work retains its budget barrier.
+        dispatch_intent_recorded: Whether external dispatch intent was committed.
+    """
 
     lease_id: ArtifactId
     resolution_id: ArtifactId
@@ -114,9 +139,10 @@ class TextCellLeaseStore:
     """Coordinate one local project's paid text-simulation cells across processes.
 
     A claim commits atomically before a candidate or world-model provider call. A process
-    that sees a live claim waits for its immutable rollout up to a bounded deadline. An expired
-    claim with a dead owner becomes a durable non-reserving tombstone: the earlier process may have
-    paid a provider just before crashing, so the cell is not replayed.
+    that sees a live claim waits for its immutable rollout up to a bounded deadline. Each owner
+    holds a kernel file lock for the lifetime of its execution. A claim whose owner has exited
+    becomes a durable tombstone: the earlier process may have paid a provider just before crashing,
+    so the cell is not replayed and its unknown spend remains reserved.
     """
 
     def __init__(
@@ -136,10 +162,12 @@ class TextCellLeaseStore:
         Args:
             project_directory: Canonical mutable directory for one EXP project.
             clock: Aware wall clock used for durable lease timestamps.
-            owner_alive: Process-liveness probe, injectable for deterministic recovery tests.
+            owner_alive: Optional process-liveness override for deterministic recovery tests.
+                The default probes the exact owner's kernel lock, independently of PID reuse.
             sleep: Short follower wait seam, injectable for deterministic tests.
             monotonic: Deadline clock, injectable with ``sleep`` for deterministic tests.
-            stale_after_seconds: Minimum retained duration before a dead claim is stale.
+            stale_after_seconds: Recorded claim deadline. A live owner's kernel lock remains
+                authoritative after this deadline; confirmed owner exit permits immediate recovery.
             poll_interval_seconds: Follower interval while another process owns a live claim.
             wait_timeout_seconds: Maximum wait for active same-cell or budget contention.
 
@@ -159,13 +187,14 @@ class TextCellLeaseStore:
         )
         self._directory = project_directory / _LEASE_DIRECTORY_NAME
         self._clock = clock
-        self._owner_alive = _owner_process_is_alive if owner_alive is None else owner_alive
+        self._owner_alive = owner_alive
         self._sleep = sleep
         self._monotonic = monotonic
         self._stale_after = timedelta(seconds=stale_after_seconds)
         self._poll_interval_seconds = poll_interval_seconds
         self._wait_timeout_seconds = wait_timeout_seconds
         self._admission_lock = threading.Lock()
+        self._ownership_locks: dict[str, FileLock] = {}
 
     def acquire(
         self,
@@ -260,6 +289,7 @@ class TextCellLeaseStore:
             with self._admission_transaction():
                 existing = self._read_optional(path)
                 if existing is None:
+                    self.abandon(lease)
                     return
                 intended = lease.model_copy(update={"dispatch_intent_recorded": True})
                 if existing != lease and existing != intended:
@@ -267,17 +297,32 @@ class TextCellLeaseStore:
                         f"text-cell lease {lease.lease_id!r} changed before its owner released it"
                     )
                 self._reap(path, existing)
+                self.abandon(lease)
         except (OSError, FileLockTimeout) as exc:
             logger.warning(
                 "could not release text-cell lease %s after immutable rollout persistence: %s",
                 lease.lease_id,
                 exc,
             )
+            self.abandon(lease)
+
+    def abandon(self, lease: TextCellLease) -> None:
+        """End this execution's kernel ownership without deleting its durable claim.
+
+        The caller must have stopped executing the cell. Missing rollout evidence remains an
+        ambiguous paid attempt, so a follower records the existing stale outcome without replay.
+
+        Args:
+            lease: Claim owned by this store whose execution has ended.
+        """
+        lock = self._ownership_locks.pop(lease.owner_id, None)
+        if lock is not None:
+            lock.release()
 
     def stale_recovery_pending(self, lease_id: ArtifactId) -> bool:
         """Return whether a dead prior claim awaits this exact cell's recovery rollout.
 
-        A stale tombstone, or an expired claim whose owner process is gone, keeps a
+        A stale tombstone, or a claim whose owner execution is gone, keeps a
         whole-ceiling budget barrier that only this cell's persisted recovery evidence
         clears, so callers should run such cells before admitting sibling cells.
 
@@ -285,7 +330,7 @@ class TextCellLeaseStore:
             lease_id: Stable local filename for the exact resolution and cell binding.
 
         Returns:
-            True when a stale tombstone or a dead expired claim awaits this cell's recovery.
+            True when a stale tombstone or an abandoned claim awaits this cell's recovery.
         """
         try:
             lease = self._read_optional(self._path(lease_id))
@@ -396,12 +441,17 @@ class TextCellLeaseStore:
                 binding_sha256=binding_sha256,
                 maximum_cost_usd=maximum_cost_usd,
                 reserved_cost_usd=reservation,
-                owner_id=uuid4().hex,
+                owner_id=f"{_OWNER_PROTOCOL}{uuid4().hex}",
                 owner_pid=os.getpid(),
                 claimed_at=now,
                 expires_at=now + self._stale_after,
             )
-            self._write_exclusive(path, lease)
+            self._hold_ownership(lease)
+            try:
+                self._write_exclusive(path, lease)
+            except BaseException:
+                self.abandon(lease)
+                raise
             return TextCellLeaseClaim(TextCellLeaseState.OWNED, lease, spend)
 
     @contextmanager
@@ -543,8 +593,45 @@ class TextCellLeaseStore:
         return tuple(leases)
 
     def _is_stale(self, lease: TextCellLease, now: datetime) -> bool:
-        """Recognize only expired claims whose local owner process is no longer alive."""
-        return now >= lease.expires_at and not self._owner_alive(lease.owner_pid)
+        """Recognize a stopped owner without trusting a reused or foreign process number."""
+        if self._owner_alive is not None:
+            return now >= lease.expires_at and not self._owner_alive(lease.owner_pid)
+        if not lease.owner_id.startswith(_OWNER_PROTOCOL):
+            raise TextCellLeaseError(
+                "text-cell claim uses an unsupported ownership protocol; start a fresh evaluation "
+                "after stopping its previous execution. The existing claim was not changed."
+            )
+        probe = self._owner_lock(lease)
+        try:
+            probe.acquire(timeout=0)
+        except Timeout:
+            return False
+        except OSError as exc:
+            raise TextCellLeaseError(
+                "cannot verify text-cell ownership; retry the evaluation"
+            ) from exc
+        else:
+            probe.release()
+            return True
+
+    def _owner_lock(self, lease: TextCellLease) -> FileLock:
+        """Return the exact owner's shared kernel lock with a safe derived filename."""
+        lock_id = stable_id("owner", {"owner_id": lease.owner_id})
+        path = self._directory / f"{lock_id}.lock"
+        if path.is_symlink():
+            raise TextCellLeaseError("text-cell owner lock must not be a symlink")
+        return FileLock(path, timeout=0, mode=0o600, thread_local=False)
+
+    def _hold_ownership(self, lease: TextCellLease) -> None:
+        """Acquire ownership before publishing a claim and retain it throughout execution."""
+        lock = self._owner_lock(lease)
+        try:
+            lock.acquire(timeout=0)
+        except (OSError, Timeout) as exc:
+            raise TextCellLeaseError(
+                "cannot claim text-cell ownership; retry the evaluation"
+            ) from exc
+        self._ownership_locks[lease.owner_id] = lock
 
     def _tombstone(self, path: Path, lease: TextCellLease) -> TextCellLease:
         """Atomically retain non-replay evidence without retaining its budget reservation."""
@@ -645,14 +732,3 @@ def _aware_now(clock: Callable[[], datetime]) -> datetime:
     if now.tzinfo is None or now.utcoffset() is None:
         raise TextCellLeaseError("text-cell lease clock must return timezone-aware datetimes")
     return now.astimezone(UTC)
-
-
-def _owner_process_is_alive(pid: int) -> bool:
-    """Return whether a local owner PID still exists without signaling it."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
