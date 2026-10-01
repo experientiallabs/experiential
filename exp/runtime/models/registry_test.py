@@ -189,10 +189,10 @@ def test_default_catalog_trusts_only_official_authenticated_gateway(
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        """Return a trusted-shaped refusal with a wait exceeding the configured retry ceiling."""
+        """Return a trusted-shaped refusal with a wait exceeding the request deadline."""
         requests.append(request)
         return httpx.Response(
-            429, json={}, headers={"Retry-After": "3", "x-gateway-admission-refused": "true"}
+            429, json={}, headers={"Retry-After": "10000", "x-gateway-admission-refused": "true"}
         )
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))

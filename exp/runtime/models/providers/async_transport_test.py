@@ -288,6 +288,44 @@ def test_directed_throttle_does_not_retry_before_unserviceable_hint(hint: float)
     assert not is_known_unbilled_failure(caught.value)
 
 
+@pytest.mark.parametrize("succeed", [False, True])
+def test_server_minimum_can_exceed_backoff_ceiling_within_request_deadline(succeed: bool) -> None:
+    """Ordinary five-second throttles retain three potentially paid attempts and exact pacing."""
+    clock = _RetryClock()
+    attempts = 0
+    failure = ProviderTransportError("busy", status_code=429, retry_after_seconds=5)
+
+    async def operation(timeout: float) -> str:
+        """Succeed after two ordinary upstream throttles, or exhaust the unchanged allowance."""
+        del timeout
+        nonlocal attempts
+        attempts += 1
+        if succeed and attempts == 3:
+            return "ok"
+        raise failure
+
+    async def scenario() -> str:
+        """Use one 30-second deadline without changing the default two-second backoff bound."""
+        return await run_with_retry_async(
+            operation,
+            policy=RetryPolicy(),
+            deadline=RequestDeadline.after(30, now_monotonic=clock.now),
+            sleep=clock.sleep,
+            now_monotonic=lambda: clock.now,
+            random_sample=lambda: 0.5,
+        )
+
+    if succeed:
+        assert asyncio.run(scenario()) == "ok"
+    else:
+        with pytest.raises(ProviderTransportError) as caught:
+            asyncio.run(scenario())
+        assert caught.value is failure
+        assert not is_known_unbilled_failure(caught.value)
+    assert attempts == 3
+    assert clock.sleeps == [6, 6]
+
+
 @pytest.mark.parametrize(
     ("url", "trusted", "authenticated", "status", "redirected", "expected"),
     [

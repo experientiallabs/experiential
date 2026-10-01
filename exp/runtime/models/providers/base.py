@@ -22,6 +22,7 @@ from exp.common.models import (
 from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
+    ProviderDeadlineExceeded,
     RequestDeadline,
     as_async_transport,
     post_json_async,
@@ -39,6 +40,7 @@ from exp.runtime.models.providers.transport import (
     RetryPolicy,
     classify_retry,
     is_unbilled_attempt,
+    propagate_request_attempt_evidence,
 )
 
 if TYPE_CHECKING:
@@ -752,5 +754,14 @@ async def _wait_for[ResultT](
     Returns:
         The provider result before timeout.
     """
-    async with asyncio.timeout(timeout_seconds):
-        return await operation
+    timeout = asyncio.timeout(timeout_seconds)
+    try:
+        async with timeout:
+            return await operation
+    except TimeoutError as error:
+        if not timeout.expired():
+            raise
+        failure = ProviderDeadlineExceeded("provider request deadline exceeded")
+        if isinstance(error.__cause__, asyncio.CancelledError):
+            propagate_request_attempt_evidence(error.__cause__, failure)
+        raise failure from error

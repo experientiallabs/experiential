@@ -538,14 +538,18 @@ async def run_with_retry_async[ResultT](
                 or attempts - unbilled_attempts >= policy.maximum_attempts
             ):
                 raise error
+            remaining = deadline.remaining_seconds(now_monotonic=now_monotonic())
             wait = retry_delay_seconds(
-                error, delay=delay, policy=policy, random_sample=random_sample
+                error,
+                delay=delay,
+                policy=policy,
+                random_sample=random_sample,
+                server_wait_ceiling_seconds=remaining,
             )
             # Admission retries require positive pacing even when the caller selects immediate
             # ordinary retries. A zero-delay policy cannot create a deadline-long busy loop.
             if wait is None or (unbilled and wait <= 0):
                 raise error
-            remaining = deadline.remaining_seconds(now_monotonic=now_monotonic())
             if remaining <= wait:
                 raise ProviderDeadlineExceeded("provider request deadline exceeded") from error
             if wait > 0:

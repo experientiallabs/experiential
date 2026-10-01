@@ -1,6 +1,7 @@
 """Pinned served identities and durable pairwise probe coordinates survive budget pauses."""
 
 import asyncio
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -37,8 +38,13 @@ from exp.optimize.router.judging.service_test import (
     _wide_axes,
 )
 from exp.runtime.models.budget import RequestBudget, SpendLimitReached
-from exp.runtime.models.providers import async_transport
+from exp.runtime.models.providers import async_transport, base
+from exp.runtime.models.providers.async_transport import (
+    HttpxAsyncJsonTransport,
+    ProviderDeadlineExceeded,
+)
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.providers.transport import RetryPolicy, is_known_unbilled_failure
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.registry_test import _catalog as _runtime_catalog
 
@@ -246,4 +252,65 @@ def test_standard_catalog_admission_retries_charge_only_the_successful_dispatch(
         assert wrapper.complete(request) == response
     assert len(requests) == 6
     assert budget.accounted_usd == pytest.approx(0.00014)
+    asyncio.run(http_client.aclose())
+
+
+@pytest.mark.parametrize("mode", ["unpaid", "unknown_then_unpaid", "unpaid_then_inflight"])
+def test_sync_completion_timeout_preserves_whole_request_billing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """The outer sync deadline cannot discard certified evidence when converting cancellation."""
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Exercise unpaid refusals, prior unknown outcomes, or cancelled active dispatch."""
+        del request
+        nonlocal attempts
+        attempts += 1
+        if mode == "unknown_then_unpaid" and attempts == 1:
+            return httpx.Response(503, json={})
+        if mode == "unpaid_then_inflight" and attempts == 2:
+            await asyncio.Event().wait()
+            raise AssertionError("active request returned")
+        return httpx.Response(429, json={}, headers={"x-gateway-admission-refused": "true"})
+
+    async def delayed_sleep(seconds: float) -> None:
+        """Deterministically let the caller's earlier outer timeout interrupt unpaid backoff."""
+        del seconds
+        if mode != "unpaid" and attempts == 1:
+            return
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        base,
+        "run_with_retry_async",
+        partial(async_transport.run_with_retry_async, sleep=delayed_sleep),
+    )
+    reservation = _completion_reservation("candidate")
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(
+        model=reservation.model,
+        api_key="fixture",
+        base_url="https://gateway.test/v1",
+        transport=HttpxAsyncJsonTransport(
+            http_client, trusted_admission_origin="https://gateway.test"
+        ),
+        timeout_seconds=0.05,
+        retry_policy=RetryPolicy(initial_delay_seconds=0.001),
+    )
+    budget = RequestBudget(
+        ProjectStore(tmp_path, "sync-timeout"), identity=mode, maximum_cost_usd=100
+    )
+    wrapper = BudgetedCompletion(client, budget, reservation, role="judge")
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=1
+    )
+    with budget.scope("cell"), pytest.raises(ProviderDeadlineExceeded) as caught:
+        wrapper.complete(request)
+    assert attempts == (1 if mode == "unpaid" else 2)
+    assert is_known_unbilled_failure(caught.value) is (mode == "unpaid")
+    if mode == "unpaid":
+        assert budget.accounted_usd == 0
+    else:
+        assert budget.accounted_usd > 0
     asyncio.run(http_client.aclose())

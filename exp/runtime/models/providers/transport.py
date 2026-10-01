@@ -111,6 +111,17 @@ def is_known_unbilled_failure(error: BaseException) -> bool:
     )
 
 
+def propagate_request_attempt_evidence(source: BaseException, target: BaseException) -> None:
+    """Preserve exact owning-loop evidence when a controlled boundary translates an error.
+
+    This copies only one explicitly supplied exception's evidence. Following arbitrary cause
+    chains could accidentally treat an earlier unpaid refusal as proof about a later dispatch.
+    """
+    evidence = getattr(source, "_exp_request_attempt_evidence", None)
+    if isinstance(evidence, _RequestAttemptEvidence):
+        target.__dict__["_exp_request_attempt_evidence"] = evidence
+
+
 def _safe_retry_delay(value: float | None) -> float | None:
     """Accept only finite nonnegative numeric transport hints."""
     return value if value is not None and math.isfinite(value) and value >= 0 else None
@@ -494,7 +505,9 @@ class RetryPolicy:
         maximum_attempts: Maximum potentially billable attempts. The async loop may separately
             wait for certified non-dispatch responses until its fixed request deadline.
         initial_delay_seconds: Initial backoff for ordinary transport failures.
-        maximum_delay_seconds: Explicit maximum wait between attempts, including server hints.
+        maximum_delay_seconds: Exponential backoff and jitter ceiling. Async server-directed
+            minimum waits may exceed it within the existing absolute request deadline. The
+            sync helper has no request deadline, so this remains its total per-retry wait bound.
     """
 
     maximum_attempts: int = 3
@@ -601,23 +614,36 @@ def retry_delay_seconds(
     delay: float,
     policy: RetryPolicy,
     random_sample: Callable[[], float],
+    server_wait_ceiling_seconds: float | None = None,
 ) -> float | None:
     """Respect a server minimum and add bounded jitter only to directed throttling.
 
+    Args:
+        error: The preceding attempt's safe failure metadata.
+        delay: Current exponential backoff, already bounded by policy.
+        policy: Exponential backoff and jitter bound.
+        random_sample: Injected uniform sample in [0, 1].
+        server_wait_ceiling_seconds: Remaining absolute request time for async callers. A
+            server minimum may exceed the backoff ceiling only within this bound. Without
+            it, the sync helper keeps the policy's explicit total delay ceiling.
+
     Returns:
-        The next wait, or None if the server minimum cannot fit the configured maximum.
-        A hint never extends that maximum, and jitter never advances the server's retry time.
+        The next wait, or None if the server minimum cannot fit its applicable bound.
+        Jitter never advances the server's retry time or extends the request deadline.
     """
     hint = error.retry_after_seconds if isinstance(error, ProviderTransportError) else None
+    ceiling = policy.maximum_delay_seconds
+    if hint is not None and hint > ceiling and server_wait_ceiling_seconds is not None:
+        ceiling = server_wait_ceiling_seconds
     floor = max(delay, hint or 0.0)
-    if floor > policy.maximum_delay_seconds:
+    if floor > ceiling:
         return None
     if hint is None and not is_unbilled_attempt(error):
         return floor
     sample = random_sample()
     if not math.isfinite(sample) or not 0 <= sample <= 1:
         raise ValueError("retry random sample must be finite and between zero and one")
-    headroom = min(policy.maximum_delay_seconds - floor, floor)
+    headroom = min(ceiling - floor, floor, policy.maximum_delay_seconds)
     return floor + headroom * sample
 
 
