@@ -86,13 +86,13 @@ class _Retriever:
         return OperationEconomics(cost_usd=NumericMeasurement(value=0.01, provenance="estimated"))
 
     def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
-        """Record a query and return no grounding examples.
+        """Record a query and return the configured whole grounding examples.
 
         Args:
             query: Canonical retrieval query dispatched by the recorder.
 
         Returns:
-            Empty deterministic result set.
+            Deterministic optional grounding examples.
         """
         self.queries.append(query)
         return self.matches
