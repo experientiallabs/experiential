@@ -350,3 +350,61 @@ def test_cli_spending_pause_is_saved_without_report_or_invalid_rollouts(
     assert saved.required_spending_limit_usd is not None
     assert saved.spending_limit_usd is not None
     assert saved.required_spending_limit_usd > saved.spending_limit_usd
+
+
+@pytest.mark.parametrize("choice", ["start", "back"])
+def test_uncapped_warning_precedes_the_single_launch_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str
+) -> None:
+    """An above-threshold uncapped review warns before authorization and defaults to Back."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(models=("candidate-a", "candidate-b")),
+        code_revision=_REVISION,
+    )
+    set_maximum_command_cost_usd(0.01, project.paths.root)
+    assert run.prepared.cost.estimated_cost_usd > 0.01
+    output = StringIO()
+    monkeypatch.setattr(flow, "_console", Console(file=output, width=200))
+    monkeypatch.setattr(flow, "can_prompt", lambda console: True)
+    monkeypatch.setattr(consent, "can_prompt", lambda console: False)
+    reviewed: list[str] = []
+    constructed: list[ModelCatalog] = []
+
+    def choose(*args: object, **kwargs: object) -> PickerResult:
+        """Verify the warning is already visible before accepting the single user choice."""
+        del args
+        assert "configured $0.01 warning threshold" in output.getvalue()
+        assert "Spending limit off" in output.getvalue()
+        assert kwargs["default"] == "back"
+        reviewed.append(choice)
+        return PickerResult(values=(choice,))
+
+    def runtime(catalog: ModelCatalog) -> RuntimeModelCatalog:
+        """Record authorization without constructing a live provider."""
+        constructed.append(catalog)
+        raise ValueError("authorized provider boundary")
+
+    def unexpected_confirmation(*args: object, **kwargs: object) -> bool:
+        """Reject any second confirmation after the reviewed launch action."""
+        del args, kwargs
+        pytest.fail("reviewed Start must be the only authorization")
+
+    monkeypatch.setattr(flow, "choose_one", choose)
+    monkeypatch.setattr(flow, "RuntimeModelCatalog", runtime)
+    monkeypatch.setattr(consent.Confirm, "ask", unexpected_confirmation)
+    before = len(state.completion_calls), len(state.embedding_calls), state.credential_resolutions
+    result = CliRunner().invoke(
+        app, ["eval", "support", "--root", str(project.paths.root), "--resume", run.run_id]
+    )
+    assert reviewed == [choice], result.output
+    assert len(constructed) == (1 if choice == "start" else 0)
+    assert result.exit_code == (2 if choice == "start" else 0), result.output
+    assert output.getvalue().count("configured $0.01 warning threshold") == 1
+    assert before == (
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    )

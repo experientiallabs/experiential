@@ -289,7 +289,10 @@ def run_prepared_model_evaluation(
             (runtime_input,),
             judging_protocol=judging_protocol,
             judging_input=judging_revision,
-            spending_limit_usd=budget.maximum_cost_usd,
+            # Every inference role shares the request ledger above. It enforces the
+            # operator cap before new dispatch; post-hoc service checks must not reject
+            # replay of already-paid evidence when that cap is lowered on resume.
+            spending_limit_usd=None,
             judge_spend=judge_spend,
         ),
         # Semantic execution bounds stay frozen across allowance changes. The request

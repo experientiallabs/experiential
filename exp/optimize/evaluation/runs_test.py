@@ -6,14 +6,18 @@ from typing import cast
 import pytest
 
 from exp.cli.build.app import _build_grounded_artifacts
+from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import ModelCatalog
 from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectStore, write_project_config
+from exp.common.project.records import ProjectRecords
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
+from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.export import export_report, load_report_evidence
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import (
     EvaluationDefaults,
+    EvaluationPreparationOutdated,
     evaluation_tasks,
     execute_run,
     list_runs,
@@ -21,6 +25,7 @@ from exp.optimize.evaluation.runs import (
     prepare_run,
     save_run,
 )
+from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
     _TIME,
@@ -30,6 +35,7 @@ from exp.optimize.router.automatic.service_test import (
     _trace,
 )
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.budget import SpendLimitReached
 from exp.simulation.build import build_project, select_completed_build
 from exp.simulation.mining.service import MiningSpec
 
@@ -171,3 +177,95 @@ def test_interrupted_parallel_run_resumes_without_repeating_paid_cells(tmp_path:
     assert result.report.compared_cells == 20
     assert sum(alias.startswith("candidate") for alias, _ in state.completion_calls) == 40
     assert load_run(project, run.run_id).status == "completed"
+
+
+def test_saved_run_requires_explicit_nullable_spending_limit(tmp_path: Path) -> None:
+    """Null is an intentional no-limit setting; an omitted persisted field is outdated."""
+    project, catalog, _ = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(models=("candidate-a", "candidate-b")),
+        code_revision=_REVISION,
+    )
+    records = ProjectRecords(project.paths.root, project.paths.project_id, "evaluation-runs")
+    payload = run.model_dump(mode="json")
+    assert "spending_limit_usd" in payload and payload["spending_limit_usd"] is None
+    assert load_run(project, run.run_id) == run
+    del payload["spending_limit_usd"]
+    records.write(run.run_id, canonical_json_bytes(payload))
+    with pytest.raises(EvaluationPreparationOutdated, match="new cost plan"):
+        load_run(project, run.run_id)
+    payload["spending_limit_usd"] = None
+    records.write(run.run_id, canonical_json_bytes(payload))
+    assert load_run(project, run.run_id) == run
+
+
+@pytest.mark.parametrize("pause_stage", ["evaluation cells", "judging", "judgments"])
+def test_lowered_cap_pauses_only_new_dispatch_and_preserves_paid_lineage(
+    tmp_path: Path, pause_stage: str
+) -> None:
+    """Lowering a cap replays paid work, pauses new calls, and never starts a new judge pass."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(
+            models=("candidate-a", "candidate-b"),
+            options=ModelEvaluationOptions(maximum_steps=1, maximum_concurrency=1),
+        ),
+        code_revision=_REVISION,
+    )
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    initial_calls = len(state.completion_calls)
+
+    def interrupt(event: ProgressEvent) -> None:
+        """Interrupt after paid rollouts or a persisted judgment, before all work completes."""
+        if event.stage == pause_stage and (pause_stage == "judging" or event.completed):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        execute_run(project, run, runtime, provider_spend_consented=True, progress=interrupt)
+    interrupted = load_run(project, run.run_id)
+    assert interrupted.status == "interrupted"
+    paid_calls = tuple(state.completion_calls[initial_calls:])
+    assert any(alias.startswith("candidate") for alias, _ in paid_calls)
+    assert any(alias == "judge" for alias, _ in paid_calls) is (pause_stage == "judgments")
+    limited = interrupted.model_copy(update={"spending_limit_usd": 1e-12})
+    save_run(project, limited)
+    before = tuple(state.completion_calls), tuple(state.embedding_calls)
+    with pytest.raises(SpendLimitReached):
+        execute_run(project, limited, runtime, provider_spend_consented=True)
+    paused = load_run(project, run.run_id)
+    assert paused.status == "paused"
+    assert paused.stage == "Spending limit reached"
+    assert paused.judging_revision == interrupted.judging_revision
+    assert paused.required_spending_limit_usd is not None
+    assert before == (tuple(state.completion_calls), tuple(state.embedding_calls))
+
+    resumed = paused.model_copy(update={"spending_limit_usd": None})
+    save_run(project, resumed)
+    result = execute_run(project, resumed, runtime, provider_spend_consented=True)
+    completed = load_run(project, run.run_id)
+    assert completed.status == "completed"
+    assert completed.judging_revision == interrupted.judging_revision
+    assert result.report.compared_cells == 20
+    final_calls = state.completion_calls[initial_calls:]
+    assert sum(alias.startswith("candidate") for alias, _ in final_calls) == 40
+    assert sum(alias == "judge" for alias, _ in final_calls) == 40
+    assert result.simulation_cost_usd > 1e-12
+    assert result.judge_cost_usd > 1e-12
+
+    before_replay = tuple(state.completion_calls), tuple(state.embedding_calls)
+    replay = run_prepared_model_evaluation(
+        project.snapshot(completed.project_config_sha256),
+        completed.prepared,
+        runtime,
+        budget=EvaluationBudget(maximum_cost_usd=1e-12, maximum_judgments=40),
+        provider_spend_consented=True,
+        created_at=completed.created_at,
+        code_revision=completed.code_revision,
+        judging_revision=completed.judging_revision,
+    )
+    assert replay == result
+    assert before_replay == (tuple(state.completion_calls), tuple(state.embedding_calls))

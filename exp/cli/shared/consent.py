@@ -92,7 +92,8 @@ def require_spend_consent(
             models carry no catalog pricing and the cost cannot be estimated.
         command: Complete command identity shown to the operator.
         non_interactive: Whether this invocation forbids terminal questions.
-        previously_confirmed: Whether immutable command state records an earlier confirmation.
+        previously_confirmed: Whether the estimate and its warnings were reviewed and
+            explicitly confirmed. Uncapped reviews do not repeat warnings after confirmation.
         additional_budgets: Component budgets to review together with the command total.
         cost_is_upper_bound: Whether the displayed estimate is an enforced allowance. False
             labels uncapped execution honestly and always requires explicit confirmation.
@@ -118,25 +119,12 @@ def require_spend_consent(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     budget = _cost_decimal(configured, label="configured command budget")
-    warnings: list[str] = []
-    for component in (
-        SpendBudget("command", estimated_cost_usd, configured),
-        *additional_budgets,
-    ):
-        limit = _cost_decimal(component.maximum_cost_usd, label=f"{component.name} budget")
-        if component.estimated_cost_usd is None:
-            continue
-        cost = _cost_decimal(component.estimated_cost_usd, label=f"{component.name} estimate")
-        if cost > limit:
-            threshold = (
-                f"{_format_usd(limit)} budget"
-                if cost_is_upper_bound
-                else f"configured {_format_usd(limit)} warning threshold"
-            )
-            warnings.append(
-                f"[yellow]warning[/yellow] {escape(component.name)} estimate "
-                f"{_format_usd(cost)} exceeds the {threshold}."
-            )
+    warnings = spend_warnings(
+        (SpendBudget("command", estimated_cost_usd, configured), *additional_budgets),
+        cost_is_upper_bound=cost_is_upper_bound,
+    )
+    if previously_confirmed and not cost_is_upper_bound:
+        return True
     if warnings:
         return _confirm_over_budget(
             console,
@@ -166,6 +154,40 @@ def require_spend_consent(
         return Confirm.ask(prompt, default=False, console=console)
     except EOFError:
         _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
+
+
+def spend_warnings(
+    budgets: Sequence[SpendBudget], *, cost_is_upper_bound: bool = True
+) -> tuple[str, ...]:
+    """Format cost warnings without prompting, authorizing, or changing settings.
+
+    Args:
+        budgets: Named estimates and configured warning thresholds.
+        cost_is_upper_bound: Whether amounts are enforced allowances or uncapped estimates.
+
+    Returns:
+        Markup-safe warnings for estimates above their configured thresholds.
+
+    Raises:
+        typer.BadParameter: A cost or threshold is negative or non-finite.
+    """
+    warnings: list[str] = []
+    for component in budgets:
+        limit = _cost_decimal(component.maximum_cost_usd, label=f"{component.name} budget")
+        if component.estimated_cost_usd is None:
+            continue
+        cost = _cost_decimal(component.estimated_cost_usd, label=f"{component.name} estimate")
+        if cost > limit:
+            threshold = (
+                f"{_format_usd(limit)} budget"
+                if cost_is_upper_bound
+                else f"configured {_format_usd(limit)} warning threshold"
+            )
+            warnings.append(
+                f"[yellow]warning[/yellow] {escape(component.name)} estimate "
+                f"{_format_usd(cost)} exceeds the {threshold}."
+            )
+    return tuple(warnings)
 
 
 def _confirm_undefined_cost(

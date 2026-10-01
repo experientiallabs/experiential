@@ -14,11 +14,12 @@ from rich.text import Text
 
 from exp.cli.evaluation.setup import configure_evaluation
 from exp.cli.evaluation.view import heading, inspect_report, render_report
-from exp.cli.shared.consent import can_prompt, require_spend_consent
+from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent, spend_warnings
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.picker import PickerOption, choose_one
 from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
+from exp.common.config import resolve_command_budget_usd
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressEvent, ProgressHook
 from exp.common.project import ProjectStore
@@ -170,7 +171,7 @@ def run_evaluation(
                     progress=progress,
                 )
                 save_defaults(store, selected_defaults)
-        _preflight(store, run)
+        _preflight(store, run, reviewing=interactive and not yes)
         if dry_run:
             _console.print("Prepared without provider calls. Resume with:")
             _console.print(f"exp eval {project} --root {root} --resume {run.run_id}", markup=False)
@@ -301,12 +302,13 @@ def _project_screen(project: ProjectStore) -> str | None:
             return selected.values[0]
 
 
-def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
+def _preflight(project: ProjectStore, run: EvaluationRun, *, reviewing: bool = False) -> None:
     """Show the model matrix and costs in one short launch review.
 
     Args:
         project: Project supplying the display name.
         run: Prepared evaluation supplying frozen models, repeats, and cost estimates.
+        reviewing: Whether an interactive launch choice follows this displayed estimate.
     """
     cost = run.prepared.cost
     setup = run.prepared.setup
@@ -329,6 +331,25 @@ def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
         else f"Spending limit ${run.spending_limit_usd:,.2f}"
     )
     _console.print(f"\nEstimated ${cost.estimated_cost_usd:,.2f} · {limit}")
+    if reviewing:
+        for warning in _uncapped_spend_warnings(project, run):
+            _console.print(warning)
+
+
+def _uncapped_spend_warnings(project: ProjectStore, run: EvaluationRun) -> tuple[str, ...]:
+    """Resolve warning copy for an uncapped review without granting launch authority."""
+    if run.spending_limit_usd is not None:
+        return ()
+    return spend_warnings(
+        (
+            SpendBudget(
+                "command",
+                run.prepared.cost.estimated_cost_usd,
+                resolve_command_budget_usd(project.paths.root, None),
+            ),
+        ),
+        cost_is_upper_bound=False,
+    )
 
 
 def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
@@ -346,6 +367,7 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
         choice = choose_one(
             _console,
             title="Ready",
+            default="back" if _uncapped_spend_warnings(project, run) else None,
             options=(
                 PickerOption(
                     "start", "Resume evaluation" if run.status != "prepared" else "Start evaluation"
@@ -390,7 +412,7 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
                 _console.print("Enter a positive dollar amount or none.")
                 continue
             run = run.model_copy(update={"spending_limit_usd": limit})
-            _preflight(project, run)
+            _preflight(project, run, reviewing=True)
             continue
         heading(_console, project.paths.project_id, "Cost details")
         table = Table("Stage", "Estimate", box=None)
