@@ -207,7 +207,9 @@ def test_prose_rejects_credential_assignments_and_values(content: str) -> None:
         assert_prose_secret_free(content)
 
 
-@pytest.mark.parametrize("key", ["password-policy", "authorization status"])
+@pytest.mark.parametrize(
+    "key", ["password-policy", "authorization status", "security.password-policy"]
+)
 def test_descriptive_keys_are_not_credential_fields(key: str) -> None:
     """A schema can describe credentials without storing a credential field."""
     assert_key_secret_free(key)
@@ -221,6 +223,9 @@ def test_descriptive_keys_are_not_credential_fields(key: str) -> None:
         "credential-ref",
         "OPENAI_API_KEY",
         "OPENAI_API_KEY=arbitrary-value",
+        "openai_api_key",
+        "provider.auth_token",
+        "provider/password",
         "sk-abcdefghijklmnopqrstuvwxyz123456",
     ],
 )

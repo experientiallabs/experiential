@@ -81,8 +81,14 @@ def _response_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]
 
 
 def _response_json(payload: str) -> JsonValue:
-    """Decode a response without silently discarding duplicate object members."""
-    return _JSON_VALUE.validate_python(json.loads(payload, object_pairs_hook=_response_object))
+    """Decode fields and string content without discarding duplicate object members.
+
+    Integer literals stay as digit strings in this validation-only view, avoiding Python's
+    integer-conversion limit. Persistence retains the original response, including number types.
+    """
+    return _JSON_VALUE.validate_python(
+        json.loads(payload, object_pairs_hook=_response_object, parse_int=str)
+    )
 
 
 def _validate_response_values(value: JsonValue) -> None:
@@ -100,7 +106,8 @@ def _validate_response_values(value: JsonValue) -> None:
             nested = _response_json(value)
         except (json.JSONDecodeError, ValidationError):
             return
-        _validate_response_values(nested)
+        if nested != value:
+            _validate_response_values(nested)
 
 
 class RequestReceipt(ContractModel):

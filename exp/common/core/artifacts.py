@@ -55,8 +55,7 @@ _SECRET_ENVIRONMENT_NAME_PATTERN = re.compile(
     r"\b(?:[A-Z][A-Z0-9]*_)*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN|SECRET|"
     r"CREDENTIAL)(?:_[A-Z0-9]+)*\b"
 )
-_SECRET_REFERENCE_PATTERN = re.compile(
-    r"\b(?:"
+_SECRET_REFERENCE_NAME = (
     r"access[_ -]?token|"
     r"api[_ -]?key(?:[_ -]?env)?|"
     r"authorization|"
@@ -65,7 +64,10 @@ _SECRET_REFERENCE_PATTERN = re.compile(
     r"refresh[_ -]?token|"
     r"secret(?:[_ -]?(?:env|ref))?|"
     r"token[_ -]?env"
-    r")\b",
+)
+_SECRET_REFERENCE_PATTERN = re.compile(rf"\b(?:{_SECRET_REFERENCE_NAME})\b", re.IGNORECASE)
+_SECRET_KEY_FIELD_PATTERN = re.compile(
+    rf"(?:^|[._:/ -])(?:{_SECRET_REFERENCE_NAME}|auth[_ -]?token)$",
     re.IGNORECASE,
 )
 _SECRET_ASSIGNMENT_SUFFIX_PATTERN = re.compile(
@@ -396,6 +398,8 @@ def assert_prose_secret_free(value: str) -> None:
 def assert_key_secret_free(value: str) -> None:
     """Reject credential fields and secret values while allowing descriptive JSON keys.
 
+    A provider or namespace prefix does not make a terminal credential field safe.
+
     Args:
         value: A decoded JSON object key, without its value.
 
@@ -403,9 +407,7 @@ def assert_key_secret_free(value: str) -> None:
         SecretBoundaryError: The key names a credential field or contains credential-like content.
     """
     name = value.strip()
-    if _SECRET_REFERENCE_PATTERN.fullmatch(name) or _SECRET_ENVIRONMENT_NAME_PATTERN.fullmatch(
-        name
-    ):
+    if _SECRET_KEY_FIELD_PATTERN.search(name) or _SECRET_ENVIRONMENT_NAME_PATTERN.fullmatch(name):
         raise SecretBoundaryError("immutable artifacts cannot contain credential fields")
     assert_prose_secret_free(value)
 

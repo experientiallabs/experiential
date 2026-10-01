@@ -22,6 +22,8 @@ from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
         '{"output": "The product includes password management: resets and vaults."}',
         json.dumps({"output": json.dumps({"text": "password management software"})}),
         '{"output": {"password-policy": "rotated", "authorization status": "granted"}}',
+        pytest.param(json.dumps({"output": "9" * 10_000}), id="long-numeric-prose"),
+        pytest.param('{"output":' + "9" * 10_000 + "}", id="long-json-integer"),
     ],
 )
 def test_response_prose_replays_without_treating_credential_words_as_values(
@@ -70,6 +72,13 @@ def test_response_prose_replays_without_treating_credential_words_as_values(
         '{"output": "The token env is set to arbitrary-value"}',
         '{"OPENAI_API_KEY=arbitrary-value": "output"}',
         '{" api_key ": "arbitrary-value"}',
+        '{"openai_api_key": "arbitrary-value"}',
+        '{"provider.auth_token": "arbitrary-value"}',
+        '{"provider/password": "arbitrary-value"}',
+        pytest.param(
+            '{"number":' + "9" * 10_000 + ',"\\u0061pi_key":"arbitrary-value"}',
+            id="long-integer-cannot-hide-escaped-key",
+        ),
     ],
 )
 def test_secret_response_rejected_without_settling_or_persisting(
