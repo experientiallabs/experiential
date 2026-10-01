@@ -4,7 +4,70 @@ from __future__ import annotations
 
 import json
 
-from exp.common.models.structured import structured_json_text
+import pytest
+
+from exp.common.models.model import (
+    AssistantAction,
+    BillingSource,
+    ModelFinishReason,
+    ModelResponse,
+    ModelSnapshot,
+    OperationEconomics,
+    ToolCall,
+)
+from exp.common.models.structured import (
+    StructuredReplyError,
+    structured_json_text,
+    structured_reply_json,
+)
+
+_DIGEST = "d" * 64
+
+
+def _response(
+    content: str | None,
+    *,
+    tool_calls: tuple[ToolCall, ...] = (),
+    finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED,
+) -> ModelResponse:
+    """Build one completed response carrying the given visible reply."""
+    return ModelResponse(
+        output=AssistantAction(content=content, tool_calls=tool_calls),
+        model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            provider="scripted",
+            model_id="structured-model",
+            capabilities_sha256=_DIGEST,
+            connection_sha256=_DIGEST,
+        ),
+        economics=OperationEconomics(),
+        finish_reason=finish_reason,
+    )
+
+
+def test_reply_json_parses_bare_and_fenced_payloads() -> None:
+    """Bare JSON and a single json-fenced payload both parse."""
+    assert structured_reply_json(_response('{"a": 1}')) == {"a": 1}
+    assert structured_reply_json(_response('```json\n[{"a": 1}]\n```')) == [{"a": 1}]
+
+
+def test_reply_json_rejects_truncation_before_parsing() -> None:
+    """A reply stopped at its token limit is refused even when it parses."""
+    with pytest.raises(StructuredReplyError, match="output-token limit"):
+        structured_reply_json(_response('{"a": 1}', finish_reason=ModelFinishReason.LENGTH))
+
+
+def test_reply_json_rejects_a_textless_reply() -> None:
+    """A tool-call-only reply carries no JSON payload."""
+    response = _response(None, tool_calls=(ToolCall(call_id="call-1", name="noise"),))
+    with pytest.raises(StructuredReplyError, match="no text"):
+        structured_reply_json(response)
+
+
+def test_reply_json_rejects_non_json_text() -> None:
+    """Prose that is not strict JSON is refused loudly."""
+    with pytest.raises(StructuredReplyError, match="non-JSON"):
+        structured_reply_json(_response("Here you go: a = 1"))
 
 
 def test_labeled_fence_is_unwrapped() -> None:

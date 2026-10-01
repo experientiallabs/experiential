@@ -20,6 +20,11 @@ from exp.common.judging.calibration_provenance import (
 )
 from exp.common.judging.definition import JudgeDefinition
 from exp.common.judging.display import render_rubric_table
+from exp.common.judging.grading import (
+    AnswerGrade,
+    AnswerGradeError,
+    AnswerGradeJudge,
+)
 from exp.common.judging.interface import Judge
 from exp.common.judging.judgment import DimensionJudgment, Judgment
 from exp.common.judging.labels import HumanLabelSet, HumanScore, HumanScoreHistory, HumanScoreReview
@@ -44,6 +49,11 @@ from exp.common.judging.proposal import (
     RubricProposalEvidence,
     write_rubric_proposal_evidence,
 )
+from exp.common.judging.realism import (
+    RealismAssessment,
+    RealismJudge,
+    RealismJudgmentError,
+)
 from exp.common.judging.review import (
     RubricReview,
     RubricReviewDraft,
@@ -63,6 +73,9 @@ from exp.common.judging.rubric import (
 )
 
 __all__ = [
+    "AnswerGrade",
+    "AnswerGradeError",
+    "AnswerGradeJudge",
     "CalibrationDatum",
     "CalibrationError",
     "CalibrationReport",
@@ -92,6 +105,9 @@ __all__ = [
     "RawDimensionJudgment",
     "RawJudgment",
     "judge_response_schema",
+    "RealismAssessment",
+    "RealismJudge",
+    "RealismJudgmentError",
     "Rubric",
     "RubricProposal",
     "RubricProposalEvidence",
