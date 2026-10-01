@@ -22,7 +22,8 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
 )
 from exp.common.evaluations import EvaluationCell, EvaluationPlan
-from exp.common.evaluations.build_test import _snapshot, _store
+from exp.common.evaluations.build_test import _snapshot as _base_snapshot
+from exp.common.evaluations.build_test import _store
 from exp.common.models import (
     AssistantAction,
     CompletionCostReservation,
@@ -403,6 +404,20 @@ def _grounded_world_model_input() -> ArtifactInput:
     return ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
 
 
+def _snapshot(alias: str) -> ModelSnapshot:
+    """Pin the grounded fixture world model to its actual declared capacities."""
+    snapshot = _base_snapshot(alias)
+    if alias == "world-model-a":
+        return snapshot.model_copy(
+            update={
+                "capabilities_sha256": ModelCapabilities(
+                    context_window_tokens=100_000, maximum_output_tokens=16_000
+                ).identity_sha256()
+            }
+        )
+    return snapshot
+
+
 def _grounded_world_model(
     world_client: ModelClient,
     retriever: TraceRAGRetriever,
@@ -437,6 +452,7 @@ def _grounded_world_model(
         ),
         retriever=retriever,
         client=world_client,
+        capabilities=ModelCapabilities(context_window_tokens=100_000, maximum_output_tokens=16_000),
     )
 
 

@@ -262,16 +262,41 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
         store.artifacts,
         artifact_input(artifact.manifest),
         client=client,
+        capabilities=world_capabilities,
         fit_retriever=fit_retriever,
     )
     assert runtime.retriever.rag_input == artifact_input(rag.manifest)
     assert fit_runtime.retriever.rag_input == artifact_input(fit_rag.manifest)
     assert fit_runtime.artifact_input == artifact_input(artifact.manifest)
+    assert fit_runtime.capabilities == world_capabilities
+    fit_runtime.step(task="Reset my password", action=AssistantAction(content="What email?"))
+    assert len(client.requests) == 2
+    with pytest.raises(ValueError, match="required world-model input.*context"):
+        fit_runtime.step(task="Required task " * 3_000, action=AssistantAction(content="Help"))
+    with pytest.raises(ValueError, match="lower maximum_output_tokens or choose a model"):
+        fit_runtime.step(
+            task="Reset my password",
+            action=AssistantAction(content="Help"),
+            maximum_output_tokens=8_193,
+        )
+    assert len(client.requests) == 2
+    for context in (None, 16_384, 65_536):
+        with pytest.raises(ValueError, match="capabilities differ from.*artifact"):
+            bind_fit_grounded_world_model(
+                store.artifacts,
+                artifact_input(artifact.manifest),
+                client=client,
+                fit_retriever=fit_retriever,
+                capabilities=world_capabilities.model_copy(
+                    update={"context_window_tokens": context}
+                ),
+            )
     with pytest.raises(ValueError, match="fit-only"):
         bind_fit_grounded_world_model(
             store.artifacts,
             artifact_input(artifact.manifest),
             client=client,
+            capabilities=world_capabilities,
             fit_retriever=runtime.retriever,
         )
     with pytest.raises(ValueError, match="manifest differs"):
@@ -279,6 +304,7 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
             store.artifacts,
             artifact_input(artifact.manifest).model_copy(update={"sha256": "0" * 64}),
             client=client,
+            capabilities=world_capabilities,
             fit_retriever=fit_retriever,
         )
 
@@ -294,6 +320,7 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
             store.artifacts,
             inconsistent.world_model_id,
             client=client,
+            capabilities=world_capabilities,
             embedder=binding,
         )
 
@@ -376,21 +403,25 @@ class _Retriever:
         return self.matches
 
 
-def _runtime(output: str) -> tuple[GroundedWorldModel, _Retriever, _WorldClient]:
+def _runtime(
+    output: str, *, capabilities: ModelCapabilities | None = None
+) -> tuple[GroundedWorldModel, _Retriever, _WorldClient]:
     """Build an isolated runtime with observable retrieval and completion dispatches.
 
     Args:
         output: Exact response text returned by the simulated world-model provider.
+        capabilities: Exact provider metadata frozen into the fixture model identity.
 
     Returns:
         Runtime, query recorder, and completion recorder.
     """
+    capabilities = capabilities or ModelCapabilities()
     rag_input = ArtifactInput(artifact_id="serving-rag", sha256="a" * 64)
     snapshot = ModelSnapshot(
         billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="world",
-        capabilities_sha256=sha256_json(ModelCapabilities()),
+        capabilities_sha256=capabilities.identity_sha256(),
         connection_sha256=sha256_json({"connection": "world"}),
     )
     retriever = _Retriever()
@@ -412,8 +443,25 @@ def _runtime(output: str) -> tuple[GroundedWorldModel, _Retriever, _WorldClient]
         ),
         retriever=cast(TraceRAGRetriever, retriever),
         client=client,
+        capabilities=capabilities,
     )
     return runtime, retriever, client
+
+
+@pytest.mark.parametrize("context", [None, 16_384, 65_536])
+def test_direct_runtime_rejects_capabilities_outside_frozen_identity(context: int | None) -> None:
+    """Direct construction cannot disable or widen the artifact's known context capacity."""
+    runtime, retriever, client = _runtime(
+        '{"message":"Next","terminal":false}',
+        capabilities=ModelCapabilities(context_window_tokens=32_768, maximum_output_tokens=8_192),
+    )
+    with pytest.raises(ValueError, match="capabilities differ from.*artifact"):
+        replace(
+            runtime,
+            capabilities=runtime.capabilities.model_copy(update={"context_window_tokens": context}),
+        )
+    assert retriever.queries == []
+    assert client.requests == []
 
 
 def test_step_rejects_unsolicited_tool_results_for_text_action() -> None:
@@ -426,9 +474,8 @@ def test_step_rejects_unsolicited_tool_results_for_text_action() -> None:
 @pytest.mark.parametrize("public_session", [False, True])
 def test_public_steps_pack_examples_and_reject_required_overflow(public_session: bool) -> None:
     """Both public step surfaces fit optional evidence before dispatch, retaining required text."""
-    runtime, retriever, client = _runtime('{"message":"Next","terminal":false}')
-    runtime = replace(
-        runtime,
+    runtime, retriever, client = _runtime(
+        '{"message":"Next","terminal":false}',
         capabilities=ModelCapabilities(context_window_tokens=24_000, maximum_output_tokens=16_000),
     )
     retriever.matches = (_grounding_example("oversized", 30_000), _grounding_example("fits", 50))

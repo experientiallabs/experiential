@@ -233,7 +233,7 @@ def _priced_capabilities() -> ModelCapabilities:
     return ModelCapabilities(
         supports_completions=True,
         context_window_tokens=100_000,
-        maximum_output_tokens=16_000,
+        maximum_output_tokens=32_000,
         input_cost_per_million_tokens_usd=1.0,
         output_cost_per_million_tokens_usd=1.0,
         cached_input_cost_per_million_tokens_usd=1.0,
@@ -699,6 +699,7 @@ class _SimulatorFactory:
                     project.artifacts,
                     completed.world_model,
                     client=world_model.client,
+                    capabilities=world_model.capabilities,
                     fit_retriever=fit_retriever,
                 )
             },
@@ -843,6 +844,7 @@ class _CapExhaustedSimulatorFactory(_SimulatorFactory):
                     project.artifacts,
                     completed.world_model,
                     client=world_model.client,
+                    capabilities=world_model.capabilities,
                     fit_retriever=fit_retriever,
                 )
             },

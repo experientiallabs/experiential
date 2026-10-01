@@ -137,7 +137,8 @@ class GroundedWorldModel:
         artifact: Frozen model identity and grounding protocol.
         retriever: Fit or serving retriever bound to the artifact's immutable corpus.
         client: Explicit completion provider for world predictions.
-        capabilities: Resolved capacity for request fitting, when available.
+        capabilities: Required resolved metadata matching the artifact's frozen identity.
+            Unknown capacity fields remain explicit rather than disabling identity verification.
         token_counter: Complete-request counter used for capacity admission.
     """
 
@@ -145,8 +146,16 @@ class GroundedWorldModel:
     artifact: GroundedWorldModelArtifact
     retriever: TraceRAGRetriever
     client: ModelClient
-    capabilities: ModelCapabilities | None = None
+    capabilities: ModelCapabilities
     token_counter: TokenCounter = field(default_factory=Utf8UpperBoundTokenCounter)
+
+    def __post_init__(self) -> None:
+        """Reject a capacity binding that differs from the immutable build artifact."""
+        if self.capabilities.identity_sha256() != self.artifact.model.capabilities_sha256:
+            raise ValueError(
+                "world-model capabilities differ from the frozen build artifact; "
+                "use the artifact's resolved model or rebuild with the intended model"
+            )
 
     def prepare_turn(
         self,
@@ -217,19 +226,21 @@ class GroundedWorldModel:
         Raises:
             ValueError: Required evidence or output cannot fit the bound model capacity.
         """
-        if self.capabilities is not None:
-            prepared = prepared.fit_context(self.capabilities, self.token_counter)
-            required = self.token_counter.count(prepared.request)
-            output = prepared.request.maximum_output_tokens or 0
-            context = self.capabilities.context_window_tokens
-            if required < 0 or (context is not None and required + output > context):
-                raise ValueError(
-                    "required world-model input and output exceed the context capacity; "
-                    "choose a larger-context world model"
-                )
-            published_output = self.capabilities.maximum_output_tokens
-            if published_output is not None and output > published_output:
-                raise ValueError("world-model output exceeds the published model capacity")
+        prepared = prepared.fit_context(self.capabilities, self.token_counter)
+        required = self.token_counter.count(prepared.request)
+        output = prepared.request.maximum_output_tokens or 0
+        context = self.capabilities.context_window_tokens
+        if required < 0 or (context is not None and required + output > context):
+            raise ValueError(
+                "required world-model input and output exceed the context capacity; "
+                "choose a larger-context world model"
+            )
+        published_output = self.capabilities.maximum_output_tokens
+        if published_output is not None and output > published_output:
+            raise ValueError(
+                "world-model output exceeds the published model capacity; lower "
+                "maximum_output_tokens or choose a model with a larger output capacity"
+            )
         response = self.client.complete(prepared.request)
         return DispatchedGroundedWorldModelCall(
             request=prepared.request,
@@ -323,8 +334,8 @@ def load_grounded_world_model(
     artifact_id: str,
     *,
     client: ModelClient,
+    capabilities: ModelCapabilities,
     embedder: RAGEmbedderBinding | None = None,
-    capabilities: ModelCapabilities | None = None,
     token_counter: TokenCounter | None = None,
 ) -> GroundedWorldModel:
     """Load and verify one executable grounded world-model artifact.
@@ -335,8 +346,8 @@ def load_grounded_world_model(
         client: Runtime client. Every returned response must match the artifact's exact model
             identity before its output is accepted.
         embedder: Exact explicit semantic embedding binding used to build the serving RAG.
-        capabilities: Resolved world-model capacity for pre-dispatch packing. When supplied,
-            its identity must match the artifact's frozen model snapshot.
+        capabilities: Required resolved metadata for pre-dispatch packing. Its identity must
+            match the artifact's frozen model snapshot, including unknown capacity fields.
         token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
 
     Returns:
@@ -348,10 +359,6 @@ def load_grounded_world_model(
     stored = store.read(artifact_id)
     world_model_input = artifact_input(stored.manifest)
     artifact = _load_verified_artifact(store, world_model_input)
-    if capabilities is not None and (
-        capabilities.identity_sha256() != artifact.model.capabilities_sha256
-    ):
-        raise ValueError("world-model capabilities differ from the frozen build artifact")
     loaded_rag = load_rag_index(store, artifact.serving_rag.artifact_id)
     return GroundedWorldModel(
         artifact_input=world_model_input,
@@ -407,6 +414,8 @@ def bind_fit_grounded_world_model(
     *,
     client: ModelClient,
     fit_retriever: TraceRAGRetriever,
+    capabilities: ModelCapabilities,
+    token_counter: TokenCounter | None = None,
 ) -> GroundedWorldModel:
     """Bind a persisted world-model protocol to the exact fit-only simulation index.
 
@@ -415,12 +424,15 @@ def bind_fit_grounded_world_model(
         world_model_input: Exact completed grounded world-model manifest pointer.
         client: Resolved world-model provider client.
         fit_retriever: Exact fit-only retriever used by optimization simulation.
+        capabilities: Required resolved metadata matching the artifact's frozen identity.
+        token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
 
     Returns:
         Artifact-bound executor that can retrieve only fit evidence.
 
     Raises:
-        ValueError: Artifact, source, schema, embedder, lineage, or top-k identity differs.
+        ValueError: Artifact, capability, source, schema, embedder, lineage, or top-k
+            identity differs.
     """
     artifact = _load_verified_artifact(store, world_model_input)
     serving = load_rag_index(store, artifact.serving_rag.artifact_id)
@@ -457,6 +469,8 @@ def bind_fit_grounded_world_model(
         artifact=artifact,
         retriever=fit_retriever,
         client=client,
+        capabilities=capabilities,
+        token_counter=token_counter or Utf8UpperBoundTokenCounter(),
     )
 
 

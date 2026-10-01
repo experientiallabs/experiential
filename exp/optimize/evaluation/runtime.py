@@ -242,6 +242,7 @@ def run_prepared_model_evaluation(
         project.artifacts,
         completed.world_model,
         client=world.client,
+        capabilities=world.capabilities,
         fit_retriever=retriever,
     )
 

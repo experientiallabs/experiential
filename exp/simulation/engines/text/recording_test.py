@@ -98,12 +98,20 @@ class _Retriever:
         return self.matches
 
 
-def _snapshot(name: str) -> ModelSnapshot:
+def _snapshot(
+    name: str,
+    *,
+    capabilities: ModelCapabilities | None = None,
+) -> ModelSnapshot:
+    """Freeze the exact declared capacity for a scripted provider response."""
+    capabilities = capabilities or ModelCapabilities(
+        context_window_tokens=100_000, maximum_output_tokens=16_000
+    )
     return ModelSnapshot(
         billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=name,
-        capabilities_sha256="a" * 64,
+        capabilities_sha256=capabilities.identity_sha256(),
         connection_sha256="b" * 64,
     )
 
@@ -207,18 +215,19 @@ def _resolved(
     Returns:
         Exact scripted runtime model.
     """
+    capabilities = ModelCapabilities(
+        supports_completions=True if completion_pricing else None,
+        context_window_tokens=context_window_tokens,
+        maximum_output_tokens=output_limit,
+        input_cost_per_million_tokens_usd=input_price if completion_pricing else None,
+        output_cost_per_million_tokens_usd=2.0 if completion_pricing else None,
+        cached_input_cost_per_million_tokens_usd=0.5 if completion_pricing else None,
+        cache_write_cost_per_million_tokens_usd=1.5 if completion_pricing else None,
+    )
     return ResolvedModel(
         alias=alias,
-        snapshot=_snapshot(alias),
-        capabilities=ModelCapabilities(
-            supports_completions=True if completion_pricing else None,
-            context_window_tokens=context_window_tokens,
-            maximum_output_tokens=output_limit,
-            input_cost_per_million_tokens_usd=input_price if completion_pricing else None,
-            output_cost_per_million_tokens_usd=2.0 if completion_pricing else None,
-            cached_input_cost_per_million_tokens_usd=0.5 if completion_pricing else None,
-            cache_write_cost_per_million_tokens_usd=1.5 if completion_pricing else None,
-        ),
+        snapshot=_snapshot(alias, capabilities=capabilities),
+        capabilities=capabilities,
         client=client,
         embedding_client=None,
     )
@@ -304,6 +313,8 @@ def _recorder(
         ),
         retriever=retriever,
         client=world_client,
+        capabilities=world_model.capabilities,
+        token_counter=_Utf8Counter(),
     )
     return RecordingCandidateClient(
         task=task or _task(),
@@ -333,7 +344,11 @@ def _recorder(
 
 
 def _completion_reservation(
-    alias: str, *, maximum_input_tokens: int = 80_000, maximum_output_tokens: int = 16_000
+    alias: str,
+    *,
+    maximum_input_tokens: int = 80_000,
+    maximum_output_tokens: int = 16_000,
+    capabilities: ModelCapabilities | None = None,
 ) -> CompletionCostReservation:
     """Return a complete one-attempt request reservation for a scripted alias.
 
@@ -341,12 +356,13 @@ def _completion_reservation(
         alias: Exact candidate or world-model alias.
         maximum_input_tokens: Full request input ceiling.
         maximum_output_tokens: Finite request output budget.
+        capabilities: Exact provider capacity metadata frozen into the reservation identity.
 
     Returns:
         Conservative completion request reservation.
     """
     return completion_cost_reservation(
-        model=_snapshot(alias),
+        model=_snapshot(alias, capabilities=capabilities),
         input_usd_per_million_tokens=1,
         output_usd_per_million_tokens=2,
         cached_input_usd_per_million_tokens=0.5,
@@ -387,8 +403,24 @@ def test_world_context_packs_whole_examples_and_records_only_dispatched_groundin
     candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
     world = _ScriptedClient(
         [
-            _response("bad", model=_snapshot("world-model-a")),
-            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+            _response(
+                "bad",
+                model=_snapshot(
+                    "world-model-a",
+                    capabilities=ModelCapabilities(
+                        context_window_tokens=24_000, maximum_output_tokens=16_000
+                    ),
+                ),
+            ),
+            _response(
+                '{"message":"","terminal":true}',
+                model=_snapshot(
+                    "world-model-a",
+                    capabilities=ModelCapabilities(
+                        context_window_tokens=24_000, maximum_output_tokens=16_000
+                    ),
+                ),
+            ),
         ]
     )
     recorder = _recorder(
@@ -421,9 +453,25 @@ def test_world_context_packs_whole_examples_and_records_only_dispatched_groundin
 
 def test_unpublished_world_output_packs_examples_before_binding_output() -> None:
     """Optional grounding must not consume the requested output when no hard max is published."""
-    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    candidate = _ScriptedClient(
+        [
+            _response(
+                "answer",
+                model=_snapshot(
+                    "candidate-a", capabilities=ModelCapabilities(context_window_tokens=100_000)
+                ),
+            )
+        ]
+    )
     world = _ScriptedClient(
-        [_response('{"message":"","terminal":true}', model=_snapshot("world-model-a"))]
+        [
+            _response(
+                '{"message":"","terminal":true}',
+                model=_snapshot(
+                    "world-model-a", capabilities=ModelCapabilities(context_window_tokens=24_000)
+                ),
+            )
+        ]
     )
     recorder = _recorder(
         candidate,
@@ -734,7 +782,12 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
     assert overflow_error.value.stop_reason == StopReason.CONTEXT_OVERFLOW
     assert candidate_client.requests == []
 
-    candidate_snapshot = _snapshot("candidate-a")
+    candidate_snapshot = _snapshot(
+        "candidate-a",
+        capabilities=ModelCapabilities(
+            context_window_tokens=100_000, maximum_output_tokens=output_limit
+        ),
+    )
     length_client = _ScriptedClient(
         [
             _response(
@@ -759,9 +812,13 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
 
 def test_unpublished_output_limits_dispatch_full_requests_within_context_and_reservations() -> None:
     """Both completion roles work without an invented provider limit and keep exact inputs."""
+    candidate_capabilities = ModelCapabilities(context_window_tokens=10_000)
+    world_capabilities = ModelCapabilities(context_window_tokens=100_000)
     candidate = _ScriptedClient(
         [
-            _response("Done.", model=_snapshot("candidate-a")).model_copy(
+            _response(
+                "Done.", model=_snapshot("candidate-a", capabilities=candidate_capabilities)
+            ).model_copy(
                 update={
                     "economics": OperationEconomics(usage=Usage(input_tokens=4, output_tokens=3))
                 }
@@ -769,7 +826,12 @@ def test_unpublished_output_limits_dispatch_full_requests_within_context_and_res
         ]
     )
     world = _ScriptedClient(
-        [_response('{"message":"Done.","terminal":true}', model=_snapshot("world-model-a"))]
+        [
+            _response(
+                '{"message":"Done.","terminal":true}',
+                model=_snapshot("world-model-a", capabilities=world_capabilities),
+            )
+        ]
     )
     recorder = _recorder(
         candidate,
@@ -777,9 +839,14 @@ def test_unpublished_output_limits_dispatch_full_requests_within_context_and_res
         candidate_context_window=10_000,
         output_limit=None,
         candidate_request=_completion_reservation(
-            "candidate-a", maximum_input_tokens=10_000, maximum_output_tokens=10_000
+            "candidate-a",
+            maximum_input_tokens=10_000,
+            maximum_output_tokens=10_000,
+            capabilities=candidate_capabilities,
         ),
-        world_request=_completion_reservation("world-model-a", maximum_input_tokens=100_000),
+        world_request=_completion_reservation(
+            "world-model-a", maximum_input_tokens=100_000, capabilities=world_capabilities
+        ),
     )
     request = ModelRequest(messages=(ModelMessage(role="user", content="Complete the task."),))
     recorder.complete(request)
@@ -1123,10 +1190,17 @@ def test_world_retry_without_feedback_room_reuses_full_original_request(limited_
     with pytest.raises(TextSimulationError):
         baseline.complete(request)
     input_tokens = _Utf8Counter().count(baseline_world.requests[0])
+    world_context = input_tokens + 16_000 if limited_by == "context" else 100_000
+    world_snapshot = _snapshot(
+        "world-model-a",
+        capabilities=ModelCapabilities(
+            context_window_tokens=world_context, maximum_output_tokens=16_000
+        ),
+    )
     world = _ScriptedClient(
         [
-            invalid,
-            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+            invalid.model_copy(update={"model": world_snapshot}),
+            _response('{"message":"","terminal":true}', model=world_snapshot),
         ]
     )
     world.responses = [
@@ -1144,7 +1218,7 @@ def test_world_retry_without_feedback_room_reuses_full_original_request(limited_
         candidate,
         world,
         maximum_transition_attempts=3,
-        world_context_window=input_tokens + 16_000 if limited_by == "context" else 100_000,
+        world_context_window=world_context,
         world_request=_completion_reservation("world-model-a", maximum_input_tokens=input_tokens)
         if limited_by == "reservation"
         else None,

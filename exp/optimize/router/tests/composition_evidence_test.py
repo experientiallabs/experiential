@@ -280,6 +280,7 @@ class _EvidenceSimulatorFactory:
                     project.artifacts,
                     completed.world_model,
                     client=world_model.client,
+                    capabilities=world_model.capabilities,
                     fit_retriever=fit_retriever,
                 )
             },

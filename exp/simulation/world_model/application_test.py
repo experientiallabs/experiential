@@ -507,6 +507,7 @@ def _runtime(
         ),
         retriever=cast(TraceRAGRetriever, retriever),
         client=client,
+        capabilities=ModelCapabilities(),
     )
     return runtime, retriever, client
 
@@ -530,7 +531,7 @@ def _snapshot(
         billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id=model_id,
-        capabilities_sha256=sha256_json(resolved_capabilities),
+        capabilities_sha256=resolved_capabilities.identity_sha256(),
         connection_sha256=sha256_json({"connection": model_id}),
     )
 

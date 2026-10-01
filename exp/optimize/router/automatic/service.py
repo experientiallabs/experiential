@@ -657,6 +657,7 @@ def _workflow_services(
                     project.artifacts,
                     preflight.completed_build.world_model,
                     client=world.client,
+                    capabilities=world.capabilities,
                     fit_retriever=retriever,
                 )
             },

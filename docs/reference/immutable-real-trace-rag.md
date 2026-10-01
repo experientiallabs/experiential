@@ -38,6 +38,12 @@ fails instead of truncating it. For models without a published output maximum, t
 remaining-context output binding happens after optional examples yield to the requested output. The
 100-step and 1,000,000-total-output-token rollout defaults are independent of this packing.
 
+Low-level `GroundedWorldModel` construction, `load_grounded_world_model`, and
+`bind_fit_grounded_world_model` require `capabilities=resolved_model.capabilities`. The metadata
+must match the model identity frozen into the build artifact before either serving or fit-only
+execution can proceed. A matching explicit `ModelCapabilities()` remains valid for a model with
+unknown capacities; omitting known metadata cannot disable capacity admission.
+
 ## Historical provenance
 
 This design restores useful behavior from the last coherent pre-refactor implementation:
