@@ -133,13 +133,47 @@ jobs:
           uv run pytest -q -k "not live"
           exp/optimize/model/sft/tinker_test.py
       - name: non-live tests
+        # The three slowest areas (~83% of test time) run in gate-shards, in
+        # parallel with this job; keep these --ignore dirs equal to its matrix paths.
         run: >-
           uv run pytest -n 4 --dist worksteal -q -k "not live"
           exp
+          --ignore=exp/optimize/router
+          --ignore=exp/runtime/gateway
+          --ignore=exp/optimize/evaluation
           --ignore=exp/optimize/model/sft/tinker_test.py
-          --ignore=exp/optimize/router/tests/composition_evidence_test.py
           --ignore=exp/simulation/tests/comparison_evidence_test.py
           --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
+
+  gate-shards:
+    # Standard runners are free on this public repository, so splitting the
+    # slowest test areas off the gate job halves its wall clock at no cost.
+    name: gate tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: router
+            paths: exp/optimize/router
+          - name: gateway-evaluation
+            paths: exp/runtime/gateway exp/optimize/evaluation
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: exp/runtime/gateway/native
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: non-live tests
+        run: >-
+          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          ${{ matrix.paths }}
+          --ignore=exp/optimize/router/tests/composition_evidence_test.py
 
   sdk-python312:
     runs-on: ubuntu-latest
