@@ -35,7 +35,7 @@ class EvaluationSetup(ContractModel):
         maximum_steps: Positive candidate-turn ceiling.
         continuation_of: Optional parent evaluation retained during budget continuation.
         maximum_rollout_output_tokens: Positive cumulative generation ceiling, default one million.
-        maximum_concurrency: Positive maximum number of simultaneous rollouts.
+        maximum_concurrency: Positive phase-wide allowance for simultaneous rollouts or judgments.
         repeats: Independent runs per scenario/model pair, default one and separate from retries.
     """
 

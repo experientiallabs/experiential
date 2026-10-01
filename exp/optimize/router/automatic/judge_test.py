@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from exp.common.models import (
     BillingSource,
     ModelCapabilities,
+    ModelClient,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    OperationEconomics,
+    Usage,
     completion_cost_reservation,
 )
 from exp.optimize.router.automatic.judge import ReservedJudgeClient
@@ -21,6 +27,129 @@ from exp.optimize.router.errors import (
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
+
+
+def _parallel_model() -> ModelSnapshot:
+    """Return the exact identity shared by concurrent judge fixtures."""
+    return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        provider="openai",
+        model_id="judge-model",
+        capabilities_sha256="a" * 64,
+        connection_sha256="b" * 64,
+    )
+
+
+class _UsageClient:
+    """Report distinct input usage so accounting from neighboring judgments is detectable."""
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Return usage encoded in this fixture's sole message."""
+        content = request.messages[0].content
+        assert isinstance(content, str)
+        return _unused_response(_parallel_model()).model_copy(
+            update={
+                "economics": OperationEconomics(
+                    provider_attempts=1,
+                    usage=Usage(input_tokens=int(content), output_tokens=1),
+                )
+            }
+        )
+
+
+def _reserved_client(client: ModelClient, *, maximum_calls: int) -> ReservedJudgeClient:
+    """Wrap a fixture in the actual frozen request and global call-count boundaries."""
+    model = _parallel_model()
+    reservation = completion_cost_reservation(
+        model=model,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=4.0,
+        cached_input_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=2.0,
+        maximum_attempts=1,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    return ReservedJudgeClient(
+        client,
+        reservation=reservation,
+        model=model,
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            context_window_tokens=2_000,
+            maximum_output_tokens=500,
+            input_cost_per_million_tokens_usd=1.0,
+            output_cost_per_million_tokens_usd=4.0,
+            cached_input_cost_per_million_tokens_usd=0.5,
+            cache_write_cost_per_million_tokens_usd=2.0,
+        ),
+        maximum_attempts=1,
+        maximum_provider_calls=maximum_calls,
+    )
+
+
+def test_judge_accounting_is_isolated_across_overlapping_scopes() -> None:
+    """Every scope sees only its own responses even after all siblings have completed."""
+    client = _reserved_client(_UsageClient(), maximum_calls=4)
+    barrier = threading.Barrier(4)
+
+    def complete(tokens: int) -> tuple[int, tuple[int, ...]]:
+        """Inspect one local ledger only after every concurrent call recorded usage."""
+        with client.accounting_scope() as accounting:
+            client.complete(
+                ModelRequest(
+                    messages=(ModelMessage(role="user", content=str(tokens)),),
+                    maximum_output_tokens=32,
+                )
+            )
+            barrier.wait(timeout=5)
+            return accounting.calls, tuple(
+                item.usage.input_tokens for item in accounting.economics if item.usage
+            )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = tuple(pool.map(complete, (100, 200, 300, 400)))
+    assert results == ((1, (100,)), (1, (200,)), (1, (300,)), (1, (400,)))
+    assert client.calls == 4
+    assert len(client.economics) == 4
+    with client.accounting_scope() as fresh:
+        assert fresh.calls == 0
+        assert fresh.economics == []
+
+
+def test_concurrent_judge_calls_cannot_exceed_one_shared_call_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent preflight completion cannot multiply the global dispatch allowance."""
+    client = _reserved_client(_UsageClient(), maximum_calls=3)
+    barrier = threading.Barrier(8)
+
+    def count(request: ModelRequest) -> int:
+        """Hold all threads at the preflight/admission boundary simultaneously."""
+        barrier.wait(timeout=5)
+        return 10
+
+    monkeypatch.setattr(client._counter, "count", count)
+
+    def complete(index: int) -> bool:
+        """Attempt one bounded call and identify rejected excess admissions."""
+        try:
+            client.complete(
+                ModelRequest(
+                    messages=(ModelMessage(role="user", content="100"),),
+                    maximum_output_tokens=32,
+                )
+            )
+            return True
+        except ValueError as exc:
+            assert "call reservation is exhausted" in str(exc)
+            return False
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        admitted = tuple(pool.map(complete, range(8)))
+    assert sum(admitted) == 3
+    assert client.calls == 3
+    assert len(client.economics) == 3
 
 
 class _Client:

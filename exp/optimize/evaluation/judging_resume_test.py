@@ -1,5 +1,6 @@
 """Judging recovery preserves completed rollouts, scores, and prior spend."""
 
+import threading
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
@@ -14,11 +15,13 @@ from exp.common.models import AssistantAction, ModelCatalog, ModelRequest, Model
 from exp.common.project import ArtifactManifest
 from exp.common.project.records import ProjectRecords
 from exp.common.rollouts import RolloutArtifact
+from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.judging_resume import (
     prepare_judging_revision,
     read_judging_revision,
 )
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
+from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runs import (
     EvaluationDefaults,
     EvaluationRun,
@@ -27,9 +30,12 @@ from exp.optimize.evaluation.runs import (
     prepare_run,
     save_run,
 )
+from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
+from exp.optimize.evaluation.service import ModelEvaluationResult
 from exp.optimize.router.automatic import service_test as automatic_fixtures
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
+    _TIME,
     _completed_project,
     _CompletionClient,
     _RuntimeCatalog,
@@ -38,6 +44,76 @@ from exp.optimize.router.judging import protocol
 from exp.optimize.router.judging.contracts import JudgePromptTemplate, ManualJudgeError
 from exp.optimize.router.judgment_budget import JudgmentExclusionRecord
 from exp.runtime.models import RuntimeModelCatalog
+
+
+def test_parallel_judge_write_failure_drains_and_reuses_every_paid_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent successful receipts survive one failed artifact write and exact resume."""
+    project, catalog, state, prepared = _prepare(tmp_path)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    original_write = project.artifacts.write_json
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    probes = 0
+
+    def write_probe(
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: ArtifactEnvelope,
+        files: Mapping[str, BaseModel | JsonValue],
+    ) -> ArtifactManifest:
+        """Fail one completed response only after a sibling is also ready to persist."""
+        nonlocal probes
+        if artifact_type == "manual-judge-probe":
+            with lock:
+                probes += 1
+                ordinal = probes
+            if ordinal <= 2:
+                barrier.wait(timeout=5)
+            if ordinal == 1:
+                raise OSError("interrupted concurrent probe write")
+        return original_write(
+            artifact_id=artifact_id, artifact_type=artifact_type, envelope=envelope, files=files
+        )
+
+    def run() -> ModelEvaluationResult:
+        """Use the exact same evaluation identity and shared request ledger on every attempt."""
+        return run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+
+    monkeypatch.setattr(project.artifacts, "write_json", write_probe)
+    with pytest.raises(OSError, match="interrupted concurrent probe write"):
+        run()
+    before = Counter(alias for alias, _ in state.completion_calls)
+    saved_judgments = {
+        key
+        for key in project.artifacts.list_ids()
+        if project.artifacts.read(key).manifest.artifact_type == "judgment"
+    }
+    assert 2 <= before["judge"] <= 6
+    assert saved_judgments
+    monkeypatch.setattr(project.artifacts, "write_json", original_write)
+    result = run()
+    after = Counter(alias for alias, _ in state.completion_calls)
+    assert after["judge"] == 6
+    assert after["candidate-a"] == after["candidate-b"] == 3
+    assert result.report.compared_cells == 3
+    assert saved_judgments.issubset(project.artifacts.list_ids())
+    assert not any(
+        project.artifacts.read(key).manifest.artifact_type == "judgment-exclusion"
+        for key in project.artifacts.list_ids()
+    )
+    assert run() == result
+    assert after == Counter(alias for alias, _ in state.completion_calls)
 
 
 def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
@@ -51,7 +127,9 @@ def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
         EvaluationDefaults(
             models=("candidate-a", "candidate-b"),
             minimum_scenarios=3,
-            options=ModelEvaluationOptions(maximum_steps=1, maximum_judge_input_tokens=32_768),
+            options=ModelEvaluationOptions(
+                maximum_steps=1, maximum_judge_input_tokens=32_768, maximum_concurrency=1
+            ),
         ),
         code_revision=_REVISION,
     ).model_copy(update={"spending_limit_usd": 100.0})
@@ -196,7 +274,7 @@ def test_recovery_counts_paid_response_when_probe_write_failed(
         EvaluationDefaults(
             models=("candidate-a", "candidate-b"),
             minimum_scenarios=3,
-            options=ModelEvaluationOptions(maximum_steps=1),
+            options=ModelEvaluationOptions(maximum_steps=1, maximum_concurrency=1),
         ),
         code_revision=_REVISION,
     ).model_copy(update={"spending_limit_usd": 100.0})

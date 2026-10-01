@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from exp.common.evaluations.model_report import ModelEvaluationReport
-from exp.common.judging import HumanScoreReview, JudgeCalibrationService, PromptDefinition
+from exp.common.judging import HumanScoreReview, JudgeCalibrationService, Judgment, PromptDefinition
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.common.tasks import load_task_set
@@ -41,6 +42,77 @@ class _Judge(_RouterTestJudge):
     """Expose the configured test model before any simulation or judgment dispatch."""
 
     model: ModelSnapshot = _snapshot("judge-model")
+
+
+def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
+    tmp_path: Path,
+) -> None:
+    """Real persisted evaluations overlap judgments and replay without another dispatch."""
+    project, setup = _prepared(tmp_path)
+    setup = setup.model_copy(update={"maximum_concurrency": 2})
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    active = 0
+    peak = 0
+    admitted = 0
+
+    class ConcurrentJudge(_Judge):
+        """Hold the first pair of provider-bound judgments open simultaneously."""
+
+        def judge_persisted(
+            self,
+            store: ProjectStore,
+            *,
+            rollout_artifact_id: str,
+            rubric_artifact_id: str,
+            calibration_artifact_id: str,
+        ) -> Judgment:
+            """Record concurrency around the actual artifact-bound judge implementation."""
+            nonlocal active, peak, admitted
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                admitted += 1
+                ordinal = admitted
+            try:
+                if ordinal <= 2:
+                    barrier.wait(timeout=5)
+                return super().judge_persisted(
+                    store,
+                    rollout_artifact_id=rollout_artifact_id,
+                    rubric_artifact_id=rubric_artifact_id,
+                    calibration_artifact_id=calibration_artifact_id,
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+    judge = ConcurrentJudge()
+    services = EvaluationServices(simulator_factory=_SimulatorFactory(), judge=judge)
+    budget = EvaluationBudget(maximum_cost_usd=10, maximum_judgments=100)
+    result = evaluate_models(
+        project,
+        setup,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    assert peak == 2
+    assert judge.calls == len(result.plan.cells)
+    assert result.report.compared_cells == len(result.plan.cells)
+    assert (
+        evaluate_models(
+            project,
+            setup,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+        == result
+    )
+    assert judge.calls == len(result.plan.cells)
 
 
 class _UnavailableClient(_TargetedTransportFailureClient):

@@ -1,20 +1,88 @@
 """Unusable judge output produces priced terminal evidence instead of paid replay loops."""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from exp.common.models import AssistantAction, ModelClient, ModelRequest, ModelResponse
+from exp.common.judging import Judgment
+from exp.common.models import (
+    AssistantAction,
+    ModelClient,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+)
+from exp.common.project import ProjectStore
 from exp.optimize.evaluation.contracts import EvaluationBudget
+from exp.optimize.evaluation.judge import DurableEvaluationJudge
 from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
+from exp.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJudgeClient
+from exp.optimize.router.automatic.judge_test import _reserved_client, _UsageClient
 from exp.optimize.router.automatic.service_test import _REVISION, _TIME, _RuntimeCatalog
+from exp.optimize.router.errors import JudgeDispatchExhaustedError
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.transport import ProviderTransportError
+
+
+def test_concurrent_judge_failures_charge_only_their_own_responses(tmp_path: Path) -> None:
+    """A malformed judgment cannot charge a neighboring judgment's successful response."""
+    client = _reserved_client(_UsageClient(), maximum_calls=2)
+    barrier = threading.Barrier(2)
+
+    class MalformedJudge(AutomaticRouterJudge):
+        """Fail parsing only after both isolated provider responses have completed."""
+
+        def __init__(self, reserved: ReservedJudgeClient) -> None:
+            """Retain only the provider boundary exercised by this accounting fixture."""
+            self._client = reserved
+
+        def judge_persisted(
+            self,
+            store: ProjectStore,
+            *,
+            rollout_artifact_id: str,
+            rubric_artifact_id: str,
+            calibration_artifact_id: str,
+        ) -> Judgment:
+            """Produce distinct paid usage and then fail the output parser."""
+            self._client.complete(
+                ModelRequest(
+                    messages=(ModelMessage(role="user", content=rollout_artifact_id),),
+                    maximum_output_tokens=32,
+                )
+            )
+            barrier.wait(timeout=5)
+            raise ValueError("malformed judgment")
+
+    judge = DurableEvaluationJudge(MalformedJudge(client), client, client._reservation)
+    project = ProjectStore(tmp_path, "judge-accounting")
+
+    def fail(tokens: int) -> float:
+        """Collect this failed judgment's conservative charge from the durable wrapper."""
+        with pytest.raises(JudgeDispatchExhaustedError) as raised:
+            judge.judge_persisted(
+                project,
+                rollout_artifact_id=str(tokens),
+                rubric_artifact_id="rubric-a",
+                calibration_artifact_id="calibration-a",
+            )
+        return raised.value.conservative_cost_usd
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        charged = tuple(pool.map(fail, (100, 200)))
+    own_costs = {
+        item.usage.input_tokens: item.cost_usd.value
+        for item in client.economics
+        if item.usage and item.cost_usd
+    }
+    assert charged == (own_costs[100], own_costs[200])
 
 
 class _FailingClient:

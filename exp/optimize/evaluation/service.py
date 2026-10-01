@@ -212,6 +212,7 @@ def evaluate_models(
             else None
         ),
         progress=progress,
+        maximum_concurrency=setup.maximum_concurrency,
     )
     judge_cost = math.fsum((judge_cost, prior_judge_cost))
     if math.fsum((simulation_cost, judge_cost)) > spending_limit:
