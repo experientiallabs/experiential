@@ -68,6 +68,8 @@ def test_response_prose_replays_without_treating_credential_words_as_values(
         '{"output": "The API key was arbitrary-value"}',
         '{"output": "The credential equals arbitrary-value"}',
         '{"output": "The token env is set to arbitrary-value"}',
+        '{"OPENAI_API_KEY=arbitrary-value": "output"}',
+        '{" api_key ": "arbitrary-value"}',
     ],
 )
 def test_secret_response_rejected_without_settling_or_persisting(

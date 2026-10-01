@@ -400,14 +400,14 @@ def assert_key_secret_free(value: str) -> None:
         value: A decoded JSON object key, without its value.
 
     Raises:
-        SecretBoundaryError: The key names a credential field or includes a secret-like value.
+        SecretBoundaryError: The key names a credential field or contains credential-like content.
     """
-    if _SECRET_REFERENCE_PATTERN.fullmatch(value) or _SECRET_ENVIRONMENT_NAME_PATTERN.fullmatch(
-        value
+    name = value.strip()
+    if _SECRET_REFERENCE_PATTERN.fullmatch(name) or _SECRET_ENVIRONMENT_NAME_PATTERN.fullmatch(
+        name
     ):
         raise SecretBoundaryError("immutable artifacts cannot contain credential fields")
-    if _has_secret_value(value):
-        raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
+    assert_prose_secret_free(value)
 
 
 def redact_secret_text(value: str) -> tuple[str, int]:

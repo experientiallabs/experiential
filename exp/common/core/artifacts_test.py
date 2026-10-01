@@ -215,7 +215,14 @@ def test_descriptive_keys_are_not_credential_fields(key: str) -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["api_key", "credential-ref", "OPENAI_API_KEY", "sk-abcdefghijklmnopqrstuvwxyz123456"],
+    [
+        "api_key",
+        " api_key ",
+        "credential-ref",
+        "OPENAI_API_KEY",
+        "OPENAI_API_KEY=arbitrary-value",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+    ],
 )
 def test_exact_credential_keys_and_secret_values_are_rejected(key: str) -> None:
     """Precise field validation still rejects decoded credential and environment names."""
