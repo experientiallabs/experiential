@@ -607,7 +607,6 @@ def complete_cell_evidence(
     except JudgmentBudgetError as exc:
         raise RouterCompositionError(str(exc)) from exc
 
-    evidence: list[EvaluationCellEvidence] = []
     consumed = 0
     overspend_warned = False
     judge_spend_usd = math.fsum(
@@ -615,12 +614,12 @@ def complete_cell_evidence(
     )
     excluded_costs: list[float] = []
 
-    def _report_judgments() -> None:
-        """Report judgment progress after appending one evidence row."""
+    def _report_judgments(completed: int) -> None:
+        """Report completed evidence on the coordinating caller's thread."""
         report(
             progress,
             "judgments",
-            completed=len(evidence),
+            completed=completed,
             total=len(bound_cells),
             detail=progress_detail,
         )
@@ -628,12 +627,6 @@ def complete_cell_evidence(
     report(progress, "judgments", completed=0, total=len(bound_cells), detail=progress_detail)
     state_lock = threading.Lock()
     rollout_locks = {rollout_id: threading.Lock() for rollout_id in protocols_by_rollout}
-
-    def finish(row: EvaluationCellEvidence) -> EvaluationCellEvidence:
-        """Append and report one row while the metadata coordinator lock is held."""
-        evidence.append(row)
-        _report_judgments()
-        return row
 
     def complete_one(
         item: tuple[EvaluationCell, str, EvaluationProtocol], cancelled: Callable[[], bool]
@@ -647,7 +640,7 @@ def complete_cell_evidence(
                 if cancelled():
                     raise CancelledError
                 if _rollout_failed(rollout):
-                    return finish(_unjudged_cell_evidence(cell, protocol, rollout))
+                    return _unjudged_cell_evidence(cell, protocol, rollout)
                 try:
                     judgment = judgments_by_rollout.get(rollout_id)
                     receipt = read_dispatch_reservation(
@@ -690,7 +683,7 @@ def complete_cell_evidence(
                 if judgment is None and exclusion is not None:
                     excluded_costs.append(exclusion.conservative_cost_usd)
                     judge_spend_usd = math.fsum((judge_spend_usd, exclusion.conservative_cost_usd))
-                    return finish(_unjudged_cell_evidence(cell, protocol, rollout))
+                    return _unjudged_cell_evidence(cell, protocol, rollout)
                 if judgment is None:
                     # In parallel, the request ledger may include siblings' temporary
                     # reservations. Its atomic admission waits for those requests to settle;
@@ -758,24 +751,24 @@ def complete_cell_evidence(
                     with state_lock:
                         judge_spend_usd = math.fsum((judge_spend_usd, exhausted_cost_usd))
                         excluded_costs.append(exhausted_cost_usd)
-                        return finish(_unjudged_cell_evidence(cell, protocol, rollout))
+                        return _unjudged_cell_evidence(cell, protocol, rollout)
                 _persist_judgment(project, judgment)
                 with state_lock:
                     judgments_by_rollout[rollout_id] = judgment
                     judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
-            with state_lock:
-                return finish(
-                    EvaluationCellEvidence(
-                        cell_id=cell.cell_id,
-                        protocol_id=protocol.protocol_id,
-                        rollout_artifact_id=rollout_id,
-                        judgment_artifact_id=judgment.judgment_id,
-                        source_run_id=rollout.source_run_id,
-                    )
-                )
+            return EvaluationCellEvidence(
+                cell_id=cell.cell_id,
+                protocol_id=protocol.protocol_id,
+                rollout_artifact_id=rollout_id,
+                judgment_artifact_id=judgment.judgment_id,
+                source_run_id=rollout.source_run_id,
+            )
 
     ordered_evidence = dispatch_judgments(
-        bound_cells, complete_one, maximum_concurrency=maximum_concurrency
+        bound_cells,
+        complete_one,
+        maximum_concurrency=maximum_concurrency,
+        on_completed=_report_judgments,
     )
     # Sum the same complete ledger on first execution and replay, rather than returning
     # different rounding from iterative versus batch accumulation.

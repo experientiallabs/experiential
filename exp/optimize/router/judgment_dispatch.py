@@ -14,6 +14,7 @@ def dispatch_judgments[ItemT](
     execute: Callable[[ItemT, Callable[[], bool]], EvaluationCellEvidence],
     *,
     maximum_concurrency: int,
+    on_completed: Callable[[int], None] | None = None,
 ) -> tuple[EvaluationCellEvidence, ...]:
     """Run one bounded window, preserving input order and draining admitted work on failure.
 
@@ -21,6 +22,7 @@ def dispatch_judgments[ItemT](
         items: Canonically ordered, independently bound judgment inputs.
         execute: Executes and persists one cell; checks cancellation before provider admission.
         maximum_concurrency: Positive total concurrency across the complete judgment phase.
+        on_completed: Optional completion count callback, invoked only on the calling thread.
 
     Returns:
         Completed evidence in the original input order, regardless of completion order.
@@ -33,7 +35,12 @@ def dispatch_judgments[ItemT](
     if maximum_concurrency <= 0:
         raise ValueError("judgment concurrency must be positive")
     if maximum_concurrency == 1:
-        return tuple(execute(item, lambda: False) for item in items)
+        serial_results = []
+        for item in items:
+            serial_results.append(execute(item, lambda: False))
+            if on_completed is not None:
+                on_completed(len(serial_results))
+        return tuple(serial_results)
     if not items:
         return ()
     cancelled = threading.Event()
@@ -72,6 +79,8 @@ def dispatch_judgments[ItemT](
             completed, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in sorted(completed, key=pending.__getitem__):
                 results[pending.pop(future)] = future.result()
+                if on_completed is not None:
+                    on_completed(len(results))
             fill_window()
     except BaseException as exc:
         cancelled.set()

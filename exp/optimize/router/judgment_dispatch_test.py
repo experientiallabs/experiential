@@ -23,7 +23,10 @@ def _evidence(index: int) -> EvaluationCellEvidence:
     )
 
 
-def test_judgments_overlap_with_one_total_limit_and_preserve_input_order() -> None:
+@pytest.mark.parametrize("concurrency", [1, 3])
+def test_judgments_overlap_with_one_total_limit_and_preserve_input_order(
+    concurrency: int,
+) -> None:
     """Two full windows overlap, complete out of order, and retain canonical output order."""
     barrier = threading.Barrier(3)
     finished_last = [threading.Event(), threading.Event()]
@@ -31,6 +34,13 @@ def test_judgments_overlap_with_one_total_limit_and_preserve_input_order() -> No
     active = 0
     peak = 0
     completion_order: list[int] = []
+    progress: list[int] = []
+    owner = threading.get_ident()
+
+    def report_completed(count: int) -> None:
+        """Reject background callbacks and retain each monotonic completion update."""
+        assert threading.get_ident() == owner
+        progress.append(count)
 
     def execute(index: int, cancelled: Callable[[], bool]) -> EvaluationCellEvidence:
         """Hold a complete window open, then finish each window's first item last."""
@@ -39,8 +49,9 @@ def test_judgments_overlap_with_one_total_limit_and_preserve_input_order() -> No
         with lock:
             active += 1
             peak = max(peak, active)
-        barrier.wait(timeout=5)
-        if index % 3 == 0:
+        if concurrency > 1:
+            barrier.wait(timeout=5)
+        if concurrency > 1 and index % 3 == 0:
             assert finished_last[index // 3].wait(timeout=5)
         with lock:
             completion_order.append(index)
@@ -49,11 +60,15 @@ def test_judgments_overlap_with_one_total_limit_and_preserve_input_order() -> No
             finished_last[index // 3].set()
         return _evidence(index)
 
-    result = dispatch_judgments(tuple(range(6)), execute, maximum_concurrency=3)
+    result = dispatch_judgments(
+        tuple(range(6)), execute, maximum_concurrency=concurrency, on_completed=report_completed
+    )
     assert result == tuple(_evidence(index) for index in range(6))
-    assert peak == 3
-    assert completion_order.index(2) < completion_order.index(0)
-    assert completion_order.index(5) < completion_order.index(3)
+    assert peak == concurrency
+    assert progress == list(range(1, 7))
+    if concurrency > 1:
+        assert completion_order.index(2) < completion_order.index(0)
+        assert completion_order.index(5) < completion_order.index(3)
 
 
 @pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])

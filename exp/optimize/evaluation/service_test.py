@@ -11,6 +11,7 @@ import pytest
 from exp.common.evaluations.model_report import ModelEvaluationReport
 from exp.common.judging import HumanScoreReview, JudgeCalibrationService, Judgment, PromptDefinition
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.common.tasks import load_task_set
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices, EvaluationSetup
@@ -34,6 +35,7 @@ from exp.optimize.router.composition_test import (
 from exp.optimize.router.composition_test import (
     _Judge as _RouterTestJudge,
 )
+from exp.optimize.router.errors import JudgeDispatchExhaustedError
 from exp.optimize.router.evaluation.build import reconstruct_completed_project_build
 from exp.runtime.models.providers.errors import ProviderTransportError
 
@@ -44,8 +46,10 @@ class _Judge(_RouterTestJudge):
     model: ModelSnapshot = _snapshot("judge-model")
 
 
+@pytest.mark.parametrize("concurrent_admission", [False, True])
 def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
     tmp_path: Path,
+    concurrent_admission: bool,
 ) -> None:
     """Real persisted evaluations overlap judgments and replay without another dispatch."""
     project, setup = _prepared(tmp_path)
@@ -55,6 +59,14 @@ def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
     active = 0
     peak = 0
     admitted = 0
+    owner = threading.get_ident()
+    completed: list[int | None] = []
+
+    def progress(event: ProgressEvent) -> None:
+        """Keep UI and host callbacks on the caller's thread in monotonically completed order."""
+        if event.stage == "judgments":
+            assert threading.get_ident() == owner
+            completed.append(event.completed)
 
     class ConcurrentJudge(_Judge):
         """Hold the first pair of provider-bound judgments open simultaneously."""
@@ -75,7 +87,7 @@ def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
                 admitted += 1
                 ordinal = admitted
             try:
-                if ordinal <= 2:
+                if concurrent_admission and ordinal <= 2:
                     barrier.wait(timeout=5)
                 return super().judge_persisted(
                     store,
@@ -87,7 +99,12 @@ def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
                 with lock:
                     active -= 1
 
-    judge = ConcurrentJudge()
+    class ConcurrentBudgetedJudge(ConcurrentJudge):
+        """Explicitly declare thread-safe admission for this provider-free judge."""
+
+        supports_concurrent_request_admission = True
+
+    judge = ConcurrentBudgetedJudge() if concurrent_admission else ConcurrentJudge()
     services = EvaluationServices(simulator_factory=_SimulatorFactory(), judge=judge)
     budget = EvaluationBudget(maximum_cost_usd=10, maximum_judgments=100)
     result = evaluate_models(
@@ -97,8 +114,10 @@ def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
         budget=budget,
         created_at=_TIME,
         code_revision="test-revision",
+        progress=progress,
     )
-    assert peak == 2
+    assert peak == (2 if concurrent_admission else 1)
+    assert completed == list(range(len(result.plan.cells) + 1))
     assert judge.calls == len(result.plan.cells)
     assert result.report.compared_cells == len(result.plan.cells)
     assert (
@@ -113,6 +132,39 @@ def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
         == result
     )
     assert judge.calls == len(result.plan.cells)
+
+
+def test_undeclared_injected_judge_preserves_serial_spend_checks(tmp_path: Path) -> None:
+    """An injected judge cannot multiply admitted spend merely because rollouts allow overlap."""
+    project, setup = _prepared(tmp_path)
+    setup = setup.model_copy(update={"maximum_concurrency": 8})
+
+    class ExhaustedJudge(_Judge):
+        """Consume the remaining allowance without declaring shared request admission."""
+
+        def judge_persisted(
+            self,
+            store: ProjectStore,
+            *,
+            rollout_artifact_id: str,
+            rubric_artifact_id: str,
+            calibration_artifact_id: str,
+        ) -> Judgment:
+            """Retain one admitted call and its conservative charge without usable feedback."""
+            self.calls += 1
+            raise JudgeDispatchExhaustedError("provider exhausted", conservative_cost_usd=10)
+
+    judge = ExhaustedJudge()
+    with pytest.raises(ValueError, match="shared ceiling"):
+        evaluate_models(
+            project,
+            setup,
+            services=EvaluationServices(simulator_factory=_SimulatorFactory(), judge=judge),
+            budget=EvaluationBudget(maximum_cost_usd=10, maximum_judgments=100),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert judge.calls == 1
 
 
 class _UnavailableClient(_TargetedTransportFailureClient):

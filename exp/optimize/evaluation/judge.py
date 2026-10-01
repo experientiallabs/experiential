@@ -34,6 +34,11 @@ class DurableEvaluationJudge:
         self._budget = budget
 
     @property
+    def supports_concurrent_request_admission(self) -> bool:
+        """Allow overlapping judgments only with the shared durable request-spend ledger."""
+        return self._budget is not None
+
+    @property
     def model(self) -> ModelSnapshot:
         """Expose the delegate's verified provider identity before any execution."""
         return self._delegate.model

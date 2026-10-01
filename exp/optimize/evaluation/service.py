@@ -212,7 +212,11 @@ def evaluate_models(
             else None
         ),
         progress=progress,
-        maximum_concurrency=setup.maximum_concurrency,
+        maximum_concurrency=(
+            setup.maximum_concurrency
+            if getattr(services.judge, "supports_concurrent_request_admission", False) is True
+            else 1
+        ),
     )
     judge_cost = math.fsum((judge_cost, prior_judge_cost))
     if math.fsum((simulation_cost, judge_cost)) > spending_limit:
