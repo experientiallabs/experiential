@@ -24,6 +24,10 @@ from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
         '{"output": {"password-policy": "rotated", "authorization status": "granted"}}',
         pytest.param(json.dumps({"output": "9" * 10_000}), id="long-numeric-prose"),
         pytest.param('{"output":' + "9" * 10_000 + "}", id="long-json-integer"),
+        pytest.param(
+            "[" * 300 + '{"text":"password management software"}' + "]" * 300,
+            id="deep-json-prose",
+        ),
     ],
 )
 def test_response_prose_replays_without_treating_credential_words_as_values(
@@ -79,6 +83,10 @@ def test_response_prose_replays_without_treating_credential_words_as_values(
             '{"number":' + "9" * 10_000 + ',"\\u0061pi_key":"arbitrary-value"}',
             id="long-integer-cannot-hide-escaped-key",
         ),
+        pytest.param(
+            "[" * 300 + '{"\\u0061pi_key":"arbitrary-value"}' + "]" * 300,
+            id="deep-json-cannot-hide-escaped-key",
+        ),
     ],
 )
 def test_secret_response_rejected_without_settling_or_persisting(
@@ -116,6 +124,28 @@ def test_response_rejection_explains_safe_reason_and_recovery(
     assert "fresh evaluation" in str(rejected.value)
     assert "arbitrary-value" not in str(rejected.value)
     assert "OPENAI_API_KEY" not in str(rejected.value)
+
+
+@pytest.mark.parametrize("encoded_in_string", [False, True])
+def test_excessive_response_nesting_fails_with_safe_recovery_guidance(
+    tmp_path: Path, encoded_in_string: bool
+) -> None:
+    """Decoder depth failures do not leak raw interpreter errors or bypass validation."""
+    project = ProjectStore(tmp_path, "project-a")
+    ledger = RequestBudgetStore(project, "run-a")
+    pending = RequestReceipt(fingerprint="request", charge=2, state="pending")
+    ledger.write("request-a", pending)
+    depth = 10_000
+    payload = "[" * depth + '{"\\u0061pi_key":"arbitrary-value"}' + "]" * depth
+    if encoded_in_string:
+        payload = json.dumps({"output": payload})
+    with pytest.raises(ArtifactStoreError, match="JSON nesting") as rejected:
+        ledger.complete("request-a", 0.4, payload)
+    assert "fresh evaluation" in str(rejected.value)
+    assert "arbitrary-value" not in str(rejected.value)
+    assert ledger.read("request-a") == pending
+    assert ledger.total() == 2
+    assert project.artifacts.list_ids() == ()
 
 
 def test_saved_text_receipt_replays_without_mutation(tmp_path: Path) -> None:

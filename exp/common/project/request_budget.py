@@ -5,10 +5,10 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 from uuid import uuid4
 
-from pydantic import Field, JsonValue, TypeAdapter, ValidationError
+from pydantic import Field, JsonValue
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -17,7 +17,6 @@ from exp.common.core.artifacts import (
     SecretBoundaryError,
     assert_key_secret_free,
     assert_prose_secret_free,
-    assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
     stable_id,
@@ -27,8 +26,6 @@ from exp.common.project.manifests import artifact_input
 from exp.common.project.records import ProjectRecords
 from exp.common.project.store import ProjectStore
 from exp.common.release_revision import installed_release_revision
-
-_JSON_VALUE = TypeAdapter(JsonValue)
 
 
 class _Response(ContractModel):
@@ -48,21 +45,26 @@ def _validate_response(payload: str) -> None:
         payload: Encoded response, which may be arbitrary text or serialized JSON.
 
     Raises:
-        ArtifactStoreError: The response contains a secret value or credential field.
+        ArtifactStoreError: The response violates the credential boundary or decoder depth limit.
     """
     try:
         try:
             value = _response_json(payload)
-        except (json.JSONDecodeError, ValidationError):
+        except json.JSONDecodeError:
             assert_text_secret_free(payload)
         else:
             _validate_response_values(value)
-            assert_secret_free(value)
     except SecretBoundaryError as exc:
         raise ArtifactStoreError(
             "provider response violates the secret boundary (credential-like content). "
             "Remove credential-bearing fields, assignments, and secret values from the output, "
             "then start a fresh evaluation. The rejected response was not saved."
+        ) from exc
+    except RecursionError as exc:
+        raise ArtifactStoreError(
+            "provider response exceeds the JSON nesting supported by the decoder. "
+            "Simplify the nested JSON output, then start a fresh evaluation. "
+            "The rejected response was not saved."
         ) from exc
 
 
@@ -86,28 +88,28 @@ def _response_json(payload: str) -> JsonValue:
     Integer literals stay as digit strings in this validation-only view, avoiding Python's
     integer-conversion limit. Persistence retains the original response, including number types.
     """
-    return _JSON_VALUE.validate_python(
-        json.loads(payload, object_pairs_hook=_response_object, parse_int=str)
-    )
+    return cast(JsonValue, json.loads(payload, object_pairs_hook=_response_object, parse_int=str))
 
 
 def _validate_response_values(value: JsonValue) -> None:
     """Check credential fields and assignments, including JSON encoded inside string leaves."""
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            assert_key_secret_free(key)
-            _validate_response_values(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            _validate_response_values(nested)
-    elif isinstance(value, str):
-        assert_prose_secret_free(value)
-        try:
-            nested = _response_json(value)
-        except (json.JSONDecodeError, ValidationError):
-            return
-        if nested != value:
-            _validate_response_values(nested)
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, nested in current.items():
+                assert_key_secret_free(key)
+                pending.append(nested)
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif isinstance(current, str):
+            assert_prose_secret_free(current)
+            try:
+                nested = _response_json(current)
+            except json.JSONDecodeError:
+                continue
+            if nested != current:
+                pending.append(nested)
 
 
 class RequestReceipt(ContractModel):
