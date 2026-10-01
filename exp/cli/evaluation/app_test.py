@@ -2,6 +2,7 @@
 
 from io import StringIO
 from pathlib import Path
+from typing import cast
 
 import pytest
 from rich.console import Console
@@ -12,12 +13,20 @@ from exp.cli.evaluation import flow
 from exp.cli.shared import consent
 from exp.cli.shared.picker import PickerResult
 from exp.common.config.settings import set_maximum_command_cost_usd
-from exp.common.models import ModelCatalog
+from exp.common.models import ModelCatalog, ModelRequest, ModelResponse
+from exp.common.progress import ProgressEvent
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
-from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_run, save_run
+from exp.optimize.evaluation.runs import (
+    EvaluationDefaults,
+    execute_run,
+    load_run,
+    prepare_run,
+    save_run,
+)
 from exp.optimize.evaluation.runs_test import _twenty_scenarios
-from exp.optimize.router.automatic.service_test import _REVISION, _RuntimeCatalog
+from exp.optimize.router.automatic.service_test import _REVISION, _CompletionClient, _RuntimeCatalog
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.budget import SpendLimitReached
 from exp.simulation.engines.text.leases import (
     TextCellLeaseClaim,
     TextCellLeaseState,
@@ -408,3 +417,84 @@ def test_uncapped_warning_precedes_the_single_launch_choice(
         len(state.embedding_calls),
         state.credential_resolutions,
     )
+
+
+@pytest.mark.parametrize("affordable", [False, True])
+def test_resumed_progress_retires_cap_hint_and_ledger_admits_lower_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, affordable: bool
+) -> None:
+    """A saved reservation hint never vetoes review; current ledger admission owns the cap."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    complete = _CompletionClient.complete
+
+    def one_attempt(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Report the scripted client's one real call so its unused retry holds settle."""
+        response = complete(client, request)
+        return response.model_copy(
+            update={"economics": response.economics.model_copy(update={"provider_attempts": 1})}
+        )
+
+    monkeypatch.setattr(_CompletionClient, "complete", one_attempt)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(
+            models=("candidate-a", "candidate-b"),
+            options=ModelEvaluationOptions(
+                maximum_steps=1, maximum_concurrency=1, maximum_judge_output_tokens=16
+            ),
+        ),
+        code_revision=_REVISION,
+    ).model_copy(update={"spending_limit_usd": 1e-12})
+    save_run(project, run)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    before = tuple(state.completion_calls), tuple(state.embedding_calls)
+    with pytest.raises(SpendLimitReached):
+        execute_run(project, run, runtime, provider_spend_consented=True)
+    paused = load_run(project, run.run_id)
+    old_hint = paused.required_spending_limit_usd
+    assert old_hint is not None and old_hint > 1e-12
+    assert before == (tuple(state.completion_calls), tuple(state.embedding_calls))
+    choices = iter(("start", "back"))
+    monkeypatch.setattr(
+        flow, "choose_one", lambda *args, **kwargs: PickerResult(values=(next(choices),))
+    )
+    assert flow._review(project, paused) == paused
+    with pytest.raises(SpendLimitReached):
+        execute_run(project, paused, runtime, provider_spend_consented=True)
+    assert before == (tuple(state.completion_calls), tuple(state.embedding_calls))
+
+    resumed = paused.model_copy(update={"spending_limit_usd": run.prepared.cost.maximum_cost_usd})
+    save_run(project, resumed)
+
+    def interrupt(event: ProgressEvent) -> None:
+        """Stop after the previously blocked calls settle and before cheaper judging starts."""
+        if event.stage == "judging":
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        execute_run(project, resumed, runtime, provider_spend_consented=True, progress=interrupt)
+    interrupted = load_run(project, run.run_id)
+    assert interrupted.status == "interrupted"
+    assert interrupted.required_spending_limit_usd is None
+    lowered = interrupted.model_copy(
+        update={"spending_limit_usd": old_hint * 0.75 if affordable else 1e-12}
+    )
+    choices = iter(("start", "back"))
+    assert flow._review(project, lowered) == lowered
+    save_run(project, lowered)
+    before_judging = tuple(state.completion_calls), tuple(state.embedding_calls)
+    if affordable:
+        result = execute_run(project, lowered, runtime, provider_spend_consented=True)
+        assert result.report.compared_cells == 20
+        assert result.simulation_cost_usd + result.judge_cost_usd < old_hint * 0.75
+        assert load_run(project, run.run_id).status == "completed"
+    else:
+        with pytest.raises(SpendLimitReached):
+            execute_run(project, lowered, runtime, provider_spend_consented=True)
+        fresh = load_run(project, run.run_id)
+        assert fresh.status == "paused"
+        assert fresh.required_spending_limit_usd is not None
+        assert fresh.required_spending_limit_usd < old_hint
+        assert before_judging == (tuple(state.completion_calls), tuple(state.embedding_calls))
+    assert load_run(project, run.run_id).judging_revision == run.judging_revision

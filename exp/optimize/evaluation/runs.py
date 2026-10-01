@@ -77,7 +77,8 @@ class EvaluationRun(ContractModel):
         spending_limit_usd: Optional total allowance, authorized by explicit launch consent.
             Explicit None keeps accounting without an aggregate spending cap. The field
             must be present in persisted records.
-        required_spending_limit_usd: Minimum total allowance requested by a paused call.
+        required_spending_limit_usd: Advisory allowance from the last blocked request.
+            Cleared on resume; only the live request ledger decides new admission.
         stage: Most recent engine progress stage.
         completed: Completed units in that stage, when available.
         total: Planned units in that stage, when available.
@@ -363,7 +364,9 @@ def execute_run(
             raise ValueError("supplied run differs from its frozen database snapshot")
         frozen_project = project.snapshot(saved.project_config_sha256)
         active = (
-            saved if saved.status == "completed" else saved.model_copy(update={"status": "running"})
+            saved
+            if saved.status == "completed"
+            else saved.model_copy(update={"status": "running", "required_spending_limit_usd": None})
         )
         save_run(project, active)
 

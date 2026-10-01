@@ -380,13 +380,8 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
         if not choice.values or choice.values[0] == "back":
             return None
         if choice.values[0] == "start":
-            if (
-                run.required_spending_limit_usd
-                and run.spending_limit_usd is not None
-                and run.spending_limit_usd < run.required_spending_limit_usd
-            ):
-                _console.print("Increase or remove the spending limit before resuming.")
-                continue
+            # A prior reservation hint can outlive other calls settling. The request
+            # ledger decides whether this explicitly reviewed cap admits new work.
             return run
         if choice.values[0] == "limit":
             value = Prompt.ask(
