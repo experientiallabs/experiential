@@ -1,8 +1,10 @@
 """Bounded parallel cell dispatch with serialized progress and durable budget admission."""
 
 import math
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from itertools import islice
 
 from exp.common.evaluations import EvaluationCell
 from exp.common.rollouts import RolloutArtifact
@@ -70,6 +72,25 @@ def cell_reservation(
     return cost if cost > 0 else None
 
 
+def interleave_models(cells: Sequence[EvaluationCell]) -> tuple[EvaluationCell, ...]:
+    """Round-robin pending models while preserving each model's scenario and repeat order.
+
+    Model lanes follow their first appearance in the frozen plan. This scheduling order
+    does not change cell identities or the canonical order of persisted results.
+    """
+    by_model: dict[str, deque[EvaluationCell]] = {}
+    for cell in cells:
+        by_model.setdefault(cell.candidate_alias, deque()).append(cell)
+    lanes = deque(by_model.values())
+    ordered: list[EvaluationCell] = []
+    while lanes:
+        lane = lanes.popleft()
+        ordered.append(lane.popleft())
+        if lane:
+            lanes.append(lane)
+    return tuple(ordered)
+
+
 def dispatch_cells(
     cells: Sequence[EvaluationCell],
     *,
@@ -81,19 +102,38 @@ def dispatch_cells(
     """Run isolated cells concurrently and publish progress from the owning thread.
 
     Args:
-        cells: Cells still missing final evidence.
-        workers: Maximum simultaneously active cells.
+        cells: Cells still missing final evidence, in admission order.
+        workers: Maximum submitted cells across every model, including active work.
         execute: Durable admission and execution boundary for one cell.
         completed: Owner-thread map receiving completed immutable artifacts.
         observe: Called after each durable result has been installed.
     """
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="exp-eval") as pool:
-        futures = {pool.submit(execute, cell): cell for cell in cells}
+    if workers < 1:
+        raise ValueError("parallel cell dispatch requires at least one worker")
+    if not cells:
+        return
+    pending = iter(cells)
+    with ThreadPoolExecutor(
+        max_workers=min(workers, len(cells)), thread_name_prefix="exp-eval"
+    ) as pool:
+        futures: dict[Future[RolloutArtifact], EvaluationCell] = {}
+
+        def fill_available_slots() -> None:
+            """Admit only the next cells that fit the shared execution window."""
+            for cell in islice(pending, workers - len(futures)):
+                futures[pool.submit(execute, cell)] = cell
+
         try:
-            for future in as_completed(futures):
-                cell = futures[future]
-                completed[cell.cell_id] = future.result()
-                observe()
+            fill_available_slots()
+            while futures:
+                ready, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in tuple(futures):
+                    if future not in ready:
+                        continue
+                    cell = futures.pop(future)
+                    completed[cell.cell_id] = future.result()
+                    observe()
+                fill_available_slots()
         except BaseException:
             for future in futures:
                 future.cancel()

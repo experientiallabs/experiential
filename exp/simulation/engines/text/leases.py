@@ -193,7 +193,7 @@ class TextCellLeaseStore:
         self._stale_after = timedelta(seconds=stale_after_seconds)
         self._poll_interval_seconds = poll_interval_seconds
         self._wait_timeout_seconds = wait_timeout_seconds
-        self._admission_lock = threading.Lock()
+        self._admission_lock = threading.RLock()
         self._ownership_locks: dict[str, FileLock] = {}
 
     def acquire(
@@ -245,31 +245,50 @@ class TextCellLeaseStore:
         while True:
             if is_cancelled():
                 return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
+            queued_at = self._monotonic()
+            if not self._wait_for_local_turn(cancelled):
                 return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
             try:
-                decision = self._admit_once(
-                    lease_id=lease_id,
-                    resolution_id=resolution_id,
-                    simulation_id=simulation_id,
-                    rollout_id=rollout_id,
-                    binding_sha256=binding_sha256,
-                    maximum_cost_usd=maximum_cost_usd,
-                    rollout_completed=rollout_completed,
-                    observed_spend_usd=observed_spend_usd,
-                    stop_on_overspend=stop_on_overspend,
-                    reservation_cost_usd=reservation_cost_usd,
-                    lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
-                )
-            except FileLockTimeout:
-                decision = None
+                # Waiting behind our own metadata writers is scheduling, not evidence that
+                # another runner owns this cell. Only contention consumes the follower wait.
+                deadline += self._monotonic() - queued_at
+                remaining = deadline - self._monotonic()
+                if remaining <= 0 or is_cancelled():
+                    return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
+                try:
+                    decision = self._admit_once(
+                        lease_id=lease_id,
+                        resolution_id=resolution_id,
+                        simulation_id=simulation_id,
+                        rollout_id=rollout_id,
+                        binding_sha256=binding_sha256,
+                        maximum_cost_usd=maximum_cost_usd,
+                        rollout_completed=rollout_completed,
+                        observed_spend_usd=observed_spend_usd,
+                        stop_on_overspend=stop_on_overspend,
+                        reservation_cost_usd=reservation_cost_usd,
+                        lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
+                    )
+                except FileLockTimeout:
+                    decision = None
+            finally:
+                self._admission_lock.release()
             if decision is not None:
                 return decision
             remaining = deadline - self._monotonic()
             if remaining <= 0 or is_cancelled():
                 return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
             self._sleep(min(self._poll_interval_seconds, remaining))
+
+    def _wait_for_local_turn(self, cancelled: Callable[[], bool] | None) -> bool:
+        """Wait outside the follower deadline, letting cooperative cancellation leave the queue."""
+        if cancelled is None:
+            self._admission_lock.acquire()
+            return True
+        while not cancelled():
+            if self._admission_lock.acquire(timeout=self._poll_interval_seconds):
+                return True
+        return False
 
     def release(self, lease: TextCellLease) -> None:
         """Remove this owner's claim after its immutable rollout is safely persisted.
@@ -417,11 +436,17 @@ class TextCellLeaseStore:
                     return None
                 if rollout_completed(rollout_id):
                     return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
-                active_leases = self._active_leases_for(
-                    resolution_id=resolution_id,
-                    simulation_id=simulation_id,
-                    now=now,
-                    rollout_completed=rollout_completed,
+                # Request-budgeted cells share no whole-cell reservation. Consulting every
+                # sibling's artifacts here makes independent admission quadratic in run size.
+                active_leases = (
+                    ()
+                    if maximum_cost_usd is None
+                    else self._active_leases_for(
+                        resolution_id=resolution_id,
+                        simulation_id=simulation_id,
+                        now=now,
+                        rollout_completed=rollout_completed,
+                    )
                 )
                 spend = observed_spend_usd()
                 reservation, contended = self._reserve_budget(
@@ -462,23 +487,22 @@ class TextCellLeaseStore:
     ) -> Iterator[None]:
         """Queue local metadata writers before the bounded cross-process lock.
 
-        Local workers wake directly when their predecessor exits instead of repeatedly
-        polling the file lock while newer workers acquire it. Both waits share one deadline.
-        No provider call runs under either lock.
+        Local workers wake when their predecessor exits. Their queue wait is separate from
+        the bounded cross-process lock and SQLite admission. No provider call runs under
+        either lock.
 
         Args:
-            timeout_s: Combined local and cross-process lock wait allowance.
+            timeout_s: Cross-process file lock and SQLite wait allowance after the local turn.
 
         Yields:
             None while both metadata locks are held.
 
         Raises:
-            FileLockTimeout: Another metadata writer holds either lock past the deadline.
+            FileLockTimeout: Another process holds the file lock or database past the deadline.
         """
-        deadline = time.monotonic() + timeout_s
-        if not self._admission_lock.acquire(timeout=timeout_s):
-            raise FileLockTimeout("local text simulation metadata is busy; retry the operation")
+        self._admission_lock.acquire()
         try:
+            deadline = time.monotonic() + timeout_s
             with file_write_lock(
                 self._admission_path(),
                 what="text simulation cell admission",

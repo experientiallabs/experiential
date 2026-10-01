@@ -468,6 +468,11 @@ Advanced rollout budgets are optional. Saved results show score, assistant cost,
 Open report opens plots and side-by-side traces. Details exposes paths and accounting.
 The default minimum is 20 distinct scenarios,
 with one repeat, eight parallel workers, 100 steps, and 1,000,000 generated tokens per rollout.
+Set `exp eval PROJECT --models ALIAS,ALIAS --concurrency 512` to allow up to 512 rollouts
+in total across the selected models. Python callers use
+`ModelEvaluationOptions(maximum_concurrency=512)`. Pending work is interleaved across models;
+the SDK admits only as many cells as the shared pool can execute. Provider rate limits and the
+approved spending allowance still apply.
 Retries are separate from repeats. New evaluations collect fresh evidence; resume reuses the
 exact saved run. Settings are saved in the project's `evaluation.json`.
 
