@@ -21,6 +21,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
+          # Keep warnings-as-errors reproducible on the validated native toolchain.
+          toolchain: "1.98.1"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
