@@ -37,6 +37,11 @@ NATIVE_PIN_BUMP = (
     '-    "exp-gateway-native>=0.3.119,<0.4",  # compiled gateway data plane\n'
     '+    "exp-gateway-native>=0.3.120,<0.4",  # compiled gateway data plane'
 )
+NATIVE_MARKER_ADDED = (
+    "@@ -11 +11 @@\n"
+    '-    "exp-gateway-native>=0.3.119,<0.4",  # compiled gateway data plane\n'
+    "+    \"exp-gateway-native>=0.3.120,<0.4; sys_platform == 'linux'\",  # data plane"
+)
 DEPENDENCY_CHANGE = (
     '@@ -5 +5 @@\n-    { name = "certifi" },\n+    { name = "certifi", marker = "x" },'
 )
@@ -49,6 +54,7 @@ DEPENDENCY_CHANGE = (
         ([{"filename": "uv.lock", "patch": VERSION_BUMP_LOCK}], False),
         ([{"filename": "pyproject.toml", "patch": NATIVE_PIN_BUMP}], False),
         ([{"filename": "uv.lock", "patch": DEPENDENCY_CHANGE}], True),
+        ([{"filename": "pyproject.toml", "patch": NATIVE_MARKER_ADDED}], True),
         ([{"filename": "uv.lock"}], True),
         ([{"filename": "exp/runtime/capture/proxy.py", "patch": "+x"}], True),
         ([{"filename": "exp/simulation/engines/sandbox.py", "patch": "+x"}], True),

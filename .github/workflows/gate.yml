@@ -253,7 +253,10 @@ jobs:
           )
           MANIFESTS = {"pyproject.toml", "uv.lock"}
           # Every release bumps both manifests; only a dependency change matters here.
-          VERSION_ONLY = re.compile(r'^[+-](version = "[^"]*"|\s*"exp-gateway-native>=[^"]*",.*)$')
+          VERSION_ONLY = re.compile(
+              r'^[+-](version = "[0-9][0-9a-z.+-]*"'
+              r'|\s*"exp-gateway-native>=[0-9][0-9.]*,<[0-9][0-9.]*",(\s*#.*)?)$'
+          )
 
           def needs_macos(changed: dict) -> bool:
               name = changed["filename"]
