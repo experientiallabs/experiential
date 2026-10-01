@@ -153,11 +153,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Balanced on measured test time; each shard is ~2-3 minutes of tests on
+        # four workers. A path a shard ignores must be another shard's path.
         include:
+          - name: router-hosted
+            paths: exp/optimize/router/hosted_test.py exp/optimize/router/automatic
           - name: router
-            paths: exp/optimize/router
-          - name: gateway-evaluation
-            paths: exp/runtime/gateway exp/optimize/evaluation
+            paths: exp/optimize/router --ignore=exp/optimize/router/hosted_test.py --ignore=exp/optimize/router/automatic
+          - name: gateway
+            paths: exp/runtime/gateway
+          - name: evaluation
+            paths: exp/optimize/evaluation
     env:
       UV_PYTHON: "3.13"
     steps:
