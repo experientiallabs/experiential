@@ -27,6 +27,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         billing_customer_managed: false,
         explicit_cache: false,
         automatic_cache: false,
+        automatic_cache_written_tokens: None,
         idempotency_key: "op".to_string(),
         time_to_first_byte_base_seconds: base,
         time_to_first_byte_seconds_per_million_input_tokens: slope,

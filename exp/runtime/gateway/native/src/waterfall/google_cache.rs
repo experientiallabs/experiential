@@ -244,7 +244,14 @@ where
                     expires_at,
                 } => {
                     let created = created.ok_or_else(internal)?;
-                    overlay(wire, payload, &created.name, &endpoint, expires_at)
+                    let overlaid = overlay(wire, payload, &created.name, &endpoint, expires_at)?;
+                    // The generation reads back the prefix this attempt just wrote.
+                    Ok(overlaid.map(|mut cached| {
+                        if wire.automatic_cache {
+                            cached.automatic_cache_written_tokens = Some(created.total_tokens);
+                        }
+                        cached
+                    }))
                 }
             }
         }

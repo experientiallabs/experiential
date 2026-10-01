@@ -271,6 +271,8 @@ async fn creation_records_only_allowlisted_evidence_before_cached_generation() {
         .await
         .unwrap()
         .unwrap();
+    // A client-marked (explicit) cache never reports gateway-created writes.
+    assert_eq!(overlaid.automatic_cache_written_tokens, None);
     assert_eq!(
         host.calls()[1],
         (

@@ -437,6 +437,11 @@ impl UpstreamRelay {
             .set_cache_writes_within_reads(writes_within_reads);
     }
 
+    /// Carry the tokens this attempt's own automatic cache create wrote.
+    pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
+        self.normalizer.set_gemini_cache_writes(written);
+    }
+
     /// Carry the Codex native-tool inversion map (see
     /// `codex_native_inversion`); applied to every tool-call event this relay
     /// yields. Empty leaves every event untouched.

@@ -154,9 +154,10 @@ async fn automatic_preflight_counts_only_prefix_and_skips_below_minimum() {
         }
         let (base, task) = server(replies).await;
         let path = "/v1/projects/fruit-project/locations/us";
-        let original = wire(&format!(
+        let mut original = wire(&format!(
             "{base}{path}/publishers/google/models/gemini-test:streamGenerateContent?alt=sse"
         ));
+        original.automatic_cache = true;
         let mut create = claim(&format!("{base}{path}/cachedContents"), &expires);
         create["resource_prefix"] = json!(prefix);
         create["measure_tokens"] = json!(true);
@@ -188,7 +189,11 @@ async fn automatic_preflight_counts_only_prefix_and_skips_below_minimum() {
             assert_eq!(host.calls()[1].1["outcome"], "not_created");
             assert_eq!(requests.len(), 1);
         } else {
-            assert_eq!(result.unwrap().upstream_payload["cachedContent"], name);
+            let overlaid = result.unwrap();
+            assert_eq!(overlaid.upstream_payload["cachedContent"], name);
+            // This attempt wrote the cache its generation reads: usage reports
+            // Google's created token count as writes read back in-call.
+            assert_eq!(overlaid.automatic_cache_written_tokens, Some(tokens));
             assert!(requests[1].starts_with(&format!("POST {path}/cachedContents ")));
         }
     }

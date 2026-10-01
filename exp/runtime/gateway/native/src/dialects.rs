@@ -216,6 +216,13 @@ impl Normalizer {
         );
     }
 
+    /// Report reads of the cache this attempt just created as cache writes.
+    /// Only the Gemini usage observer honours it.
+    pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
+        self.gemini_cache_writes =
+            written.filter(|_| self.dialect == Dialect::GeminiGenerateContent);
+    }
+
     /// Whether the latest normalized meter replaces earlier ones instead of
     /// merging by maximum. A writes-within-reads accumulator already coalesces
     /// every report and lowers the read leg once a write arrives, so a
@@ -441,6 +448,9 @@ pub struct Normalizer {
     // mapper's local counter.
     gemini_tool_index: u32,
     gemini: gemini::StreamState,
+    // Tokens this attempt's own automatic Google cache create wrote; reported
+    // cache reads up to this count settle as writes read back in the same call.
+    gemini_cache_writes: Option<u64>,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
     // Caller-known label words (the dispatched model id) exempt from the
@@ -504,6 +514,7 @@ impl Normalizer {
             finish_reason: None,
             gemini_tool_index: 0,
             gemini: gemini::StreamState::default(),
+            gemini_cache_writes: None,
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
