@@ -24,11 +24,16 @@ jobs:
       UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
+      - name: Key the uv cache on the git-pinned source builds
+        # What the uv cache holds across runs is the wheels uv built from
+        # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
+        # (~3 min). Keying on all of uv.lock went cold on every release bump.
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key
       - uses: astral-sh/setup-uv@v6
         with:
-          # The Python 3.13 jobs keep their own uv cache. A shared key is saved
-          # once by whichever job finishes first (often the 3.12 one), so these
-          # rebuilt the git-pinned exp-mitmproxy-rs (~3 min) on every run.
+          # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
+          # by whichever finishes first, holding the wrong interpreter's builds.
+          cache-dependency-glob: .uv-cache-key
           cache-suffix: py313-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -165,11 +170,16 @@ jobs:
       UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
+      - name: Key the uv cache on the git-pinned source builds
+        # What the uv cache holds across runs is the wheels uv built from
+        # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
+        # (~3 min). Keying on all of uv.lock went cold on every release bump.
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key
       - uses: astral-sh/setup-uv@v6
         with:
-          # The Python 3.13 jobs keep their own uv cache. A shared key is saved
-          # once by whichever job finishes first (often the 3.12 one), so these
-          # rebuilt the git-pinned exp-mitmproxy-rs (~3 min) on every run.
+          # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
+          # by whichever finishes first, holding the wrong interpreter's builds.
+          cache-dependency-glob: .uv-cache-key
           cache-suffix: py313-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
