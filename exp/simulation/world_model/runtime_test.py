@@ -184,11 +184,14 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
         default_top_k=5,
         included_partitions=frozenset({"fit", "held_out"}),
     )
+    world_capabilities = ModelCapabilities(
+        context_window_tokens=32_768, maximum_output_tokens=8_192
+    )
     world_snapshot = ModelSnapshot(
         billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="world",
-        capabilities_sha256=sha256_json(ModelCapabilities()),
+        capabilities_sha256=world_capabilities.identity_sha256(),
         connection_sha256=sha256_json({"connection": "world"}),
     )
     artifact = persist_grounded_world_model(
@@ -203,12 +206,27 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     assert artifact.artifact.top_k == 5
     client = _WorldClient(world_snapshot)
 
+    for context in (16_384, 65_536):
+        with pytest.raises(ValueError, match="capabilities differ from.*artifact"):
+            load_grounded_world_model(
+                store.artifacts,
+                artifact.artifact.world_model_id,
+                client=client,
+                embedder=binding,
+                capabilities=world_capabilities.model_copy(
+                    update={"context_window_tokens": context}
+                ),
+            )
+    assert client.requests == []
+
     runtime = load_grounded_world_model(
         store.artifacts,
         artifact.artifact.world_model_id,
         client=client,
         embedder=binding,
+        capabilities=world_capabilities,
     )
+    assert runtime.capabilities == world_capabilities
     transition = runtime.step(
         task="Reset my password",
         action=AssistantAction(content="What email is associated with the account?"),

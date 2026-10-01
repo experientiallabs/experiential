@@ -335,15 +335,23 @@ def load_grounded_world_model(
         client: Runtime client. Every returned response must match the artifact's exact model
             identity before its output is accepted.
         embedder: Exact explicit semantic embedding binding used to build the serving RAG.
-        capabilities: Resolved world-model capacity, when available, for pre-dispatch packing.
+        capabilities: Resolved world-model capacity for pre-dispatch packing. When supplied,
+            its identity must match the artifact's frozen model snapshot.
         token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
 
     Returns:
         Executable grounded world model.
+
+    Raises:
+        ValueError: Supplied capabilities differ from the artifact's frozen model identity.
     """
     stored = store.read(artifact_id)
     world_model_input = artifact_input(stored.manifest)
     artifact = _load_verified_artifact(store, world_model_input)
+    if capabilities is not None and (
+        capabilities.identity_sha256() != artifact.model.capabilities_sha256
+    ):
+        raise ValueError("world-model capabilities differ from the frozen build artifact")
     loaded_rag = load_rag_index(store, artifact.serving_rag.artifact_id)
     return GroundedWorldModel(
         artifact_input=world_model_input,
