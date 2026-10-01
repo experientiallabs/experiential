@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Self
 from uuid import uuid4
 
-from filelock import FileLock, Timeout
+from filelock import BaseFileLock, FileLock, SoftFileLock, Timeout
 from pydantic import AwareDatetime, Field, ValidationError, field_validator, model_validator
 
 from exp.common.core.artifacts import (
@@ -605,7 +605,7 @@ class TextCellLeaseStore:
             )
         probe = self._owner_lock(lease)
         try:
-            probe.acquire(timeout=0)
+            self._acquire_owner_lock(probe)
         except Timeout:
             return False
         except OSError as exc:
@@ -628,12 +628,31 @@ class TextCellLeaseStore:
         """Acquire ownership before publishing a claim and retain it throughout execution."""
         lock = self._owner_lock(lease)
         try:
-            lock.acquire(timeout=0)
+            self._acquire_owner_lock(lock)
         except (OSError, Timeout) as exc:
             raise TextCellLeaseError(
                 "cannot claim text-cell ownership; retry the evaluation"
             ) from exc
         self._ownership_locks[lease.owner_id] = lock
+
+    def _acquire_owner_lock(self, lock: BaseFileLock) -> None:
+        """Acquire only a native lock, rejecting library fallback even on contention."""
+        try:
+            lock.acquire(timeout=0)
+        except BaseException:
+            self._require_kernel_lock(lock)
+            raise
+        self._require_kernel_lock(lock)
+
+    @staticmethod
+    def _require_kernel_lock(lock: BaseFileLock) -> None:
+        """Reject soft existence/PID locks because they cannot prove owner termination."""
+        if isinstance(lock, SoftFileLock):
+            lock.release()
+            raise TextCellLeaseError(
+                "text-cell ownership requires kernel file locking; use a filesystem with "
+                "native lock support. The existing claim was not changed."
+            )
 
     def _tombstone(self, path: Path, lease: TextCellLease) -> TextCellLease:
         """Atomically retain non-replay evidence without retaining its budget reservation."""

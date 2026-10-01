@@ -1,5 +1,6 @@
 """Adversarial durability tests for text simulation paid-cell claims."""
 
+import errno
 import logging
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from filelock import _unix as filelock_unix
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.core.locks import FileLockTimeout, file_write_lock
@@ -27,6 +29,60 @@ from exp.simulation.engines.text.leases import (
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix native-lock fallback")
+@pytest.mark.parametrize("operation", ["claim", "probe"])
+def test_unsupported_flock_rejects_soft_ownership_without_changing_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """A filesystem's ENOSYS cannot silently turn owner detection back into PID checks."""
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
+    claim = store.acquire(
+        lease_id="lease-a",
+        resolution_id="resolution-a",
+        simulation_id="simulation-a",
+        rollout_id="rollout-a",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        observed_spend_usd=lambda: 0.0,
+        rollout_completed=lambda _: False,
+    )
+    assert claim.lease is not None
+    store.abandon(claim.lease)
+    before = store._records.read("lease-a")
+
+    def unsupported_flock(_descriptor: int, _operation: int) -> None:
+        """Exercise filelock's real native-to-soft fallback on an unsupported mount."""
+        raise OSError(errno.ENOSYS, "flock not implemented")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(filelock_unix.fcntl, "flock", unsupported_flock)
+        with pytest.warns(UserWarning, match="falling back"):
+            with pytest.raises(TextCellLeaseError, match="requires kernel file locking"):
+                if operation == "claim":
+                    store._hold_ownership(claim.lease)
+                else:
+                    store.stale_recovery_pending("lease-a")
+    assert store._records.read("lease-a") == before
+    assert not store._ownership_locks
+
+
+def test_contended_soft_fallback_is_rejected_instead_of_treated_as_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A soft fallback timeout cannot certify a reused PID as a live owner."""
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
+    soft = leases.SoftFileLock(tmp_path / "soft-owner.lock", timeout=0)
+
+    def contended(*, timeout: float) -> None:
+        """Represent soft-lock contention before a caller has obtained ownership."""
+        assert timeout == 0
+        raise leases.Timeout(soft.lock_file)
+
+    monkeypatch.setattr(soft, "acquire", contended)
+    with pytest.raises(TextCellLeaseError, match="requires kernel file locking"):
+        store._acquire_owner_lock(soft)
 
 
 @pytest.mark.parametrize(
