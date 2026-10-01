@@ -423,6 +423,7 @@ def test_judging_recovery_can_exceed_original_quote_under_approved_allowance(
     assert Counter(alias for alias, _ in state.completion_calls) - before == {"judge": 6}
     assert result.report.compared_cells == 3
     assert result.judge_cost_usd > run.prepared.cost.maximum_cost_usd
+    assert resumed.spending_limit_usd is not None
     assert result.judge_cost_usd < resumed.spending_limit_usd
     history = tuple(
         EvaluationRun.model_validate_json(payload)

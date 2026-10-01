@@ -27,10 +27,12 @@ from exp.simulation.engines.text import simulator
 
 
 @pytest.mark.parametrize("blank_worker", [False, True])
+@pytest.mark.parametrize("uncapped", [False, True])
 def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     blank_worker: bool,
+    uncapped: bool,
 ) -> None:
     """Only provider transport is deterministic; all evaluation execution is production code."""
     project, catalog, state, prepared = _prepare(tmp_path)
@@ -63,7 +65,7 @@ def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
     embeddings_before = len(state.embedding_calls)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
     budget = EvaluationBudget(
-        maximum_cost_usd=prepared.cost.maximum_cost_usd,
+        maximum_cost_usd=None if uncapped else prepared.cost.maximum_cost_usd,
         maximum_judgments=prepared.cost.judgment_count,
     )
     result = run_prepared_model_evaluation(
@@ -208,7 +210,10 @@ def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
     assert before == (len(state.completion_calls), len(state.embedding_calls))
 
 
-def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(tmp_path: Path) -> None:
+@pytest.mark.parametrize("resumed_limit", [100, None])
+def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(
+    tmp_path: Path, resumed_limit: float | None
+) -> None:
     """An allowance far below the theoretical bound pauses, then replays a paid prefix for free."""
 
     project, catalog, state, prepared = _prepare(tmp_path)
@@ -233,7 +238,7 @@ def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(tmp_path
         project,
         prepared,
         runtime,
-        budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+        budget=EvaluationBudget(maximum_cost_usd=resumed_limit, maximum_judgments=100),
         provider_spend_consented=True,
         created_at=_TIME,
         code_revision=_REVISION,

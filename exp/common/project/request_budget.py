@@ -175,8 +175,8 @@ class RequestBudgetStore:
         with self._records.transaction():
             yield
 
-    def authorize(self, limit: float) -> None:
-        """Append the explicitly approved limit to the durable execution history."""
+    def authorize(self, limit: float | None) -> None:
+        """Append the approved aggregate limit, or null for uncapped accounting, to history."""
         self._records.append(
             str(uuid4()),
             canonical_json_bytes({"limit_usd": limit, "created_at": datetime.now(UTC).isoformat()}),

@@ -59,14 +59,15 @@ class EvaluationSetup(ContractModel):
 
 
 class EvaluationBudget(ContractModel):
-    """Finite ceilings for simulation plus judging; execution never opts out of enforcement.
+    """Judgment-count authority and an optional aggregate provider-spend limit.
 
     Attributes:
-        maximum_cost_usd: Positive finite provider-spend ceiling.
+        maximum_cost_usd: Optional positive finite provider-spend ceiling. None removes only
+            the aggregate cap; per-request token and cost reservations remain enforced.
         maximum_judgments: Positive ceiling on durable cell judgments.
     """
 
-    maximum_cost_usd: float = Field(gt=0, allow_inf_nan=False)
+    maximum_cost_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     maximum_judgments: int = Field(gt=0)
 
 
@@ -76,7 +77,7 @@ class EvaluationExecutionContract(ArtifactEnvelope):
     Attributes:
         contract_id: Content-derived execution identity.
         setup: Frozen model, environment and judge inputs.
-        budget: Frozen finite execution ceilings. Catalog-backed execution also enforces
+        budget: Frozen execution ceilings. Catalog-backed execution also enforces
             the separately approved request allowance in its durable spending ledger.
     """
 
@@ -122,7 +123,8 @@ class EvaluationServices:
         plan_inputs: Additional immutable execution inputs, empty by default.
         judging_protocol: Optional explicit fresh judging pass over saved rollouts.
         judging_input: Immutable reviewed judging revision, independent of simulation identity.
-        spending_limit_usd: Optional request-ledger allowance, independent of plan identity.
+        spending_limit_usd: Request-ledger allowance, independent of plan identity. Omitted
+            uses the execution budget; explicit None removes the aggregate cap.
         judge_spend: Optional authoritative request-ledger reconciliation for saved rollouts.
     """
 
@@ -131,7 +133,7 @@ class EvaluationServices:
     plan_inputs: tuple[ArtifactInput, ...] = ()
     judging_protocol: EvaluationProtocol | None = None
     judging_input: ArtifactInput | None = None
-    spending_limit_usd: float | None = None
+    spending_limit_usd: float | None | Literal["execution_budget"] = "execution_budget"
     judge_spend: Callable[[tuple[str, ...]], float] | None = None
 
 

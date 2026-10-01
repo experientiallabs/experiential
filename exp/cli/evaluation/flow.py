@@ -8,7 +8,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.prompt import FloatPrompt
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -185,9 +185,14 @@ def run_evaluation(
                 _console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=run.spending_limit_usd,
+                estimated_cost_usd=(
+                    run.prepared.cost.estimated_cost_usd
+                    if run.spending_limit_usd is None
+                    else run.spending_limit_usd
+                ),
                 command=f"exp eval {project} --resume {run.run_id}",
                 non_interactive=not interactive,
+                cost_is_upper_bound=run.spending_limit_usd is not None,
             ):
                 return
             save_run(store, run)
@@ -214,7 +219,7 @@ def run_evaluation(
                     )
                     return
                 yes = False
-                _console.print("Increase the spending limit to continue this evaluation.")
+                _console.print("Increase or remove the spending limit to continue.")
             except SimulationContentionError:
                 _console.print("Paused: rollout state is busy. Completed work saved.")
                 _console.print(
@@ -315,10 +320,12 @@ def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
     )
     if run.judging_revision is not None:
         _console.print("Retry judging with full model context. Saved rollouts are reused.")
-    _console.print(
-        f"\nEstimated ${cost.estimated_cost_usd:,.2f} · "
-        f"Spending limit ${run.spending_limit_usd:,.2f}"
+    limit = (
+        "Spending limit off"
+        if run.spending_limit_usd is None
+        else f"Spending limit ${run.spending_limit_usd:,.2f}"
     )
+    _console.print(f"\nEstimated ${cost.estimated_cost_usd:,.2f} · {limit}")
 
 
 def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
@@ -350,20 +357,34 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
         if choice.values[0] == "start":
             if (
                 run.required_spending_limit_usd
+                and run.spending_limit_usd is not None
                 and run.spending_limit_usd < run.required_spending_limit_usd
             ):
-                _console.print("Increase the spending limit before resuming.")
+                _console.print("Increase or remove the spending limit before resuming.")
                 continue
             return run
         if choice.values[0] == "limit":
-            suggested = max(run.spending_limit_usd, run.required_spending_limit_usd or 0)
-            limit = FloatPrompt.ask(
-                "Total spending limit ($)",
+            value = Prompt.ask(
+                "Total spending limit ($, or none)",
                 console=_console,
-                default=math.ceil(suggested * 100) / 100,
-            )
-            if not math.isfinite(limit) or limit <= 0:
-                _console.print("Enter a positive dollar amount.")
+                default=(
+                    "none"
+                    if run.spending_limit_usd is None
+                    else str(
+                        math.ceil(
+                            max(run.spending_limit_usd, run.required_spending_limit_usd or 0) * 100
+                        )
+                        / 100
+                    )
+                ),
+            ).strip()
+            try:
+                limit = None if value.lower() == "none" else float(value)
+            except ValueError:
+                _console.print("Enter a positive dollar amount or none.")
+                continue
+            if limit is not None and (not math.isfinite(limit) or limit <= 0):
+                _console.print("Enter a positive dollar amount or none.")
                 continue
             run = run.model_copy(update={"spending_limit_usd": limit})
             _preflight(project, run)
@@ -384,7 +405,8 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
         _console.print(Text(run.prepared.cost.estimate_basis), style="dim")
         _console.print(
             f"Captured turns with measured tokens: {run.prepared.cost.measured_turns:g} / "
-            f"{run.prepared.cost.captured_turns:g}. Pauses before exceeding the spending limit.",
+            f"{run.prepared.cost.captured_turns:g}. "
+            "An enabled spending limit pauses before the next unaffordable request.",
             style="dim",
         )
 

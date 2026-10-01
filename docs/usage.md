@@ -316,7 +316,7 @@ result = run_prepared_model_evaluation(
     prepared,
     runtime_catalog,
     budget=EvaluationBudget(
-        maximum_cost_usd=prepared.cost.maximum_cost_usd,
+        maximum_cost_usd=None,  # Optional aggregate cap; use a positive USD amount to enable one.
         maximum_judgments=prepared.cost.judgment_count,
     ),
     provider_spend_consented=consent_after_credit_reservation,
@@ -331,6 +331,14 @@ frontier. The chart's cost is worker operating cost, not the cost of generating 
 calls. The quote and result exclude earlier trace mining and grounding costs; a host must include
 those separately before offering a complete trace-to-report price. Credit conversion, promotions,
 identity authorization and job persistence remain hosting responsibilities.
+
+Aggregate evaluation spending limits are off by default. The estimate remains visible and paid
+execution still requires consent. Every request keeps a finite token and retry-inclusive cost
+reservation; completed charges, unknown-dispatch holds and exact response replay remain durable
+with or without an aggregate cap. In the launch review, select Spending limit to set a positive
+dollar amount or enter `none` to remove it. Changing that limit does not change the frozen plan.
+`EvaluationServices` uses the execution budget when its spending limit is omitted; explicitly
+passing `spending_limit_usd=None` disables only that aggregate limit.
 
 Judges use their declared context capacity minus the output reservation. Full visible task and
 tool evidence is retained; a transcript that exceeds that capacity is excluded with an explicit

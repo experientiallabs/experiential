@@ -85,13 +85,114 @@ def test_parallel_reservations_share_one_allowance(tmp_path: Path) -> None:
     assert budget.accounted_usd == 3
 
 
+def test_uncapped_parallel_requests_keep_durable_accounting_and_replay(tmp_path: Path) -> None:
+    """No aggregate cap blocks concurrent finite reservations, and reopening preserves charges."""
+    project = ProjectStore(tmp_path, "budget-test")
+    budget = RequestBudget(project, identity="uncapped", maximum_cost_usd=None)
+    admitted = threading.Barrier(8)
+    calls: list[str] = []
+
+    def worker(index: int) -> str:
+        """Require all eight requests to hold their reservations before any settles."""
+        key = str(index)
+
+        def operation() -> str:
+            """Prove that independent requests are admitted together without an aggregate cap."""
+            calls.append(key)
+            admitted.wait(timeout=10)
+            return key
+
+        with budget.scope(key):
+            return budget.call(
+                role="assistant",
+                fingerprint=key,
+                maximum_cost_usd=100,
+                operation=operation,
+                encode=str,
+                decode=str,
+                charge=lambda result: 100,
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert list(pool.map(worker, range(8))) == [str(index) for index in range(8)]
+    assert budget.accounted_usd == 800
+    reopened = RequestBudget(ProjectStore(tmp_path, "budget-test"), identity="uncapped")
+    for index in range(8):
+        assert _call(reopened, key=str(index), calls=calls, maximum=100) == str(index)
+    assert len(calls) == 8
+    assert reopened.accounted_usd == 800
+
+
+def test_aggregate_limit_can_be_removed_and_lowered_without_rewriting_paid_work(
+    tmp_path: Path,
+) -> None:
+    """Explicit replacement affects new admission while exact paid replay remains free."""
+    project = ProjectStore(tmp_path, "budget-test")
+    calls: list[str] = []
+    limited = RequestBudget(project, identity="replace", maximum_cost_usd=1)
+    _call(limited, key="first", calls=calls)
+    with pytest.raises(SpendLimitReached):
+        _call(limited, key="second", calls=calls)
+    unlimited = RequestBudget(project, identity="replace", maximum_cost_usd=None)
+    _call(unlimited, key="second", calls=calls)
+    reduced = RequestBudget(project, identity="replace", maximum_cost_usd=0.5)
+    assert _call(reduced, key="first", calls=calls) == "first"
+    with pytest.raises(SpendLimitReached) as paused:
+        _call(reduced, key="third", calls=calls)
+    assert paused.value.limit_usd == 0.5
+    assert paused.value.accounted_usd == 2
+    assert calls == ["first", "second"]
+
+
+@pytest.mark.parametrize("maximum", [-1, float("inf"), float("nan")])
+def test_uncapped_execution_still_requires_finite_request_reservations(
+    tmp_path: Path, maximum: float
+) -> None:
+    """Removing aggregate authorization never removes each request's bounded admission."""
+    budget = RequestBudget(ProjectStore(tmp_path, "budget-test"), identity="bounds")
+    calls: list[str] = []
+    with pytest.raises(ValueError, match="reservation must be finite and nonnegative"):
+        _call(budget, key="invalid", calls=calls, maximum=maximum)
+    assert calls == []
+    assert budget.accounted_usd == 0
+
+
+def test_uncapped_request_cannot_settle_above_its_reservation(tmp_path: Path) -> None:
+    """A provider violating a finite request bound retains an unresolved receipt."""
+    project = ProjectStore(tmp_path, "budget-test")
+    budget = RequestBudget(project, identity="overcharge")
+    with budget.scope("cell"), pytest.raises(ValueError, match="exceeds.*reservation"):
+        budget.call(
+            role="assistant",
+            fingerprint="request",
+            maximum_cost_usd=1,
+            operation=lambda: "answer",
+            encode=str,
+            decode=str,
+            charge=lambda result: 2,
+        )
+    assert budget.accounted_usd == 1
+    reopened = RequestBudget(project, identity="overcharge")
+    with reopened.scope("cell"), pytest.raises(ValueError, match="unresolved spend"):
+        reopened.call(
+            role="assistant",
+            fingerprint="request",
+            maximum_cost_usd=1,
+            operation=lambda: "unexpected",
+            encode=str,
+            decode=str,
+            charge=lambda result: 0,
+        )
+
+
+@pytest.mark.parametrize("limit", [2, None])
 @pytest.mark.parametrize("maximum", [0, 1])
 def test_unknown_dispatch_retains_its_reservation_and_never_replays(
-    tmp_path: Path, maximum: float
+    tmp_path: Path, maximum: float, limit: float | None
 ) -> None:
     """A provider failure is not evidence that a paid request was free."""
     budget = RequestBudget(
-        ProjectStore(tmp_path, "budget-test"), identity="fixture", maximum_cost_usd=2
+        ProjectStore(tmp_path, "budget-test"), identity="fixture", maximum_cost_usd=limit
     )
 
     def fail() -> str:
@@ -110,7 +211,7 @@ def test_unknown_dispatch_retains_its_reservation_and_never_replays(
         )
     assert budget.accounted_usd == maximum
     resumed = RequestBudget(
-        ProjectStore(tmp_path, "budget-test"), identity="fixture", maximum_cost_usd=2
+        ProjectStore(tmp_path, "budget-test"), identity="fixture", maximum_cost_usd=limit
     )
     with resumed.scope("cell"), pytest.raises(ValueError, match="unresolved spend") as saved:
         resumed.call(

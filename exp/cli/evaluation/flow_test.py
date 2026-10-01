@@ -49,7 +49,7 @@ def test_review_can_change_allowance_without_changing_rollout_limits(
     monkeypatch.setattr(
         flow, "choose_one", lambda *args, **kwargs: PickerResult(values=(next(choices),))
     )
-    monkeypatch.setattr(flow.FloatPrompt, "ask", lambda *args, **kwargs: 12.0)
+    monkeypatch.setattr(flow.Prompt, "ask", lambda *args, **kwargs: "12")
     output = StringIO()
     monkeypatch.setattr(flow, "_console", Console(file=output, width=120))
     before = len(state.completion_calls), len(state.embedding_calls)
@@ -61,3 +61,31 @@ def test_review_can_change_allowance_without_changing_rollout_limits(
     assert "Maximum $" not in output.getvalue()
     assert "Captured turns with measured tokens:" in output.getvalue()
     assert before == (len(state.completion_calls), len(state.embedding_calls))
+
+
+def test_review_can_remove_limit_from_a_paused_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit uncapped choice persists null and permits resume without changing the plan."""
+    project, catalog, _ = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(models=("candidate-a", "candidate-b")),
+        code_revision=_REVISION,
+    ).model_copy(
+        update={"status": "paused", "spending_limit_usd": 1, "required_spending_limit_usd": 2}
+    )
+    choices = iter(("limit", "start"))
+    monkeypatch.setattr(
+        flow, "choose_one", lambda *args, **kwargs: PickerResult(values=(next(choices),))
+    )
+    monkeypatch.setattr(flow.Prompt, "ask", lambda *args, **kwargs: "none")
+    output = StringIO()
+    monkeypatch.setattr(flow, "_console", Console(file=output, width=120))
+    reviewed = flow._review(project, run)
+    assert reviewed is not None
+    assert reviewed.spending_limit_usd is None
+    assert reviewed.prepared == run.prepared
+    assert "Spending limit off" in output.getvalue()
+    assert '"spending_limit_usd":null' in reviewed.model_dump_json()

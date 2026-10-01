@@ -17,7 +17,7 @@ def build_router_simulation_spec(
     plan_input: ArtifactInput,
     task_input: ArtifactInput,
     setup: EvaluationSetup,
-    maximum_cost_usd: float,
+    maximum_cost_usd: float | None,
     created_at: datetime,
     code_revision: str,
     cells: tuple[EvaluationCell, ...],
@@ -32,7 +32,7 @@ def build_router_simulation_spec(
         plan_input: Exact persisted evaluation-plan pointer.
         task_input: Exact persisted task-set pointer.
         setup: Reviewed candidates, protocols, retrieval pointer, and world-model settings.
-        maximum_cost_usd: Finite provider-spend ceiling for this phase.
+        maximum_cost_usd: Optional finite provider-spend ceiling for this phase.
         created_at: Immutable specification timestamp.
         code_revision: Exact source revision bound to generated artifacts.
         cells: Phase-specific plan cells eligible for simulation.

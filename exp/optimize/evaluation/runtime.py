@@ -54,8 +54,9 @@ def run_prepared_model_evaluation(
         project: Owner of the completed scenario, world-model and judge evidence.
         prepared: Exact engine preparation whose quote the user accepted.
         catalog: Runtime catalog holding transient provider credential references.
-        budget: Approved total provider allowance and judgment count. Raising only the
+        budget: Optional total provider allowance and finite judgment count. Changing only the
             allowance resumes the same plan and replays completed provider responses for free.
+            None removes the aggregate cap while preserving finite request reservations.
         provider_spend_consented: Explicit consent after the host's atomic credit reservation.
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.

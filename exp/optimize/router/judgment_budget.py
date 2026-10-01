@@ -494,7 +494,7 @@ def complete_cell_evidence(
     judge: Judge,
     maximum_judgments: int,
     *,
-    remaining_cost_usd: float,
+    remaining_cost_usd: float | None,
     stop_on_overspend: bool,
     spend_ceiling_crossed: Callable[[bool, str, str], None],
     progress: ProgressHook | None = None,
@@ -536,7 +536,7 @@ def complete_cell_evidence(
         review: Approved rubric and calibration identifiers.
         judge: Injected judge completing missing judgments.
         maximum_judgments: Finite whole-workflow judgment dispatch ceiling.
-        remaining_cost_usd: Shared provider-spend remainder available to judging.
+        remaining_cost_usd: Shared provider-spend remainder, or None without an aggregate cap.
         stop_on_overspend: Whether crossing the shared ceiling blocks the next dispatch.
         spend_ceiling_crossed: Fail-closed or warn-once handler for a crossed spend ceiling.
         progress: Optional progress hook for judgment counting.
@@ -690,7 +690,7 @@ def complete_cell_evidence(
                     # treating them here as final spend would pause an affordable run early.
                     if reconciled_spend is not None and maximum_concurrency == 1:
                         judge_spend_usd = reconciled_spend()
-                    if judge_spend_usd >= remaining_cost_usd:
+                    if remaining_cost_usd is not None and judge_spend_usd >= remaining_cost_usd:
                         if stop_on_overspend or not overspend_warned:
                             spend_ceiling_crossed(
                                 stop_on_overspend,

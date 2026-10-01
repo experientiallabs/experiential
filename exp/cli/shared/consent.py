@@ -66,6 +66,7 @@ def require_spend_consent(
     non_interactive: bool = False,
     previously_confirmed: bool = False,
     additional_budgets: Sequence[SpendBudget] = (),
+    cost_is_upper_bound: bool = True,
 ) -> bool:
     """Enforce the configured authorization policy for one conservative cost estimate.
 
@@ -91,6 +92,8 @@ def require_spend_consent(
         non_interactive: Whether this invocation forbids terminal questions.
         previously_confirmed: Whether immutable command state records an earlier confirmation.
         additional_budgets: Component budgets to review together with the command total.
+        cost_is_upper_bound: Whether the displayed estimate is an enforced allowance. False
+            labels uncapped execution honestly without changing warning or consent thresholds.
 
     Returns:
         True when execution is authorized, or False after an interactive decline.
@@ -135,12 +138,17 @@ def require_spend_consent(
             warnings=warnings,
             yes=yes or previously_confirmed,
             non_interactive=non_interactive,
+            cost_is_upper_bound=cost_is_upper_bound,
         )
     if estimate <= budget / Decimal(2) or yes or previously_confirmed:
         return True
     if non_interactive or not can_prompt(console):
         _refuse_noninteractive(console, command=command, estimate=estimate, budget=budget)
-    prompt = f"Authorize {command} to spend up to {_format_usd(estimate)}?"
+    prompt = (
+        f"Authorize {command} to spend up to {_format_usd(estimate)}?"
+        if cost_is_upper_bound
+        else f"Authorize {command} (estimated {_format_usd(estimate)}, no spending limit)?"
+    )
     try:
         return Confirm.ask(prompt, default=False, console=console)
     except EOFError:
@@ -207,6 +215,7 @@ def _confirm_over_budget(
     warnings: Sequence[str],
     yes: bool,
     non_interactive: bool,
+    cost_is_upper_bound: bool,
 ) -> bool:
     """Warn about exceeded budgets and offer one explicit override for this invocation.
 
@@ -217,6 +226,7 @@ def _confirm_over_budget(
         warnings: Named budget overruns to display before confirmation.
         yes: Whether the invocation already has explicit confirmation.
         non_interactive: Whether this invocation forbids terminal questions.
+        cost_is_upper_bound: Whether the amount is an enforced allowance or an uncapped estimate.
 
     Returns:
         True only after explicit confirmation; a blank answer or decline authorizes nothing.
@@ -228,13 +238,18 @@ def _confirm_over_budget(
         console.print(warning)
     if yes:
         return True
+    amount = (
+        f"up to {_format_usd(estimate)}"
+        if cost_is_upper_bound
+        else f"estimated {_format_usd(estimate)}, no spending limit"
+    )
     if non_interactive or not can_prompt(console):
         console.print(
             "No spend was authorized. Re-run in an interactive terminal to proceed, or use "
-            f"--yes after reviewing {escape(command)} (up to {_format_usd(estimate)})."
+            f"--yes after reviewing {escape(command)} ({amount})."
         )
         raise typer.Exit(NO_CONSENT_EXIT_CODE)
-    prompt = f"Proceed anyway (up to {_format_usd(estimate)})?"
+    prompt = f"Proceed anyway ({amount})?"
     try:
         confirmed = Confirm.ask(prompt, default=False, console=console)
     except EOFError:

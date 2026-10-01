@@ -1,4 +1,4 @@
-"""Durable request admission and exact response replay under an approved spend limit."""
+"""Durable request admission and exact response replay with an optional aggregate limit."""
 
 from __future__ import annotations
 
@@ -45,18 +45,23 @@ class RequestBudget:
     with large files referenced from SQLite.
     """
 
-    def __init__(self, project: ProjectStore, *, identity: str, maximum_cost_usd: float) -> None:
+    def __init__(
+        self, project: ProjectStore, *, identity: str, maximum_cost_usd: float | None = None
+    ) -> None:
         """Bind a local ledger to immutable execution identity and explicit authorization.
 
         Args:
             project: Owner of the shared SQLite accounting records and response artifacts.
             identity: Digest of immutable models, tasks, prompts, prices and execution settings.
-            maximum_cost_usd: Total approved allowance, including completed and unknown calls.
+            maximum_cost_usd: Optional total allowance, including completed and unknown calls.
+                None disables the aggregate cap, while every request retains its finite bound.
 
         Raises:
             ValueError: Authorization is invalid or the ledger belongs to another execution.
         """
-        if not math.isfinite(maximum_cost_usd) or maximum_cost_usd <= 0:
+        if maximum_cost_usd is not None and (
+            not math.isfinite(maximum_cost_usd) or maximum_cost_usd <= 0
+        ):
             raise ValueError("spending limit must be finite and positive")
         self._store = RequestBudgetStore(project, identity)
         self._limit = maximum_cost_usd
@@ -218,7 +223,7 @@ class RequestBudget:
                             )
                         return self._store.response(row)
                     spent = self._store.total()
-                    if spent + maximum <= self._limit + 1e-9:
+                    if self._limit is None or spent + maximum <= self._limit + 1e-9:
                         self._store.write(
                             key,
                             RequestReceipt(
@@ -227,6 +232,6 @@ class RequestBudget:
                         )
                         self._active.add(key)
                         return None
-                if not self._active:
+                if not self._active and self._limit is not None:
                     raise SpendLimitReached(self._limit, spent, spent + maximum)
                 self._condition.wait(timeout=1)

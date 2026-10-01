@@ -82,7 +82,7 @@ def test_twenty_scenarios_repeats_persist_report_and_exact_resume(tmp_path: Path
     assert {event.total for event in tools_progress} == {20}
     assert run.prepared.cost.judgment_count == 80
     assert run.prepared.cost.scenario_count == 20
-    run = run.model_copy(update={"spending_limit_usd": 100.0})
+    assert run.spending_limit_usd is None
 
     save_run(project, run)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
@@ -150,8 +150,6 @@ def test_interrupted_parallel_run_resumes_without_repeating_paid_cells(tmp_path:
         ),
         code_revision=_REVISION,
     )
-    run = run.model_copy(update={"spending_limit_usd": 100.0})
-
     save_run(project, run)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
 

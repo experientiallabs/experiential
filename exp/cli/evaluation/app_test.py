@@ -52,7 +52,7 @@ def test_cli_review_and_resume_preserve_exact_preparation(tmp_path: Path) -> Non
     )
     assert result.exit_code == 0, result.output
     assert "20 scenarios" in result.output
-    assert "Spending limit $5.00" in result.output
+    assert "Spending limit off" in result.output
     assert "Maximum $" not in result.output
     assert (
         "Models:" in result.output and "World model" in result.output and "Judge" in result.output
@@ -293,4 +293,5 @@ def test_cli_spending_pause_is_saved_without_report_or_invalid_rollouts(
     assert saved.status == "paused"
     assert saved.report_id is None
     assert saved.required_spending_limit_usd is not None
+    assert saved.spending_limit_usd is not None
     assert saved.required_spending_limit_usd > saved.spending_limit_usd

@@ -262,6 +262,30 @@ def test_over_budget_noninteractive_without_consent_explains_how_to_proceed(tmp_
     assert "interactive terminal to proceed, or use --yes" in _flat(buffer)
 
 
+@pytest.mark.parametrize("estimate", [15.0, 35.0])
+def test_uncapped_estimate_is_never_presented_as_an_enforced_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None, estimate: float
+) -> None:
+    """Both consent branches keep the estimate visible without promising a spending ceiling."""
+    root = tmp_path / ".exp"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(True)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, _ = _console(terminal=True)
+    assert require_spend_consent(
+        console,
+        root=root,
+        yes=False,
+        estimated_cost_usd=estimate,
+        command="exp eval support",
+        cost_is_upper_bound=False,
+    )
+    assert len(answer.asked) == 1
+    assert f"estimated ${estimate:.2f}, no spending limit" in answer.asked[0]
+    assert "up to" not in answer.asked[0]
+    assert answer.defaults == [False]
+
+
 @pytest.mark.parametrize("accepted", [False, True])
 def test_component_budgets_share_one_confirmation(
     tmp_path: Path,
