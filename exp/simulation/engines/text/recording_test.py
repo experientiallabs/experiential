@@ -419,6 +419,34 @@ def test_world_context_packs_whole_examples_and_records_only_dispatched_groundin
     assert recorder.recorded.retrieved_transition_ids == (("fits",), ("fits",))
 
 
+def test_unpublished_world_output_packs_examples_before_binding_output() -> None:
+    """Optional grounding must not consume the requested output when no hard max is published."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [_response('{"message":"","terminal":true}', model=_snapshot("world-model-a"))]
+    )
+    recorder = _recorder(
+        candidate,
+        world,
+        output_limit=None,
+        world_context_window=24_000,
+        retrieval_matches=(
+            _grounding_example("too-large-with-output", 6_000),
+            _grounding_example("fits", 50),
+        ),
+    )
+    recorder.complete(
+        ModelRequest(messages=(ModelMessage(role="user", content="Required question"),))
+    )
+
+    request = world.requests[0]
+    evidence = json.loads(request.messages[1].content or "")
+    assert [item["transition_id"] for item in evidence["grounded_examples"]] == ["fits"]
+    assert request.maximum_output_tokens == 16_000
+    assert _Utf8Counter().count(request) + 16_000 <= 24_000
+    assert recorder.recorded.retrieved_transition_ids == (("fits",),)
+
+
 @pytest.mark.parametrize("json_output", [False, True])
 def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free(
     json_output: bool,

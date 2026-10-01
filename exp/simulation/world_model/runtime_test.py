@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -37,6 +38,8 @@ from exp.simulation.engines.text.prompt import (
     TextWorldModelProtocolError,
     text_prompt_sha256,
 )
+from exp.simulation.engines.text.recording_test import _grounding_example
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 from exp.simulation.retrieval import (
     RAGAction,
     RAGEmbedderBinding,
@@ -49,6 +52,7 @@ from exp.simulation.retrieval import (
     persist_trace_rag,
 )
 from exp.simulation.world_model import (
+    WorldModel,
     bind_fit_grounded_world_model,
     load_grounded_world_model,
     persist_grounded_world_model,
@@ -346,11 +350,12 @@ class _Retriever:
     def __init__(self) -> None:
         """Start with no observed grounding requests."""
         self.queries: list[RAGQuery] = []
+        self.matches: tuple[RAGMatch, ...] = ()
 
     def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
-        """Record the query and return an empty but valid grounding corpus."""
+        """Record the query and return the configured grounding corpus."""
         self.queries.append(query)
-        return ()
+        return self.matches
 
 
 def _runtime(output: str) -> tuple[GroundedWorldModel, _Retriever, _WorldClient]:
@@ -398,6 +403,37 @@ def test_step_rejects_unsolicited_tool_results_for_text_action() -> None:
     runtime, _, _ = _runtime('{"tool_results":[{"call_id":"invented","content":"ok"}]}')
     with pytest.raises(TextWorldModelProtocolError, match="match every candidate call_id"):
         runtime.step(task="Research", action=AssistantAction(content="Done"))
+
+
+@pytest.mark.parametrize("public_session", [False, True])
+def test_public_steps_pack_examples_and_reject_required_overflow(public_session: bool) -> None:
+    """Both public step surfaces fit optional evidence before dispatch, retaining required text."""
+    runtime, retriever, client = _runtime('{"message":"Next","terminal":false}')
+    runtime = replace(
+        runtime,
+        capabilities=ModelCapabilities(context_window_tokens=24_000, maximum_output_tokens=16_000),
+    )
+    retriever.matches = (_grounding_example("oversized", 30_000), _grounding_example("fits", 50))
+
+    def step(task: str) -> None:
+        """Drive the real shared dispatch through one of the two public entrypoints."""
+        if public_session:
+            world = WorldModel(runtime)
+            session = world.new_session(task=task)
+            world.step(session.id, {"role": "assistant", "content": "Required action"})
+        else:
+            runtime.step(task=task, action=AssistantAction(content="Required action"))
+
+    step("Required task")
+    request = client.requests[0]
+    evidence = json.loads(request.messages[1].content or "")
+    assert [item["transition_id"] for item in evidence["grounded_examples"]] == ["fits"]
+    assert evidence["task"]["instruction"] == "Required task"
+    assert request.maximum_output_tokens == 1_024
+    assert Utf8UpperBoundTokenCounter().count(request) + 1_024 <= 24_000
+    with pytest.raises(ValueError, match="required world-model input.*context"):
+        step("Required task " * 3_000)
+    assert len(client.requests) == 1
 
 
 def test_step_returns_exact_parallel_tool_results_with_canonical_grounding() -> None:

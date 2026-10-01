@@ -66,6 +66,7 @@ from exp.optimize.router.automatic.replay import (
 from exp.optimize.router.automatic.reservations import (
     AutomaticRouterCostPlan,
     plan_automatic_router_cost,
+    retrieval_query_input_limit,
     simulation_input_token_estimate,
 )
 from exp.optimize.router.automatic.service import (
@@ -723,7 +724,7 @@ def _wizard_cost_plan(
             catalog,
             selection,
         ),
-        estimated_input_tokens=_wizard_simulation_input_estimate(store, plan, options),
+        estimated_input_tokens=_wizard_simulation_input_estimate(store, plan, options, catalog),
         options=options,
     )
 
@@ -732,6 +733,7 @@ def _wizard_simulation_input_estimate(
     store: ProjectStore,
     plan: WizardBuildPlan,
     options: AutomaticRouterOptions,
+    catalog: ModelCatalog,
 ) -> int:
     """Size the realistic per-call simulation input reservation from persisted build traces.
 
@@ -739,6 +741,7 @@ def _wizard_simulation_input_estimate(
         store: Project-local artifact store.
         plan: Verified task plan and optional fresh deterministic build.
         options: Bounded automatic-router controls supplying token budgets.
+        catalog: Selected capacity metadata for an omitted aggregate query ceiling.
 
     Returns:
         Trace-derived per-call input token planning estimate.
@@ -760,10 +763,20 @@ def _wizard_simulation_input_estimate(
             config.retrieval if config.retrieval is not None else ProjectRetrievalConfiguration()
         )
         top_k = retrieval.top_k
+    problems: list[str] = []
+    query_limit = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias=plan.selected.world_model,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
+        configured_limit=options.maximum_retrieval_query_tokens,
+    )
+    if query_limit is None:
+        raise ValueError("router query capacity is incomplete: " + "; ".join(problems))
     estimate = simulation_input_token_estimate(
         traces,
         retrieved_transition_count=top_k,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+        maximum_retrieval_query_tokens=query_limit,
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     if estimate is None:

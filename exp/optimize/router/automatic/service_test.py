@@ -583,6 +583,8 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
             "20",
             "--maximum-model-calls",
             "1",
+            "--maximum-retrieval-query-tokens",
+            "32768",
             "--simulation-maximum-output-tokens",
             "8000",
             "--non-interactive",

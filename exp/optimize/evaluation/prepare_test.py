@@ -290,7 +290,12 @@ def test_heterogeneous_capacities_use_model_specific_input_estimates(
         judge_setup=initial.judge_setup,
         calibration_id=initial.setup.simulation_protocol.judge_calibration_id,
         embedder_alias="embedder",
-        options=ModelEvaluationOptions(maximum_steps=1, maximum_output_tokens=output_ceiling),
+        options=ModelEvaluationOptions(
+            maximum_steps=1,
+            maximum_output_tokens=output_ceiling,
+            # Isolate output sizing from the separately tested derived query capacity.
+            maximum_retrieval_query_tokens=32_768,
+        ),
         created_at=_TIME,
         code_revision=_REVISION,
     )

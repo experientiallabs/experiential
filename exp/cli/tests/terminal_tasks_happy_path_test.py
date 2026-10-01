@@ -242,7 +242,9 @@ def _calibrate_arguments(
         str(root),
         "--yes",
         "--maximum-input-tokens",
-        "128000",
+        # Source paths change the deterministic fit split. Admit the complete long public
+        # transcripts in any selected five-case sample instead of relying on one small split.
+        "1000000",
         "--approve",
         "--non-interactive",
         *labels,
@@ -320,7 +322,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
-    assert "command estimate $2.17 exceeds the $0.50 budget" in refused_text
+    assert "command estimate $15.25 exceeds the $0.50 budget" in refused_text
     assert "$0.50" in refused_text
     assert "interactive terminal to proceed, or use --yes" in refused_text
     assert "missing labels" not in refused_text

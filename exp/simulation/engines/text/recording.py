@@ -485,12 +485,8 @@ class RecordingCandidateClient:
         self._clear_unknown_dispatch()
         prepared = replace(
             prepared,
-            request=bound_unpublished_output(
-                prepared.request.model_copy(
-                    update={"json_object_output": self._world_model_json_object_output}
-                ),
-                self._world_model.capabilities,
-                self._token_counter,
+            request=prepared.request.model_copy(
+                update={"json_object_output": self._world_model_json_object_output}
             ),
         )
         transition = self._complete_world_turn(prepared, candidate_ended_at)

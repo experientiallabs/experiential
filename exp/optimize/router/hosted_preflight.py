@@ -393,10 +393,19 @@ def _router_stage_reservations(
         maximum_input_tokens=options.maximum_judge_input_tokens,
         maximum_output_tokens=options.maximum_judge_output_tokens,
     )
+    query_limit = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias=world_model.alias,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
+        configured_limit=options.maximum_retrieval_query_tokens,
+    )
+    if query_limit is None:
+        return (), ()
     estimated_input_tokens = simulation_input_token_estimate(
         traces,
         retrieved_transition_count=setup.retrieval.top_k,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+        maximum_retrieval_query_tokens=query_limit,
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     if estimated_input_tokens is None:
@@ -416,13 +425,7 @@ def _router_stage_reservations(
         catalog,
         embedder.alias,
         embedder.model,
-        retrieval_query_input_limit(
-            problems,
-            catalog=catalog,
-            world_alias=world_model.alias,
-            maximum_output_tokens=options.simulation_maximum_output_tokens,
-            configured_limit=options.maximum_retrieval_query_tokens,
-        ),
+        query_limit,
         RetryPolicy().maximum_attempts,
     )
     if len(candidate_requests) != len(candidates) or world_request is None or retrieval is None:

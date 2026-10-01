@@ -423,6 +423,7 @@ def load_world_model(
             store.artifacts,
             config.build.world_model.artifact_id,
             client=resolved_world.client,
+            capabilities=resolved_world.capabilities,
             embedder=RAGEmbedderBinding(
                 client=resolved_embedder.embedding_client,
                 snapshot=resolved_embedder.snapshot,

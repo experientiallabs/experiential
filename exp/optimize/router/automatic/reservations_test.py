@@ -293,7 +293,8 @@ def test_simulation_input_estimate_sums_explicit_deterministic_components() -> N
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
-    assert estimate == 6 * median + min(median, _QUERY_TOKENS) + _OUTPUT_TOKENS + 4_096
+    assert _QUERY_TOKENS > median
+    assert estimate == 6 * median + _QUERY_TOKENS + _OUTPUT_TOKENS + 4_096
     assert (
         simulation_input_token_estimate(
             (),

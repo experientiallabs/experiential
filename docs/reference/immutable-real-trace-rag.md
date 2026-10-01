@@ -24,15 +24,18 @@ New evaluations and router optimizations derive an omitted `maximum_retrieval_qu
 from the world model's available input capacity after its declared output reservation. This
 aggregate limit is separate from the embedding model's per-input context window: complete query
 components are losslessly split into bounded UTF-8 chunks, and each dispatched batch retains its
-actual input-byte accounting. An explicit query limit is still enforced exactly. Planning uses
-observed trace sizes within the ceiling rather than assuming every query fills the allowance.
+actual input-byte accounting. An explicit query limit is still enforced exactly. Router spend
+authorization includes the full resolved query allowance. Evaluation reports separately estimate
+expected usage from the captured task evidence.
 
 Before a text-world request is dispatched, optional retrieved examples are packed in priority
 order as whole examples within the model context and frozen input reservation. Required task
 instructions, tool definitions, conversation, environment state, system prompt and output controls
 are retained. Protocol retries use the same rule when adding correction feedback. Saved grounding
-IDs identify only the examples actually included in each request. If the required prompt alone
-cannot fit, dispatch fails instead of truncating it or reducing the output reservation. The
+IDs identify only the examples actually included in each request. Public world-model sessions use
+the same fitting rule with their resolved model capacities. If required input cannot fit, dispatch
+fails instead of truncating it. For models without a published output maximum, the existing
+remaining-context output binding happens after optional examples yield to the requested output. The
 100-step and 1,000,000-total-output-token rollout defaults are independent of this packing.
 
 ## Historical provenance

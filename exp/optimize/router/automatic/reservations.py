@@ -59,7 +59,7 @@ def simulation_input_token_estimate(
     traces: tuple[Trace, ...],
     *,
     retrieved_transition_count: int,
-    maximum_retrieval_query_tokens: int | None,
+    maximum_retrieval_query_tokens: int,
     maximum_output_tokens: int,
 ) -> int | None:
     """Size one realistic per-call input planning estimate from the frozen build traces.
@@ -67,7 +67,7 @@ def simulation_input_token_estimate(
     The estimate sums explicit deterministic components instead of a model's full context
     window: one median-length trace for the visible episode transcript, one median-length trace
     for each of the world model's retrieved fit-RAG transitions rendered into the prompt (one
-    whole trace bounds one transition), a median-sized query within its explicit ceiling, one full
+    whole trace bounds one transition), the full resolved query input ceiling, one full
     output turn echoed back into the next request, and a fixed prompt-framing allowance.
 
     The estimate prices provider reservations only. It never bounds an individual request:
@@ -76,7 +76,7 @@ def simulation_input_token_estimate(
     Args:
         traces: Verified traces persisted by the completed build.
         retrieved_transition_count: Frozen world-model retrieval count rendered per prediction.
-        maximum_retrieval_query_tokens: Optional hard query ceiling, not its expected size.
+        maximum_retrieval_query_tokens: Explicit or capacity-derived aggregate query ceiling.
         maximum_output_tokens: Per-turn completion output ceiling echoed into later prompts.
 
     Returns:
@@ -95,11 +95,7 @@ def simulation_input_token_estimate(
     return (
         transcript_tokens
         + retrieved_transition_tokens
-        + (
-            median
-            if maximum_retrieval_query_tokens is None
-            else min(median, maximum_retrieval_query_tokens)
-        )
+        + maximum_retrieval_query_tokens
         + maximum_output_tokens
         + _PROMPT_FRAMING_TOKEN_BUDGET
     )

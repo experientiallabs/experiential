@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from exp.common.models import (
     ModelResponse,
     ModelRoles,
     ModelSnapshot,
+    RouterCandidateSelection,
     write_model_catalog,
 )
 from exp.common.project import ProjectModelConfiguration
@@ -42,6 +44,7 @@ from exp.common.traces.sqlite import SQLiteTraceStore
 from exp.common.traces.sqlite_schema import trace_database_path
 from exp.optimize.router.activation import load_project_router
 from exp.optimize.router.automatic.replay import AutomaticRouterReplay
+from exp.optimize.router.automatic.reservations import median_trace_token_estimate
 from exp.optimize.router.automatic.service import AutomaticRouterOptions
 from exp.optimize.router.automatic.service_test import (
     _approve_manual_judge,
@@ -60,6 +63,52 @@ _SAVED_SETUP = "\n" * 6 + "y\n"
 _SAVED_DISCOVERED_SETUP = "\n" * 10 + "y\n"
 # Pick the two known completion models and one embedder, then choose every role explicitly.
 _NEW_SETUP = "1,2,4\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n"
+
+
+@pytest.mark.parametrize("query_limit", [None, 32_768])
+def test_wizard_and_router_reserve_full_resolved_query_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, query_limit: int | None
+) -> None:
+    """Wizard consent and later preflight price the same full explicit or derived query bound."""
+    store, catalog, state = _completed_project(tmp_path)
+    _approve_manual_judge(store, catalog, state)
+    config = store.load_project()
+    assert config.build is not None and config.models is not None
+    tasks = load_task_set(store.artifacts, config.build.task_set.artifact_id).tasks
+    plan = replace(_plan(catalog), tasks=tasks, selected=config.models)
+    options = AutomaticRouterOptions(
+        maximum_provider_cost_usd=10_000,
+        maximum_retrieval_query_tokens=query_limit,
+    )
+    monkeypatch.setattr(wizard, "AutomaticRouterOptions", lambda: options)
+    selection = RouterCandidateSelection(
+        candidates=("candidate-a", "candidate-b"), incumbent="candidate-a"
+    )
+    calls = (len(state.completion_calls), len(state.embedding_calls), state.credential_resolutions)
+
+    preflight = wizard.preflight_automatic_router(store, selection, options=options)
+    cost = wizard._wizard_cost_plan(store.paths.root, "support", plan, catalog, selection)
+    estimate = wizard._wizard_simulation_input_estimate(store, plan, options, catalog)
+
+    assert cost == preflight.cost_plan
+    resolved_query = preflight.retrieval_embedding_reservation.maximum_input_tokens
+    world = catalog.models[config.models.world_model].capabilities
+    assert world is not None
+    assert world.context_window_tokens is not None and world.maximum_output_tokens is not None
+    assert resolved_query == (
+        query_limit
+        if query_limit is not None
+        else world.context_window_tokens
+        - min(options.simulation_maximum_output_tokens, world.maximum_output_tokens)
+    )
+    median = median_trace_token_estimate(preflight.traces)
+    assert median is not None and resolved_query > median
+    assert estimate >= resolved_query + median + options.simulation_maximum_output_tokens
+    assert (
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    ) == calls
 
 
 def _compact_terminal_text(value: str) -> str:

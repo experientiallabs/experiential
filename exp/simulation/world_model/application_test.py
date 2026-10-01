@@ -435,6 +435,7 @@ def test_loader_resolves_exact_serving_artifact_without_dispatch(
         """
         loaded.append(cast(str, args[1]))
         assert kwargs["client"] is client
+        assert kwargs["capabilities"] == catalog.world.capabilities
         binding = cast(RAGEmbedderBinding, kwargs["embedder"])
         assert binding.client is embedder_client
         assert binding.snapshot == embedder_snapshot

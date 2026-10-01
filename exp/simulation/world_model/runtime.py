@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from exp.common.core.artifacts import (
     ArtifactInput,
@@ -29,7 +29,11 @@ from exp.simulation.engines.text.prompt import (
     parse_world_model_transition,
     validate_transition_action,
 )
-from exp.simulation.engines.text.tokens import TokenCounter
+from exp.simulation.engines.text.tokens import (
+    TokenCounter,
+    Utf8UpperBoundTokenCounter,
+    bound_unpublished_output,
+)
 from exp.simulation.retrieval import (
     RAGMatch,
     RAGQuery,
@@ -86,6 +90,9 @@ class PreparedGroundedWorldModelCall:
         request, identifiers = pack_world_model_request(
             self.request, maximum_input_tokens=ceiling, token_counter=token_counter
         )
+        # Optional evidence yields to the requested output first. An unpublished output limit
+        # can then use remaining context around the required prompt, never around dropped examples.
+        request = bound_unpublished_output(request, capabilities, token_counter)
         matches = tuple(
             match for match in self.matches if match.transition.transition_id in identifiers
         )
@@ -123,12 +130,23 @@ class GroundedWorldModelCall:
 
 @dataclass(frozen=True)
 class GroundedWorldModel:
-    """Call one configured model with nearest observed transitions as immutable evidence."""
+    """Call one configured model with nearest observed transitions as immutable evidence.
+
+    Attributes:
+        artifact_input: Exact verified grounded-model manifest reference.
+        artifact: Frozen model identity and grounding protocol.
+        retriever: Fit or serving retriever bound to the artifact's immutable corpus.
+        client: Explicit completion provider for world predictions.
+        capabilities: Resolved capacity for request fitting, when available.
+        token_counter: Complete-request counter used for capacity admission.
+    """
 
     artifact_input: ArtifactInput
     artifact: GroundedWorldModelArtifact
     retriever: TraceRAGRetriever
     client: ModelClient
+    capabilities: ModelCapabilities | None = None
+    token_counter: TokenCounter = field(default_factory=Utf8UpperBoundTokenCounter)
 
     def prepare_turn(
         self,
@@ -195,7 +213,23 @@ class GroundedWorldModel:
 
         Returns:
             Exact request, response, and retrieved evidence.
+
+        Raises:
+            ValueError: Required evidence or output cannot fit the bound model capacity.
         """
+        if self.capabilities is not None:
+            prepared = prepared.fit_context(self.capabilities, self.token_counter)
+            required = self.token_counter.count(prepared.request)
+            output = prepared.request.maximum_output_tokens or 0
+            context = self.capabilities.context_window_tokens
+            if required < 0 or (context is not None and required + output > context):
+                raise ValueError(
+                    "required world-model input and output exceed the context capacity; "
+                    "choose a larger-context world model"
+                )
+            published_output = self.capabilities.maximum_output_tokens
+            if published_output is not None and output > published_output:
+                raise ValueError("world-model output exceeds the published model capacity")
         response = self.client.complete(prepared.request)
         return DispatchedGroundedWorldModelCall(
             request=prepared.request,
@@ -290,6 +324,8 @@ def load_grounded_world_model(
     *,
     client: ModelClient,
     embedder: RAGEmbedderBinding | None = None,
+    capabilities: ModelCapabilities | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> GroundedWorldModel:
     """Load and verify one executable grounded world-model artifact.
 
@@ -299,6 +335,8 @@ def load_grounded_world_model(
         client: Runtime client. Every returned response must match the artifact's exact model
             identity before its output is accepted.
         embedder: Exact explicit semantic embedding binding used to build the serving RAG.
+        capabilities: Resolved world-model capacity, when available, for pre-dispatch packing.
+        token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
 
     Returns:
         Executable grounded world model.
@@ -312,6 +350,8 @@ def load_grounded_world_model(
         artifact=artifact,
         retriever=TraceRAGRetriever(loaded_rag, embedder=embedder),
         client=client,
+        capabilities=capabilities,
+        token_counter=token_counter or Utf8UpperBoundTokenCounter(),
     )
 
 
