@@ -15,85 +15,12 @@ from exp.common.models import (
     ModelCatalog,
     ModelRecord,
     ProviderConnection,
-    ProviderConnectionAuthoringError,
     ProviderSetup,
-    configure_provider_connections,
     connection_authoring,
     load_model_catalog,
     sync_provider_models,
     write_model_catalog,
 )
-
-
-def test_role_free_connection_authoring_creates_connections_only_catalog(tmp_path: Path) -> None:
-    """Gateway setup can persist one real BYOK connection before choosing a model or role."""
-    path = tmp_path / "models.toml"
-
-    configured = configure_provider_connections(
-        path,
-        (
-            ProviderConnection(
-                name="openai",
-                provider="openai",
-                api_key_env="OPENAI_API_KEY",
-            ),
-        ),
-    )
-
-    assert configured.models == {}
-    assert configured.roles.candidates == ()
-    assert load_model_catalog(path) == configured
-
-
-def test_role_free_authoring_preserves_models_and_rejects_connection_rebinding(
-    tmp_path: Path,
-) -> None:
-    """Connection updates preserve unrelated state and cannot move an existing model endpoint."""
-    path = tmp_path / "models.toml"
-    original = ModelCatalog(
-        connections={
-            "openai": ProviderConnection(
-                name="openai", provider="openai", api_key_env="OPENAI_API_KEY"
-            ).catalog_config()
-        },
-        models={
-            "coding": ModelRecord(
-                connection="openai",
-                model="gpt-coding",
-                billing_source=BillingSource.CUSTOMER_MANAGED,
-                capabilities=ModelCapabilities(supports_completions=True),
-            )
-        },
-    )
-    write_model_catalog(path, original)
-
-    configure_provider_connections(
-        path,
-        (
-            ProviderConnection(
-                name="anthropic",
-                provider="anthropic",
-                api_key_env="ANTHROPIC_API_KEY",
-            ),
-        ),
-    )
-    with pytest.raises(ProviderConnectionAuthoringError, match="used by model aliases"):
-        configure_provider_connections(
-            path,
-            (
-                ProviderConnection(
-                    name="openai",
-                    provider="openai-compatible",
-                    api_key_env="COMPATIBLE_API_KEY",
-                    base_url="https://models.example.test/v1",
-                ),
-            ),
-            replace=True,
-        )
-
-    loaded = load_model_catalog(path)
-    assert loaded.models == original.models
-    assert set(loaded.connections) == {"anthropic", "openai"}
 
 
 def test_optimizer_provider_setup_still_requires_all_build_roles() -> None:
@@ -226,13 +153,20 @@ def test_failed_model_commit_preserves_a_concurrent_catalog_update(tmp_path: Pat
     def add_unrelated_connection() -> ModelCatalog:
         """Attempt a normal catalog update while synchronization still owns the lock."""
         writer_attempted.set()
-        result = configure_provider_connections(
+        other = ProviderConnection(
+            name="anthropic", provider="anthropic", api_key_env="ANTHROPIC_API_KEY"
+        )
+        result = sync_provider_models(
             path,
-            (
-                ProviderConnection(
-                    name="anthropic", provider="anthropic", api_key_env="ANTHROPIC_API_KEY"
-                ),
-            ),
+            connection=other,
+            models={
+                "other-chat": ModelRecord(
+                    connection=other.name,
+                    model="other",
+                    billing_source=BillingSource.HOST_MANAGED,
+                    capabilities=ModelCapabilities(supports_completions=True),
+                )
+            },
         )
         writer_finished.set()
         return result
@@ -252,7 +186,7 @@ def test_failed_model_commit_preserves_a_concurrent_catalog_update(tmp_path: Pat
 
     assert load_model_catalog(path) == updated
     assert set(updated.connections) == {"openai", "anthropic"}
-    assert set(updated.models) == {"coding"}
+    assert set(updated.models) == {"coding", "other-chat"}
     assert path.read_bytes() != original
 
 

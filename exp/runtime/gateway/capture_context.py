@@ -16,24 +16,6 @@ from exp.runtime.gateway.replay_identity import provider_replay_authority
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
-def capture_request_context(
-    request: GatewayRequest, *, maximum_bytes: int = 1_048_576, session_id: str | None = None
-) -> JsonObject | None:
-    """Snapshot post-guardrail, expanded context without changing the served request.
-
-    Provider-significant carriers excluded from normal model serialization are
-    retained separately. Only the optional X-Session-Id correlation header is
-    retained, never other headers, credentials, or provider connection configuration.
-    A prompt can itself contain
-    sensitive text; this function does not promise content redaction.
-    """
-    if maximum_bytes < 1:
-        raise ValueError("maximum_bytes must be positive")
-    document = capture_context_document(request, session_id=session_id)
-    encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":"))
-    return document if len(encoded) <= maximum_bytes else None
-
-
 def capture_context_document(
     request: GatewayRequest, *, session_id: str | None = None
 ) -> JsonObject:

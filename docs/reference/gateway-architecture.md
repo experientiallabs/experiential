@@ -843,8 +843,7 @@ narrows to a strict-capable rung when the route has one and otherwise drops only
 a schema keyword. The same validator requires `additionalProperties: false` on every object, so
 strict tool schemas reaching an Anthropic rung have their objects closed with the
 `tools.parameters.additionalProperties->false` disclosure, exactly like structured-output schemas.
-The `capability_parity` row reports the per-release forced-choice fact as
-`supports_forced_tool_choice`. On the OpenAI-compatible Chat Completions wire a canonical
+On the OpenAI-compatible Chat Completions wire a canonical
 `developer` message is emitted as `system` without disclosure: OpenAI defines the two roles
 identically (developer-provided instructions the model follows regardless of user messages),
 while the third-party servers behind that dialect enumerate only the classic roles and reject
@@ -929,9 +928,6 @@ SDK accumulators (Python and TypeScript) copy every usage field present on `mess
 their final message shows the true counts. The estimate is display-only: the encoder keeps it
 apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
 bill the provider's report.
-The per-deployment `capability_parity` export joins catalog declarations with provider-family ground truth so catalogs can warn about gaps and route around them.
-Schema version 7 additionally projects `supports_prompt_cache_boundaries`, `supports_custom_tools`, `supports_grammar_tools`, `supports_tool_call_limit`, `reports_model_status`, and the existing `reports_reasoning_tokens` declaration.
-These declarations default false and never enable a request feature. Cache boundaries mean explicit breakpoints and retention, not implicit prefix caching. Read tool flags with the row's `dialect` and public API surface: Chat still refuses custom and grammar tools; Responses still refuses `max_tool_calls`.
 Gemini `modelStatus` is not preserved; catalogs must leave `reports_model_status` false until the response contract carries it.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are

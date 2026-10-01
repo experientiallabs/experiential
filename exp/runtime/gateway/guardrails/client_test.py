@@ -13,7 +13,6 @@ from exp.runtime.gateway.guardrails.client import (
     GuardrailRecursionError,
     assert_not_internal_classification,
     classification_scope,
-    internal_classification_active,
 )
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
@@ -44,12 +43,10 @@ def _check() -> GuardrailCheck:
 
 def test_classification_scope_blocks_public_route_reentry() -> None:
     """The public gateway must not run while a classifier call is active."""
-    assert internal_classification_active() is False
+    assert_not_internal_classification()
     with classification_scope():
-        assert internal_classification_active() is True
         with pytest.raises(GuardrailRecursionError, match="public gateway"):
             assert_not_internal_classification()
-    assert internal_classification_active() is False
     assert_not_internal_classification()
 
 
@@ -66,7 +63,8 @@ def test_direct_client_never_uses_a_public_http_route() -> None:
             check: GuardrailCheck,
         ) -> ClassifierVerdict:
             """Require the internal classification flag during the adapter call."""
-            assert internal_classification_active() is True
+            with pytest.raises(GuardrailRecursionError):
+                assert_not_internal_classification()
             return await super().inspect_input(request=request, check=check)
 
     async def scenario() -> None:
@@ -81,7 +79,7 @@ def test_direct_client_never_uses_a_public_http_route() -> None:
         verdict = await client.inspect_input(request=request, check=_check())
 
         assert verdict.flagged is False
-        assert internal_classification_active() is False
+        assert_not_internal_classification()
 
     asyncio.run(scenario())
 

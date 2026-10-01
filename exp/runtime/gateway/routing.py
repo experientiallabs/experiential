@@ -10,7 +10,6 @@ from collections.abc import Mapping
 from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from typing import Protocol
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import ModelRequest
@@ -130,48 +129,6 @@ class GatewayRoute(ContractModel):
         if self.requires_reasoning_strip(deployment):
             return REASONING_CONTINUATION_FAILOVER_ROUTE_REASON
         return self.route_reason
-
-
-class RouteResolver(Protocol):
-    """Structural contract for the gateway's authorized route resolver.
-
-    Platform wrappers can delegate to ``CatalogRouteResolver`` and annotate
-    themselves against this protocol to catch missing or drifted methods.
-    The seam includes selected-root classification before serving authorization
-    and the three ways authority becomes a frozen :class:`GatewayRoute`.
-    Catalog-swap, listing metadata, and lifecycle methods remain private.
-    """
-
-    def requires_model_chain_authority(self, authorization: AuthorizationSnapshot) -> bool:
-        """Classify the selected root in its exact revision before acceptance or replay.
-
-        Wrappers must delegate classification to their catalog authority and
-        propagate invalid or missing catalog errors. This result identifies
-        required host enforcement; it does not itself grant serving permission.
-        """
-        ...
-
-    def resolve_direct(self, authorization: AuthorizationSnapshot) -> GatewayRoute:
-        """Resolve one direct-target authorization without event-loop work."""
-        ...
-
-    def resolve_deployment_hint(
-        self,
-        authorization: AuthorizationSnapshot,
-        deployment_id: str,
-    ) -> GatewayRoute:
-        """Resolve one canonical carrier-hint deployment inside current authority."""
-        ...
-
-    def resolve_project_blocking(
-        self,
-        *,
-        authorization: AuthorizationSnapshot,
-        request: GatewayRequest,
-        episode_namespace: tuple[str, str, str, str],
-    ) -> GatewayRoute:
-        """Resolve one project target from a caller thread without an event loop."""
-        ...
 
 
 class CatalogRouteResolver:

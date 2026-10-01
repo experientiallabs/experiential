@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import get_args
 
-from exp.common.models.failover_tokens import (
-    FAILOVER_CLASS_TOKENS,
-    FAILOVER_TOKENS,
-    REFUSAL_REASON_TOKENS,
-    REFUSAL_TOKEN,
-    REFUSAL_TOKEN_PREFIX,
-)
+from exp.common.models.failover_tokens import REFUSAL_TOKEN, REFUSAL_TOKEN_PREFIX, FailoverToken
 from exp.runtime.gateway.stream_contracts import GatewayFailureClass, GatewayRefusalReason
 
 _ERRORS_RS = Path(__file__).resolve().parents[2] / "runtime" / "gateway" / "native" / "src"
+FAILOVER_TOKENS: tuple[str, ...] = get_args(FailoverToken)
+FAILOVER_CLASS_TOKENS = tuple(t for t in FAILOVER_TOKENS if not t.startswith(REFUSAL_TOKEN))
+REFUSAL_REASON_TOKENS = tuple(t for t in FAILOVER_TOKENS if t.startswith(REFUSAL_TOKEN_PREFIX))
 
 # The classes a rung may name: every class the waterfall can fail over from.
 # A caller's own error, the gateway's own budget refusal, and the terminal

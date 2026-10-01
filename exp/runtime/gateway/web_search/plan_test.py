@@ -11,7 +11,10 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
-from exp.runtime.gateway.web_search.backend import FailingWebSearchBackend, StaticWebSearchBackend
+from exp.runtime.gateway.web_search.backend_fixture_test import (
+    FailingWebSearchBackend,
+    StaticWebSearchBackend,
+)
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch, GatewayWebSearchResult
 from exp.runtime.gateway.web_search.plan import (
     DROPPED_FAILED,

@@ -67,32 +67,3 @@ def write_shields_endpoint(*, p50_ms: float, path: Path) -> JsonObject:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload
-
-
-def gateway_p50_ms_from_report_json(path: Path) -> float:
-    """Read representative non-stream gateway p50 from a report file.
-
-    Args:
-        path: Versioned ``exp.gateway.latency_report`` JSON artifact.
-
-    Returns:
-        ``representative_run.gateway.p50_ms``.
-
-    Raises:
-        ValueError: The file is not a report object with a numeric p50.
-        OSError: The file cannot be read.
-        json.JSONDecodeError: The file is not JSON.
-    """
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("latency report must be a JSON object")
-    run = raw.get("representative_run")
-    if not isinstance(run, dict):
-        raise ValueError("latency report is missing representative_run")
-    gateway = run.get("gateway")
-    if not isinstance(gateway, dict):
-        raise ValueError("latency report is missing representative_run.gateway")
-    p50 = gateway.get("p50_ms")
-    if isinstance(p50, bool) or not isinstance(p50, int | float):
-        raise ValueError("latency report representative_run.gateway.p50_ms must be a number")
-    return float(p50)

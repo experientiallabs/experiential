@@ -1,12 +1,13 @@
 """Live end-to-end walk of every locked CLI path against real OpenAI providers.
 
-The ordinary gate excludes this module by name (``-k "not live"``); run it locally with real
-credentials when needed. It configures an OpenAI catalog around gpt-5.6-luna at
-pinned maximum reasoning effort, builds immutable evidence from the pinned public terminal-tasks
-export, calibrates the judge with real provider calls, optimizes a router over an attributed copy
-of the export, serves the frozen policy over the OpenAI-compatible loopback surface, and proves
-``optimize model`` fails closed without a persisted SFT configuration. Every provider budget is
-explicit and bounded, and no credential is ever written to disk.
+The module skips itself unless ``EXP_RUN_LIVE_TESTS=1`` and ``OPENAI_API_KEY`` are both set, so
+no bare ``pytest exp/...`` run can spend against a real provider. It configures an OpenAI
+catalog around gpt-5.6-luna at pinned maximum reasoning effort, builds immutable evidence from
+the pinned public terminal-tasks export, calibrates the judge with real provider calls,
+optimizes a router over an attributed copy of the export, serves the frozen policy over the
+OpenAI-compatible loopback surface, and proves ``optimize model`` fails closed without a
+persisted SFT configuration. Every provider budget is explicit and bounded, and no credential
+is ever written to disk.
 """
 
 from __future__ import annotations
@@ -131,8 +132,8 @@ _MODELS: tuple[dict[str, object], ...] = (
 )
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("OPENAI_API_KEY"),
-    reason="live OpenAI credentials are required",
+    os.environ.get("EXP_RUN_LIVE_TESTS") != "1" or not os.environ.get("OPENAI_API_KEY"),
+    reason="set EXP_RUN_LIVE_TESTS=1 and OPENAI_API_KEY to run the live OpenAI pipeline",
 )
 
 

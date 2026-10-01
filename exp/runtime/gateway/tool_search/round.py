@@ -11,7 +11,7 @@ response renders (query, pattern, matched names).
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from exp.common.core.artifacts import JsonObject
@@ -202,7 +202,3 @@ def perform_round(
         update={"messages": messages, "tools": state.dispatch_tools(), "tool_choice": None}
     )
     return RoundOutcome(request=extended, rounds=rounds, exhausted=state.exhausted)
-
-
-RebuildDispatch = Callable[[GatewayRequest, int], JsonObject]
-"""Rebuilds one depth's wire entry from an extended provider request."""

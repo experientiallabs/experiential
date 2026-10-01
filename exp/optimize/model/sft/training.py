@@ -64,7 +64,6 @@ from exp.optimize.model.sft.training_runtime import (
 )
 
 _MANIFEST_FILE = "manifest.json"
-_EVENTS_FILE = "events.jsonl"
 _MODEL_FILE = "model.json"
 _MODEL_INTENT_FILE = "model-intent.json"
 _RESULT_FILE = "result.json"

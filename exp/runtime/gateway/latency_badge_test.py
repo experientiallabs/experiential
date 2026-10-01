@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from exp.runtime.gateway.latency_badge import (
     BADGE_FILENAME,
     RAW_ENDPOINT_URL,
@@ -14,7 +12,6 @@ from exp.runtime.gateway.latency_badge import (
     SHIELDS_IMAGE_URL,
     SHIELDS_LABEL,
     format_latency_ms,
-    gateway_p50_ms_from_report_json,
     shields_endpoint,
     write_shields_endpoint,
 )
@@ -58,52 +55,6 @@ def test_write_shields_endpoint_round_trips(tmp_path: Path) -> None:
     assert loaded == written
     assert loaded["message"] == "22.2 ms"
     assert loaded["label"] == "gateway latency"
-
-
-def test_gateway_p50_ms_from_report_json_reads_representative_gateway(tmp_path: Path) -> None:
-    """Badge generation reads gateway p50 from the report, not a constant."""
-    report = tmp_path / "report.json"
-    report.write_text(
-        json.dumps(
-            {
-                "representative_run": {
-                    "gateway": {"p50_ms": 22.204},
-                    "gateway_added": {"p50_ms": 14.58},
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert gateway_p50_ms_from_report_json(report) == pytest.approx(22.204)
-    payload = write_shields_endpoint(
-        p50_ms=gateway_p50_ms_from_report_json(report),
-        path=tmp_path / BADGE_FILENAME,
-    )
-    assert payload["message"] == "22.2 ms"
-    assert payload["message"] != "14.6 ms"
-
-
-def test_gateway_p50_ms_from_report_json_rejects_missing_fields(tmp_path: Path) -> None:
-    """A report without a numeric representative gateway p50 fails closed."""
-    report = tmp_path / "bad.json"
-    report.write_text("[]", encoding="utf-8")
-    with pytest.raises(ValueError, match="JSON object"):
-        gateway_p50_ms_from_report_json(report)
-    report.write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError, match="representative_run"):
-        gateway_p50_ms_from_report_json(report)
-    report.write_text(
-        json.dumps({"representative_run": {"gateway_added": {"p50_ms": 14.58}}}),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="representative_run.gateway"):
-        gateway_p50_ms_from_report_json(report)
-    report.write_text(
-        json.dumps({"representative_run": {"gateway": {"p50_ms": "fast"}}}),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="must be a number"):
-        gateway_p50_ms_from_report_json(report)
 
 
 def test_readme_uses_shields_endpoint_not_actions_status() -> None:

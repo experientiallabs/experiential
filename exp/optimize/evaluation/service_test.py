@@ -422,11 +422,3 @@ def test_changed_authorization_has_a_distinct_execution_identity(tmp_path: Path)
         "test-revision",
     )
     assert first.artifact_id != second.artifact_id
-
-
-def test_evaluation_api_is_public() -> None:
-    """Hosted consumers import the canonical engine entry point, not a platform copy."""
-    import exp
-
-    assert exp.evaluate_models is evaluate_models
-    assert exp.EvaluationSetup is EvaluationSetup

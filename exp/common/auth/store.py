@@ -19,7 +19,6 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from exp.common.auth.paths import default_auth_path
 from exp.common.core.artifacts import ContractModel, Sha256
@@ -62,15 +61,6 @@ class StoredCredentialEndpointMismatch(ProviderAuthStoreError):
 
 class StoredCredentialKindMismatch(ProviderAuthStoreError):
     """A stored record exists but is an API key where a sign-in was expected, or vice versa."""
-
-
-class StoredCredentialStatus(ContractModel):
-    """Public metadata for one stored or configured provider connection."""
-
-    connection_id: str
-    provider: str
-    source: Literal["environment", "stored", "missing", "aws_chain", "mismatch"]
-    environment_variable: str | None = None
 
 
 @dataclass(frozen=True)

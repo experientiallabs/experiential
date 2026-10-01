@@ -39,12 +39,12 @@ from exp.common.models import (
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import (
-    upsert_certified_pool,
     upsert_connection,
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.tests.native_messages_test import _DRIVER_SOURCE, _HOST, _ServingEngine
 
 pytest.importorskip("exp_gateway_native")

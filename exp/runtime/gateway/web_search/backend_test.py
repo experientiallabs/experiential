@@ -10,12 +10,12 @@ import pytest
 from exp.runtime.gateway.web_search.backend import (
     EXA_API_KEY_ENV,
     ExaWebSearchBackend,
-    StaticWebSearchBackend,
     WebSearchBackendError,
     _parse_exa,
     default_web_search_backend,
     validate_search_url,
 )
+from exp.runtime.gateway.web_search.backend_fixture_test import StaticWebSearchBackend
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 
 

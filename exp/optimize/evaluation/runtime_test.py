@@ -9,7 +9,6 @@ from typing import cast
 
 import pytest
 
-import exp
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse
 from exp.common.progress import ProgressEvent
 from exp.optimize.evaluation.contracts import EvaluationBudget
@@ -288,13 +287,6 @@ def test_runtime_refuses_changed_accepted_inputs_before_provider_dispatch(
         len(state.completion_calls),
         len(state.embedding_calls),
     )
-
-
-def test_prepared_runtime_is_public() -> None:
-    """Hosting uses the public engine API instead of copying its runtime construction."""
-
-    assert exp.run_prepared_model_evaluation is run_prepared_model_evaluation
-    assert exp.SpendLimitReached is SpendLimitReached
 
 
 def test_prepared_workers_world_and_judge_accept_pinned_served_ids(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Literal
 
@@ -14,7 +13,7 @@ from exp.common.evaluations import load_evaluation_dataset
 from exp.common.evaluations.dataset import EvaluationRow
 from exp.common.evaluations.model_report import ModelEvaluationReport
 from exp.common.project import ProjectStore
-from exp.common.rollouts import RolloutArtifact, RolloutEventKind
+from exp.common.rollouts import RolloutArtifact
 from exp.common.tasks import TaskCase, load_task_set
 from exp.optimize.evaluation.runs import EvaluationRun, run_directory
 from exp.simulation.engines.text.resume import load_rollout
@@ -99,11 +98,3 @@ def export_report(project: ProjectStore, run: EvaluationRun) -> tuple[Path, Path
         Path(__file__).with_name("report.html").read_text().replace("__DATA__", safe),
     )
     return root / "report.json", root / "report.html"
-
-
-def rollout_transcript(rollout: RolloutArtifact) -> str:
-    """Render the last complete candidate request and output without duplicating history."""
-    spans = [event for event in rollout.spans if event.kind == RolloutEventKind.AGENT_MODEL_CALL]
-    if not spans:
-        return "No candidate response was saved."
-    return json.dumps(spans[-1].payload, ensure_ascii=False, indent=2)

@@ -37,6 +37,33 @@ def test_bind_prompt_template_rejects_stale_boolean_projections() -> None:
         bind_prompt_template(template, (default_task_success_axis(),))
 
 
+def test_bind_prompt_template_rebinds_custom_scalar_and_checks_boolean_ranges() -> None:
+    """A wide axis rebinds a custom scalar schema and re-checks boolean projections."""
+    wide = scored_axis("quality", "Quality", "Completeness.", min_score=0, max_score=4)
+    custom = JudgePromptTemplate(
+        prompt=PromptDefinition.from_text("custom-judge-v1", "Follow the saved contract exactly."),
+        variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
+        response_schema=judge_feedback_schema("scalar", min_score=0, max_score=1),
+    )
+    rebound = bind_prompt_template(custom, (wide,))
+    assert rebound.prompt.prompt_id == "custom-judge-v1"
+    assert rebound.response_schema == judge_feedback_schema("scalar", min_score=0, max_score=4)
+
+    boolean = JudgePromptTemplate(
+        prompt=PromptDefinition.from_text("custom-bool-v1", "Return passed."),
+        response_shape="boolean",
+        variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
+        response_schema=judge_feedback_schema("boolean"),
+        score_projection=JudgeScoreProjection(boolean_scores={"false": 0, "true": 4}),
+    )
+    assert bind_prompt_template(boolean, (wide,)) is boolean
+    stale = boolean.model_copy(
+        update={"score_projection": JudgeScoreProjection(boolean_scores={"false": 0, "true": 1})}
+    )
+    with pytest.raises(ValueError, match="include 0 and 4"):
+        bind_prompt_template(stale, (wide,))
+
+
 def test_bind_prompt_template_keeps_custom_scalar_with_builtin_prompt_id() -> None:
     """A custom scalar contract is not replaced just because it reuses the built-in prompt ID."""
     template = JudgePromptTemplate(

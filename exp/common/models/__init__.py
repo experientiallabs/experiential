@@ -17,7 +17,6 @@ from exp.common.models.catalog import (
 from exp.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
 from exp.common.models.connection_authoring import (
     ProviderConnectionAuthoringError,
-    configure_provider_connections,
     sync_provider_models,
 )
 from exp.common.models.discovery import (
@@ -183,7 +182,6 @@ __all__ = [
     "completion_cost_reservation",
     "completion_request_cost_usd",
     "configure_provider_catalog",
-    "configure_provider_connections",
     "sync_provider_models",
     "configure_router_candidates",
     "derive_connection_name",

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import cast
 
 from exp.common.core.artifacts import (
     FailureAttribution,
@@ -99,24 +98,6 @@ def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | No
         attribution=FailureAttribution.TOOL,
         details={"phase": "agent_tool_call"},
     )
-
-
-def known_total_spend(
-    rollouts: Sequence[RolloutArtifact],
-) -> float | None:
-    """Return total conservative provider spend, or ``None`` if any episode is unpriced.
-
-    Args:
-        rollouts: Completed text-simulation rollout artifacts to total.
-
-    Returns:
-        The known conservative provider spend, or ``None`` when any billed call is not priced
-        and has no persisted worst-case reservation.
-    """
-    values = tuple(rollout_spend(rollout) for rollout in rollouts)
-    if any(value is None for value in values):
-        return None
-    return sum(cast(float, value) for value in values)
 
 
 def rollout_spend(

@@ -63,7 +63,6 @@ from exp.optimize.router.automatic.reservations import (
 )
 from exp.optimize.router.judging.contracts import (
     JudgeSetupArtifact,
-    ManualJudgeCalibrationAudit,
 )
 from exp.runtime.agents import agent_factory_sha256
 from exp.runtime.models import RuntimeModelCatalog
@@ -145,30 +144,6 @@ class AutomaticRouterPreflight:
                 self.judge_provenance.calibration_input,
             )
         return (self.judge_provenance.calibration_input,)
-
-    @property
-    def judge_audit(self) -> ManualJudgeCalibrationAudit | None:
-        """Return the completed human calibration audit, when one exists."""
-        if isinstance(self.judge_provenance, HumanCalibratedAutomaticJudge):
-            return self.judge_provenance.audit
-        return None
-
-    @property
-    def judge_audit_input(self) -> ArtifactInput | None:
-        """Return the exact human calibration audit input, when one exists."""
-        if isinstance(self.judge_provenance, HumanCalibratedAutomaticJudge):
-            return self.judge_provenance.audit_input
-        return None
-
-    @property
-    def approved_calibration_id(self) -> str:
-        """Return the selected calibration artifact identity."""
-        return self.judge_provenance.calibration_id
-
-    @property
-    def approved_calibration_input(self) -> ArtifactInput:
-        """Return the exact selected calibration manifest input."""
-        return self.judge_provenance.calibration_input
 
 
 def preflight_automatic_router(

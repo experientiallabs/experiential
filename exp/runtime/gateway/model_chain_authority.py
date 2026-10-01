@@ -203,29 +203,6 @@ def authorize_serving_model_chains(
     return authorize_model_chain(components.store, authorization, required=required, mode=mode)
 
 
-def refuse_sqlite_chain_authorization(
-    connection: sqlite3.Connection,
-    organization_id: str,
-    alias_revision_id: str,
-    *,
-    maximum_bytes: int = 64 * 1024 * 1024,
-) -> None:
-    """Check requested and currently active policy before local acceptance or replay."""
-    rows = connection.execute(
-        """SELECT r.snapshot_ref, active.snapshot_ref FROM alias_revisions r
-        JOIN gateway_aliases a ON a.organization_id=r.organization_id AND a.alias_id=r.alias_id
-        LEFT JOIN alias_revisions active ON active.organization_id=a.organization_id
-          AND active.revision_id=a.active_revision_id
-        WHERE r.organization_id=? AND r.revision_id=?""",
-        (organization_id, alias_revision_id),
-    ).fetchall()
-    references = dict.fromkeys(
-        str(reference) for row in rows for reference in row if reference is not None
-    )
-    for reference in references:
-        refuse_sqlite_chain_snapshot(connection, reference, maximum_bytes=maximum_bytes)
-
-
 def refuse_sqlite_chain_snapshot(
     connection: sqlite3.Connection,
     snapshot_ref: str,

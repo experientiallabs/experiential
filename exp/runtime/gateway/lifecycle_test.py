@@ -33,7 +33,6 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.runtime.gateway.catalog_authority import (
-    upsert_certified_pool,
     upsert_connection,
     upsert_singleton_deployment,
 )
@@ -62,6 +61,7 @@ from exp.runtime.gateway.model_chain_authority import (
 )
 from exp.runtime.gateway.project_activation import ProjectActivation, ProjectActivationError
 from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.openai_protocol.requests import decode_chat

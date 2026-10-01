@@ -261,7 +261,6 @@ class _RuntimeCatalog:
         *,
         role: CatalogRoleName | None = None,
     ) -> ResolvedModel:
-        del role
         """Return exact static identities with alias-specific capabilities.
 
         Args:
@@ -271,13 +270,13 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
+        del role
         _RESOLVE_CALLS.append(alias)
         snapshot, capabilities = self.snapshot(alias)
         embedding = self._embedding if capabilities.supports_embeddings else None
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        del role
         """Reuse local preflight for roles with no extra capability requirement.
 
         Args:
@@ -286,6 +285,7 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
+        del role
         _RESOLVE_CALLS.append(alias)
         snapshot, capabilities = self.snapshot(alias)
         embedding = self._embedding if capabilities.supports_embeddings else None

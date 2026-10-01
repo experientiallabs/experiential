@@ -9,7 +9,7 @@ import pytest
 
 from exp.common.traces.ingest.sources import TraceSourceError
 from exp.runtime.anthropic_protocol.requests import decode_messages
-from exp.runtime.gateway.capture_context import capture_request_context
+from exp.runtime.gateway.capture_context import capture_context_document
 from exp.runtime.gateway.ingest.conversion import load_gateway_capture
 from exp.runtime.gateway.local_capture_contracts import (
     CapturedExchange,
@@ -56,7 +56,7 @@ def _experience(identity: str = "developer") -> CapturedExchange:
         scope=LocalCaptureScope(user_id=identity, application_id="gateway"),
         protocol="chat_completions",
         captured_at=datetime.now(UTC),
-        request={"exp_context": capture_request_context(request)},
+        request={"exp_context": capture_context_document(request)},
         response={
             "choices": [
                 {
@@ -215,7 +215,7 @@ def test_reasoning_raw_arguments_and_environment_bytes_reach_semantic_spans(tmp_
     experience = _experience().model_copy(
         update={
             "request": {
-                "exp_context": capture_request_context(request),
+                "exp_context": capture_context_document(request),
                 "exp_capture_output": {"provider_reasoning": "final reasoning\n"},
             }
         }
@@ -279,7 +279,7 @@ def test_messages_tool_error_and_thinking_are_preserved(tmp_path: Path) -> None:
     experience = _experience().model_copy(
         update={
             "protocol": "messages",
-            "request": {"exp_context": capture_request_context(request)},
+            "request": {"exp_context": capture_context_document(request)},
             "response": {
                 "id": "msg",
                 "type": "message",
@@ -343,7 +343,7 @@ def test_messages_visible_reasoning_with_sealed_replay_survives_standalone_inges
     experience = _experience().model_copy(
         update={
             "protocol": "messages",
-            "request": {"exp_context": capture_request_context(request)},
+            "request": {"exp_context": capture_context_document(request)},
             "response": {
                 "id": "msg-final",
                 "type": "message",
@@ -389,7 +389,7 @@ def test_explicit_response_lineage_restores_reasoning_without_prefix_joining(
             "protocol": "responses",
             "response_id": "parent",
             "request": {
-                "exp_context": capture_request_context(parent_request),
+                "exp_context": capture_context_document(parent_request),
                 "exp_capture_output": {"provider_reasoning": "observed parent reasoning"},
             },
             "response": {
@@ -417,7 +417,7 @@ def test_explicit_response_lineage_restores_reasoning_without_prefix_joining(
             "experience_id": "child",
             "response_id": "child",
             "parent_response_id": "parent",
-            "request": {"exp_context": capture_request_context(continued_request)},
+            "request": {"exp_context": capture_context_document(continued_request)},
             "response": {
                 "id": "child",
                 "status": "completed",
@@ -485,7 +485,7 @@ def test_linked_reasoning_survives_coalesced_text_and_tools(
             "protocol": "responses",
             "response_id": "parent",
             "request": {
-                "exp_context": capture_request_context(parent_request),
+                "exp_context": capture_context_document(parent_request),
                 "exp_capture_output": {"provider_reasoning": "observed parent reasoning"},
             },
             "response": {
@@ -521,7 +521,7 @@ def test_linked_reasoning_survives_coalesced_text_and_tools(
             "experience_id": "child",
             "response_id": "child",
             "parent_response_id": "parent",
-            "request": {"exp_context": capture_request_context(continued_request)},
+            "request": {"exp_context": capture_context_document(continued_request)},
             "response": {
                 "id": "child",
                 "status": "completed",
@@ -552,7 +552,7 @@ def test_messages_output_keeps_exact_provider_argument_text(tmp_path: Path) -> N
         update={
             "protocol": "messages",
             "request": {
-                "exp_context": capture_request_context(request),
+                "exp_context": capture_context_document(request),
                 "exp_capture_output": {
                     "provider_tool_calls_json": json.dumps(
                         [{"call_id": "call-1", "name": "lookup", "raw_arguments": arguments}]

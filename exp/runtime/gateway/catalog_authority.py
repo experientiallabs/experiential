@@ -354,48 +354,6 @@ def rollback_singleton_deployment_update(
         )
 
 
-def upsert_certified_pool(
-    root: Path,
-    *,
-    pool_id: str,
-    exact_model_id: str,
-    deployment_aliases: tuple[str, ...],
-    certification: GatewayEquivalenceCertification,
-    expected_catalog_sha256: str,
-    replace: bool,
-) -> tuple[NormalizedGatewayCatalog, Path, bool]:
-    """Author one certified ordered pool against an optimistic catalog digest.
-
-    Args:
-        root: EXP root containing ``models.toml`` and gateway snapshots.
-        pool_id: Stable direct-pool and public-alias identifier.
-        exact_model_id: Exact logical model identity shared by every deployment.
-        deployment_aliases: Ordered existing deployment aliases.
-        certification: Operator evidence binding the declared equivalence.
-        expected_catalog_sha256: Normalized digest observed before this mutation.
-        replace: Whether an existing pool declaration may change.
-
-    Returns:
-        Updated normalized catalog, immutable snapshot path, and change status.
-
-    Raises:
-        GatewayCatalogAuthoringError: The catalog moved or the pool already differs.
-    """
-    path = root / "models.toml"
-    with file_write_lock(path, what="the gateway exact-model pool catalog"):
-        update = plan_certified_pool_update(
-            root,
-            pool_id=pool_id,
-            exact_model_id=exact_model_id,
-            deployment_aliases=deployment_aliases,
-            certification=certification,
-            expected_catalog_sha256=expected_catalog_sha256,
-            replace=replace,
-        )
-        apply_certified_pool_update(root, update)
-    return update.normalized, update.snapshot, update.changed
-
-
 def plan_certified_pool_update(
     root: Path,
     *,

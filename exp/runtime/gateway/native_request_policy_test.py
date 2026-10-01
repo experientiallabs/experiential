@@ -38,7 +38,8 @@ from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
     publish_authored_chain_fixture,
 )
-from exp.runtime.gateway.web_search.backend import StaticWebSearchBackend, WebSearchBackend
+from exp.runtime.gateway.web_search.backend import WebSearchBackend
+from exp.runtime.gateway.web_search.backend_fixture_test import StaticWebSearchBackend
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 from exp.runtime.gateway.web_search.plan import WebSearchPlan, plan_web_search
 from exp.runtime.models.providers.errors import ProviderParameterError

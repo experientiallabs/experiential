@@ -283,12 +283,3 @@ def windows_snapshot_anchor(stream: BinaryIO) -> int:
         api.close(anchor)
         raise
     return descriptor
-
-
-@contextmanager
-def windows_snapshot_stream(root: Path, relative_path: str) -> Iterator[BinaryIO]:
-    """Require a present regular file while retaining every checked Windows handle."""
-    with windows_snapshot_observation(root, relative_path) as (stream, _directories):
-        if stream is None:
-            raise FileNotFoundError(relative_path)
-        yield stream

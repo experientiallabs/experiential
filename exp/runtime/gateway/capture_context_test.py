@@ -8,7 +8,6 @@ import pytest
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import (
     capture_context_document,
-    capture_request_context,
     restore_capture_context,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
@@ -26,8 +25,7 @@ def test_session_correlation_is_capture_only_and_reasoning_is_optional(
     ).request
     before = request.model_dump_json()
     digest = canonical_request_sha256(request)
-    context = capture_request_context(request, session_id=session_id)
-    assert context is not None
+    context = capture_context_document(request, session_id=session_id)
     assert context.get("session_id") == session_id
     assert context["request"] == request.model_dump(mode="json", exclude_none=True)
     assert request.model_dump_json() == before
@@ -40,8 +38,8 @@ def test_invalid_optional_session_never_rejects_capture(session_id: str) -> None
     request = decode_chat(
         {"model": "coding", "messages": [{"role": "user", "content": "hello"}]}
     ).request
-    context = capture_request_context(request, session_id=session_id)
-    assert context is not None and "session_id" not in context
+    context = capture_context_document(request, session_id=session_id)
+    assert "session_id" not in context
 
 
 @pytest.mark.parametrize("visible", ["Compare α and 雪.\n", "line one\x00line two\t"])
@@ -74,8 +72,7 @@ def test_sealed_messages_history_retains_visible_reasoning_only_for_capture(visi
     before = request.model_dump_json()
     authority = provider_replay_authority(request)
     digest = canonical_request_sha256(request)
-    context = capture_request_context(request)
-    assert context is not None
+    context = capture_context_document(request)
     restored = restore_capture_context(context)
     provider = restored["provider_context"]
     assert isinstance(provider, dict)
@@ -105,21 +102,6 @@ def test_sealed_messages_history_retains_visible_reasoning_only_for_capture(visi
     assert [block.kind for block in request.messages[1].provider_reasoning] == [
         "sealed_reasoning_content"
     ]
-    assert capture_request_context(request, maximum_bytes=1) is None
-
-
-def test_storable_context_is_encoded_once_without_a_normalization_copy() -> None:
-    """Ordinary traffic never pays for exceptional-text projection or a second size pass."""
-    request = decode_chat(
-        {"model": "coding", "messages": [{"role": "user", "content": "café 雪"}]}
-    ).request
-    with (
-        patch("exp.runtime.gateway.capture_context.json.dumps", wraps=json.dumps) as dumps,
-        patch("exp.runtime.gateway.capture_context.normalize_durable_object") as normalize,
-    ):
-        assert capture_request_context(request) is not None
-    assert dumps.call_count == 1
-    normalize.assert_not_called()
 
 
 def test_native_context_projection_never_serializes_ordinary_input() -> None:
@@ -131,17 +113,6 @@ def test_native_context_projection_never_serializes_ordinary_input() -> None:
         context = capture_context_document(request)
     dumps.assert_not_called()
     assert context["request"] == request.model_dump(mode="json", exclude_none=True)
-
-
-def test_valid_surrogate_pair_and_literal_escape_do_not_need_a_second_encoding() -> None:
-    """A fast-path candidate that normalizes unchanged retains the original size check."""
-    request = decode_chat(
-        {"model": "coding", "messages": [{"role": "user", "content": "😀 literal \\u0000"}]}
-    ).request
-    with patch("exp.runtime.gateway.capture_context.json.dumps", wraps=json.dumps) as dumps:
-        context = capture_request_context(request)
-    assert context is not None and "source_json" not in context
-    assert dumps.call_count == 1
 
 
 def test_capture_context_preserves_tools_and_generation_settings() -> None:
@@ -167,12 +138,10 @@ def test_capture_context_preserves_tools_and_generation_settings() -> None:
         }
     ).request
     before = request.model_dump_json()
-    context = capture_request_context(request)
-    assert context is not None
+    context = capture_context_document(request)
     assert context["request"] == request.model_dump(mode="json", exclude_none=True)
     assert request.tools[0].parameters["type"] == "object"
     assert request.model_dump_json() == before
-    assert capture_request_context(request, maximum_bytes=1) is None
 
 
 def test_excluded_provider_carriers_are_retained_separately() -> None:
@@ -185,8 +154,7 @@ def test_excluded_provider_carriers_are_retained_separately() -> None:
     ).request.model_copy(
         update={"provider_thinking_config": {"type": "enabled", "budget_tokens": 32}}
     )
-    context = capture_request_context(request)
-    assert context is not None
+    context = capture_context_document(request)
     provider = context["provider_context"]
     assert isinstance(provider, dict)
     assert provider["provider_thinking_config"] == {"type": "enabled", "budget_tokens": 32}
@@ -225,8 +193,7 @@ def test_capture_context_is_storable_and_omits_transport_replay_key() -> None:
         {"model": "coding", "messages": [{"role": "user", "content": "a\x00b\ud800"}]}
     ).request.model_copy(update={"idempotency_key": "private-header"})
     before = request.model_dump()
-    context = capture_request_context(request)
-    assert context is not None
+    context = capture_context_document(request)
     serialized = json.dumps(context)
     assert "\x00" not in serialized
     restored = restore_capture_context(context)
@@ -238,14 +205,11 @@ def test_capture_context_is_storable_and_omits_transport_replay_key() -> None:
     assert request.model_dump() == before
 
 
-def test_lossless_context_retains_colliding_keys_and_enforces_total_budget() -> None:
-    """A lossless sidecar never bypasses the admission memory ceiling."""
+def test_lossless_context_retains_colliding_keys() -> None:
+    """A lossless sidecar restores colliding keys and NUL text exactly."""
     request = decode_chat(
         {"model": "coding", "messages": [{"role": "user", "content": "a\0b"}]}
     ).request
-    context = capture_request_context(request)
-    assert context is not None
-    size = len(json.dumps(context, ensure_ascii=True, separators=(",", ":")))
-    assert capture_request_context(request, maximum_bytes=size - 1) is None
+    context = capture_context_document(request)
     restored = GatewayRequest.model_validate(restore_capture_context(context)["request"])
     assert restored.messages[0].content == "a\0b"

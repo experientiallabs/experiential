@@ -8,7 +8,6 @@ from exp.common.auth.store import (
     StoredCredentialBinding,
     StoredCredentialEndpointMismatch,
     StoredCredentialKindMismatch,
-    StoredCredentialStatus,
     StoredOAuthTokens,
 )
 
@@ -20,7 +19,6 @@ __all__ = [
     "StoredCredentialBinding",
     "StoredCredentialEndpointMismatch",
     "StoredCredentialKindMismatch",
-    "StoredCredentialStatus",
     "StoredOAuthTokens",
     "default_auth_path",
     "derived_api_key_env",

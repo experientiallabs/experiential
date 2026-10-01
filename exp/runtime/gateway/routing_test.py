@@ -43,29 +43,16 @@ from exp.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoute,
     GatewayRoutingError,
-    RouteResolver,
 )
 from exp.runtime.models import RuntimeModelCatalog
 
 _REVISION = "revision-one"
 
 
-def test_catalog_route_resolver_satisfies_the_route_resolver_protocol() -> None:
-    """CatalogRouteResolver structurally satisfies the exported Protocol.
-
-    The annotated binding makes ``ty`` verify the public resolution seam at
-    type-check time, so a wrapper annotated ``RouteResolver`` catches a missing
-    or drifted resolve_* method statically.
-    """
-    resolver: RouteResolver = CatalogRouteResolver({})
-    assert resolver is not None
-    assert "requires_model_chain_authority" in RouteResolver.__dict__
-
-
 class _ForwardingRouteResolver:
     """Expose the required public resolver seam without forwarding arbitrary private methods."""
 
-    def __init__(self, delegate: RouteResolver) -> None:
+    def __init__(self, delegate: CatalogRouteResolver) -> None:
         """Keep one revision-aware delegate and an observable classification count."""
         self.delegate = delegate
         self.classifications = 0
@@ -167,14 +154,13 @@ def test_forwarding_resolver_preserves_actual_serving_authority(
             {("wrapped-revision", digest): normalized}, project_resolver=Selection()
         )
     )
-    resolver: RouteResolver = wrapper
     control = NativeControlPlane(
         cast(
             NativeGatewayComponents,
             SimpleNamespace(
                 store=store,
                 ledger=SQLiteAttemptLedger(manager.database_path),
-                routes=resolver,
+                routes=wrapper,
                 runtime_catalogs={
                     ("wrapped-revision", digest): RuntimeModelCatalog(
                         authored, environment={"TEST_PROVIDER_KEY": "test-only"}

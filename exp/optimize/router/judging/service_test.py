@@ -148,7 +148,6 @@ class _RuntimeCatalog:
         self.preflight_calls = 0
 
     def preflight(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        del role
         """Return the fake judge only for its configured alias.
 
         Args:
@@ -157,6 +156,7 @@ class _RuntimeCatalog:
         Returns:
             Injected resolved judge.
         """
+        del role
         self.preflight_calls += 1
         assert alias == self.resolved.alias
         return self.resolved

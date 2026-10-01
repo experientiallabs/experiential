@@ -47,7 +47,6 @@ from exp.runtime.gateway.model_chain_authority import (
     authorize_model_chain,
     prepare_sqlite_chain_authority,
     refuse_local_chain_snapshot,
-    refuse_sqlite_chain_authorization,
     require_bound_model_chain_authority,
 )
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
@@ -365,48 +364,6 @@ def test_nonchat_cached_receiptless_plain_authority_still_checks_host_floor(
     with sqlite3.connect(ledger.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
-
-
-def test_local_snapshot_checks_deduplicate_only_identical_revision_references(
-    tmp_path: Path,
-) -> None:
-    """One check reads each distinct requested/active reference once, including its sidecar."""
-    manager, key = _configured_pool_gateway(tmp_path)
-    store = manager.require_initialized()
-    request = decode_chat(json.loads(_chat_body())).request
-    auth = store.authorize_request(
-        raw_key=key, alias="coding", request=request, deadline_monotonic=time.monotonic() + 30
-    )
-    with (
-        store._connect() as connection,
-        patch("exp.runtime.gateway.model_chain_authority.refuse_sqlite_chain_snapshot") as check,
-    ):
-        refuse_sqlite_chain_authorization(connection, auth.organization_id, auth.alias_revision_id)
-        assert check.call_count == 1
-    active = manager.aliases()[0]
-    store.register_catalog_snapshot(
-        organization_id=auth.organization_id,
-        snapshot_ref="remote/other.json",
-        catalog_sha256="f" * 64,
-    )
-    store.activate_alias_revision(
-        organization_id=auth.organization_id,
-        alias_id=active.alias_id,
-        alias_name=auth.alias,
-        revision_id="new-revision",
-        target=auth.target,
-        snapshot_ref="remote/other.json",
-        catalog_sha256="f" * 64,
-    )
-    with (
-        store._connect() as connection,
-        patch("exp.runtime.gateway.model_chain_authority.refuse_sqlite_chain_snapshot") as check,
-    ):
-        refuse_sqlite_chain_authorization(connection, auth.organization_id, auth.alias_revision_id)
-        assert [call.args[1] for call in check.call_args_list] == [
-            active.snapshot_ref,
-            "remote/other.json",
-        ]
 
 
 def test_plain_authority_does_not_require_an_optional_chain_backend() -> None:

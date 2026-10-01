@@ -1553,9 +1553,9 @@ def test_carrier_whose_issuing_rung_left_the_route_drops_instead_of_refusing(
 
     from exp.common.models import GatewayEquivalenceCertification
     from exp.runtime.gateway.catalog_authority import (
-        upsert_certified_pool,
         upsert_singleton_deployment,
     )
+    from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 
     _control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
     # Re-certify the pool without the issuing rung (beta plus a new gamma), the
@@ -2619,10 +2619,10 @@ def _configured_pool_gateway(
     from exp.common.models import GatewayEquivalenceCertification
     from exp.runtime.gateway.catalog_authority import (
         ConnectionConfig,
-        upsert_certified_pool,
         upsert_connection,
         upsert_singleton_deployment,
     )
+    from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 
     manager = GatewayManagement(root)
     manager.initialize()

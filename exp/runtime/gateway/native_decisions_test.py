@@ -28,7 +28,6 @@ from exp.common.models.gateway_chains import (
     GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.catalog_authority import (
-    upsert_certified_pool,
     upsert_connection,
     upsert_singleton_deployment,
 )
@@ -44,6 +43,7 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_decisions import _admit_accepted
+from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
     publish_authored_chain_fixture,

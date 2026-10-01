@@ -138,8 +138,8 @@ class _RuntimeCatalog:
         *,
         role: CatalogRoleName | None = None,
     ) -> ResolvedModel:
-        del role
         """Return a deterministic resolved model for one configured alias."""
+        del role
         del requirement
         snapshot, capabilities = self._real.snapshot(alias)
         client = _JudgeClient(snapshot, fail_after=type(self).judge_fail_after)
@@ -148,8 +148,8 @@ class _RuntimeCatalog:
         return ResolvedModel(alias, snapshot, capabilities, client, embedding)
 
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        del role
         """Resolve one alias with the same deterministic clients as preflight."""
+        del role
         return self.preflight(alias)
 
 
