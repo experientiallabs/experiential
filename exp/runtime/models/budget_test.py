@@ -14,7 +14,12 @@ from exp.runtime.models.providers.async_transport import (
     RequestDeadline,
     run_with_retry_async,
 )
-from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
+from exp.runtime.models.providers.transport import (
+    ProviderTransportError,
+    RetryPolicy,
+    is_known_unbilled_failure,
+    known_unbilled_attempts,
+)
 
 
 def _call(budget: RequestBudget, *, key: str, calls: list[str], maximum: float = 1) -> str:
@@ -80,7 +85,10 @@ def test_parallel_reservations_share_one_allowance(tmp_path: Path) -> None:
     assert budget.accounted_usd == 3
 
 
-def test_unknown_dispatch_retains_its_reservation_and_never_replays(tmp_path: Path) -> None:
+@pytest.mark.parametrize("maximum", [0, 1])
+def test_unknown_dispatch_retains_its_reservation_and_never_replays(
+    tmp_path: Path, maximum: float
+) -> None:
     """A provider failure is not evidence that a paid request was free."""
     budget = RequestBudget(
         ProjectStore(tmp_path, "budget-test"), identity="fixture", maximum_cost_usd=2
@@ -94,23 +102,27 @@ def test_unknown_dispatch_retains_its_reservation_and_never_replays(tmp_path: Pa
         budget.call(
             role="assistant",
             fingerprint="request",
-            maximum_cost_usd=1,
+            maximum_cost_usd=maximum,
             operation=fail,
             encode=str,
             decode=str,
             charge=lambda result: 0,
         )
-    assert budget.accounted_usd == 1
-    with budget.scope("cell"), pytest.raises(ValueError, match="unresolved spend"):
-        budget.call(
+    assert budget.accounted_usd == maximum
+    resumed = RequestBudget(
+        ProjectStore(tmp_path, "budget-test"), identity="fixture", maximum_cost_usd=2
+    )
+    with resumed.scope("cell"), pytest.raises(ValueError, match="unresolved spend") as saved:
+        resumed.call(
             role="assistant",
             fingerprint="request",
-            maximum_cost_usd=1,
+            maximum_cost_usd=maximum,
             operation=fail,
             encode=str,
             decode=str,
             charge=lambda result: 0,
         )
+    assert not is_known_unbilled_failure(saved.value)
 
 
 @pytest.mark.parametrize("unknown_first", [False, True])
@@ -164,7 +176,9 @@ def test_terminal_admission_failure_settles_only_certified_unpaid_requests(
     assert budget.accounted_usd == expected
     resumed = RequestBudget(project, identity="unpaid", maximum_cost_usd=2)
     assert resumed.accounted_usd == expected
-    with resumed.scope("cell-attempt-1"), pytest.raises(ValueError, match="unresolved spend"):
+    prior_attempts = attempts
+    message = "unresolved spend" if unknown_first else "certified unpaid"
+    with resumed.scope("cell-attempt-1"), pytest.raises(ValueError, match=message) as saved:
         resumed.call(
             role="assistant",
             fingerprint="request",
@@ -174,6 +188,23 @@ def test_terminal_admission_failure_settles_only_certified_unpaid_requests(
             decode=str,
             charge=lambda result: 0,
         )
+    assert attempts == prior_attempts
+    assert known_unbilled_attempts(saved.value) == (0 if unknown_first else prior_attempts)
+    with (
+        resumed.scope("cell-attempt-1"),
+        pytest.raises(ValueError, match="request changed") as changed,
+    ):
+        resumed.call(
+            role="assistant",
+            fingerprint="different-request",
+            maximum_cost_usd=1,
+            operation=dispatch,
+            encode=str,
+            decode=str,
+            charge=lambda result: 0,
+        )
+    assert not is_known_unbilled_failure(changed.value)
+    assert attempts == prior_attempts
     assert _call(resumed, key="cell-attempt-2", calls=[]) == "cell-attempt-2"
     assert resumed.accounted_usd == expected + 1
 

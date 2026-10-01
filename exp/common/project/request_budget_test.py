@@ -13,6 +13,37 @@ from exp.common.project.manifests import artifact_input
 from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
 
 
+def test_unbilled_failure_receipt_requires_explicit_zero_charge_attempt_proof() -> None:
+    """Zero cost alone never certifies a saved failure, and existing receipt bytes stay stable."""
+    for state in ("pending", "complete", "unknown"):
+        receipt = RequestReceipt(fingerprint="request", charge=0, state=state)
+        assert "unbilled_attempts" not in receipt.model_dump()
+    with pytest.raises(ValueError, match="positive attempt proof"):
+        RequestReceipt(fingerprint="request", charge=0, state="unbilled")
+    with pytest.raises(ValueError, match="zero charge"):
+        RequestReceipt(fingerprint="request", charge=1, state="unbilled", unbilled_attempts=2)
+    with pytest.raises(ValueError, match="terminal unbilled receipt"):
+        RequestReceipt(fingerprint="request", charge=0, state="unknown", unbilled_attempts=2)
+    certified = RequestReceipt(
+        fingerprint="request", charge=0, state="unbilled", unbilled_attempts=5
+    )
+    assert RequestReceipt.model_validate_json(certified.model_dump_json()) == certified
+
+
+@pytest.mark.parametrize("invalid", [True, "5", 1.0, 1.5])
+def test_unbilled_attempt_proof_rejects_coerced_counts(invalid: bool | str | float) -> None:
+    """Persisted proof requires actual integer counts, never bool, string, or float coercion."""
+    with pytest.raises(ValueError, match="valid integer"):
+        RequestReceipt.model_validate(
+            {
+                "fingerprint": "request",
+                "charge": 0,
+                "state": "unbilled",
+                "unbilled_attempts": invalid,
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "payload",
     [

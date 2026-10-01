@@ -5,10 +5,10 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Literal, Self, cast
 from uuid import uuid4
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -119,13 +119,28 @@ class RequestReceipt(ContractModel):
         fingerprint: Exact request and pricing identity.
         charge: Settled cost or conservative unresolved reservation, in USD.
         response: Immutable response artifact, present only after completion.
-        state: Whether dispatch is pending, complete, or unresolved.
+        state: Whether dispatch is pending, complete, unresolved, or certified wholly unpaid.
+        unbilled_attempts: Exact positive attempt count for a terminal wholly unpaid request.
+            Absent for existing receipts and all other states.
     """
 
     fingerprint: str
     charge: float = Field(ge=0, allow_inf_nan=False)
     response: ArtifactInput | None = None
-    state: Literal["pending", "complete", "unknown"]
+    state: Literal["pending", "complete", "unknown", "unbilled"]
+    unbilled_attempts: int = Field(
+        default=0, ge=0, strict=True, exclude_if=lambda value: value == 0
+    )
+
+    @model_validator(mode="after")
+    def _validate_unbilled_failure(self) -> Self:
+        """Only explicit wholly unpaid failures may retain a certified positive count."""
+        if self.state == "unbilled":
+            if self.charge != 0 or self.response is not None or self.unbilled_attempts == 0:
+                raise ValueError("unbilled receipt requires positive attempt proof and zero charge")
+        elif self.unbilled_attempts:
+            raise ValueError("unbilled attempt proof requires a terminal unbilled receipt")
+        return self
 
 
 class _Total(ContractModel):

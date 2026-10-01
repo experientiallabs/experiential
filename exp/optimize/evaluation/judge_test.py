@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -20,8 +21,10 @@ from exp.common.models import (
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.judge import DurableEvaluationJudge
+from exp.optimize.evaluation.prepare import ModelEvaluationOptions, prepare_model_evaluation
 from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
+from exp.optimize.router import judgment_budget
 from exp.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJudgeClient
 from exp.optimize.router.automatic.judge_test import _reserved_client, _UsageClient
 from exp.optimize.router.automatic.service_test import _REVISION, _TIME, _RuntimeCatalog
@@ -232,3 +235,109 @@ def test_judge_parameter_error_stops_without_excluding_cells(tmp_path: Path) -> 
         project.artifacts.read(key).manifest.artifact_type == "judgment-exclusion"
         for key in project.artifacts.list_ids()
     )
+
+
+@pytest.mark.parametrize("failure", ["unpaid", "mixed_unpaid"])
+def test_interrupted_unpaid_exclusion_resumes_without_dispatch_or_phantom_cost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """A crash after the request receipt preserves unpaid proof and earlier paid judgments."""
+    project, catalog, state, initial = _prepare(tmp_path)
+    prepared = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        judge_setup=initial.judge_setup,
+        calibration_id=initial.setup.simulation_protocol.judge_calibration_id,
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(maximum_steps=1, maximum_concurrency=1),
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    failing = _FailingCatalog(catalog, state)
+    failing.failure = failure
+    runtime = cast(RuntimeModelCatalog, failing)
+    budget = EvaluationBudget(
+        maximum_cost_usd=prepared.cost.maximum_cost_usd,
+        maximum_judgments=prepared.cost.judgment_count,
+    )
+    requests: list[str] = []
+    original_complete = _FailingClient.complete
+
+    def complete(client: _FailingClient, request: ModelRequest) -> ModelResponse:
+        """Complete one paid judgment before interrupting the next request's exclusion."""
+        requests.append(request.model_dump_json())
+        if len(requests) == 1:
+            return client._delegate.complete(request)
+        return original_complete(client, request)
+
+    monkeypatch.setattr(_FailingClient, "complete", complete)
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(
+            judgment_budget,
+            "_record_judgment_exclusion",
+            Mock(side_effect=KeyboardInterrupt("crash before exclusion persistence")),
+        )
+        with pytest.raises(KeyboardInterrupt, match="before exclusion persistence"):
+            run_prepared_model_evaluation(
+                project,
+                prepared,
+                runtime,
+                budget=budget,
+                provider_spend_consented=True,
+                created_at=_TIME,
+                code_revision=_REVISION,
+            )
+    assert len(requests) == 2
+    failed_request = requests[-1]
+    saved_judgments = {
+        key: project.artifacts.read(key)
+        for key in project.artifacts.list_ids()
+        if project.artifacts.read(key).manifest.artifact_type == "judgment"
+    }
+    assert len(saved_judgments) == 1
+    assert not any(
+        project.artifacts.read(key).manifest.artifact_type == "judgment-exclusion"
+        for key in project.artifacts.list_ids()
+    )
+
+    reopened = ProjectStore(project.paths.root, project.paths.project_id)
+    result = run_prepared_model_evaluation(
+        reopened,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert requests.count(failed_request) == 1
+    assert all(reopened.artifacts.read(key) == value for key, value in saved_judgments.items())
+    exclusions = [
+        judgment_budget.JudgmentExclusionRecord.model_validate_json(
+            reopened.artifacts.read_bytes(key, "exclusion.json")
+        )
+        for key in reopened.artifacts.list_ids()
+        if reopened.artifacts.read(key).manifest.artifact_type == "judgment-exclusion"
+    ]
+    assert len(exclusions) == prepared.cost.judgment_count - 1
+    costs = [item.conservative_cost_usd for item in exclusions]
+    if failure == "unpaid":
+        assert all(cost == 0 for cost in costs)
+    else:
+        assert all(cost > 0 for cost in costs)
+    assert result.judge_cost_usd > 0  # The successful request still contributes its paid usage.
+    calls = len(requests)
+    assert (
+        run_prepared_model_evaluation(
+            reopened,
+            prepared,
+            runtime,
+            budget=budget,
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+        == result
+    )
+    assert len(requests) == calls

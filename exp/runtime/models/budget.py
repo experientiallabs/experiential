@@ -11,7 +11,10 @@ from contextvars import ContextVar
 from exp.common.core.artifacts import sha256_json
 from exp.common.project import ProjectStore
 from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
-from exp.runtime.models.providers.transport import is_known_unbilled_failure
+from exp.runtime.models.providers.transport import (
+    known_unbilled_attempts,
+    retain_request_attempt_evidence,
+)
 
 
 class SpendLimitReached(BaseException):
@@ -37,6 +40,7 @@ class RequestBudget:
     Every request belongs to a deterministic cell/attempt/role/ordinal coordinate. Replaying
     that coordinate returns its saved response only if the exact request digest matches.
     Unknown crash or failure charges retain their full reservation and never replay silently.
+    Certified unpaid failures replay their saved failure proof without dispatching again.
     No credentials or request bodies are saved. Response payloads are immutable project artifacts,
     with large files referenced from SQLite.
     """
@@ -127,7 +131,7 @@ class RequestBudget:
 
         Raises:
             SpendLimitReached: No in-flight request can release enough allowance.
-            ValueError: A saved coordinate drifted, has unknown spend, or violates its bound.
+            ValueError: A saved coordinate drifted, previously failed, or violates its bound.
             Exception: The provider failed. Unknown dispatch retains its full reservation;
                 certified wholly unpaid refusal retains a zero-charge failed receipt.
         """
@@ -156,10 +160,16 @@ class RequestBudget:
             with self._store.transaction():
                 receipt = self._store.read(key)
                 if receipt is not None and receipt.state == "pending":
-                    retained_charge = 0.0 if is_known_unbilled_failure(error) else receipt.charge
+                    unbilled_attempts = known_unbilled_attempts(error)
                     self._store.write(
                         key,
-                        receipt.model_copy(update={"state": "unknown", "charge": retained_charge}),
+                        receipt.model_copy(
+                            update={
+                                "state": "unbilled" if unbilled_attempts else "unknown",
+                                "charge": 0.0 if unbilled_attempts else receipt.charge,
+                                "unbilled_attempts": unbilled_attempts,
+                            }
+                        ),
                     )
             raise
         finally:
@@ -191,6 +201,17 @@ class RequestBudget:
                             raise ValueError(
                                 "saved provider request changed; start a new evaluation"
                             )
+                        if row.state == "unbilled":
+                            failure = ValueError(
+                                "saved provider request was certified unpaid; "
+                                "start a fresh attempt to retry"
+                            )
+                            retain_request_attempt_evidence(
+                                failure,
+                                attempts=row.unbilled_attempts,
+                                unbilled_attempts=row.unbilled_attempts,
+                            )
+                            raise failure
                         if row.state != "complete":
                             raise ValueError(
                                 "saved provider dispatch has unresolved spend; not replayed"

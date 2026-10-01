@@ -103,11 +103,24 @@ def is_known_unbilled_failure(error: BaseException) -> bool:
     keeps the entire failed request's reservation conservative. Cancellation during active
     I/O likewise has a started attempt without a matching non-dispatch receipt.
     """
+    return known_unbilled_attempts(error) > 0
+
+
+def known_unbilled_attempts(error: BaseException) -> int:
+    """Return the exact certified count only if every started request attempt was unpaid.
+
+    Durable failure receipts retain this count so a crash before caller-level exclusion
+    persistence cannot discard the owning retry loop's aggregate accounting proof.
+    """
     evidence = getattr(error, "_exp_request_attempt_evidence", None)
     return (
-        isinstance(evidence, _RequestAttemptEvidence)
-        and evidence.attempts > 0
-        and evidence.attempts == evidence.unbilled_attempts
+        evidence.attempts
+        if (
+            isinstance(evidence, _RequestAttemptEvidence)
+            and evidence.attempts > 0
+            and evidence.attempts == evidence.unbilled_attempts
+        )
+        else 0
     )
 
 
