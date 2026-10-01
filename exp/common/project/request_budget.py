@@ -15,6 +15,7 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     SecretBoundaryError,
+    assert_key_secret_free,
     assert_prose_secret_free,
     assert_secret_free,
     assert_text_secret_free,
@@ -58,7 +59,11 @@ def _validate_response(payload: str) -> None:
             _validate_response_values(value)
             assert_secret_free(value)
     except SecretBoundaryError as exc:
-        raise ArtifactStoreError("provider response violates the secret boundary") from exc
+        raise ArtifactStoreError(
+            "provider response violates the secret boundary (credential-like content). "
+            "Remove credential-bearing fields, assignments, and secret values from the output, "
+            "then start a fresh evaluation. The rejected response was not saved."
+        ) from exc
 
 
 def _response_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
@@ -66,7 +71,11 @@ def _response_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]
     value: dict[str, JsonValue] = {}
     for key, nested in pairs:
         if key in value:
-            raise SecretBoundaryError("provider responses cannot contain duplicate JSON keys")
+            raise ArtifactStoreError(
+                "provider response violates the secret boundary (duplicate JSON keys). "
+                "Remove duplicate keys from the encoded output, then start a fresh evaluation. "
+                "The rejected response was not saved."
+            )
         value[key] = nested
     return value
 
@@ -80,7 +89,7 @@ def _validate_response_values(value: JsonValue) -> None:
     """Check credential fields and assignments, including JSON encoded inside string leaves."""
     if isinstance(value, dict):
         for key, nested in value.items():
-            assert_text_secret_free(key)
+            assert_key_secret_free(key)
             _validate_response_values(nested)
     elif isinstance(value, list):
         for nested in value:

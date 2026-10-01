@@ -68,7 +68,9 @@ _SECRET_REFERENCE_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_SECRET_ASSIGNMENT_SUFFIX_PATTERN = re.compile(r"[\s\"'`]*[:=]")
+_SECRET_ASSIGNMENT_SUFFIX_PATTERN = re.compile(
+    r"(?:[\s\"'`]*[:=]|\s+(?:is|was|equals|set\s+to)\b)", re.IGNORECASE
+)
 SECRET_REDACTION_PLACEHOLDER = "[REDACTED]"
 _SECRET_REDACTION_PATTERNS = (
     *(pattern for _, pattern in _SECRET_VALUE_RULES),
@@ -372,8 +374,8 @@ def assert_text_secret_free(value: str) -> None:
 def assert_prose_secret_free(value: str) -> None:
     """Allow credential terminology in prose while rejecting assignments and secret values.
 
-    Credential terms immediately followed by a colon or equals sign remain prohibited,
-    including ambiguous prose, because the assigned value may lack a recognizable token prefix.
+    Credential terms followed by assignment punctuation or verbs remain prohibited, including
+    ambiguous prose, because the assigned value may lack a recognizable token prefix.
 
     Args:
         value: Decoded prose about to enter an immutable artifact.
@@ -387,6 +389,23 @@ def assert_prose_secret_free(value: str) -> None:
                 raise SecretBoundaryError(
                     "immutable artifacts cannot contain credential assignments"
                 )
+    if _has_secret_value(value):
+        raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
+
+
+def assert_key_secret_free(value: str) -> None:
+    """Reject credential fields and secret values while allowing descriptive JSON keys.
+
+    Args:
+        value: A decoded JSON object key, without its value.
+
+    Raises:
+        SecretBoundaryError: The key names a credential field or includes a secret-like value.
+    """
+    if _SECRET_REFERENCE_PATTERN.fullmatch(value) or _SECRET_ENVIRONMENT_NAME_PATTERN.fullmatch(
+        value
+    ):
+        raise SecretBoundaryError("immutable artifacts cannot contain credential fields")
     if _has_secret_value(value):
         raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
 

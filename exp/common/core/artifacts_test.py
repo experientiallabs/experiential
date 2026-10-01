@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
     SecretBoundaryError,
     SourceIdentity,
     StructuredFailure,
+    assert_key_secret_free,
     assert_prose_secret_free,
     assert_secret_free,
     assert_text_secret_free,
@@ -195,6 +196,8 @@ def test_prose_allows_credential_mentions(content: str) -> None:
         '"CUSTOM_AUTH_TOKEN": "arbitrary-value"',
         "password = arbitrary-value",
         "api key: arbitrary-value",
+        "The password is arbitrary-value",
+        "The API key was arbitrary-value",
         "Use sk-abcdefghijklmnopqrstuvwxyz123456 to connect.",
     ],
 )
@@ -202,6 +205,22 @@ def test_prose_rejects_credential_assignments_and_values(content: str) -> None:
     """Unrecognized credential values and known token prefixes remain prohibited."""
     with pytest.raises(SecretBoundaryError):
         assert_prose_secret_free(content)
+
+
+@pytest.mark.parametrize("key", ["password-policy", "authorization status"])
+def test_descriptive_keys_are_not_credential_fields(key: str) -> None:
+    """A schema can describe credentials without storing a credential field."""
+    assert_key_secret_free(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["api_key", "credential-ref", "OPENAI_API_KEY", "sk-abcdefghijklmnopqrstuvwxyz123456"],
+)
+def test_exact_credential_keys_and_secret_values_are_rejected(key: str) -> None:
+    """Precise field validation still rejects decoded credential and environment names."""
+    with pytest.raises(SecretBoundaryError):
+        assert_key_secret_free(key)
 
 
 def test_artifact_file_paths_reject_nonportable_components() -> None:

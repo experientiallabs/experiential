@@ -21,6 +21,7 @@ from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
         '{"output": "Set OPENAI_API_KEY in the environment. Do not share the secret."}',
         '{"output": "The product includes password management: resets and vaults."}',
         json.dumps({"output": json.dumps({"text": "password management software"})}),
+        '{"output": {"password-policy": "rotated", "authorization status": "granted"}}',
     ],
 )
 def test_response_prose_replays_without_treating_credential_words_as_values(
@@ -63,6 +64,10 @@ def test_response_prose_replays_without_treating_credential_words_as_values(
         '{"output":"sk-' + "sensitive" * 4 + '","output":"safe"}',
         '{"output":[{"text":"first","text":"last"}]}',
         '{"output":"first","\\u006futput":"last"}',
+        '{"output": "The password is arbitrary-value"}',
+        '{"output": "The API key was arbitrary-value"}',
+        '{"output": "The credential equals arbitrary-value"}',
+        '{"output": "The token env is set to arbitrary-value"}',
     ],
 )
 def test_secret_response_rejected_without_settling_or_persisting(
@@ -80,6 +85,26 @@ def test_secret_response_rejected_without_settling_or_persisting(
     assert ledger.read("request-a") == pending
     assert ledger.total() == 2
     assert project.artifacts.list_ids() == ()
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        ('{"output": "OPENAI_API_KEY=arbitrary-value"}', "credential-like content"),
+        ('{"output": "first", "output": "last"}', "duplicate JSON keys"),
+    ],
+)
+def test_response_rejection_explains_safe_reason_and_recovery(
+    tmp_path: Path, payload: str, reason: str
+) -> None:
+    """Diagnostics identify the repair without echoing rejected response data."""
+    ledger = RequestBudgetStore(ProjectStore(tmp_path, "project-a"), "run-a")
+    ledger.write("request-a", RequestReceipt(fingerprint="request", charge=2, state="pending"))
+    with pytest.raises(ArtifactStoreError, match=reason) as rejected:
+        ledger.complete("request-a", 0.4, payload)
+    assert "fresh evaluation" in str(rejected.value)
+    assert "arbitrary-value" not in str(rejected.value)
+    assert "OPENAI_API_KEY" not in str(rejected.value)
 
 
 def test_saved_text_receipt_replays_without_mutation(tmp_path: Path) -> None:
