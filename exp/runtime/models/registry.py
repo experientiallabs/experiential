@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
+from threading import TIMEOUT_MAX
 from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
@@ -48,6 +50,7 @@ from exp.runtime.models.providers.azure import (
     bind_azure_api_key,
     resolve_azure_api_surface,
 )
+from exp.runtime.models.providers.base import DEFAULT_TIMEOUT_SECONDS
 from exp.runtime.models.providers.bedrock import (
     BedrockClient,
     BedrockRuntimeFactory,
@@ -169,6 +172,7 @@ class RuntimeModelCatalog:
         *,
         environment: Mapping[str, str] | None = None,
         transport_factory: Callable[[], ProviderTransport] = HttpxAsyncJsonTransport,
+        http_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         tinker_sampler_factory: TinkerSamplerFactory | None = None,
         bedrock_runtime_factory: BedrockRuntimeFactory | None = None,
         vertex_token_provider_factory: VertexTokenProviderFactory | None = None,
@@ -189,15 +193,31 @@ class RuntimeModelCatalog:
             anthropic_oauth_app: The OAuth app Anthropic issued to this operator for Claude
                 plan sign-in. Omit it to read ``EXP_ANTHROPIC_OAUTH_*`` from ``environment``.
             transport_factory: Explicit transport construction for HTTP-backed providers.
+            http_timeout_seconds: Finite positive request-timeout floor for HTTP completion
+                and embedding clients, including injected transport work. Completions retain
+                their output-derived allowance when larger. Defaults to 60 seconds; does not
+                configure Bedrock, Tinker, or native-only TypeSafe execution. Cannot exceed
+                the operating system's ``threading.TIMEOUT_MAX`` representation limit.
             tinker_sampler_factory: Optional deterministic test override for completed-handle
                 sampling. Omit it to use the runtime-owned Tinker SDK construction seam.
             bedrock_runtime_factory: Optional deterministic Bedrock runtime factory used by tests.
             vertex_token_provider_factory: Optional deterministic Vertex bearer-token seam used
                 by tests. Omit it to mint tokens from the connection's service-account JSON.
         """
+        if (
+            isinstance(http_timeout_seconds, bool)
+            or not math.isfinite(http_timeout_seconds)
+            or http_timeout_seconds <= 0
+            or http_timeout_seconds > TIMEOUT_MAX
+        ):
+            raise ValueError(
+                "http_timeout_seconds must be finite and positive; "
+                f"choose a value no greater than threading.TIMEOUT_MAX ({TIMEOUT_MAX:g} seconds)"
+            )
         self._catalog = catalog
         self._environment = os.environ if environment is None else environment
         self._transport_factory = transport_factory
+        self._http_timeout_seconds = http_timeout_seconds
         self._tinker_sampler_factory = tinker_sampler_factory
         self._bedrock_runtime_factory = bedrock_runtime_factory
         self._vertex_token_provider_factory = vertex_token_provider_factory
@@ -376,6 +396,7 @@ class RuntimeModelCatalog:
                     api_key=api_key,
                     base_url=connection.base_url,
                     transport=self._transport_factory(),
+                    timeout_seconds=self._http_timeout_seconds,
                     token_provider=token_provider,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
@@ -405,6 +426,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url,
                 transport=self._transport_factory(),
+                timeout_seconds=self._http_timeout_seconds,
                 token_provider=token_provider,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),
@@ -432,6 +454,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 base_url=connection.base_url or OPENAI_BASE_URL,
                 transport=self._transport_factory(),
+                timeout_seconds=self._http_timeout_seconds,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
@@ -484,6 +507,7 @@ class RuntimeModelCatalog:
                     base_url=azure_anthropic_base_url(connection.base_url),
                     authorization_bearer=True,
                     transport=self._transport_factory(),
+                    timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
                     supports_top_k=_supports_flag(capabilities, "supports_top_k"),
@@ -512,6 +536,7 @@ class RuntimeModelCatalog:
                 api_version=api_version,
                 api_surface=api_surface,
                 transport=self._transport_factory(),
+                timeout_seconds=self._http_timeout_seconds,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
@@ -585,6 +610,7 @@ class RuntimeModelCatalog:
         if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
             http_kwargs.update(
                 {
+                    "timeout_seconds": self._http_timeout_seconds,
                     "supports_temperature": capabilities.supports_temperature,
                     "supports_top_p": _supports_top_p(capabilities),
                     "supports_top_k": _supports_flag(capabilities, "supports_top_k"),
@@ -695,6 +721,7 @@ class RuntimeModelCatalog:
                     model=snapshot,
                     tokens=tokens,
                     transport=self._transport_factory(),
+                    timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
                     supports_reasoning=capabilities.supports_reasoning,
@@ -707,6 +734,7 @@ class RuntimeModelCatalog:
                     tokens=tokens,
                     app=self._anthropic_app(),
                     transport=self._transport_factory(),
+                    timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
                     supports_top_k=_supports_flag(capabilities, "supports_top_k"),
@@ -780,6 +808,7 @@ class RuntimeModelCatalog:
             catalog,
             environment=self._environment,
             transport_factory=self._transport_factory,
+            http_timeout_seconds=self._http_timeout_seconds,
             tinker_sampler_factory=self._tinker_sampler_factory,
             bedrock_runtime_factory=self._bedrock_runtime_factory,
             vertex_token_provider_factory=self._vertex_token_provider_factory,
