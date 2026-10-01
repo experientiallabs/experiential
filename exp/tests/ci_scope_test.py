@@ -53,7 +53,20 @@ DEPENDENCY_CHANGE = (
         ([{"filename": "exp/runtime/capture/proxy.py", "patch": "+x"}], True),
         ([{"filename": "exp/simulation/engines/sandbox.py", "patch": "+x"}], True),
         ([{"filename": ".github/workflows/gate.yml", "patch": "+x"}], True),
+        ([{"filename": "exp/tests/release_revision_test.py", "patch": "+x"}], True),
+        ([{"filename": "exp/conftest.py", "patch": "+x"}], True),
         ([{"filename": "docs/usage.md", "patch": "+x"}], False),
+        (
+            [
+                {
+                    "filename": "exp/legacy/sandbox.py",
+                    "previous_filename": "exp/simulation/engines/sandbox.py",
+                    "patch": "",
+                }
+            ],
+            True,
+        ),
+        ([{"filename": "docs/usage.md", "previous_filename": None, "patch": "+x"}], False),
     ],
 )
 def test_darwin_scope_skips_version_bumps_but_not_dependency_changes(

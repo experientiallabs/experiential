@@ -28,7 +28,7 @@ jobs:
         # What the uv cache holds across runs is the wheels uv built from
         # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
         # (~3 min). Keying on all of uv.lock went cold on every release bump.
-        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key || true
       - uses: astral-sh/setup-uv@v6
         with:
           # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
@@ -174,7 +174,7 @@ jobs:
         # What the uv cache holds across runs is the wheels uv built from
         # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
         # (~3 min). Keying on all of uv.lock went cold on every release bump.
-        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key || true
       - uses: astral-sh/setup-uv@v6
         with:
           # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
@@ -232,7 +232,7 @@ jobs:
             exit 0
           fi
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate \
-            -q '.[] | {filename, patch}' > files.jsonl || {
+            -q '.[] | {filename, previous_filename, patch}' > files.jsonl || {
             echo "could not list the pull request's files; running the macOS job" >&2
             echo "required=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -245,6 +245,10 @@ jobs:
           SCOPE = re.compile(
               r"^(exp/runtime/capture/|exp/cli/capture/|exp/runtime/environments/"
               r"|exp/runtime/router/|exp/optimize/router/|exp/simulation/"
+              # Shared files the evidence suites load directly. exp/common/ is
+              # deliberately out (a quarter of all merges); main pushes cover it.
+              r"|conftest\.py$|exp/__init__\.py$|exp/conftest\.py$"
+              r"|exp/tests/release_revision_test\.py$"
               r"|\.github/workflows/gate\.yml$)"
           )
           MANIFESTS = {"pyproject.toml", "uv.lock"}
@@ -253,7 +257,8 @@ jobs:
 
           def needs_macos(changed: dict) -> bool:
               name = changed["filename"]
-              if SCOPE.match(name):
+              # A rename out of the scope still removes a file the job covers.
+              if SCOPE.match(name) or SCOPE.match(changed.get("previous_filename") or ""):
                   return True
               if name not in MANIFESTS:
                   return False

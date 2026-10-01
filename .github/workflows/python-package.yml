@@ -64,11 +64,11 @@ jobs:
           # Any lookup failure builds every target (fail closed).
           if [ "${GITHUB_EVENT_NAME}" = pull_request ]; then
             files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
-              --paginate -q '.[].filename')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+              --paginate -q '.[] | .filename, (.previous_filename // empty)')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
           else
             # Compare lists at most 300 files; a list that long builds everything.
             files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
-              -q '.files[].filename')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+              -q '.files[] | .filename, (.previous_filename // empty)')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
             if [ "$(printf '%s\n' "${files}" | grep -c .)" -ge 300 ]; then
               echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
             fi
