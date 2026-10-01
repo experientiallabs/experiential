@@ -1,7 +1,9 @@
 """Pinned served identities and durable pairwise probe coordinates survive budget pauses."""
 
+import asyncio
 from pathlib import Path
 
+import httpx
 import pytest
 
 from exp.common.judging import Rubric
@@ -35,6 +37,10 @@ from exp.optimize.router.judging.service_test import (
     _wide_axes,
 )
 from exp.runtime.models.budget import RequestBudget, SpendLimitReached
+from exp.runtime.models.providers import async_transport
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.models.registry_test import _catalog as _runtime_catalog
 
 
 class _Client:
@@ -179,3 +185,65 @@ def test_pairwise_budget_resume_preserves_reverse_probe_identity(tmp_path: Path)
     assert client.calls == 2
     assert execute(0.002) == result
     assert client.calls == 2
+
+
+@pytest.mark.parametrize("role", ["assistant", "world", "judge"])
+def test_standard_catalog_admission_retries_charge_only_the_successful_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    """The ordinary catalog path handles six certified wire attempts and exact zero-call replay."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Refuse five requests at the authenticated origin before one successful completion."""
+        requests.append(request)
+        if len(requests) <= 5:
+            return httpx.Response(
+                429, json={}, headers={"Retry-After": "0", "x-gateway-admission-refused": "true"}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+            },
+        )
+
+    # Patch the reusable HTTP connection only. Catalog and client construction use the same
+    # defaults as exp eval; no injected unbilled flag bypasses the public trust boundary.
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(async_transport, "_pooled_client", lambda: http_client)
+    catalog = _runtime_catalog(
+        provider="openai-compatible", base_url="https://api.experientiallabs.ai/v1"
+    )
+    resolved = RuntimeModelCatalog(catalog, environment={"FIXTURE_API_KEY": "fixture"}).resolve(
+        "fixture-model"
+    )
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    reservation = completion_cost_reservation(
+        model=resolved.snapshot,
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=1,
+        cache_write_usd_per_million_tokens=1,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    budget = RequestBudget(ProjectStore(tmp_path, "retry-test"), identity=role, maximum_cost_usd=1)
+    wrapper = BudgetedCompletion(resolved.client, budget, reservation, role=role)
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=500
+    )
+    with budget.scope("cell"):
+        response = wrapper.complete(request)
+    assert len(requests) == 6
+    assert len({request.headers["Idempotency-Key"] for request in requests}) == 1
+    assert response.economics.provider_attempts == 6
+    assert response.economics.unbilled_attempts == 5
+    assert budget.accounted_usd == pytest.approx(0.00014)
+    with budget.scope("cell"):
+        assert wrapper.complete(request) == response
+    assert len(requests) == 6
+    assert budget.accounted_usd == pytest.approx(0.00014)
+    asyncio.run(http_client.aclose())

@@ -313,8 +313,9 @@ def reconcile_completion_economics(
     """Derive a conservative retry-inclusive charge from response economics.
 
     A successful response exposes usage for its completed attempt. When the adapter reports
-    its actual attempt count, unused retry allowance is released. Otherwise every permitted
-    attempt remains possible. The charge prices successful usage under mutually exclusive
+    its actual attempt count, unused retry allowance is released. Certified unpaid admission
+    refusals remain in the wire count but do not consume paid attempt allowance. Otherwise every
+    permitted attempt remains possible. The charge prices successful usage under mutually exclusive
     rates and reserves, for each earlier attempt whose billing is unresolved, observed request
     input at the highest input rate plus the full reserved output budget. Earlier attempts
     sent the same request, so observed input size bounds them without charging the context
@@ -399,6 +400,11 @@ def reconcile_completion_economics(
         + reservation.maximum_output_tokens * reservation.output_usd_per_million_tokens
     ) / 1_000_000
     attempts = economics.provider_attempts or reservation.maximum_attempts
+    if economics.unbilled_attempts and economics.provider_attempts is None:
+        raise ValueError("unbilled attempts require an observed total attempt count")
+    attempts -= economics.unbilled_attempts
+    if attempts < 1:
+        raise ValueError("successful completion requires at least one potentially billed attempt")
     if attempts > reservation.maximum_attempts:
         raise ValueError("observed provider attempts exceed the request reservation")
     retry_inclusive_cost = successful_cost + (attempts - 1) * maximum_attempt_cost

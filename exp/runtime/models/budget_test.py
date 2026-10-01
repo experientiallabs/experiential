@@ -1,5 +1,6 @@
 """Parallel spend admission, crash reservations and exact request replay."""
 
+import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,6 +9,12 @@ import pytest
 
 from exp.common.project import ProjectStore
 from exp.runtime.models.budget import RequestBudget, SpendLimitReached
+from exp.runtime.models.providers.async_transport import (
+    ProviderDeadlineExceeded,
+    RequestDeadline,
+    run_with_retry_async,
+)
+from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 
 
 def _call(budget: RequestBudget, *, key: str, calls: list[str], maximum: float = 1) -> str:
@@ -104,6 +111,71 @@ def test_unknown_dispatch_retains_its_reservation_and_never_replays(tmp_path: Pa
             decode=str,
             charge=lambda result: 0,
         )
+
+
+@pytest.mark.parametrize("unknown_first", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_terminal_admission_failure_settles_only_certified_unpaid_requests(
+    tmp_path: Path, unknown_first: bool, cancel: bool
+) -> None:
+    """Timeout/cancel is durably zero only without unknown dispatch, and fresh attempts can run."""
+    project = ProjectStore(tmp_path, "budget-test")
+    budget = RequestBudget(project, identity="unpaid", maximum_cost_usd=2)
+    attempts = 0
+
+    async def operation(timeout: float) -> str:
+        """Optionally lose one response, then receive only trusted admission refusals."""
+        del timeout
+        nonlocal attempts
+        attempts += 1
+        if unknown_first and attempts == 1:
+            raise ProviderTransportError("unknown dispatch")
+        raise ProviderTransportError("busy", status_code=429, known_unbilled=True)
+
+    async def sleep(seconds: float) -> None:
+        """Permit one unknown retry, then interrupt after the certified refusal."""
+        del seconds
+        if unknown_first and attempts == 1:
+            return
+        if cancel:
+            raise asyncio.CancelledError
+        raise ProviderDeadlineExceeded("provider request deadline exceeded")
+
+    def dispatch() -> str:
+        """Use the production owning retry loop to establish aggregate failure evidence."""
+        return asyncio.run(
+            run_with_retry_async(
+                operation, policy=RetryPolicy(), deadline=RequestDeadline.after(10), sleep=sleep
+            )
+        )
+
+    error_type = asyncio.CancelledError if cancel else ProviderDeadlineExceeded
+    with budget.scope("cell-attempt-1"), pytest.raises(error_type):
+        budget.call(
+            role="assistant",
+            fingerprint="request",
+            maximum_cost_usd=1,
+            operation=dispatch,
+            encode=str,
+            decode=str,
+            charge=lambda result: 0,
+        )
+    expected = 1 if unknown_first else 0
+    assert budget.accounted_usd == expected
+    resumed = RequestBudget(project, identity="unpaid", maximum_cost_usd=2)
+    assert resumed.accounted_usd == expected
+    with resumed.scope("cell-attempt-1"), pytest.raises(ValueError, match="unresolved spend"):
+        resumed.call(
+            role="assistant",
+            fingerprint="request",
+            maximum_cost_usd=1,
+            operation=dispatch,
+            encode=str,
+            decode=str,
+            charge=lambda result: 0,
+        )
+    assert _call(resumed, key="cell-attempt-2", calls=[]) == "cell-attempt-2"
+    assert resumed.accounted_usd == expected + 1
 
 
 def test_changed_request_at_same_coordinate_fails_before_dispatch(tmp_path: Path) -> None:

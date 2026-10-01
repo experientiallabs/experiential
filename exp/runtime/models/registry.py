@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Literal, Protocol
+from urllib.parse import urlsplit
 
 from exp.common.auth import ProviderAuthStore
 from exp.common.core.artifacts import JsonObject, sha256_json
@@ -561,11 +562,25 @@ class RuntimeModelCatalog:
             raise ModelConnectionError(
                 f"OpenAI-compatible alias {alias!r} needs connection.base_url"
             )
+        transport = self._transport_factory()
+        endpoint = urlsplit(base_url)
+        if (
+            self._transport_factory is HttpxAsyncJsonTransport
+            and provider == "openai-compatible"
+            and endpoint.scheme == "https"
+            and endpoint.hostname == "api.experientiallabs.ai"
+            and endpoint.port in (None, 443)
+            and endpoint.username is None
+            and endpoint.password is None
+        ):
+            transport = HttpxAsyncJsonTransport(
+                trusted_admission_origin="https://api.experientiallabs.ai"
+            )
         http_kwargs: dict[str, object] = {
             "model": snapshot,
             "api_key": api_key,
             "base_url": base_url,
-            "transport": self._transport_factory(),
+            "transport": transport,
         }
         if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
             http_kwargs.update(

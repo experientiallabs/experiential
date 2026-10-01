@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, StoredOAuthTokens
@@ -34,8 +36,10 @@ from exp.runtime.models.credentials import (
 )
 from exp.runtime.models.credentials_test import AtomicEnvironment
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
+from exp.runtime.models.providers import async_transport
 from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.anthropic_subscription import AnthropicSubscriptionClient
+from exp.runtime.models.providers.async_transport import HttpxAsyncJsonTransport
 from exp.runtime.models.providers.azure import AzureClient
 from exp.runtime.models.providers.chatgpt_subscription import ChatGptSubscriptionClient
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
@@ -44,10 +48,14 @@ from exp.runtime.models.providers.tinker_sampling import (
     TinkerSample,
     TinkerSampler,
 )
-from exp.runtime.models.providers.transport import ScriptedJsonTransport
+from exp.runtime.models.providers.transport import (
+    ProviderTransportError,
+    ScriptedJsonTransport,
+    is_known_unbilled_failure,
+)
 from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.providers.vertex import VertexTokenProvider
-from exp.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
+from exp.runtime.models.registry import CatalogRoleName, ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
     supports_tools=True,
@@ -156,6 +164,56 @@ def _catalog(
         },
         roles=ModelRoles(candidates=("fixture-model",), incumbent="fixture-model"),
     )
+
+
+@pytest.mark.parametrize("role", ["world_model", "judge", "candidate"])
+@pytest.mark.parametrize(
+    "base_url,explicit_transport,expected",
+    [
+        ("https://api.experientiallabs.ai/v1", False, True),
+        ("https://api.experientiallabs.ai:443/v1", False, True),
+        ("https://api.experientiallabs.ai:444/v1", False, False),
+        ("https://api.experientiallabs.ai.attacker.test/v1", False, False),
+        ("http://api.experientiallabs.ai/v1", False, False),
+        ("https://api.experientiallabs.ai/v1", True, False),
+    ],
+)
+def test_default_catalog_trusts_only_official_authenticated_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    role: CatalogRoleName,
+    base_url: str,
+    explicit_transport: bool,
+    expected: bool,
+) -> None:
+    """All inference roles use exact origin trust while injected factories remain caller-owned."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a trusted-shaped refusal with a wait exceeding the configured retry ceiling."""
+        requests.append(request)
+        return httpx.Response(
+            429, json={}, headers={"Retry-After": "3", "x-gateway-admission-refused": "true"}
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(async_transport, "_pooled_client", lambda: http_client)
+    catalog = _catalog(provider="openai-compatible", base_url=base_url)
+    if explicit_transport:
+        runtime = RuntimeModelCatalog(
+            catalog,
+            environment={"FIXTURE_API_KEY": "fixture"},
+            transport_factory=lambda: HttpxAsyncJsonTransport(),
+        )
+    else:
+        runtime = RuntimeModelCatalog(catalog, environment={"FIXTURE_API_KEY": "fixture"})
+    with pytest.raises(ProviderTransportError) as caught:
+        runtime.resolve("fixture-model", role=role).client.complete(
+            ModelRequest(messages=(ModelMessage(role="user", content="hello"),))
+        )
+    assert len(requests) == 1
+    assert caught.value.known_unbilled is expected
+    assert is_known_unbilled_failure(caught.value) is expected
+    asyncio.run(http_client.aclose())
 
 
 def test_typesafe_resolves_native_client_without_changing_capability_identity() -> None:

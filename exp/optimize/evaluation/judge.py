@@ -13,7 +13,7 @@ from exp.optimize.router.errors import JudgeDispatchExhaustedError
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.errors import ProviderParameterError
-from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.models.providers.transport import ProviderTransportError, is_known_unbilled_failure
 
 
 class DurableEvaluationJudge:
@@ -93,6 +93,10 @@ class DurableEvaluationJudge:
             ]
             if isinstance(exc, JudgeDispatchExhaustedError) and missing > 0:
                 costs.append(exc.conservative_cost_usd)
+                missing -= 1
+            elif is_known_unbilled_failure(exc) and missing > 0:
+                # The final logical call contains only certified pre-dispatch refusals.
+                # Earlier successful or ambiguous counterbalanced calls keep their costs.
                 missing -= 1
             costs.extend([self._reservation.absolute_maximum_call_cost_usd()] * missing)
             raise JudgeDispatchExhaustedError(

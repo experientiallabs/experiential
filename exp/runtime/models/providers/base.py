@@ -38,6 +38,7 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    is_unbilled_attempt,
 )
 
 if TYPE_CHECKING:
@@ -553,19 +554,25 @@ class ProviderHttpClient(abc.ABC):
         request_headers["Idempotency-Key"] = idempotency_key or f"exp-{uuid4().hex}"
 
         attempts = 0
+        unbilled_attempts = 0
 
         async def attempt(timeout_seconds: float) -> ModelResponse:
             """Send and parse one provider attempt under its remaining time bound."""
-            nonlocal attempts
+            nonlocal attempts, unbilled_attempts
             attempts += 1
             started_at = time.monotonic()
-            response = await self._transport.post(
-                url,
-                headers=request_headers,
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                response = await self._transport.post(
+                    url,
+                    headers=request_headers,
+                    payload=payload,
+                    timeout_seconds=timeout_seconds,
+                )
+            except ProviderTransportError as error:
+                unbilled_attempts += int(is_unbilled_attempt(error))
+                raise
             if not 200 <= response.status_code < 300:
+                unbilled_attempts += int(response.known_unbilled)
                 error = response.body.get("error")
                 if (
                     idempotency_key is None
@@ -579,6 +586,8 @@ class ProviderHttpClient(abc.ABC):
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
+                    retry_after_seconds=response.retry_after_seconds,
+                    known_unbilled=response.known_unbilled,
                 )
             try:
                 return self._parse_response(
@@ -600,7 +609,9 @@ class ProviderHttpClient(abc.ABC):
         )
         return result.model_copy(
             update={
-                "economics": result.economics.model_copy(update={"provider_attempts": attempts})
+                "economics": result.economics.model_copy(
+                    update={"provider_attempts": attempts, "unbilled_attempts": unbilled_attempts}
+                )
             }
         )
 

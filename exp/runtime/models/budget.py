@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from exp.common.core.artifacts import sha256_json
 from exp.common.project import ProjectStore
 from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
+from exp.runtime.models.providers.transport import is_known_unbilled_failure
 
 
 class SpendLimitReached(BaseException):
@@ -127,7 +128,8 @@ class RequestBudget:
         Raises:
             SpendLimitReached: No in-flight request can release enough allowance.
             ValueError: A saved coordinate drifted, has unknown spend, or violates its bound.
-            Exception: The provider failed; its full reservation remains durably charged.
+            Exception: The provider failed. Unknown dispatch retains its full reservation;
+                certified wholly unpaid refusal retains a zero-charge failed receipt.
         """
         if not math.isfinite(maximum_cost_usd) or maximum_cost_usd < 0:
             raise ValueError("request reservation must be finite and nonnegative")
@@ -150,11 +152,15 @@ class RequestBudget:
             with self._condition:
                 self._store.complete(key, cost, payload)
             return result
-        except BaseException:
+        except BaseException as error:
             with self._store.transaction():
                 receipt = self._store.read(key)
                 if receipt is not None and receipt.state == "pending":
-                    self._store.write(key, receipt.model_copy(update={"state": "unknown"}))
+                    retained_charge = 0.0 if is_known_unbilled_failure(error) else receipt.charge
+                    self._store.write(
+                        key,
+                        receipt.model_copy(update={"state": "unknown", "charge": retained_charge}),
+                    )
             raise
         finally:
             with self._condition:

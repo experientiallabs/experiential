@@ -1,5 +1,6 @@
 """Unusable judge output produces priced terminal evidence instead of paid replay loops."""
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -12,9 +13,13 @@ from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.router.automatic.service_test import _REVISION, _TIME, _RuntimeCatalog
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
-from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
+from exp.runtime.models.providers.async_transport import (
+    ProviderDeadlineExceeded,
+    RequestDeadline,
+    run_with_retry_async,
+)
 from exp.runtime.models.providers.errors import ProviderParameterError
-from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 
 
 class _FailingClient:
@@ -27,6 +32,8 @@ class _FailingClient:
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Return a paid response that cannot be parsed as a judgment."""
+        if self._failure in {"unpaid", "mixed_unpaid"}:
+            return _admission_deadline_failure(unknown_first=self._failure == "mixed_unpaid")
         if self._failure == "parameters":
             raise ProviderParameterError(
                 message="temperature is incompatible with configured reasoning",
@@ -45,6 +52,39 @@ class _FailingClient:
         return response.model_copy(update={"output": AssistantAction(content="not JSON")})
 
 
+def _admission_deadline_failure(*, unknown_first: bool) -> ModelResponse:
+    """Produce authentic aggregate failure evidence through the production async retry loop."""
+    attempts = 0
+    now = 10.0
+
+    async def attempt(timeout: float) -> ModelResponse:
+        """Optionally lose a provider response, then receive only certified admission refusals."""
+        del timeout
+        nonlocal attempts
+        attempts += 1
+        if unknown_first and attempts == 1:
+            raise ProviderTransportError("unknown response")
+        raise ProviderTransportError(
+            "admission busy", status_code=429, retry_after_seconds=1, known_unbilled=True
+        )
+
+    async def sleep(seconds: float) -> None:
+        """Advance the test deadline without provider calls or wall-time waits."""
+        nonlocal now
+        now += seconds
+
+    return asyncio.run(
+        run_with_retry_async(
+            attempt,
+            policy=RetryPolicy(),
+            deadline=RequestDeadline.after(0.75, now_monotonic=now),
+            sleep=sleep,
+            now_monotonic=lambda: now,
+            random_sample=lambda: 0,
+        )
+    )
+
+
 class _FailingCatalog(_RuntimeCatalog):
     """Change only judge provider output, leaving the complete runtime path intact."""
 
@@ -60,7 +100,9 @@ class _FailingCatalog(_RuntimeCatalog):
         )
 
 
-@pytest.mark.parametrize("failure", ["malformed", "transport", "deadline", "identity"])
+@pytest.mark.parametrize(
+    "failure", ["malformed", "transport", "deadline", "identity", "unpaid", "mixed_unpaid"]
+)
 def test_judge_failure_has_durable_cost_and_never_redispatches(
     tmp_path: Path, failure: str
 ) -> None:
@@ -84,7 +126,10 @@ def test_judge_failure_has_durable_cost_and_never_redispatches(
     )
     assert result.report.compared_cells == 0
     assert result.report.excluded_cells == prepared.cost.scenario_count
-    assert result.judge_cost_usd > 0
+    if failure == "unpaid":
+        assert result.judge_cost_usd == 0
+    else:
+        assert result.judge_cost_usd > 0
     calls = len(state.completion_calls)
     replay = run_prepared_model_evaluation(
         project,

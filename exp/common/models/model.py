@@ -111,15 +111,27 @@ class OperationEconomics(ContractModel):
 
     Attributes:
         provider_attempts: Observed dispatch attempts, or None when not reported.
+        unbilled_attempts: Trusted pre-dispatch refusals included in provider_attempts. Zero is
+            omitted from serialized evidence to preserve artifacts without admission retries.
         usage: Successful-response token accounting, when available.
         cost_usd: Observed or conservatively estimated provider charge.
         latency_seconds: Observed or estimated operation duration.
     """
 
     provider_attempts: int | None = Field(default=None, ge=1)
+    unbilled_attempts: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None
+
+    @model_validator(mode="after")
+    def validate_unbilled_attempts(self) -> OperationEconomics:
+        """Require a complete observed attempt count before releasing known unpaid retries."""
+        if self.unbilled_attempts and (
+            self.provider_attempts is None or self.unbilled_attempts > self.provider_attempts
+        ):
+            raise ValueError("unbilled attempts require a matching observed total attempt count")
+        return self
 
 
 def combine_economics(

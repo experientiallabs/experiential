@@ -455,3 +455,30 @@ def test_observed_attempts_release_unused_retry_allowance(attempts: int) -> None
     ).cost_usd
     assert cost is not None
     assert cost.value == pytest.approx(0.00014 + (attempts - 1) * 0.0021)
+
+
+@pytest.mark.parametrize("unknown_attempts", [0, 1, 2])
+def test_certified_unpaid_attempts_do_not_consume_paid_retry_allowance(
+    unknown_attempts: int,
+) -> None:
+    """More than three wire calls remain bounded by their potentially paid attempt count."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=1,
+        cache_write_usd_per_million_tokens=1,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    economics = OperationEconomics(
+        provider_attempts=6 + unknown_attempts,
+        unbilled_attempts=5,
+        usage=Usage(input_tokens=100, output_tokens=10),
+    )
+    reconciled = reconcile_completion_economics(reservation, economics)
+    assert reconciled.cost_usd is not None
+    assert reconciled.cost_usd.value == pytest.approx(0.00014 + unknown_attempts * 0.0021)
+    assert reconciled.provider_attempts == 6 + unknown_attempts
+    assert reconciled.unbilled_attempts == 5
