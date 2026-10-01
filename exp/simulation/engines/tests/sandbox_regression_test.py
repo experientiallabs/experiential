@@ -12,7 +12,6 @@ from exp.common.project.records import ProjectRecords
 from exp.common.rollouts import RolloutArtifact, StopReason
 from exp.simulation.engines.sandbox import (
     EnvironmentCostBinding,
-    SandboxContentionError,
     SandboxSimulationError,
 )
 from exp.simulation.engines.sandbox_test import (
@@ -29,7 +28,6 @@ from exp.simulation.engines.sandbox_test import (
 from exp.simulation.engines.text.leases import (
     TextCellLease,
     TextCellLeaseStatus,
-    TextCellLeaseStore,
 )
 
 
@@ -87,7 +85,13 @@ def test_paid_dispatch_persistence_failure_retains_non_replay_barrier(
             cost_is_observable=True,
         ),
     )
-    spec = _spec(plan_input, task_input, ("cell-a", "cell-b"), maximum_cost_usd=1.0)
+    spec = _spec(
+        plan_input,
+        task_input,
+        ("cell-a", "cell-b"),
+        maximum_cost_usd=1.0,
+        stop_on_overspend=True,
+    )
 
     def fail_persistence(*_: object) -> RolloutArtifact:
         raise OSError("injected persistence failure")
@@ -112,21 +116,18 @@ def test_paid_dispatch_persistence_failure_retains_non_replay_barrier(
     assert retained.reserved_cost_usd == pytest.approx(1.0)
     monkeypatch.undo()
 
-    elapsed = [0.0]
-    simulator._leases = TextCellLeaseStore(
-        store.project_directory,
-        clock=lambda: retained.claimed_at,
-        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
-        monotonic=lambda: elapsed[0],
-        wait_timeout_seconds=0.05,
-    )
-    with pytest.raises(SandboxContentionError, match="contended"):
-        simulator.run(spec)
-
+    assert simulator._leases.stale_recovery_pending(lease_ids[0])
+    result = simulator.run(spec)
+    rollouts = [_load_rollout(store, artifact_id) for artifact_id in result.artifact_ids]
+    assert len(rollouts) == 2
+    assert all(rollout.stop_reason == StopReason.MAXIMUM_COST for rollout in rollouts)
+    assert rollouts[0].failure is not None
+    assert rollouts[0].failure.details["phase"] == "paid_cell_stale_lease"
+    assert rollouts[1].failure is not None
+    assert rollouts[1].failure.details["phase"] == "paid_cell_admission"
+    assert simulator.run(spec) == result
     assert len(client.requests) == 1
     assert runtime.opened_task_ids == ["task-a"]
-    assert _artifact_ids_of_type(store, "rollout") == ()
-    assert len(lease_records.list_ids()) == 1
 
 
 @pytest.mark.parametrize("interruption", (KeyboardInterrupt, SystemExit))
@@ -213,19 +214,14 @@ def test_post_dispatch_interrupt_keeps_non_replay_barrier(
     assert retained.dispatch_intent_recorded
     assert retained.reserved_cost_usd == pytest.approx(1.0)
 
-    elapsed = [0.0]
-    simulator._leases = TextCellLeaseStore(
-        store.project_directory,
-        clock=lambda: retained.claimed_at,
-        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
-        monotonic=lambda: elapsed[0],
-        wait_timeout_seconds=0.05,
-    )
-    with pytest.raises(SandboxContentionError, match="contended"):
-        simulator.run(spec)
-
+    assert simulator._leases.stale_recovery_pending(lease_ids[0])
+    result = simulator.run(spec)
+    rollout = _load_rollout(store, result.artifact_ids[0])
+    assert rollout.stop_reason == StopReason.MAXIMUM_COST
+    assert rollout.failure is not None
+    assert rollout.failure.details["phase"] == "paid_cell_stale_lease"
+    assert simulator.run(spec) == result
     assert len(client.requests) == 1
-    assert _artifact_ids_of_type(store, "rollout") == ()
 
 
 def test_pre_dispatch_persistence_failure_releases_owned_lease(

@@ -134,6 +134,48 @@ def test_abandoned_execution_retains_claim_and_unknown_spend(tmp_path: Path) -> 
     assert recovered.lease.unknown_spend_blocks_budget
 
 
+@pytest.mark.parametrize("exit_error", [KeyboardInterrupt, OSError])
+def test_admission_exit_failure_releases_ownership_without_deleting_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_error: type[BaseException]
+) -> None:
+    """An exception after commit cannot strand ownership that no caller received."""
+    project = tmp_path / "projects" / "project-a"
+    owner = TextCellLeaseStore(project, clock=lambda: _TIME)
+    transaction = owner._admission_transaction
+
+    @contextmanager
+    def interrupted_exit(*, timeout_s: float) -> Iterator[None]:
+        """Commit the real claim before interrupting the context-manager exit."""
+        with transaction(timeout_s=timeout_s):
+            yield
+        raise exit_error("admission exit interrupted")
+
+    def acquire(store: TextCellLeaseStore) -> TextCellLeaseClaim:
+        """Attempt the exact same cell without invoking any provider."""
+        return store.acquire(
+            lease_id="lease-a",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id="rollout-a",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            reservation_cost_usd=0.2,
+            observed_spend_usd=lambda: 0.0,
+            rollout_completed=lambda _: False,
+        )
+
+    monkeypatch.setattr(owner, "_admission_transaction", interrupted_exit)
+    with pytest.raises(exit_error, match="admission exit interrupted"):
+        acquire(owner)
+    assert owner._records.read("lease-a") is not None
+    follower = TextCellLeaseStore(project, clock=lambda: _TIME, wait_timeout_seconds=0.01)
+    recovered = acquire(follower)
+    assert recovered.state == TextCellLeaseState.STALE
+    assert recovered.lease is not None
+    assert recovered.lease.reserved_cost_usd == 1.0
+    assert recovered.lease.unknown_spend_blocks_budget
+
+
 def test_unsupported_active_owner_protocol_fails_closed_without_changing_claim(
     tmp_path: Path,
 ) -> None:

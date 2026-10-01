@@ -391,68 +391,70 @@ class TextCellLeaseStore:
     ) -> TextCellLeaseClaim | None:
         """Make one lock-protected admission attempt, returning ``None`` for a live follower."""
         self._ensure_directory()
-        with self._admission_transaction(timeout_s=lock_timeout_seconds):
-            path = self._path(lease_id)
-            existing = self._read_optional(path)
-            now = _aware_now(self._clock)
-            if existing is not None:
-                self._require_same_claim(
-                    existing,
+        lease: TextCellLease | None = None
+        try:
+            with self._admission_transaction(timeout_s=lock_timeout_seconds):
+                path = self._path(lease_id)
+                existing = self._read_optional(path)
+                now = _aware_now(self._clock)
+                if existing is not None:
+                    self._require_same_claim(
+                        existing,
+                        resolution_id=resolution_id,
+                        simulation_id=simulation_id,
+                        rollout_id=rollout_id,
+                        binding_sha256=binding_sha256,
+                        maximum_cost_usd=maximum_cost_usd,
+                    )
+                    if rollout_completed(existing.rollout_id):
+                        self._reap(path, existing)
+                        return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
+                    if existing.status == TextCellLeaseStatus.STALE:
+                        return TextCellLeaseClaim(TextCellLeaseState.STALE, existing, None)
+                    if self._is_stale(existing, now):
+                        stale = self._tombstone(path, existing)
+                        return TextCellLeaseClaim(TextCellLeaseState.STALE, stale, None)
+                    return None
+                if rollout_completed(rollout_id):
+                    return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
+                active_leases = self._active_leases_for(
+                    resolution_id=resolution_id,
+                    simulation_id=simulation_id,
+                    now=now,
+                    rollout_completed=rollout_completed,
+                )
+                spend = observed_spend_usd()
+                reservation, contended = self._reserve_budget(
+                    maximum_cost_usd=maximum_cost_usd,
+                    observed_spend_usd=spend,
+                    active_leases=active_leases,
+                    stop_on_overspend=stop_on_overspend,
+                    reservation_cost_usd=reservation_cost_usd,
+                )
+                if contended:
+                    return None
+                if maximum_cost_usd is not None and reservation is None:
+                    return TextCellLeaseClaim(TextCellLeaseState.BUDGET_BLOCKED, None, spend)
+                lease = TextCellLease(
+                    lease_id=lease_id,
                     resolution_id=resolution_id,
                     simulation_id=simulation_id,
                     rollout_id=rollout_id,
                     binding_sha256=binding_sha256,
                     maximum_cost_usd=maximum_cost_usd,
+                    reserved_cost_usd=reservation,
+                    owner_id=f"{_OWNER_PROTOCOL}{uuid4().hex}",
+                    owner_pid=os.getpid(),
+                    claimed_at=now,
+                    expires_at=now + self._stale_after,
                 )
-                if rollout_completed(existing.rollout_id):
-                    self._reap(path, existing)
-                    return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
-                if existing.status == TextCellLeaseStatus.STALE:
-                    return TextCellLeaseClaim(TextCellLeaseState.STALE, existing, None)
-                if self._is_stale(existing, now):
-                    stale = self._tombstone(path, existing)
-                    return TextCellLeaseClaim(TextCellLeaseState.STALE, stale, None)
-                return None
-            if rollout_completed(rollout_id):
-                return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
-            active_leases = self._active_leases_for(
-                resolution_id=resolution_id,
-                simulation_id=simulation_id,
-                now=now,
-                rollout_completed=rollout_completed,
-            )
-            spend = observed_spend_usd()
-            reservation, contended = self._reserve_budget(
-                maximum_cost_usd=maximum_cost_usd,
-                observed_spend_usd=spend,
-                active_leases=active_leases,
-                stop_on_overspend=stop_on_overspend,
-                reservation_cost_usd=reservation_cost_usd,
-            )
-            if contended:
-                return None
-            if maximum_cost_usd is not None and reservation is None:
-                return TextCellLeaseClaim(TextCellLeaseState.BUDGET_BLOCKED, None, spend)
-            lease = TextCellLease(
-                lease_id=lease_id,
-                resolution_id=resolution_id,
-                simulation_id=simulation_id,
-                rollout_id=rollout_id,
-                binding_sha256=binding_sha256,
-                maximum_cost_usd=maximum_cost_usd,
-                reserved_cost_usd=reservation,
-                owner_id=f"{_OWNER_PROTOCOL}{uuid4().hex}",
-                owner_pid=os.getpid(),
-                claimed_at=now,
-                expires_at=now + self._stale_after,
-            )
-            self._hold_ownership(lease)
-            try:
+                self._hold_ownership(lease)
                 self._write_exclusive(path, lease)
-            except BaseException:
+                return TextCellLeaseClaim(TextCellLeaseState.OWNED, lease, spend)
+        except BaseException:
+            if lease is not None:
                 self.abandon(lease)
-                raise
-            return TextCellLeaseClaim(TextCellLeaseState.OWNED, lease, spend)
+            raise
 
     @contextmanager
     def _admission_transaction(
