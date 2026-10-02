@@ -57,7 +57,8 @@ def test_disjoint_subsets_and_unknown_ttl() -> None:
     )
 
 
-def test_whole_request_threshold_and_selected_service_tier() -> None:
+@pytest.mark.parametrize("base_tier", [None, "default", "auto"])
+def test_whole_request_threshold_and_selected_service_tier(base_tier: str | None) -> None:
     """Threshold applies to each whole request; only an observed flex tier uses flex."""
     card = prices().model_copy(
         update={
@@ -75,6 +76,7 @@ def test_whole_request_threshold_and_selected_service_tier() -> None:
     ordinary = Usage(
         input_tokens=99,
         output_tokens=10,
+        service_tier=base_tier,
         cached_input_tokens=0,
         cache_write_input_tokens=0,
         reasoning_tokens=0,

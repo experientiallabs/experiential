@@ -58,11 +58,11 @@ def token_cost_nano_usd(
 def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> int | None:
     """Apply the observed processing tier and whole-request context tier once.
 
-    An omitted service tier denotes the ordinary request path. A reported tier
+    An omitted, default, or auto service tier uses the ordinary request path. A tier
     without an authored schedule is unknown, never a fallback to base prices.
     """
     if (
-        usage.service_tier not in (None, "default")
+        usage.service_tier not in (None, "default", "auto")
         and prices.service_tier(usage.service_tier) is None
     ):
         return None

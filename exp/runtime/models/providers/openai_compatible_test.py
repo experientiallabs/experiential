@@ -22,6 +22,8 @@ from exp.common.models import (
     ToolCall,
     ToolChoice,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
+from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
@@ -247,6 +249,164 @@ def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
     idempotency_keys = [request[1]["Idempotency-Key"] for request in transport.requests]
     assert idempotency_keys[0].startswith("exp-")
     assert idempotency_keys[0] == idempotency_keys[1]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id", "details", "expected_read", "expected_write", "expected_cost"),
+    [
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 80, "cache_write_tokens": 80},
+            0,
+            80,
+            180_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            20,
+            20,
+            105_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 100, "cache_write_tokens": 100},
+            0,
+            100,
+            200_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 80, "cache_write_tokens": 0},
+            80,
+            0,
+            40_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 10, "cache_write_tokens": 20},
+            10,
+            20,
+            112_500,
+        ),
+        ("openrouter", "google/gemini-2.5-pro", {"cache_write_tokens": 20}, None, 20, None),
+        ("openrouter", "google/gemini-2.5-pro", {"cached_tokens": 40}, 40, None, None),
+        ("openrouter", "google/gemini-2.5-pro", {}, None, None, None),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 0, "cache_write_tokens": 0},
+            0,
+            0,
+            100_000,
+        ),
+        (
+            "openrouter",
+            "google/gemma-3-27b-it",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+        (
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+        (
+            "openai-compatible",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+    ],
+)
+def test_client_cache_accounting_uses_only_the_configured_provider_policy(
+    provider: str,
+    model_id: str,
+    details: JsonObject,
+    expected_read: int | None,
+    expected_write: int | None,
+    expected_cost: int | None,
+) -> None:
+    """Gemini writes leave the overlapping read leg; other models retain disjoint usage.
+
+    Different fresh, read, and write rates expose both overbilling on a small
+    overlap and incorrectly unpriceable usage when the raw slices exceed input.
+    The write rate includes the provider's write plus read charge for that leg.
+    """
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "model": "served-model-alias",
+                    "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 0,
+                        "prompt_tokens_details": details,
+                    },
+                },
+            )
+        ]
+    )
+    client_type = OpenRouterClient if provider == "openrouter" else OpenAICompatibleClient
+    client = client_type(
+        model=_snapshot(provider, model_id),
+        base_url=OPENROUTER_BASE_URL if provider == "openrouter" else "https://example.test/v1",
+        api_key="fixture-key",
+        transport=transport,
+    )
+    response = client.complete(_request())
+    usage = response.economics.usage
+    assert usage is not None
+    assert usage.input_tokens == 100
+    assert usage.cached_input_tokens == expected_read
+    assert usage.cache_write_input_tokens == expected_write
+    assert response.model.model_id == "served-model-alias"
+    prices = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=250_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=2_000_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=2_000_000_000,
+        output_nano_usd_per_million_tokens=4_000_000_000,
+        reasoning_nano_usd_per_million_tokens=4_000_000_000,
+    )
+    assert schedule_usage_cost_nano_usd(prices, usage) == expected_cost
+
+
+@pytest.mark.parametrize("unknown", ["cached_tokens", "cache_write_tokens"])
+def test_openrouter_cache_overlap_preserves_explicit_unknown_meters(unknown: str) -> None:
+    """A compatibility zero marked unreported must not become measured cache usage."""
+    details: JsonObject = {"cached_tokens": 0, "cache_write_tokens": 0}
+    response = openai_compatible_response(
+        {
+            "choices": [{"message": {"content": "done"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 0,
+                "prompt_tokens_details": details,
+                "unreported_token_details": [unknown],
+            },
+        },
+        configured_model=_snapshot("openrouter", "google/gemini-2.5-pro"),
+        latency_seconds=1,
+    )
+    usage = response.economics.usage
+    assert usage is not None
+    assert usage.cached_input_tokens == (None if unknown == "cached_tokens" else 0)
+    assert usage.cache_write_input_tokens == (None if unknown == "cache_write_tokens" else 0)
 
 
 def test_response_without_choices_fails_closed_without_exposing_the_key() -> None:

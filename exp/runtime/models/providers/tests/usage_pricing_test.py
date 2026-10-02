@@ -160,7 +160,10 @@ def test_messages_usage_keeps_known_and_unknown_one_hour_writes(hour: int | None
         "cache_creation_input_tokens": 30,
     }
     if hour is not None:
-        usage["cache_creation"] = {"ephemeral_1h_input_tokens": hour}
+        usage["cache_creation"] = {
+            "ephemeral_5m_input_tokens": 30 - hour,
+            "ephemeral_1h_input_tokens": hour,
+        }
     response = anthropic_messages_response(
         {
             "model": "fixture",
@@ -233,3 +236,98 @@ def test_openai_shaped_additive_reasoning_matches_native(
     assert normalized["failure"] is None
     meters = [event for event in normalized["events"] if event["kind"] == "usage"]
     assert len(meters) == 1 and meters[0]["output_tokens"] == expected
+
+
+@pytest.mark.parametrize(
+    ("creation", "expected_hour"),
+    [
+        (None, None),
+        ({}, None),
+        ({"ephemeral_5m_input_tokens": 25}, None),
+        ({"ephemeral_1h_input_tokens": 5}, None),
+        ({"ephemeral_5m_input_tokens": None, "ephemeral_1h_input_tokens": 5}, None),
+        ({"ephemeral_5m_input_tokens": 25, "ephemeral_1h_input_tokens": None}, None),
+        ({"ephemeral_5m_input_tokens": 25, "ephemeral_1h_input_tokens": 5}, 5),
+        ({"ephemeral_5m_input_tokens": 30, "ephemeral_1h_input_tokens": 0}, 0),
+    ],
+)
+def test_messages_ttl_breakdown_matches_native_observation(
+    creation: JsonValue, expected_hour: int | None
+) -> None:
+    """Only a complete consistent split proves TTL allocation on either provider path."""
+    usage: JsonObject = {
+        "input_tokens": 60,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 30,
+        "cache_creation": creation,
+    }
+    response = anthropic_messages_response(
+        {
+            "model": "fixture",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": usage,
+        },
+        configured_model=_snapshot("anthropic"),
+        latency_seconds=1,
+    )
+    assert response.economics.usage is not None
+    assert response.economics.usage.cache_write_1h_input_tokens == expected_hour
+    normalized = _native_messages_usage(usage)
+    assert normalized["failure"] is None
+    events = normalized["events"]
+    assert isinstance(events, list)
+    meters = [event for event in events if isinstance(event, dict) and event["kind"] == "usage"]
+    assert meters[-1].get("cache_creation_1h_input_tokens") == expected_hour
+
+
+@pytest.mark.parametrize(
+    "creation",
+    [
+        7,
+        {"ephemeral_5m_input_tokens": -1},
+        {"ephemeral_1h_input_tokens": True},
+        {"ephemeral_5m_input_tokens": "25"},
+        {"ephemeral_5m_input_tokens": 31},
+        {"ephemeral_1h_input_tokens": 31},
+        {"ephemeral_5m_input_tokens": 25, "ephemeral_1h_input_tokens": 4},
+        {"ephemeral_5m_input_tokens": 25, "ephemeral_1h_input_tokens": 6},
+    ],
+)
+def test_messages_ttl_breakdown_rejects_malformed_or_contradictory_evidence(
+    creation: JsonValue,
+) -> None:
+    """Malformed partial counts and contradictory complete totals never acquire a price."""
+    usage: JsonObject = {
+        "input_tokens": 60,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 30,
+        "cache_creation": creation,
+    }
+    with pytest.raises(ProviderResponseError, match="cache_creation"):
+        anthropic_messages_response(
+            {
+                "model": "fixture",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": usage,
+            },
+            configured_model=_snapshot("anthropic"),
+            latency_seconds=1,
+        )
+    assert _native_messages_usage(usage)["failure"] is not None
+
+
+def _native_messages_usage(usage: JsonObject) -> JsonObject:
+    """Observe identical usage through the existing compiled Messages normalizer."""
+    native = pytest.importorskip("exp_gateway_native")
+    events: list[JsonObject] = [
+        {"type": "message_start", "message": {"usage": usage}},
+        {"type": "message_stop"},
+    ]
+    frames = ["data: " + json.dumps(event) + "\n\n" for event in events]
+    result = json.loads(native.normalize_stream_fixture("anthropic_messages", json.dumps(frames)))
+    assert isinstance(result, dict)
+    return result
