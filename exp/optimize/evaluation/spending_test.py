@@ -1,12 +1,14 @@
 """Pinned served identities and durable pairwise probe coordinates survive budget pauses."""
 
 import asyncio
+import json
 from functools import partial
 from pathlib import Path
 
 import httpx
 import pytest
 
+from exp.common.core.artifacts import sha256_json
 from exp.common.judging import Rubric
 from exp.common.judging.provenance import read_artifact_json
 from exp.common.models import (
@@ -19,7 +21,10 @@ from exp.common.models import (
     Usage,
     completion_cost_reservation,
 )
+from exp.common.models.pricing_test import _model
+from exp.common.models.token_cost_test import prices
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.project.request_budget import RequestBudgetStore
 from exp.common.rollouts import RolloutArtifact
 from exp.optimize.evaluation.spending import BudgetedCompletion
 from exp.optimize.router.composition_test import _completion_reservation
@@ -97,6 +102,18 @@ def test_budgeted_completion_accepts_only_the_configured_served_identity(
         return
     with budget.scope("cell"):
         first = wrapper.complete(request)
+    store = RequestBudgetStore(ProjectStore(tmp_path, "budget-test"), "served-pin")
+    receipt = store.read(sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0}))
+    assert receipt is not None
+    assert "token_prices" not in reservation.model_dump(mode="json")
+    assert receipt.fingerprint == sha256_json(
+        {
+            "request": request.model_dump(mode="json"),
+            "reservation": reservation.model_dump(mode="json"),
+            "served_model": served.model_dump(mode="json"),
+        }
+    )
+    assert store.response(receipt) == first.model_dump_json()
     with budget.scope("cell"):
         assert wrapper.complete(request) == first
     assert first.model == served
@@ -314,3 +331,66 @@ def test_sync_completion_timeout_preserves_whole_request_billing_evidence(
     else:
         assert budget.accounted_usd > 0
     asyncio.run(http_client.aclose())
+
+
+class _PaidClient:
+    """Record a physical successful call whose reported reasoning has an unknown tariff."""
+
+    def __init__(self) -> None:
+        """Use a counter independent of persisted request state."""
+        self.calls = 0
+        self.response = ModelResponse(
+            model=_model(),
+            output=AssistantAction(content="paid response retained exactly"),
+            economics=OperationEconomics(
+                usage=Usage(input_tokens=10, output_tokens=10, reasoning_tokens=3),
+                provider_attempts=1,
+            ),
+        )
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Return already generated output without claiming a price."""
+        self.calls += 1
+        return self.response
+
+
+def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(tmp_path: Path) -> None:
+    """No second dispatch, false settled cost, or lost output after a missing-rate response."""
+    project = ProjectStore(tmp_path, "scheduled")
+    card = prices().model_copy(update={"reasoning_nano_usd_per_million_tokens": None})
+    reservation = completion_cost_reservation(
+        model=_model(),
+        token_prices=card,
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=100,
+    )
+    client = _PaidClient()
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=100
+    )
+    original = RequestBudget(project, identity="schedule", maximum_cost_usd=None)
+    wrapper = BudgetedCompletion(client, original, reservation, role="assistant")
+    with original.scope("cell"), pytest.raises(ValueError, match="not priceable"):
+        wrapper.complete(request)
+    store = RequestBudgetStore(project, "schedule")
+    key = sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0})
+    receipt = store.read(key)
+    assert receipt is not None and receipt.state == "unknown"
+    assert not receipt.charge_is_upper_bound and store.has_unbounded_liability()
+    raw = store.response(receipt)
+    saved = json.loads(raw)
+    assert ModelResponse.model_validate(saved["response"]) == client.response
+    assert saved["charge_usd"] is None
+    resumed = RequestBudget(project, identity="schedule", maximum_cost_usd=0.0000001)
+    resumed_wrapper = BudgetedCompletion(client, resumed, reservation, role="assistant")
+    with resumed.scope("cell"), pytest.raises(ValueError, match="not priceable"):
+        resumed_wrapper.complete(request)
+    with resumed.scope("new-cell"), pytest.raises(ValueError, match="complete applicable"):
+        resumed_wrapper.complete(request)
+    assert client.calls == 1
+    assert store.read(key) == receipt and store.response(receipt) == raw

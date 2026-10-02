@@ -5,6 +5,7 @@ import math
 from exp.common.evaluations.dataset import EvaluationRow
 from exp.common.evaluations.evidence import read_rollout
 from exp.common.models import CandidateTokenPrice, NumericMeasurement, Usage
+from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.common.project import ArtifactStore
 from exp.common.rollouts import RolloutEventKind
 
@@ -24,6 +25,13 @@ def candidate_usage_cost(
     """
     if usage is None:
         return None
+    if price.token_prices is not None:
+        cost = schedule_usage_cost_nano_usd(price.token_prices, usage)
+        return (
+            None
+            if cost is None
+            else NumericMeasurement(value=cost / 1_000_000_000, provenance="estimated")
+        )
     cached = usage.cached_input_tokens or 0
     written = usage.cache_write_input_tokens or 0
     if cached + written > usage.input_tokens:
@@ -49,8 +57,29 @@ def operating_row(
         return row
     rollout, _ = read_rollout(store, row.rollout_id)
     latency = row.candidate_latency_seconds
+    spans = [span for span in rollout.spans if span.kind == RolloutEventKind.AGENT_MODEL_CALL]
+    if price.token_prices is None:
+        cost = candidate_usage_cost(rollout.candidate_economics.usage, price)
+    else:
+        calls = [candidate_usage_cost(span.usage, price) for span in spans]
+        cumulative = rollout.candidate_economics.usage
+        covers_usage = cumulative is not None and (
+            sum(span.usage.input_tokens for span in spans if span.usage is not None)
+            == cumulative.input_tokens
+            and sum(span.usage.output_tokens for span in spans if span.usage is not None)
+            == cumulative.output_tokens
+        )
+        # Long-context rates apply to each request, not to the cumulative episode.
+        # A missing per-call meter leaves cost unknown rather than pricing a partial total.
+        cost = (
+            NumericMeasurement(
+                value=math.fsum(item.value for item in calls if item is not None),
+                provenance="estimated",
+            )
+            if covers_usage and calls and all(item is not None for item in calls)
+            else None
+        )
     if latency is None:
-        spans = [span for span in rollout.spans if span.kind == RolloutEventKind.AGENT_MODEL_CALL]
         if spans:
             latency = NumericMeasurement(
                 value=math.fsum(
@@ -60,7 +89,7 @@ def operating_row(
             )
     return row.model_copy(
         update={
-            "candidate_cost_usd": candidate_usage_cost(rollout.candidate_economics.usage, price),
+            "candidate_cost_usd": cost,
             "candidate_latency_seconds": latency,
         }
     )

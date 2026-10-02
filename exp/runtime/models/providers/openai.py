@@ -15,7 +15,7 @@ from openai.types.responses import (
 )
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import (
     AssistantAction,
     ModelMessage,
@@ -25,6 +25,7 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
+from exp.common.models.usage_observability import unreported_token_details
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
@@ -36,6 +37,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalSignal,
     ProviderResponseError,
     ProviderRetryableResponseError,
+    require_object,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
 from exp.runtime.models.providers.reasoning_compat import (
@@ -215,7 +217,7 @@ def openai_responses_response(
         output=action,
         configured_model=configured_model,
         served_model_id=parsed.model,
-        usage=_usage(parsed.usage),
+        usage=_usage(parsed.usage, raw=payload.get("usage"), service_tier=parsed.service_tier),
         latency_seconds=latency_seconds,
         hit_length_limit=status == "incomplete",
     )
@@ -388,15 +390,41 @@ def _tool_call(item: ResponseFunctionToolCall, index: int) -> ToolCall:
         ) from exc
 
 
-def _usage(usage: ResponseUsage | None) -> Usage | None:
+def _usage(
+    usage: ResponseUsage | None,
+    *,
+    raw: JsonValue,
+    service_tier: str | None = None,
+) -> Usage | None:
     """Map optional typed Responses usage without accepting negative token counts."""
     if usage is None:
         return None
     try:
+        unknown = unreported_token_details(require_object(raw, "usage"), responses=True)
         return Usage(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
-            cached_input_tokens=usage.input_tokens_details.cached_tokens,
+            cached_input_tokens=(
+                None if "cached_tokens" in unknown else usage.input_tokens_details.cached_tokens
+            ),
+            cache_write_input_tokens=(
+                None
+                if "cache_write_tokens" in unknown
+                else usage.input_tokens_details.cache_write_tokens
+            ),
+            cache_write_1h_input_tokens=(
+                None
+                if "cache_write_1h_tokens" in unknown
+                else (usage.input_tokens_details.model_extra or {}).get("cache_write_1h_tokens")
+            ),
+            reasoning_tokens=(
+                None
+                if "reasoning_tokens" in unknown
+                else usage.output_tokens_details.reasoning_tokens
+            ),
+            service_tier=service_tier,
         )
-    except ValidationError as exc:
-        raise ProviderResponseError("OpenAI Responses usage values must be non-negative") from exc
+    except ValueError as exc:
+        raise ProviderResponseError(
+            "OpenAI Responses usage values or observability are invalid"
+        ) from exc

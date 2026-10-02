@@ -531,6 +531,7 @@ def completion_reservation_from_catalog(
     try:
         return completion_cost_reservation(
             model=model,
+            token_prices=catalog.models[alias].token_prices,
             input_usd_per_million_tokens=input_price,
             output_usd_per_million_tokens=output_price,
             cached_input_usd_per_million_tokens=cached_input_price,
@@ -616,6 +617,7 @@ def judge_completion_reservation(
     try:
         return completion_cost_reservation(
             model=judge,
+            token_prices=catalog.models[judge_alias].token_prices,
             input_usd_per_million_tokens=input_price,
             output_usd_per_million_tokens=output_price,
             cached_input_usd_per_million_tokens=cached_input_price,

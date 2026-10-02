@@ -22,7 +22,7 @@ from exp.common.judging import (
 )
 from exp.common.judging.evidence import DEFAULT_JUDGE_OUTPUT_TOKENS
 from exp.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
-from exp.common.models import ModelSnapshot, OperationEconomics, PricingSource
+from exp.common.models import ModelResponse, ModelSnapshot, OperationEconomics, PricingSource
 
 
 class ManualJudgeError(ValueError):
@@ -655,7 +655,12 @@ class ManualJudgeTraceReviewArtifact(ArtifactEnvelope):
 
 
 class JudgeProtocolProbeArtifact(ArtifactEnvelope):
-    """One immutable schema-valid provider probe used by manual calibration."""
+    """One immutable provider probe, including retained unpriceable paid evidence.
+
+    Attributes:
+        pricing_error: Explicit valuation failure; this probe cannot become a judgment.
+        unpriced_response: Paid output and usage retained before that failure is raised.
+    """
 
     probe_id: ArtifactId
     setup: ArtifactInput
@@ -665,6 +670,10 @@ class JudgeProtocolProbeArtifact(ArtifactEnvelope):
     response: JsonObject
     model: ModelSnapshot
     economics: OperationEconomics
+    pricing_error: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    unpriced_response: ModelResponse | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _require_complete_probe_inputs(self) -> JudgeProtocolProbeArtifact:
@@ -694,6 +703,15 @@ class JudgeProtocolProbeArtifact(ArtifactEnvelope):
             raise ValueError("single judge probes cannot bind a reference rollout")
         if self.order != "single" and self.reference_rollout is None:
             raise ValueError("counterbalanced judge probes require a reference rollout")
+        if (self.pricing_error is None) != (self.unpriced_response is None):
+            raise ValueError("unpriceable judge probes must retain both the response and error")
+        if self.unpriced_response is not None and (
+            self.unpriced_response.model != self.model
+            or self.unpriced_response.economics != self.economics
+            or self.economics.cost_usd is not None
+            or self.response
+        ):
+            raise ValueError("unpriceable judge probe evidence must match its unknown economics")
         return self
 
 

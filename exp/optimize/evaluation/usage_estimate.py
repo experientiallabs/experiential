@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from statistics import mean
 
 from exp.common.core.artifacts import JsonValue, canonical_json_bytes
-from exp.common.models import CompletionCostReservation
+from exp.common.models import CompletionCostReservation, Usage
+from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace, TraceSpan
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_SYSTEM_PROMPT
@@ -215,9 +216,33 @@ def task_usage(
 
 
 def expected_completion_cost(
-    request: CompletionCostReservation, input_tokens: float, output_tokens: float
+    request: CompletionCostReservation,
+    input_tokens: float,
+    output_tokens: float,
+    *,
+    request_count: float = 1,
 ) -> float:
-    """Price expected usage at ordinary catalog rates, without assuming retries or cache hits."""
+    """Price ordinary-tier expected requests without assuming retries or cache hits.
+
+    Full schedules select a context tier from the mean request size. This remains
+    a planning estimate; actual report prices use individual saved calls.
+    """
+    if request.token_prices is not None:
+        if request_count <= 0:
+            return 0
+        cost = schedule_usage_cost_nano_usd(
+            request.token_prices,
+            Usage(
+                input_tokens=math.ceil(input_tokens / request_count),
+                output_tokens=math.ceil(output_tokens / request_count),
+                cached_input_tokens=0,
+                cache_write_input_tokens=0,
+                reasoning_tokens=0,
+            ),
+        )
+        if cost is None:
+            raise ValueError("expected ordinary completion usage has no authored price")
+        return request_count * cost / 1_000_000_000
     return (
         input_tokens * request.input_usd_per_million_tokens
         + output_tokens * request.output_usd_per_million_tokens

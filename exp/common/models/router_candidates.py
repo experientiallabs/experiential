@@ -350,6 +350,7 @@ def router_candidate_prices(catalog: ModelCatalog) -> tuple[CandidateTokenPrice,
         prices.append(
             CandidateTokenPrice(
                 candidate_alias=alias,
+                token_prices=catalog.models[alias].token_prices,
                 input_usd_per_million_tokens=input_price,
                 output_usd_per_million_tokens=output_price,
                 cached_input_usd_per_million_tokens=cached_input_price,

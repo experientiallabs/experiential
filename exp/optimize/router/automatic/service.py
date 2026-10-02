@@ -487,6 +487,7 @@ def _automatic_judge(
         reservation=reservation,
         model=judge.snapshot,
         capabilities=judge.capabilities,
+        token_prices=judge.token_prices,
         maximum_attempts=reservation.maximum_attempts,
         maximum_provider_calls=preflight.judge_provider_call_count,
     )

@@ -136,6 +136,8 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
         input_tokens=13,
         output_tokens=5,
         cached_input_tokens=4,
+        cache_write_input_tokens=0,
+        reasoning_tokens=0,
     )
     url, headers, payload = transport.requests[0]
     assert url == "https://openai.fixture/v1/responses"
@@ -493,6 +495,7 @@ def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> No
         input_tokens=12,
         output_tokens=20,
         cached_input_tokens=4,
+        reasoning_tokens=14,
     )
     assert tuple(item.values for item in embeddings) == ((0.6, 0.8), (0.0, 1.0))
     generate_url, headers, generate_payload = transport.requests[0]

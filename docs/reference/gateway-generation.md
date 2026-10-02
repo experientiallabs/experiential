@@ -175,6 +175,16 @@ meaning; thinking tokens still contribute to billed output. An absent usage obje
 Cumulative reports from one generation are merged, not added. Costs from separate physical
 generations cannot acquire a known total by adding a known count to an unknown one.
 
+Chat and Responses preserve the observed `cache_write_1h_tokens` detail within total cache
+writes. An omitted split stays unknown; a measured zero stays zero. Where the standard response
+schema requires an integer, `usage.unreported_token_details` names any compatibility zero that
+stands for an unreported meter. Its only allowed names are `cached_tokens`, `cache_write_tokens`,
+`cache_write_1h_tokens`, and `reasoning_tokens`, without duplicates. A named detail must be absent,
+null, or the integer zero; contradictory positive or malformed values are rejected. Native
+gateway hops and SDK provider adapters restore those details to unknown before valuation.
+Every relay hop must preserve this evidence. A downstream parser cannot recover observability
+that an older relay already discarded.
+
 ## Gemini usage trailers
 
 Native Gemini and Vertex Gemini routes use upstream `streamGenerateContent` SSE even when

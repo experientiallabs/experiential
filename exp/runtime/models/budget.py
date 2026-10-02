@@ -39,7 +39,9 @@ class RequestBudget:
 
     Every request belongs to a deterministic cell/attempt/role/ordinal coordinate. Replaying
     that coordinate returns its saved response only if the exact request digest matches.
-    Unknown crash or failure charges retain their full reservation and never replay silently.
+    Unknown crash or failure charges retain their reservation. A response saved with unknown
+    pricing replays its exact payload, including the owning wrapper's pricing error, while an
+    unknown dispatch without saved output never replays silently.
     Certified unpaid failures replay their saved failure proof without dispatching again.
     No credentials or request bodies are saved. Response payloads are immutable project artifacts,
     with large files referenced from SQLite.
@@ -54,7 +56,8 @@ class RequestBudget:
             project: Owner of the shared SQLite accounting records and response artifacts.
             identity: Digest of immutable models, tasks, prompts, prices and execution settings.
             maximum_cost_usd: Optional total allowance, including completed and unknown calls.
-                None disables the aggregate cap, while every request retains its finite bound.
+                None disables the aggregate cap. Every request retains a finite reservation;
+                incomplete tariffs are explicitly estimates and cannot enforce a numeric cap.
 
         Raises:
             ValueError: Authorization is invalid or the ledger belongs to another execution.
@@ -118,18 +121,24 @@ class RequestBudget:
         operation: Callable[[], ResultT],
         encode: Callable[[ResultT], str],
         decode: Callable[[str], ResultT],
-        charge: Callable[[ResultT], float],
+        charge: Callable[[ResultT], float | None],
+        cost_is_upper_bound: bool = True,
     ) -> ResultT:
         """Reserve an exact request, replay a saved answer, or pause before dispatch.
 
         Args:
             role: Distinguishes assistant aliases, world model, embedder and judge.
             fingerprint: Exact request, model, reservation and execution digest.
-            maximum_cost_usd: Retry-inclusive bound for this pending provider call.
+            maximum_cost_usd: Retry-inclusive known-rate reservation for this pending call.
+                It is a strict bound only when ``cost_is_upper_bound`` is true.
             operation: Provider call, executed outside the transaction.
             encode: Serialize the successful result for exact replay.
             decode: Restore the successful result without contacting a provider.
-            charge: Reconcile actual usage and any unresolved retry charges.
+            charge: Reconcile actual usage and any unresolved retry charges. None saves
+                the response but retains explicitly unbounded liability.
+            cost_is_upper_bound: False when the reservation only prices known tariff
+                dimensions. Such requests require an uncapped aggregate policy; exact
+                completed replay remains available under a subsequently supplied cap.
 
         Returns:
             A new or exactly replayed response. Replays spend no additional allowance.
@@ -142,6 +151,8 @@ class RequestBudget:
         """
         if not math.isfinite(maximum_cost_usd) or maximum_cost_usd < 0:
             raise ValueError("request reservation must be finite and nonnegative")
+        if not isinstance(cost_is_upper_bound, bool):
+            raise ValueError("cost_is_upper_bound must be an explicit boolean")
         scope = self._scope.get()
         if scope is None:
             raise ValueError("paid request requires an explicit execution scope")
@@ -149,13 +160,19 @@ class RequestBudget:
         ordinal = ordinals.get(role, 0)
         ordinals[role] = ordinal + 1
         key = sha256_json({"scope": identity, "role": role, "ordinal": ordinal})
-        cached = self._reserve(key, fingerprint, maximum_cost_usd)
+        cached = self._reserve(
+            key, fingerprint, maximum_cost_usd, cost_is_upper_bound=cost_is_upper_bound
+        )
         if cached is not None:
             return decode(cached)
         try:
             result = operation()
             cost = charge(result)
-            if not math.isfinite(cost) or cost < 0 or cost > maximum_cost_usd + 1e-9:
+            if cost is not None and (
+                not math.isfinite(cost)
+                or cost < 0
+                or (cost_is_upper_bound and cost > maximum_cost_usd + 1e-9)
+            ):
                 raise ValueError("provider charge exceeds the admitted request reservation")
             payload = encode(result)
             with self._condition:
@@ -172,6 +189,9 @@ class RequestBudget:
                             update={
                                 "state": "unbilled" if unbilled_attempts else "unknown",
                                 "charge": 0.0 if unbilled_attempts else receipt.charge,
+                                "charge_is_upper_bound": True
+                                if unbilled_attempts
+                                else receipt.charge_is_upper_bound,
                                 "unbilled_attempts": unbilled_attempts,
                             }
                         ),
@@ -182,7 +202,9 @@ class RequestBudget:
                 self._active.discard(key)
                 self._condition.notify_all()
 
-    def _reserve(self, key: str, fingerprint: str, maximum: float) -> str | None:
+    def _reserve(
+        self, key: str, fingerprint: str, maximum: float, *, cost_is_upper_bound: bool
+    ) -> str | None:
         """Atomically admit concurrent requests without multiplying the approved allowance.
 
         Args:
@@ -217,17 +239,29 @@ class RequestBudget:
                                 unbilled_attempts=row.unbilled_attempts,
                             )
                             raise failure
-                        if row.state != "complete":
+                        if row.state != "complete" and not (
+                            row.state == "unknown" and row.response is not None
+                        ):
                             raise ValueError(
                                 "saved provider dispatch has unresolved spend; not replayed"
                             )
                         return self._store.response(row)
+                    if self._limit is not None and (
+                        not cost_is_upper_bound or self._store.has_unbounded_liability()
+                    ):
+                        raise ValueError(
+                            "a spending limit requires complete applicable token prices and "
+                            "resolved earlier charges; reconcile pricing before dispatch"
+                        )
                     spent = self._store.total()
                     if self._limit is None or spent + maximum <= self._limit + 1e-9:
                         self._store.write(
                             key,
                             RequestReceipt(
-                                fingerprint=fingerprint, charge=maximum, state="pending"
+                                fingerprint=fingerprint,
+                                charge=maximum,
+                                state="pending",
+                                charge_is_upper_bound=cost_is_upper_bound,
                             ),
                         )
                         self._active.add(key)

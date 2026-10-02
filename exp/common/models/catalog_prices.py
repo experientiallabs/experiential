@@ -67,10 +67,12 @@ class GatewayTokenPrices(ContractModel):
     Values are integer nano-USD per million provider-reported tokens (one nano-USD is a
     billionth of a dollar: $1.25 per million is ``1_250_000_000``), bounded above by
     ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS``. ``None`` means the rate is unknown; it must
-    never be interpreted as zero. Existing optimizer float pricing remains unchanged.
-    Cache-creation rates price disjoint 5-minute and 1-hour write tokens. The
+    never be interpreted as zero. Evaluation snapshots may freeze this complete card separately
+    from provider invoice charges. Explicit four-rate snapshots remain a distinct price contract.
+    Cache-creation rates price disjoint non-one-hour and one-hour write tokens. The
     unqualified rate prices the remainder after observed 1-hour writes; missing
-    TTL evidence leaves write cost unknown, never inferred from requested TTL.
+    TTL evidence leaves write cost unknown unless both authored write rates are equal, never
+    inferred from requested TTL or provider name.
     """
 
     input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None

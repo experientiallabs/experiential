@@ -29,6 +29,7 @@ from exp.common.models import (
     Usage,
     completion_cost_reservation,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.models import ResolvedModel
@@ -291,6 +292,9 @@ def _recorder(
         input_price=active_input_price,
         output_limit=output_limit,
     )
+    candidate = replace(
+        candidate, token_prices=candidate_request.token_prices if candidate_request else None
+    )
     if candidate_served_model_id is not None:
         candidate = replace(candidate, served_model_id=candidate_served_model_id)
     retriever = cast(TraceRAGRetriever, _Retriever(retrieval_matches))
@@ -301,6 +305,9 @@ def _recorder(
         context_window_tokens=world_context_window,
         completion_pricing=world_request is not None,
         output_limit=output_limit,
+    )
+    world_model = replace(
+        world_model, token_prices=world_request.token_prices if world_request else None
     )
     grounded = grounded_world_model or GroundedWorldModel(
         artifact_input=ArtifactInput(artifact_id="grounded-world-model", sha256="d" * 64),
@@ -672,6 +679,56 @@ def test_recorder_persists_estimated_cost_for_native_candidate_and_world_usage()
     assert world_cost is not None and world_cost.provenance == "estimated"
     assert candidate_cost.value > 0
     assert world_cost.value > 0
+
+
+@pytest.mark.parametrize("role", ["candidate", "world"])
+def test_unpriceable_paid_response_is_retained_before_recorder_failure(role: str) -> None:
+    """Unknown full-schedule valuation keeps paid text and usage, never an unrelated price."""
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=1_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=2_000_000_000,
+    )
+    reservations = []
+    for alias in ("candidate-a", "world-model-a"):
+        original = _completion_reservation(alias)
+        reservations.append(
+            completion_cost_reservation(
+                model=original.model,
+                input_usd_per_million_tokens=1,
+                output_usd_per_million_tokens=2,
+                cached_input_usd_per_million_tokens=0.5,
+                cache_write_usd_per_million_tokens=1.5,
+                maximum_attempts=1,
+                maximum_input_tokens=original.maximum_input_tokens,
+                maximum_output_tokens=original.maximum_output_tokens,
+                token_prices=card if alias.startswith(role) else None,
+            )
+        )
+    candidate = _ScriptedClient([_response("paid candidate", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient([_response("paid world", model=_snapshot("world-model-a"))])
+    recorder = _recorder(
+        candidate, world, candidate_request=reservations[0], world_request=reservations[1]
+    )
+    with pytest.raises(TextSimulationError):
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))
+    recorded = recorder.recorded
+    spans = recorded.candidate_spans if role == "candidate" else recorded.world_model_spans
+    economics = (
+        recorded.candidate_economics if role == "candidate" else recorded.world_model_economics
+    )
+    assert len(spans) == 1
+    assert spans[0].payload["response"] == {
+        "output": {"content": f"paid {role}", "tool_calls": []},
+        "finish_reason": "completed",
+    }
+    assert spans[0].usage == Usage(input_tokens=4, output_tokens=3)
+    assert economics.cost_usd is None
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == (0 if role == "candidate" else 1)
 
 
 def test_candidate_unknown_usage_retains_unknown_spend_after_dispatch() -> None:

@@ -24,6 +24,7 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
+from exp.common.models.usage_observability import unreported_token_details
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
@@ -746,19 +747,32 @@ def _usage(payload: JsonObject) -> Usage | None:
     if value is None:
         return None
     usage = require_object(value, "usage")
+    try:
+        unknown = unreported_token_details(usage)
+    except ValueError as error:
+        raise OpenAICompatibleResponseError(str(error)) from error
     prompt_tokens = require_integer(usage.get("prompt_tokens"), "usage.prompt_tokens")
     completion_tokens = require_integer(usage.get("completion_tokens"), "usage.completion_tokens")
-    details_value = usage.get("prompt_tokens_details")
-    cached_input_tokens = None
-    if details_value is not None:
-        details = require_object(details_value, "usage.prompt_tokens_details")
-        cached_input_tokens = require_integer(
-            details.get("cached_tokens"), "usage.prompt_tokens_details.cached_tokens"
-        )
+
+    def detail(group: str, field: str) -> int | None:
+        """Preserve a reported token subset without treating omission as zero."""
+        if field in unknown:
+            return None
+        raw = usage.get(group)
+        if raw is None:
+            return None
+        value = require_object(raw, f"usage.{group}").get(field)
+        return None if value is None else require_integer(value, f"usage.{group}.{field}")
+
+    tier = payload.get("service_tier")
     return Usage(
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
-        cached_input_tokens=cached_input_tokens,
+        cached_input_tokens=detail("prompt_tokens_details", "cached_tokens"),
+        cache_write_input_tokens=detail("prompt_tokens_details", "cache_write_tokens"),
+        cache_write_1h_input_tokens=detail("prompt_tokens_details", "cache_write_1h_tokens"),
+        reasoning_tokens=detail("completion_tokens_details", "reasoning_tokens"),
+        service_tier=None if tier is None else require_string(tier, "service_tier"),
     )
 
 

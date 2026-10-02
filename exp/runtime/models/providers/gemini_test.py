@@ -77,7 +77,9 @@ def test_thoughts_fold_into_billed_output_tokens() -> None:
             "totalTokenCount": 19,
         }
     )
-    assert usage == Usage(input_tokens=11, output_tokens=8, cached_input_tokens=2)
+    assert usage == Usage(
+        input_tokens=11, output_tokens=8, cached_input_tokens=2, reasoning_tokens=3
+    )
 
 
 def test_zero_thoughts_keep_output_at_candidates_token_count() -> None:
@@ -90,7 +92,9 @@ def test_zero_thoughts_keep_output_at_candidates_token_count() -> None:
             "thoughtsTokenCount": 0,
         }
     )
-    assert usage == Usage(input_tokens=11, output_tokens=5, cached_input_tokens=2)
+    assert usage == Usage(
+        input_tokens=11, output_tokens=5, cached_input_tokens=2, reasoning_tokens=0
+    )
 
 
 @pytest.mark.parametrize("bad", ("3", True, -1, 1.5, []))
@@ -166,7 +170,10 @@ def test_completed_and_streamed_gemini_usage_agree(thoughts: int | None) -> None
         }
     ]
     assert observed == Usage(
-        input_tokens=11, output_tokens=5 + (thoughts or 0), cached_input_tokens=2
+        input_tokens=11,
+        output_tokens=5 + (thoughts or 0),
+        cached_input_tokens=2,
+        reasoning_tokens=thoughts,
     )
 
 
@@ -229,7 +236,7 @@ def test_gemini_completion_bills_thoughts_over_loopback(asynchronous: bool) -> N
             )
             assert response.output.content == "ok"
             assert response.economics.usage == Usage(
-                input_tokens=11, output_tokens=8, cached_input_tokens=2
+                input_tokens=11, output_tokens=8, cached_input_tokens=2, reasoning_tokens=3
             )
             assert len(requests) == 1
             path, key, payload = requests[0]

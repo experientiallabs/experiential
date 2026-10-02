@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from exp.common.judging import verify_persisted_calibration
-from exp.common.models import ModelSnapshot
+from exp.common.models import ModelSnapshot, completion_cost_reservation
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
 from exp.optimize.evaluation.planning import estimate_model_evaluation
@@ -103,6 +104,40 @@ def test_quote_refuses_unbound_or_wrong_judge_pricing(tmp_path: Path) -> None:
             setup.model_copy(update={"simulation_completion_input": None}),
             judge_request=_completion_reservation("wrong"),
         )
+
+
+def test_incomplete_schedule_quote_cannot_claim_a_strict_spending_bound(tmp_path: Path) -> None:
+    """Known ordinary rates support an estimate without pretending missing subsets are free."""
+    project, setup = _prepared(tmp_path, multiple=True)
+    original = _completion_reservation("judge-model")
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=int(original.input_usd_per_million_tokens * 1e9),
+        output_nano_usd_per_million_tokens=int(original.output_usd_per_million_tokens * 1e9),
+        cached_input_nano_usd_per_million_tokens=int(
+            original.cached_input_usd_per_million_tokens * 1e9
+        ),
+        cache_creation_input_nano_usd_per_million_tokens=int(
+            original.cache_write_usd_per_million_tokens * 1e9
+        ),
+    )
+    request = completion_cost_reservation(
+        model=original.model,
+        token_prices=card,
+        input_usd_per_million_tokens=original.input_usd_per_million_tokens,
+        output_usd_per_million_tokens=original.output_usd_per_million_tokens,
+        cached_input_usd_per_million_tokens=original.cached_input_usd_per_million_tokens,
+        cache_write_usd_per_million_tokens=original.cache_write_usd_per_million_tokens,
+        maximum_attempts=original.maximum_attempts,
+        maximum_input_tokens=original.maximum_input_tokens,
+        maximum_output_tokens=original.maximum_output_tokens,
+    )
+    quote = estimate_model_evaluation(project, setup, judge_request=request)
+    assert not quote.maximum_is_upper_bound and not quote.judge.maximum_is_upper_bound
+    assert quote.workers.maximum_is_upper_bound and quote.simulation.maximum_is_upper_bound
+    assert quote.estimated_cost_usd > 0 and quote.maximum_cost_usd > quote.estimated_cost_usd
+    assert quote.model_dump(mode="json")["maximum_is_upper_bound"] is False
+    flat = estimate_model_evaluation(project, setup, judge_request=original)
+    assert "maximum_is_upper_bound" not in flat.model_dump(mode="json")
 
 
 def test_quote_refuses_calibration_status_drift(tmp_path: Path) -> None:

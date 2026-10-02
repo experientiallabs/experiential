@@ -9,21 +9,154 @@ from typing import cast
 
 import pytest
 
-from exp.common.models import AssistantAction, ModelRequest, ModelResponse
+from exp.common.models import AssistantAction, ModelRequest, ModelResponse, Usage
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayTokenPrices
 from exp.common.progress import ProgressEvent
 from exp.optimize.evaluation.contracts import EvaluationBudget
+from exp.optimize.evaluation.prepare import ModelEvaluationOptions, prepare_model_evaluation
 from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.evaluation.spending import BudgetedCompletion
+from exp.optimize.router.automatic.provisional import prepare_hosted_provisional_judge
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
     _TIME,
+    _completed_project,
     _CompletionClient,
     _RuntimeCatalog,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
 from exp.simulation.engines.text import simulator
+
+
+class _ScheduledRuntimeCatalog(_RuntimeCatalog):
+    """Keep real runtime schedule bindings around deterministic provider clients."""
+
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        """Match the public resolver's immutable complete-price metadata handoff."""
+        return replace(
+            super().resolve(alias, role=role),
+            token_prices=self._catalog_value.models[alias].token_prices,
+        )
+
+
+def test_full_schedule_preparation_execution_report_and_lower_cap_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The actual engine carries whole-request rates and disjoint usage through every role."""
+    project, catalog, state = _completed_project(tmp_path)
+    build = project.load_project().build
+    assert build is not None
+    original_world = project.artifacts.read_bytes(build.world_model.artifact_id, "world-model.json")
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=2_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=3_000_000_000,
+        long_context=GatewayLongContextTier(
+            input_threshold_tokens=8,
+            input_nano_usd_per_million_tokens=2_000_000_000,
+            cached_input_nano_usd_per_million_tokens=1_000_000_000,
+            cache_creation_input_nano_usd_per_million_tokens=3_000_000_000,
+            cache_creation_1h_input_nano_usd_per_million_tokens=5_000_000_000,
+            output_nano_usd_per_million_tokens=4_000_000_000,
+            reasoning_nano_usd_per_million_tokens=6_000_000_000,
+        ),
+    )
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                alias: record.model_copy(update={"gateway": GatewayDeploymentMetadata(prices=card)})
+                if alias != "embedder"
+                else record
+                for alias, record in catalog.models.items()
+            }
+        }
+    )
+    judge = prepare_hosted_provisional_judge(
+        project,
+        catalog,
+        maximum_input_tokens=32_768,
+        maximum_output_tokens=8_192,
+        maximum_attempts=3,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    prepared = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        judge_setup=judge.setup_input,
+        calibration_id=judge.calibration_id,
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(maximum_steps=1),
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert prepared.judge_request.token_prices == card
+    assert prepared.cost.maximum_is_upper_bound
+    real_complete = _CompletionClient.complete
+
+    def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Supply one successful provider-shaped meter with all six token dimensions."""
+        response = real_complete(client, request)
+        return response.model_copy(
+            update={
+                "economics": response.economics.model_copy(
+                    update={
+                        "usage": Usage(
+                            input_tokens=8,
+                            output_tokens=4,
+                            cached_input_tokens=2,
+                            cache_write_input_tokens=2,
+                            cache_write_1h_input_tokens=1,
+                            reasoning_tokens=1,
+                        ),
+                        "provider_attempts": 1,
+                    }
+                )
+            }
+        )
+
+    monkeypatch.setattr(_CompletionClient, "complete", complete)
+    runtime = cast(RuntimeModelCatalog, _ScheduledRuntimeCatalog(catalog, state))
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=EvaluationBudget(maximum_cost_usd=None, maximum_judgments=100),
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert result.report.compared_cells == 3
+    assert all(row.operating_cost_usd == pytest.approx(0.000036) for row in result.report.models)
+    assert {alias for alias, _ in state.completion_calls} == {
+        "candidate-a",
+        "candidate-b",
+        "world",
+        "judge",
+    }
+    calls = (len(state.completion_calls), len(state.embedding_calls))
+    replay = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=EvaluationBudget(maximum_cost_usd=0.0000001, maximum_judgments=100),
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert replay == result
+    assert calls == (len(state.completion_calls), len(state.embedding_calls))
+    assert (
+        project.artifacts.read_bytes(build.world_model.artifact_id, "world-model.json")
+        == original_world
+    )
 
 
 @pytest.mark.parametrize("blank_worker", [False, True])

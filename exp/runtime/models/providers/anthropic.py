@@ -380,9 +380,20 @@ def _anthropic_usage(payload: JsonObject) -> Usage | None:
     cache_write = require_integer(
         usage.get("cache_creation_input_tokens"), "Anthropic usage.cache_creation_input_tokens"
     )
+    creation = usage.get("cache_creation")
+    hour = None
+    if creation is not None:
+        raw_hour = require_object(creation, "Anthropic usage.cache_creation").get(
+            "ephemeral_1h_input_tokens"
+        )
+        if raw_hour is not None:
+            hour = require_integer(
+                raw_hour, "Anthropic usage.cache_creation.ephemeral_1h_input_tokens"
+            )
     return Usage(
         input_tokens=input_tokens + cache_read + cache_write,
         output_tokens=require_integer(usage.get("output_tokens"), "Anthropic usage.output_tokens"),
         cached_input_tokens=cache_read,
         cache_write_input_tokens=cache_write,
+        cache_write_1h_input_tokens=hour,
     )

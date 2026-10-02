@@ -748,6 +748,11 @@ class ModelRecord(ContractModel):
     gateway: GatewayDeploymentMetadata | None = None
     sft_provenance: SFTModelProvenance | None = None
 
+    @property
+    def token_prices(self) -> GatewayTokenPrices | None:
+        """Return the complete authored schedule when this model carries one."""
+        return self.gateway.prices if self.gateway is not None else None
+
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
         """Reject contradictory reasoning metadata and credential-bearing identity fields."""

@@ -26,10 +26,12 @@ from exp.common.models import (
     reconcile_completion_economics,
     verify_completion_reservation,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact
 from exp.optimize.router.errors import (
     JudgeDispatchExhaustedError,
+    JudgePricingError,
     JudgeTranscriptAdmissionError,
 )
 from exp.optimize.router.judging.contracts import (
@@ -69,6 +71,7 @@ class ReservedJudgeClient:
         maximum_attempts: int,
         maximum_provider_calls: int,
         served_model_id: str | None = None,
+        token_prices: GatewayTokenPrices | None = None,
     ) -> None:
         """Validate active economics before exposing the provider client.
 
@@ -90,6 +93,7 @@ class ReservedJudgeClient:
             reservation,
             model=model,
             capabilities=capabilities,
+            token_prices=token_prices,
             maximum_attempts=maximum_attempts,
         )
         self._client = client
@@ -181,14 +185,23 @@ class ReservedJudgeClient:
             ) from exc
         if response.model not in (self._reservation.model, self._served_model):
             raise ValueError("judge response model differs from its frozen reservation")
-        economics = reconcile_completion_economics(
-            self._reservation,
-            response.economics,
-        )
+        pricing_error = None
+        try:
+            economics = reconcile_completion_economics(self._reservation, response.economics)
+        except ValueError as error:
+            if self._reservation.token_prices is None:
+                raise
+            economics = response.economics.model_copy(update={"cost_usd": None})
+            pricing_error = error
         with self._lock:
             self._economics.append(economics)
             if accounting is not None:
                 accounting.economics.append(economics)
+        if pricing_error is not None:
+            raise JudgePricingError(
+                str(pricing_error),
+                response=response.model_copy(update={"economics": economics, "model": self.model}),
+            ) from pricing_error
         # The served pin is verified above; artifacts bind the finalized catalog identity.
         return response.model_copy(update={"economics": economics, "model": self.model})
 

@@ -28,10 +28,13 @@ class EvaluationCostComponent(ContractModel):
     Attributes:
         estimated_cost_usd: Nonnegative finite planning estimate.
         maximum_cost_usd: Nonnegative finite token and retry ceiling.
+        maximum_is_upper_bound: False when missing tariff dimensions make this a known-rate
+            estimate. Such a figure cannot authorize strict capped dispatch.
     """
 
     estimated_cost_usd: float = Field(ge=0, allow_inf_nan=False)
     maximum_cost_usd: float = Field(ge=0, allow_inf_nan=False)
+    maximum_is_upper_bound: bool = Field(default=True, exclude_if=lambda value: value is True)
 
 
 class EvaluationCostPlan(ContractModel):
@@ -52,6 +55,7 @@ class EvaluationCostPlan(ContractModel):
         judge: Judge-model estimates and maximum spend.
         estimated_cost_usd: Nonnegative finite sum of stage estimates.
         maximum_cost_usd: Nonnegative finite sum of stage ceilings.
+        maximum_is_upper_bound: Whether every stage has a complete tariff at its hard bounds.
         captured_turns: Source-sized assistant turns per scenario matrix, before model repeats.
         measured_turns: Those turns with recorded provider token counts.
         estimate_basis: Human-readable assumptions for the expected workload.
@@ -67,6 +71,7 @@ class EvaluationCostPlan(ContractModel):
     judge: EvaluationCostComponent
     estimated_cost_usd: float = Field(ge=0, allow_inf_nan=False)
     maximum_cost_usd: float = Field(ge=0, allow_inf_nan=False)
+    maximum_is_upper_bound: bool = Field(default=True, exclude_if=lambda value: value is True)
     captured_turns: float = Field(ge=0, allow_inf_nan=False)
     measured_turns: float = Field(ge=0, allow_inf_nan=False)
     estimate_basis: str
@@ -88,8 +93,9 @@ def estimate_model_evaluation(
         judge_calls_per_rollout: One for scalar judging, two for counterbalanced pairwise.
 
     Returns:
-        A content-bound planning estimate plus an absolute token/retry bound. The maximum
-        includes every permitted cell attempt, simulation step, retrieval and judge request.
+        A content-bound planning estimate plus a token/retry maximum over known rates. The
+        maximum includes every permitted cell attempt, step, retrieval and judge request;
+        ``maximum_is_upper_bound`` is false when any applicable tariff is incomplete.
 
     Raises:
         ValueError: A price, identity, completion bound or required input is unavailable.
@@ -156,7 +162,9 @@ def estimate_model_evaluation(
         for task in tasks
     )
     worker_estimate = setup.repeats * math.fsum(
-        expected_completion_cost(request, item.assistant_input, item.assistant_output)
+        expected_completion_cost(
+            request, item.assistant_input, item.assistant_output, request_count=item.turns
+        )
         for request in requests.values()
         for item in usage
     )
@@ -165,7 +173,9 @@ def estimate_model_evaluation(
         * setup.repeats
         * MAXIMUM_CELL_ATTEMPTS
         * math.fsum(
-            (
+            setup.maximum_steps * request.absolute_maximum_call_cost_usd()
+            if request.token_prices is not None
+            else (
                 request.maximum_attempts
                 * setup.maximum_steps
                 * request.maximum_input_tokens
@@ -192,6 +202,7 @@ def estimate_model_evaluation(
     worker_cost = EvaluationCostComponent(
         estimated_cost_usd=min(worker_estimate, worker_maximum),
         maximum_cost_usd=worker_maximum,
+        maximum_is_upper_bound=all(item.maximum_is_upper_bound() for item in requests.values()),
     )
     world_maximum = (
         count
@@ -209,12 +220,16 @@ def estimate_model_evaluation(
             * workers
             * math.fsum(
                 expected_completion_cost(
-                    contract.world_model_request, item.world_input, item.world_output
+                    contract.world_model_request,
+                    item.world_input,
+                    item.world_output,
+                    request_count=item.turns,
                 )
                 for item in usage
             ),
         ),
         maximum_cost_usd=world_maximum,
+        maximum_is_upper_bound=contract.world_model_request.maximum_is_upper_bound(),
     )
     retrieval_reservation = maximum_query_reservation(retrieval).cost_usd
     assert retrieval_reservation is not None
@@ -262,6 +277,7 @@ def estimate_model_evaluation(
             ),
         ),
         maximum_cost_usd=judge_maximum,
+        maximum_is_upper_bound=judge_request.maximum_is_upper_bound(),
     )
     components = (worker_cost, world_cost, retrieval_component, judge_component)
     return EvaluationCostPlan(
@@ -294,4 +310,5 @@ def estimate_model_evaluation(
         judge=judge_component,
         estimated_cost_usd=math.fsum(item.estimated_cost_usd for item in components),
         maximum_cost_usd=math.fsum(item.maximum_cost_usd for item in components),
+        maximum_is_upper_bound=all(item.maximum_is_upper_bound for item in components),
     )

@@ -539,13 +539,18 @@ pub fn compact_json(payload: &Value) -> String {
 fn streaming_chat_usage(usage: &Usage) -> Value {
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    json!({
+    let mut wire = json!({
         "prompt_tokens": input,
         "completion_tokens": output,
         "total_tokens": input + output,
         "prompt_tokens_details": chat_input_details(usage, true),
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
-    })
+    });
+    let unreported = usage.unreported_token_details();
+    if !unreported.is_empty() {
+        wire["unreported_token_details"] = json!(unreported);
+    }
+    wire
 }
 
 /// Input subsets remain unknown when absent; cache writes are never invented.
@@ -556,6 +561,9 @@ fn chat_input_details(usage: &Usage, streaming: bool) -> Value {
     }
     if let Some(written) = usage.cache_creation_input_tokens {
         details.insert("cache_write_tokens".into(), json!(written));
+    }
+    if let Some(hour) = usage.cache_creation_1h_input_tokens {
+        details.insert("cache_write_1h_tokens".into(), json!(hour));
     }
     if details.is_empty() {
         Value::Null

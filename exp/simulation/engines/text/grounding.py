@@ -301,12 +301,14 @@ def completion_reservations(
             selected,
             model=candidate.snapshot,
             capabilities=candidate.capabilities,
+            token_prices=candidate.token_prices,
             maximum_attempts=attempts,
         )
         verify_completion_reservation(
             world,
             model=world_model.snapshot,
             capabilities=world_model.capabilities,
+            token_prices=world_model.token_prices,
             maximum_attempts=attempts,
         )
     except ValueError as exc:

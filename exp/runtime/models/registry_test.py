@@ -29,7 +29,9 @@ from exp.common.models import (
     ModelSnapshot,
     Usage,
 )
+from exp.common.models.catalog import GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import normalize_gateway_catalog
+from exp.common.models.token_cost_test import prices
 from exp.runtime.gateway.execution_resolution import _resolved_wire_profile
 from exp.runtime.models.credentials import (
     CredentialResolution,
@@ -70,6 +72,29 @@ _DEFAULT_CAPABILITIES = ModelCapabilities(
     context_window_tokens=128_000,
     maximum_output_tokens=16_000,
 )
+
+
+def test_complete_price_metadata_does_not_rebind_transport_or_capacities() -> None:
+    """A full tariff changes pricing authority only, preserving the explicit gateway route."""
+    catalog = _catalog(provider="openai-compatible", base_url="https://gateway.example.test/v1")
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    before = runtime.resolve("fixture-model")
+    record = catalog.models["fixture-model"].model_copy(
+        update={"gateway": GatewayDeploymentMetadata(prices=prices())}
+    )
+    after = runtime.with_catalog(
+        catalog.model_copy(update={"models": {"fixture-model": record}})
+    ).resolve("fixture-model")
+    assert before.snapshot == after.snapshot and before.capabilities == after.capabilities
+    assert isinstance(before.client, ProviderHttpClient) and isinstance(
+        after.client, ProviderHttpClient
+    )
+    assert before.client.gateway_wire_profile() == after.client.gateway_wire_profile()
+    assert before.token_prices is None and after.token_prices == prices()
 
 
 @pytest.mark.parametrize(

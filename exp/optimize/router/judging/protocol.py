@@ -31,7 +31,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact
-from exp.optimize.router.errors import JudgeTranscriptAdmissionError
+from exp.optimize.router.errors import JudgePricingError, JudgeTranscriptAdmissionError
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
     JudgeProtocolProbeArtifact,
@@ -226,25 +226,32 @@ class TemplateJudgeClient:
                 order,
             )
             self._probes.append(artifact_input(self._store.artifacts.read(saved.probe_id).manifest))
+            if saved.pricing_error is not None:
+                assert saved.unpriced_response is not None
+                raise JudgePricingError(saved.pricing_error, response=saved.unpriced_response)
             return ModelResponse(
                 output=AssistantAction(content=json.dumps(saved.response)),
                 model=saved.model,
                 economics=saved.economics,
             )
         context = self._request_scope(probe_id) if self._request_scope else nullcontext()
+        pricing_error = None
         with context:
-            response = self._client.complete(
-                _bounded_judge_request(
-                    self._template,
-                    self._rubric,
-                    candidate_a,
-                    candidate_b,
-                    maximum_input_tokens=self._maximum_input_tokens,
-                    maximum_output_tokens=self._maximum_output_tokens,
+            try:
+                response = self._client.complete(
+                    _bounded_judge_request(
+                        self._template,
+                        self._rubric,
+                        candidate_a,
+                        candidate_b,
+                        maximum_input_tokens=self._maximum_input_tokens,
+                        maximum_output_tokens=self._maximum_output_tokens,
+                    )
                 )
-            )
+            except JudgePricingError as error:
+                response, pricing_error = error.response, error
         self._provider_calls_made += 1
-        raw = _raw_response(response)
+        raw = _raw_response(response) if pricing_error is None else {}
         inputs = tuple(
             sorted(
                 (
@@ -268,6 +275,8 @@ class TemplateJudgeClient:
             response=raw,
             model=response.model,
             economics=response.economics,
+            pricing_error=str(pricing_error) if pricing_error is not None else None,
+            unpriced_response=response if pricing_error is not None else None,
         )
         try:
             manifest = self._store.artifacts.write_json(
@@ -279,6 +288,8 @@ class TemplateJudgeClient:
         except ArtifactAlreadyExistsError as exc:
             raise ManualJudgeError("manual judge probe conflicted during persistence") from exc
         self._probes.append(artifact_input(manifest))
+        if pricing_error is not None:
+            raise pricing_error
         return response
 
     def _normalize_single(self, response: ModelResponse) -> ModelResponse:

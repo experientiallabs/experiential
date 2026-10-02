@@ -334,7 +334,7 @@ identity authorization and job persistence remain hosting responsibilities.
 
 Catalog-backed evaluations and `exp eval` have no aggregate spending limit by default. The
 estimate remains visible and uncapped execution requires an explicit Start action or `--yes`.
-Every request keeps a finite token and retry-inclusive cost
+Every request keeps finite token bounds and a retry-inclusive cost
 reservation; completed charges, unknown-dispatch holds and exact response replay remain durable
 with or without an aggregate cap. In the launch review, select Spending limit to set a positive
 dollar amount or enter `none` to remove it. Changing that limit does not change the frozen plan.
@@ -501,3 +501,22 @@ shared valid cohort; invalid/incomplete coverage and total experiment spend rema
 Assistant cost per task reprices recorded successful-rollout tokens at the frozen catalog rates.
 It excludes simulation, judging, invalid attempts, and hypothetical retry reservations.
 Conservative experiment-spend accounting remains separate from the report's operating cost.
+
+When a catalog model carries `gateway.prices`, preparation freezes the complete
+`GatewayTokenPrices` in its request reservations and `CandidateTokenPrice.token_prices`.
+Long-context thresholds apply to each request's original input total, never to the sum of a
+rollout's calls. Cache reads and writes remain disjoint input subsets; reasoning remains an
+output subset. Explicitly returned service tiers select their authored schedule. When no tier
+is returned, valuation uses the ordinary request contract. Native gateway relays currently do
+not preserve returned service-tier metadata, so their reports cannot establish a different tier.
+These frozen attribution rates are separate from provider invoices, account discounts, and any
+gateway debit. Previously prepared four-rate runs keep their original contract and receipts.
+
+Unknown meters remain distinct from measured zero. Missing subset counts are priceable only
+when every possible allocation has the same authored rate. A positive cache-write total with
+no one-hour split is priceable only when both write rates are known and equal. No rate or meter
+is inferred from a provider name. A missing applicable rate makes the quote's
+`maximum_is_upper_bound` false; an aggregate cap cannot authorize that request. Uncapped
+execution still saves paid responses and unknown liability before surfacing a valuation error.
+Exact replay returns the saved result or pricing error without another call, including after
+the operator adds a lower cap. Unpriceable assistant usage cannot create a known report cost.

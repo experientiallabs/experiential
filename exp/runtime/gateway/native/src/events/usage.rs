@@ -7,6 +7,18 @@ use serde_json::{Map, Value};
 use super::Usage;
 
 impl Usage {
+    /// Mark unknown subsets that an OpenAI-compatible shape represents as zero.
+    pub(crate) fn unreported_token_details(&self) -> Vec<&'static str> {
+        [
+            ("cached_tokens", self.cached_input_tokens),
+            ("cache_write_tokens", self.cache_creation_input_tokens),
+            ("reasoning_tokens", self.reasoning_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(name, count)| count.is_none().then_some(name))
+        .collect()
+    }
+
     pub fn has_token_counts(&self) -> bool {
         self.input_tokens.is_some() && self.output_tokens.is_some()
     }
@@ -177,6 +189,8 @@ pub(crate) struct OpenAiUsageAccumulator {
     reported: Usage,
     total_tokens: Option<u64>,
     writes_within_reads: bool,
+    // Sparse TTL evidence stays private until a write total can cover it.
+    pending_cache_creation_1h_input_tokens: Option<u64>,
 }
 
 impl OpenAiUsageAccumulator {
@@ -228,12 +242,14 @@ impl OpenAiUsageAccumulator {
         };
         let input_tokens = count_if_present(object, input_key, "OpenAI usage")?;
         let output_tokens = count_if_present(object, output_key, "OpenAI usage")?;
+        let unreported = unreported_token_details(object, input_details, output_details)?;
         let reasoning_tokens = optional_usage_detail(
             object,
             output_details,
             "reasoning_tokens",
             "OpenAI reasoning_tokens",
-        )?;
+        )?
+        .filter(|_| !unreported[3]);
         let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
         let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
             object,
@@ -241,13 +257,34 @@ impl OpenAiUsageAccumulator {
             input_tokens,
             self.writes_within_reads,
         )?;
+        let cached_input_tokens = cached_input_tokens.filter(|_| !unreported[0]);
+        let cache_creation_input_tokens = cache_creation_input_tokens.filter(|_| !unreported[1]);
+        let cache_creation_1h_input_tokens = optional_usage_detail(
+            object,
+            input_details,
+            "cache_write_1h_tokens",
+            "cache_write_1h_tokens",
+        )?
+        .filter(|_| !unreported[2])
+        .max(self.pending_cache_creation_1h_input_tokens);
+        let covering_writes =
+            cache_creation_input_tokens.or(self.reported.cache_creation_input_tokens);
+        if let (Some(hour), Some(written)) = (cache_creation_1h_input_tokens, covering_writes) {
+            if hour > written {
+                return Err("one-hour cache writes exceed total cache writes".into());
+            }
+        }
         let mut candidate = self.clone();
+        candidate.pending_cache_creation_1h_input_tokens = covering_writes
+            .is_none()
+            .then_some(cache_creation_1h_input_tokens)
+            .flatten();
         candidate.reported.merge_observed(&Usage {
             input_tokens,
             output_tokens,
             cached_input_tokens,
             cache_creation_input_tokens,
-            cache_creation_1h_input_tokens: None,
+            cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
             reasoning_tokens,
         });
         candidate.total_tokens = candidate.total_tokens.max(total_tokens);
@@ -273,10 +310,148 @@ impl OpenAiUsageAccumulator {
     }
 }
 
+/// Restore missing meter evidence without rejecting required integer wire fields.
+fn unreported_token_details(
+    object: &Map<String, Value>,
+    input_details: &str,
+    output_details: &str,
+) -> Result<[bool; 4], String> {
+    let mut unreported = [false; 4];
+    let Some(raw) = object.get("unreported_token_details") else {
+        return Ok(unreported);
+    };
+    let fields = raw
+        .as_array()
+        .ok_or("unreported_token_details must be an array")?;
+    for field in fields {
+        let name = field
+            .as_str()
+            .ok_or("unreported_token_details entries must be strings")?;
+        let index = match name {
+            "cached_tokens" => 0,
+            "cache_write_tokens" => 1,
+            "cache_write_1h_tokens" => 2,
+            "reasoning_tokens" => 3,
+            _ => return Err("unreported_token_details contains an unknown field".into()),
+        };
+        if unreported[index] {
+            return Err("unreported_token_details contains a duplicate field".into());
+        }
+        let group = if index == 3 {
+            output_details
+        } else {
+            input_details
+        };
+        if optional_usage_detail(object, group, name, name)?.is_some_and(|value| value != 0) {
+            return Err("an unreported token detail cannot contain a positive count".into());
+        }
+        unreported[index] = true;
+    }
+    Ok(unreported)
+}
+
 #[cfg(test)]
 mod sparse_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unreported_meter_marker_rejects_malformed_or_contradictory_evidence() {
+        for marker in [
+            json!(null),
+            json!({}),
+            json!("cached_tokens"),
+            json!([1]),
+            json!(["other"]),
+            json!(["cached_tokens", "cached_tokens"]),
+        ] {
+            assert!(OpenAiUsageAccumulator::default()
+                .update_chat(&json!({
+                    "prompt_tokens": 10, "completion_tokens": 10,
+                    "unreported_token_details": marker
+                }))
+                .is_err());
+        }
+        for field in [
+            "cached_tokens",
+            "cache_write_tokens",
+            "cache_write_1h_tokens",
+            "reasoning_tokens",
+        ] {
+            for count in [json!(1), json!(-1), json!(true), json!(0.5), json!("0")] {
+                let group = if field == "reasoning_tokens" {
+                    "completion_tokens_details"
+                } else {
+                    "prompt_tokens_details"
+                };
+                let mut report = json!({
+                    "prompt_tokens": 10, "completion_tokens": 10,
+                    "unreported_token_details": [field]
+                });
+                report[group] = json!({field: count});
+                assert!(OpenAiUsageAccumulator::default()
+                    .update_chat(&report)
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_cache_ttl_is_retained_checked_and_invalidated_on_write_growth() {
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        let partial = accumulator
+            .update_chat(&json!({
+                "prompt_tokens_details": {"cache_write_1h_tokens": 3}
+            }))
+            .unwrap();
+        assert_eq!(partial.cache_creation_1h_input_tokens, None);
+        assert!(accumulator
+            .update_chat(&json!({
+                "prompt_tokens": 20,
+                "prompt_tokens_details": {"cache_write_tokens": 2}
+            }))
+            .is_err());
+        let complete = accumulator
+            .update_chat(&json!({
+                "prompt_tokens": 20, "completion_tokens": 2,
+                "prompt_tokens_details": {"cache_write_tokens": 5}
+            }))
+            .unwrap();
+        assert_eq!(complete.cache_creation_1h_input_tokens, Some(3));
+        let grown = accumulator
+            .update_chat(&json!({
+                "prompt_tokens_details": {"cache_write_tokens": 10}
+            }))
+            .unwrap();
+        assert_eq!(grown.cache_creation_1h_input_tokens, None);
+        let zero = accumulator
+            .update_chat(&json!({
+                "prompt_tokens_details": {"cache_write_1h_tokens": 0}
+            }))
+            .unwrap();
+        assert_eq!(zero.cache_creation_1h_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn cache_ttl_refuses_malformed_counts_and_non_subsets() {
+        for bad in [
+            json!(-1),
+            json!(true),
+            json!(1.5),
+            json!("2"),
+            json!(101),
+            json!(MAXIMUM_LEDGER_COUNT + 1),
+        ] {
+            assert!(OpenAiUsageAccumulator::default().update_chat(&json!({
+                "prompt_tokens": 120, "completion_tokens": 10,
+                "prompt_tokens_details": {"cache_write_tokens": 100, "cache_write_1h_tokens": bad}
+            })).is_err());
+            assert!(OpenAiUsageAccumulator::default().update_responses(Some(&json!({
+                "input_tokens": 120, "output_tokens": 10,
+                "input_tokens_details": {"cache_write_tokens": 100, "cache_write_1h_tokens": bad}
+            }))).is_err());
+        }
+    }
 
     #[test]
     fn responses_sparse_raw_counters_match_whole_report_and_never_fold_twice() {
@@ -322,6 +497,14 @@ mod sparse_tests {
 }
 
 fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
+    if let (Some(hour), Some(written)) = (
+        usage.cache_creation_1h_input_tokens,
+        usage.cache_creation_input_tokens,
+    ) {
+        if hour > written {
+            return Err("one-hour cache writes exceed total cache writes".into());
+        }
+    }
     let subsets = bounded_ledger_sum(
         &[
             usage.cached_input_tokens.unwrap_or(0),

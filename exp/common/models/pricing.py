@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
     stable_id,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.models.model import (
     ModelAlias,
     ModelCapabilities,
@@ -21,13 +22,31 @@ from exp.common.models.model import (
     NumericMeasurement,
     OperationEconomics,
 )
+from exp.common.models.token_cost import (
+    schedule_maximum_cost_nano_usd,
+    schedule_prices_complete,
+    schedule_usage_cost_nano_usd,
+)
 from exp.common.project import ArtifactStore, artifact_input
 
 
 class CandidateTokenPrice(ContractModel):
-    """USD price units per one million candidate-model tokens."""
+    """Frozen candidate prices, with an optional complete per-request tariff.
+
+    Attributes:
+        candidate_alias: Selected candidate identity.
+        token_prices: Full nano-USD schedule, authoritative when present. None retains
+            explicit four-rate pricing. Missing schedule dimensions are never inherited.
+        input_usd_per_million_tokens: Ordinary input rate, matching the schedule base.
+        output_usd_per_million_tokens: Ordinary output rate, matching the schedule base.
+        cached_input_usd_per_million_tokens: Optional cached-read rate.
+        cache_write_usd_per_million_tokens: Optional non-one-hour write rate.
+    """
 
     candidate_alias: ModelAlias
+    token_prices: GatewayTokenPrices | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     input_usd_per_million_tokens: float = Field(ge=0)
     output_usd_per_million_tokens: float = Field(ge=0)
     cached_input_usd_per_million_tokens: float | None = Field(default=None, ge=0)
@@ -44,6 +63,46 @@ class CandidateTokenPrice(ContractModel):
         if value is not None and not math.isfinite(value):
             raise ValueError("candidate token prices must be finite")
         return value
+
+    @model_validator(mode="after")
+    def _require_matching_base(self) -> CandidateTokenPrice:
+        """Prevent contradictory flat and complete frozen pricing declarations."""
+        _verify_base_prices(
+            self.token_prices,
+            self.input_usd_per_million_tokens,
+            self.output_usd_per_million_tokens,
+            self.cached_input_usd_per_million_tokens,
+            self.cache_write_usd_per_million_tokens,
+        )
+        return self
+
+
+def _verify_base_prices(
+    prices: GatewayTokenPrices | None,
+    input_price: float,
+    output_price: float,
+    cached_price: float | None,
+    written_price: float | None,
+) -> None:
+    """Reject divergent representations of the same authored ordinary schedule."""
+    if prices is None:
+        return
+    for flat, nano in zip(
+        (input_price, output_price, cached_price, written_price),
+        (
+            prices.input_nano_usd_per_million_tokens,
+            prices.output_nano_usd_per_million_tokens,
+            prices.cached_input_nano_usd_per_million_tokens,
+            prices.cache_creation_input_nano_usd_per_million_tokens,
+        ),
+        strict=True,
+    ):
+        if (flat is None) != (nano is None) or (
+            flat is not None
+            and nano is not None
+            and not math.isclose(flat, nano / 1_000_000_000, rel_tol=1e-12, abs_tol=1e-12)
+        ):
+            raise ValueError("flat prices differ from the complete token schedule base")
 
 
 class EmbeddingCostReservation(ContractModel):
@@ -74,16 +133,24 @@ class EmbeddingCostReservation(ContractModel):
 
 
 class CompletionCostReservation(ContractModel):
-    """Conservative retry-bound ceiling for one completion provider request.
+    """Retry-bound token reservation and authored price estimate for one completion request.
 
     ``maximum_input_tokens`` is the hard per-request admission ceiling, sized from the model's
     real context capacity. ``estimated_input_tokens`` is the realistic per-call planning size
     used only to price ``estimated_maximum_call_cost_usd``; an actual request may exceed the
     estimate as long as it fits the hard ceiling and the caller's remaining spend budget.
     An absent estimate prices the reservation from the hard ceiling itself.
+    ``maximum_is_upper_bound`` distinguishes a complete tariff from a known-rate estimate;
+    missing price dimensions cannot authorize dispatch under a strict aggregate dollar cap.
+
+    Attributes:
+        token_prices: Full immutable tariff, or None for the explicit four-rate contract.
     """
 
     model: ModelSnapshot
+    token_prices: GatewayTokenPrices | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     input_usd_per_million_tokens: float = Field(ge=0)
     output_usd_per_million_tokens: float = Field(ge=0)
     cached_input_usd_per_million_tokens: float = Field(ge=0)
@@ -152,38 +219,43 @@ class CompletionCostReservation(ContractModel):
         Returns:
             Conservative planning cost in USD priced from the realistic input estimate.
         """
-        input_price = self._input_price_ceiling(
-            self.input_usd_per_million_tokens,
-            self.cached_input_usd_per_million_tokens,
-            self.cache_write_usd_per_million_tokens,
-        )
-        return (
-            self.maximum_attempts
-            * (
-                self.planning_input_tokens() * input_price
-                + self.maximum_output_tokens * self.output_usd_per_million_tokens
-            )
-            / 1_000_000
+        return self.maximum_attempts * self.attempt_cost_usd(
+            input_tokens=self.planning_input_tokens(), output_tokens=self.maximum_output_tokens
         )
 
     def absolute_maximum_call_cost_usd(self) -> float:
         """Calculate the retry-bound cost of one request at the hard admission ceiling.
 
         Returns:
-            Absolute maximum cost in USD for one admitted request.
+            Known-rate maximum in USD; a strict bound only when ``maximum_is_upper_bound``.
         """
-        input_price = self._input_price_ceiling(
-            self.input_usd_per_million_tokens,
-            self.cached_input_usd_per_million_tokens,
-            self.cache_write_usd_per_million_tokens,
+        return self.maximum_attempts * self.attempt_cost_usd(
+            input_tokens=self.maximum_input_tokens, output_tokens=self.maximum_output_tokens
         )
-        return (
-            self.maximum_attempts
-            * (
-                self.maximum_input_tokens * input_price
-                + self.maximum_output_tokens * self.output_usd_per_million_tokens
+
+    def attempt_cost_usd(self, *, input_tokens: int, output_tokens: int) -> float:
+        """Reserve one attempt across the frozen card's reachable known schedules."""
+        if self.token_prices is not None:
+            return (
+                schedule_maximum_cost_nano_usd(
+                    self.token_prices, input_tokens=input_tokens, output_tokens=output_tokens
+                )
+                / 1_000_000_000
             )
-            / 1_000_000
+        return (
+            input_tokens
+            * self._input_price_ceiling(
+                self.input_usd_per_million_tokens,
+                self.cached_input_usd_per_million_tokens,
+                self.cache_write_usd_per_million_tokens,
+            )
+            + output_tokens * self.output_usd_per_million_tokens
+        ) / 1_000_000
+
+    def maximum_is_upper_bound(self) -> bool:
+        """Whether every potentially billed dimension is priced at the hard request size."""
+        return self.token_prices is None or schedule_prices_complete(
+            self.token_prices, maximum_input_tokens=self.maximum_input_tokens
         )
 
     @model_validator(mode="after")
@@ -202,6 +274,13 @@ class CompletionCostReservation(ContractModel):
             and self.estimated_input_tokens > self.maximum_input_tokens
         ):
             raise ValueError("completion input estimate exceeds its hard admission ceiling")
+        _verify_base_prices(
+            self.token_prices,
+            self.input_usd_per_million_tokens,
+            self.output_usd_per_million_tokens,
+            self.cached_input_usd_per_million_tokens,
+            self.cache_write_usd_per_million_tokens,
+        )
         if not math.isclose(
             self.estimated_maximum_call_cost_usd,
             self.expected_maximum_call_cost_usd(),
@@ -223,6 +302,7 @@ def completion_cost_reservation(
     maximum_input_tokens: int,
     maximum_output_tokens: int,
     estimated_input_tokens: int | None = None,
+    token_prices: GatewayTokenPrices | None = None,
 ) -> CompletionCostReservation:
     """Create one exact conservative completion-call reservation.
 
@@ -237,6 +317,7 @@ def completion_cost_reservation(
         maximum_output_tokens: Provider output ceiling.
         estimated_input_tokens: Realistic per-call input size used only for cost planning,
             or ``None`` to plan at the hard ceiling.
+        token_prices: Optional complete frozen tariff; its base must match the flat rates.
 
     Returns:
         Validated retry-bound planning call cost.
@@ -257,8 +338,19 @@ def completion_cost_reservation(
         )
         / 1_000_000
     )
+    if token_prices is not None:
+        estimated = (
+            maximum_attempts
+            * schedule_maximum_cost_nano_usd(
+                token_prices,
+                input_tokens=planning_input_tokens,
+                output_tokens=maximum_output_tokens,
+            )
+            / 1_000_000_000
+        )
     return CompletionCostReservation(
         model=model,
+        token_prices=token_prices,
         input_usd_per_million_tokens=input_usd_per_million_tokens,
         output_usd_per_million_tokens=output_usd_per_million_tokens,
         cached_input_usd_per_million_tokens=cached_input_usd_per_million_tokens,
@@ -294,15 +386,8 @@ def completion_request_cost_usd(
         raise ValueError("completion request exceeds its reserved input-token ceiling")
     if output_tokens > reservation.maximum_output_tokens:
         raise ValueError("completion request exceeds its reserved output-token ceiling")
-    input_price = CompletionCostReservation._input_price_ceiling(
-        reservation.input_usd_per_million_tokens,
-        reservation.cached_input_usd_per_million_tokens,
-        reservation.cache_write_usd_per_million_tokens,
-    )
-    return (
-        reservation.maximum_attempts
-        * (input_tokens * input_price + output_tokens * reservation.output_usd_per_million_tokens)
-        / 1_000_000
+    return reservation.maximum_attempts * reservation.attempt_cost_usd(
+        input_tokens=input_tokens, output_tokens=output_tokens
     )
 
 
@@ -390,15 +475,17 @@ def reconcile_completion_economics(
     successful_cost = (
         successful_input_cost + usage.output_tokens * reservation.output_usd_per_million_tokens
     ) / 1_000_000
-    maximum_attempt_cost = (
-        usage.input_tokens
-        * CompletionCostReservation._input_price_ceiling(
-            reservation.input_usd_per_million_tokens,
-            reservation.cached_input_usd_per_million_tokens,
-            reservation.cache_write_usd_per_million_tokens,
-        )
-        + reservation.maximum_output_tokens * reservation.output_usd_per_million_tokens
-    ) / 1_000_000
+    if reservation.token_prices is not None:
+        observed = schedule_usage_cost_nano_usd(reservation.token_prices, usage)
+        if observed is None:
+            raise ValueError(
+                "completion usage is not priceable under its frozen schedule; "
+                "preserve the response and supply complete prices or usage"
+            )
+        successful_cost = observed / 1_000_000_000
+    maximum_attempt_cost = reservation.attempt_cost_usd(
+        input_tokens=usage.input_tokens, output_tokens=reservation.maximum_output_tokens
+    )
     attempts = economics.provider_attempts or reservation.maximum_attempts
     if economics.unbilled_attempts and economics.provider_attempts is None:
         raise ValueError("unbilled attempts require an observed total attempt count")
@@ -427,6 +514,7 @@ def verify_completion_reservation(
     model: ModelSnapshot,
     capabilities: ModelCapabilities,
     maximum_attempts: int,
+    token_prices: GatewayTokenPrices | None = None,
 ) -> None:
     """Verify one frozen reservation against the exact active runtime metadata.
 
@@ -435,6 +523,7 @@ def verify_completion_reservation(
         model: Active exact model identity.
         capabilities: Active explicit capability and pricing declaration.
         maximum_attempts: Active provider retry ceiling.
+        token_prices: Complete active schedule, or None for explicit four-rate pricing.
 
     Raises:
         ValueError: Model, pricing, context, or retry metadata drifted or is unknown.
@@ -445,6 +534,10 @@ def verify_completion_reservation(
         capabilities.cached_input_cost_per_million_tokens_usd,
         capabilities.cache_write_cost_per_million_tokens_usd,
     )
+    if reservation.token_prices != token_prices:
+        raise ValueError(
+            "completion reservation schedule differs from the active catalog; prepare again"
+        )
     if reservation.model != model:
         raise ValueError("completion reservation model differs from the active model")
     if capabilities.supports_completions is not True:

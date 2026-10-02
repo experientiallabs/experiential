@@ -225,8 +225,9 @@ def test_large_response_is_referenced_and_replays_with_exact_scope(tmp_path: Pat
         restored.response(receipt)
 
 
+@pytest.mark.parametrize("known", [False, True])
 def test_failed_settlement_rolls_back_receipt_total_and_response(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, known: bool
 ) -> None:
     """A failed metadata commit retains the full reservation and publishes no response record."""
     project = ProjectStore(tmp_path, "project-a")
@@ -243,8 +244,9 @@ def test_failed_settlement_rolls_back_receipt_total_and_response(
 
     monkeypatch.setattr(ledger._records, "write", fail_total)
     with pytest.raises(OSError, match="interrupted settlement"):
-        ledger.complete("request-a", 0.4, "paid response")
+        ledger.complete("request-a", 0.4 if known else None, "paid response")
     restored = RequestBudgetStore(ProjectStore(tmp_path, "project-a"), "run-a")
     assert restored.read("request-a") == pending
     assert restored.total() == 2
+    assert not restored.has_unbounded_liability()
     assert project.artifacts.list_ids() == ()

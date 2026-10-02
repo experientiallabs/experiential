@@ -84,12 +84,28 @@ class Usage(ContractModel):
     replace the total input count and must not be added a second time by callers.
     ``output_tokens`` is total generated usage, including provider-reported reasoning tokens;
     reasoning is a subset and must not be added again.
+
+    Attributes:
+        input_tokens: Total observed input, including cache-read and cache-write subsets.
+        output_tokens: Total observed generated tokens, including reasoning.
+        cached_input_tokens: Observed read subset, or None when unreported.
+        cache_write_input_tokens: Observed write subset, or None when unreported.
+        cache_write_1h_input_tokens: Observed one-hour portion of writes; zero and None differ.
+        reasoning_tokens: Observed reasoning portion of output, or None when unreported.
+        service_tier: Explicitly returned processing tier; None uses the ordinary request basis.
     """
 
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_write_input_tokens: int | None = Field(default=None, ge=0)
+    cache_write_1h_input_tokens: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    reasoning_tokens: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
+    service_tier: str | None = Field(
+        default=None, min_length=1, max_length=64, exclude_if=lambda value: value is None
+    )
 
 
 class NumericMeasurement(ContractModel):
@@ -188,6 +204,24 @@ def _sum_usage(values: Sequence[Usage]) -> Usage:
         output_tokens=sum(value.output_tokens for value in values),
         cached_input_tokens=cached_total,
         cache_write_input_tokens=written_total,
+        cache_write_1h_input_tokens=_sum_optional_counts(
+            tuple(value.cache_write_1h_input_tokens for value in values)
+        ),
+        reasoning_tokens=_sum_optional_counts(tuple(value.reasoning_tokens for value in values)),
+        service_tier=(
+            values[0].service_tier
+            if all(value.service_tier == values[0].service_tier for value in values)
+            else None
+        ),
+    )
+
+
+def _sum_optional_counts(values: Sequence[int | None]) -> int | None:
+    """Sum one observed subset only when every constituent reports it."""
+    return (
+        sum(value for value in values if value is not None)
+        if all(value is not None for value in values)
+        else None
     )
 
 

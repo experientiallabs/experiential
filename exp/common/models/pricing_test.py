@@ -23,6 +23,8 @@ from exp.common.models import (
     reconcile_completion_economics,
     verify_completion_reservation,
 )
+from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayTokenPrices
+from exp.common.models.token_cost_test import prices
 from exp.common.project import ProjectConfig, ProjectStore
 
 
@@ -482,3 +484,111 @@ def test_certified_unpaid_attempts_do_not_consume_paid_retry_allowance(
     assert reconciled.cost_usd.value == pytest.approx(0.00014 + unknown_attempts * 0.0021)
     assert reconciled.provider_attempts == 6 + unknown_attempts
     assert reconciled.unbilled_attempts == 5
+
+
+def tiered_prices() -> GatewayTokenPrices:
+    """Use complete different rates above a boundary, including both write durations."""
+    return prices().model_copy(
+        update={
+            "long_context": GatewayLongContextTier(
+                input_threshold_tokens=100,
+                input_nano_usd_per_million_tokens=2_000_000_000,
+                cached_input_nano_usd_per_million_tokens=200_000_000,
+                cache_creation_input_nano_usd_per_million_tokens=4_000_000_000,
+                cache_creation_1h_input_nano_usd_per_million_tokens=6_000_000_000,
+                output_nano_usd_per_million_tokens=8_000_000_000,
+                reasoning_nano_usd_per_million_tokens=10_000_000_000,
+            )
+        }
+    )
+
+
+def test_complete_card_bounds_every_attempt_and_reconciles_actual_subsets() -> None:
+    """Known-long requests reserve high subset rates and release unused paid retries."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=100,
+        estimated_input_tokens=50,
+        token_prices=tiered_prices(),
+    )
+    assert reservation.estimated_maximum_call_cost_usd == pytest.approx(0.00195)
+    assert completion_request_cost_usd(
+        reservation, input_tokens=100, output_tokens=100
+    ) == pytest.approx(0.0048)
+    usage = Usage(
+        input_tokens=100,
+        output_tokens=20,
+        cached_input_tokens=10,
+        cache_write_input_tokens=30,
+        cache_write_1h_input_tokens=5,
+        reasoning_tokens=7,
+    )
+    observed = reconcile_completion_economics(
+        reservation,
+        OperationEconomics(usage=usage, provider_attempts=5, unbilled_attempts=4),
+    )
+    assert observed.cost_usd is not None
+    assert observed.cost_usd.value == pytest.approx(0.000426)
+    uncertain_retry = reconcile_completion_economics(
+        reservation, OperationEconomics(usage=usage, provider_attempts=2)
+    )
+    assert uncertain_retry.cost_usd is not None
+    assert uncertain_retry.cost_usd.value == pytest.approx(0.002026)
+    caps = ModelCapabilities(
+        supports_completions=True,
+        context_window_tokens=1_100,
+        maximum_output_tokens=100,
+        input_cost_per_million_tokens_usd=1,
+        output_cost_per_million_tokens_usd=4,
+        cached_input_cost_per_million_tokens_usd=0.1,
+        cache_write_cost_per_million_tokens_usd=2,
+    )
+    verify_completion_reservation(
+        reservation,
+        model=_model(),
+        capabilities=caps,
+        maximum_attempts=3,
+        token_prices=tiered_prices(),
+    )
+    with pytest.raises(ValueError, match="schedule differs"):
+        verify_completion_reservation(
+            reservation,
+            model=_model(),
+            capabilities=caps,
+            maximum_attempts=3,
+            token_prices=prices(),
+        )
+
+
+def test_price_snapshot_binds_full_schedule_without_mutating_previous_bytes(tmp_path: Path) -> None:
+    """A tier-only change creates a new frozen identity, even with unchanged base prices."""
+    project = ProjectStore(tmp_path, "pricing")
+    project.initialize(ProjectConfig(project_id="pricing"))
+    price = CandidateTokenPrice(
+        candidate_alias="worker",
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        token_prices=prices(),
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    first = persist_pricing_snapshot(
+        project.artifacts, (price,), created_at=now, code_revision="revision"
+    )
+    original = project.artifacts.read_bytes(first.pricing_snapshot_id, "pricing.json")
+    changed = persist_pricing_snapshot(
+        project.artifacts,
+        (price.model_copy(update={"token_prices": tiered_prices()}),),
+        created_at=now,
+        code_revision="revision",
+    )
+    assert changed.pricing_snapshot_id != first.pricing_snapshot_id
+    assert changed.candidate_prices[0].token_prices == tiered_prices()
+    assert project.artifacts.read_bytes(first.pricing_snapshot_id, "pricing.json") == original

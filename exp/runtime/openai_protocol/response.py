@@ -139,6 +139,8 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
         details["cached_tokens"] = usage.cached_input_tokens
     if usage.cache_creation_input_tokens is not None:
         details["cache_write_tokens"] = usage.cache_creation_input_tokens
+    if usage.cache_creation_1h_input_tokens is not None:
+        details["cache_write_1h_tokens"] = usage.cache_creation_1h_input_tokens
     output_details: JsonObject = {}
     if usage.reasoning_tokens is not None:
         output_details["reasoning_tokens"] = usage.reasoning_tokens

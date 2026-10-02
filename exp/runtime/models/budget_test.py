@@ -22,6 +22,123 @@ from exp.runtime.models.providers.transport import (
 )
 
 
+def test_unknown_price_retains_response_and_blocks_capped_new_work(tmp_path: Path) -> None:
+    """An unpriceable paid response replays, but an estimate cannot authorize later spend."""
+    project = ProjectStore(tmp_path, "unknown-price")
+    calls: list[str] = []
+
+    def call(budget: RequestBudget, key: str, known: bool = False) -> str:
+        """Save actual response bytes while retaining an explicitly unknown charge."""
+
+        def operation() -> str:
+            """Count physical calls independently of logical retries."""
+            calls.append(key)
+            return "paid response"
+
+        with budget.scope(key):
+            return budget.call(
+                role="assistant",
+                fingerprint=key,
+                maximum_cost_usd=2,
+                operation=operation,
+                encode=str,
+                decode=str,
+                charge=lambda result: 1 if known else None,
+                cost_is_upper_bound=known,
+            )
+
+    uncapped = RequestBudget(project, identity="fixture", maximum_cost_usd=None)
+    assert call(uncapped, "first") == "paid response"
+    assert uncapped.accounted_usd == 2
+    capped = RequestBudget(project, identity="fixture", maximum_cost_usd=100)
+    assert call(capped, "first") == "paid response"
+    with pytest.raises(ValueError, match="resolved earlier charges"):
+        call(capped, "second", known=True)
+    assert calls == ["first"]
+
+
+@pytest.mark.parametrize("actual_cost", [1.0, 3.0])
+def test_known_settlement_releases_uncertain_reservation_on_reopen(
+    tmp_path: Path, actual_cost: float
+) -> None:
+    """A complete actual meter resolves the uncertainty of an uncapped reservation."""
+    project = ProjectStore(tmp_path, "known-price")
+    original = RequestBudget(project, identity="fixture", maximum_cost_usd=None)
+    with original.scope("first"):
+        assert (
+            original.call(
+                role="assistant",
+                fingerprint="first",
+                maximum_cost_usd=2,
+                operation=lambda: "result",
+                encode=str,
+                decode=str,
+                charge=lambda result: actual_cost,
+                cost_is_upper_bound=False,
+            )
+            == "result"
+        )
+    assert original.accounted_usd == actual_cost
+    capped = RequestBudget(project, identity="fixture", maximum_cost_usd=actual_cost + 1)
+    assert _call(capped, key="second", calls=[]) == "second"
+
+
+def test_uncertain_reservation_is_rejected_before_capped_dispatch(tmp_path: Path) -> None:
+    """A finite limit cannot authorize a new call using only known-rate estimates."""
+    budget = RequestBudget(
+        ProjectStore(tmp_path, "bounded"), identity="fixture", maximum_cost_usd=100
+    )
+    calls: list[str] = []
+    with budget.scope("first"), pytest.raises(ValueError, match="complete applicable token prices"):
+        budget.call(
+            role="assistant",
+            fingerprint="first",
+            maximum_cost_usd=1,
+            operation=lambda: calls.append("called"),
+            encode=lambda result: "saved",
+            decode=lambda value: None,
+            charge=lambda result: 1,
+            cost_is_upper_bound=False,
+        )
+    assert calls == [] and budget.accounted_usd == 0
+
+
+def test_parallel_known_settlements_cannot_erase_one_unknown_liability(tmp_path: Path) -> None:
+    """The durable uncertainty count survives concurrent settlement and a reopened cap."""
+    project = ProjectStore(tmp_path, "uncertain-concurrent")
+    budget = RequestBudget(project, identity="fixture", maximum_cost_usd=None)
+    admitted = threading.Barrier(8)
+
+    def worker(index: int) -> int:
+        """Settle seven prices while one paid response retains unpriced liability."""
+
+        def operation() -> int:
+            """Keep all eight reservations present before any completes."""
+            admitted.wait(timeout=10)
+            return index
+
+        with budget.scope(str(index)):
+            return budget.call(
+                role="assistant",
+                fingerprint=str(index),
+                maximum_cost_usd=2,
+                operation=operation,
+                encode=str,
+                decode=int,
+                charge=lambda result: None if result == 0 else 1,
+                cost_is_upper_bound=False,
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert sorted(pool.map(worker, range(8))) == list(range(8))
+    assert budget.accounted_usd == 9
+    reopened = RequestBudget(project, identity="fixture", maximum_cost_usd=100)
+    calls: list[str] = []
+    with pytest.raises(ValueError, match="resolved earlier charges"):
+        _call(reopened, key="new", calls=calls)
+    assert calls == [] and reopened.accounted_usd == 9
+
+
 def _call(budget: RequestBudget, *, key: str, calls: list[str], maximum: float = 1) -> str:
     """Run a deterministic charged request through the production ledger."""
     with budget.scope(key):

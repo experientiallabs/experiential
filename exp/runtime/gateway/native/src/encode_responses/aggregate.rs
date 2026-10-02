@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "usage_tests.rs"]
+mod usage_tests;
+
 /// Usage shape from `exp.runtime.openai_protocol.streaming._responses_usage`.
 pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     let usage = match usage {
@@ -10,18 +14,27 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     };
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    json!({
+    let mut input_details = json!({
+        "cached_tokens": usage.cached_input_tokens.unwrap_or(0),
+        "cache_write_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
+    });
+    if let Some(hour) = usage.cache_creation_1h_input_tokens {
+        input_details["cache_write_1h_tokens"] = json!(hour);
+    }
+    let mut wire = json!({
         "input_tokens": input,
         // `cache_write_tokens` joined the official shape (openai-python 3.x
         // marks it required), so SDK-strict callers need it present.
-        "input_tokens_details": {
-            "cached_tokens": usage.cached_input_tokens.unwrap_or(0),
-            "cache_write_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
-        },
+        "input_tokens_details": input_details,
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
         "total_tokens": input + output,
-    })
+    });
+    let unreported = usage.unreported_token_details();
+    if !unreported.is_empty() {
+        wire["unreported_token_details"] = json!(unreported);
+    }
+    wire
 }
 
 /// The aggregated non-streaming Responses outcome from one event stream.

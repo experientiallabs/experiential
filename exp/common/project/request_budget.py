@@ -117,8 +117,10 @@ class RequestReceipt(ContractModel):
 
     Attributes:
         fingerprint: Exact request and pricing identity.
-        charge: Settled cost or conservative unresolved reservation, in USD.
-        response: Immutable response artifact, present only after completion.
+        charge: Settled cost or retained unresolved reservation, in USD.
+        charge_is_upper_bound: Whether the retained amount bounds the liability. False
+            preserves an estimate for unpriced usage without pretending it is settled spend.
+        response: Immutable response artifact, including paid results with unknown pricing.
         state: Whether dispatch is pending, complete, unresolved, or certified wholly unpaid.
         unbilled_attempts: Exact positive attempt count for a terminal wholly unpaid request.
             Absent for existing receipts and all other states.
@@ -126,6 +128,9 @@ class RequestReceipt(ContractModel):
 
     fingerprint: str
     charge: float = Field(ge=0, allow_inf_nan=False)
+    charge_is_upper_bound: bool = Field(
+        default=True, strict=True, exclude_if=lambda value: value is True
+    )
     response: ArtifactInput | None = None
     state: Literal["pending", "complete", "unknown", "unbilled"]
     unbilled_attempts: int = Field(
@@ -136,10 +141,17 @@ class RequestReceipt(ContractModel):
     def _validate_unbilled_failure(self) -> Self:
         """Only explicit wholly unpaid failures may retain a certified positive count."""
         if self.state == "unbilled":
-            if self.charge != 0 or self.response is not None or self.unbilled_attempts == 0:
+            if (
+                self.charge != 0
+                or not self.charge_is_upper_bound
+                or self.response is not None
+                or self.unbilled_attempts == 0
+            ):
                 raise ValueError("unbilled receipt requires positive attempt proof and zero charge")
         elif self.unbilled_attempts:
             raise ValueError("unbilled attempt proof requires a terminal unbilled receipt")
+        if self.state == "complete" and not self.charge_is_upper_bound:
+            raise ValueError("completed receipt requires a known settled charge")
         return self
 
 
@@ -147,10 +159,14 @@ class _Total(ContractModel):
     """Atomic accounting total, including unresolved provider reservations.
 
     Attributes:
-        charge: Sum of all request charges in this execution namespace.
+        charge: Sum of all retained request amounts in this execution namespace.
+        unbounded_requests: Unresolved requests whose amounts are estimates, not bounds.
     """
 
     charge: float = Field(ge=0, allow_inf_nan=False)
+    unbounded_requests: int = Field(
+        default=0, ge=0, strict=True, exclude_if=lambda value: value == 0
+    )
 
 
 class RequestBudgetStore:
@@ -192,6 +208,11 @@ class RequestBudgetStore:
         payload = self._records.read("total")
         return 0.0 if payload is None else _Total.model_validate_json(payload).charge
 
+    def has_unbounded_liability(self) -> bool:
+        """Return whether any unresolved request lacks a proven monetary upper bound."""
+        payload = self._records.read("total")
+        return payload is not None and _Total.model_validate_json(payload).unbounded_requests > 0
+
     def write(self, key: str, receipt: RequestReceipt) -> None:
         """Commit a receipt and its accounting delta together.
 
@@ -201,16 +222,30 @@ class RequestBudgetStore:
         """
         with self.transaction():
             previous = self.read(key)
-            total = math.fsum((self.total(), -(previous.charge if previous else 0), receipt.charge))
+            payload = self._records.read("total")
+            prior_total = (
+                _Total(charge=0) if payload is None else _Total.model_validate_json(payload)
+            )
+            total = math.fsum(
+                (prior_total.charge, -(previous.charge if previous else 0), receipt.charge)
+            )
+            unbounded = (
+                prior_total.unbounded_requests
+                - int(previous is not None and not previous.charge_is_upper_bound)
+                + int(not receipt.charge_is_upper_bound)
+            )
             self._records.write(f"request/{key}", canonical_json_bytes(receipt))
-            self._records.write("total", canonical_json_bytes(_Total(charge=max(0.0, total))))
+            self._records.write(
+                "total",
+                canonical_json_bytes(_Total(charge=max(0.0, total), unbounded_requests=unbounded)),
+            )
 
-    def complete(self, key: str, cost: float, payload: str) -> None:
+    def complete(self, key: str, cost: float | None, payload: str) -> None:
         """Atomically bind paid response bytes and replace the conservative reservation.
 
         Args:
             key: Request coordinate with a durable pending reservation.
-            cost: Validated finite, nonnegative settled charge in USD.
+            cost: Validated settled charge, or None to retain explicitly unbounded liability.
             payload: Encoded response to retain for exact replay.
 
         Raises:
@@ -235,9 +270,10 @@ class RequestBudgetStore:
                 key,
                 previous.model_copy(
                     update={
-                        "charge": cost,
+                        "charge": previous.charge if cost is None else cost,
+                        "charge_is_upper_bound": cost is not None,
                         "response": artifact_input(manifest),
-                        "state": "complete",
+                        "state": "unknown" if cost is None else "complete",
                     }
                 ),
             )

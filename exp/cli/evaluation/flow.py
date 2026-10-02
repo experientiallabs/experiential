@@ -331,6 +331,8 @@ def _preflight(project: ProjectStore, run: EvaluationRun, *, reviewing: bool = F
         else f"Spending limit ${run.spending_limit_usd:,.2f}"
     )
     _console.print(f"\nEstimated ${cost.estimated_cost_usd:,.2f} · {limit}")
+    if not cost.maximum_is_upper_bound:
+        _console.print("Some tariff dimensions are unknown; estimates are not spending bounds.")
     if reviewing:
         for warning in _uncapped_spend_warnings(project, run):
             _console.print(warning)

@@ -274,6 +274,7 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
     return Usage(
         input_tokens=require_integer(usage.get("promptTokenCount"), "Gemini promptTokenCount"),
         output_tokens=candidates_tokens + thoughts_tokens,
+        reasoning_tokens=(thoughts_tokens if usage.get("thoughtsTokenCount") is not None else None),
         cached_input_tokens=require_integer(
             usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),

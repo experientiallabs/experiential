@@ -311,6 +311,7 @@ def prepare_model_evaluation(
     judge_request = _judge_request_reservation(
         judge_caps,
         judge_model=judge_model,
+        token_prices=catalog.models[selected.judge_alias].token_prices,
         maximum_input_tokens=options.maximum_judge_input_tokens,
         maximum_output_tokens=options.maximum_judge_output_tokens,
         maximum_attempts=attempts,
@@ -327,6 +328,7 @@ def prepare_model_evaluation(
         tuple(
             CandidateTokenPrice(
                 candidate_alias=item.candidate_alias,
+                token_prices=item.request.token_prices,
                 input_usd_per_million_tokens=item.request.input_usd_per_million_tokens,
                 output_usd_per_million_tokens=item.request.output_usd_per_million_tokens,
                 cached_input_usd_per_million_tokens=item.request.cached_input_usd_per_million_tokens,

@@ -34,9 +34,9 @@ from exp.common.models import (
     ToolCall,
     combine_economics,
     completion_request_cost_usd,
-    reconcile_completion_economics,
     verify_completion_reservation,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.rollouts import (
     UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutEventKind,
@@ -65,6 +65,7 @@ from exp.simulation.engines.text.recording_payloads import (
     bounded_candidate_request,
     delivered_world_span,
     model_span,
+    priced_response,
     world_retry_request,
 )
 from exp.simulation.engines.text.redaction import redact_json
@@ -379,6 +380,7 @@ class RecordingCandidateClient:
                 self._candidate_request,
                 model=self._candidate.snapshot,
                 capabilities=self._candidate.capabilities,
+                token_prices=self._candidate.token_prices,
                 maximum_attempts=self._completion_maximum_attempts,
                 role="candidate",
             )
@@ -398,15 +400,9 @@ class RecordingCandidateClient:
                 else None
             ),
         )
-        if self._candidate_request is not None:
-            candidate_response = candidate_response.model_copy(
-                update={
-                    "economics": reconcile_completion_economics(
-                        self._candidate_request,
-                        candidate_response.economics,
-                    )
-                }
-            )
+        candidate_response, pricing_error = priced_response(
+            candidate_response, self._candidate_request
+        )
         candidate_ended_at = timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
@@ -420,6 +416,8 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        if pricing_error is not None:
+            raise pricing_error
         _require_response_identity(candidate_response, self._candidate, role="candidate")
         self._clear_unknown_dispatch()
         _require_complete_response(candidate_response, role="candidate")
@@ -567,6 +565,7 @@ class RecordingCandidateClient:
                 self._world_model_request,
                 model=self._world_model.snapshot,
                 capabilities=self._world_model.capabilities,
+                token_prices=self._world_model.token_prices,
                 maximum_attempts=self._completion_maximum_attempts,
                 role="world model",
             )
@@ -588,16 +587,8 @@ class RecordingCandidateClient:
         )
         world_request = dispatched.request
         world_response = dispatched.response
-        if self._world_model_request is not None:
-            world_response = world_response.model_copy(
-                update={
-                    "economics": reconcile_completion_economics(
-                        self._world_model_request,
-                        world_response.economics,
-                    )
-                }
-            )
-            dispatched = replace(dispatched, response=world_response)
+        world_response, pricing_error = priced_response(world_response, self._world_model_request)
+        dispatched = replace(dispatched, response=world_response)
         world_ended_at = timestamp(self._clock, not_before=world_started_at)
         self._retrieved_transition_ids.append(
             tuple(match.transition.transition_id for match in dispatched.matches)
@@ -614,6 +605,8 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        if pricing_error is not None:
+            raise pricing_error
         _require_response_identity(world_response, self._world_model, role="world model")
         self._clear_unknown_dispatch()
         _require_complete_response(world_response, role="world model")
@@ -758,12 +751,6 @@ class RecordingCandidateClient:
     ) -> ResultT:
         """Run one provider dispatch inside an explicit unknown-spend accounting window.
 
-        The executing client owns bounded transport retries inside the same retry-inclusive
-        reservation that admitted this dispatch, so this boundary never multiplies attempts.
-        While the dispatch is in flight its worst-case reservation is retained so a failure
-        that leaves spend unknown persists an exact conservative charge with its evidence
-        instead of an unpriceable hole.
-
         Args:
             operation: One provider dispatch whose spend is ambiguous until it returns.
             reserved_cost_usd: Retry-inclusive worst-case charge admitted for this dispatch.
@@ -835,6 +822,7 @@ def _verify_completion_budget_binding(
     capabilities: ModelCapabilities,
     maximum_attempts: int,
     role: str,
+    token_prices: GatewayTokenPrices | None = None,
 ) -> None:
     """Translate active reservation drift into a structured zero-dispatch budget failure.
 
@@ -844,6 +832,7 @@ def _verify_completion_budget_binding(
         capabilities: Active explicit prices and capacities.
         maximum_attempts: Active provider retry ceiling.
         role: Candidate or world-model diagnostic label.
+        token_prices: Optional full active schedule, verified against frozen preparation.
 
     Raises:
         TextSimulationError: Active model, economics, capacity, or retry metadata drifted.
@@ -853,6 +842,7 @@ def _verify_completion_budget_binding(
             reservation,
             model=model,
             capabilities=capabilities,
+            token_prices=token_prices,
             maximum_attempts=maximum_attempts,
         )
     except ValueError as exc:

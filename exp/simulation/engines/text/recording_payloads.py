@@ -13,6 +13,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     OperationEconomics,
+    reconcile_completion_economics,
 )
 from exp.common.rollouts import RolloutEventKind, RolloutSpan
 from exp.simulation.engines.text.packing import pack_world_model_request
@@ -42,6 +43,27 @@ class RecordedTextCalls:
     retrieval_economics: OperationEconomics
     transitions: tuple[TextWorldModelTransition, ...]
     retrieved_transition_ids: tuple[tuple[str, ...], ...]
+
+
+def priced_response(
+    response: ModelResponse, reservation: CompletionCostReservation | None
+) -> tuple[ModelResponse, ValueError | None]:
+    """Reconcile a response, retaining paid evidence before a full-schedule pricing error.
+
+    The recorder must append the returned response and span before raising the returned
+    error. Unknown valuation never inherits a provider's unrelated dollar-cost field.
+    """
+    if reservation is None:
+        return response, None
+    try:
+        economics = reconcile_completion_economics(reservation, response.economics)
+    except ValueError as error:
+        if reservation.token_prices is None:
+            raise
+        return response.model_copy(
+            update={"economics": response.economics.model_copy(update={"cost_usd": None})}
+        ), error
+    return response.model_copy(update={"economics": economics}), None
 
 
 def world_retry_request(

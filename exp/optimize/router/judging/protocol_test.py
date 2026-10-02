@@ -22,10 +22,14 @@ from exp.common.models import (
     ModelResponse,
     ModelSnapshot,
     OperationEconomics,
+    Usage,
+    completion_cost_reservation,
 )
+from exp.common.models.token_cost_test import prices
 from exp.common.project import artifact_input
 from exp.common.rollouts import RolloutArtifact
-from exp.optimize.router.errors import JudgeTranscriptAdmissionError
+from exp.optimize.router.automatic.judge import ReservedJudgeClient
+from exp.optimize.router.errors import JudgePricingError, JudgeTranscriptAdmissionError
 from exp.optimize.router.judging.artifacts import write_production_rollout
 from exp.optimize.router.judging.contracts import ManualJudgeError, judge_feedback_schema
 from exp.optimize.router.judging.protocol import (
@@ -277,6 +281,113 @@ def test_null_rationale_probe_persists_and_replays(tmp_path: Path) -> None:
     assert len(client.requests) == 1
     assert replay_client.requests == []
     assert replay.provider_calls_made == 0
+
+
+def test_paid_unpriceable_judge_probe_persists_and_replays_without_dispatch(tmp_path: Path) -> None:
+    """A real full-schedule client error retains its response before the protocol rejects it."""
+    store = _built_store(tmp_path)
+    setup = commit_manual_judge_setup(
+        store,
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            prompt_template=_template("scalar"),
+            created_at=_TIME,
+            code_revision="test-revision",
+        ),
+        confirmed=True,
+    )
+    plan = prepare_manual_judge_calibration(store, sample_size=1)
+    rollout_input = write_production_rollout(
+        store, setup, plan.tasks[0], plan.traces[0], _TIME, "test-revision"
+    )
+    rollout, _ = read_artifact_json(
+        store,
+        artifact_id=rollout_input.artifact_id,
+        expected_artifact_type="rollout",
+        relative_path="rollout.json",
+        model_type=RolloutArtifact,
+    )
+    rubric, _ = read_artifact_json(
+        store,
+        artifact_id=setup.rubric.artifact_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+    )
+
+    class Client(_NullRationaleClient):
+        """Return paid output whose cache meters were genuinely not observed."""
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            """Keep actual output and usage for the frozen card's strict valuation."""
+            return (
+                super()
+                .complete(request)
+                .model_copy(
+                    update={
+                        "economics": OperationEconomics(
+                            usage=Usage(input_tokens=100, output_tokens=20), provider_attempts=1
+                        )
+                    }
+                )
+            )
+
+    client = Client(setup.judge_model)
+    card = prices()
+    reservation = completion_cost_reservation(
+        model=setup.judge_model,
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=1,
+        maximum_input_tokens=100_000,
+        maximum_output_tokens=16_384,
+        token_prices=card,
+    )
+    reserved = ReservedJudgeClient(
+        client,
+        reservation=reservation,
+        model=setup.judge_model,
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            context_window_tokens=200_000,
+            maximum_output_tokens=16_384,
+            input_cost_per_million_tokens_usd=1,
+            output_cost_per_million_tokens_usd=4,
+            cached_input_cost_per_million_tokens_usd=0.1,
+            cache_write_cost_per_million_tokens_usd=2,
+        ),
+        maximum_attempts=1,
+        maximum_provider_calls=2,
+        token_prices=card,
+    )
+    retained = None
+    for _ in range(2):
+        adapter = TemplateJudgeClient(
+            reserved,
+            setup.prompt_template,
+            rollout,
+            rubric,
+            store=store,
+            setup_input=artifact_input(store.artifacts.read(setup.setup_id).manifest),
+            rollout_input=rollout_input,
+            reference_input=None,
+            created_at=_TIME,
+            code_revision="test-revision",
+            maximum_output_tokens=16_384,
+        )
+        with pytest.raises(JudgePricingError) as error:
+            adapter.complete(_scalar_request(setup.prompt_template.prompt.text))
+        assert error.value.response.economics.cost_usd is None
+        if retained is None:
+            retained = error.value.response
+        else:
+            assert error.value.response == retained
+    assert len(client.requests) == 1
+    assert reserved.calls == 1
+    assert len(reserved.economics) == 1
 
 
 def _oversized_rollout(rollout: RolloutArtifact) -> RolloutArtifact:

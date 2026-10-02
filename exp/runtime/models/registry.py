@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from threading import TIMEOUT_MAX
 from typing import Literal, Protocol
@@ -25,6 +25,7 @@ from exp.common.models import (
     known_model_metadata,
     normalize_gateway_catalog,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.runtime.models.credentials import (
     DispatchCredentialReceipt,
     connection_credential_binding,
@@ -150,6 +151,8 @@ class ResolvedModel:
     """One alias resolved to static identity, capabilities, and focused runtime clients.
 
     Attributes:
+        token_prices: Optional complete authored tariff, independent of endpoint selection
+            and the capability identity. It never changes a provider's wire dialect.
         credential_receipt: Private receipt resolved atomically with authentication, or None
             when the credential source cannot establish recovery or cache evidence scope.
     """
@@ -160,6 +163,7 @@ class ResolvedModel:
     client: ModelClient
     embedding_client: EmbeddingClient | None
     served_model_id: str | None = None
+    token_prices: GatewayTokenPrices | None = None
     credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
 
 
@@ -271,6 +275,12 @@ class RuntimeModelCatalog:
         )
 
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        """Resolve the client and bind the same catalog's complete pricing schedule."""
+        resolved = self._resolve(alias, role=role)
+        gateway = self._catalog.models[alias].gateway
+        return replace(resolved, token_prices=gateway.prices if gateway is not None else None)
+
+    def _resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Build the one approved client shape named by an alias.
 
         Args:

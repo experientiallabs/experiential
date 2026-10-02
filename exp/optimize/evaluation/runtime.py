@@ -162,6 +162,7 @@ def run_prepared_model_evaluation(
             request,
             model=resolved.snapshot,
             capabilities=resolved.capabilities,
+            token_prices=resolved.token_prices,
             maximum_attempts=attempts,
         )
     if retrieval.maximum_attempts != attempts:
@@ -212,6 +213,7 @@ def run_prepared_model_evaluation(
         reservation=judge_request,
         model=judge_model.snapshot,
         capabilities=judge_model.capabilities,
+        token_prices=judge_model.token_prices,
         maximum_attempts=attempts,
         maximum_provider_calls=quote.judgment_count * calls_per_rollout,
         served_model_id=judge_model.served_model_id,

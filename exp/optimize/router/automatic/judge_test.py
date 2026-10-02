@@ -255,7 +255,8 @@ def test_reserved_judge_prices_openai_usage_without_observed_cost() -> None:
 
     assert result.economics.cost_usd is not None
     assert result.economics.cost_usd.provenance == "estimated"
-    assert result.economics.cost_usd.value == 0.0024025
+    # The explicitly reported zero writes price fresh input at its ordinary rate.
+    assert result.economics.cost_usd.value == 0.0023275
 
 
 def test_reserved_judge_rejects_an_over_ceiling_transcript_without_a_provider_call() -> None:
