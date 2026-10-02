@@ -82,6 +82,23 @@ MESSAGES_MANIFEST = CompatibilityManifest(
             "inference_geo",
         ),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
+        # ``safeguards`` asks Anthropic to run Claude Code's auto-mode action
+        # classifier server-side (an array with one ``dangerous_tool_use``
+        # entry, paired with the ``dangerous-tool-use-2026-09-03`` beta), and
+        # the verdicts come back as ``safeguard_results`` keyed by tool-use id
+        # on ``message_delta`` and the non-stream body. This gateway re-encodes
+        # every response from canonical events and cannot carry those results,
+        # so forwarding the request would buy nothing. It is accepted, never
+        # dispatched, and disclosed. Dropping it never weakens the review the
+        # caller asked for: Claude Code documents that a response completing
+        # with no review results makes it fall back to its own classifier
+        # requests, while a missing or unreadable verdict for an action only
+        # denies that action. Relaying the results is a future change on
+        # all-Anthropic routes. Sources:
+        # https://code.claude.com/docs/en/permission-modes#server-side-classifier-review
+        # https://code.claude.com/docs/en/auto-mode-classifier-billing
+        # https://code.claude.com/docs/en/llm-gateway-protocol#feature-pass-through
+        _field("safeguards", CompatibilityDisposition.IGNORED),
         # Conscious rejections, each with a recorded reason:
         # - ``thread`` is Anthropic's server-held conversation state (it
         #   replaces ``messages`` upstream); the stateless gateway cannot
