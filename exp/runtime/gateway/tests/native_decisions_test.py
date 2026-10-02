@@ -22,6 +22,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
@@ -223,7 +224,9 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
 
 
 @pytest.fixture(scope="module", name="engine")
-def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+def _engine(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_ServingEngine]:
     """Serve the shared native driver with separately granted chat/decision aliases.
 
     Yields:
@@ -369,6 +372,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _TIMEOUT_SECONDS,
+            "default_lane_bound": request.param if hasattr(request, "param") else None,
             "typesafe_loopback_url": f"http://{_HOST}:{upstream_port}/v1/systemone",
         }
     )
@@ -809,6 +813,36 @@ def test_disconnect_settles_before_deadline_and_holds_unknown_liability(
     assert attempt["state"] == "cancelled"
     assert _provider_calls() == calls_before + 1
     _assert_unknown_liability(engine, attempt)
+
+
+@pytest.mark.parametrize("engine", [1], indirect=True)
+def test_systemone_capacity_refusal_preserves_committed_unbilled_proof(
+    engine: _ServingEngine,
+) -> None:
+    """Real SystemOne capacity refusal forwards the certificate without a provider call."""
+    _DecisionsUpstream.stall_started.clear()
+    _DecisionsUpstream.release_stalls.clear()
+    before = _request_ids(engine)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        occupied = pool.submit(_post, engine, _body("disconnect"))
+        try:
+            assert _DecisionsUpstream.stall_started.wait(5)
+            refused = _post(engine, _body("capacity-retry"))
+            assert refused.status_code == 429, refused.text
+            assert refused.headers["retry-after"] == "5"
+            assert refused.headers["x-gateway-admission-refused"] == "true"
+        finally:
+            _DecisionsUpstream.release_stalls.set()
+        assert occupied.result(timeout=5).status_code == 200
+    retried = _post(engine, _body("capacity-retry"))
+    assert retried.status_code == 200, retried.text
+    requests = _settled(engine, before, expected=3)
+    assert sorted(len(attempts) for _request, attempts in requests) == [0, 1, 1]
+    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        certified = connection.execute(
+            "SELECT request_id FROM gateway_requests WHERE failed_without_effects = 1"
+        ).fetchall()
+    assert len(certified) == 1
 
 
 def test_timeout_retains_unknown_liability_and_exhausts_budget(engine: _ServingEngine) -> None:

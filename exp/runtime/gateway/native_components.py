@@ -97,11 +97,13 @@ class SyncWriteLedger(Protocol):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
+        certify_no_effects: bool = False,
     ) -> bool:
-        """Finalize work and certify zero durable attempts under the dispatch write fence.
+        """Finalize work and certify no paid effects under the dispatch write fence.
 
-        Return true only after commit. Any prior attempt, including one with unknown or
-        zero cost, returns false; persistence failures raise instead of certifying.
+        Certification defaults false and requires trusted admission without paid prework.
+        Return true only after commit. Any prior attempt or uncertified terminal failure
+        returns false; persistence failures raise instead of certifying.
         """
         ...
 

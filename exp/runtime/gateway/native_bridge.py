@@ -91,6 +91,7 @@ from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
 from exp.runtime.gateway.native_decisions import NativeDecisionsMixin
 from exp.runtime.gateway.native_decode_boundary import NativeDecodeMixin
 from exp.runtime.gateway.native_dispatch_signing import NativeDispatchSigningMixin
+from exp.runtime.gateway.native_effects import admission_without_effects
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
 from exp.runtime.gateway.native_execution import (
     FrozenDispatchBinding,
@@ -721,6 +722,7 @@ class NativeControlPlane(
                 request=provider_request,
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
+                no_paid_prework=admission_without_effects(authorization, captured_request, policy),
                 policy=policy,
                 signers=tuple(signers),
                 dispatch_bindings=tuple(dispatch_bindings),

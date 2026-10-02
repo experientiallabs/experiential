@@ -210,6 +210,7 @@ def _admit_accepted(
             route=route,
             request=request,
             deadline_monotonic=deadline,
+            no_paid_prework=True,
             signers=(None,) * depth,
             dispatch_bindings=(None,) * depth,
             reasoning_carrier_authorities=(None,) * depth,

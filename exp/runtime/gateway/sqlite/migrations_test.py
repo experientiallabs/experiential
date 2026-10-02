@@ -1172,9 +1172,9 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
         assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
         if source_version >= 20:
-            assert (
-                tuple(migrated.execute("SELECT * FROM gateway_requests").fetchone())
-                == before_request
+            assert tuple(migrated.execute("SELECT * FROM gateway_requests").fetchone()) == (
+                *before_request,
+                0,
             )
             assert tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone()) == (
                 *before_attempt,

@@ -115,8 +115,7 @@ class NativeAttemptAccounting:
 
         Args:
             write_ledger: Blocking durable request and attempt ledger.
-            budget_error_factory: Optional hosted mapping for a rejected
-                reservation.
+            budget_error_factory: Optional mapping for a rejected reservation.
             default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
             cache_sample_gate: Predicate admitting a settled attempt to the cache-priority
                 EWMA. Hosts exclude promo-funded samples so subsidized replay cannot buy
@@ -416,8 +415,7 @@ class NativeAttemptAccounting:
         forced_overflow = False
         capacity_refused = False
         shed_records: dict[int, RungShed] = {}
-        # The input half of the reservation tokenizes the whole prompt, so it
-        # is computed once per ladder walk and shared with every candidate.
+        # Tokenize the input reservation once per ladder walk for all candidates.
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             with self._lock:
@@ -637,24 +635,23 @@ class NativeAttemptAccounting:
             )
         exhaustion = last_failure
         if exhaustion is None:
-            # Nothing dispatched and nothing classified: forced claims admit
-            # any non-throttled circuit, so an empty first claim means every
-            # deployment sits inside a provider throttle window.
+            # An empty forced claim means every deployment is provider-throttled.
+            # Otherwise report unavailable without a free-capacity certificate.
             throttled_remaining = self._health.throttled_remaining_seconds(keys)
             exhaustion = (
                 all_routes_throttled_failure(throttled_remaining)
                 if throttled_remaining is not None
                 else all_routes_unavailable_failure()
             )
-        no_dispatch = active and self.finish_request_quietly(
-            entry.authorization, ledger_failure(exhaustion)
+        certified = active and self.finish_request_quietly(
+            entry.authorization,
+            ledger_failure(exhaustion),
+            certify_no_effects=capacity_refused and entry.no_paid_prework,
         )
         with self._lock:
             if entry.pending_abandon is None:
                 self._inflight.pop(request_id, None)
-        return exhausted_attempt_payload(
-            exhaustion, known_unbilled=capacity_refused and no_dispatch
-        )
+        return exhausted_attempt_payload(exhaustion, known_unbilled=capacity_refused and certified)
 
     def settle(self, argument: str) -> str:
         """Durably settle one previously reserved attempt exactly once.
@@ -797,12 +794,15 @@ class NativeAttemptAccounting:
         self,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
+        *,
+        certify_no_effects: bool = False,
     ) -> bool:
-        """Return committed zero-attempt proof; failed writes never certify free work."""
+        """Return committed no-effects proof; failed writes never certify free work."""
         try:
             committed = self._write_ledger.finish_request(
                 authorization=authorization,
                 failure=failure,
+                certify_no_effects=certify_no_effects,
             )
             return committed is True
         except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.

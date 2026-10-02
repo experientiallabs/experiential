@@ -311,13 +311,14 @@ class _RecordingLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
+        certify_no_effects: bool = False,
     ) -> bool:
         """Record terminalization and report the fake's exact prior-attempt history."""
         if self.fail_request_finishes:
             self.fail_request_finishes -= 1
             raise RuntimeError("scripted request terminal-write failure")
         self.finished_requests.append(failure)
-        return authorization.request_id not in self.started_request_ids
+        return certify_no_effects and authorization.request_id not in self.started_request_ids
 
 
 def _registry() -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
@@ -1308,6 +1309,7 @@ def _admit(
     sticky_preferred: bool = False,
     reasoning_pinned_deployment_id: str | None = None,
     catalog_sha256: str = _DIGEST,
+    no_paid_prework: bool = True,
 ) -> InflightRequest:
     """Register one admitted request over the given rung ladder.
 
@@ -1347,6 +1349,7 @@ def _admit(
         route=route,
         request=_request(),
         deadline_monotonic=time.monotonic() + 30,
+        no_paid_prework=no_paid_prework,
         affinity_fingerprint=affinity_fingerprint,
         sticky_preferred=sticky_preferred,
     )
@@ -1420,17 +1423,18 @@ class TestLaneSaturation:
         _admit(registry, only, request_id="request-3")
         assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
 
+    @pytest.mark.parametrize("no_paid_prework", [False, True])
     @pytest.mark.parametrize("prior_attempt", [False, True])
     @pytest.mark.parametrize("write_fails", [False, True])
     def test_capacity_certificate_requires_durable_zero_attempt_proof(
-        self, prior_attempt: bool, write_fails: bool
+        self, prior_attempt: bool, write_fails: bool, no_paid_prework: bool
     ) -> None:
         """In-memory counters and a swallowed terminal error cannot certify free work."""
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
         only = (_deployment("deployment-a", connection_sha256="b" * 64),)
         _admit(registry, only, request_id="occupied")
-        _admit(registry, only, request_id="refused")
+        _admit(registry, only, request_id="refused", no_paid_prework=no_paid_prework)
         _start(registry, ordinal=0, request_id="occupied")
         if prior_attempt:
             ledger.started_request_ids.add("refused")
@@ -1438,7 +1442,9 @@ class TestLaneSaturation:
 
         response = _start(registry, ordinal=0, request_id="refused")
 
-        assert response.get("known_unbilled", False) is (not prior_attempt and not write_fails)
+        assert response.get("known_unbilled", False) is (
+            no_paid_prework and not prior_attempt and not write_fails
+        )
         assert registry.accounting_healthy is (not write_fails)
         assert len(ledger.started) == 1
 

@@ -608,8 +608,14 @@ def test_zero_attempt_certificate_waits_for_committed_terminal_state(
 
     def apply(connection: sqlite3.Connection, **kwargs: object) -> bool:
         """Hold the already-written transaction before its COMMIT."""
-        assert kwargs == {"authorization": authorization, "failure": failure}
-        result = original(connection, authorization=authorization, failure=failure)
+        assert kwargs == {
+            "authorization": authorization,
+            "failure": failure,
+            "certify_no_effects": True,
+        }
+        result = original(
+            connection, authorization=authorization, failure=failure, certify_no_effects=True
+        )
         applied.set()
         assert release.wait(10)
         return result
@@ -618,10 +624,14 @@ def test_zero_attempt_certificate_waits_for_committed_terminal_state(
         """Collect the result through the selected public facade."""
         if asynchronous:
             result = asyncio.run(
-                grouped.finish_request(authorization=authorization, failure=failure)
+                grouped.finish_request(
+                    authorization=authorization, failure=failure, certify_no_effects=True
+                )
             )
         else:
-            result = facade.finish_request(authorization=authorization, failure=failure)
+            result = facade.finish_request(
+                authorization=authorization, failure=failure, certify_no_effects=True
+            )
         results.append(result)
 
     worker = threading.Thread(target=finish)
@@ -665,20 +675,36 @@ def test_rolled_back_terminal_write_never_returns_zero_attempt_certificate(tmp_p
 
     def fail_after_write(connection: sqlite3.Connection, **kwargs: object) -> bool:
         """Inject storage failure after the proof was computed, before commit."""
-        assert kwargs == {"authorization": authorization, "failure": failure}
-        assert original(connection, authorization=authorization, failure=failure) is True
+        assert kwargs == {
+            "authorization": authorization,
+            "failure": failure,
+            "certify_no_effects": True,
+        }
+        assert (
+            original(
+                connection, authorization=authorization, failure=failure, certify_no_effects=True
+            )
+            is True
+        )
         raise sqlite3.OperationalError("terminal write lost before commit")
 
     try:
         with mock.patch.object(core, "apply_finish_request", side_effect=fail_after_write):
             with pytest.raises(sqlite3.OperationalError, match="before commit"):
-                facade.finish_request(authorization=authorization, failure=failure)
+                facade.finish_request(
+                    authorization=authorization, failure=failure, certify_no_effects=True
+                )
         with sqlite3.connect(tmp_path / "gateway.db") as reader:
             assert reader.execute(
                 "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
                 (authorization.request_id,),
             ).fetchone() == (None,)
-        assert facade.finish_request(authorization=authorization, failure=failure) is True
+        assert (
+            facade.finish_request(
+                authorization=authorization, failure=failure, certify_no_effects=True
+            )
+            is True
+        )
     finally:
         grouped.close()
 

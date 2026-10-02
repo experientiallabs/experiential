@@ -1452,6 +1452,7 @@ def test_zero_attempt_refusal_reenters_the_same_key_after_reopen(tmp_path: Path)
     assert (
         ledger.finish_request(
             authorization=original,
+            certify_no_effects=True,
             failure=GatewayFailure(
                 failure_class=GatewayFailureClass.THROTTLED,
                 safe_message="local lane capacity is full",
@@ -1497,6 +1498,7 @@ def test_no_dispatch_certificate_never_covers_an_unknown_attempt(tmp_path: Path)
     assert (
         ledger.finish_request(
             authorization=first,
+            certify_no_effects=True,
             failure=GatewayFailure(
                 failure_class=GatewayFailureClass.THROTTLED,
                 safe_message="remaining local lane capacity is full",
@@ -1518,8 +1520,11 @@ def test_no_dispatch_certificate_never_covers_an_unknown_attempt(tmp_path: Path)
         )
 
 
-def test_refused_same_key_reentry_admits_only_one_concurrent_owner(tmp_path: Path) -> None:
-    """Equal acceptance timestamps do not hide a newly accepted competing owner."""
+@pytest.mark.parametrize("rollback_seconds", [0, 60])
+def test_refused_same_key_reentry_admits_only_one_concurrent_owner(
+    tmp_path: Path, rollback_seconds: int
+) -> None:
+    """Equal or backwards wall time cannot hide the latest accepted owner."""
     clock = FakeLedgerClock()
     store, ledger, raw_key = _authority_fixture(tmp_path, clock)
     authorizations = tuple(
@@ -1534,10 +1539,13 @@ def test_refused_same_key_reentry_admits_only_one_concurrent_owner(tmp_path: Pat
     ledger.accept_request(authorization=authorizations[0])
     ledger.finish_request(
         authorization=authorizations[0],
+        certify_no_effects=True,
         failure=GatewayFailure(
             failure_class=GatewayFailureClass.THROTTLED, safe_message="local lane is full"
         ),
     )
+
+    clock.wall -= timedelta(seconds=rollback_seconds)
 
     def accept(authorization: AuthorizationSnapshot) -> bool:
         """Attempt one independently connected owner without mutating rejected work."""
@@ -1550,6 +1558,39 @@ def test_refused_same_key_reentry_admits_only_one_concurrent_owner(tmp_path: Pat
 
     with ThreadPoolExecutor(max_workers=8) as workers:
         assert sum(workers.map(accept, authorizations[1:])) == 1
+
+
+def test_uncertified_zero_attempt_failure_cannot_be_reentered_or_later_certified(
+    tmp_path: Path,
+) -> None:
+    """Missing model attempts cannot erase possible paid admission work."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    request = _request("same", idempotency_key="possible-paid-prework")
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED, safe_message="local lane is full"
+    )
+    assert ledger.finish_request(authorization=authorization, failure=failure) is False
+    assert (
+        ledger.finish_request(authorization=authorization, failure=failure, certify_no_effects=True)
+        is False
+    )
+    retry = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    restarted = SQLiteAttemptLedger(tmp_path / "gateway.db", clock=clock)
+    with pytest.raises(IdempotencyReplayUnavailableError):
+        restarted.accept_request(authorization=retry)
 
 
 def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Path) -> None:

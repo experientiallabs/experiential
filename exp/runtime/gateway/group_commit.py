@@ -327,16 +327,21 @@ class GroupCommitAttemptLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
+        certify_no_effects: bool = False,
     ) -> bool:
-        """Return zero-attempt proof only after the terminal write commits.
+        """Return the no-effects certificate only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted admission attestation; omitted callers cannot certify.
         """
         return await self._submit(
             lambda connection: self.core.apply_finish_request(
-                connection, authorization=authorization, failure=failure
+                connection,
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
             )
         )
 
@@ -736,16 +741,21 @@ class SyncGroupCommitLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
+        certify_no_effects: bool = False,
     ) -> bool:
-        """Return zero-attempt proof only after the terminal write commits.
+        """Return the no-effects certificate only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted admission attestation; omitted callers cannot certify.
         """
         return self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_request(
-                connection, authorization=authorization, failure=failure
+                connection,
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
             )
         )
 

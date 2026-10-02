@@ -90,6 +90,7 @@ _DRIVER_SOURCE = textwrap.dedent(
         control_plane = control_plane_type(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
+            default_lane_bound=config.get("default_lane_bound"),
         )
         last_error = None
         for _attempt in range(5):

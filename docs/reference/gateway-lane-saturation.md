@@ -53,15 +53,22 @@ shed reason (`shed_keeps_pin`), the documented continuity-over-spill trade.
 ## Durable retry and billing proof
 
 A local capacity refusal carries `x-gateway-admission-refused: true` only after the
-request's terminal ledger write commits and proves that no provider attempt was recorded.
+request's terminal ledger write commits a `failed_without_effects` certificate. Admission
+must attest a direct target without web search or input-classifier checks, and the ledger
+must verify that no provider attempt was recorded under the same serialized write lock.
+Routed requests, requested searches and input checks remain uncertified because they can
+incur charges before a model attempt. Historical and unspecified finishes default to false;
+a later finish cannot upgrade an uncertified terminal record.
 The same `Idempotency-Key` and request content can then retry safely: acceptance atomically
-checks the prior failed request and admits only one new owner. Completed requests still
+checks the prior certified failure and admits only one new owner. Insertion order identifies
+the newest owner even when wall time moves backwards. Completed requests still
 replay normally. Any recorded attempt, even one with zero reported cost, keeps the existing
 replay barrier and conservative accounting. A failed terminal write never certifies free work.
 
-`AttemptLedger.finish_request` and `SyncWriteLedger.finish_request` return this committed
-zero-attempt boolean. Custom ledger adapters must serialize the proof with attempt admission
-and return it only after commit. HTTP relays must strip upstream copies of the reserved
+`AttemptLedger.finish_request` and `SyncWriteLedger.finish_request` accept the trusted
+`certify_no_effects=False` keyword and return the committed certificate. Custom ledger
+adapters must persist it only on the first failed terminal transition, serialize its zero-attempt
+check with attempt admission, and return it only after commit. HTTP relays strip upstream copies of the reserved
 header; only their own durable admission authority can certify a local refusal. A generic
 provider HTTP 429 is not proof of an unpaid request.
 

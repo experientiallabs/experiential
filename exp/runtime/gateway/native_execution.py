@@ -171,6 +171,7 @@ class InflightRequest:
         recovery_recorded_attempts: Attempts whose recovery effects already ran, initially empty.
         recovery_reason: Optional content-free reason for the admitted recovery placement.
         denied_destination_pools: Exactly bound destination-only budget refusals in this request.
+        no_paid_prework: Trusted admission without possible paid prework, default false.
         explicit_cache_state: Private marked-prefix plans and durable operation bindings,
             absent unless a host provides explicit cache spending authority.
     """
@@ -179,6 +180,7 @@ class InflightRequest:
     route: GatewayRoute
     request: ServingRequest
     deadline_monotonic: float
+    no_paid_prework: bool = field(default=False, kw_only=True)
     attempt_counts: list[int] = field(default_factory=list)
     ordinary_attempt_counts: list[int] = field(default_factory=list)
     attempt_policy: RequestAttemptPolicy = field(default_factory=RequestAttemptPolicy)

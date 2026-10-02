@@ -121,11 +121,13 @@ class AttemptLedger(Protocol):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
+        certify_no_effects: bool = False,
     ) -> bool:
-        """Terminalize work, returning committed proof that no attempt row exists.
+        """Terminalize work, returning a committed no-effects certificate.
 
-        The terminal write and attempt-absence check must serialize with attempt creation.
-        A failed write raises; a request with any attempt returns false, regardless of cost.
+        Certification defaults false and requires trusted admission without paid prework.
+        The terminal write and attempt-absence check serialize with attempt creation.
+        Historical failures and any prior attempt remain uncertified; failed writes raise.
         """
         ...
 
