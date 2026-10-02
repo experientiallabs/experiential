@@ -135,6 +135,9 @@ pub(crate) fn error_response(error: &PublicError) -> Response {
     if let Some(wait) = error.retry_after_seconds {
         builder = builder.header(header::RETRY_AFTER, wait.to_string());
     }
+    if error.status_code == 429 && error.known_unbilled {
+        builder = builder.header("x-gateway-admission-refused", "true");
+    }
     builder
         .body(Body::from(compact_json(&error.json_body())))
         .unwrap_or_else(|_| Response::new(Body::empty()))
@@ -433,6 +436,30 @@ pub(crate) async fn finish_stream_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_certified_429_responses_publish_the_admission_marker() {
+        for (status, certified, expected) in [
+            (429, true, Some("true")),
+            (429, false, None),
+            (409, true, None),
+            (502, true, None),
+        ] {
+            let mut error = PublicError::new(status, "unavailable_route", "busy", "api_error");
+            error.retry_after_seconds = Some(5);
+            error.known_unbilled = certified;
+            let response = error_response(&error);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-gateway-admission-refused")
+                    .map(|v| v.to_str().unwrap()),
+                expected
+            );
+            assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+            assert!(error.json_body()["error"].get("known_unbilled").is_none());
+        }
+    }
 
     #[test]
     fn repeated_list_header_lines_join_in_arrival_order() {

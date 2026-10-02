@@ -142,6 +142,9 @@ pub(crate) struct StartResponse {
     pub(crate) exhausted: bool,
     #[serde(default)]
     pub(crate) failure: Option<Failure>,
+    /// A durable zero-attempt certificate from the trusted accounting callback.
+    #[serde(default)]
+    pub(crate) known_unbilled: bool,
 }
 
 /// One pre-commit attempt outcome, private to the waterfall loop.
@@ -302,7 +305,9 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 )
             });
             let failure = with_largest_retry_after(failure, largest_retry_after);
-            return Won::Failed(collection_public_error(&failure.boundary()));
+            let mut error = collection_public_error(&failure.boundary());
+            error.known_unbilled = started.known_unbilled;
+            return Won::Failed(error);
         }
         let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
             guard

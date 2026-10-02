@@ -196,12 +196,14 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         if authorization.caller_operation_sha256 is not None:
             prior = connection.execute(
                 """
-                SELECT canonical_request_sha256, terminal_state
+                SELECT canonical_request_sha256, terminal_state,
+                  NOT EXISTS (SELECT 1 FROM gateway_attempts AS a
+                    WHERE a.request_id = gateway_requests.request_id) AS no_dispatch
                 FROM gateway_requests
                 WHERE organization_id = ? AND identity_id = ?
                   AND alias_revision_id = ? AND api_surface = ?
                   AND caller_operation_sha256 = ?
-                ORDER BY accepted_at DESC LIMIT 1
+                ORDER BY accepted_at DESC, rowid DESC LIMIT 1
                 """,
                 (
                     authorization.organization_id,
@@ -215,18 +217,15 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 if str(prior["canonical_request_sha256"]) != (
                     authorization.canonical_request_sha256
                 ):
-                    # Deliberately fail closed even when the prior attempt
-                    # failed: after an ambiguous failure the provider may
-                    # have executed, so different content under one
-                    # operation identity is a client bug the key exists to
-                    # surface. Retrying different content needs a new key.
+                    # A failed request never authorizes different content under the same key.
                     raise IdempotencyConflictError(
                         "caller operation key was reused with different request content"
                     )
-                if str(prior["terminal_state"]) not in {
-                    "expired_before_dispatch",
-                    "unknown_after_crash",
-                }:
+                if not (
+                    str(prior["terminal_state"])
+                    in {"expired_before_dispatch", "unknown_after_crash"}
+                    or (prior["terminal_state"] == "failed" and prior["no_dispatch"])
+                ):
                     raise IdempotencyReplayUnavailableError(
                         "matching keyed request exists but durable content replay is unavailable"
                     )
@@ -767,15 +766,17 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Idempotently terminalize accepted work that never reached dispatch.
+    ) -> bool:
+        """Terminalize accepted work and return committed proof of zero attempts.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
         """
         with self._transaction() as connection:
-            self.apply_finish_request(connection, authorization=authorization, failure=failure)
+            return self.apply_finish_request(
+                connection, authorization=authorization, failure=failure
+            )
 
     def apply_finish_request(
         self,
@@ -783,8 +784,8 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Run the pre-dispatch settlement inside the caller's open write transaction.
+    ) -> bool:
+        """Return zero-attempt proof inside the write fence; expose it only after commit.
 
         Args:
             connection: Open write transaction owned by the caller.
@@ -795,7 +796,10 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         del normalized_failure, _failure_message
         row = connection.execute(
             """
-            SELECT organization_id, terminal_state FROM gateway_requests
+            SELECT organization_id, terminal_state,
+              NOT EXISTS (SELECT 1 FROM gateway_attempts AS a
+                WHERE a.request_id = gateway_requests.request_id) AS no_dispatch
+            FROM gateway_requests
             WHERE request_id = ?
             """,
             (authorization.request_id,),
@@ -807,7 +811,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         current = row["terminal_state"]
         if current is not None:
             if str(current) == state:
-                return
+                return bool(row["no_dispatch"])
             raise GatewayLedgerError("request is already settled with another terminal state")
         connection.execute(
             """
@@ -816,6 +820,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             """,
             (state, utc_text(self._clock.now()), authorization.request_id),
         )
+        return bool(row["no_dispatch"])
 
     def reconcile_crashed_requests(self, *, cleanup_grace: timedelta) -> tuple[int, int]:
         """Settle expired pre-dispatch and dispatched work after a crash.

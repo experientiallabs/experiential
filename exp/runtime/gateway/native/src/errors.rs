@@ -18,6 +18,10 @@ pub struct PublicError {
     pub param: Option<String>,
     #[serde(default)]
     pub retry_after_seconds: Option<u32>,
+    /// Committed control-plane proof that this admission created no provider attempt.
+    /// Never derived from upstream headers or a provider error body.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub known_unbilled: bool,
     /// The bounded category of a provider refusal (`code: refusal` only):
     /// every refusal answer carries one, `unspecified` when the provider
     /// named no reason. Absent on every other error.
@@ -29,6 +33,10 @@ fn default_error_type() -> String {
     "invalid_request_error".to_string()
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl PublicError {
     pub fn new(status_code: u16, code: &str, message: &str, error_type: &str) -> Self {
         Self {
@@ -38,6 +46,7 @@ impl PublicError {
             error_type: error_type.to_string(),
             param: None,
             retry_after_seconds: None,
+            known_unbilled: false,
             refusal_reason: None,
         }
     }

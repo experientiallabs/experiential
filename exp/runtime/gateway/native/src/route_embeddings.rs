@@ -201,7 +201,9 @@ async fn run_ladder(
                     "all exact-model deployments are unavailable",
                 )
             });
-            return Err(collection_public_error(&failure.boundary()));
+            let mut error = collection_public_error(&failure.boundary());
+            error.known_unbilled = started.known_unbilled;
+            return Err(error);
         }
         let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
             guard

@@ -327,14 +327,14 @@ class GroupCommitAttemptLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Durably terminalize accepted work that never reached dispatch.
+    ) -> bool:
+        """Return zero-attempt proof only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
         """
-        await self._submit(
+        return await self._submit(
             lambda connection: self.core.apply_finish_request(
                 connection, authorization=authorization, failure=failure
             )
@@ -736,14 +736,14 @@ class SyncGroupCommitLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Durably terminalize accepted work that never reached dispatch.
+    ) -> bool:
+        """Return zero-attempt proof only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
         """
-        self._writer.submit_blocking(
+        return self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_request(
                 connection, authorization=authorization, failure=failure
             )

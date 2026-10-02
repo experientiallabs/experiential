@@ -121,8 +121,12 @@ class AttemptLedger(Protocol):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Terminalize accepted work that failed before a provider dispatch existed."""
+    ) -> bool:
+        """Terminalize work, returning committed proof that no attempt row exists.
+
+        The terminal write and attempt-absence check must serialize with attempt creation.
+        A failed write raises; a request with any attempt returns false, regardless of cost.
+        """
         ...
 
 

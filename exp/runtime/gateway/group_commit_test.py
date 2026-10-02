@@ -24,6 +24,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
+    GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
     GatewayUsage,
@@ -584,6 +585,102 @@ def test_closed_writer_rejects_sync_operations(tmp_path: Path) -> None:
     grouped.close()
     with pytest.raises(RuntimeError, match="closed"):
         facade.flush()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_zero_attempt_certificate_waits_for_committed_terminal_state(
+    tmp_path: Path, asynchronous: bool
+) -> None:
+    """Both facades expose the certificate only after the writer commits it."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "capacity-refusal")
+    facade.accept_request(authorization=authorization)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED, safe_message="local capacity exhausted"
+    )
+    applied = threading.Event()
+    release = threading.Event()
+    results: list[bool] = []
+    original = core.apply_finish_request
+
+    def apply(connection: sqlite3.Connection, **kwargs: object) -> bool:
+        """Hold the already-written transaction before its COMMIT."""
+        assert kwargs == {"authorization": authorization, "failure": failure}
+        result = original(connection, authorization=authorization, failure=failure)
+        applied.set()
+        assert release.wait(10)
+        return result
+
+    def finish() -> None:
+        """Collect the result through the selected public facade."""
+        if asynchronous:
+            result = asyncio.run(
+                grouped.finish_request(authorization=authorization, failure=failure)
+            )
+        else:
+            result = facade.finish_request(authorization=authorization, failure=failure)
+        results.append(result)
+
+    worker = threading.Thread(target=finish)
+    try:
+        with mock.patch.object(core, "apply_finish_request", side_effect=apply):
+            worker.start()
+            assert applied.wait(10)
+            assert results == []
+            with sqlite3.connect(tmp_path / "gateway.db") as reader:
+                assert reader.execute(
+                    "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+                    (authorization.request_id,),
+                ).fetchone() == (None,)
+            release.set()
+            worker.join(10)
+            assert not worker.is_alive()
+        assert results == [True]
+        with sqlite3.connect(tmp_path / "gateway.db") as reader:
+            assert reader.execute(
+                "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+                (authorization.request_id,),
+            ).fetchone() == ("failed",)
+    finally:
+        release.set()
+        worker.join(10)
+        grouped.close()
+
+
+def test_rolled_back_terminal_write_never_returns_zero_attempt_certificate(tmp_path: Path) -> None:
+    """A failure after the SQL update rolls it back and fails the waiting caller."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "rolled-back-refusal")
+    facade.accept_request(authorization=authorization)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED, safe_message="local capacity exhausted"
+    )
+    original = core.apply_finish_request
+
+    def fail_after_write(connection: sqlite3.Connection, **kwargs: object) -> bool:
+        """Inject storage failure after the proof was computed, before commit."""
+        assert kwargs == {"authorization": authorization, "failure": failure}
+        assert original(connection, authorization=authorization, failure=failure) is True
+        raise sqlite3.OperationalError("terminal write lost before commit")
+
+    try:
+        with mock.patch.object(core, "apply_finish_request", side_effect=fail_after_write):
+            with pytest.raises(sqlite3.OperationalError, match="before commit"):
+                facade.finish_request(authorization=authorization, failure=failure)
+        with sqlite3.connect(tmp_path / "gateway.db") as reader:
+            assert reader.execute(
+                "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+                (authorization.request_id,),
+            ).fetchone() == (None,)
+        assert facade.finish_request(authorization=authorization, failure=failure) is True
+    finally:
+        grouped.close()
 
 
 def test_batch_machinery_failure_fails_blocked_callers_and_writer_recovers(

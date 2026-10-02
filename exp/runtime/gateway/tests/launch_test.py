@@ -40,18 +40,20 @@ exp_gateway_native = pytest.importorskip("exp_gateway_native")
 class _ServedGateway:
     """One native gateway served on a loopback port in a background thread."""
 
-    def __init__(self, root: Path, port: int) -> None:
+    def __init__(self, root: Path, port: int, *, default_lane_bound: int | None = None) -> None:
         """Load components over the seeded root and bind the serving facts.
 
         Args:
             root: Initialized EXP root whose granted aliases are served.
             port: Loopback port the native plane will bind.
+            default_lane_bound: Maximum concurrent attempts in one physical lane.
         """
         self.port = port
         self.components = load_gateway_components(root)
         self.control_plane = NativeControlPlane(
             self.components,
             data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
+            default_lane_bound=default_lane_bound,
         )
         self.shutdown = exp_gateway_native.shutdown_handle()
         self.error: BaseException | None = None

@@ -1433,6 +1433,125 @@ def test_a_failed_keyed_request_still_conflicts_a_mutated_retry(tmp_path: Path) 
         ledger.accept_request(authorization=mutated)
 
 
+def test_zero_attempt_refusal_reenters_the_same_key_after_reopen(tmp_path: Path) -> None:
+    """A durable refusal before dispatch retains evidence without poisoning its key."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+
+    def authorize() -> AuthorizationSnapshot:
+        """Create a fresh request for the exact same caller operation and content."""
+        return store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request("same", idempotency_key="capacity-operation"),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+
+    original = authorize()
+    ledger.accept_request(authorization=original)
+    assert (
+        ledger.finish_request(
+            authorization=original,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.THROTTLED,
+                safe_message="local lane capacity is full",
+            ),
+        )
+        is True
+    )
+    restarted = SQLiteAttemptLedger(tmp_path / "gateway.db", clock=clock)
+    retry = authorize()
+    restarted.accept_request(authorization=retry)
+    with pytest.raises(IdempotencyReplayUnavailableError):
+        restarted.accept_request(authorization=authorize())
+    with pytest.raises(GatewayLedgerError, match="already terminal"):
+        restarted.start_attempt(
+            snapshot=_execution(original),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+        )
+    restarted.start_attempt(
+        snapshot=_execution(retry), deployment=_deployment(), attempt_ordinal=0, route_depth=0
+    )
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 1
+
+
+def test_no_dispatch_certificate_never_covers_an_unknown_attempt(tmp_path: Path) -> None:
+    """A reserved attempt keeps its replay barrier even if the next rung is full."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    request = _request("same", idempotency_key="mixed-operation")
+    first = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=first)
+    ledger.start_attempt(
+        snapshot=_execution(first), deployment=_deployment(), attempt_ordinal=0, route_depth=0
+    )
+    assert (
+        ledger.finish_request(
+            authorization=first,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.THROTTLED,
+                safe_message="remaining local lane capacity is full",
+            ),
+        )
+        is False
+    )
+    retry = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    with pytest.raises(IdempotencyReplayUnavailableError):
+        ledger.accept_request(authorization=retry)
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        assert (
+            connection.execute("SELECT state FROM gateway_attempts").fetchone()[0] == "dispatched"
+        )
+
+
+def test_refused_same_key_reentry_admits_only_one_concurrent_owner(tmp_path: Path) -> None:
+    """Equal acceptance timestamps do not hide a newly accepted competing owner."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorizations = tuple(
+        store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request("same", idempotency_key="concurrent-capacity-operation"),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        for _ in range(9)
+    )
+    ledger.accept_request(authorization=authorizations[0])
+    ledger.finish_request(
+        authorization=authorizations[0],
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED, safe_message="local lane is full"
+        ),
+    )
+
+    def accept(authorization: AuthorizationSnapshot) -> bool:
+        """Attempt one independently connected owner without mutating rejected work."""
+        contender = SQLiteAttemptLedger(tmp_path / "gateway.db", clock=clock)
+        try:
+            contender.accept_request(authorization=authorization)
+        except IdempotencyReplayUnavailableError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        assert sum(workers.map(accept, authorizations[1:])) == 1
+
+
 def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Path) -> None:
     """Expired accepted work is free while dispatched work becomes unknown after crash."""
     clock = FakeLedgerClock()

@@ -50,6 +50,21 @@ bypass that was not a registry shed (a cold throttle failover) keeps the histori
 A reasoning-pinned continuation's first dispatch still force-admits its pinned rung for every
 shed reason (`shed_keeps_pin`), the documented continuity-over-spill trade.
 
+## Durable retry and billing proof
+
+A local capacity refusal carries `x-gateway-admission-refused: true` only after the
+request's terminal ledger write commits and proves that no provider attempt was recorded.
+The same `Idempotency-Key` and request content can then retry safely: acceptance atomically
+checks the prior failed request and admits only one new owner. Completed requests still
+replay normally. Any recorded attempt, even one with zero reported cost, keeps the existing
+replay barrier and conservative accounting. A failed terminal write never certifies free work.
+
+`AttemptLedger.finish_request` and `SyncWriteLedger.finish_request` return this committed
+zero-attempt boolean. Custom ledger adapters must serialize the proof with attempt admission
+and return it only after commit. HTTP relays must strip upstream copies of the reserved
+header; only their own durable admission authority can certify a local refusal. A generic
+provider HTTP 429 is not proof of an unpaid request.
+
 ## Metrics
 
 `rung_admission_counters()` returns `(sheds, saturated_overflows, saturation_refusals)`;

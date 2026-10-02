@@ -3319,7 +3319,7 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
-    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> bool:
         recorded.append(failure)
         return original_finish(authorization, failure)
 
@@ -3355,7 +3355,7 @@ def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
-    def _capture(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+    def _capture(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> bool:
         recorded.append(failure)
         return original_finish(authorization, failure)
 
@@ -5556,7 +5556,7 @@ def test_capability_rejection_names_the_public_request_field(
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
-    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> bool:
         recorded.append(failure)
         return original_finish(authorization, failure)
 
