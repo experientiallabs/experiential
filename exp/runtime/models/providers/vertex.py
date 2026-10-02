@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField, ModelRequest, ModelResponse, ModelSnapshot
+from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     ProviderDeadlineExceeded,
@@ -43,7 +44,11 @@ from exp.runtime.models.providers.openai_compatible import (
     OpenAICompatibleClient,
     openai_compatible_request,
 )
-from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
+from exp.runtime.models.providers.transport import (
+    JsonHttpTransport,
+    ProviderTransportError,
+    RetryPolicy,
+)
 
 VERTEX_TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 """OAuth scope requested for every Vertex access token."""
@@ -114,7 +119,7 @@ def vertex_openapi_model_id(model_id: str) -> str:
     return f"{match.group(1)}/{match.group(2)}"
 
 
-class VertexCredentialError(ValueError):
+class VertexCredentialError(ModelCredentialError):
     """A Vertex service-account credential could not mint a usable OAuth access token."""
 
 
@@ -211,13 +216,27 @@ class ServiceAccountTokenProvider:
             A non-empty OAuth access token.
 
         Raises:
-            VertexCredentialError: Google's token endpoint returned no usable token.
+            VertexCredentialError: Google refused the credential or returned no usable token.
+            ProviderTransportError: The token endpoint failed temporarily or could not be reached.
         """
         with self._lock:
             if not self._credentials.valid:
+                from google.auth.exceptions import RefreshError, TransportError
                 from google.auth.transport.requests import Request
 
-                self._credentials.refresh(Request())
+                try:
+                    self._credentials.refresh(Request())
+                except TransportError as exc:
+                    raise ProviderTransportError("Vertex token endpoint request failed") from exc
+                except RefreshError as exc:
+                    if exc.retryable:
+                        raise ProviderTransportError(
+                            "Vertex token endpoint request failed"
+                        ) from exc
+                    raise VertexCredentialError(
+                        "Google refused the Vertex service-account credential; verify the key "
+                        "exists and has Vertex AI permission"
+                    ) from exc
             token = self._credentials.token
             if not token:
                 raise VertexCredentialError(
