@@ -36,13 +36,21 @@ inline evidence; this format does not summarize or trim it. Packing removes a co
 no retained example references it, and checks reference integrity even when the full request fits.
 
 Prompt identity is immutable. An older grounded-world artifact is rejected with an instruction
-to prepare a new one; its saved evaluations and receipts are not rewritten. Python applications
-can call `persist_grounded_world_model` with the unchanged serving RAG pointer, then
+to prepare a new one; its saved evaluations and receipts are not rewritten. For a plain evaluation
+project with `system`, `build_spend_ledger`, `hosted_judge`, `router_policy` and `router_report`
+all unset, Python applications can call `persist_grounded_world_model` with the unchanged serving
+RAG pointer, then
 `select_completed_build` with the same trace, task, fit/serving RAG and review pointers plus the new
 world-model manifest. Pass `trace_import_id=project.load_project().trace_import_id` to retain the
 project's existing import association; omitting it clears that association. This materializes the
 current prompt without re-embedding source evidence.
 Prepare a new evaluation afterward; never resume a frozen preparation under a different prompt.
+
+Do not use this generic selector to refresh a hosted optimizer project. Its frozen build-spend
+ledger and downstream judge, policy and report selections bind the original world-model artifact;
+replacing only the build pointer breaks that graph. Create a fresh hosted setup through the hosted
+workflow instead, leaving the original project, stage ledgers and selected results intact. This
+release provides no in-place hosted-project prompt migration.
 
 Before a text-world request is dispatched, optional retrieved examples are packed in priority
 order as whole examples within the model context and frozen input reservation. Required task

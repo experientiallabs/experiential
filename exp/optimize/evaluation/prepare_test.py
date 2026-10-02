@@ -121,7 +121,7 @@ def test_prepare_freezes_replayable_catalog_selection_without_provider_access(
 def test_new_prompt_preparation_reuses_immutable_build_evidence_without_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Reject a stale prompt and reuse exact task/RAG bytes through a new world artifact."""
+    """Refresh a plain evaluation project without altering its immutable input evidence."""
     with monkeypatch.context() as producer:
         producer.setattr(
             world_artifact, "GROUNDED_WORLD_MODEL_PROMPT_VERSION", "text-world-model-v2"
@@ -141,6 +141,11 @@ def test_new_prompt_preparation_reuses_immutable_build_evidence_without_calls(
     )
     project.bind_completed_build(build, trace_import_id=receipt.import_id)
     original_config = project.load_project()
+    assert original_config.system is None
+    assert original_config.build_spend_ledger is None
+    assert original_config.hosted_judge is None
+    assert original_config.router_policy is None
+    assert original_config.router_report is None
     old_bytes = project.artifacts.read_bytes(
         build.world_model.artifact_id, WORLD_MODEL_ARTIFACT_PATH
     )
