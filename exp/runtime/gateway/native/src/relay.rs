@@ -330,6 +330,7 @@ impl UpstreamRelay {
     }
 
     fn queue_events(&mut self, events: Vec<Event>) {
+        self.observe_unexposed_reasoning_progress();
         if let Some(observation) = &self.observation {
             observation.record_service_tier(&self.normalizer.service_tier);
             // Several dialects retain a parsed meter until terminal encoding.

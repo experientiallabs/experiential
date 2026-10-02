@@ -109,6 +109,11 @@ fn frame_key_names(payload: &serde_json::Map<String, Value>) -> String {
 }
 
 impl Normalizer {
+    /// Consume a progress observation without retaining or exposing its text.
+    pub(crate) fn take_unexposed_reasoning_progress(&mut self) -> bool {
+        std::mem::take(&mut self.unexposed_reasoning_progress)
+    }
+
     pub(in crate::dialects) fn feed_openai_compatible(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -252,12 +257,12 @@ impl Normalizer {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
+        let reasoning = delta
+            .get("reasoning_content")
+            .filter(|value| !value.is_null())
+            .or_else(|| delta.get("reasoning"));
         if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
-            if let Some(value) = delta
-                .get("reasoning_content")
-                .filter(|value| !value.is_null())
-                .or_else(|| delta.get("reasoning"))
-            {
+            if let Some(value) = reasoning {
                 let reasoning = match value {
                     Value::Null => None,
                     Value::String(text) => Some(text),
@@ -271,6 +276,11 @@ impl Normalizer {
                     });
                 }
             }
+        } else if reasoning
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        {
+            self.unexposed_reasoning_progress = true;
         }
         if let Some(raw_tools) = delta.get("tool_calls") {
             if !raw_tools.is_null() {

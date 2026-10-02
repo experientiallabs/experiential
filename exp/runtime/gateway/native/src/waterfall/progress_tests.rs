@@ -7,6 +7,10 @@ use tokio::io::AsyncWriteExt;
 
 const REASONING: &str =
     "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private thought\"}}]}\n\n";
+const REASONING_ALIAS: &str =
+    "data: {\"choices\":[{\"delta\":{\"reasoning\":\"private thought\"}}]}\n\n";
+const REASONING_NULL_ALIAS: &str =
+    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"reasoning\":\"private thought\"}}]}\n\n";
 const TEXT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n";
 const DONE: &str = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\ndata: [DONE]\n\n";
 const SECONDARY: &[&str] = &["{\"choices\":[{\"delta\":{\"content\":\"secondary\"}}]}"];
@@ -123,6 +127,122 @@ fn active_private_reasoning_survives_first_token_window_and_retains_the_winner()
             .settle("completed", committed.usage.as_ref(), &[], None, true)
             .await;
         assert_eq!(harness.story().await["counts"], json!([1, 0]));
+    });
+}
+
+#[test]
+fn unexposed_compatible_reasoning_keeps_generation_alive_without_a_carrier() {
+    block_on(async {
+        for (reasoning, after_visible_output) in [
+            (REASONING, false),
+            (REASONING, true),
+            (REASONING_ALIAS, false),
+            (REASONING_ALIAS, true),
+            (REASONING_NULL_ALIAS, false),
+            (REASONING_NULL_ALIAS, true),
+        ] {
+            let mut frames = Vec::new();
+            if after_visible_output {
+                frames.push(TEXT);
+            }
+            frames.extend(std::iter::repeat_n(reasoning, 12));
+            frames.extend([TEXT, DONE]);
+            let primary = paced_rung(frames).await;
+            let harness = Harness::new();
+            let mut rung = private_wire(&primary);
+            rung.fireworks_reasoning_route_sha256 = None;
+            let (won, mut guard) = harness.run(&[rung], None, Duration::from_secs(3)).await;
+            let Won::Committed(mut committed) = won else {
+                panic!("unexposed reasoning is generation progress before visible output")
+            };
+            let events = collect_committed(
+                &mut committed,
+                Instant::now() + Duration::from_secs(2),
+                Duration::from_millis(150),
+                guard.started,
+            )
+            .await
+            .expect("unexposed reasoning is generation progress after visible output");
+            assert!(matches!(events.last(), Some(Event::Completed)));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::ReasoningContentDelta { .. })));
+            let public = crate::encode::completed_chat_body_with_ignored(
+                "request-private",
+                "kimi",
+                1,
+                &events,
+                &[],
+                false,
+            )
+            .unwrap();
+            assert!(!public.body.to_string().contains("private thought"));
+            assert!(public.body["choices"][0]["message"]
+                .get("reasoning_content")
+                .is_none());
+            let text: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::TextDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                text,
+                "answer".repeat(if after_visible_output { 2 } else { 1 })
+            );
+            guard
+                .settle("completed", committed.usage.as_ref(), &[], None, true)
+                .await;
+            assert_eq!(harness.story().await["counts"], json!([1, 0]));
+        }
+    });
+}
+
+#[test]
+fn empty_unexposed_reasoning_and_usage_do_not_renew_progress() {
+    block_on(async {
+        let empty = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"}}]}\n\n";
+        let empty_alias =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"reasoning\":\"\"}}]}\n\n";
+        let usage =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n";
+        let mut frames = vec![REASONING];
+        frames.extend([empty, empty_alias, usage, ": ping\n\n"].repeat(7));
+        let primary = paced_rung(frames).await;
+        let secondary = spawn_rung(vec![Answer::Stream(SECONDARY)]).await;
+        let harness = Harness::new();
+        let mut rung = private_wire(&primary);
+        rung.fireworks_reasoning_route_sha256 = None;
+        let (won, _guard) = harness
+            .run(
+                &[rung, wire("secondary", &secondary.url, 0)],
+                None,
+                Duration::from_secs(3),
+            )
+            .await;
+        let Won::Committed(committed) = won else {
+            panic!("empty deltas must allow failover")
+        };
+        assert_eq!(committed.depth, 1);
+        let story = harness.story().await;
+        assert_eq!(story["settles"][0]["failure"]["failure_class"], "transport");
+    });
+}
+
+#[test]
+fn unexposed_reasoning_cannot_extend_the_total_request_deadline() {
+    block_on(async {
+        let primary = paced_rung(vec![REASONING; 20]).await;
+        let harness = Harness::new();
+        let mut rung = private_wire(&primary);
+        rung.fireworks_reasoning_route_sha256 = None;
+        let (won, _guard) = harness.run(&[rung], None, Duration::from_millis(180)).await;
+        assert!(matches!(won, Won::Failed(_)));
+        assert_eq!(
+            harness.story().await["settles"][0]["failure"]["failure_class"],
+            "timeout"
+        );
     });
 }
 

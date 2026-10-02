@@ -43,6 +43,36 @@ async fn first_token_at_is_stamped_on_the_first_output_delta() {
 }
 
 #[tokio::test]
+async fn discarded_reasoning_is_progress_without_a_first_token_measurement() {
+    let frames = vec![
+        Ok::<_, reqwest::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private thought\"}}]}\n\n",
+        )),
+        Ok::<_, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+    ];
+    let started = Instant::now();
+    let mut relay = UpstreamRelay::from_stream(
+        stream::iter(frames).boxed(),
+        Dialect::OpenAiCompatible,
+        started + Duration::from_secs(5),
+    );
+    let event = relay
+        .next_event(
+            started + Duration::from_secs(30),
+            Duration::from_secs(5),
+            started,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, Event::Completed));
+    assert!(relay.last_progress_at.is_some());
+    assert!(!relay.stall_bound_armed);
+    assert!(!relay.committed);
+    assert!(relay.first_token_at().is_none());
+}
+
+#[tokio::test]
 async fn stop_sequences_cut_the_relayed_text_and_keep_usage_and_settlement_exact() {
     // A Chat-compatible stream stands in for any dialect: "</block>" spans
     // two content deltas, more text follows it, then usage and the
