@@ -73,10 +73,12 @@ class Plane:
                     if self.first_depth is not None
                     else next(i for i, rules in enumerate(self.rules) if rules is None)
                 )
+            elif data.get("reasoning_repair"):
+                candidate = depth
             elif (
                 data.get("throttle_backoff")
                 and failure["failure_class"] == "throttled"
-                and self.counts[depth] <= self.max_redials
+                and sum(1 for start in self.starts if start.get("throttle_backoff") and start.get("current_depth") == depth) <= self.max_redials
             ):
                 candidate = depth
             elif depth + 1 < len(self.counts) and self.admits(depth + 1, failure):
@@ -125,6 +127,8 @@ pub(super) enum Answer {
     Throttle(Option<u32>),
     /// A 400 carrying this exact JSON body.
     Rejected(&'static str),
+    /// A 403 carrying this exact JSON body.
+    Forbidden(&'static str),
     /// A 200 event stream carrying these SSE frames, then `[DONE]`.
     Stream(&'static [&'static str]),
     /// A 200 native Responses event stream carrying these SSE frames and
@@ -139,11 +143,18 @@ pub(super) enum Answer {
 
 fn render(answer: &Answer) -> String {
     match answer {
-        Answer::Rejected(body) => format!(
-            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len(),
-        ),
+        Answer::Rejected(body) | Answer::Forbidden(body) => {
+            let status = if matches!(answer, Answer::Forbidden(_)) {
+                "403 Forbidden"
+            } else {
+                "400 Bad Request"
+            };
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+        }
         Answer::Throttle(retry_after) => {
             let body = "{\"error\":{\"message\":\"We're currently processing too many requests - \
                         please try again later\",\"type\":\"server_error\",\"code\":null}}";
@@ -260,11 +271,15 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
+        exact_model_id: "fixture-model".into(),
         dialect: "openai_compatible".to_string(),
         url: url.to_string(),
         headers: HashMap::new(),
         model_id: "gpt-test".to_string(),
         billing_customer_managed: false,
+        explicit_cache: false,
+        automatic_cache: false,
+        automatic_cache_written_tokens: None,
         timeout_seconds: 10.0,
         upstream_payload: json!({
             "model": "gpt-test",
@@ -277,12 +292,14 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        cache_writes_within_reads: false,
         image_output: false,
         idempotency_key: format!("op-{deployment_id}"),
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
         time_to_first_token_base_seconds: None,
         throttle_redial_budget,
+        throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
     }
@@ -368,14 +385,14 @@ const THROTTLE_FRAME: &str = "{\"error\":{\"code\":\"rate_limit_exceeded\",\
 /// Everything one ladder run needs, kept alive together.
 pub(super) struct Harness {
     bridge: Arc<Bridge>,
-    http: reqwest::Client,
+    http: crate::upstream::UpstreamClient,
 }
 
 impl Harness {
     pub(super) fn new() -> Self {
         Self {
             bridge: Arc::new(Bridge::new(plane(), 2).expect("bridge starts")),
-            http: build_client(Duration::from_secs(2)).expect("client"),
+            http: build_client(Duration::from_secs(2), false).expect("client"),
         }
     }
 
@@ -407,6 +424,31 @@ impl Harness {
         throttle_redial: Option<ThrottleRedial>,
         deadline: Duration,
     ) -> (Won, AttemptGuard) {
+        self.run_with_policy(
+            raw_key,
+            caller_scope,
+            route,
+            RoutePolicy {
+                maximum_total_attempts: 8,
+                maximum_same_deployment_attempts: 2,
+                refusal_failover: false,
+                throttle_redial,
+                physical_route_cap: None,
+                backoff: None,
+            },
+            deadline,
+        )
+        .await
+    }
+
+    pub(super) async fn run_with_policy(
+        &self,
+        raw_key: &str,
+        caller_scope: Option<&str>,
+        route: &[DeploymentWire],
+        policy: RoutePolicy,
+        deadline: Duration,
+    ) -> (Won, AttemptGuard) {
         let mut guard = AttemptGuard::new(
             self.bridge.clone(),
             Arc::new(AtomicUsize::new(0)),
@@ -420,12 +462,7 @@ impl Harness {
             raw_key,
             caller_scope,
             route,
-            policy: RoutePolicy {
-                maximum_total_attempts: 8,
-                maximum_same_deployment_attempts: 2,
-                refusal_failover: false,
-                throttle_redial,
-            },
+            policy,
             deadline: Instant::now() + deadline,
             time_to_first_byte: Duration::from_secs(5),
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
@@ -756,6 +793,82 @@ fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire 
         failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
         zdr_constrained: false,
         ..wire(deployment_id, url, 0)
+    }
+}
+
+#[test]
+fn gemini_relay_refusal_http_and_sse_stop_the_default_ladder_and_settle_once() {
+    const BODY: &str =
+        r#"{"error":{"code":403,"message":"Gemini blocked the request: PROHIBITED_CONTENT"}}"#;
+    for (answer, detail, dialect) in [
+        (
+            Answer::Forbidden(BODY),
+            "Gemini blocked the request: PROHIBITED_CONTENT",
+            "openai_compatible",
+        ),
+        (
+            Answer::Stream(&[BODY]),
+            "403: Gemini blocked the request: PROHIBITED_CONTENT",
+            "openai_compatible",
+        ),
+        (
+            Answer::Forbidden(BODY),
+            "Gemini blocked the request: PROHIBITED_CONTENT",
+            "openai_responses",
+        ),
+        (
+            Answer::ResponsesFailed(
+                r#"{"type":"response.failed","response":{"error":{"code":403,"message":"Gemini blocked the request: PROHIBITED_CONTENT"}}}"#,
+            ),
+            "403: Gemini blocked the request: PROHIBITED_CONTENT",
+            "openai_responses",
+        ),
+    ] {
+        block_on(async {
+            let harness = Harness::new();
+            let rung_a = spawn_rung(vec![answer]).await;
+            let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+            let mut route = [wire("a", &rung_a.url, 2), wire("b", &rung_b.url, 2)];
+            route[0].dialect = dialect.to_string();
+            let (won, guard) = harness
+                .run(&route, Some(SCHEDULE), Duration::from_secs(10))
+                .await;
+            let Won::Failed(error) = finish(guard, won).await else {
+                panic!("a content-policy refusal must end the default ladder");
+            };
+            assert_eq!(error.status_code, 400);
+            assert_eq!(error.code, "refusal");
+            assert_eq!(error.error_type, "invalid_request_error");
+            assert_eq!(
+                error.message,
+                "provider refused the request: content policy"
+            );
+            assert_eq!(
+                error.json_body()["error"]["refusal_reason"],
+                "content_policy"
+            );
+            assert!(!error.json_body().to_string().contains("PROHIBITED_CONTENT"));
+            assert_eq!(rung_a.accepted.lock().expect("lock").len(), 1);
+            assert!(rung_b.accepted.lock().expect("lock").is_empty());
+            let story = harness.story().await;
+            assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+            assert_eq!(story["counts"], json!([1, 0]));
+            let settles = story["settles"].as_array().expect("settles");
+            assert_eq!(settles.len(), 1);
+            assert_eq!(settles[0]["outcome"], "failed");
+            assert_eq!(settles[0]["finalize"], true);
+            assert_eq!(
+                settles[0]["failure"],
+                json!({
+                    "failure_class": "refusal",
+                    "safe_message": "provider refused the request: content policy",
+                    "refusal_reason": "content_policy",
+                    "provider_detail": detail,
+                    "customer_owned": false,
+                    "retry_after_seconds": null,
+                }),
+            );
+        });
     }
 }
 

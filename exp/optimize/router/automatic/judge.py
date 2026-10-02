@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactInput
@@ -35,7 +40,20 @@ from exp.optimize.router.judging.contracts import (
 )
 from exp.optimize.router.judging.protocol import TemplateJudgeClient
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
+
+
+@dataclass
+class JudgeCallAccounting:
+    """Provider activity belonging only to one judgment execution.
+
+    Attributes:
+        calls: Admitted provider requests within this scope, including failed requests.
+        economics: Reconciled successful responses within this scope, in request order.
+    """
+
+    calls: int = 0
+    economics: list[OperationEconomics] = field(default_factory=list)
 
 
 class ReservedJudgeClient:
@@ -50,6 +68,7 @@ class ReservedJudgeClient:
         capabilities: ModelCapabilities,
         maximum_attempts: int,
         maximum_provider_calls: int,
+        served_model_id: str | None = None,
     ) -> None:
         """Validate active economics before exposing the provider client.
 
@@ -60,6 +79,7 @@ class ReservedJudgeClient:
             capabilities: Active explicit catalog declaration.
             maximum_attempts: Active client retry ceiling.
             maximum_provider_calls: Full scalar or counterbalanced provider-call ceiling.
+            served_model_id: Explicit catalog pin for an alternate provider-reported model ID.
 
         Raises:
             ValueError: Pricing, model, retries, capacity, or call ceiling is invalid.
@@ -74,20 +94,46 @@ class ReservedJudgeClient:
         )
         self._client = client
         self._reservation = reservation
+        self._served_model = (
+            model.model_copy(update={"model_id": served_model_id})
+            if served_model_id is not None
+            else model
+        )
         self._maximum_provider_calls = maximum_provider_calls
         self._calls = 0
         self._economics: list[OperationEconomics] = []
+        self._lock = threading.Lock()
+        self._accounting: ContextVar[JudgeCallAccounting | None] = ContextVar(
+            "judge-call-accounting", default=None
+        )
         self._counter = Utf8UpperBoundTokenCounter()
+
+    @property
+    def model(self) -> ModelSnapshot:
+        """Return the provider identity verified against the frozen reservation at construction."""
+        return self._reservation.model
 
     @property
     def calls(self) -> int:
         """Return provider requests made through this reservation boundary."""
-        return self._calls
+        with self._lock:
+            return self._calls
 
     @property
     def economics(self) -> tuple[OperationEconomics, ...]:
         """Return reconciled economics for every completed judge provider request."""
-        return tuple(self._economics)
+        with self._lock:
+            return tuple(self._economics)
+
+    @contextmanager
+    def accounting_scope(self) -> Iterator[JudgeCallAccounting]:
+        """Isolate one judgment's failure accounting from concurrently running siblings."""
+        accounting = JudgeCallAccounting()
+        token = self._accounting.set(accounting)
+        try:
+            yield accounting
+        finally:
+            self._accounting.reset(token)
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Preflight one exact request and reconcile bounded response economics.
@@ -105,8 +151,6 @@ class ReservedJudgeClient:
                 without usable output; the error carries the conservative billed-spend ceiling.
             ValueError: The request exceeds a bound or provider usage and spend cannot be bounded.
         """
-        if self._calls >= self._maximum_provider_calls:
-            raise ValueError("judge provider call reservation is exhausted")
         input_tokens = self._counter.count(request)
         output_tokens = request.maximum_output_tokens
         if output_tokens is None:
@@ -117,7 +161,13 @@ class ReservedJudgeClient:
             )
         if output_tokens > self._reservation.maximum_output_tokens:
             raise ValueError("judge request exceeds its reserved output-token ceiling")
-        self._calls += 1
+        accounting = self._accounting.get()
+        with self._lock:
+            if self._calls >= self._maximum_provider_calls:
+                raise ValueError("judge provider call reservation is exhausted")
+            self._calls += 1
+            if accounting is not None:
+                accounting.calls += 1
         try:
             response = self._client.complete(request)
         except ProviderRetryableResponseError as exc:
@@ -129,14 +179,18 @@ class ReservedJudgeClient:
                     output_tokens=output_tokens,
                 ),
             ) from exc
-        if response.model != self._reservation.model:
+        if response.model not in (self._reservation.model, self._served_model):
             raise ValueError("judge response model differs from its frozen reservation")
         economics = reconcile_completion_economics(
             self._reservation,
             response.economics,
         )
-        self._economics.append(economics)
-        return response.model_copy(update={"economics": economics})
+        with self._lock:
+            self._economics.append(economics)
+            if accounting is not None:
+                accounting.economics.append(economics)
+        # The served pin is verified above; artifacts bind the finalized catalog identity.
+        return response.model_copy(update={"economics": economics, "model": self.model})
 
 
 class AutomaticRouterJudge:
@@ -151,6 +205,7 @@ class AutomaticRouterJudge:
         code_revision: str,
         maximum_input_tokens: int | None = None,
         maximum_output_tokens: int,
+        request_scope: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Bind the finalized manual setup and provider boundary.
 
@@ -161,6 +216,7 @@ class AutomaticRouterJudge:
             code_revision: Exact producer revision.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
             maximum_output_tokens: Approved per-call output-token reservation for dispatches.
+            request_scope: Optional durable request scope keyed by each finalized judge probe.
         """
         self._client = client
         self._setup = setup
@@ -168,6 +224,20 @@ class AutomaticRouterJudge:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._request_scope = request_scope
+
+    @property
+    def model(self) -> ModelSnapshot:
+        """Expose the actual reserved provider identity for pre-dispatch evaluation checks.
+
+        Raises:
+            ManualJudgeError: The client is unbound or differs from the persisted judge setup.
+        """
+        if not isinstance(self._client, ReservedJudgeClient):
+            raise ManualJudgeError("evaluation requires a reservation-bound judge client")
+        if self._client.model != self._setup.judge_model:
+            raise ManualJudgeError("reserved judge model differs from the finalized judge setup")
+        return self._client.model
 
     @property
     def provider_economics(self) -> tuple[OperationEconomics, ...]:
@@ -223,6 +293,7 @@ class AutomaticRouterJudge:
             code_revision=self._code_revision,
             maximum_input_tokens=self._maximum_input_tokens,
             maximum_output_tokens=self._maximum_output_tokens,
+            request_scope=self._request_scope,
         )
         return LMJudge(
             adapter,

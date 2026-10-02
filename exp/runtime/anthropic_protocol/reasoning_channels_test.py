@@ -32,6 +32,44 @@ def test_absent_reasoning_keeps_the_anthropic_channels_verbatim() -> None:
     assert output_config_effort({"effort": "hyperdrive"}) is None
 
 
+@pytest.mark.parametrize("reasoning", (ReasoningConfig(), ReasoningConfig(exclude=True)))
+def test_between_tools_survives_visibility_only_reasoning(reasoning: ReasoningConfig) -> None:
+    """An extension without depth cannot turn up-front thinking back on."""
+    channels = resolve_reasoning_channels(
+        reasoning,
+        max_tokens=512,
+        thinking={"type": "between_tools"},
+        output_config={"effort": "low"},
+    )
+    assert channels.thinking_config == {"type": "between_tools"}
+    assert channels.effort == "low"
+    assert channels.output_config == {"effort": "low"}
+    assert channels.disclosures == ((REASONING_EXCLUDE_DISCLOSURE,) if reasoning.exclude else ())
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    (
+        ReasoningConfig(effort="low"),
+        ReasoningConfig(effort="max"),
+        ReasoningConfig(effort="none"),
+        ReasoningConfig(enabled=True),
+        ReasoningConfig(enabled=False),
+        ReasoningConfig(max_tokens=1024),
+    ),
+)
+def test_between_tools_cannot_be_replaced_by_extension_depth(reasoning: ReasoningConfig) -> None:
+    """Conflicting channels cannot bypass exact model and effort admission."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        resolve_reasoning_channels(
+            reasoning,
+            max_tokens=4096,
+            thinking={"type": "between_tools"},
+            output_config=None,
+        )
+    assert error.value.detail.param == "reasoning"
+
+
 def test_budget_form_stays_a_numeric_bound_without_an_advisory_effort() -> None:
     """A token budget forwards exactly and never manufactures an effort level."""
     channels = resolve_reasoning_channels(

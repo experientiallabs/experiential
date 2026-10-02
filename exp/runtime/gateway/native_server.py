@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector
 
 if TYPE_CHECKING:
-    from exp_gateway_native import ShutdownHandle
+    from exp_gateway_native import CaptureCollector, ShutdownHandle
 
     from exp.runtime.gateway.native_bridge import NativeControlPlane
 
@@ -41,10 +41,12 @@ def serve_native_gateway(
     max_active_requests: int = 64,
     graceful_timeout_seconds: float = 10.0,
     connect_timeout_seconds: float = 5.0,
+    public_upstreams_only: bool = False,
     time_to_first_byte_seconds: float = 15.0,
     time_to_first_byte_seconds_per_million_input_tokens: float = 240.0,
     time_to_first_token_seconds: float = 120.0,
     native_usage_enabled: bool = True,
+    capture: CaptureCollector | None = None,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
 ) -> None:
@@ -85,9 +87,15 @@ def serve_native_gateway(
             commits, reads are paced by the deployment's own per-chunk
             timeout. A stall fails over to the next rung. Deployments may
             override the flat bound through their gateway capabilities.
+        public_upstreams_only: Restrict native provider connections to public HTTPS
+            addresses, including connection-time DNS checks and proxy bypass.
+            Hosted embedders accepting customer endpoints must enable this. It
+            defaults to False for local/private model servers and does not cover
+            Python control-plane callbacks that make their own HTTP requests.
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
+        capture: The collector shared with the admission controller; None retains no content.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
             background thread calls ``request_shutdown()`` to stop the plane
@@ -114,6 +122,7 @@ def serve_native_gateway(
         "request_timeout_seconds": control_plane.request_timeout_seconds,
         "graceful_timeout_seconds": graceful_timeout_seconds,
         "connect_timeout_seconds": connect_timeout_seconds,
+        "public_upstreams_only": public_upstreams_only,
         "time_to_first_byte_seconds": time_to_first_byte_seconds,
         "time_to_first_byte_seconds_per_million_input_tokens": (
             time_to_first_byte_seconds_per_million_input_tokens
@@ -128,6 +137,7 @@ def serve_native_gateway(
             shutdown,
             on_listening,
             control_plane.guardrail_detectors,
+            capture,
         )
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.

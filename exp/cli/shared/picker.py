@@ -549,6 +549,9 @@ def select_many_list(
                     return PickerResult(action=PickerAction.CANCEL)
                 query, searching, focus = edit.query, edit.searching, edit.focus
                 continue
+            if event.key is PickerKey.ESCAPE and query:
+                query, focus = "", 0
+                continue
             key = _navigation_key(event)
             if key is PickerKey.SEARCH:
                 searching = True

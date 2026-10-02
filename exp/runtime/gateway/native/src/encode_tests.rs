@@ -72,6 +72,45 @@ fn fireworks_chat_reasoning_round_trips_only_as_sealed_carrier() {
 }
 
 #[test]
+fn exposed_tool_reasoning_is_plaintext_not_concatenated_with_a_carrier() {
+    let events = fireworks_tool_events();
+    let mut stream = ChatSseEncoder::new_with_ignored("request", "model", 1, false, vec![]);
+    stream.set_reasoning_output_exposed(true);
+    stream.set_reasoning_content_carrier("opaque-carrier".into());
+    let mut frames = stream.start().unwrap();
+    for event in &events {
+        frames.extend(stream.feed(event).unwrap());
+    }
+    let text: String = frames
+        .iter()
+        .filter_map(|frame| {
+            let payload = frame.strip_prefix("data: ")?.trim();
+            serde_json::from_str::<Value>(payload).ok()
+        })
+        .filter_map(|frame| {
+            frame["choices"][0]["delta"]["reasoning_content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(text, "hidden provider reasoning");
+    let completed = completed_chat_body_with_carrier(
+        "request",
+        "model",
+        1,
+        &events,
+        &[],
+        Some("opaque-carrier"),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        completed.body["choices"][0]["message"]["reasoning_content"],
+        text
+    );
+}
+
+#[test]
 fn fireworks_chat_reasoning_fails_closed_without_carrier_or_unique_completion() {
     let events = fireworks_tool_events();
     assert!(completed_chat_body_with_ignored(

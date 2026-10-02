@@ -105,7 +105,7 @@ dial and both per-deployment overridable through the gateway capabilities:
   `time_to_first_byte_base_seconds` / `time_to_first_byte_seconds_per_million_input_tokens`).
 - **First token**: `time_to_first_token_seconds` (120 s, clamped to three quarters of the
   request budget so a stall can still fail over: under the engine's own 120 s request
-  timeout the effective default is 90 s; the platform's 1500 s budget keeps the full
+  timeout the effective default is 90 s; a caller's 1500 s budget keeps the full
   allowance) plus the same input slope bounds the wait for generation to begin (override
   `time_to_first_token_base_seconds`). Outward semantic output commits the attempt. A nonempty
   private `reasoning_content` token also starts generation timing, but does not commit: its
@@ -149,6 +149,12 @@ visible text and client-tool output still commit. A private-only successful term
 the existing encoding and accounting behavior. Known usage received before a stall settles
 with that physical attempt; absence of a report remains unknown, never invented zero usage.
 
+An OpenAI-compatible stream can also send nonempty `reasoning_content` without an authorized
+replay carrier. Those deltas start and refresh generation-idle timing without retaining their
+text, exposing an event, or committing the attempt. Empty reasoning, usage reports and
+keepalives cannot renew that timer. These discarded deltas do not stamp `first_token_at`;
+the first normalized output token still owns that measurement.
+
 Structural output may commit a surface before generation begins, but does not shorten its
 first-progress allowance to the connection timeout. In particular omitted Anthropic thinking
 with an empty delta can wait for its signature under the full first-token allowance.
@@ -164,8 +170,8 @@ the hard deadline; the gateway never retries such irreversible work.
 
 The total `request_timeout_seconds` remains a hard budget shared by the whole ladder. Neither
 progress nor keepalives extend it. Defaults for first byte, first token and input scaling are
-unchanged; the platform's 1500 s total is unchanged too. Active reasoning and long generation
+unchanged; an explicitly configured 1500 s total is unchanged too. Active reasoning and long generation
 can run beyond individual first-token and idle windows, but not beyond the explicitly authored
 total budget. `time_to_first_byte_ms` still records the first body byte; `first_token_at` records
-the first provider output token, including private reasoning, not necessarily the first frame
-the caller sees.
+the first normalized output token, including route-bound private reasoning, not necessarily
+the first frame the caller sees.

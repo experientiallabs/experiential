@@ -6,8 +6,11 @@ import logging
 from collections.abc import Collection, Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
+from pydantic import JsonValue
+
 from exp.common.models.known_models import canonical_model_id, known_model_metadata
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.models.providers.anthropic_tool_compat import matches_anthropic_release
 from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
@@ -44,6 +47,12 @@ def default_reasoning_effort(
         wire_format,
         configured_effort=configured_fallback,
     )
+    if (
+        wire_format in {"anthropic_adaptive", "reasoning"}
+        and matches_anthropic_release(model_id, ("claude-sonnet-5-5",))
+        and "high" in supported
+    ):
+        return "high"
     if "medium" in supported:
         return "medium"
     if "high" in supported:
@@ -166,7 +175,6 @@ def supported_reasoning_efforts(
 _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES = (
     "claude-fable-5",
     "claude-mythos-5",
-    "claude-mythos-preview",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
@@ -177,14 +185,17 @@ _ANTHROPIC_ALWAYS_THINKING_FAMILIES = (
     "claude-mythos-5",
     "claude-mythos-preview",
 )
+# Opus 5.5 changes the off-switch contract without changing the whole generation.
+_ANTHROPIC_ALWAYS_THINKING_RELEASES = ("claude-opus-5-5",)
 
 
 def anthropic_adaptive_only_thinking(model_id: str) -> bool:
-    """Return whether adaptive is the model's only enabled thinking mode.
+    """Return whether enabling thinking forbids a manual token budget.
 
     These families reject budgeted ``thinking.type.enabled``. That does not
-    imply that thinking cannot be disabled: Sonnet and Opus support an off
-    switch, with Opus 5 restricting it to effort high or below.
+    imply that thinking cannot be disabled: older Sonnet and Opus releases
+    support an off switch, while Opus 5.5 always reasons adaptively. Sonnet 5.5
+    additionally supports its non-budgeted ``between_tools`` mode.
 
     Args:
         model_id: Exact Anthropic model identifier.
@@ -430,6 +441,73 @@ THINKING_BUDGET_DERIVED_DISCLOSURE = "thinking.budget_tokens->derived"
 shape) is forwarded to an Anthropic rung with the gateway's derived budget."""
 
 
+def require_between_tools_support(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> None:
+    """Validate the exact native contract without translating this thinking mode.
+
+    Between-tools reasoning is neither disabled nor a portable effort request.
+    Its only carrier is a Sonnet 5.5 Messages rung, at low, medium or high
+    effort. Check the effective wire value, including a verbatim output config
+    and any required profile default, before other shaping can alter it.
+
+    Args:
+        profiles: Every rung the shaped request could dispatch to.
+        request: The caller's canonical request, including native thinking fields.
+
+    Raises:
+        ProviderParameterError: The shape, model, dialect or effort is unsupported.
+    """
+    config = request.provider_thinking_config
+    if config is None or config.get("type") != "between_tools":
+        return
+    extras = sorted(set(config) - {"type"})
+    if extras:
+        raise ProviderParameterError(
+            message=(
+                "Thinking type 'between_tools' accepts only the 'type' field. "
+                "Remove the other thinking fields, or use adaptive thinking."
+            ),
+            param=f"thinking.{extras[0]}",
+            code="invalid_parameter",
+        )
+    for profile in profiles:
+        if profile.dialect != "anthropic_messages" or not matches_anthropic_release(
+            profile.model_id, ("claude-sonnet-5-5",)
+        ):
+            raise ProviderParameterError(
+                message=(
+                    "Thinking type 'between_tools' requires Claude Sonnet 5.5 on a native "
+                    "Anthropic Messages route. Choose a supported route, or explicitly "
+                    "choose a thinking mode that this route supports."
+                ),
+                param="thinking.type",
+                code="unsupported_parameter",
+            )
+        effort: JsonValue = request.reasoning_effort
+        effort_parameter = request.caller_effort_parameter
+        if effort is None and profile.reasoning_effort_required:
+            effort = profile.reasoning_effort
+        if effort is None:
+            effort = "high"
+        if (
+            request.provider_output_config is not None
+            and "effort" in request.provider_output_config
+        ):
+            effort = request.provider_output_config["effort"]
+            effort_parameter = "output_config.effort"
+        if effort not in ("low", "medium", "high"):
+            raise ProviderParameterError(
+                message=(
+                    "Thinking type 'between_tools' requires effort 'low', 'medium' or 'high'. "
+                    "Choose one of these efforts, or use adaptive thinking for higher effort."
+                ),
+                param=effort_parameter,
+                code="invalid_parameter",
+            )
+
+
 def shape_anthropic_thinking_config(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
@@ -493,7 +571,7 @@ def shape_anthropic_thinking_config(
         )
     if adaptive_only and config_type == "enabled":
         # A bare enable requests thinking but specifies no numerical bound.
-        provider_updates["provider_thinking_config"] = {"type": "adaptive"}
+        provider_updates["provider_thinking_config"] = {**config, "type": "adaptive"}
         disclose("thinking.type->adaptive")
         _logger.warning(
             "translated a caller bare 'enabled' thinking config to adaptive; "
@@ -515,10 +593,20 @@ def shape_anthropic_thinking_config(
         disclose(THINKING_BUDGET_DERIVED_DISCLOSURE)
     elif config_type == "disabled":
         for profile in profiles:
+            if matches_anthropic_release(profile.model_id, ("claude-sonnet-5-5",)):
+                raise ProviderParameterError(
+                    message=(
+                        "Claude Sonnet 5.5 does not support thinking type 'disabled'. "
+                        "Use thinking {type: 'between_tools'} at low, medium or high effort "
+                        "to turn off up-front thinking, or use adaptive thinking."
+                    ),
+                    param="thinking.type",
+                    code="unsupported_parameter",
+                )
             normalized = _normalized_model(profile.model_id)
             always_thinks = any(
                 family in normalized for family in _ANTHROPIC_ALWAYS_THINKING_FAMILIES
-            )
+            ) or matches_anthropic_release(profile.model_id, _ANTHROPIC_ALWAYS_THINKING_RELEASES)
             effort = request.reasoning_effort
             if request.provider_output_config is not None:
                 effort = request.provider_output_config.get("effort", effort)

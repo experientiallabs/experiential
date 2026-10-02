@@ -1157,15 +1157,15 @@ def test_tool_messages_carry_text_and_image_parts_only() -> None:
             content="",
             content_parts=(DocumentContentPart(media_type="application/pdf", data="aGk="),),
         )
-    with pytest.raises(ValidationError, match="valid only for user and tool"):
-        GatewayMessage(
-            role="assistant",
-            content="hi",
-            content_parts=(
-                TextContentPart(text="hi"),
-                ImageContentPart(media_type="image/png", data="aGk="),
-            ),
-        )
+    assistant = GatewayMessage(
+        role="assistant",
+        content="hi",
+        content_parts=(
+            TextContentPart(text="hi"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+    assert assistant.images
 
 
 def test_replay_identity_binds_the_function_call_namespace() -> None:

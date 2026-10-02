@@ -908,6 +908,24 @@ def test_throttle_disposition_names_each_branch_and_only_those() -> None:
     )
 
 
+def test_wire_entry_marks_openrouter_gemini_cache_writes_within_reads() -> None:
+    """Only an OpenRouter Chat rung dispatching a Google model reports writes inside reads."""
+    route = _route()
+    deployment = route.deployment.model_copy(update={"provider": "openrouter"})
+
+    def flag(dialect: str, model_id: str, rung: ExactModelDeployment = deployment) -> object:
+        """Return the wire entry's cache accounting flag for one rung shape."""
+        profile = GatewayWireProfile(
+            dialect=dialect, url="https://provider.test", model_id=model_id
+        )
+        return deployment_wire_entry(route, rung, profile, {})["cache_writes_within_reads"]
+
+    assert flag("openai_compatible", "google/gemini-3.1-flash-lite") is True
+    assert flag("openai_compatible", "anthropic/claude-opus-5") is False
+    assert flag("openai_responses", "google/gemini-3.1-flash-lite") is False
+    assert flag("openai_compatible", "google/gemini-3.1-flash-lite", route.deployment) is False
+
+
 def test_wire_entry_carries_the_tool_call_serialization_flag() -> None:
     """A rung emulating parallel_tool_calls=false tells the data plane to serialize."""
     route = _route()
@@ -1056,6 +1074,54 @@ def test_dispatch_disclosure_names_a_backoff_redial_on_every_pool() -> None:
             forced_overflow=True,
             throttle_backoff=True,
         ) == (THROTTLE_BACKOFF, None)
+
+
+@pytest.mark.parametrize("root_affinity", [False, True])
+def test_dispatch_disclosure_uses_actual_stage_policy_and_preference(root_affinity: bool) -> None:
+    """A child affinity mode and its preferred provider never inherit root identity."""
+    route = _route()
+    lead, child = route.deployments[:2]
+    sibling = child.model_copy(update={"deployment_id": "child-sibling"})
+    root = route.snapshot.stage_for_depth(0).model_copy(
+        update={
+            "deployment_ids": (lead.deployment_id,),
+            "failover_mode": "maximize_cache_affinity"
+            if root_affinity
+            else "maximize_availability",
+        }
+    )
+    descendant = root.model_copy(
+        update={
+            "stage_index": 1,
+            "deployment_ids": (child.deployment_id, sibling.deployment_id),
+            "failover_mode": "maximize_availability"
+            if root_affinity
+            else "maximize_cache_affinity",
+        }
+    )
+    route = route.model_copy(
+        update={
+            "fallback_deployments": (child, sibling),
+            "snapshot": route.snapshot.model_copy(
+                update={
+                    "deployment_ids": (
+                        lead.deployment_id,
+                        child.deployment_id,
+                        sibling.deployment_id,
+                    ),
+                    "model_stages": (root, descendant),
+                    "failover_mode": root.failover_mode,
+                }
+            ),
+        }
+    )
+    assert dispatch_disclosure(route, 1, policy_sheds=[], forced_overflow=False) == (
+        None if root_affinity else "affinity",
+        None,
+    )
+    reason, preferred = dispatch_disclosure(route, 2, policy_sheds=[], forced_overflow=False)
+    assert reason == (None if root_affinity else "rung_dead")
+    assert preferred == (None if root_affinity else child)
 
 
 def test_wire_entry_carries_the_throttle_redial_budget() -> None:

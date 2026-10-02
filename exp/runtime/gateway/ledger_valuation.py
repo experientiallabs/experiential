@@ -11,7 +11,15 @@ from __future__ import annotations
 
 import sqlite3
 
-from exp.runtime.gateway.contracts import GatewayUsage
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayUsage,
+)
+from exp.runtime.gateway.ledger_errors import GatewayLedgerError
 
 MAXIMUM_NANO_USD = 9_223_372_036_854_775_807
 """Largest nano-USD amount the signed 64-bit ledger columns (SQLite INTEGER,
@@ -60,8 +68,9 @@ def estimated_cost_nano_usd(
 
     Cache reads and writes are disjoint input subsets; one-hour writes are a
     subset of all writes. Clamp reads, then writes, to remaining input. A missing
-    rate or TTL breakdown for observed writes preserves unknown cost. Reasoning
-    is an output subset. Price each remainder at its base rate exactly once.
+    rate preserves unknown cost. An absent TTL split is priceable only when both
+    authored write rates are identical, so every possible split has the same cost.
+    Reasoning is an output subset. Price each remainder at its base rate exactly once.
 
     Rates are nano-USD per million tokens, so the sum of ``tokens * rate`` is divided by one
     million and rounded half-up at one nano-USD. This is the ONE rounding rule of the ledger:
@@ -93,7 +102,13 @@ def estimated_cost_nano_usd(
         usage.cache_creation_input_tokens or 0, usage.input_tokens - cached_input_tokens
     )
     if cache_creation and usage.cache_creation_1h_input_tokens is None:
-        return None
+        if (
+            cache_creation_input_rate is None
+            or cache_creation_input_rate != cache_creation_1h_input_rate
+        ):
+            return None
+        # The split is unobserved, not zero. Equal rates make this decomposition
+        # cost-invariant without writing a made-up TTL into provider usage.
     hour_creation = min(usage.cache_creation_1h_input_tokens or 0, cache_creation)
     reasoning_tokens = min(usage.reasoning_tokens or 0, usage.output_tokens)
     dimensions = (
@@ -108,6 +123,104 @@ def estimated_cost_nano_usd(
         return None
     numerator = sum(tokens * (rate or 0) for tokens, rate in dimensions)
     return require_representable_nano_usd((numerator + 500_000) // 1_000_000, what="attempt cost")
+
+
+def terminal_values(
+    terminal_event: GatewayEvent | None,
+    failure: GatewayFailure | None,
+) -> tuple[str, str | None, str | None, GatewayUsage | None]:
+    """Normalize one finish call to state, failure class, message, and usage.
+
+    The failure message is the provider's own sanitized explanation
+    (``provider_detail``); it is present only for a client-error rejection and
+    is the same bounded, credential-free sentence the caller already receives.
+    """
+    event_failure = None if terminal_event is None else terminal_event.failure
+    normalized = failure or event_failure
+    if terminal_event is None and normalized is None:
+        raise GatewayLedgerError("attempt finish needs a terminal event or failure")
+    if terminal_event is not None and terminal_event.kind not in {
+        GatewayEventKind.COMPLETED,
+        GatewayEventKind.INCOMPLETE,
+        GatewayEventKind.FAILED,
+    }:
+        raise GatewayLedgerError("attempt finish event must be terminal")
+    if normalized is not None:
+        state = (
+            "cancelled" if normalized.failure_class == GatewayFailureClass.CANCELLED else "failed"
+        )
+        return (
+            state,
+            normalized.failure_class.value,
+            normalized.provider_detail,
+            (None if terminal_event is None else terminal_event.usage),
+        )
+    assert terminal_event is not None
+    return terminal_event.kind.value, None, None, terminal_event.usage
+
+
+def observed_usage_cost(
+    row: sqlite3.Row,
+    usage: GatewayUsage | None,
+    terminal_event: GatewayEvent | None,
+) -> int | None:
+    """Price provider or explicitly estimated usage; unestimated disconnects remain unknown."""
+    threshold = optional_int(row["long_context_threshold_tokens"])
+    long_context = (
+        threshold is not None
+        and usage is not None
+        and usage.input_tokens is not None
+        and usage.input_tokens >= threshold
+    )
+    prefix = "long_context_" if long_context else ""
+    partial = (
+        terminal_event is not None
+        and terminal_event.usage_incomplete_due_to_disconnect
+        and not terminal_event.usage_estimated
+    )
+    return None if partial else frozen_usage_cost(row, usage, prefix=prefix)
+
+
+def budget_settlement_nano_usd(
+    row: sqlite3.Row,
+    cost: int | None,
+    usage: GatewayUsage | None,
+    terminal_event: GatewayEvent | None,
+) -> int | None:
+    """Project the conservative settlement while retaining unmetered decision liability."""
+    budget_settlement = cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
+    if row["api_surface"] == GatewayApiSurface.DECISIONS.value and cost is None:
+        # An unmetered decision can still have executed upstream. Keep the
+        # reservation held without inventing usage or a settled charge.
+        # Only a witnessed HTTP rejection proves that this hold can release.
+        rejected = (
+            terminal_event is not None
+            and terminal_event.kind is GatewayEventKind.FAILED
+            and terminal_event.decision_provider_rejected
+            and usage is None
+        )
+        budget_settlement = 0 if rejected else None
+    if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
+        raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
+    return budget_settlement
+
+
+def usage_source_label(usage: GatewayUsage | None, *, estimated: bool) -> str:
+    """The ledger's usage provenance for one settlement.
+
+    ``unknown`` without usage, ``estimated`` when the registry completed a
+    disconnect's meter with the gateway tokenizer, ``observed`` otherwise.
+
+    Args:
+        usage: The usage the settlement carries, if any.
+        estimated: Whether that usage is the gateway's disconnect estimate.
+
+    Returns:
+        One of the three ``usage_source`` labels every ledger schema accepts.
+    """
+    if usage is None:
+        return "unknown"
+    return "estimated" if estimated else "observed"
 
 
 def optional_int(value: int | None) -> int | None:

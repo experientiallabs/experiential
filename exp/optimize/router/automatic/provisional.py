@@ -45,22 +45,24 @@ def prepare_hosted_provisional_judge(
     project: ProjectStore,
     catalog: ModelCatalog,
     *,
-    maximum_input_tokens: int,
+    maximum_input_tokens: int | None,
     maximum_output_tokens: int,
     maximum_attempts: int,
     created_at: datetime,
     code_revision: str,
+    select_for_project: bool = True,
 ) -> HostedAutomaticJudgeEvidence:
     """Persist deterministic machine-only setup and zero-label provisional calibration.
 
     Args:
         project: Project with a selected completed grounded build.
         catalog: Transient secret-free catalog used only for static identity and pricing.
-        maximum_input_tokens: Per-judge-request input ceiling.
+        maximum_input_tokens: Input ceiling, or None to use model capacity minus output.
         maximum_output_tokens: Per-judge-request output ceiling.
         maximum_attempts: Retry ceiling reserved for every judge request.
         created_at: Artifact completion time.
         code_revision: Exact producer revision.
+        select_for_project: Also advance the project configuration pointer when true.
 
     Returns:
         Verified setup, provisional calibration, and bounded request reservation.
@@ -180,12 +182,13 @@ def prepare_hosted_provisional_judge(
         maximum_output_tokens=maximum_output_tokens,
         maximum_attempts=maximum_attempts,
     )
-    project.bind_hosted_judge_evidence(
-        ProjectHostedJudgeEvidence(
-            setup=setup_input,
-            calibration=calibration_input,
+    if select_for_project:
+        project.bind_hosted_judge_evidence(
+            ProjectHostedJudgeEvidence(
+                setup=setup_input,
+                calibration=calibration_input,
+            )
         )
-    )
     return HostedAutomaticJudgeEvidence(
         setup=setup,
         setup_input=setup_input,
@@ -423,7 +426,7 @@ def _judge_request_reservation(
     capabilities: ModelCapabilities,
     *,
     judge_model: ModelSnapshot,
-    maximum_input_tokens: int,
+    maximum_input_tokens: int | None,
     maximum_output_tokens: int,
     maximum_attempts: int,
 ) -> CompletionCostReservation:
@@ -432,7 +435,7 @@ def _judge_request_reservation(
     Args:
         capabilities: Explicit judge model capabilities and token prices.
         judge_model: Exact judge snapshot.
-        maximum_input_tokens: Per-call input ceiling.
+        maximum_input_tokens: Input ceiling, or None to use model capacity minus output.
         maximum_output_tokens: Per-call output ceiling.
         maximum_attempts: Per-call retry ceiling.
 
@@ -449,6 +452,10 @@ def _judge_request_reservation(
         raise ValueError("hosted judge requires complete input, output, and cache pricing")
     context = capabilities.context_window_tokens
     output_capacity = capabilities.maximum_output_tokens
+    if maximum_input_tokens is None:
+        if context is None or context <= maximum_output_tokens:
+            raise ValueError("judge context capacity must exceed its output reservation")
+        maximum_input_tokens = context - maximum_output_tokens
     if (
         context is None
         or output_capacity is None

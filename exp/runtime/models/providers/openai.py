@@ -141,6 +141,8 @@ def openai_responses_request(
         }
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
+    if request.json_object_output:
+        payload["text"] = {"format": {"type": "json_object"}}
     return payload
 
 
@@ -335,10 +337,10 @@ def _responses_items_for_message(message: ModelMessage) -> list[JsonObject]:
                 "output": message.content or "",
             }
         ]
-    if message.role == "user":
+    if message.role in {"user", "developer"}:
         if message.content is None:
-            raise ValueError("user messages need text content")
-        return [{"role": "user", "content": message.content}]
+            raise ValueError(f"{message.role} messages need text content")
+        return [{"role": message.role, "content": message.content}]
     if message.role != "assistant":
         raise ValueError(f"unsupported Responses message role {message.role!r}")
     action = message.assistant_action

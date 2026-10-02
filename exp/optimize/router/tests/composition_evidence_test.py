@@ -39,6 +39,7 @@ from exp.common.models import (
 from exp.common.project import ProjectConfig, ProjectStore, artifact_input
 from exp.common.routing import FrozenEmbedding, FrozenEmbeddingSet, KnnGuard, RouterFeatureExtractor
 from exp.common.tasks import load_task_set
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.composition import (
     ApprovedRouterReview,
     RouterCompositionBudget,
@@ -61,7 +62,6 @@ from exp.simulation.engines.text.simulator_test import (
     _response,
     _ScriptedClient,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.orchestration import Simulator
 from exp.simulation.retrieval import load_fit_rag_retriever, load_rag_index
 from exp.simulation.retrieval.tests.retrieval_test import _message_trace as _trace
@@ -169,7 +169,7 @@ class _EvidenceSetupSupplier:
             agent_id="agent-a",
             simulator_id="text-world-model-v1",
             world_model=_snapshot("world-model-a"),
-            simulator_prompt_id="world-model-text-v1",
+            simulator_prompt_id="world-model-text-v2",
             rubric_id="rubric-a",
             judge_calibration_id="calibration-a",
             pricing_snapshot_id="w16-pricing",
@@ -194,7 +194,7 @@ class _EvidenceSetupSupplier:
             world_model_settings=WorldModelSettings(
                 world_model_alias="world-model-a",
                 grounded_world_model_input=completed.world_model,
-                prompt_version="text-world-model-v1",
+                prompt_version="text-world-model-v2",
                 query_embedding=EmbeddingCostReservation(
                     model=fit_index.embedder,
                     input_usd_per_million_tokens=0.0,
@@ -280,6 +280,7 @@ class _EvidenceSimulatorFactory:
                     project.artifacts,
                     completed.world_model,
                     client=world_model.client,
+                    capabilities=world_model.capabilities,
                     fit_retriever=fit_retriever,
                 )
             },
@@ -403,11 +404,11 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     list_ids_calls = 0
     list_ids = project.artifacts.list_ids
 
-    def count_list_ids() -> tuple[str, ...]:
-        """Count artifact-directory scans across the complete evidence workflow."""
+    def count_list_ids(*, artifact_type: str | None = None) -> tuple[str, ...]:
+        """Count indexed artifact queries across the complete evidence workflow."""
         nonlocal list_ids_calls
         list_ids_calls += 1
-        return list_ids()
+        return list_ids(artifact_type=artifact_type)
 
     monkeypatch.setattr(project.artifacts, "list_ids", count_list_ids)
     normalized = TraceNormalizationResult(

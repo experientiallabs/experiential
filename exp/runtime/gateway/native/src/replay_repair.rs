@@ -23,8 +23,8 @@
 //! converges after each worker has repaired it once, and a shared store
 //! would buy nothing worth its roll hazards.
 //!
-//! Telemetry: the refused dial and its re-dial run under ONE reservation, so
-//! the ledger records one attempt and never the refusal. What does record it:
+//! Telemetry: the refused dial and its repaired successor each reserve and
+//! settle a separate physical attempt. The repair is additionally disclosed by:
 //! the `x-gateway-replay-repair` header on HTTP responses (the WebSocket
 //! Responses transport carries no response headers), the data-plane counters
 //! `encrypted_reasoning_stripped` (a refusal repaired on this attempt) and
@@ -452,6 +452,14 @@ impl<'a> AttemptRepair<'a> {
         self.reactive = true;
         self.last_dial_opened = false;
         true
+    }
+
+    /// Keep a repaired successor's disclosure attached to its own physical attempt.
+    pub(crate) fn mark_reactive_successor(&mut self) {
+        self.reactive = true;
+        self.reactive_strips = encrypted_payloads(&self.wire.upstream_payload)
+            .len()
+            .saturating_sub(encrypted_payloads(self.payload()).len());
     }
 
     /// Note that the current dial opened (the provider answered 2xx).

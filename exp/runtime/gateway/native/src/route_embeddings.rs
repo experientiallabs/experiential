@@ -59,6 +59,8 @@ impl EmbeddingsAdmission {
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: false,
             throttle_redial: None,
+            physical_route_cap: None,
+            backoff: None,
         }
     }
 }
@@ -265,7 +267,7 @@ async fn run_ladder(
 /// carries whether the provider dispatch opened (for deployment-health
 /// recording); a rejected open never opened.
 async fn dispatch(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &EmbeddingsAdmission,

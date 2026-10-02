@@ -76,6 +76,62 @@ class TestConcurrencyBound:
         assert isinstance(_reserve(registry, "org-a", force=True), str)
         assert registry.inflight(_KEY) == 5
 
+    def test_forced_rate_retry_rechecks_hard_capacity_after_competing_admission(self) -> None:
+        """A forced rate-window retry cannot reuse headroom consumed between registry calls."""
+        registry = _registry([0.0])
+        first = _reserve(registry, "org-a", bound=2, requests_per_minute=1)
+        assert isinstance(first, str)
+        assert _reserve(registry, "org-a", bound=2, requests_per_minute=1) == RungShed("rate_limit")
+        assert isinstance(_reserve(registry, "org-b", bound=2), str)
+        assert registry.reserve(
+            _KEY,
+            organization_id="org-a",
+            weight=1,
+            bound=2,
+            fair_share=False,
+            requests_per_minute=1,
+            force=True,
+            hard_bound=True,
+        ) == RungShed("queue_bound")
+        assert registry.inflight(_KEY) == 2
+        registry.release_ticket(first)
+        assert isinstance(
+            registry.reserve(
+                _KEY,
+                organization_id="org-a",
+                weight=1,
+                bound=2,
+                fair_share=False,
+                requests_per_minute=1,
+                force=True,
+                hard_bound=True,
+            ),
+            str,
+        )
+        assert registry.inflight(_KEY) == 2
+
+    def test_rate_retry_rechecks_fair_share_after_another_organization_arrives(self) -> None:
+        """Skipping a paid rate backoff cannot consume a newly active tenant's reserved capacity."""
+        registry = _registry([0.0])
+        tickets = [_reserve(registry, "org-a", bound=4, fair_share=True) for _ in range(4)]
+        assert _reserve(registry, "org-b", bound=4, fair_share=True) == RungShed("queue_bound")
+        first = tickets[0]
+        assert isinstance(first, str)
+        registry.release_ticket(first)
+        assert registry.reserve(
+            _KEY,
+            organization_id="org-a",
+            weight=1,
+            bound=4,
+            fair_share=True,
+            requests_per_minute=1,
+            force=True,
+            rate_retry=True,
+        ) == RungShed("fair_share_shed")
+        assert registry.inflight(_KEY) == 3
+        assert isinstance(_reserve(registry, "org-b", bound=4, fair_share=True), str)
+        assert registry.inflight(_KEY) == 4
+
     def test_releases_are_idempotent(self) -> None:
         """Settle, abandon, and the sweep can all release without corruption."""
         registry = _registry([0.0])

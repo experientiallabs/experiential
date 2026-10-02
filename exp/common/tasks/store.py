@@ -55,7 +55,7 @@ def load_task_set(store: ArtifactStore, task_set_id: str) -> LoadedTaskSet:
     try:
         tasks = tuple(
             TaskCase.model_validate_json(line)
-            for line in task_payload.decode("utf-8").splitlines()
+            for line in task_payload.decode("utf-8").split("\n")
             if line
         )
     except (UnicodeDecodeError, ValidationError, ValueError) as exc:

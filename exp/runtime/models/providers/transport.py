@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import math
+import os
+import random
+import ssl
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from typing import NamedTuple
 
 import httpx
+import truststore
 
 from exp.common.core.artifacts import JsonObject
 
@@ -16,18 +24,191 @@ _RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 @dataclass(frozen=True)
 class JsonHttpResponse:
-    """One decoded HTTP response returned by a provider endpoint."""
+    """One decoded HTTP response and explicitly trusted transport facts.
+
+    Attributes:
+        status_code: HTTP response status.
+        body: Decoded provider object.
+        retry_after_seconds: Sanitized server minimum wait, or None when absent or invalid.
+        known_unbilled: A trusted adapter certifies this 429 was rejected before any billable
+            backend dispatch. Generic HTTP transports never infer this from response headers.
+    """
 
     status_code: int
     body: JsonObject
+    retry_after_seconds: float | None = None
+    known_unbilled: bool = False
+
+    def __post_init__(self) -> None:
+        """Keep safe numeric delay metadata and restrict admission proof to HTTP 429."""
+        object.__setattr__(self, "retry_after_seconds", _safe_retry_delay(self.retry_after_seconds))
+        object.__setattr__(
+            self, "known_unbilled", self.known_unbilled is True and self.status_code == 429
+        )
 
 
 class ProviderTransportError(RuntimeError):
-    """A non-success HTTP or transport result that contains no secret-bearing payload."""
+    """A sanitized transport failure with safe retry metadata.
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    Attributes:
+        status_code: Optional HTTP status, absent for an unknown transport outcome.
+        retry_after_seconds: Sanitized minimum server wait.
+        known_unbilled: Trusted proof this attempt was rejected before billable dispatch.
+            It says nothing about earlier attempts in the same logical request.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+        known_unbilled: bool = False,
+    ) -> None:
+        """Retain only explicit safe metadata, never raw headers or provider error bodies."""
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after_seconds = _safe_retry_delay(retry_after_seconds)
+        self.known_unbilled = known_unbilled is True and status_code == 429
+
+
+@dataclass(frozen=True)
+class _RequestAttemptEvidence:
+    """Aggregate proof attached by an owning retry loop to its terminal exception.
+
+    Attributes:
+        attempts: Total attempts actually started, including ambiguous in-flight requests.
+        unbilled_attempts: Attempts positively rejected before any billable backend dispatch.
+    """
+
+    attempts: int
+    unbilled_attempts: int
+
+
+def retain_request_attempt_evidence(
+    error: BaseException, *, attempts: int, unbilled_attempts: int
+) -> None:
+    """Retain aggregate dispatch proof without replacing exception or cancellation identity."""
+    if not 0 <= unbilled_attempts <= attempts:
+        raise ValueError("unbilled attempts must be a subset of all attempts")
+    error.__dict__["_exp_request_attempt_evidence"] = _RequestAttemptEvidence(
+        attempts, unbilled_attempts
+    )
+
+
+def is_known_unbilled_failure(error: BaseException) -> bool:
+    """Return true only when the owning retry loop certifies every started attempt was free.
+
+    A single attempt's ``known_unbilled`` flag is insufficient: any earlier unknown outcome
+    keeps the entire failed request's reservation conservative. Cancellation during active
+    I/O likewise has a started attempt without a matching non-dispatch receipt.
+    """
+    return known_unbilled_attempts(error) > 0
+
+
+def known_unbilled_attempts(error: BaseException) -> int:
+    """Return the exact certified count only if every started request attempt was unpaid.
+
+    Durable failure receipts retain this count so a crash before caller-level exclusion
+    persistence cannot discard the owning retry loop's aggregate accounting proof.
+    """
+    evidence = getattr(error, "_exp_request_attempt_evidence", None)
+    return (
+        evidence.attempts
+        if (
+            isinstance(evidence, _RequestAttemptEvidence)
+            and evidence.attempts > 0
+            and evidence.attempts == evidence.unbilled_attempts
+        )
+        else 0
+    )
+
+
+def propagate_request_attempt_evidence(source: BaseException, target: BaseException) -> None:
+    """Preserve exact owning-loop evidence when a controlled boundary translates an error.
+
+    This copies only one explicitly supplied exception's evidence. Following arbitrary cause
+    chains could accidentally treat an earlier unpaid refusal as proof about a later dispatch.
+    """
+    evidence = getattr(source, "_exp_request_attempt_evidence", None)
+    if isinstance(evidence, _RequestAttemptEvidence):
+        target.__dict__["_exp_request_attempt_evidence"] = evidence
+
+
+def _safe_retry_delay(value: float | None) -> float | None:
+    """Accept only finite nonnegative numeric transport hints."""
+    return value if value is not None and math.isfinite(value) and value >= 0 else None
+
+
+def parse_retry_after(value: str | None, *, now_unix_seconds: float | None = None) -> float | None:
+    """Parse an RFC Retry-After delay or HTTP date without retaining header content.
+
+    Args:
+        value: Raw Retry-After field, or None when absent.
+        now_unix_seconds: Optional wall-clock reading for deterministic HTTP-date tests.
+
+    Returns:
+        A nonnegative minimum wait, or None for malformed input. Valid enormous delay values
+        saturate at the largest finite float so policy rejects them instead of retrying early.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if stripped and stripped.isascii() and stripped.isdecimal():
+        try:
+            seconds = float(stripped)
+        except ValueError:
+            return None
+        return min(seconds, sys.float_info.max)
+    try:
+        date = parsedate_to_datetime(stripped)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=UTC)
+        now = time.time() if now_unix_seconds is None else now_unix_seconds
+        return _safe_retry_delay(max(0.0, date.timestamp() - now))
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def validated_admission_origin(origin: str | None) -> httpx.URL | None:
+    """Validate an explicit HTTPS authority whose admission receipts the caller trusts."""
+    if origin is None:
+        return None
+    url = httpx.URL(origin)
+    if (
+        url.scheme != "https"
+        or not url.host
+        or url.userinfo
+        or url.path != "/"
+        or url.query
+        or url.fragment
+    ):
+        raise ValueError("trusted admission origin must be an HTTPS origin without credentials")
+    return url
+
+
+def certified_admission_refusal(response: httpx.Response, trusted_origin: httpx.URL | None) -> bool:
+    """Read a reserved non-dispatch receipt only from the exact authenticated trusted origin.
+
+    The trusted server must strip downstream copies and emit this marker only for its own
+    pre-dispatch refusals. Redirects, alternate ports, and unauthenticated responses cannot
+    establish this accounting fact.
+    """
+    if (
+        trusted_origin is None
+        or response.status_code != 429
+        or response.headers.get("x-gateway-admission-refused") != "true"
+        or response.history
+    ):
+        return False
+    request = response.request
+    return (
+        request.url.scheme == trusted_origin.scheme
+        and request.url.host == trusted_origin.host
+        and request.url.port == trusted_origin.port
+        and not request.url.userinfo
+        and bool(request.headers.get("Authorization", "").strip())
+    )
 
 
 class JsonHttpTransport:
@@ -169,8 +350,12 @@ class ScriptedJsonTransport(JsonHttpTransport):
 class HttpxJsonTransport(JsonHttpTransport):
     """Production JSON transport backed by a caller-owned-or-default httpx client."""
 
-    def __init__(self, client: httpx.Client | None = None) -> None:
-        self._client = client or httpx.Client()
+    def __init__(
+        self, client: httpx.Client | None = None, *, trusted_admission_origin: str | None = None
+    ) -> None:
+        """Bind an HTTP client and an optional explicit admission-receipt authority."""
+        self._trusted_admission_origin = validated_admission_origin(trusted_admission_origin)
+        self._client = client if client is not None else httpx.Client(verify=provider_ssl_context())
 
     def get(
         self,
@@ -195,10 +380,10 @@ class HttpxJsonTransport(JsonHttpTransport):
         try:
             response = self._client.get(url, headers=dict(headers), timeout=timeout_seconds)
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
-        return _decoded_response(response)
+            raise ProviderTransportError(transport_error_message(exc)) from exc
+        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
 
     def post(
         self,
@@ -230,17 +415,60 @@ class HttpxJsonTransport(JsonHttpTransport):
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
-        return _decoded_response(response)
+            raise ProviderTransportError(transport_error_message(exc)) from exc
+        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
 
 
-def _decoded_response(response: httpx.Response) -> JsonHttpResponse:
+def provider_ssl_context() -> ssl.SSLContext:
+    """Verify provider TLS with native system trust, preserving explicit CA overrides.
+
+    Native trust can resolve intermediate certificates and system-managed roots absent from
+    static bundles. Explicit SSL_CERT_FILE or SSL_CERT_DIR settings retain HTTPX's selected
+    trust boundary. Caller-owned clients remain untouched; SSL is never patched globally.
+    """
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return httpx.create_ssl_context()
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def transport_error_message(error: httpx.TransportError) -> str:
+    """Describe network failure classes without exposing exception text, URLs, or headers."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return (
+                "provider TLS certificate verification failed; check system certificate trust "
+                "and SSL_CERT_FILE/SSL_CERT_DIR settings"
+            )
+        current = current.__cause__ or current.__context__
+    for error_type, message in (
+        (httpx.TimeoutException, "provider request timed out"),
+        (httpx.ConnectError, "provider connection failed (ConnectError)"),
+        (
+            httpx.RemoteProtocolError,
+            "provider connection closed unexpectedly (RemoteProtocolError)",
+        ),
+        (httpx.ReadError, "provider response could not be read (ReadError)"),
+        (httpx.WriteError, "provider request could not be sent (WriteError)"),
+        (httpx.ProxyError, "provider proxy connection failed (ProxyError)"),
+    ):
+        if isinstance(error, error_type):
+            return message
+    return "provider transport request failed"
+
+
+def _decoded_response(
+    response: httpx.Response, *, trusted_origin: httpx.URL | None = None
+) -> JsonHttpResponse:
     """Decode one provider response body as a JSON object without revealing content.
 
     Args:
         response: Completed provider HTTP response.
+        trusted_origin: Explicit authority for certified non-dispatch receipts, if configured.
 
     Returns:
         The status code paired with the decoded JSON object body.
@@ -248,19 +476,30 @@ def _decoded_response(response: httpx.Response) -> JsonHttpResponse:
     Raises:
         ProviderTransportError: The body is not decodable JSON or is not a JSON object.
     """
+    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+    known_unbilled = certified_admission_refusal(response, trusted_origin)
     try:
         body = response.json()
     except ValueError as exc:
         raise ProviderTransportError(
             f"provider returned non-JSON HTTP {response.status_code}",
             status_code=response.status_code,
+            retry_after_seconds=retry_after,
+            known_unbilled=known_unbilled,
         ) from exc
     if not isinstance(body, dict):
         raise ProviderTransportError(
             f"provider returned non-object JSON HTTP {response.status_code}",
             status_code=response.status_code,
+            retry_after_seconds=retry_after,
+            known_unbilled=known_unbilled,
         )
-    return JsonHttpResponse(status_code=response.status_code, body=body)
+    return JsonHttpResponse(
+        status_code=response.status_code,
+        body=body,
+        retry_after_seconds=retry_after,
+        known_unbilled=known_unbilled,
+    )
 
 
 @dataclass(frozen=True)
@@ -273,7 +512,16 @@ class RetryClassification:
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """Bounded exponential retry policy without provider failover semantics."""
+    """Bounded exponential retry policy without provider failover semantics.
+
+    Attributes:
+        maximum_attempts: Maximum potentially billable attempts. The async loop may separately
+            wait for certified non-dispatch responses until its fixed request deadline.
+        initial_delay_seconds: Initial backoff for ordinary transport failures.
+        maximum_delay_seconds: Exponential backoff and jitter ceiling. Async server-directed
+            minimum waits may exceed it within the existing absolute request deadline. The
+            sync helper has no request deadline, so this remains its total per-retry wait bound.
+    """
 
     maximum_attempts: int = 3
     initial_delay_seconds: float = 0.25
@@ -283,8 +531,10 @@ class RetryPolicy:
         """Reject attempt and delay bounds that cannot describe a finite retry schedule."""
         if self.maximum_attempts < 1:
             raise ValueError("maximum_attempts must be at least one")
-        if self.initial_delay_seconds < 0:
-            raise ValueError("initial_delay_seconds cannot be negative")
+        if not math.isfinite(self.initial_delay_seconds) or self.initial_delay_seconds < 0:
+            raise ValueError("initial_delay_seconds must be finite and nonnegative")
+        if not math.isfinite(self.maximum_delay_seconds):
+            raise ValueError("maximum_delay_seconds must be finite")
         if self.maximum_delay_seconds < self.initial_delay_seconds:
             raise ValueError("maximum_delay_seconds cannot be smaller than initial_delay_seconds")
 
@@ -317,6 +567,7 @@ def run_with_retry[ResultT](
     policy: RetryPolicy,
     sleep: Callable[[float], None] = time.sleep,
     classify: Callable[[Exception], RetryClassification] = classify_retry,
+    random_sample: Callable[[], float] = random.random,
 ) -> ResultT:
     """Run one idempotent request operation with bounded same-endpoint retries.
 
@@ -333,17 +584,80 @@ def run_with_retry[ResultT](
         Exception: The first non-retryable error or last retryable error.
     """
     delay = policy.initial_delay_seconds
-    for attempt in range(1, policy.maximum_attempts + 1):
-        try:
-            return operation()
-        except Exception as exc:
-            classification = classify(exc)
-            if not classification.retryable or attempt == policy.maximum_attempts:
-                raise
-            if delay > 0:
-                sleep(delay)
-            delay = min(delay * 2, policy.maximum_delay_seconds)
+    attempts = 0
+    unbilled_attempts = 0
+    try:
+        for attempt in range(1, policy.maximum_attempts + 1):
+            attempts += 1
+            try:
+                return operation()
+            except Exception as exc:
+                unbilled_attempts += int(is_unbilled_attempt(exc))
+                classification = classify(exc)
+                if not classification.retryable or attempt == policy.maximum_attempts:
+                    raise
+                wait = retry_delay_seconds(
+                    exc, delay=delay, policy=policy, random_sample=random_sample
+                )
+                if wait is None:
+                    raise
+                if wait > 0:
+                    sleep(wait)
+                delay = min(delay * 2, policy.maximum_delay_seconds)
+    except BaseException as error:
+        retain_request_attempt_evidence(
+            error, attempts=attempts, unbilled_attempts=unbilled_attempts
+        )
+        raise
     raise RuntimeError("retry loop exhausted without running an attempt")
+
+
+def is_unbilled_attempt(error: BaseException) -> bool:
+    """Recognize only an explicit trusted adapter's pre-dispatch HTTP 429 assertion."""
+    return (
+        isinstance(error, ProviderTransportError)
+        and error.status_code == 429
+        and error.known_unbilled is True
+    )
+
+
+def retry_delay_seconds(
+    error: Exception,
+    *,
+    delay: float,
+    policy: RetryPolicy,
+    random_sample: Callable[[], float],
+    server_wait_ceiling_seconds: float | None = None,
+) -> float | None:
+    """Respect a server minimum and add bounded jitter only to directed throttling.
+
+    Args:
+        error: The preceding attempt's safe failure metadata.
+        delay: Current exponential backoff, already bounded by policy.
+        policy: Exponential backoff and jitter bound.
+        random_sample: Injected uniform sample in [0, 1].
+        server_wait_ceiling_seconds: Remaining absolute request time for async callers. A
+            server minimum may exceed the backoff ceiling only within this bound. Without
+            it, the sync helper keeps the policy's explicit total delay ceiling.
+
+    Returns:
+        The next wait, or None if the server minimum cannot fit its applicable bound.
+        Jitter never advances the server's retry time or extends the request deadline.
+    """
+    hint = error.retry_after_seconds if isinstance(error, ProviderTransportError) else None
+    ceiling = policy.maximum_delay_seconds
+    if hint is not None and hint > ceiling and server_wait_ceiling_seconds is not None:
+        ceiling = server_wait_ceiling_seconds
+    floor = max(delay, hint or 0.0)
+    if floor > ceiling:
+        return None
+    if hint is None and not is_unbilled_attempt(error):
+        return floor
+    sample = random_sample()
+    if not math.isfinite(sample) or not 0 <= sample <= 1:
+        raise ValueError("retry random sample must be finite and between zero and one")
+    headroom = min(ceiling - floor, floor, policy.maximum_delay_seconds)
+    return floor + headroom * sample
 
 
 def get_json(
@@ -386,4 +700,6 @@ def _successful_body(response: JsonHttpResponse) -> JsonObject:
     raise ProviderTransportError(
         f"provider returned HTTP {response.status_code}",
         status_code=response.status_code,
+        retry_after_seconds=response.retry_after_seconds,
+        known_unbilled=response.known_unbilled,
     )

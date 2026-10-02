@@ -16,7 +16,6 @@ from exp.runtime.openai_protocol.manifest import (
     RESPONSES_INCLUDE_PATHS_ACCEPTED,
     RESPONSES_INCLUDE_PATHS_REJECTED,
     RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED,
-    RESPONSES_INPUT_ITEM_FIELDS_REJECTED,
     RESPONSES_MANIFEST,
     RESPONSES_REASONING_CONTEXTS_ACCEPTED,
     RESPONSES_REASONING_EFFORTS_ACCEPTED,
@@ -204,7 +203,5 @@ def test_every_official_sdk_echoable_input_item_field_is_decided() -> None:
     }
     for item_type, sdk_type in sdk_items.items():
         accepted = RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED[item_type]
-        rejected = RESPONSES_INPUT_ITEM_FIELDS_REJECTED[item_type]
-        assert not accepted & rejected, item_type
-        undecided = set(sdk_type.__annotations__) - accepted - rejected
+        undecided = set(sdk_type.__annotations__) - accepted
         assert not undecided, _decided(undecided, f"echoed {item_type} input item")

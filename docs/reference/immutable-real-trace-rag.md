@@ -18,6 +18,37 @@ examples cannot enter this index.
 Trace count is not a validation boundary. A corpus with any positive number of valid traces is
 accepted. The 100 to 1,000 range is only a common happy path for useful coverage.
 
+## Query and world-prompt capacity
+
+New evaluations and router optimizations derive an omitted `maximum_retrieval_query_tokens`
+from the world model's available input capacity after its declared output reservation. This
+aggregate limit is separate from the embedding model's per-input context window: complete query
+components are losslessly split into bounded UTF-8 chunks, and each dispatched batch retains its
+actual input-byte accounting. An explicit query limit is still enforced exactly. Router spend
+authorization includes the full resolved query allowance. Evaluation reports separately estimate
+expected usage from the captured task evidence.
+
+Before a text-world request is dispatched, optional retrieved examples are packed in priority
+order as whole examples within the model context and frozen input reservation. Required task
+instructions, tool definitions, conversation, environment state, system prompt and output controls
+are retained. Protocol retries use the same rule when adding correction feedback. Saved grounding
+IDs identify only the examples actually included in each request. Public world-model sessions use
+the same fitting rule with their resolved model capacities. If required input cannot fit, dispatch
+fails instead of truncating it. For models without a published output maximum, the existing
+remaining-context output binding happens after optional examples yield to the requested output. The
+100-step and 1,000,000-total-output-token rollout defaults are independent of this packing.
+
+Required prompt framing and output capacity are checked before query embedding or retrieval cost
+admission, then checked again before completion dispatch. Public `WorldModel.step` sessions report
+these local capacity failures as `WorldModelSessionError`; low-level grounded runtimes use
+`ValueError`. Provider failures retain their original exception types.
+
+Low-level `GroundedWorldModel` construction, `load_grounded_world_model`, and
+`bind_fit_grounded_world_model` require `capabilities=resolved_model.capabilities`. The metadata
+must match the model identity frozen into the build artifact before either serving or fit-only
+execution can proceed. A matching explicit `ModelCapabilities()` remains valid for a model with
+unknown capacities; omitting known metadata cannot disable capacity admission.
+
 ## Historical provenance
 
 This design restores useful behavior from the last coherent pre-refactor implementation:

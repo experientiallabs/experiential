@@ -15,6 +15,7 @@ from exp.common.core.artifacts import ContractModel
 from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.runtime.gateway import (
     ActivateAliasRevisionCommand,
     AliasRevisionRecord,
@@ -222,6 +223,92 @@ def _deployment() -> ExactModelDeployment:
         capabilities=ModelCapabilities(maximum_output_tokens=16),
         gateway=GatewayDeploymentMetadata(),
     )
+
+
+def _staged_execution() -> ExecutionSnapshot:
+    """Freeze one root model followed by two deployments of an authorized child."""
+    return ExecutionSnapshot(
+        authorization=_authorization(),
+        exact_model_id="exact-one",
+        pool_id="pool-one",
+        deployment_ids=("deployment-one", "deployment-two", "deployment-three"),
+        model_stages=(
+            ModelExecutionStage(
+                stage_index=0,
+                exact_model_id="exact-one",
+                pool_id="pool-one",
+                deployment_ids=("deployment-one",),
+            ),
+            ModelExecutionStage(
+                stage_index=1,
+                exact_model_id="exact-two",
+                pool_id="pool-two",
+                deployment_ids=("deployment-two", "deployment-three"),
+                ancestry=("exact-one",),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("route_depth", [0, 1, 2])
+def test_attempt_reservation_accepts_exact_stage_without_replacing_root(route_depth: int) -> None:
+    """A destination stage owns the attempt while root identity and authority stay frozen."""
+    snapshot = _staged_execution()
+    frozen_snapshot = snapshot.model_dump_json()
+    stage = snapshot.stage_for_depth(route_depth)
+    reservation = AttemptReservationRequest(
+        organization_id="org-one",
+        snapshot=snapshot,
+        deployment=_deployment().model_copy(
+            update={
+                "deployment_id": snapshot.deployment_ids[route_depth],
+                "exact_model_id": stage.exact_model_id,
+            }
+        ),
+        attempt_ordinal=4,
+        route_depth=route_depth,
+    )
+
+    assert reservation.snapshot.model_dump_json() == frozen_snapshot
+    assert reservation.snapshot.exact_model_id == "exact-one"
+    assert reservation.snapshot.pool_id == "pool-one"
+    assert reservation.snapshot.authorization == _authorization()
+    assert reservation.deployment.exact_model_id == stage.exact_model_id
+    _round_trip(reservation)
+
+
+@pytest.mark.parametrize(
+    ("organization_id", "deployment_id", "exact_model_id", "route_depth", "error"),
+    [
+        ("org-two", "deployment-two", "exact-two", 1, "organization differs"),
+        ("org-one", "deployment-one", "exact-one", 1, "stage cursor"),
+        ("org-one", "deployment-two", "exact-two", 0, "stage cursor"),
+        ("org-one", "deployment-two", "exact-two", 2, "stage cursor"),
+        ("org-one", "deployment-two", "exact-one", 1, "stage exact model"),
+        ("org-one", "deployment-two", "exact-other", 1, "stage exact model"),
+        ("org-one", "deployment-one", "exact-one", 3, "route depth"),
+        ("org-one", "deployment-one", "exact-one", -1, "greater than or equal"),
+        ("org-one", "deployment-missing", "exact-two", 1, "absent"),
+    ],
+)
+def test_attempt_reservation_rejects_stage_or_tenant_drift(
+    organization_id: str,
+    deployment_id: str,
+    exact_model_id: str,
+    route_depth: int,
+    error: str,
+) -> None:
+    """Global membership cannot override the exact stage cursor, model, or tenant."""
+    with pytest.raises(ValidationError, match=error):
+        AttemptReservationRequest(
+            organization_id=organization_id,
+            snapshot=_staged_execution(),
+            deployment=_deployment().model_copy(
+                update={"deployment_id": deployment_id, "exact_model_id": exact_model_id}
+            ),
+            attempt_ordinal=4,
+            route_depth=route_depth,
+        )
 
 
 def _round_trip(model: ContractModel) -> None:

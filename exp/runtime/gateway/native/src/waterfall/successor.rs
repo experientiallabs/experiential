@@ -53,12 +53,28 @@ pub(super) fn throttle_backoff_delay(
     throttle_redials_at_depth: u32,
     total_attempts: u32,
 ) -> Option<Duration> {
-    let schedule = ctx.policy.throttle_redial?;
+    let schedule = wire.throttle_redial.or(ctx.policy.throttle_redial)?;
     if wire.throttle_redial_budget == 0
         || failure.failure_class != FailureClass::Throttled
         || total_attempts >= ctx.policy.maximum_total_attempts
     {
         return None;
+    }
+    if throttle_redials_at_depth >= schedule.max_attempts.min(wire.throttle_redial_budget) {
+        return None;
+    }
+    if let Some(backoff) = ctx.policy.backoff {
+        return backoff.delay(
+            throttle_redials_at_depth,
+            failure.retry_after_seconds,
+            remaining(ctx.deadline).saturating_sub(first_byte_allowance(
+                wire,
+                ctx.time_to_first_byte,
+                ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+                ctx.approximate_input_tokens,
+            )),
+            ctx.request_id,
+        );
     }
     BackoffQuery {
         // The rung's per-request budget never exceeds the schedule's cap.

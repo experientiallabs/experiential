@@ -32,6 +32,24 @@ from exp.common.tasks import ToolSchema
 _CAPABILITIES_DIGEST = "a" * 64
 
 
+def test_absent_unbilled_counter_preserves_existing_economics_serialization() -> None:
+    """Adding admission evidence does not change the canonical bytes of existing receipts."""
+    legacy = {"provider_attempts": 1, "usage": None, "cost_usd": None, "latency_seconds": None}
+    economics = OperationEconomics.model_validate(legacy)
+    assert economics.unbilled_attempts == 0
+    assert economics.model_dump(mode="json") == legacy
+    assert sha256_json(economics) == sha256_json(legacy)
+
+
+@pytest.mark.parametrize("attempts,unbilled", [(None, 1), (1, 2), (2, -1)])
+def test_unbilled_attempts_require_a_complete_consistent_wire_count(
+    attempts: int | None, unbilled: int
+) -> None:
+    """Incomplete or contradictory counters cannot release retry reservations."""
+    with pytest.raises(ValidationError):
+        OperationEconomics(provider_attempts=attempts, unbilled_attempts=unbilled)
+
+
 def test_actions_need_payload_and_measurements_are_finite() -> None:
     """Invalid empty actions and non-finite economics fail at the shared boundary."""
     with pytest.raises(ValidationError, match="content or at least one tool"):
@@ -208,8 +226,8 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="tool", content="missing linkage")
 
 
-def test_model_messages_carry_image_parts_on_user_and_tool_roles_only() -> None:
-    """A tool result holds a screenshot beside its text; no other non-user role does."""
+def test_model_messages_carry_images_on_user_tool_and_assistant_roles() -> None:
+    """Tool screenshots and generated assistant images preserve their content parts."""
     image = ImageContentPart(media_type="image/png", data="aGk=")
     tool = ModelMessage(
         role="tool",
@@ -218,11 +236,15 @@ def test_model_messages_carry_image_parts_on_user_and_tool_roles_only() -> None:
         content_parts=(TextContentPart(text="shot"), image),
     )
     assert tool.images == (image,)
-    with pytest.raises(ValidationError, match="valid only for user and tool messages"):
+    assistant = ModelMessage(
+        role="assistant",
+        content="shot",
+        content_parts=(TextContentPart(text="shot"), image),
+    )
+    assert assistant.images == (image,)
+    with pytest.raises(ValidationError, match="valid only for user, tool, and assistant messages"):
         ModelMessage(
-            role="assistant",
-            content="shot",
-            content_parts=(TextContentPart(text="shot"), image),
+            role="system", content="shot", content_parts=(TextContentPart(text="shot"), image)
         )
     with pytest.raises(ValidationError, match="tool messages carry only text and image parts"):
         ModelMessage(

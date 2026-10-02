@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.cache_write_migration import (
     CACHE_WRITE_COLUMNS,
@@ -12,8 +13,8 @@ from exp.runtime.gateway.sqlite.cache_write_migration import (
     migrate_cache_write,
 )
 from exp.runtime.gateway.sqlite.migrations import (
+    SCHEMA_VERSION,
     GatewaySchemaError,
-    connect_database,
     initialize_database,
 )
 from exp.runtime.gateway.sqlite.migrations_test import _replay_history
@@ -95,10 +96,15 @@ def test_both_published_v22_layouts_preserve_attempt_evidence(
     try:
         after = dict(connection.execute("SELECT * FROM gateway_attempts").fetchone())
         assert {column: after[column] for column in before} == before
-        added = {"upstream_provider"} if cache_layout else set(CACHE_WRITE_COLUMNS)
+        added = ({"upstream_provider"} if cache_layout else set(CACHE_WRITE_COLUMNS)) | {
+            "service_tier_admission",
+            "service_tier_settlement",
+        }
         assert after.keys() - before.keys() == added
         assert all(after[column] is None for column in added)
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert after["service_tier_admission"] is None
+        assert after["service_tier_settlement"] is None
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:

@@ -21,6 +21,7 @@ from exp.common.models.content import (
     VideoContentPart,
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -47,9 +48,11 @@ from exp.runtime.gateway.native_admission import (
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.gateway.native_execution import deployment_health_key
 from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
+from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.requests import decode_chat
@@ -230,6 +233,42 @@ def test_cache_marked_requests_dispatch_marker_honoring_rungs_first() -> None:
         _marked_request(),
     )
     assert route.deployment.deployment_id == "shim"
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_staged_marker_ordering_is_owned_by_stage_scheduler(pinned: bool) -> None:
+    """Rank stage markers once, while preserving a live reasoning issuer."""
+    route = _mixed_route("maximize_cache")
+    stage = ModelExecutionStage(
+        stage_index=0,
+        exact_model_id=route.snapshot.exact_model_id,
+        pool_id=route.snapshot.pool_id,
+        deployment_ids=route.snapshot.deployment_ids,
+        failover_mode="maximize_cache",
+    )
+    route = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(update={"model_stages": (stage,)}),
+            "reasoning_pinned_deployment_id": "shim" if pinned else None,
+        }
+    )
+    wires = _wires()
+    request = _marked_request()
+    unchanged, unchanged_wires = _prefer_cache_capable_rungs(route, wires, request)
+    assert unchanged is route
+    assert unchanged_wires is wires
+    ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+        unchanged,
+        unchanged_wires,
+        request,
+        accounting=_affinity_accounting(),
+        authorization=route.snapshot.authorization,
+        continuation=None,
+    )
+    expected = ("shim", "native") if pinned else ("native", "shim")
+    assert ordered.snapshot.deployment_ids == expected
+    assert ordered.snapshot.model_stages[0].deployment_ids == expected
+    assert ordered_wires[0][0].dialect == ("openai_compatible" if pinned else "anthropic_messages")
 
 
 def test_reasoning_pin_holds_the_issuing_rung_first_only_while_it_survives() -> None:
@@ -575,6 +614,8 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
 
+        recovery_host = None
+
         recorded = 0
 
         def record_admission_coercions(self, count: int) -> None:
@@ -642,6 +683,8 @@ def test_admission_attaches_a_tenant_namespaced_cache_affinity_key() -> None:
 
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
+
+        recovery_host = None
 
         recorded = 0
 
@@ -714,6 +757,8 @@ def test_disabled_thinking_keeps_the_opus_rung_that_honors_it() -> None:
 
     class _CoercionCounter:
         """Count coercion recordings without a live ledger."""
+
+        recovery_host = None
 
         recorded = 0
 
@@ -807,6 +852,8 @@ def _tool_screenshot_route_request(*, stream: bool) -> GatewayRequest:
 
 class _AdmissionCoercionCounter:
     """Count coercion recordings without a live ledger."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         self.recorded = 0
@@ -1007,7 +1054,7 @@ def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> N
             accounting=cast(NativeAttemptAccounting, accounting),
             authorization=route.snapshot.authorization,
         )
-    assert rejected.value.param == "thinking"
+    assert rejected.value.param == "thinking.budget_tokens"
     assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
     assert accounting.recorded == 0
 
@@ -1035,7 +1082,7 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
     # House rung: billing_customer_managed False and no tier pricing, so it does
     # not forward service_tier.
     wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
-    accounting = cast(NativeAttemptAccounting, object())
+    accounting = cast(NativeAttemptAccounting, _CoercionCounter())
 
     for tier in ("flex", "priority"):
         request = GatewayRequest(
@@ -1069,6 +1116,46 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
             accounting=accounting,
             authorization=route.snapshot.authorization,
         )
+
+
+@pytest.mark.parametrize("mode", ["maximize_availability", "maximize_cache"])
+def test_priority_house_card_excludes_standard_only_lead(mode: str) -> None:
+    """Explicit Fast never silently executes on an unconfigured leading house rung."""
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        mode,
+        (_deployment("standard", gateway=gateway), _deployment("priority", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://standard.test"), client),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://priority.test",
+                service_tier_pricing_enabled=True,
+                service_tier_cards=frozenset({"priority"}),
+            ),
+            client,
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="priority",
+    )
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(deployment.deployment_id for deployment in narrowed.deployments) == ("priority",)
+    assert provider.service_tier == "priority"
 
 
 def test_tier_priced_host_lane_admits_the_named_tier() -> None:
@@ -1118,7 +1205,7 @@ def test_tier_priced_host_lane_admits_the_named_tier() -> None:
         route,
         wires,
         request,
-        accounting=cast(NativeAttemptAccounting, object()),
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
         authorization=route.snapshot.authorization,
     )
     # The tier survives to the provider request on the tier-priced house lane.
@@ -1132,7 +1219,7 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
     (the customer pays the provider directly)."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
-    accounting = cast(NativeAttemptAccounting, object())
+    accounting = cast(NativeAttemptAccounting, _CoercionCounter())
     client = cast(NativeWireClient, object())
     streaming = GatewayDeploymentCapabilities(supports_streaming=True)
 
@@ -1219,6 +1306,8 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
 class _CoercionCounter:
     """Count coercion recordings without a live ledger."""
 
+    recovery_host = None
+
     def __init__(self) -> None:
         """Start at zero recorded coercions."""
         self.recorded = 0
@@ -1239,16 +1328,16 @@ _TOOL_CAPABLE = GatewayDeploymentMetadata(
 
 
 def _fable_and_shim_wires(
-    *, shim_model: str = "anthropic/claude-fable-5-1"
+    *, shim_model: str = "anthropic/claude-fable-5-1", native_model: str = "claude-fable-5-1"
 ) -> tuple[tuple[GatewayWireProfile, NativeWireClient], ...]:
-    """Pair a native fable-5-1 rung with an OpenAI-compatible aggregator rung."""
+    """Pair a native Messages rung with an OpenAI-compatible aggregator rung."""
     client = cast(NativeWireClient, object())
     return (
         (
             GatewayWireProfile(
                 dialect="anthropic_messages",
                 url="https://anthropic.test",
-                model_id="claude-fable-5-1",
+                model_id=native_model,
             ),
             client,
         ),
@@ -1286,9 +1375,7 @@ def _forced_choice_request(
 def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
     surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
 ) -> None:
-    """fable-5-1 declines ``any``/``tool`` by name, so a waterfall with an
-    aggregator rung serves the caller's forced choice VERBATIM on that rung
-    and discloses nothing."""
+    """A known refusing release narrows out while an opaque shim preserves forced tools."""
     deployments = (
         _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
         _deployment("shim", gateway=_TOOL_CAPABLE),
@@ -1297,7 +1384,7 @@ def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
     accounting = _CoercionCounter()
     narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
-        _fable_and_shim_wires(),
+        _fable_and_shim_wires(shim_model="provider-model-exact"),
         _forced_choice_request(surface, choice),
         accounting=cast(NativeAttemptAccounting, accounting),
         authorization=route.snapshot.authorization,
@@ -1316,18 +1403,17 @@ def test_a_forced_choice_narrows_to_the_rung_that_can_force_tools(
         (GatewayApiSurface.MESSAGES, GatewayNamedToolChoice(name="lookup")),
     ),
 )
+@pytest.mark.parametrize("model_id", ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"))
 def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
-    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice
+    surface: GatewayApiSurface, choice: Literal["required"] | GatewayNamedToolChoice, model_id: str
 ) -> None:
-    """An all-fable-5-1 route (production shape: ~45 requests in 6h failed
-    post-dispatch across all three surfaces) serves under ``auto`` and tells
-    the caller through ``ignored_parameters``."""
+    """A release rejecting forced tools uses the existing disclosed auto policy."""
     deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
     route = _mixed_route("maximize_availability", deployments, surface)
     accounting = _CoercionCounter()
     narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
         route,
-        _fable_and_shim_wires()[:1],
+        _fable_and_shim_wires(native_model=model_id)[:1],
         _forced_choice_request(surface, choice),
         accounting=cast(NativeAttemptAccounting, accounting),
         authorization=route.snapshot.authorization,
@@ -1337,6 +1423,60 @@ def test_a_forced_choice_relaxes_to_auto_with_disclosure_when_no_rung_can_force(
     assert public.tool_choice == "auto"
     assert public.ignored_parameters == ("tool_choice->auto",)
     assert accounting.recorded == 1
+
+
+@pytest.mark.parametrize("choice", ("required", GatewayNamedToolChoice(name="lookup")))
+@pytest.mark.parametrize("bedrock", (False, True))
+def test_sonnet_55_forced_choice_is_disclosed_across_provider_wires(
+    choice: Literal["required"] | GatewayNamedToolChoice, bedrock: bool
+) -> None:
+    """The model's forced-tool refusal applies to relays and Bedrock during admission."""
+    client = cast(NativeWireClient, object())
+    if bedrock:
+        deployments = (_deployment("bedrock", provider="bedrock", gateway=_TOOL_CAPABLE),)
+        wires = (
+            (
+                GatewayWireProfile(
+                    dialect="bedrock_converse_stream",
+                    url="https://bedrock.test",
+                    model_id="anthropic.claude-sonnet-5-5-v1:0",
+                ),
+                client,
+            ),
+        )
+    else:
+        deployments = (
+            _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),
+            _deployment("shim", gateway=_TOOL_CAPABLE),
+        )
+        wires = _fable_and_shim_wires(
+            native_model="claude-sonnet-5-5", shim_model="anthropic/claude-sonnet-5.5"
+        )
+    route = _mixed_route("maximize_availability", deployments)
+    accounting = _CoercionCounter()
+    narrowed, wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        _forced_choice_request(GatewayApiSurface.MESSAGES, choice).model_copy(
+            update={"maximum_output_tokens": 256}
+        ),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.deployments == deployments
+    assert provider.tool_choice == "auto"
+    assert public.ignored_parameters == ("tool_choice->auto",)
+    assert accounting.recorded == 1
+    for profile, _client in wires_out:
+        payload = dialect_stream_payload(profile, provider)
+        if bedrock:
+            tool_config = payload["toolConfig"]
+            assert isinstance(tool_config, dict)
+            assert "toolChoice" not in tool_config
+        elif profile.dialect == "anthropic_messages":
+            assert payload["tool_choice"] == {"type": "auto"}
+        else:
+            assert payload["tool_choice"] == "auto"
 
 
 _MAX_ITEMS_SCHEMA: JsonObject = {
@@ -1507,7 +1647,7 @@ def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> N
             _wires(),
             request,
             # Never reached: the refusal precedes every coercion or reservation.
-            accounting=cast(NativeAttemptAccounting, object()),
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
             authorization=route.snapshot.authorization,
         )
 
@@ -1590,12 +1730,15 @@ def _order(route: GatewayRoute) -> tuple[str, ...]:
 
 
 class _AffinityAccounting:
-    """Just the sticky and health registries affinity ordering reads."""
+    """The local registries read by direct and staged affinity ordering."""
+
+    recovery_host = None
 
     def __init__(self) -> None:
         """Compose fresh empty registries."""
         self.sticky = StickySpillRegistry()
         self.health = DeploymentHealthRegistry()
+        self.recovery = SessionRecoveryRegistry()
 
 
 def _affinity_accounting() -> NativeAttemptAccounting:
@@ -2141,4 +2284,108 @@ def test_chat_thinking_budget_selects_only_the_native_qwen_rung() -> None:
     assert len(retained) == 1
     assert public.thinking_budget == provider.thinking_budget == 4096
     assert provider.reasoning_effort is None
+    assert accounting.recorded == 0
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_nested_budget_narrows_to_budget_capable_anthropic_rung(stream: bool) -> None:
+    """A mixed ladder preserves the numeric bound on its eligible Anthropic rung."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "max_tokens": 8192,
+            "stream": stream,
+        }
+    ).request
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = tuple(
+        _deployment(name, gateway=gateway) for name in ("effort", "adaptive", "budget")
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    profiles = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://relay.test/v1"),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://api.anthropic.com/v1/messages",
+            model_id="claude-sonnet-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://api.anthropic.com/v1/messages",
+            model_id="claude-sonnet-4-6",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+    )
+    accounting = _AdmissionCoercionCounter()
+    narrowed, retained, public, provider, _placement = admitted_route_requests(
+        route,
+        tuple((profile, client) for profile in profiles),
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.deployment.deployment_id == "budget"
+    assert len(retained) == 1
+    assert (
+        public.provider_thinking_config
+        == provider.provider_thinking_config
+        == {
+            "type": "enabled",
+            "budget_tokens": 4096,
+        }
+    )
+    assert provider.reasoning_effort is None
+    assert accounting.recorded == 0
+
+
+@pytest.mark.parametrize(
+    "dialect,model,reasoning",
+    (
+        ("openai_compatible", "kimi-k2-thinking", True),
+        ("anthropic_messages", "claude-sonnet-5", True),
+        ("anthropic_messages", "claude-haiku-3-5", False),
+    ),
+)
+def test_chat_nested_budget_refuses_routes_that_cannot_preserve_it(
+    dialect: str, model: str, reasoning: bool
+) -> None:
+    """Numeric budgets never fall through to a lossy effort substitution."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "max_tokens": 8192,
+        }
+    ).request
+    route = _mixed_route(
+        "maximize_availability", (_deployment("only"),), GatewayApiSurface.CHAT_COMPLETIONS
+    )
+    profile = GatewayWireProfile(
+        dialect=dialect,
+        url="https://provider.test/v1",
+        model_id=model,
+        supports_reasoning=reasoning,
+        reasoning_wire_format="anthropic_adaptive"
+        if dialect == "anthropic_messages"
+        else "reasoning_effort",
+    )
+    accounting = _AdmissionCoercionCounter()
+    with pytest.raises(ProviderParameterError) as error:
+        admitted_route_requests(
+            route,
+            ((profile, cast(NativeWireClient, object())),),
+            request,
+            accounting=cast(NativeAttemptAccounting, accounting),
+            authorization=route.snapshot.authorization,
+        )
+    assert error.value.param == "thinking.budget_tokens"
     assert accounting.recorded == 0

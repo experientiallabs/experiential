@@ -699,6 +699,36 @@ pub(crate) fn completed_responses_body_for(
     )
 }
 
+/// Encode admitted Responses events with their unchanged gateway tool configuration.
+pub(crate) fn encode_responses_sse(
+    admission: &Admission,
+    created_at: i64,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+) -> Result<Vec<u8>, PublicError> {
+    let envelope = admission.envelope.clone().unwrap_or_default();
+    let mut encoder = ResponsesSseEncoder::new(
+        &admission.request_id,
+        &admission.alias,
+        created_at,
+        envelope,
+    );
+    configure_responses_encoder(&mut encoder, admission);
+    if let Some(carrier) = reasoning_content_carrier {
+        encoder.set_reasoning_content_carrier(carrier.to_string())?;
+    }
+    let mut body = Vec::new();
+    for frame in encoder.start()? {
+        body.extend_from_slice(frame.as_bytes());
+    }
+    for event in events {
+        for frame in encoder.feed(event)? {
+            body.extend_from_slice(frame.as_bytes());
+        }
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 #[path = "tool_search_tests.rs"]
 mod tests;

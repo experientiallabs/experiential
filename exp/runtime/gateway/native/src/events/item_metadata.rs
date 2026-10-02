@@ -3,6 +3,11 @@
 use super::{ProviderAssistantMessagePhase, ProviderOutputItemStatus};
 use serde_json::Value;
 
+/// Count hosted invocations only, not results, approvals, listings or opaque items.
+pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
+    item_type.ends_with("_call")
+}
+
 pub(super) fn add_provider_item_metadata(
     payload: &mut Value,
     item_id: &Option<String>,

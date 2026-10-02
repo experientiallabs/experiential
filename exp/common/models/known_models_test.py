@@ -306,6 +306,39 @@ def test_claude_fable_5_1_is_recorded_with_its_verified_launch_contract() -> Non
     assert mythos is not None and mythos.cached_input_cost_per_million_tokens_usd == 0.25
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    ("claude-sonnet-5-5", "claude-sonnet-5-5-20260928", "claude-sonnet-5-5@20260928"),
+)
+def test_sonnet_55_metadata_pins_documented_prices_limits_and_default(model_id: str) -> None:
+    """Sonnet 5.5 records its own prices and high effort, including dated snapshots."""
+    known = known_model_metadata("anthropic", model_id)
+    assert known is not None
+    assert known.supports_tools and known.supports_structured_output
+    assert known.supports_reasoning_effort
+    assert known.reasoning_effort == "high"
+    assert known.minimum_temperature == known.maximum_temperature == 1.0
+    assert known.minimum_top_p == 0.99
+    assert known.supports_top_k is False
+    assert known.context_window_tokens == 1_000_000
+    assert known.maximum_output_tokens == 128_000
+    assert known.input_cost_per_million_tokens_usd == 2.0
+    assert known.output_cost_per_million_tokens_usd == 10.0
+    assert known.cached_input_cost_per_million_tokens_usd == 0.2
+    assert known.cache_write_cost_per_million_tokens_usd == 2.5
+
+
+@pytest.mark.parametrize("model_id", ("claude-sonnet-5-50", "claude-sonnet-5-5-1"))
+def test_unknown_sonnet_point_releases_still_inherit_no_prices(model_id: str) -> None:
+    """Generic generation-control inheritance does not claim an exact launch price."""
+    known = known_model_metadata("anthropic", model_id)
+    assert known is not None
+    assert known.input_cost_per_million_tokens_usd is None
+    assert known.output_cost_per_million_tokens_usd is None
+    assert known.cached_input_cost_per_million_tokens_usd is None
+    assert known.cache_write_cost_per_million_tokens_usd is None
+
+
 def test_anthropic_point_releases_inherit_generation_controls_never_prices() -> None:
     """An unrecorded minor version keeps its generation's wire contract.
 

@@ -111,8 +111,7 @@ def load_rollout(store: ArtifactStore, rollout_id: ArtifactId) -> RolloutArtifac
 
 def load_optional_rollout(store: ArtifactStore, rollout_id: ArtifactId) -> RolloutArtifact | None:
     """Load an existing rollout while distinguishing absence from immutable corruption."""
-    destination = store.project_directory / "artifacts" / rollout_id
-    if not destination.exists():
+    if not store.exists(rollout_id):
         return None
     return load_rollout(store, rollout_id)
 
@@ -144,6 +143,7 @@ def validate_resume_rollout(
         binding.grounded_world_model_input,
         binding.simulation_spec_input,
         pins.resolution_input,
+        *((rollout.continuation_of,) if rollout.continuation_of is not None else ()),
     )
     if (
         rollout.cell_id != cell.cell_id

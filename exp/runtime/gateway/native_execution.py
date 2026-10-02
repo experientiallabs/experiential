@@ -12,6 +12,7 @@ boundary encoding; this module owns the frozen semantics.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
@@ -21,26 +22,29 @@ from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
-    NormalizedGatewayCatalog,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
+    GatewayServiceTierAdmission,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.execution_resolution import (
-    GatewayWireContractError,
     _require_deployment_identity,
     _resolved_wire_profile,
 )
+from exp.runtime.gateway.execution_resolution import alias_native_blockers as alias_native_blockers
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_depths
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
+from exp.runtime.gateway.recovery import FrozenRecoveryBinding
+from exp.runtime.gateway.request_policy import RequestAttemptPolicy, attempt_policy
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.gateway.tool_search.plan import ToolSearchState
@@ -48,57 +52,26 @@ from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.openrouter_routing import (
+    openrouter_cache_writes_within_reads,
+    openrouter_chat_wire,
+)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+    from exp.runtime.gateway.native_explicit_cache import NativeCacheState
 
 # The frozen native retry policy.
 MAXIMUM_TOTAL_ATTEMPTS = 8
 MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 
-# The failure classes whose failover is a cache-stakes decision rather than a
-# fixed rule. A throttle (429) leaves the rung's prompt cache intact but
-# unreachable for this request right now: an immediate re-claim is refused
-# (the 429 sets the rung's throttle window before the next candidate is
-# chosen), and failing over cold abandons the cache the provider just built,
-# strips the conversation's reasoning carry-over, and rebills the whole
-# context. Without a ``throttle_redial`` schedule the only two moves are to
-# SURFACE the throttle (the caller retries the warm rung after the provider's
-# backoff) or to ADVANCE cold, and which is better depends on how much warm
-# cache is actually at stake. A pool authoring ``throttle_cache_threshold``
-# decides per request by ``throttle_disposition`` below: surface when the
-# requesting organization's observed cached fraction on the throttled rung
-# meets the threshold, advance otherwise (an organization with no cache
-# evidence reads as 0 and advances, so a request is never stranded to protect
-# cache that does not exist). With no threshold the mode's fixed rule stands:
-# ``maximize_cache`` surfaces every throttle, ``maximize_availability`` and
-# ``maximize_cache_affinity`` advance.
-#
-# A pool authoring ``throttle_redial`` adds the third move and removes the
-# surfacing one: the data plane waits out a backoff and asks to redial the SAME
-# rung (``throttle_backoff`` on its reservation), which passes the throttle
-# window because this request is the one deliberately probing the rung back;
-# once the redial cap is spent the ladder advances cold, and a throttle
-# surfaces only when every rung is exhausted. The cache-stakes gate then means
-# "how long to wait here" rather than "surface": it is applied at admission
-# per rung as a redial budget (``DeploymentWire.throttle_redial_budget``), the
-# full schedule at or above the threshold, a proportional share below it, and
-# zero with no cache evidence, so a rung with little at stake fails over
-# sooner and one with nothing at stake fails over at once.
-#
-# TIMEOUT is deliberately NOT in this set. The classifier already decides, per
-# timeout, whether the same rung may be redialed: a genuine retryable timeout
-# (provider 408) carries retryable_same_deployment=True and so redials the warm
-# rung in BOTH modes via the retryable-same branch below, needing no policy
-# override. The only timeouts that reach here with retryable_same_deployment=False
-# are the first-byte and header-phase stalls (relay.first_byte_timeout_failure /
-# upstream.open_timeout_failure), which are dead-lane signals: the lane accepted
-# the connection but never answered, so it must fail over. Folding the whole
-# TIMEOUT class into this set would suppress that failover and strand a stalled
-# request on a lane that never answered -- there is no warm cache to preserve on a
-# lane that never answered.
+# Only throttles trade prompt-cache continuity against immediate failover.
+# Operator schedules permit bounded redials; absent a schedule the cache
+# threshold or failover mode decides whether to advance or surface the 429.
+# Timeouts keep their classifier's retry flags: a 408 can retry; a silent
+# first-byte stall must advance and is not a cache-preserving failure.
 _CACHE_PRESERVING_NO_FAILOVER_CLASSES = frozenset({GatewayFailureClass.THROTTLED})
 
 ThrottleDisposition = Literal[
@@ -175,6 +148,31 @@ class InflightRequest:
     physical dispatch (the frozen route, the provider request for budget
     sizing, and the per-deployment attempt counters) plus the retention
     facts the terminal settlement consumes.
+
+    Attributes:
+        attempt_service_tiers: Frozen pricing authority keyed by physical attempt, initially
+            empty; untiered and customer-managed attempts have no entry.
+        recovery_observed_at: First validated terminal receipt epoch per reserved attempt;
+            retries never renew cache residency or failure cooldowns.
+        recovery_observation_lock: Serializes recovery observation timestamps and effects
+            for this request only, never held across ledger I/O or host callbacks.
+        estimated_cache_fractions: First cached-fraction sample used to price each attempt's
+            disconnect estimate; retained retries reuse it without creating observed warmth.
+        execution_lock: Serializes reservation, abandonment and estimated-fraction retention
+            for this request only; fraction reads and tokenization run outside it.
+        pending_abandon: Terminal failure retained while a reservation is in flight.
+        ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
+            counts; semantic tool turns and reasoning-repair successors do not increment them.
+        attempt_policy: Effective caller bounds, defaulting to the operator's retry mechanics.
+        verified_warm_deployment_id: Exact scoped warm destination, or None without evidence.
+        verified_warm_until_monotonic: Admission's nonrenewable warmth expiry, initially zero.
+        recovery_scoped: Whether admission requires exact scoped evidence, default False.
+        recovery_bindings: Frozen private wire bindings by deployment, initially empty.
+        recovery_recorded_attempts: Attempts whose recovery effects already ran, initially empty.
+        recovery_reason: Optional content-free reason for the admitted recovery placement.
+        denied_destination_pools: Exactly bound destination-only budget refusals in this request.
+        explicit_cache_state: Private marked-prefix plans and durable operation bindings,
+            absent unless a host provides explicit cache spending authority.
     """
 
     authorization: AuthorizationSnapshot
@@ -182,6 +180,8 @@ class InflightRequest:
     request: ServingRequest
     deadline_monotonic: float
     attempt_counts: list[int] = field(default_factory=list)
+    ordinary_attempt_counts: list[int] = field(default_factory=list)
+    attempt_policy: RequestAttemptPolicy = field(default_factory=RequestAttemptPolicy)
     # Post-backoff redials reserved per route depth, and the budget each
     # depth was given at admission (the schedule scaled by the cache at
     # stake); only these redials spend it, never a retryable-class redial of
@@ -193,9 +193,13 @@ class InflightRequest:
     active_attempt_id: str | None = None
     # Every reserved attempt's route depth, for health recording at settle.
     attempt_depths: dict[str, int] = field(default_factory=dict)
+    attempt_service_tiers: dict[str, GatewayServiceTierAdmission] = field(default_factory=dict)
+    estimated_cache_fractions: dict[str, float] = field(default_factory=dict)
     # The exact settlement the data plane could not land; the sweep replays it
     # verbatim so a completed outcome and its usage are never downgraded.
     pending_settlement: JsonObject | None = None
+    execution_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    pending_abandon: GatewayFailure | None = None
     # Responses-only retention facts consumed by ``remember`` after a
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = None
@@ -216,6 +220,11 @@ class InflightRequest:
     # so dispatch reservation can read and refresh the worker-local sticky
     # binding and apply the fresh-session spill threshold.
     affinity_fingerprint: bytes | None = None
+    # Only this admission's tenant/prefix/credential-verified recovery choice is
+    # warm on scoped routes. Unscoped sticky bindings cannot supply that evidence.
+    verified_warm_deployment_id: str | None = None
+    verified_warm_until_monotonic: float = 0
+    recovery_scoped: bool = False
     # Attempts whose settled usage already fed the cache-priority EWMA: a
     # settlement can land through the direct path AND the retained-settlement
     # sweep (both idempotent at the ledger), so the fold is guarded to exactly
@@ -224,23 +233,36 @@ class InflightRequest:
     # Whether the route's depth 0 was chosen by a live sticky binding rather
     # than rendezvous order, for the ``affinity_sticky`` disclosure.
     sticky_preferred: bool = False
+    recovery_bindings: dict[str, FrozenRecoveryBinding] = field(default_factory=dict, repr=False)
+    recovery_recorded_attempts: set[str] = field(default_factory=set)
+    recovery_observed_at: dict[str, float] = field(default_factory=dict)
+    recovery_observation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    recovery_reason: str | None = None
+    denied_destination_pools: set[str] = field(default_factory=set)
     # Rebuild material for gateway tool-search rounds: the admitted wires and
     # the public request ``build_rung_dispatch`` needs again, plus the search
     # state; ``None`` on requests the gateway runs no tool search for.
     resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
     public_request: GatewayRequest | None = None
     tool_search: ToolSearchState | None = None
+    explicit_cache_state: NativeCacheState | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
+        if isinstance(self.request, GatewayRequest):
+            self.attempt_policy = attempt_policy(self.request.gateway)
         if not self.attempt_counts:
             self.attempt_counts = [0 for _ in self.route.deployments]
+        if not self.ordinary_attempt_counts:
+            self.ordinary_attempt_counts = list(self.attempt_counts)
         if not self.throttle_redials:
             self.throttle_redials = [0 for _ in self.route.deployments]
         if not self.throttle_redial_budgets:
-            schedule = self.route.snapshot.throttle_redial
-            budget = 0 if schedule is None else schedule.max_attempts
-            self.throttle_redial_budgets = tuple(budget for _ in self.route.deployments)
+            self.throttle_redial_budgets = tuple(
+                0 if stage.throttle_redial is None else stage.throttle_redial.max_attempts
+                for depth in range(len(self.route.deployments))
+                for stage in (self.route.snapshot.stage_for_depth(depth),)
+            )
 
 
 def deployment_health_key(
@@ -268,17 +290,10 @@ def deployment_priced_for_service_tier(
 ) -> ExactModelDeployment:
     """Reprice one deployment for a requested flex/priority processing tier.
 
-    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
-    the tier to its provider and carries a pass-through card for it, the card's
-    rates replace the base schedule on a copy used only for THIS reservation, so
-    the ceiling, the stored per-token rates, and settlement all bill the tier
-    transparently. ``forwards_tier`` is the admission-time forwarding decision
-    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
-    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
-    wire would strip the tier (non-tier dialect, tier disabled): such a depth
-    runs the provider's base schedule, so it must bill the base schedule too. No
-    tier, no forwarding, or no card returns the deployment unchanged. The copy
-    stays Python-side and never crosses the native boundary.
+    The admitted card is frozen beside the standard card; settlement selects
+    between them from upstream evidence rather than assuming the requested tier.
+    No tier, no forwarding, or no card returns the deployment unchanged. The
+    copy stays Python-side and never crosses the native boundary.
     """
     if not forwards_tier:
         return deployment
@@ -303,9 +318,9 @@ def dispatch_disclosure(
 
     Emission is gated so an alias the platform never opted in keeps byte-null
     disclosure columns. On a ``maximize_cache_affinity`` pool every attempt
-    discloses against the preferred depth-0 rung: ``affinity`` on the happy
+    discloses against its own stage's first rung: ``affinity`` on the happy
     path (``affinity_sticky`` when a live sticky binding, not rendezvous,
-    chose depth 0), the shed reason when depth 0 was policy-shed in this
+    chose request depth 0), the shed reason when the stage lead was policy-shed in this
     reservation, ``rung_dead`` when it was bypassed by health or an earlier
     failure, ``saturated_overflow`` when the ladder force-admitted past a
     bound. On any other pool a disclosure appears only when a dispatch policy
@@ -338,14 +353,15 @@ def dispatch_disclosure(
     """
     if throttle_backoff:
         return THROTTLE_BACKOFF, None
-    if route.snapshot.failover_mode == "maximize_cache_affinity":
-        target_depth = 0
+    stage = route.snapshot.stage_for_depth(candidate)
+    if stage.failover_mode == "maximize_cache_affinity":
+        target_depth = route.snapshot.deployment_ids.index(stage.deployment_ids[0])
         if forced_overflow:
             reason = "saturated_overflow"
-        elif candidate == 0:
-            reason = "affinity_sticky" if sticky_preferred else "affinity"
+        elif candidate == target_depth:
+            reason = "affinity_sticky" if sticky_preferred and candidate == 0 else "affinity"
         else:
-            lead_shed = next((shed for depth, shed in policy_sheds if depth == 0), None)
+            lead_shed = next((shed for depth, shed in policy_sheds if depth == target_depth), None)
             reason = lead_shed or "rung_dead"
     elif forced_overflow:
         target_depth = policy_sheds[0][0]
@@ -413,6 +429,8 @@ def next_route_candidate(
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     fallback_rules: FallbackRules = (),
+    physical_route_cap: int | None = None,
+    physical_attempt_counts: list[int] | None = None,
 ) -> int | None:
     """Choose a safe retry or later exact deployment without changing logical model.
 
@@ -492,8 +510,13 @@ def next_route_candidate(
     """
     if total_attempts >= maximum_total_attempts:
         return None
+    physical_counts = physical_attempt_counts or attempt_counts
+    same_permitted = (
+        physical_route_cap is None or physical_counts[current_depth] < physical_route_cap
+    )
     if (
-        failure.retryable_same_deployment
+        same_permitted
+        and failure.retryable_same_deployment
         and attempt_counts[current_depth] < maximum_same_deployment_attempts
         and health.claim(keys[current_depth])
     ):
@@ -504,6 +527,7 @@ def next_route_candidate(
         # through its own throttle window while the redial cap allows.
         if (
             throttle_backoff
+            and same_permitted
             and throttle_redial_budget > 0
             and health.claim_throttle_redial(keys[current_depth])
         ):
@@ -748,6 +772,15 @@ def select_route_deployments(
         ValueError: The selection is empty, unordered, repeated, or out of range.
     """
     deployments = route.deployments
+    if route.resolved_route_id is not None and 0 not in indexes:
+        raise ProviderParameterError(
+            message=(
+                "The requested route cannot serve this request. "
+                "Choose another route or omit gateway.routing.route_id."
+            ),
+            param="gateway.routing.route_id",
+            code="invalid_parameter",
+        )
     if not indexes:
         raise ValueError("a narrowed route requires at least one deployment")
     if indexes != tuple(sorted(set(indexes))):
@@ -758,14 +791,13 @@ def select_route_deployments(
         return route
     selected = tuple(deployments[index] for index in indexes)
     return GatewayRoute(
-        snapshot=route.snapshot.model_copy(
-            update={"deployment_ids": tuple(item.deployment_id for item in selected)}
-        ),
+        snapshot=project_stage_selection(route.snapshot, indexes),
         deployment=selected[0],
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
         reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
+        resolved_route_id=route.resolved_route_id,
     )
 
 
@@ -800,16 +832,19 @@ def reorder_route_deployments(
         raise ValueError("route reorder requires a permutation of every deployment")
     if order == tuple(range(len(deployments))):
         return route
+    if route.snapshot.model_stages and tuple(
+        route.snapshot.stage_for_depth(i).stage_index for i in order
+    ) != tuple(route.snapshot.stage_for_depth(i).stage_index for i in range(len(deployments))):
+        raise ValueError("route scheduling cannot cross a model reference boundary")
     selected = tuple(deployments[index] for index in order)
     return GatewayRoute(
-        snapshot=route.snapshot.model_copy(
-            update={"deployment_ids": tuple(item.deployment_id for item in selected)}
-        ),
+        snapshot=project_stage_selection(route.snapshot, order),
         deployment=selected[0],
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
         reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
+        resolved_route_id=route.resolved_route_id,
     )
 
 
@@ -863,9 +898,13 @@ def deployment_wire_entry(
         The JSON-compatible wire entry consumed by the data plane.
     """
     capabilities = deployment.gateway.capabilities
+    stage = route.snapshot.stage_for_depth(
+        route.snapshot.deployment_ids.index(deployment.deployment_id)
+    )
     return {
         "provider": deployment.provider,
         "deployment_id": deployment.deployment_id,
+        "exact_model_id": deployment.exact_model_id,
         "dialect": profile.dialect,
         "url": profile.url,
         "headers": dict(profile.headers) if headers is None else dict(headers),
@@ -885,6 +924,13 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # OpenRouter's Gemini rungs report cache writes as a subset of cache
+        # reads (the creating call reads the written prefix back); the data
+        # plane separates the two legs before settlement.
+        "cache_writes_within_reads": (
+            openrouter_chat_wire(deployment.provider, profile.dialect)
+            and openrouter_cache_writes_within_reads(profile.model_id)
+        ),
         # Codex native tools translated to function tools on a foreign wire;
         # the data plane inverts the tool-call responses back to the native
         # (namespaced / custom) shape the caller declared. Empty on native
@@ -892,13 +938,8 @@ def deployment_wire_entry(
         "native_tool_translation": {
             mangled: list(origin) for mangled, origin in (native_tool_translation or {}).items()
         },
-        # An image-emitting lane (the platform projects `emits_images` from the
-        # model's output modalities): the data plane answers an empty
-        # completion there at once instead of redialing a second whole image.
-        # Deliberately NOT `supports_image_generation`: that claim admits
-        # /v1/images, and every OpenAI-compatible profile carries an
-        # images_url, so reusing it opened OpenRouter chat lanes to image
-        # generations (2026-09-15).
+        # Mixed chat image output needs a larger bounded SSE frame and must
+        # never regenerate an image after an empty completion.
         "image_output": (
             deployment.capabilities is not None and deployment.capabilities.emits_images
         ),
@@ -906,6 +947,9 @@ def deployment_wire_entry(
         # failover (the pool's schedule scaled by this request's cache at
         # stake); zero keeps the historical failover-only throttle.
         "throttle_redial_budget": throttle_redial_budget,
+        "throttle_redial": None
+        if stage.throttle_redial is None
+        else stage.throttle_redial.model_dump(mode="json"),
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
         # serving defaults when a deployment declares nothing.
@@ -921,54 +965,6 @@ def deployment_wire_entry(
         ),
         "zdr_constrained": zdr_constrained,
     }
-
-
-def alias_native_blockers(
-    alias: str,
-    normalized: NormalizedGatewayCatalog,
-    runtime_catalog: RuntimeModelCatalog,
-) -> tuple[str, ...]:
-    """Name why the native engine cannot serve one alias, or ``()`` if it can.
-
-    Every deployment reachable from the alias's catalog snapshot (direct pools
-    and project candidates alike) must resolve to a provider client with a
-    native wire dialect and a valid wire contract, since no other engine exists
-    to serve the request. This is the per-alias servability check the catalog
-    build runs so a structurally unservable alias is excluded (marked
-    UNAVAILABLE) rather than aborting the whole build; the same check names the
-    fleet-level startup blockers.
-
-    Args:
-        alias: Public alias name, used only for the returned reason text.
-        normalized: The alias's normalized catalog snapshot.
-        runtime_catalog: The frozen runtime catalog for the alias's revision.
-
-    Returns:
-        Display-safe reasons the alias cannot be served natively, deduplicated,
-        or an empty tuple when every deployment resolves to a native wire.
-    """
-    reasons: list[str] = []
-    for deployment in normalized.deployments:
-        try:
-            resolved = runtime_catalog.resolve(deployment.source_alias)
-        except Exception:  # noqa: BLE001 - name the deployment, not the internals.
-            reasons.append(f"deployment {deployment.deployment_id!r} does not resolve")
-            continue
-        client = resolved.client
-        if not isinstance(client, NativeWireClient):
-            reasons.append(f"provider {deployment.provider!r} has no native wire profile")
-            continue
-        try:
-            _resolved_wire_profile(deployment, resolved)
-        except ProviderCapabilityError as exc:
-            if exc.capability != "native_data_plane":
-                raise
-            reasons.append(f"provider {deployment.provider!r} has no native dialect implementation")
-        except GatewayWireContractError:
-            reasons.append(
-                f"deployment {deployment.deployment_id!r} has an invalid reasoning wire contract"
-            )
-    return tuple(dict.fromkeys(reasons))
 
 
 def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ...]:

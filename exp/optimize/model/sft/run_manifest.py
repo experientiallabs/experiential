@@ -19,7 +19,6 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from exp.common.core.files import write_bytes_atomic
 from exp.common.core.locks import file_write_lock
 from exp.common.models import ModelSnapshot
 from exp.common.project import (
@@ -29,6 +28,7 @@ from exp.common.project import (
     ProjectStore,
     artifact_input,
 )
+from exp.common.project.records import ProjectRecordError, ProjectRecords
 from exp.optimize.model.sft.builder import SFTBuildError, load_verified_sft_dataset
 from exp.optimize.model.sft.contracts import SFTDatasetArtifact
 from exp.optimize.model.sft.rendering import partitioned_rows_sha256
@@ -291,12 +291,13 @@ def load_automatic_sft_acceptance_selection(
     """
     path = automatic_sft_acceptance_path(store)
     _require_safe_automatic_acceptance_path(store, path)
-    if not path.exists():
+    if store.records.read("automatic-sft-acceptance") is None:
         return None
-    if not path.is_file() or path.is_symlink():
+    if path.is_symlink():
         raise TinkerSFTResumeError("automatic SFT acceptance pointer is not a safe file")
     try:
-        payload = path.read_bytes()
+        payload = store.records.read("automatic-sft-acceptance")
+        assert payload is not None
         selection = AutomaticSFTRunAcceptanceSelection.model_validate_json(payload)
     except (OSError, ValueError) as exc:
         raise TinkerSFTResumeError(f"cannot read automatic SFT acceptance pointer: {exc}") from exc
@@ -326,25 +327,28 @@ def write_automatic_sft_acceptance_selection_unlocked(
     Raises:
         TinkerSFTResumeError: Project identity, prior selection, or stored bytes conflict.
     """
-    if selection.project_id != store.paths.project_id:
-        raise TinkerSFTResumeError("cannot select automatic SFT acceptance for another project")
-    current = load_automatic_sft_acceptance_selection(store)
-    if current is not None and current == selection:
-        return current
-    current_input = None if current is None else current.acceptance
-    if current_input != expected_current or selection.previous_acceptance != expected_current:
-        raise TinkerSFTResumeError(
-            "automatic SFT acceptance selection changed before consent commit"
-        )
-    path = automatic_sft_acceptance_path(store)
-    _require_safe_automatic_acceptance_path(store, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _require_safe_automatic_acceptance_path(store, path)
-    write_bytes_atomic(path, canonical_json_bytes(selection), follow_symlinks=False)
-    stored = load_automatic_sft_acceptance_selection(store)
-    if stored is None or stored != selection:
-        raise TinkerSFTResumeError("automatic SFT acceptance pointer did not preserve selection")
-    return stored
+    with store.records.transaction():
+        if selection.project_id != store.paths.project_id:
+            raise TinkerSFTResumeError("cannot select automatic SFT acceptance for another project")
+        current = load_automatic_sft_acceptance_selection(store)
+        if current is not None and current == selection:
+            return current
+        current_input = None if current is None else current.acceptance
+        if current_input != expected_current or selection.previous_acceptance != expected_current:
+            raise TinkerSFTResumeError(
+                "automatic SFT acceptance selection changed before consent commit"
+            )
+        path = automatic_sft_acceptance_path(store)
+        _require_safe_automatic_acceptance_path(store, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _require_safe_automatic_acceptance_path(store, path)
+        store.records.write("automatic-sft-acceptance", canonical_json_bytes(selection))
+        stored = load_automatic_sft_acceptance_selection(store)
+        if stored is None or stored != selection:
+            raise TinkerSFTResumeError(
+                "automatic SFT acceptance pointer did not preserve selection"
+            )
+        return stored
 
 
 def initialize_tinker_sft_run(
@@ -374,13 +378,13 @@ def initialize_tinker_sft_run(
     """
     dataset, dataset_input = verified_training_inputs(store, dataset_id)
     validate_run_inputs(dataset, created_at=created_at, code_revision=code_revision)
-    manifest_path = output_dir / MANIFEST_FILE
+    manifest_path = sft_run_lock_path(store, output_dir)
     with file_write_lock(manifest_path, what="the Tinker SFT run"):
         return load_or_create_manifest(
             dataset=dataset,
             dataset_input=dataset_input,
             spec=spec,
-            output_dir=output_dir,
+            state=sft_run_records(store, output_dir),
             created_at=created_at,
             code_revision=code_revision,
         )
@@ -410,13 +414,14 @@ def load_tinker_sft_run(
         TinkerSFTError: The dataset or existing manifest cannot be verified exactly.
     """
     dataset, dataset_input = verified_training_inputs(store, dataset_id)
-    path = output_dir / MANIFEST_FILE
-    if not path.exists():
+    path = sft_run_lock_path(store, output_dir)
+    state = sft_run_records(store, output_dir)
+    if state.read(MANIFEST_FILE) is None:
         return None
     with file_write_lock(path, what="the Tinker SFT run"):
-        if not path.exists():
+        if state.read(MANIFEST_FILE) is None:
             return None
-        manifest = _read_model(path, TinkerSFTRunManifest, "Tinker SFT manifest")
+        manifest = _read_model(state, MANIFEST_FILE, TinkerSFTRunManifest, "Tinker SFT manifest")
         validate_manifest(
             manifest,
             dataset=dataset,
@@ -491,7 +496,7 @@ def load_or_create_manifest(
     dataset: SFTDatasetArtifact,
     dataset_input: ArtifactInput,
     spec: TinkerSFTSpec,
-    output_dir: Path,
+    state: ProjectRecords,
     created_at: datetime,
     code_revision: str,
 ) -> TinkerSFTRunManifest:
@@ -501,7 +506,7 @@ def load_or_create_manifest(
         dataset: Recursively verified W12 dataset artifact.
         dataset_input: Exact W12 artifact manifest input.
         spec: Frozen base model, schedule, and spend settings.
-        output_dir: Stable append-only W13 run directory.
+        state: Project-owned immutable run records.
         created_at: Time recorded only for a new manifest.
         code_revision: Exact release revision recorded or required by the run.
 
@@ -511,9 +516,8 @@ def load_or_create_manifest(
     Raises:
         TinkerSFTError: The dataset input or existing manifest differs from the run contract.
     """
-    path = output_dir / MANIFEST_FILE
-    if path.exists():
-        manifest = _read_model(path, TinkerSFTRunManifest, "Tinker SFT manifest")
+    if state.read(MANIFEST_FILE) is not None:
+        manifest = _read_model(state, MANIFEST_FILE, TinkerSFTRunManifest, "Tinker SFT manifest")
         validate_manifest(
             manifest,
             dataset=dataset,
@@ -548,7 +552,7 @@ def load_or_create_manifest(
         spec=spec,
         spec_sha256=spec_sha256,
     )
-    _write_new_json(path, manifest, "Tinker SFT manifest")
+    _write_new_json(state, MANIFEST_FILE, manifest, "Tinker SFT manifest")
     return manifest
 
 
@@ -745,43 +749,58 @@ def _validate_automatic_acceptance(
         )
 
 
-def _write_new_json(path: Path, value: BaseModel, label: str) -> None:
-    """Persist one secret-free canonical JSON contract without replacement.
+def sft_run_lock_path(store: ProjectStore, output_dir: Path) -> Path:
+    """Serialize one database run identity independently of caller export paths."""
+    identity = stable_id("sft-lock", {"namespace": sft_run_records(store, output_dir).namespace})
+    return store.paths.project_directory / "locks" / "sft" / identity
+
+
+def sft_run_records(store: ProjectStore, output_dir: Path) -> ProjectRecords:
+    """Bind an exact run location without storing its metadata in that directory.
 
     Args:
-        path: New append-only file path.
-        value: Validated contract to serialize canonically.
-        label: User-facing artifact label used by failures.
-
-    Raises:
-        TinkerSFTResumeError: The append-only path already exists.
-    """
-    if path.exists():
-        raise TinkerSFTResumeError(
-            f"{label} already exists at {path}; append-only runs do not replace it"
-        )
-    assert_secret_free(value)
-    write_bytes_atomic(path, canonical_json_bytes(value) + b"\n")
-
-
-def _read_model[ModelT: BaseModel](path: Path, model_type: type[ModelT], label: str) -> ModelT:
-    """Read one validated local contract with a contextual resume failure.
-
-    Args:
-        path: Existing local contract path.
-        model_type: Pydantic model class used for exact validation.
-        label: User-facing artifact label used by failures.
+        store: Project that owns all run metadata and evidence.
+        output_dir: Named run directory used for locking and optional exports.
 
     Returns:
-        The validated contract instance.
-
-    Raises:
-        TinkerSFTResumeError: The file is absent, unreadable, or malformed.
+        Project-scoped records with portable identities for project-relative run directories.
     """
+    if (output_dir / MANIFEST_FILE).exists():
+        raise TinkerSFTResumeError(
+            "File-based SFT run metadata is unsupported; preserve it with its matching release."
+        )
+    directory = output_dir.resolve()
+    project_directory = store.paths.project_directory.resolve()
+    if directory.is_relative_to(project_directory):
+        location = {"project_relative": directory.relative_to(project_directory).as_posix()}
+    else:
+        location = {"external": str(directory)}
+    namespace = f"sft-run:{sha256_json(location)}"
+    return ProjectRecords(store.paths.root, store.paths.project_id, namespace)
+
+
+def _write_new_json(state: ProjectRecords, key: str, value: BaseModel, label: str) -> None:
+    """Commit a secret-free append-only run record before external dispatch."""
+    assert_secret_free(value)
     try:
-        return model_type.model_validate_json(path.read_bytes())
-    except (OSError, ValueError) as exc:
-        raise TinkerSFTResumeError(f"cannot read {label} at {path}: {exc}") from exc
+        state.write(key, canonical_json_bytes(value) + b"\n", exclusive=True)
+    except ProjectRecordError as exc:
+        raise TinkerSFTResumeError(
+            f"{label} already exists; append-only runs do not replace it"
+        ) from exc
+
+
+def _read_model[ModelT: BaseModel](
+    state: ProjectRecords, key: str, model_type: type[ModelT], label: str
+) -> ModelT:
+    """Read one verified run record with a contextual resume failure."""
+    try:
+        payload = state.read(key)
+        if payload is None:
+            raise ValueError("record is absent")
+        return model_type.model_validate_json(payload)
+    except ValueError as exc:
+        raise TinkerSFTResumeError(f"cannot read {label}: {exc}") from exc
 
 
 def _require_safe_automatic_acceptance_path(store: ProjectStore, path: Path) -> None:

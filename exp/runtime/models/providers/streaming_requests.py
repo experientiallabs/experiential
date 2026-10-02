@@ -13,7 +13,6 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.codex_tools import (
-    NativeToolMapping,
     convert_native_history,
     translate_native_tools,
 )
@@ -84,6 +83,7 @@ from exp.runtime.models.providers.openai_payloads import (
 )
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
+    require_between_tools_support,
     shape_anthropic_thinking_config,
 )
 from exp.runtime.models.providers.server_tools import (
@@ -92,7 +92,13 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tools_present,
     disclose_dropped_server_tools,
 )
-from exp.runtime.models.providers.thinking_budget import require_thinking_budget_support
+from exp.runtime.models.providers.thinking_budget import (
+    qwen_uses_total_budget_cap,
+    require_thinking_budget_support,
+    thinking_budget_parameter,
+    thinking_budget_value,
+    thinking_budget_wire_field,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -159,6 +165,7 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
+    require_between_tools_support(profiles, request)
     if request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
         require_chat_logprobs(profiles, request)
     require_responses_logprobs(profiles, request)
@@ -168,6 +175,19 @@ def route_generation_parameter_requests(
             require_responses_continuation_channel(request)
 
     ignored = list(request.ignored_parameters)
+    budget = thinking_budget_value(request)
+    if budget is not None:
+        source = thinking_budget_parameter(request)
+        for profile in profiles:
+            target = thinking_budget_wire_field(profile)
+            if target != source:
+                disclosure = f"{source}->translated({target})"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+            if profile.dialect == "openai_compatible" and not qwen_uses_total_budget_cap(profile):
+                disclosure = "max_tokens->translated(total_output_minus_thinking_budget)"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
     provider_updates: dict[str, object] = {}
 
     def ignore(field: str, public_path: str | None = None) -> None:
@@ -178,6 +198,18 @@ def route_generation_parameter_requests(
             ignored.append(path)
 
     if request.maximum_output_tokens is not None:
+        if any(profile.omits_output_token_limit for profile in profiles):
+            # A plan backend refuses any output ceiling, and a ceiling is caller
+            # authority: the plan rung narrows out rather than serve unbounded.
+            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            raise ProviderParameterError(
+                message=(
+                    f"The parameter {parameter!r} is not accepted by a plan account on this "
+                    "model route. Remove the ceiling or use a route with an API-key account."
+                ),
+                param=parameter,
+                code="unsupported_parameter",
+            )
         route_limits = tuple(
             profile.maximum_output_tokens
             for profile in profiles
@@ -350,7 +382,7 @@ def route_generation_parameter_requests(
                 ),
                 param=effort_path,
             )
-    else:
+    elif budget is None:
         # An omitted caller value remains omitted on the shared request. Each
         # dialect payload injects only its own provider-required default, so a
         # fallback never forces that default onto a wire where it is optional.
@@ -697,7 +729,7 @@ def route_generation_parameter_requests(
         # serves and discloses the drop: foreign wires omit them at encoding.
         if THINKING_HISTORY_DROP_DISCLOSURE not in ignored:
             ignored.append(THINKING_HISTORY_DROP_DISCLOSURE)
-    if request.provider_thinking_config is not None and non_anthropic_route:
+    if request.provider_thinking_config is not None and non_anthropic_route and budget is None:
         # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
         # cross-wire reading. The named rejection here is what lets the admit
         # loop offer the disclosed thinking->reasoning_effort translation (or
@@ -745,15 +777,16 @@ def route_generation_parameter_requests(
     # web_search/tool_search dropped with disclosure). The inverse mapping rides
     # on the provider request so the response path re-shapes tool calls back.
     native_history_present = any(
-        message.provider_native_item is not None for message in request.messages
+        message.provider_native_item is not None
+        or any(call.provider_namespace is not None for call in message.tool_calls)
+        for message in request.messages
     )
     if (request.provider_native_tools or native_history_present) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
-        native_mapping = NativeToolMapping()
+        translation = translate_native_tools(request)
+        native_mapping = translation.mapping
         if request.provider_native_tools:
-            translation = translate_native_tools(request)
-            native_mapping = translation.mapping
             provider_updates["tools"] = translation.tools
             provider_updates["provider_native_tools"] = ()
             for disclosure in translation.disclosures:

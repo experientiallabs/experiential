@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Sequence
 from enum import StrEnum
+from operator import not_
 from typing import Final, Literal
 
 from pydantic import (
@@ -81,6 +82,8 @@ class Usage(ContractModel):
 
     Cache-read and cache-write counts are subsets of ``input_tokens`` when present. They never
     replace the total input count and must not be added a second time by callers.
+    ``output_tokens`` is total generated usage, including provider-reported reasoning tokens;
+    reasoning is a subset and must not be added again.
     """
 
     input_tokens: int = Field(ge=0)
@@ -104,11 +107,31 @@ class NumericMeasurement(ContractModel):
 
 
 class OperationEconomics(ContractModel):
-    """Usage, cost, and latency observed for one isolated operation."""
+    """Usage, cost, and latency observed for one isolated operation.
 
+    Attributes:
+        provider_attempts: Observed dispatch attempts, or None when not reported.
+        unbilled_attempts: Trusted pre-dispatch refusals included in provider_attempts. Zero is
+            omitted from serialized evidence to preserve artifacts without admission retries.
+        usage: Successful-response token accounting, when available.
+        cost_usd: Observed or conservatively estimated provider charge.
+        latency_seconds: Observed or estimated operation duration.
+    """
+
+    provider_attempts: int | None = Field(default=None, ge=1)
+    unbilled_attempts: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None
+
+    @model_validator(mode="after")
+    def validate_unbilled_attempts(self) -> OperationEconomics:
+        """Require a complete observed attempt count before releasing known unpaid retries."""
+        if self.unbilled_attempts and (
+            self.provider_attempts is None or self.unbilled_attempts > self.provider_attempts
+        ):
+            raise ValueError("unbilled attempts require a matching observed total attempt count")
+        return self
 
 
 def combine_economics(
@@ -316,22 +339,22 @@ class AssistantAction(ContractModel):
 
 
 class ModelMessage(ContractModel):
-    """One request-visible message exchanged with a model."""
+    """One request-visible message exchanged with a model.
 
-    role: Literal["system", "user", "assistant", "tool"]
+    Attributes:
+        role: Required system, developer, user, assistant, or tool author role.
+        content: Optional visible text; required unless an assistant action is supplied.
+        tool_call_id: Optional tool-result linkage, allowed only for tool messages.
+        assistant_action: Optional structured output, allowed only for assistant messages.
+        content_parts: Ordered text/media content, empty by default and excluded from serialization.
+            Text parts concatenate to content; supported providers retain the exact interleaving.
+    """
+
+    role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
     content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
-    """Ordered caller content parts when a user or tool message carries attachments.
-
-    Empty on every text-only message. The text parts concatenate to
-    ``content``, so selectors, simulators, and persisted artifacts keep
-    seeing exactly the text they saw before media existed; provider clients
-    that can carry media read the parts and emit the caller's exact
-    interleaving. Excluded from serialization so identities of text-only
-    requests are byte-identical to pre-media traffic.
-    """
 
     @model_validator(mode="after")
     def _require_message_payload(self) -> ModelMessage:
@@ -346,12 +369,14 @@ class ModelMessage(ContractModel):
         if self.content_parts:
             # Tool results carry screenshots too (Bedrock toolResult image
             # blocks); the Gemini and Bedrock wires build from this contract.
-            if self.role not in ("user", "tool"):
-                raise ValueError("content parts are valid only for user and tool messages")
-            if self.role == "tool" and any(
+            if self.role not in ("user", "tool", "assistant"):
+                raise ValueError(
+                    "content parts are valid only for user, tool, and assistant messages"
+                )
+            if self.role in ("tool", "assistant") and any(
                 part.kind not in ("text", "image") for part in self.content_parts
             ):
-                raise ValueError("tool messages carry only text and image parts")
+                raise ValueError(f"{self.role} messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -464,15 +489,9 @@ class ModelCapabilities(ContractModel):
     # Image generation is served only on a positive claim, like embeddings:
     # ``None`` is unknown and never dispatches to the images surface.
     supports_image_generation: bool | None = None
-    # The model EMITS images inside a chat/Responses turn (a text+image model
-    # such as gpt-5.4-image-2 or the gemini image lanes). A data-plane lane
-    # fact only: the chat normalizers carry no image event, so such a turn
-    # ends output-less, and the waterfall answers its empty completion at
-    # once instead of redialing a second whole image. NEVER an admission
-    # signal -- ``/v1/images`` stays gated on ``supports_image_generation``
-    # plus an Images-API wire (the 2026-09-15 lesson: reusing that claim for
-    # chat lanes admitted image generations onto OpenRouter, whose wire
-    # profile carries an ``images_url`` unconditionally).
+    # Mixed text/image output on Chat Completions. This drives native output
+    # admission and stream bounds independently of the dedicated Images API,
+    # whose admission is controlled by supports_image_generation.
     emits_images: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
@@ -668,6 +687,10 @@ class ModelRequest(ContractModel):
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
             explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.
+        json_object_output: Request one JSON object, without a JSON schema. Chat, Responses,
+            and Gemini use native JSON mode; other adapters add an explicit instruction.
+            Callers must still validate the response. Omitted when false to retain ordinary
+            saved request identities.
     """
 
     messages: tuple[ModelMessage, ...] = Field(min_length=1)
@@ -680,6 +703,7 @@ class ModelRequest(ContractModel):
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    json_object_output: bool = Field(default=False, exclude_if=not_)
 
     @model_validator(mode="after")
     def _require_coherent_tools_and_messages(self) -> ModelRequest:

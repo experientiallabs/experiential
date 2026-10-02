@@ -1,15 +1,77 @@
 """Tests for the pure ledger cost-attribution helpers."""
 
+import sqlite3
+
 import pytest
 
 from exp.common.models.catalog import MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
-from exp.runtime.gateway.contracts import GatewayUsage
+from exp.runtime.gateway.contracts import (
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayUsage,
+)
+from exp.runtime.gateway.ledger_errors import GatewayLedgerError
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
     NanoUsdOverflowError,
+    budget_settlement_nano_usd,
     estimated_cost_nano_usd,
     optional_int,
+    terminal_values,
 )
+
+
+@pytest.mark.parametrize(
+    ("surface", "cost", "reserved", "rejected", "expected"),
+    [
+        ("decisions", None, 100, False, None),
+        ("decisions", None, 100, True, 0),
+        ("chat_completions", None, 100, False, 100),
+        ("chat_completions", None, None, False, None),
+        ("decisions", 12, 100, False, 12),
+    ],
+)
+def test_budget_settlement_keeps_unknown_and_unmetered_liability(
+    surface: str,
+    cost: int | None,
+    reserved: int | None,
+    rejected: bool,
+    expected: int | None,
+) -> None:
+    """Pure settlement preserves conservative bounds and releases only proven decision rejection."""
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT ? AS api_surface, ? AS budget_reserved_nano_usd", (surface, reserved)
+        ).fetchone()
+        event = GatewayEvent(
+            kind=GatewayEventKind.FAILED,
+            sequence_number=0,
+            decision_provider_rejected=rejected,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.UNAVAILABLE, safe_message="unavailable"
+            ),
+        )
+        assert budget_settlement_nano_usd(row, cost, None, event) == expected
+        with pytest.raises(GatewayLedgerError, match="integer capacity"):
+            budget_settlement_nano_usd(row, MAXIMUM_NANO_USD + 1, None, None)
+    finally:
+        connection.close()
+
+
+def test_terminal_value_normalization_keeps_unknown_usage_and_sanitized_failure() -> None:
+    """The pure owner preserves terminal accounting without inventing observed usage."""
+    event = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0)
+    assert terminal_values(event, None) == ("completed", None, None, None)
+    cancelled = GatewayFailure(
+        failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled"
+    )
+    assert terminal_values(None, cancelled) == ("cancelled", "cancelled", None, None)
+    with pytest.raises(GatewayLedgerError, match="needs a terminal"):
+        terminal_values(None, None)
 
 
 def test_subset_tokens_price_at_their_own_rates() -> None:
@@ -63,6 +125,37 @@ def test_malformed_subset_counts_clamp_to_their_totals() -> None:
     )
     # 0*1 + 10*2 + 0*3 + 4*5 = 40 nano-USD.
     assert cost == 40
+
+
+@pytest.mark.parametrize(
+    "write_rate,hour_rate,expected",
+    [
+        (2_500_000, 2_500_000, 310),
+        (0, 0, 160),
+        (2_500_000, 5_000_000, None),
+        (2_500_000, None, None),
+        (None, 2_500_000, None),
+        (None, None, None),
+    ],
+)
+def test_unobserved_write_ttl_requires_equal_known_rates(
+    write_rate: int | None, hour_rate: int | None, expected: int | None
+) -> None:
+    """An equal-rate schedule needs no invented TTL; unequal or unknown rates stay unknown."""
+    usage = GatewayUsage(input_tokens=100, output_tokens=10, cache_creation_input_tokens=60)
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=2_000_000,
+            cached_input_rate=200_000,
+            cache_creation_input_rate=write_rate,
+            cache_creation_1h_input_rate=hour_rate,
+            output_rate=8_000_000,
+            reasoning_rate=None,
+        )
+        == expected
+    )
+    assert usage.cache_creation_1h_input_tokens is None
 
 
 def test_cache_write_prices_at_its_surcharge_rate() -> None:
@@ -350,3 +443,35 @@ def test_cache_write_nano_usd_rounding_and_overflow_are_bounded() -> None:
             output_rate=None,
             reasoning_rate=None,
         )
+
+
+def test_openrouter_gemini_cache_write_call_prices_at_openrouter_bill() -> None:
+    """Separated OpenRouter Gemini write-call legs reproduce OpenRouter's own charge.
+
+    OpenRouter reported 11,933 prompt tokens with 10,663 both read from and
+    written to a new Gemini cache and billed 1,531,065.83 nano-USD of prompt
+    (``upstream_inference_prompt_cost`` 0.0015310658333) plus 14,850 of
+    output. The data plane settles that as 1,270 fresh plus 10,663 written
+    tokens with no separate read leg, so a written token's rate is OpenRouter's
+    cache-write rate plus its cache-read rate. No TTL split is reported, so the
+    five-minute and one-hour write rates must be equal to price the leg.
+    """
+    written_and_read = 83_333_333 + 27_500_000
+    usage = GatewayUsage(
+        input_tokens=11_933,
+        cached_input_tokens=0,
+        cache_creation_input_tokens=10_663,
+        output_tokens=9,
+    )
+    assert (
+        estimated_cost_nano_usd(
+            usage,
+            input_rate=275_000_000,
+            cached_input_rate=27_500_000,
+            cache_creation_input_rate=written_and_read,
+            cache_creation_1h_input_rate=written_and_read,
+            output_rate=1_650_000_000,
+            reasoning_rate=1_650_000_000,
+        )
+        == 1_545_916
+    )

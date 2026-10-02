@@ -28,6 +28,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCompletion,
     GuardrailPolicy,
     GuardrailRejected,
+    OutputGuardrailMode,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
@@ -35,6 +36,7 @@ from exp.runtime.gateway.guardrails.native import (
     enforce_native_input,
     enforce_native_output,
     enforce_native_output_segment,
+    native_output_mode,
     parse_output_payload,
 )
 from exp.runtime.gateway.guardrails.regex import (
@@ -364,6 +366,16 @@ def test_output_segment_releases_redacted_text() -> None:
         client=DirectClassifierClient(ClassifierRegistry({"detector": detector})),
         monotonic=lambda: 0.0,
     )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Draw"),),
+        stream=True,
+    )
+    assert native_output_mode(engine, policy, request) == OutputGuardrailMode.STREAM
+    assert (
+        native_output_mode(engine, policy, request, image_output=True) == OutputGuardrailMode.BUFFER
+    )
+    assert native_output_mode(engine, None, request, image_output=True) == OutputGuardrailMode.OFF
     decision = json.loads(
         enforce_native_output_segment(
             engine,

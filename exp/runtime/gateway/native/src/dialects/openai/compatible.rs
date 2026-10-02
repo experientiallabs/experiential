@@ -140,6 +140,7 @@ impl Normalizer {
         } else {
             None
         };
+        let raw_message = envelope.as_ref().and_then(|envelope| envelope.message);
         if envelope.is_some() {
             let (code, message) = match envelope {
                 Some(envelope) => {
@@ -160,10 +161,12 @@ impl Normalizer {
             return Ok(vec![Event::Failed(self.provider_stream_failure(
                 "openai_compatible",
                 code.as_deref(),
+                raw_message,
                 message.as_deref(),
             ))]);
         }
         let mut events = Vec::new();
+        self.service_tier.observe(payload.get("service_tier"));
         // An aggregator names the upstream that serves the stream on each
         // chunk (OpenRouter `provider`, opted in by its metadata header); the
         // first label is kept for settlement so a zero-data-retention
@@ -240,12 +243,26 @@ impl Normalizer {
                 events.push(Event::TextDelta(content.clone()));
             }
         }
+        if let Some(images) = delta.get("images").filter(|value| !value.is_null()) {
+            let images = images.as_array().ok_or_else(|| {
+                malformed("Chat images must be an array").with_retry(false, false)
+            })?;
+            for image in images {
+                let url = crate::image_output::chat_image(image)?;
+                self.reserve_image_bytes(url.len())?;
+                events.push(Event::Image(url));
+            }
+        }
         if let Some(Value::String(refusal)) = delta.get("refusal") {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
         if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
-            if let Some(value) = delta.get("reasoning_content") {
+            if let Some(value) = delta
+                .get("reasoning_content")
+                .filter(|value| !value.is_null())
+                .or_else(|| delta.get("reasoning"))
+            {
                 let reasoning = match value {
                     Value::Null => None,
                     Value::String(text) => Some(text),

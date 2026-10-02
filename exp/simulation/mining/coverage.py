@@ -19,6 +19,7 @@ from exp.simulation.mining.select import (
     ClusterSelection,
     PartitionSelection,
     SelectedRepresentative,
+    nearest_representative,
 )
 
 DEFAULT_COVERAGE_SIMILARITY_THRESHOLD = 0.70
@@ -276,14 +277,9 @@ def _distances(
         if not selected:
             continue
         by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
+        selected_ids = tuple(selection.representative_trace_id for selection in selected)
         for candidate in candidates:
-            nearest_id = min(
-                (selection.representative_trace_id for selection in selected),
-                key=lambda selected_id: (
-                    -_cosine(candidate.vector, by_id[selected_id].vector),
-                    selected_id,
-                ),
-            )
+            nearest_id = nearest_representative(candidate, selected_ids, by_id)
             similarity = _cosine(candidate.vector, by_id[nearest_id].vector)
             for trace_id in candidate.source_trace_ids:
                 distances.append(

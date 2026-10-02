@@ -69,6 +69,12 @@ def cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
         text = str(part)
         if text in _LOCATION_NOISE:
             continue
+        if (
+            tuple(cleaned) == ("gateway", "retry", "backoff")
+            and text in {"none", "exponential"}
+            and index != last_index
+        ):
+            continue
         # Typed-dict union branches are labeled with their class name, which
         # no request field ever shares: every public field is lower case.
         if isinstance(part, str) and (
@@ -247,6 +253,20 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     location = max((cleaned for cleaned, _ in best), key=len, default=())
     param = ".".join(location) or "body"
     details = [detail for cleaned, detail in best if cleaned == location]
+    if param.startswith("gateway."):
+        for detail in details:
+            if detail["type"] == "extra_forbidden":
+                return invalid_field(param, f"Unknown parameter '{param}'. Remove it and resend.")
+            if detail["type"] in {
+                "greater_than_equal",
+                "less_than_equal",
+                "finite_number",
+                "string_pattern_mismatch",
+            }:
+                return invalid_field(
+                    param,
+                    f"Invalid value for '{param}': {detail['msg']}. Correct the field and resend.",
+                )
     if param == "body":
         # A whole-request rule (such as the attachment count ceiling) has no
         # field of its own, so its own wording is the only useful message.

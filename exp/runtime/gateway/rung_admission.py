@@ -244,6 +244,8 @@ class RungLoadRegistry:
         warm_session: bool = True,
         fresh_spill_fraction: float | None = None,
         force: bool = False,
+        hard_bound: bool = False,
+        rate_retry: bool = False,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
 
@@ -265,8 +267,9 @@ class RungLoadRegistry:
                 here); fresh sessions shed at the early threshold.
             fresh_spill_fraction: Fraction of the bound where fresh sessions
                 shed early; ``None`` disables the early threshold.
-            force: Admit past every policy limit (the caller proved no other
-                rung can serve; policy must never manufacture a failure).
+            force: Admit past soft policy limits when the caller permits overflow.
+            hard_bound: Recheck the capacity ceiling even on a forced rate-window retry.
+            rate_retry: Skip rate windows, not capacity, fairness or fresh-session checks.
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -281,7 +284,9 @@ class RungLoadRegistry:
             organization.weight = weight
             self._prune(key, rung, now)
             self._prune_window(rung, now)
-            if not force:
+            if hard_bound and bound is not None and rung.total >= bound:
+                return RungShed("queue_bound")
+            if not force or rate_retry:
                 shed = self._shed_reason(
                     rung,
                     organization,
@@ -294,6 +299,7 @@ class RungLoadRegistry:
                     reserved_tokens=reserved_tokens,
                     warm_session=warm_session,
                     fresh_spill_fraction=fresh_spill_fraction,
+                    skip_rate=rate_retry,
                 )
                 if shed is not None:
                     return shed
@@ -310,6 +316,51 @@ class RungLoadRegistry:
             self._tickets[ticket] = (key, organization_id)
             return ticket
 
+    def can_admit(
+        self,
+        key: RungLoadKey,
+        *,
+        organization_id: str,
+        weight: int,
+        bound: int | None,
+        fair_share: bool,
+        requests_per_minute: int | None,
+        tokens_per_minute: int | None,
+        cache_priority_alpha: float | None,
+        reserved_tokens: int,
+    ) -> bool:
+        """Check current local headroom without reserving or consuming a rate-window slot.
+
+        This is an elective recovery hint only. Dispatch still performs the atomic
+        reservation and may shed if competing traffic consumed the headroom meanwhile.
+        """
+        now = self._clock()
+        with self._lock:
+            rung = self._rungs.get(key)
+            if rung is None:
+                return True
+            organization = rung.organizations.setdefault(organization_id, _OrganizationLoad())
+            organization.last_seen = now
+            organization.weight = weight
+            self._prune(key, rung, now)
+            self._prune_window(rung, now)
+            return (
+                self._shed_reason(
+                    rung,
+                    organization,
+                    now=now,
+                    bound=bound,
+                    fair_share=fair_share,
+                    requests_per_minute=requests_per_minute,
+                    tokens_per_minute=tokens_per_minute,
+                    cache_priority_alpha=cache_priority_alpha,
+                    reserved_tokens=reserved_tokens,
+                    warm_session=True,
+                    fresh_spill_fraction=None,
+                )
+                is None
+            )
+
     def _shed_reason(
         self,
         rung: _RungLoad,
@@ -324,6 +375,7 @@ class RungLoadRegistry:
         reserved_tokens: int,
         warm_session: bool,
         fresh_spill_fraction: float | None,
+        skip_rate: bool = False,
     ) -> RungShed | None:
         """Decide one reservation under the registry lock; ``None`` admits.
 
@@ -357,7 +409,7 @@ class RungLoadRegistry:
             ):
                 return RungShed("fresh_session_spill")
         working_rpm = self._working_rpm(rung, requests_per_minute, now)
-        if working_rpm is not None and rung.window_requests + 1 > working_rpm:
+        if not skip_rate and working_rpm is not None and rung.window_requests + 1 > working_rpm:
             return RungShed("rate_limit", learned_requests_per_minute=rung.learned_rpm)
         # Burst allowance: a single request whose worst-case reservation alone
         # exceeds the token cap must still be admissible into an EMPTY window
@@ -366,7 +418,8 @@ class RungLoadRegistry:
         # rate limiting. It then occupies the window and blocks further
         # dispatches until it slides out.
         if (
-            tokens_per_minute is not None
+            not skip_rate
+            and tokens_per_minute is not None
             and rung.window_tokens > 0
             and rung.window_tokens + reserved_tokens > tokens_per_minute
         ):

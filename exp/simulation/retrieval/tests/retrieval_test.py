@@ -34,8 +34,9 @@ from exp.common.project import (
     ProjectPaths,
     artifact_input,
 )
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
-from exp.simulation.ingest import (
+from exp.common.traces.ingest import (
     TraceNormalizationResult,
     persist_trace_dataset,
 )
@@ -49,6 +50,8 @@ from exp.simulation.retrieval import (
     load_rag_index,
     persist_trace_rag,
 )
+from exp.simulation.retrieval.embedding import RAGEmbeddingCache
+from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
 from exp.simulation.retrieval.transitions import render_rag_key
 
 _CREATED_AT = datetime(2026, 8, 13, tzinfo=UTC)
@@ -183,6 +186,54 @@ def test_held_out_only_index_is_not_a_supported_fit_evidence_artifact(tmp_path: 
         )
 
 
+def test_shared_embedding_cache_preserves_fit_exclusions_and_complete_tool_results(
+    tmp_path: Path,
+) -> None:
+    """Sharing pure text vectors neither admits held-out examples nor embeds target responses."""
+    store = _store(tmp_path, "shared-cache")
+    traces = (_tool_trace(with_result=True), _tool_trace(with_result=True, index=2))
+    source_input, _ = _persist_trace_values(store, traces)
+    bindings = (
+        RAGLineageBinding(trace_id=traces[0].trace_id, lineage_id="fit", partition="fit"),
+        RAGLineageBinding(trace_id=traces[1].trace_id, lineage_id="held", partition="held_out"),
+    )
+    binding = _constant_binding()
+    cache = RAGEmbeddingCache(binding, maximum_chunk_bytes=2_048)
+    serving = persist_trace_rag(
+        store,
+        (source_input,),
+        bindings,
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+        embedder=binding,
+        embedding_cache=cache,
+        included_partitions=frozenset({"fit", "held_out"}),
+    )
+    vectors_before = dict(cache.vectors)
+    fit = persist_trace_rag(
+        store,
+        (source_input,),
+        bindings,
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+        embedder=binding,
+        embedding_cache=cache,
+    )
+    loaded = load_rag_index(store, fit.index.rag_id)
+
+    assert cache.vectors == vectors_before
+    assert len(serving.transitions) == 2
+    assert len(loaded.transitions) == 1
+    assert loaded.transitions[0].lineage_id == "fit"
+    assert loaded.transitions[0].observation.content == "account found"
+    assert all("account found" not in text for text in cache.vectors)
+    assert loaded.vectors == tuple(
+        vector
+        for vector in serving.vectors
+        if vector.transition_id == loaded.transitions[0].transition_id
+    )
+
+
 def test_retrieve_filters_lineage_before_stable_tie_break_and_never_mutates(
     tmp_path: Path,
 ) -> None:
@@ -261,7 +312,7 @@ def test_fit_loader_pins_manifest_embedder_price_retry_and_query_economics(
     economics = retriever.estimate_query_economics(query, reservation)
 
     assert economics.cost_usd == NumericMeasurement(
-        value=len(key.encode("utf-8")) * 3 * 2.0 / 1_000_000,
+        value=plan_rag_embedding_inputs((key,)).maximum_input_tokens * 3 * 2.0 / 1_000_000,
         provenance="estimated",
     )
     with pytest.raises(ValueError, match="manifest digest"):
@@ -409,7 +460,7 @@ def test_non_real_trace_provenance_is_forbidden(tmp_path: Path, kind: SourceKind
 
 def test_loader_fails_closed_on_payload_hash_change(tmp_path: Path) -> None:
     store, rag_id = _built_index(tmp_path, "bad-hash")
-    path = store.project_directory / "artifacts" / rag_id / "transitions.jsonl"
+    path = RawArtifact(store._paths, rag_id) / "transitions.jsonl"
     path.write_bytes(path.read_bytes() + b"\n")
 
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
@@ -463,7 +514,7 @@ def test_loader_fails_closed_on_vector_dimension_change(tmp_path: Path) -> None:
 
 def test_loader_fails_closed_on_nan_vector(tmp_path: Path) -> None:
     store, rag_id = _built_index(tmp_path, "bad-nan")
-    directory = store.project_directory / "artifacts" / rag_id
+    directory = RawArtifact(store._paths, rag_id)
     vector_path = directory / "vectors.jsonl"
     value = json.loads(vector_path.read_text(encoding="utf-8").splitlines()[0])
     value["values"][0] = float("nan")

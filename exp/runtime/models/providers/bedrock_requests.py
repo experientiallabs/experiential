@@ -22,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.anthropic_tool_compat import anthropic_input_schema
 from exp.runtime.models.providers.audios import reject_audio_part
 from exp.runtime.models.providers.documents import bedrock_document_block
@@ -142,6 +143,8 @@ def converse_body(
     # shared signature so all provider lanes use one capability contract, but
     # omit the request until response projection exists.
     del supports_logprobs
+    if request.json_object_output and json_object_instruction is None:
+        json_object_instruction = JSON_OBJECT_SYSTEM_INSTRUCTION
     system: list[JsonObject] = []
     messages: list[JsonObject] = []
 

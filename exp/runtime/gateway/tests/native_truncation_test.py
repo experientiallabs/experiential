@@ -178,9 +178,9 @@ class _TruncatingUpstream(threading.Thread):
                 conn, _peer = self.listener.accept()
             except OSError:
                 return
-            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._handle_connection, args=(conn,), daemon=True).start()
 
-    def _handle(self, conn: socket.socket) -> None:
+    def _handle_connection(self, conn: socket.socket) -> None:
         """Drain the request, send the truncated response, close per mode."""
         try:
             conn.settimeout(10)

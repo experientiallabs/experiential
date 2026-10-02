@@ -53,6 +53,8 @@ impl DecisionsAdmission {
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: false,
             throttle_redial: None,
+            physical_route_cap: None,
+            backoff: None,
         }
     }
 }
@@ -290,7 +292,7 @@ fn timeout_failure() -> Failure {
 }
 
 async fn dispatch(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &DecisionsAdmission,
@@ -530,13 +532,12 @@ fn public_decisions(
                     .and_then(Value::as_f64)
                     .filter(|value| value.is_finite())
                     .ok_or_else(|| malformed("decision score is not finite numeric data"))?;
-                let expected = (0..criteria.len()).try_fold(0.0, |sum, index| {
-                    probability(&answer["probabilities"][index.to_string()])
-                        .map(|value| sum + index as f64 * value)
-                })?;
+                let probabilities = (0..criteria.len())
+                    .map(|index| probability(&answer["probabilities"][index.to_string()]))
+                    .collect::<Result<Vec<_>, _>>()?;
                 if score < 0.0
                     || score > criteria.len().saturating_sub(1) as f64
-                    || (score - expected).abs() > PROBABILITY_TOLERANCE
+                    || !score_matches_distribution(score, &probabilities)
                 {
                     return Err(malformed(
                         "decision score does not match its probability distribution",
@@ -575,6 +576,72 @@ fn decision_usage(payload: &Value) -> Result<Usage, Failure> {
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
     })
+}
+
+/// Check a score without treating rounded wire probabilities as exact model values.
+fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
+    let expected: f64 = probabilities
+        .iter()
+        .enumerate()
+        .map(|(index, value)| index as f64 * value)
+        .sum();
+    if (score - expected).abs() <= PROBABILITY_TOLERANCE {
+        return true;
+    }
+    // Hundredth-valued wire scores need not equal an expectation recomputed from
+    // rounded bins. Only that precision gets an envelope; finer data stays strict.
+    let Some(score_hundredths) = hundredths(score) else {
+        return false;
+    };
+    // Half-hundredth integer units avoid floating-point boundary tolerances.
+    // A single unit distribution must explain all bins together, not a separate
+    // error allowance for each weighted term. Clamp at the probability endpoints.
+    let Some(bounds) = probabilities
+        .iter()
+        .map(|value| hundredths(*value).map(|bin| ((2 * bin - 1).max(0), (2 * bin + 1).min(200))))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let lower_sum: i64 = bounds.iter().map(|(low, _)| low).sum();
+    let upper_sum: i64 = bounds.iter().map(|(_, high)| high).sum();
+    if lower_sum > 200 || upper_sum < 200 {
+        return false;
+    }
+    let base: i64 = bounds
+        .iter()
+        .enumerate()
+        .map(|(index, (low, _))| index as i64 * low)
+        .sum();
+    let minimum = rounded_expectation(base, 200 - lower_sum, bounds.iter().enumerate());
+    let maximum = rounded_expectation(base, 200 - lower_sum, bounds.iter().enumerate().rev());
+    // Closed envelopes admit unspecified half-way rounding. No output is repaired
+    // or normalized, and structurally invalid distributions never reach this check.
+    2 * score_hundredths + 1 >= minimum && 2 * score_hundredths - 1 <= maximum
+}
+
+/// Recognize decimal hundredths, including their binary floating-point residue.
+fn hundredths(value: f64) -> Option<i64> {
+    let scaled = value * 100.0;
+    let rounded = scaled.round();
+    // Allow binary representation and multiplication roundoff, not extra decimal
+    // precision. A relative bound also keeps tiny nonzero bins distinct from zero.
+    let roundoff = 2.0 * f64::EPSILON * scaled.abs();
+    ((scaled - rounded).abs() <= roundoff).then_some(rounded as i64)
+}
+
+/// Extremize a weighted sum by filling the lowest or highest indices first.
+fn rounded_expectation<'a>(
+    mut value: i64,
+    mut remaining: i64,
+    bins: impl Iterator<Item = (usize, &'a (i64, i64))>,
+) -> i64 {
+    for (index, (low, high)) in bins {
+        let added = remaining.min(high - low);
+        value += index as i64 * added;
+        remaining -= added;
+    }
+    value
 }
 
 fn probability(value: &Value) -> Result<f64, Failure> {

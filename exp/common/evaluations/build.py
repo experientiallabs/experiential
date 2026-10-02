@@ -52,6 +52,7 @@ def build_evaluation_dataset(
     pricing_snapshot_id: ArtifactId,
     protocols: Sequence[EvaluationProtocol],
     cell_evidence: Sequence[EvaluationCellEvidence],
+    additional_inputs: Sequence[ArtifactInput] = (),
     purposes: Sequence[Literal["fit", "held_out", "fidelity"]] = (
         "fit",
         "held_out",
@@ -68,6 +69,7 @@ def build_evaluation_dataset(
         pricing_snapshot_id: Exact pricing artifact already pinned by the plan.
         protocols: Frozen production, world-model, or sandbox evidence protocols.
         cell_evidence: One explicit execution assignment for every plan cell.
+        additional_inputs: Verified immutable execution evidence such as a new judging pass.
         created_at: Time the dataset is completed.
         code_revision: Exact EXP revision creating the dataset.
 
@@ -120,6 +122,10 @@ def build_evaluation_dataset(
         pricing_input,
         *calibration_inputs,
     ]
+    for pointer in additional_inputs:
+        if artifact_input(store.read(pointer.artifact_id).manifest) != pointer:
+            raise EvaluationEvidenceError("additional evaluation input has drifted")
+        verified_inputs.append(pointer)
     rows = tuple(
         _materialize_row(
             store,
@@ -174,8 +180,7 @@ def build_evaluation_dataset(
         rows_sha256=sha256_bytes(rows_payload),
     )
     dataset = EvaluationDataset(manifest=manifest, rows=rows)
-    destination = store.project_directory / "artifacts" / evaluation_id
-    if destination.exists():
+    if store.exists(evaluation_id):
         existing = load_evaluation_dataset(store, evaluation_id)
         if existing != dataset:
             raise EvaluationEvidenceError(
@@ -335,6 +340,16 @@ def _materialize_row(
     )
     if evidence.source_run_id is not None and evidence.source_run_id != rollout.source_run_id:
         raise EvaluationEvidenceError("cell evidence source run differs from its rollout")
+    if rollout.stop_reason in {
+        StopReason.MAXIMUM_STEPS,
+        StopReason.MAXIMUM_OUTPUT_TOKENS,
+        StopReason.MAXIMUM_COST,
+        StopReason.MAXIMUM_TIME,
+        StopReason.LENGTH,
+    }:
+        if evidence.judgment_artifact_id is not None:
+            raise EvaluationEvidenceError("incomplete rollouts cannot carry a judgment")
+        return _row_from_rollout(cell, protocol, rollout, status="incomplete")
     if rollout.failure is not None or rollout.stop_reason == StopReason.FAILURE:
         if evidence.judgment_artifact_id is not None:
             raise EvaluationEvidenceError("failed rollouts cannot carry a judgment")
@@ -441,7 +456,7 @@ def _row_from_rollout(
     protocol: EvaluationProtocol,
     rollout: RolloutArtifact,
     *,
-    status: Literal["observed", "completed", "failed"],
+    status: Literal["observed", "completed", "failed", "incomplete"],
     judgment: Judgment | None = None,
     error: StructuredFailure | None = None,
 ) -> EvaluationRow:

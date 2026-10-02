@@ -4,9 +4,9 @@ An interactive terminal shows a single rich ``Live`` line naming the active stag
 stage renders a progress bar with its exact completed and total counts plus a rate-based
 remaining-time estimate. Each finished stage is printed once above the line as a permanent
 ``[x]`` row, matching the picker screens, unless the display owns a single-line section that
-keeps exactly one in-place line for its whole duration. A non-interactive stream receives stable
-newline-delimited stage updates with no cursor control, so piped and scripted sessions stay
-readable line by line.
+keeps exactly one in-place line with a continuously animated spinner and elapsed time. A
+non-interactive stream receives stable newline-delimited stage updates with no cursor control,
+so piped and scripted sessions stay readable line by line.
 """
 
 from __future__ import annotations
@@ -15,8 +15,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from time import monotonic
 
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.live import Live
+from rich.spinner import Spinner
 from rich.text import Text
 
 from exp.common.progress import ProgressEvent, ProgressHook
@@ -36,18 +37,28 @@ class ProgressDisplay:
             single_line: Keep exactly one in-place line with no permanent finished-stage rows.
         """
         self._console = console
-        self._live = (
-            Live(console=console, auto_refresh=False, transient=True)
-            if console.is_interactive
-            else None
-        )
         self._single_line = single_line
         self._current: ProgressEvent | None = None
         self._stage_started = 0.0
         self._stage_baseline = 0
+        self._started_at = 0.0
+        self._spinner = Spinner("dots")
+        self._live = (
+            Live(
+                console=console,
+                auto_refresh=single_line,
+                refresh_per_second=4,
+                transient=True,
+                get_renderable=self._render_current if single_line else None,
+            )
+            if console.is_interactive
+            else None
+        )
 
     def start(self) -> None:
         """Begin owning the in-place line on an interactive terminal."""
+        if self._single_line:
+            self._started_at = monotonic()
         if self._live is not None:
             self._live.start(refresh=False)
 
@@ -85,27 +96,45 @@ class ProgressDisplay:
             self._stage_started = monotonic()
             self._stage_baseline = event.completed or 0
         self._current = event
-        self._live.update(self._render(event), refresh=True)
+        if self._single_line:
+            self._live.refresh()
+        else:
+            self._live.update(self._render(event), refresh=True)
 
-    def _render(self, event: ProgressEvent) -> Text:
+    def _render_current(self) -> RenderableType:
+        """Refresh elapsed time and animation even while no new work has completed."""
+        event = self._current
+        return self._render(event) if event is not None else Text("")
+
+    def _render(self, event: ProgressEvent) -> RenderableType:
         """Compose the in-place line, with a bar and remaining-time estimate when countable.
 
         Args:
             event: Update being rendered on the live line.
 
         Returns:
-            The styled single-line rendering of the current stage.
+            The current stage, with continuous animation and elapsed time in single-line mode.
         """
         if event.completed is None or event.total is None or event.total == 0:
-            return Text(f"{_ROW_INDENT}> {_label(event)}", style="cyan")
-        filled = min(_BAR_WIDTH, _BAR_WIDTH * event.completed // event.total)
-        line = Text(f"{_ROW_INDENT}> {_name(event)} ", style="cyan")
-        line.append("\u2501" * filled, style="cyan")
-        line.append("\u2501" * (_BAR_WIDTH - filled), style="dim")
-        line.append(f" {event.completed}/{event.total}", style="cyan")
-        remaining = self._estimated_remaining(event)
-        if remaining is not None:
-            line.append(f" eta {remaining}", style="dim")
+            if not self._single_line:
+                return Text(f"{_ROW_INDENT}> {_label(event)}", style="cyan")
+            line = Text(_label(event), style="cyan")
+        else:
+            filled = min(_BAR_WIDTH, _BAR_WIDTH * event.completed // event.total)
+            prefix = "" if self._single_line else f"{_ROW_INDENT}> "
+            line = Text(f"{prefix}{_name(event)} ", style="cyan")
+            line.append("\u2501" * filled, style="cyan")
+            line.append("\u2501" * (_BAR_WIDTH - filled), style="dim")
+            line.append(f" {event.completed}/{event.total}", style="cyan")
+            remaining = self._estimated_remaining(event)
+            if remaining is not None:
+                line.append(f" eta {remaining}", style="dim")
+        if self._single_line:
+            elapsed = max(0, int(monotonic() - self._started_at))
+            duration = _duration(elapsed) if elapsed else "0s"
+            line.append(f" · {duration} elapsed", style="dim")
+            self._spinner.update(text=line)
+            return self._spinner
         return line
 
     def _estimated_remaining(self, event: ProgressEvent) -> str | None:

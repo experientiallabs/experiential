@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityField,
     CompatibilityManifest,
 )
 from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.openai_protocol.errors import unsupported_field
 
 
 def _field(
@@ -103,6 +105,7 @@ CHAT_MANIFEST = CompatibilityManifest(
         # on every route); the object forwards to OpenRouter rungs and is
         # dropped on wires that have no such field.
         _field("provider", CompatibilityDisposition.SUPPORTED),
+        _field("gateway", CompatibilityDisposition.SUPPORTED),
         # Both API surfaces share the native Responses output-length hint;
         # other routes omit it with disclosure. Values remain validated.
         _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
@@ -208,6 +211,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # on every route); the object forwards to OpenRouter rungs and is
         # dropped on wires that have no such field.
         _field("provider", CompatibilityDisposition.SUPPORTED),
+        _field("gateway", CompatibilityDisposition.SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -297,15 +301,6 @@ its internal shape is an evolving provider surface, so it is validated only
 as an object and round-trips verbatim like ``namespace``.
 """
 
-RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
-    "message": frozenset(),
-    "function_call": frozenset(),
-    "function_call_output": frozenset(),
-    "reasoning": frozenset(),
-}
-"""Echoable input-item fields consciously rejected with a named 400."""
-
-
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
     "messages": "validated_and_forwarded_to_cache_capable_adapters",
     "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
@@ -336,6 +331,7 @@ EMBEDDINGS_MANIFEST = CompatibilityManifest(
                 "encoding_format",
             )
         ),
+        _field("stream", CompatibilityDisposition.IGNORED),
         # End-user attribution (OpenAI spec): accepted and recorded gateway-side,
         # never forwarded to the provider. The embeddings body carries no
         # safety_identifier / prompt_cache_key, so `user` is the only one.
@@ -385,3 +381,20 @@ def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityD
         Field path to disposition mapping.
     """
     return {field.field_path: field.disposition for field in manifest.fields}
+
+
+def validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
+    """Reject unsupported and unknown top-level fields before decoding.
+
+    Args:
+        payload: Raw request body.
+        manifest: Compatibility manifest of the request's surface.
+
+    Raises:
+        OpenAIProtocolError: A field is unsupported or absent from the manifest.
+    """
+    decisions = disposition_map(manifest)
+    for field in payload:
+        disposition = decisions.get(field)
+        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
+            raise unsupported_field(field)

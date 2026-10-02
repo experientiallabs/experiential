@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import cast
 
 from exp.common.core.artifacts import (
     FailureAttribution,
@@ -20,7 +19,7 @@ from exp.common.rollouts import (
     unknown_spend_failure,
 )
 from exp.runtime.agents import AgentEpisode
-from exp.simulation.engines.text.environment import TextOnlyToolUseError
+from exp.simulation.engines.text.environment import SimulatedToolUseError
 from exp.simulation.engines.text.redaction import redact_span
 
 
@@ -81,42 +80,24 @@ def internal_failure(phase: str, exception: Exception) -> StructuredFailure:
 
 
 def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | None:
-    """Translate a tool attempt into the text mode's explicit unsupported-cell evidence.
+    """Translate a forged or repeated tool invocation into explicit invalid evidence.
 
     Args:
-        episode: Customer-agent episode that may have ended at the text-only tool boundary.
+        episode: Customer-agent episode that may have ended at the simulated tool boundary.
 
     Returns:
         The original failure, a normalized unsupported failure, or ``None``.
     """
     failure = episode.failure
-    if failure is None or failure.exception_type != TextOnlyToolUseError.__name__:
+    if failure is None or failure.exception_type != SimulatedToolUseError.__name__:
         return failure
     return StructuredFailure(
         code=FailureCode.UNSUPPORTED,
-        message="text world-model simulation cannot execute a customer-agent tool call",
+        message="agent requested an observation outside the pending simulated tool calls",
         exception_type=failure.exception_type,
         attribution=FailureAttribution.TOOL,
         details={"phase": "agent_tool_call"},
     )
-
-
-def known_total_spend(
-    rollouts: Sequence[RolloutArtifact],
-) -> float | None:
-    """Return total conservative provider spend, or ``None`` if any episode is unpriced.
-
-    Args:
-        rollouts: Completed text-simulation rollout artifacts to total.
-
-    Returns:
-        The known conservative provider spend, or ``None`` when any billed call is not priced
-        and has no persisted worst-case reservation.
-    """
-    values = tuple(rollout_spend(rollout) for rollout in rollouts)
-    if any(value is None for value in values):
-        return None
-    return sum(cast(float, value) for value in values)
 
 
 def rollout_spend(

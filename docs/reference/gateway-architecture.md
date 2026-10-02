@@ -26,8 +26,15 @@ It serves:
 - `POST /v1/embeddings` (the OpenAI Embeddings API: message-less and never streamed; served
   only by aliases whose catalog capabilities declare `supports_embeddings` on an OpenAI-wire
   connection, billed on the provider's reported `prompt_tokens` with no output leg, and
-  returned with the provider's exact vectors in `float` or `base64` form; an inbound
-  `Idempotency-Key` is ignored because the surface has no replay protocol)
+  returned with the provider's exact vectors in `float` or `base64` form. Input accepts a
+  nonempty string, a batch of nonempty strings, a nonempty integer token sequence, or a
+  batch of nonempty token sequences. A flat token sequence produces one vector; token IDs
+  are forwarded unchanged and must match the selected model's tokenizer. Boolean, fractional,
+  negative, mixed-shape, and empty token inputs are rejected. Omit `stream` or send the literal
+  `false`; `true` and unknown parameters are rejected, and `stream` is never forwarded.
+  Reservations count token IDs directly and retain normal headroom; settlement still uses
+  provider-reported input usage. There is no response cache, and an inbound `Idempotency-Key`
+  is ignored because the surface has no replay protocol)
 - `POST /v1/images/generations` (the OpenAI Images API, generations only: prompt in, images
   out, never streamed; served only by aliases whose catalog capabilities declare
   `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported
@@ -106,7 +113,7 @@ Wire facts come from each resolved client's `gateway_wire_profile()`. The dialec
 Bedrock uses AWS binary event streams, not SSE. Admission freezes the Converse body; after its
 bounded dispatch permit, the data plane obtains SigV4 headers through Python's `sign_dispatch`
 callback immediately before POSTing those exact bytes. Signing after queue wait avoids stale
-signatures. The bounded immediate open retry reuses that signature; later retries sign afresh.
+signatures. The bounded immediate open retry reuses that signature; later retries sign afresh. See [provider destination policy](gateway-egress.md) for hosted egress controls.
 
 ### Native decisions
 
@@ -283,33 +290,32 @@ that author no schedule keep byte-identical behavior; the hosted platform's reco
 authoring for house GPT lanes, whose traffic is cache-heavy, is a schedule of three redials from a
 500 ms base capped at 8 s beside its existing 0.5 threshold.
 
-A reasoning continuation (a Chat request replaying a gateway-sealed `reasoning_content` carrier
-on an assistant tool turn after the latest user message) resolves as `route_reason:
-reasoning_continuation`: the carrier is authenticated against the exact deployment and credential
-that sealed it, and that issuing rung dispatches first with the unsealed reasoning replayed, so
-the model's thinking continues across the tool call. The rung is NOT the whole ladder. The pool's
-other certified rungs follow in pool order as failover fallbacks, and every one of them is frozen
-at admission from the request with the post-user-boundary sealed reasoning removed: only the
-issuing rung's credential can unseal a carrier (each provider's carrier is AEAD domain-separated
-to its own credential, a non-carrier rung yields no authority, and the payload builders reject a
-block sealed for another route by name), so the fallback keeps the messages, visible text, tool
-calls and tool results and drops just that turn's thinking. A failover-eligible operational
-failure on the issuing rung (a throttle after the pool's `throttle_redial` budget is spent there,
-provider quota, unavailability, transport) therefore advances to the next rung exactly like any
-last-rung failure, and that attempt is recorded with `route_reason:
-reasoning_continuation_failover`; a caller error (`invalid_request`, a refusal without the
-opt-in) still surfaces without touching a fallback. The stated loss on a failover is the model's
-thinking continuity across that tool call and the issuing provider's prompt cache for the turn,
-never correctness of the visible conversation. Because its fallbacks run without the reasoning,
-the issuing rung gets the full `throttle_redial` budget (rule 2 above, beside the sticky rung),
-affinity or cache-marker reordering never demotes it from first position while it is
-dispatchable, and a rung dispatch-policy shed of the issuing rung (its authored per-worker
-`requests_per_minute`, `tokens_per_minute` or `concurrency_bound`, which trip under ordinary
-load) force-admits it as `saturated_overflow` exactly as a one-rung ladder did instead of
-spilling sideways to a stripped fallback: only a real failover-eligible failure on the pinned
-rung moves the ladder past it. A continuation
-whose sealed carriers all precede the latest user message carries no active reasoning and routes
-as a plain request; a single-rung pool has no fallback and surfaces the failure as before.
+A reasoning continuation (a Chat request replaying a gateway-sealed `reasoning_content` carrier on
+an assistant tool turn after the latest user message) resolves as `route_reason:
+reasoning_continuation`: the carrier authenticates against the exact deployment and credential that
+sealed it, and that issuing rung dispatches first with the unsealed reasoning replayed, so the
+model's thinking continues across the tool call. The pool's other certified rungs follow in pool
+order as failover fallbacks, each frozen at admission with the post-user-boundary sealed reasoning
+removed: only the issuing rung's credential can unseal a carrier (each provider's carrier is AEAD
+domain-separated to its own credential, a non-carrier rung yields no authority, and the payload
+builders reject a block sealed for another route by name), so a fallback keeps the messages,
+visible text, tool calls and tool results and drops just that turn's thinking. A failover-eligible
+operational failure on the issuing rung (a throttle after the pool's `throttle_redial` budget is
+spent there, provider quota, unavailability, transport) advances to the next rung like any
+last-rung failure, recorded as `route_reason: reasoning_continuation_failover`; a caller error
+(`invalid_request`, a refusal without the opt-in) surfaces without touching a fallback. The stated
+loss is thinking continuity and the issuing provider's prompt cache for the turn, never the visible
+conversation. The issuing rung gets the full `throttle_redial` budget (rule 2 above), affinity or
+cache-marker reordering never demotes it while dispatchable, and a dispatch-policy shed of it (its
+authored per-worker `requests_per_minute`, `tokens_per_minute` or `concurrency_bound`) force-admits
+it as `saturated_overflow` instead of spilling to a stripped fallback. A continuation whose sealed
+carriers all precede the latest user message carries no active reasoning and routes as a plain
+request; a single-rung pool has no fallback. An authentic carrier on an EDITED turn (changed tool
+call, visible text or prefix; OpenCode echoes a schema-invalid call as its `invalid` tool) drops
+unrevealed, disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`, as does one
+whose issuing rung left the route (a lane closed on exhausted credit): `issuing_route_unavailable`.
+A later carrier sealed over a dropped turn fails its prefix binding and drops too; an earlier intact
+one still pins. Authentication or authority failures (tamper, rotation) are still refused.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
@@ -320,8 +326,8 @@ channel. On Messages, a numeric `max_tokens` reasoning budget becomes an exact b
 replace another explicit numeric budget. Unsupported hard constraints are refused before
 dispatch. `exclude` retains its disclosed omission policy. The Chat surface accepts effort
 and enable controls beside `thinking`, `chat_template_kwargs`, and DashScope's top-level
-`enable_thinking`; numeric reasoning budgets receive a named compatibility refusal instead
-of a nearest-tier approximation. See [generation controls](gateway-generation.md). Chat also
+`enable_thinking`; numeric budgets travel unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud
+routes. Unsupported budgets are refused; see [generation controls](gateway-generation.md). Chat also
 replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
 same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
@@ -422,30 +428,30 @@ rate-limit response headers per attempt when the data plane harvests them (`retr
 OpenAI `x-ratelimit-*` and Anthropic `anthropic-ratelimit-*` families, normalized to integers),
 and a throttled settlement carrying a parseable `Retry-After` (seconds or HTTP-date) sizes that
 deployment's throttle window from it, clamped to [5s, 6h], instead of the fixed default, so a
-daily-quota reset actually suppresses the rung for the wait the provider asked for. Pools and
-rungs that author none of this keep byte-identical behavior and null disclosure columns.
+daily-quota reset actually suppresses the rung for the wait the provider asked for. A plan rung
+(`subscription`, see the providers reference) also throttles until a used-up usage window resets.
+Pools and rungs that author none of this keep byte-identical behavior and null disclosure columns.
 
 Under `maximize_cache_affinity`, two further per-rung fields keep provider prompt caches warm
 across spills. `sticky_spill_seconds` gives each dispatch a worker-local
 fingerprint-to-deployment binding with that lifetime (refreshed per hit, but capped at four
 lifetimes of total age from creation so continuous hits cannot pin a long-running session to a
-pricier spill rung forever): the binding is honored
-ahead of rendezvous order on later requests, so a spilled conversation keeps serving off the rung
-holding its warm cache instead of bouncing back the moment the preferred rung stops shedding, and
-a binding whose rung is throttled or circuit-open is cleared rather than followed. The binding is
-deliberately worker-local (the serving edge's keep-alives pin a client to one worker; the
-cross-worker miss costs one cold dispatch). The binding keys on the affinity fingerprint (the
-session identity rendezvous already uses), never on a derived provider cache key: on
-OpenAI-compatible shim lanes (including Experiential Cloud's vLLM boxes) no `prompt_cache_key` is
-forwarded and the box's prefix cache is content-addressed, so gateway-side session-to-rung
-consistency is the entire cache-preservation mechanism there. `fresh_session_spill_fraction`
-reserves the top slice
-of a bounded rung for warm sessions: a request whose fingerprint holds no live binding on the
-rung sheds sideways once in-flight dispatches reach `bound * fraction` (`fresh_session_spill`),
-while warm sessions ride to the hard bound (it requires `sticky_spill_seconds`, because warm
-standing IS a live binding). A hosted composition may also exclude individual attempts from the
-cache-priority EWMA through the accounting's `cache_sample_gate` (promotion-funded replay must
-not buy fair-share weight with prefixes the promotion already made costless).
+pricier spill rung forever): the binding is honored ahead of rendezvous order on later requests,
+so a spilled conversation keeps serving off the rung holding its warm cache instead of bouncing
+back the moment the preferred rung stops shedding, and a binding whose rung is throttled or
+circuit-open is cleared rather than followed. The binding is deliberately worker-local (the
+serving edge's keep-alives pin a client to one worker; the cross-worker miss costs one cold
+dispatch). The binding keys on the affinity fingerprint (the session identity rendezvous already
+uses), never on a derived provider cache key: on OpenAI-compatible shim lanes (including
+Experiential Cloud's vLLM boxes) no `prompt_cache_key` is forwarded and the box's prefix cache is
+content-addressed, so gateway-side session-to-rung consistency is the entire cache-preservation
+mechanism there. `fresh_session_spill_fraction` reserves the top slice of a bounded rung for warm
+sessions: a request whose fingerprint holds no live binding on the rung sheds sideways once
+in-flight dispatches reach `bound * fraction` (`fresh_session_spill`), while warm sessions ride
+to the hard bound (it requires `sticky_spill_seconds`, because warm standing IS a live binding).
+A hosted composition may also exclude individual attempts from the cache-priority EWMA through
+the accounting's `cache_sample_gate` (promotion-funded replay must not buy fair-share weight with
+prefixes the promotion already made costless).
 
 A deployment's price schedule may declare a long-context tier: a whole-request premium applied
 once provider-reported input tokens reach its threshold, matching both published tier schedules
@@ -722,19 +728,14 @@ reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dro
 so the model still answers with its own default; the 400 remains only for a value outside a
 supporting route's declared range, which is a genuine caller error.
 
-**An Anthropic-shaped `thinking` object on the Chat wire is a reasoning control, `adaptive`
-included.** Clients configured for Claude send `thinking: {type: "adaptive"}` (the 4.6+
-generation's only on-mode) to `/v1/chat/completions` on every model; the decoder reads `adaptive`
-and `enabled` alike as "think at the route's default depth" (`thinking->translated(reasoning_effort)`:
-the LANE default, the first rung in route order pinning a catalog `reasoning_default_effort` every
-rung can serve, as on the Messages surface; a route pinning none takes its one required default or
-the lowest portable tier), `disabled` as
-`reasoning_effort: none`, and a `budget_tokens` beside either as not carried. An Anthropic rung
-then receives the adaptive object plus `output_config.effort`; every other reasoning rung receives
-its own effort field; a route with no reasoning effort at all still refuses by name. A `type`
-outside the three members is refused naming the members, never the arriving JSON type (3,935
-Chat requests over 7 days died at decode as "expected one of 'enabled' or 'disabled', but got a
-string instead", 2026-09-15).
+**An Anthropic-shaped `thinking` object on Chat retains its requested depth.** Bare
+`enabled` and `adaptive` select the route's default effort with
+`thinking->translated(reasoning_effort)` disclosure; `disabled` selects `reasoning_effort: none`.
+An enabled `budget_tokens` instead travels unchanged on qualified numeric-budget rungs,
+without an effort approximation. The budget must be an integer of at least 1024 and below
+the output ceiling. Adaptive/off modes and competing effort or budget controls are rejected.
+Top-level Chat `thinking_budget` also exposes Gemini zero/dynamic controls. Unsupported routes return an actionable
+`thinking.budget_tokens` error before dispatch. See [generation controls](gateway-generation.md).
 
 **`parallel_tool_calls` is honoured on every route.** A rung whose wire carries the control forwards it.
 On a rung without it (Gemini, Bedrock, an OpenAI-compatible server that ignores the field), `true` is
@@ -821,8 +822,9 @@ controls narrow the waterfall to the rungs that preserve every exact value
 request only through a disclosed drop when no rung preserves it, and each remaining deployment
 passes the capability preflight plus payload build. Only when zero rungs survive does the
 capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
-minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps to the nearest level any rung supports
-on the canonical ladder (ties prefer the lower level), ANY effort on a route with no reasoning
+minimal COERCE-WITH-DISCLOSURE: a reasoning effort may snap downward to the nearest supported
+level that can serve the complete request, never upward. Explicit `none` remains off and is
+refused when the route cannot honor it; it cannot become `minimal`. Any effort on a route with no reasoning
 support at all drops (first-party clients pin effort globally, so a named rejection made whole
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
@@ -841,8 +843,7 @@ narrows to a strict-capable rung when the route has one and otherwise drops only
 a schema keyword. The same validator requires `additionalProperties: false` on every object, so
 strict tool schemas reaching an Anthropic rung have their objects closed with the
 `tools.parameters.additionalProperties->false` disclosure, exactly like structured-output schemas.
-The `capability_parity` row reports the per-release forced-choice fact as
-`supports_forced_tool_choice`. On the OpenAI-compatible Chat Completions wire a canonical
+On the OpenAI-compatible Chat Completions wire a canonical
 `developer` message is emitted as `system` without disclosure: OpenAI defines the two roles
 identically (developer-provided instructions the model follows regardless of user messages),
 while the third-party servers behind that dialect enumerate only the classic roles and reject
@@ -865,10 +866,10 @@ Gemini uses `responseMimeType: "application/json"` without a schema. Anthropic/B
 best-effort system instruction, disclosed as `response_format->instruction(json_object)`.
 Every wire receives a counted JSON-object instruction; native format fields are retained.
 No empty schema is synthesized. Use `json_schema` when a supported route must enforce a shape.
-A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
-only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
-directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
-bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
+Chat and Responses normalize `service_tier: "fast"` to `priority`; BYOK forwarding and auto/default behavior stay unchanged.
+Host tiers require enabled cards; priority selects eligible rungs, never a standard-only lead. Admission freezes standard and requested schedules, including long-context/cache writes, and reserves the larger bound.
+Hosts persist `GatewayServiceTierAdmission` and validate `GatewayServiceTierSettlement` against it, never against live catalog or provider-authored prices.
+Settlement prices the served tier (Responses terminal evidence, not its created echo); missing, unknown or conflicting evidence holds the reservation without charging or releasing it. Anthropic's own
 `service_tier` stays a recorded Messages-surface rejection. A caller top-level `provider` object (OpenRouter's routing-preference shape) is accepted on all three surfaces, Messages included (Anthropic SDKs send it through `extra_body`); exactly one key changes gateway behavior: `provider: {"zdr": true}` DEMANDS zero-data-retention routing for that request, carried as `GatewayRequest.zdr_requested` and `AuthorizationSnapshot.zdr_requested`. A host that publishes provider data-retention postures applies the same posture filter as its organization-level `require_zdr` (natively ZDR rungs first, then an OpenRouter rung dispatched under `provider: {"zdr": true, "data_collection": "deny"}` plus `X-OpenRouter-Metadata: enabled`, flagged through `ExecutionSnapshot.zdr_constrained_deployment_ids`), answers `x-gateway-zdr: true`, and refuses with a 403 naming the excluded providers when no rung qualifies; the demand only tightens and never loosens an organization policy, and the local gateway (no postures) refuses it with a 403 on `provider.zdr`.
 The rest of the object (`data_collection`, `order`, `only`, ...) forwards to OpenRouter rungs verbatim (tightened when the rung is constrained) and is dropped on every other wire (`openai_responses`, `anthropic_messages`, `gemini_generate_content`, `bedrock_converse_stream`, and non-OpenRouter `openai_compatible` rungs), which have no such field. On `maximize_cache` pools, a cache-marked request dispatches
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
@@ -927,9 +928,6 @@ SDK accumulators (Python and TypeScript) copy every usage field present on `mess
 their final message shows the true counts. The estimate is display-only: the encoder keeps it
 apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
 bill the provider's report.
-The per-deployment `capability_parity` export joins catalog declarations with provider-family ground truth so catalogs can warn about gaps and route around them.
-Schema version 7 additionally projects `supports_prompt_cache_boundaries`, `supports_custom_tools`, `supports_grammar_tools`, `supports_tool_call_limit`, `reports_model_status`, and the existing `reports_reasoning_tokens` declaration.
-These declarations default false and never enable a request feature. Cache boundaries mean explicit breakpoints and retention, not implicit prefix caching. Read tool flags with the row's `dialect` and public API surface: Chat still refuses custom and grammar tools; Responses still refuses `max_tool_calls`.
 Gemini `modelStatus` is not preserved; catalogs must leave `reports_model_status` false until the response contract carries it.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are
@@ -957,7 +955,7 @@ alias-revision-scoped stores. A `store: false` request skips continuation retent
 OpenAI Responses routes, whose opaque payloads replay verbatim from the caller's input; the
 replayed reasoning item's `id` is never forwarded upstream because the provider binds the
 encrypted payload to its original item id and callers echo this gateway's own minted public ids.
-The provider also binds the payload to the organization (Azure: the tenant) that sealed it, so a replayed item another lane, account, or tool produced is refused with `invalid_encrypted_content` whatever rung dials; the data plane treats that refusal as a repair, not a verdict, whether the refusal arrives before the stream (OpenAI's 4xx) or inside it (OpenRouter's Responses relay answers 200 and fails the stream on its first frame under `invalid_prompt`): the waterfall re-dials the SAME rung once, inside the same reservation, with every replayed reasoning item carrying `encrypted_content` stripped (message, tool-call, and tool-result items keep their positions; the calls and assistant message of a stripped turn lose their provider `id`, which the provider would tie back to the missing reasoning item), remembers that stripped payload for every later dial of the rung in the same request (a throttle redial never earns the refusal twice; another rung starts from the original, since its account may decrypt it), and remembers per worker, for 30 minutes after their last replay and up to 100,000 entries, the digests of the refused payloads (the one the provider quoted, else every one present; salted by the caller's organization and identity ids as admission names them, never by the request's bearer, which in a hosted worker is the front's ephemeral exchanged token, so one caller's memory never touches another's) so a LATER request that replays them is stripped of exactly those items before its first dial (`encrypted_reasoning_stripped_proactive`), with the reactive repair still behind it, and discloses a served repair through the `x-gateway-replay-repair: encrypted_reasoning_stripped` header (HTTP responses only), the `encrypted_reasoning_stripped` data-plane counter, and one content-free operator line, each written only once the re-dial opened.
+The provider also binds the payload to the organization (Azure: the tenant) that sealed it, so a replayed item another lane, account, or tool produced is refused with `invalid_encrypted_content` whatever rung dials; the data plane treats that refusal as a repair, not a verdict, whether the refusal arrives before the stream (OpenAI's 4xx) or inside it (OpenRouter's Responses relay answers 200 and fails the stream on its first frame under `invalid_prompt`): the waterfall re-dials the SAME rung once through a new reservation when the [request attempt budgets](gateway-request-policy.md) permit it, with every replayed reasoning item carrying `encrypted_content` stripped (message, tool-call, and tool-result items keep their positions; the calls and assistant message of a stripped turn lose their provider `id`, which the provider would tie back to the missing reasoning item), remembers that stripped payload for every later dial of the rung in the same request (a throttle redial never earns the refusal twice; another rung starts from the original, since its account may decrypt it), and remembers per worker, for 30 minutes after their last replay and up to 100,000 entries, the digests of the refused payloads (the one the provider quoted, else every one present; salted by the caller's organization and identity ids as admission names them, never by the request's bearer, which in a hosted worker is the front's ephemeral exchanged token, so one caller's memory never touches another's) so a LATER request that replays them is stripped of exactly those items before its first dial (`encrypted_reasoning_stripped_proactive`), with the reactive repair still behind it, and discloses a served repair through the `x-gateway-replay-repair: encrypted_reasoning_stripped` header (HTTP responses only), the `encrypted_reasoning_stripped` data-plane counter, and one content-free operator line, each written only once the re-dial opened.
 The verdict is read through the shared OpenAI-family envelope reader: OpenAI's and Azure's `error.code`, OpenAI's fixed sentence when a relay such as Novita re-envelopes the refusal without the code, and the document OpenRouter relays under `error.metadata.raw`; hidden reasoning continuity is lost for the stripped items only; without the memory the repair would RECUR on every later turn (the stateless caller keeps the foreign items and a `previous_response_id` continuation retains the turn as replayed; production 2026-09-15: about 74 refused dials a minute, 82% of one tenant's agent turns), so a conversation now pays the refused dial once per worker that serves it; a refusal of the stripped payload itself, or a payload with nothing to strip, surfaces the provider's 400 unchanged. Replay is opt-in through the standard `Idempotency-Key` header only;
 `X-Client-Request-Id` is caller correlation identity (Codex sends its session id there on
 every request of a session), echoed on responses and used for route affinity, never as an
@@ -966,9 +964,9 @@ or eviction returns an explicit unavailable error and never reconstructs content
 
 ## Content-free observability and lifecycle
 
-SQLite stores hashes, frozen authority, route identity, state transitions, token counts, latency,
-and estimated cost. It never stores prompts, responses, raw tool arguments, raw virtual keys, or
-provider secrets. `GET /usage` and `GET /usage.json` are two renderings of the same schema-v2 report
+The accounting SQLite stores hashes, frozen authority, route identity, state transitions, tokens,
+latency and estimated cost, never content or keys. Separate [local capture](local_gateway_traffic.md)
+is default-on (`--ghost` disables it). `GET /usage` and `GET /usage.json` render the same schema-v2 report
 and expose only aggregate, per-identity, and physical-attempt `by_billing_source` accounting.
 An anonymous request reads the organization-wide report; a request carrying a virtual key as
 `Authorization: Bearer <key>` reads the report scoped to that key's identity, and an invalid

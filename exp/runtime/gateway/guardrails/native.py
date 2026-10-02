@@ -83,6 +83,8 @@ def native_output_mode(
     engine: GuardrailEngine | None,
     policy: GuardrailPolicy | None,
     request: GatewayRequest,
+    *,
+    image_output: bool = False,
 ) -> OutputGuardrailMode:
     """Return the output enforcement shape one admission must use.
 
@@ -90,13 +92,14 @@ def native_output_mode(
         engine: Optional composed engine. ``None`` leaves the stream untouched.
         policy: Policy resolved during input enforcement, if any.
         request: Canonical request after continuation expansion.
+        image_output: Any admitted rung may generate image content.
 
     Returns:
         ``off``, ``buffer``, or ``stream`` for the data plane.
     """
     if engine is None:
         return OutputGuardrailMode.OFF
-    return engine.output_mode(
+    mode = engine.output_mode(
         policy,
         streaming=request.stream,
         tools_offered=bool(
@@ -108,6 +111,10 @@ def native_output_mode(
             or request.thinking_default_enable
         ),
     )
+
+    if image_output and mode != OutputGuardrailMode.OFF:
+        return OutputGuardrailMode.BUFFER
+    return mode
 
 
 def parse_output_payload(data: JsonObject) -> GuardrailCompletion:

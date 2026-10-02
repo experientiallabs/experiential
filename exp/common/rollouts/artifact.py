@@ -24,6 +24,7 @@ from exp.common.models import (
     ModelSnapshot,
     OperationEconomics,
 )
+from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.rollouts.otel import (
     ProductionSimulatorSnapshot,
     RolloutSpan,
@@ -47,6 +48,7 @@ class StopReason(StrEnum):
     COMPLETED = "completed"
     AGENT_STOP = "agent_stop"
     MAXIMUM_STEPS = "maximum_steps"
+    MAXIMUM_OUTPUT_TOKENS = "maximum_output_tokens"
     MAXIMUM_TIME = "maximum_time"
     MAXIMUM_COST = "maximum_cost"
     CONTEXT_OVERFLOW = "context_overflow"
@@ -152,7 +154,14 @@ class ProviderFreeSourceProvenance(ContractModel):
 
 
 class RolloutArtifact(SimulationArtifact):
-    """The v1 simulation artifact subtype that preserves one full agent episode."""
+    """The v1 simulation artifact subtype that preserves one full agent episode.
+
+    Attributes:
+        continuation_of: Exact immutable parent rollout, or None for an initial episode.
+            Continued evidence includes the paid parent prefix for complete replay.
+        text_checkpoint: Safe completed-turn state for built-in chat continuation, or None
+            when the runtime, redaction or interrupted turn prevents faithful restoration.
+    """
 
     artifact_kind: Literal["rollout"] = "rollout"
     rollout_id: ArtifactId
@@ -181,6 +190,8 @@ class RolloutArtifact(SimulationArtifact):
     simulation_spec_sha256: Sha256 | None = None
     simulation_binding: SimulationCellBinding | None = None
     sandbox_binding: SandboxSimulationCellBinding | None = None
+    continuation_of: ArtifactInput | None = None
+    text_checkpoint: TextRolloutCheckpoint | None = None
 
     @field_validator("spans")
     @classmethod

@@ -41,6 +41,7 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
+from exp.common.project.testing import RawArtifact
 from exp.common.rollouts import RolloutArtifact
 from exp.common.traces import load_trace_dataset
 from exp.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
@@ -137,8 +138,8 @@ class _RuntimeCatalog:
         *,
         role: CatalogRoleName | None = None,
     ) -> ResolvedModel:
-        del role
         """Return a deterministic resolved model for one configured alias."""
+        del role
         del requirement
         snapshot, capabilities = self._real.snapshot(alias)
         client = _JudgeClient(snapshot, fail_after=type(self).judge_fail_after)
@@ -147,8 +148,8 @@ class _RuntimeCatalog:
         return ResolvedModel(alias, snapshot, capabilities, client, embedding)
 
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        del role
         """Resolve one alias with the same deterministic clients as preflight."""
+        del role
         return self.preflight(alias)
 
 
@@ -240,6 +241,10 @@ def _calibrate_arguments(
         "--root",
         str(root),
         "--yes",
+        "--maximum-input-tokens",
+        # Source paths change the deterministic fit split. Admit the complete long public
+        # transcripts in any selected five-case sample instead of relying on one small split.
+        "1000000",
         "--approve",
         "--non-interactive",
         *labels,
@@ -263,7 +268,9 @@ def _rollout_payloads(store: ProjectStore) -> tuple[tuple[RolloutArtifact, str],
         record = store.artifacts.read(artifact_id)
         if record.manifest.artifact_type != "rollout":
             continue
-        text = (record.directory / "rollout.json").read_text(encoding="utf-8")
+        text = (
+            RawArtifact(store.artifacts._paths, record.manifest.artifact_id) / "rollout.json"
+        ).read_text(encoding="utf-8")
         payloads.append((RolloutArtifact.model_validate_json(text), text))
     return tuple(payloads)
 
@@ -311,12 +318,13 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
         "1",
     ]
     _RuntimeCatalog.judge_clients = []
+    over_budget.remove("--yes")
     refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
-    assert "conservative estimate $0.74 exceeds the configured per-command budget" in refused_text
+    assert "command estimate $15.25 exceeds the $0.50 budget" in refused_text
     assert "$0.50" in refused_text
-    assert "--yes cannot override" in refused_text
+    assert "interactive terminal to proceed, or use --yes" in refused_text
     assert "missing labels" not in refused_text
     assert _RuntimeCatalog.judge_clients == []
     assert store.read_review() == before_preflight
@@ -348,7 +356,7 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     resumed_text = " ".join(unstyle(resumed.output).replace("│", " ").split())
     assert "review progress: 1/5 distinct trace lineages complete" in resumed_text
     assert "Trace 1 of 5" not in resumed.output
-    assert "Trace 2 of 5" in resumed.output
+    assert "Trace 2 of 5" in resumed.output, resumed.output
     assert "--approve" in resumed_text
     assert sum(client.calls for client in _RuntimeCatalog.judge_clients) == _SAMPLE_SIZE - 1
     drafted = _drafted_labels(store)

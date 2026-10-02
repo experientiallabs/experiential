@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -15,7 +16,7 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
     sorted_unique_inputs,
 )
-from exp.common.core.money import USD_ZERO
+from exp.common.core.money import USD_ZERO, reserve_usd
 from exp.common.evaluations import EvaluationDatasetManifest, fidelity
 from exp.common.judging import JudgeCalibration
 from exp.common.models import (
@@ -38,6 +39,7 @@ from exp.common.project import (
     ProjectRouterPolicyArtifacts,
     ProjectRouterReportArtifacts,
     ProjectStage,
+    ProjectStageEvent,
     ProjectStageEventKind,
     ProjectStore,
     ProjectSystemConfiguration,
@@ -51,6 +53,7 @@ from exp.common.project import (
 )
 from exp.common.routing import KnnRouterPolicy
 from exp.common.routing.bank import KnnBankManifest
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.attempt_authority import (
     FileHostedAttemptAuthorityStore,
     HostedAttemptAuthorityError,
@@ -78,6 +81,7 @@ from exp.optimize.router.hosted import (
 from exp.optimize.router.hosted import (
     restore_hosted_project_bundle as restore_project_bundle,
 )
+from exp.optimize.router.hosted_preflight import preflight_hosted
 from exp.optimize.router.hosted_spend import complete_component_entries
 from exp.optimize.router.spend import (
     ProviderSpendComponent,
@@ -88,8 +92,8 @@ from exp.optimize.router.spend import (
     persist_provider_spend_ledger,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import build_project
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
@@ -99,12 +103,26 @@ from exp.simulation.retrieval import (
 from exp.simulation.world_model import persist_grounded_world_model
 
 
+@pytest.mark.parametrize("with_reasoning", [False, True])
 def test_hosted_workflow_runs_from_restored_bundle_and_replays_without_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    with_reasoning: bool,
 ) -> None:
     """Build, optimize, report, export, restore, and replay without fidelity or repeat calls."""
     prepared, catalog = _restored_prepared_project(tmp_path)
+    if with_reasoning:
+        catalog = catalog.model_copy(
+            update={
+                "roles": catalog.roles.model_copy(
+                    update={
+                        "world_model_reasoning_effort": "high",
+                        "judge_reasoning_effort": "medium",
+                        "candidate_reasoning_efforts": {"candidate-b": "low"},
+                    }
+                )
+            }
+        )
     state = _ProviderState()
     attempt_store = FileHostedAttemptAuthorityStore(tmp_path / "attempt-authority")
     authority = attempt_store.create()
@@ -289,6 +307,10 @@ def test_hosted_workflow_runs_from_restored_bundle_and_replays_without_dispatch(
     assert replay_state.embedding_calls == []
     assert replay_state.completion_calls == []
     assert attempt_store.unresolved(authority) is None
+    changed_roles = catalog.roles.model_copy(update={"judge_reasoning_effort": "high"})
+    changed_catalog = catalog.model_copy(update={"roles": changed_roles})
+    with pytest.raises(HostedRouterPreflightError, match="Project catalog differs"):
+        preflight_hosted(replay_store, _setup(), changed_catalog, _options())
 
 
 def test_hosted_workflow_preserves_mixed_billing_sources_without_private_aliases(
@@ -398,7 +420,7 @@ def test_hosted_workflow_preserves_mixed_billing_sources_without_private_aliases
         entries=swapped,
     )
     write_project_config(
-        prepared.paths.project_toml,
+        prepared.paths,
         ProjectConfig.model_validate(
             {
                 **current.model_dump(mode="python"),
@@ -712,6 +734,72 @@ def test_hosted_preflight_reserves_full_simulation_before_build_dispatch(tmp_pat
     assert prepared.artifacts.list_ids() == before_artifacts
 
 
+def test_hosted_build_uses_one_bounded_embedding_plan_for_cost_and_both_indexes(
+    tmp_path: Path,
+) -> None:
+    """Hosted preflight and dispatch share the smaller context bound and deduplicated inputs."""
+    catalog = _catalog()
+    record = catalog.models["embedder"]
+    assert record.capabilities is not None
+    capabilities = record.capabilities.model_copy(update={"context_window_tokens": 64})
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "embedder": record.model_copy(update={"capabilities": capabilities}),
+            }
+        }
+    )
+    prepared, catalog = _restored_prepared_project(tmp_path, model_catalog=catalog)
+    quote = preflight_hosted(prepared, _setup(), catalog, _options())
+    setup = _setup().model_copy(
+        update={
+            "budgets": _setup().budgets.model_copy(
+                update={"maximum_build_cost_usd": quote.build_cost_usd}
+            )
+        }
+    )
+    state = _ProviderState()
+    build_calls: list[tuple[str, ...]] = []
+
+    def capture_build(event: ProjectStageEvent) -> None:
+        """Capture only provider inputs dispatched before the durable build completion."""
+        if (
+            event.stage == ProjectStage.BUILDING_WORLD_MODEL
+            and event.kind == ProjectStageEventKind.COMPLETED
+        ):
+            build_calls.extend(state.embedding_calls)
+
+    attempt_store = FileHostedAttemptAuthorityStore(tmp_path / "bounded-build-authority")
+    authority = attempt_store.create()
+    run_hosted_router_workflow(
+        prepared,
+        setup,
+        catalog,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        attempt_store,
+        bundle_directory=tmp_path / "bounded-build-bundles",
+        attempt_id=authority.attempt_id,
+        created_at=_TIME + timedelta(hours=4),
+        code_revision=_REVISION,
+        options=_options(),
+        event_sink=capture_build,
+    )
+
+    inputs = tuple(text for batch in build_calls for text in batch)
+    assert inputs
+    assert len(inputs) == len(set(inputs))
+    assert all(len(text.encode("utf-8")) <= 64 for text in inputs)
+    price = capabilities.input_cost_per_million_tokens_usd
+    assert price is not None
+    assert quote.build_cost_usd == reserve_usd(
+        sum(len(text.encode("utf-8")) for text in inputs)
+        * RetryPolicy().maximum_attempts
+        * price
+        / 1_000_000
+    )
+
+
 def test_hosted_automatic_ceiling_never_widens_a_large_one_microunit_boundary() -> None:
     """The legacy automatic float seam never rounds an exact hosted ceiling upward."""
     exact = Decimal("99999999999998.999999")
@@ -729,14 +817,20 @@ def test_builtin_chat_system_contract_matches_platform_shape_and_bounds() -> Non
     assert system.model_dump(mode="json") == {
         "kind": "builtin_chat",
         "system_prompt": "Follow policy.",
-        "maximum_model_calls": 8,
+        "maximum_model_calls": 100,
     }
     with pytest.raises(ValueError, match="blank"):
         ProjectSystemConfiguration(system_prompt="   ")
     with pytest.raises(ValueError):
         ProjectSystemConfiguration(system_prompt="x" * 20_001)
+    assert (
+        ProjectSystemConfiguration(
+            system_prompt="valid", maximum_model_calls=1000
+        ).maximum_model_calls
+        == 1000
+    )
     with pytest.raises(ValueError):
-        ProjectSystemConfiguration(system_prompt="valid", maximum_model_calls=65)
+        ProjectSystemConfiguration(system_prompt="valid", maximum_model_calls=0)
     with pytest.raises(ValueError):
         ProjectSystemConfiguration.model_validate({"system_prompt": "valid", "unsupported": True})
 
@@ -863,7 +957,7 @@ def test_bundle_restore_rejects_same_project_semantic_pointer_swaps(
     elif selection_name == "router_policy":
         update.update(router_report=None)
     malicious = ProjectConfig.model_validate({**current.model_dump(mode="python"), **update})
-    write_project_config(primary.paths.project_toml, malicious)
+    write_project_config(primary.paths, malicious)
     bundle = export_project_bundle(
         primary,
         tmp_path / f"swapped-{selection_name}.exp.zip",
@@ -927,7 +1021,7 @@ def test_bundle_restore_rejects_calibration_with_forged_semantic_identity(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "forged-calibration.exp.zip",
@@ -1015,7 +1109,7 @@ def test_bundle_restore_rejects_policy_from_another_execution_contract(
             "router_report": None,
         }
     )
-    write_project_config(primary.paths.project_toml, malicious)
+    write_project_config(primary.paths, malicious)
     bundle = export_project_bundle(
         primary,
         tmp_path / f"swapped-execution-{variant}.exp.zip",
@@ -1097,7 +1191,7 @@ def test_bundle_restore_rejects_grounded_build_from_another_model_setup(
             "router_report": None,
         }
     )
-    write_project_config(primary.paths.project_toml, malicious)
+    write_project_config(primary.paths, malicious)
     bundle = export_project_bundle(
         primary,
         tmp_path / "swapped-grounded-build.exp.zip",
@@ -1112,10 +1206,12 @@ def test_bundle_restore_rejects_grounded_build_from_another_model_setup(
         )
 
 
-def test_bundle_restore_rejects_rag_with_an_alternate_task_partition(
+@pytest.mark.parametrize("mismatch", ["partition", "chunk_bound"])
+def test_bundle_restore_rejects_rag_with_inconsistent_retrieval_identity(
     tmp_path: Path,
+    mismatch: str,
 ) -> None:
-    """Canonical same-source RAGs cannot replace the selected task-set lineage split."""
+    """Canonical same-source RAGs cannot replace the selected lineage or chunk identity."""
     prepared, catalog = _restored_prepared_project(tmp_path)
     state = _ProviderState()
     runtime = _RuntimeCatalog(catalog, state)
@@ -1156,6 +1252,8 @@ def test_bundle_restore_rejects_rag_with_an_alternate_task_partition(
         )
         for item in bindings
     )
+    if mismatch == "chunk_bound":
+        alternate_bindings = bindings
     resolved_embedder = runtime.resolve("embedder")
     assert resolved_embedder.embedding_client is not None
     embedder = RAGEmbedderBinding(
@@ -1180,7 +1278,9 @@ def test_bundle_restore_rejects_rag_with_an_alternate_task_partition(
         alternate_bindings,
         created_at=_TIME + timedelta(hours=10),
         code_revision=_REVISION,
-        embedder=embedder,
+        embedder=replace(embedder, maximum_input_tokens=64)
+        if mismatch == "chunk_bound"
+        else embedder,
         default_top_k=2,
         included_partitions=frozenset({"fit"}),
     )
@@ -1223,7 +1323,7 @@ def test_bundle_restore_rejects_rag_with_an_alternate_task_partition(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "alternate-lineage-split.exp.zip",
@@ -1298,7 +1398,7 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, dropped_config)
+    write_project_config(prepared.paths, dropped_config)
     dropped_bundle = export_project_bundle(
         prepared,
         tmp_path / "dropped-build-spend.exp.zip",
@@ -1311,7 +1411,7 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
             expected_sha256=dropped_bundle.sha256,
         )
 
-    write_project_config(prepared.paths.project_toml, current)
+    write_project_config(prepared.paths, current)
     report_ledger = load_provider_spend_ledger(
         prepared.artifacts,
         current.router_report.spend_ledger,
@@ -1351,7 +1451,7 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
             ),
         }
     )
-    write_project_config(prepared.paths.project_toml, changed_config)
+    write_project_config(prepared.paths, changed_config)
     changed_bundle = export_project_bundle(
         prepared,
         tmp_path / "changed-fit-spend.exp.zip",
@@ -1465,7 +1565,7 @@ def test_bundle_restore_rejects_same_policy_report_from_another_evaluation(
             ),
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "wrong-held-out-evaluation.exp.zip",
@@ -1625,7 +1725,7 @@ def test_bundle_restore_rejects_fit_evaluation_with_held_out_scope(
             "router_report": None,
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "fit-with-held-out-scope.exp.zip",
@@ -1733,7 +1833,7 @@ def test_bundle_restore_rejects_report_evaluation_with_fit_scope(
             ),
         }
     )
-    write_project_config(prepared.paths.project_toml, malicious)
+    write_project_config(prepared.paths, malicious)
     bundle = export_project_bundle(
         prepared,
         tmp_path / "held-out-with-fit-scope.exp.zip",

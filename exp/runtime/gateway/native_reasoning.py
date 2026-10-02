@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
@@ -16,6 +17,7 @@ from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import resolve_route_profiles, select_route_deployments
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
+    ReasoningCarrierTurnChangedError,
     parse_reasoning_carrier_tool_calls,
     reasoning_carrier_authority,
     reasoning_history_sha256,
@@ -23,8 +25,23 @@ from exp.runtime.gateway.reasoning_carrier import (
     seal_reasoning_content,
     unseal_reasoning_content,
 )
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.routing import GatewayRoute, ReasoningCarrierIssuerUnavailableError
 from exp.runtime.openai_protocol.errors import public_failure_error
+
+_logger = logging.getLogger(__name__)
+
+UNAVAILABLE_ISSUER_CARRIER_DROPPED = (
+    "messages.reasoning_content->dropped(issuing_route_unavailable)"
+)
+"""Disclosure for a carrier whose issuing rung left the caller's route since it was sealed.
+
+The request is served on the current route without that turn's preserved thinking."""
+
+CHANGED_TURN_CARRIER_DROPPED = "messages.reasoning_content->dropped(assistant_turn_changed)"
+"""Disclosure for an authentic carrier whose echoed assistant turn no longer matches.
+
+The request is served without that turn's preserved thinking (and without any later
+carrier bound to it), exactly as if the caller had not replayed it."""
 
 
 def has_active_reasoning_content(request: GatewayRequest) -> bool:
@@ -179,7 +196,10 @@ def _process_reasoning_history(
     verify_history: bool,
 ) -> tuple[GatewayRequest, GatewayRoute | None]:
     """Validate active Fireworks carriers and optionally recover their plaintext."""
-    request = strip_stale_reasoning_history(request)
+    # Authentication examines only active carriers; keep historical evidence
+    # until post-guardrail capture. Execution still strips stale state on reveal.
+    if reveal:
+        request = strip_stale_reasoning_history(request)
     last_user = max(
         (index for index, message in enumerate(request.messages) if message.role == "user"),
         default=-1,
@@ -187,6 +207,7 @@ def _process_reasoning_history(
     routes: dict[str, tuple[GatewayRoute, ReasoningCarrierAuthority]] = {}
     messages = list(request.messages)
     pinned: GatewayRoute | None = None
+    disclosures: set[str] = set()
     for index, message in enumerate(messages):
         if index <= last_user:
             continue
@@ -216,10 +237,19 @@ def _process_reasoning_history(
             raise ValueError("reasoning carrier prefix names no known provider scheme")
         cached = routes.get(carrier.deployment_hint)
         if cached is None:
-            route = components.routes.resolve_deployment_hint(
-                authorization,
-                carrier.deployment_hint,
-            )
+            try:
+                route = components.routes.resolve_deployment_hint(
+                    authorization,
+                    carrier.deployment_hint,
+                )
+            except ReasoningCarrierIssuerUnavailableError as exc:
+                # Only the issuing rung's credential can unseal the carrier, and
+                # that rung is gone from the route, so the thinking cannot be
+                # replayed anywhere; serving without it is what a failover does.
+                messages[index] = message.model_copy(update={"provider_reasoning": ()})
+                disclosures.add(UNAVAILABLE_ISSUER_CARRIER_DROPPED)
+                _log_dropped_carrier(authorization, carrier.deployment_hint, exc)
+                continue
             # The carrier authenticates against the issuing rung alone; the
             # route's failover fallbacks (which dispatch without this
             # reasoning) are resolved later, at admission, where a dead one
@@ -232,8 +262,8 @@ def _process_reasoning_history(
             profile, _client = resolved[0]
             authority = reasoning_carrier_authority(
                 authorization=authorization,
-                exact_model_id=route.snapshot.exact_model_id,
-                pool_id=route.snapshot.pool_id,
+                exact_model_id=route.snapshot.stage_for_depth(0).exact_model_id,
+                pool_id=route.snapshot.stage_for_depth(0).pool_id,
                 deployment=route.deployment,
                 profile=profile,
                 scheme=scheme,
@@ -243,14 +273,24 @@ def _process_reasoning_history(
             cached = (route, authority)
             routes[carrier.deployment_hint] = cached
         route, authority = cached
-        block, _claims = unseal_reasoning_content(
-            carrier,
-            authority,
-            assistant_content=message.content,
-            tool_calls=message.tool_calls,
-            history_prefix=tuple(messages[:index]) if verify_history else (),
-            scheme=scheme,
-        )
+        try:
+            block, _claims = unseal_reasoning_content(
+                carrier,
+                authority,
+                assistant_content=message.content,
+                tool_calls=message.tool_calls,
+                history_prefix=tuple(messages[:index]) if verify_history else (),
+                scheme=scheme,
+            )
+        except ReasoningCarrierTurnChangedError as exc:
+            # The caller edited its own turn; refusing would end a session no
+            # client-side retry can repair. Dropping the carrier leaves the edited
+            # turn unaccompanied, so a later carrier sealed over this one's
+            # plaintext fails its prefix binding and is dropped the same way.
+            messages[index] = message.model_copy(update={"provider_reasoning": ()})
+            disclosures.add(CHANGED_TURN_CARRIER_DROPPED)
+            _log_dropped_carrier(authorization, carrier.deployment_hint, exc)
+            continue
         if reveal:
             messages[index] = message.model_copy(update={"provider_reasoning": (block,)})
         if pinned is not None and pinned.deployment != route.deployment:
@@ -262,7 +302,28 @@ def _process_reasoning_history(
         for index, message in enumerate(messages)
     ):
         raise ValueError("decrypted reasoning history requires a sealed active carrier")
-    return request.model_copy(update={"messages": tuple(messages)}), pinned
+    updates: dict[str, object] = {"messages": tuple(messages)}
+    if disclosures:
+        updates["ignored_parameters"] = tuple(
+            dict.fromkeys((*request.ignored_parameters, *sorted(disclosures)))
+        )
+    return request.model_copy(update=updates), pinned
+
+
+def _log_dropped_carrier(
+    authorization: AuthorizationSnapshot, deployment_id: str, reason: Exception
+) -> None:
+    """Name one dropped carrier for operators; the caller sees only the disclosure."""
+    _logger.warning(
+        "reasoning carrier dropped",
+        extra={
+            "operation": "native_reasoning_continuation",
+            "reason": str(reason),
+            "request_id": authorization.request_id,
+            "alias": authorization.alias,
+            "deployment_id": deployment_id,
+        },
+    )
 
 
 def seal_reasoning_carrier_content(accounting: NativeAttemptAccounting, argument: str) -> str:

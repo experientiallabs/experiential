@@ -15,15 +15,17 @@ from typing import cast
 
 from openai.types.chat import (
     ChatCompletionAssistantMessageParam,
+    ChatCompletionToolMessageParam,
     ChatCompletionUserMessageParam,
 )
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, canonical_json_bytes, stable_id
-from exp.common.models import AssistantAction, ModelMessage, load_model_catalog
+from exp.common.models import AssistantAction, ModelMessage, ToolCall, load_model_catalog
 from exp.common.project import ProjectStore, ProjectStoreError
-from exp.common.tasks import TaskCase
+from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.models import CapabilityRequirement, RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
+from exp.simulation.engines.text.tokens import WorldModelCapacityError
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.world_model.runtime import (
     GroundedWorldModel,
@@ -93,15 +95,31 @@ class WorldModelSession:
 
 @dataclass(frozen=True)
 class WorldModelObservation:
-    """One OpenAI-shaped user message predicted by a grounded world model."""
+    """Ordered OpenAI-shaped user or tool observations predicted by a world model.
 
-    message: ChatCompletionUserMessageParam
+    Attributes:
+        messages: Required ordered user message or tool results for the submitted action.
+        terminal: Required completion flag; tool-result observations remain nonterminal.
+    """
+
+    messages: tuple[ChatCompletionUserMessageParam | ChatCompletionToolMessageParam, ...]
     terminal: bool
 
 
 @dataclass
 class _SessionState:
-    """Mutable transcript and lifecycle bookkeeping for one public session."""
+    """Mutable transcript and lifecycle bookkeeping for one public session.
+
+    Attributes:
+        session: Public immutable session identity and initial context.
+        task_case: Internal task carrying the declared tools and grounding lineage.
+        messages: Ordered retained visible conversation.
+        transcript_bytes: Current retained transcript size for resource admission.
+        expires_at: Monotonic expiry deadline.
+        lock: Per-session synchronization lock, allocated on creation.
+        closed: Whether cleanup closed the session, initially false.
+        environment_state: Private simulated facts and mutations, initially empty.
+    """
 
     session: WorldModelSession
     task_case: TaskCase
@@ -110,6 +128,7 @@ class _SessionState:
     expires_at: float
     lock: Lock = field(default_factory=Lock)
     closed: bool = False
+    environment_state: JsonObject = field(default_factory=dict)
 
 
 def _new_session_id() -> str:
@@ -118,7 +137,7 @@ def _new_session_id() -> str:
 
 
 class WorldModel:
-    """Expose one verified serving-RAG world model through bounded text sessions."""
+    """Expose one verified serving-RAG world model through bounded simulated sessions."""
 
     def __init__(
         self,
@@ -149,12 +168,14 @@ class WorldModel:
         *,
         task: str,
         initial_context: JsonObject | None = None,
+        tools: tuple[ToolSchema, ...] = (),
     ) -> WorldModelSession:
         """Create one bounded in-memory session without model or embedder dispatch.
 
         Args:
             task: Nonempty request-visible scenario instruction.
             initial_context: Optional safe JSON context rendered into every grounded step.
+            tools: Declared tool schemas whose results the environment will simulate.
 
         Returns:
             Opaque session handle accepted by ``step`` and ``end_session``.
@@ -190,7 +211,7 @@ class WorldModel:
             )
             self._sessions[session_id] = _SessionState(
                 session=session,
-                task_case=_session_task(session),
+                task_case=_session_task(session).model_copy(update={"tools": tools}),
                 messages=(),
                 transcript_bytes=0,
                 expires_at=now + self.limits.session_ttl_seconds,
@@ -202,24 +223,29 @@ class WorldModel:
         session_id: str,
         action: ChatCompletionAssistantMessageParam,
     ) -> WorldModelObservation:
-        """Predict and append one user turn from an official OpenAI assistant message.
+        """Predict and append one environment turn from an official OpenAI assistant message.
 
-        The persisted artifact is text-only. Any tool call, function call, audio payload,
-        non-text content, or non-assistant role is rejected before retrieval or provider dispatch.
+        Tool calls receive generated tool messages with the original call IDs. Native provider
+        tools remain disabled; the world model simulates every observation.
 
         Args:
             session_id: Opaque identity returned by ``new_session``.
-            action: Official OpenAI assistant-message input containing visible text only.
+            action: Official OpenAI assistant message with visible text or function tools.
 
         Returns:
-            Official OpenAI user-message shape and the world-model terminal flag.
+            Official OpenAI user/tool message shapes and the world-model terminal flag.
 
         Raises:
             WorldModelSessionError: The session is absent, expired, closed, unsupported, or would
-                exceed a transcript limit.
+                exceed a transcript or model capacity limit. Provider failures retain their
+                original exception types.
         """
-        action_text = _assistant_text(action)
-        action_message = ModelMessage(role="assistant", content=action_text)
+        candidate_action = _assistant_action(action)
+        action_message = (
+            ModelMessage(role="assistant", assistant_action=candidate_action)
+            if candidate_action.tool_calls
+            else ModelMessage(role="assistant", content=candidate_action.content)
+        )
         now = self._monotonic()
         with self._registry_lock:
             self._expire_sessions(now)
@@ -232,40 +258,66 @@ class WorldModel:
                 raise WorldModelSessionError("world-model session is closed")
             self._sessions.move_to_end(session_id)
         try:
+            names = {tool.name for tool in state.task_case.tools}
+            calls = candidate_action.tool_calls
+            if any(call.name not in names for call in calls):
+                raise WorldModelSessionError("tool_calls must use the session's declared tools")
+            if len({call.call_id for call in calls}) != len(calls):
+                raise WorldModelSessionError("tool_calls require unique IDs")
             self._require_step_capacity(state, action_message)
-            prepared = self._runtime.prepare_turn(
-                task=state.task_case,
-                visible_messages=state.messages,
-                candidate_response=AssistantAction(content=action_text),
-                excluded_lineage_ids=(),
-                maximum_output_tokens=1_024,
-            )
-            dispatched = self._runtime.complete_turn(prepared)
+            try:
+                prepared = self._runtime.prepare_turn(
+                    task=state.task_case,
+                    visible_messages=state.messages,
+                    candidate_response=candidate_action,
+                    state=state.environment_state,
+                    excluded_lineage_ids=(),
+                    maximum_output_tokens=1_024,
+                )
+                dispatched = self._runtime.complete_turn(prepared)
+            except WorldModelCapacityError as exc:
+                raise WorldModelSessionError(str(exc)) from exc
             if dispatched.response.model != self._runtime.artifact.model:
                 raise WorldModelSessionError(
                     "world-model response identity differs from its build artifact"
                 )
             transition = self._runtime.parse_turn(dispatched).transition
-            user_message = ModelMessage(role="user", content=transition.message)
-            user_bytes = _message_bytes(user_message)
-            if user_bytes > self.limits.maximum_observation_bytes:
+            observations = transition.visible_messages
+            observation_bytes = sum(_message_bytes(message) for message in observations)
+            state_bytes = len(canonical_json_bytes(transition.state))
+            if observation_bytes + state_bytes > self.limits.maximum_observation_bytes:
                 raise WorldModelSessionError(
                     "world-model observation exceeds the provider-output byte limit"
                 )
-            final_bytes = state.transcript_bytes + _message_bytes(action_message) + user_bytes
-            if final_bytes > self.limits.maximum_transcript_bytes:
+            final_bytes = (
+                state.transcript_bytes + _message_bytes(action_message) + observation_bytes
+            )
+            if final_bytes + state_bytes > self.limits.maximum_transcript_bytes:
                 raise WorldModelSessionError("world-model transcript exceeds the byte limit")
-            state.messages = (*state.messages, action_message, user_message)
+            state.messages = (*state.messages, action_message, *observations)
             state.transcript_bytes = final_bytes
+            state.environment_state = transition.state
             state.expires_at = self._monotonic() + self.limits.session_ttl_seconds
             state.closed = transition.terminal
-            return WorldModelObservation(
-                message=ChatCompletionUserMessageParam(
-                    role="user",
-                    content=transition.message,
-                ),
-                terminal=transition.terminal,
-            )
+            messages: list[ChatCompletionUserMessageParam | ChatCompletionToolMessageParam] = []
+            for observation in observations:
+                if observation.role == "tool":
+                    assert observation.tool_call_id is not None
+                    messages.append(
+                        ChatCompletionToolMessageParam(
+                            role="tool",
+                            content=observation.content or "",
+                            tool_call_id=observation.tool_call_id,
+                        )
+                    )
+                else:
+                    messages.append(
+                        ChatCompletionUserMessageParam(
+                            role="user",
+                            content=observation.content or "",
+                        )
+                    )
+            return WorldModelObservation(messages=tuple(messages), terminal=transition.terminal)
         finally:
             state.lock.release()
 
@@ -297,7 +349,9 @@ class WorldModel:
         Raises:
             WorldModelSessionError: The next assistant and reserved observation exceed a limit.
         """
-        if len(state.messages) + 2 > self.limits.maximum_messages_per_session:
+        action_calls = action.assistant_action.tool_calls if action.assistant_action else ()
+        next_messages = 1 + max(1, len(action_calls))
+        if len(state.messages) + next_messages > self.limits.maximum_messages_per_session:
             raise WorldModelSessionError("world-model transcript exceeds the message-count limit")
         reserved_bytes = (
             state.transcript_bytes + _message_bytes(action) + self.limits.maximum_observation_bytes
@@ -374,11 +428,13 @@ def load_world_model(
             store.artifacts,
             config.build.world_model.artifact_id,
             client=resolved_world.client,
+            capabilities=resolved_world.capabilities,
             embedder=RAGEmbedderBinding(
                 client=resolved_embedder.embedding_client,
                 snapshot=resolved_embedder.snapshot,
                 maximum_attempts=RetryPolicy().maximum_attempts,
                 input_usd_per_million_tokens=(0.0 if embedding_price is None else embedding_price),
+                maximum_input_tokens=resolved_embedder.capabilities.context_window_tokens,
             ),
         )
         _require_project_binding(runtime, config.build.world_model, config.build.serving_rag)
@@ -395,38 +451,49 @@ def load_world_model(
         raise WorldModelLoadError(str(exc)) from exc
 
 
-def _assistant_text(action: ChatCompletionAssistantMessageParam) -> str:
-    """Return one supported assistant text action before any runtime work.
+def _assistant_action(action: ChatCompletionAssistantMessageParam) -> AssistantAction:
+    """Normalize an official OpenAI text or function-tool action before dispatch.
 
     Args:
-        action: Official OpenAI assistant-message parameter.
+        action: OpenAI assistant message with visible text or function tool calls.
 
     Returns:
-        Nonempty visible assistant text.
+        Canonical candidate action with parsed tool arguments and retained call IDs.
 
     Raises:
-        WorldModelSessionError: The action is not one plain text-only assistant message.
+        WorldModelSessionError: The action is unsupported or has malformed JSON arguments.
     """
     if action.get("role") != "assistant":
         raise WorldModelSessionError("world-model actions must use role='assistant'")
-    if action.get("tool_calls") is not None or action.get("function_call") is not None:
-        raise WorldModelSessionError(
-            "this text-only world model does not accept assistant tool_calls"
-        )
-    if action.get("audio") is not None:
-        raise WorldModelSessionError("this text-only world model does not accept assistant audio")
+    if action.get("function_call") is not None or action.get("audio") is not None:
+        raise WorldModelSessionError("use text or function tool_calls for world-model actions")
     content = action.get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise WorldModelSessionError(
-            "this text-only world model requires nonempty assistant text content"
-        )
-    return content
+    if content is not None and not isinstance(content, str):
+        raise WorldModelSessionError("world-model actions require text content")
+    calls: list[ToolCall] = []
+    try:
+        for call in action.get("tool_calls") or ():
+            if call["type"] != "function":
+                raise ValueError("only function tools are supported")
+            calls.append(
+                ToolCall(
+                    call_id=call["id"],
+                    name=call["function"]["name"],
+                    arguments=json.loads(call["function"]["arguments"]),
+                )
+            )
+        if not calls and (not isinstance(content, str) or not content.strip()):
+            raise ValueError("nonempty assistant text or tool calls are required")
+        return AssistantAction(content=content, tool_calls=tuple(calls))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise WorldModelSessionError(f"invalid world-model action: {exc}") from exc
 
 
 def _message_bytes(message: ModelMessage) -> int:
     """Return visible UTF-8 content bytes charged to one text transcript message."""
-    assert message.content is not None
-    return len(message.content.encode("utf-8"))
+    if message.assistant_action is not None:
+        return len(message.assistant_action.model_dump_json().encode("utf-8"))
+    return len((message.content or "").encode("utf-8"))
 
 
 def _session_task(session: WorldModelSession) -> TaskCase:

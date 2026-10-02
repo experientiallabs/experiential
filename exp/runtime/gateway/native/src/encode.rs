@@ -288,6 +288,10 @@ impl ChatSseEncoder {
                 None,
                 update.logprobs.as_ref(),
             )]),
+            Event::Image(url) => Ok(vec![self.chunk(
+                json!({"images": [crate::image_output::chat_image_value(url)]}),
+                None,
+            )]),
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
             Event::ProviderTextDelta { delta, .. } => {
@@ -314,6 +318,7 @@ impl ChatSseEncoder {
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
+            | Event::GeminiThoughtPart(_)
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
@@ -426,6 +431,7 @@ impl ChatSseEncoder {
                 let mut frames = Vec::new();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
                     && self.reasoning.candidate()?.is_some()
+                    && !self.reasoning_output_exposed
                 {
                     let carrier = self.reasoning_content_carrier.as_ref().ok_or_else(|| {
                         invalid_provider_stream(
@@ -702,6 +708,16 @@ pub fn completed_chat_body_with_carrier(
         "content": if text.is_empty() { Value::Null } else { Value::String(text) },
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
     });
+    let images: Vec<Value> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Image(url) => Some(crate::image_output::chat_image_value(url)),
+            _ => None,
+        })
+        .collect();
+    if !images.is_empty() {
+        message["images"] = Value::Array(images);
+    }
     // OpenAI documents `tool_calls` as an optional array and omits it from a
     // message that made no calls; it never serializes `null` there. Strict
     // OpenAI-schema consumers (the OpenRouter SDK's response parser, for one)
@@ -716,6 +732,7 @@ pub fn completed_chat_body_with_carrier(
     if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_))
         && has_tool_calls
         && reasoning.is_some()
+        && !reasoning_output_exposed
     {
         // A tool turn's reasoning round-trips as the sealed opaque carrier
         // (never raw plaintext — that would be a CoT-injection vector on the

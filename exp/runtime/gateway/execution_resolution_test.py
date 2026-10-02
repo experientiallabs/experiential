@@ -14,6 +14,7 @@ from exp.common.models.catalog import (
     GatewayTokenPrices,
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway import execution_resolution, native_execution
 from exp.runtime.gateway.execution_resolution import (
     GatewayWireContractError,
     _require_deployment_identity,
@@ -21,6 +22,11 @@ from exp.runtime.gateway.execution_resolution import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.registry import ModelClient, ResolvedModel
+
+
+def test_alias_servability_export_retains_the_same_function() -> None:
+    """The public native execution import delegates to the exact wire-resolution owner."""
+    assert native_execution.alias_native_blockers is execution_resolution.alias_native_blockers
 
 
 def _snapshot() -> ModelSnapshot:

@@ -409,6 +409,7 @@ impl Normalizer {
                     "anthropic_messages",
                     code,
                     message,
+                    None,
                 )));
             }
             "ping" => {}

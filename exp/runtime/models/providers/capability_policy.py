@@ -513,6 +513,12 @@ def coerce_generation_parameters(
         or request.top_logprobs is not None
     ):
         return None
+    if (
+        request.provider_thinking_config is not None
+        and request.provider_thinking_config.get("type") == "between_tools"
+    ):
+        # No effort-only substitution preserves the absence of up-front thinking.
+        return None
     adaptive_budget = _coerce_adaptive_budget(profiles, request)
     if adaptive_budget is not None:
         if admits is not None and not admits(adaptive_budget.request):

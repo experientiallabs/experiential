@@ -59,6 +59,7 @@ from exp.common.project import (
 from exp.common.rollouts import SimulationArtifactSet, StopReason
 from exp.common.routing import KnnGuard
 from exp.common.tasks import load_task_set
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.composition import (
     ApprovedRouterReview,
     RouterCompositionBudget,
@@ -90,7 +91,6 @@ from exp.simulation.engines.text.simulator_test import (
     _response,
     _ScriptedClient,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 from exp.simulation.orchestration import Simulator
 from exp.simulation.retrieval import (
@@ -233,7 +233,7 @@ def _priced_capabilities() -> ModelCapabilities:
     return ModelCapabilities(
         supports_completions=True,
         context_window_tokens=100_000,
-        maximum_output_tokens=16_000,
+        maximum_output_tokens=32_000,
         input_cost_per_million_tokens_usd=1.0,
         output_cost_per_million_tokens_usd=1.0,
         cached_input_cost_per_million_tokens_usd=1.0,
@@ -416,7 +416,7 @@ class _SetupSupplier:
             agent_id="agent-a",
             simulator_id="text-world-model-v1",
             world_model=_snapshot("world-model-a"),
-            simulator_prompt_id="world-model-text-v1",
+            simulator_prompt_id="world-model-text-v2",
             rubric_id="rubric-a",
             judge_calibration_id="calibration-a",
             pricing_snapshot_id="pricing-a",
@@ -441,7 +441,7 @@ class _SetupSupplier:
             world_model_settings=WorldModelSettings(
                 world_model_alias="world-model-a",
                 grounded_world_model_input=completed.world_model,
-                prompt_version="text-world-model-v1",
+                prompt_version="text-world-model-v2",
                 query_embedding=EmbeddingCostReservation(
                     model=fit_index.embedder,
                     input_usd_per_million_tokens=0.0,
@@ -699,6 +699,7 @@ class _SimulatorFactory:
                     project.artifacts,
                     completed.world_model,
                     client=world_model.client,
+                    capabilities=world_model.capabilities,
                     fit_retriever=fit_retriever,
                 )
             },
@@ -843,6 +844,7 @@ class _CapExhaustedSimulatorFactory(_SimulatorFactory):
                     project.artifacts,
                     completed.world_model,
                     client=world_model.client,
+                    capabilities=world_model.capabilities,
                     fit_retriever=fit_retriever,
                 )
             },

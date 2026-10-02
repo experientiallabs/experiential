@@ -285,6 +285,44 @@ fn compatible_missing_or_invalid_deltas_still_fail_without_valid_annotations() {
     }
 }
 
+#[test]
+fn gemini_relay_refusal_sse_ignores_quoted_messages_and_echoed_prompt_text() {
+    let message = "Gemini blocked the request: PROHIBITED_CONTENT";
+    for payload in [
+        json!({"error": {"code": 403, "message": format!("\"{message}\"")}}),
+        json!({"error": {"code": 403, "message": format!("Prompt included {message}")}}),
+        json!({"error": {"code": 403, "message": "Forbidden", "echo": message}, "prompt": message}),
+        json!({"error": {"code": 403, "message": "Forbidden", "metadata": {"raw": message}}}),
+        json!({"error": {"code": 403, "message": "Provider returned error", "metadata": {"raw": message}}}),
+        json!({"error": {"code": 403, "message": "Provider error", "metadata": {"raw": {"error": {"message": message}}}}}),
+        json!({"error": {"code": 403, "message": "Provider returned error", "metadata": {"raw": format!("  {message}  ")}}}),
+        json!({"error": {"code": 401, "message": message}}),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let events = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: payload.to_string(),
+            })
+            .unwrap();
+        let [Event::Failed(failure)] = events.as_slice() else {
+            panic!("expected one failure for {payload}");
+        };
+        assert_eq!(
+            failure.failure_class,
+            FailureClass::ProviderAuthentication,
+            "{payload}"
+        );
+    }
+    let (events, failure) = drain_stream_fixture(
+        Dialect::OpenAiCompatible,
+        &wire(&[text_frame(message), finish_frame("stop")], true),
+    );
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(events[0], json!({"kind": "text_delta", "text": message}));
+    assert_eq!(events.last(), Some(&json!({"kind": "completed"})));
+}
+
 /// An OpenAI-compatible lane that answers HTTP 200 with an error-shaped body
 /// (no `choices`) declares its failure in whichever envelope spelling it
 /// uses; each reaches the ledger with its sentence instead of dying as a
@@ -712,4 +750,204 @@ fn an_over_long_upstream_provider_label_is_not_a_name() {
         })
         .expect("frame parses");
     assert_eq!(normalizer.upstream_provider(), None);
+}
+#[test]
+fn compatible_reasoning_alias_preserves_text_and_obeys_route_authority() {
+    for delta in [
+        serde_json::json!({"reasoning": "exact reasoning\n雪"}),
+        serde_json::json!({"reasoning_content": null, "reasoning": "exact reasoning\n雪"}),
+        serde_json::json!({"reasoning_content": "exact reasoning\n雪", "reasoning": "shadowed"}),
+    ] {
+        let frame = SseEvent {
+            event: None,
+            data: serde_json::json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]})
+                .to_string(),
+        };
+        let mut normalizer = Normalizer::new_with_reasoning_content_route(
+            Dialect::OpenAiCompatible,
+            Some("a".repeat(64)),
+        );
+        assert!(
+            matches!(normalizer.feed(&frame).unwrap().as_slice(), [Event::ReasoningContentDelta { delta, .. }] if delta == "exact reasoning\n雪")
+        );
+        assert!(Normalizer::new(Dialect::OpenAiCompatible)
+            .feed(&frame)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+/// Feed one usage-only Chat Completions frame into a normalizer.
+fn feed_usage(
+    normalizer: &mut Normalizer,
+    usage: Value,
+) -> Result<Vec<Event>, crate::errors::Failure> {
+    normalizer.feed(&SseEvent {
+        event: None,
+        data: json!({"choices": [], "provider": "Google", "usage": usage}).to_string(),
+    })
+}
+
+/// OpenRouter's usage for a Gemini explicit-cache call that created the cache.
+fn openrouter_gemini_cache_write() -> Value {
+    json!({
+        "prompt_tokens": 11933, "completion_tokens": 9, "total_tokens": 11942,
+        "prompt_tokens_details": {"cached_tokens": 10663, "cache_write_tokens": 10663, "audio_tokens": 0}
+    })
+}
+
+#[test]
+fn writes_within_reads_rung_separates_the_written_tokens_from_the_read_leg() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer.set_cache_writes_within_reads(true);
+    feed_usage(&mut normalizer, openrouter_gemini_cache_write())
+        .expect("cache-write call is valid");
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(usage.input_tokens, Some(11933));
+    assert_eq!(usage.cache_creation_input_tokens, Some(10663));
+    assert_eq!(usage.cached_input_tokens, Some(0));
+    assert_eq!(usage.output_tokens, Some(9));
+
+    let mut reuse = Normalizer::new(Dialect::OpenAiCompatible);
+    reuse.set_cache_writes_within_reads(true);
+    feed_usage(
+        &mut reuse,
+        json!({
+            "prompt_tokens": 11933, "completion_tokens": 8, "total_tokens": 11941,
+            "prompt_tokens_details": {"cached_tokens": 10663, "cache_write_tokens": 0}
+        }),
+    )
+    .expect("cache-read call is valid");
+    let usage = reuse.observed_usage().unwrap();
+    assert_eq!(usage.cached_input_tokens, Some(10663));
+    assert_eq!(usage.cache_creation_input_tokens.unwrap_or(0), 0);
+}
+
+#[test]
+fn writes_within_reads_coalesces_sparse_reports_before_separating() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer.set_cache_writes_within_reads(true);
+    // A write without a covering read count is the ordinary disjoint shape: it
+    // fits input, so it settles as a plain write rather than failing the stream.
+    feed_usage(
+        &mut normalizer,
+        json!({"prompt_tokens": 11933, "prompt_tokens_details": {"cache_write_tokens": 10663}}),
+    )
+    .expect("an uncovered write that fits input settles disjointly");
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.cached_input_tokens.unwrap_or(0),
+            usage.cache_creation_input_tokens
+        ),
+        (0, Some(10663))
+    );
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer.set_cache_writes_within_reads(true);
+    feed_usage(
+        &mut normalizer,
+        json!({"prompt_tokens": 11933, "completion_tokens": 9, "prompt_tokens_details": {"cached_tokens": 10663}}),
+    )
+    .unwrap();
+    feed_usage(&mut normalizer, openrouter_gemini_cache_write()).unwrap();
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (usage.cached_input_tokens, usage.cache_creation_input_tokens),
+        (Some(0), Some(10663))
+    );
+}
+
+#[test]
+fn writes_within_reads_still_rejects_impossible_reports() {
+    for usage in [
+        // Reads above the input total.
+        json!({"prompt_tokens": 100, "completion_tokens": 1,
+               "prompt_tokens_details": {"cached_tokens": 101, "cache_write_tokens": 0}}),
+        // Writes that were not read back and do not fit input disjointly either.
+        json!({"prompt_tokens": 100, "completion_tokens": 1,
+               "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 61}}),
+        // Writes alone above the input total.
+        json!({"prompt_tokens": 100, "completion_tokens": 1,
+               "prompt_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 101}}),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        normalizer.set_cache_writes_within_reads(true);
+        let failure = feed_usage(&mut normalizer, usage).expect_err("impossible usage fails");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    }
+}
+
+#[test]
+fn disjoint_rungs_keep_rejecting_overlapping_cache_legs() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let failure = feed_usage(&mut normalizer, openrouter_gemini_cache_write())
+        .expect_err("reads plus writes above input are impossible on a disjoint rung");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+}
+
+#[test]
+fn writes_within_reads_terminal_usage_event_settles_the_separated_legs() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer.set_cache_writes_within_reads(true);
+    let mut events = normalizer
+        .feed(&frame(
+            json!({"index": 0, "delta": {"content": "ok"}, "finish_reason": null}),
+        ))
+        .unwrap();
+    events.extend(
+        normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: json!({
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "provider": "Google",
+                    "usage": openrouter_gemini_cache_write()
+                })
+                .to_string(),
+            })
+            .unwrap(),
+    );
+    events.extend(
+        normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: "[DONE]".to_string(),
+            })
+            .unwrap(),
+    );
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Usage(usage) => Some(usage.clone()),
+            _ => None,
+        })
+        .expect("terminal usage event");
+    assert_eq!(usage.input_tokens, Some(11933));
+    assert_eq!(usage.cached_input_tokens, Some(0));
+    assert_eq!(usage.cache_creation_input_tokens, Some(10663));
+    assert!(events.iter().any(Event::is_terminal));
+}
+
+#[test]
+fn writes_within_reads_accepts_a_cache_covering_the_whole_prompt() {
+    // Live OpenRouter google-vertex/us stream: the cache spanned every prompt token.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer.set_cache_writes_within_reads(true);
+    feed_usage(
+        &mut normalizer,
+        json!({
+            "prompt_tokens": 13304, "completion_tokens": 4, "total_tokens": 13308,
+            "prompt_tokens_details": {"cached_tokens": 13304, "cache_write_tokens": 13304}
+        }),
+    )
+    .expect("a whole-prompt cache write is valid");
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens
+        ),
+        (Some(13304), Some(0), Some(13304))
+    );
 }

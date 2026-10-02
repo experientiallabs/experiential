@@ -179,6 +179,41 @@ def test_thinking_config_is_carried_verbatim() -> None:
         decode_messages(_body(thinking={"type": "adaptive", "budget_tokens": 64}))
 
 
+@pytest.mark.parametrize("count_tokens", (False, True))
+def test_between_tools_thinking_is_carried_verbatim(count_tokens: bool) -> None:
+    """Messages and token counting preserve the type-only thinking mode."""
+    body = _body(thinking={"type": "between_tools"}, output_config={"effort": "low"})
+    if count_tokens:
+        body.pop("max_tokens")
+    decoder = decode_messages_count_tokens if count_tokens else decode_messages
+    request = decoder(body).request
+    assert request.provider_thinking_config == {"type": "between_tools"}
+    assert request.reasoning_effort == "low"
+
+
+@pytest.mark.parametrize("count_tokens", (False, True))
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"display": "omitted"},
+        {"display": None},
+        {"budget_tokens": 1024},
+        {"budget_tokens": None},
+        {"block_binding": {"prefix_mismatch_behavior": "drop_block"}},
+    ),
+)
+def test_between_tools_rejects_every_additional_field(
+    count_tokens: bool, extra: JsonObject
+) -> None:
+    """Optional and null fields cannot widen the provider's type-only contract."""
+    body = _body(thinking={"type": "between_tools", **extra})
+    if count_tokens:
+        body.pop("max_tokens")
+    decoder = decode_messages_count_tokens if count_tokens else decode_messages
+    with pytest.raises(OpenAIProtocolError):
+        decoder(body)
+
+
 def test_interleaved_thinking_turn_keeps_its_block_order_for_replay() -> None:
     """A thinking turn carries its blocks in the caller's order alongside the
     flattened fields, so the Anthropic wire can replay it byte-for-byte:

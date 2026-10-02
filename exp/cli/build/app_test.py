@@ -6,13 +6,11 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
-from io import StringIO
 from pathlib import Path
 
 import pytest
 from click import unstyle
 from pydantic import JsonValue
-from rich.console import Console
 from typer.testing import CliRunner
 
 import exp.cli.build.app as build_command
@@ -21,6 +19,7 @@ import exp.simulation.build as simulation_build
 from exp.cli.app import app
 from exp.cli.build.wizard import _prepare_new_build
 from exp.cli.providers.setup_test import _FakeLister as _SetupLister
+from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
@@ -38,9 +37,17 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
+from exp.common.project.testing import RawArtifact
+from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
+from exp.common.traces.ingest.dataset import read_trace_model_identity_evidence
+from exp.common.traces.ingest.persistence import ingest_traces, read_ingested_traces
+from exp.common.traces.ingest.sources import load_trace_source
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_schema import trace_database_path
+from exp.runtime.gateway.ingest import load_gateway_capture
+from exp.runtime.gateway.ingest.conversion_test import _database, _experience
 from exp.runtime.models import CatalogRoleName, ResolvedModel
-from exp.simulation.ingest.dataset import read_trace_model_identity_evidence
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model import GroundedWorldModelArtifact
 
@@ -254,7 +261,6 @@ class _RuntimeCatalog:
         *,
         role: CatalogRoleName | None = None,
     ) -> ResolvedModel:
-        del role
         """Return exact static identities with alias-specific capabilities.
 
         Args:
@@ -264,13 +270,13 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
+        del role
         _RESOLVE_CALLS.append(alias)
         snapshot, capabilities = self.snapshot(alias)
         embedding = self._embedding if capabilities.supports_embeddings else None
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        del role
         """Reuse local preflight for roles with no extra capability requirement.
 
         Args:
@@ -279,6 +285,7 @@ class _RuntimeCatalog:
         Returns:
             Deterministic resolved fixture model.
         """
+        del role
         _RESOLVE_CALLS.append(alias)
         snapshot, capabilities = self.snapshot(alias)
         embedding = self._embedding if capabilities.supports_embeddings else None
@@ -367,7 +374,7 @@ def test_first_build_provider_flags_skip_the_opening_list(
             "--provider",
             "openai",
         ],
-        input="1\n\n1\n\n1\n\ny\n",
+        input="all\n\n1\n\n1\n\n1\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -380,12 +387,15 @@ def test_first_build_provider_flags_skip_the_opening_list(
     replay = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
+        input="\n" * 7 + "y\n",
     )
 
     assert replay.exit_code == 0, replay.output
     assert lister.requests == ["openai"]
     assert "Select the providers you want to use" not in unstyle(replay.output)
     assert "Model setup is required" not in unstyle(replay.output)
+    assert "Providers" in unstyle(replay.output)
+    assert "Models to configure" in unstyle(replay.output)
 
 
 def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path) -> None:
@@ -443,7 +453,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
-        input="1\n\n1\n\n1\n\n2\n\ny\n",
+        input="/openai\n1\n\nall\n\n1\n\n1\n\n2\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -459,6 +469,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     replay = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
+        input="\n" * 7 + "y\n",
     )
 
     assert replay.exit_code == 0, replay.output
@@ -670,7 +681,10 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
     second_build = store.load_project().build
     assert second_build is not None
     selected = first_build if selected_graph == "old" else second_build
-    trace_directory = store.artifacts.read(selected.trace_dataset.artifact_id).directory
+    trace_directory = RawArtifact(
+        store.artifacts._paths,
+        store.artifacts.read(selected.trace_dataset.artifact_id).manifest.artifact_id,
+    )
     trace_path = trace_directory / "traces.jsonl"
     trace_path.write_text("corrupt\n", encoding="utf-8")
 
@@ -712,13 +726,13 @@ def test_build_package_upgrade_over_ceiling_preserves_selected_review(
     )
 
     assert blocked.exit_code == 2
-    assert "conservative embedding estimate $6.000000 exceeds" in unstyle(blocked.output)
+    assert "embedding estimate $6.00 exceeds the $5.00 budget" in unstyle(blocked.output)
     assert _RESOLVE_CALLS == []
     assert store.load_project().build == first_build
     assert store.read_review() == first_review
 
 
-def test_configured_budget_rejects_build_before_provider_resolution(
+def test_unconfirmed_budget_overrun_stops_before_provider_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -759,15 +773,14 @@ def test_configured_budget_rejects_build_before_provider_resolution(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root), "--yes"],
+        ["build", "support", "--traces", str(source), "--root", str(root)],
     )
 
     assert result.exit_code == 2
     output = " ".join(unstyle(result.output).replace("│", " ").split())
-    assert "conservative estimate $1.00 exceeds the configured per-command budget" in output
+    assert "command estimate $1.00 exceeds the $0.50 budget" in output
     assert "$0.50" in output
-    assert "exp config budget 1.00" in output
-    assert "--yes cannot override" in output
+    assert "interactive terminal to proceed, or use --yes" in output
     assert provider_resolutions == []
     store = ProjectStore(root, "support")
     assert store.load_project().build is None
@@ -935,6 +948,42 @@ def test_interactive_build_uses_the_cost_specific_confirmation(
     assert "Proceed?" not in output
 
 
+@pytest.mark.parametrize("yes_flag", [False, True])
+def test_explicit_build_can_authorize_both_command_and_embedding_overruns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yes_flag: bool
+) -> None:
+    """Both budgets warn once and the approved estimate reaches the embedding provider."""
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 7.9447329)
+    monkeypatch.setattr(consent_module, "can_prompt", lambda _console: not yes_flag)
+    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    if yes_flag:
+        arguments.extend(["--yes", "--no-interactive"])
+
+    result = _RUNNER.invoke(app, arguments, input="y\n")
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(unstyle(result.output).split())
+    assert "command estimate $7.95 exceeds the $1.00 budget" in output
+    assert "embedding estimate $7.95 exceeds the $5.00 budget" in output
+    assert output.count("Proceed anyway") == (0 if yes_flag else 1)
+    assert _RESOLVE_CALLS == ["embed"]
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is not None
+    saved_budgets = store.load_project().budgets
+    assert saved_budgets is not None and float(saved_budgets.maximum_build_cost_usd) == 5.0
+
+    _RESOLVE_CALLS.clear()
+    replay = _RUNNER.invoke(app, arguments)
+    assert replay.exit_code == 0, replay.output
+    assert "Proceed anyway" not in replay.output
+    assert _RESOLVE_CALLS == []
+
+
 @pytest.mark.parametrize("failure_mode", ["cost", "grounded"])
 def test_first_build_failure_does_not_publish_review_readiness(
     tmp_path: Path,
@@ -984,7 +1033,7 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Restart repairs review after completed-build selection without rebuilding providers.
+    """Restart selects the saved graph after an atomic selection rollback without new spend.
 
     Args:
         tmp_path: Temporary trace, catalog, and project root.
@@ -1046,7 +1095,7 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     assert "injected final review failure" in interrupted.output
     selected_build = store.load_project().build
     assert selected_build is not None
-    assert selected_build != first_build
+    assert selected_build == first_build
     assert store.read_review() == first_review
 
     monkeypatch.setattr(simulation_build, "select_build_review", original_select_review)
@@ -1067,7 +1116,8 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     )
 
     assert recovered.exit_code == 0, recovered.output
-    assert store.load_project().build == selected_build
+    selected_build = store.load_project().build
+    assert selected_build is not None and selected_build != first_build
     recovered_review = store.read_review()
     assert isinstance(recovered_review, dict)
     assert recovered_review["build_review"]["trace_dataset"] == (
@@ -1226,7 +1276,7 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
         write_model_catalog(path / "models.toml", catalog)
         return catalog
 
-    monkeypatch.setattr("exp.cli.build.app.run_provider_setup", configure)
+    monkeypatch.setattr("exp.cli.providers.setup.run_provider_setup", configure)
 
     result = _RUNNER.invoke(
         app,
@@ -1242,12 +1292,15 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
 
 def test_build_retains_active_positional_trace_consumer_but_rejects_project_option(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The hidden trace positional remains active while PROJECT stays positional.
 
     Args:
         tmp_path: Temporary project and trace root.
+        monkeypatch: Keep operator-owned local catalogs and projects outside the test.
     """
+    monkeypatch.chdir(tmp_path)
     source = _otlp_export(tmp_path)
     positional = _RUNNER.invoke(app, ["build", "support", str(source)])
     project_option = _RUNNER.invoke(
@@ -1270,7 +1323,7 @@ def test_build_help_describes_the_completed_grounded_artifact() -> None:
 
     assert result.exit_code == 0, result.output
     help_text = unstyle(result.output)
-    assert "Build a reusable grounded world model from local trace evidence." in help_text
+    assert "Import traces, mine scenarios, and build a grounded world model." in help_text
     assert "-t" in help_text
     assert "--traces" in help_text
     assert "--dry-run" in help_text
@@ -1301,7 +1354,7 @@ def test_build_preflight_auto_runs_without_proceed(tmp_path: Path) -> None:
     assert "world model  world (world-id)" in output
     assert "embedder     embed (embed-id)" in output
     assert "embedding    at most $" in output
-    assert "ceiling      $5.000000" in output
+    assert "budget       $5.000000" in output
     assert "Proceed?" not in output
     assert "serving index" in output
     assert "fit-only index" in output
@@ -1337,9 +1390,10 @@ def test_over_ceiling_build_fails_before_provider_construction(tmp_path: Path) -
 
     assert result.exit_code == 2
     output = " ".join(unstyle(result.output).replace("│", " ").split())
-    assert "conservative embedding estimate $" in output
-    assert "exceeds --max-build-cost-usd $0.010000" in output
-    assert "exp build support --traces" in output
+    assert "embedding estimate $" in output
+    assert "exceeds the $0.01 budget" in output
+    assert "exp build support" in output
+    assert "interactive terminal to proceed, or use --yes" in output
     assert "Proceed?" not in output
     assert _RESOLVE_CALLS == []
     store = ProjectStore(root, "support")
@@ -1378,9 +1432,89 @@ def test_dry_run_has_zero_calls_and_no_completed_selection(tmp_path: Path) -> No
     assert "dry run complete" in output
     assert "Proceed?" not in output
     assert _RESOLVE_CALLS == []
+    assert SQLiteTraceStore(trace_database_path(root)).list_imports("support") == ()
     store = ProjectStore(root, "support")
     assert store.load_project().build is None
     assert store.read_review() is None
+
+
+def test_build_stores_traces_and_mines_a_reusable_twenty_scenario_set(tmp_path: Path) -> None:
+    """Build reuses exact evidence and preserves earlier scenarios when the source grows."""
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    result = _RUNNER.invoke(app, arguments)
+    assert result.exit_code == 0, result.output
+    imports = SQLiteTraceStore(trace_database_path(root)).list_imports("support")
+    assert len(imports) == 1
+    imported = read_ingested_traces(root, imports[0])
+    assert imported == load_trace_source("otlp", source)
+    project = ProjectStore(root, "support")
+    selected = project.load_project().build
+    assert selected is not None
+    assert project.load_project().trace_import_id == imports[0]
+    dataset = load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id)
+    assert dataset.traces == imported.traces
+    task_set = load_task_set(project.artifacts, selected.task_set.artifact_id)
+    assert len(task_set.tasks) == 20
+    resolves = list(_RESOLVE_CALLS)
+    repeated = _RUNNER.invoke(app, arguments)
+    assert repeated.exit_code == 0, repeated.output
+    assert _RESOLVE_CALLS == resolves
+    assert project.load_project().build == selected
+    assert SQLiteTraceStore(trace_database_path(root)).list_imports("support") == imports
+
+    _otlp_export(tmp_path, count=21)
+    updated = _RUNNER.invoke(app, arguments)
+    assert updated.exit_code == 0, updated.output
+    successor = project.load_project().build
+    assert successor is not None and successor != selected
+    assert len(load_task_set(project.artifacts, successor.task_set.artifact_id).tasks) == 21
+    assert load_task_set(project.artifacts, selected.task_set.artifact_id) == task_set
+    assert load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id) == dataset
+    successor_imports = SQLiteTraceStore(trace_database_path(root)).list_imports("support")
+    assert len(successor_imports) == 2
+    assert project.load_project().trace_import_id == successor_imports[-1]
+    assert read_ingested_traces(root, imports[0]) == imported
+
+
+def test_build_from_gateway_mines_only_the_selected_identity(tmp_path: Path) -> None:
+    """Captured prompts and tools survive the single build command through task mining."""
+    source = tmp_path / "traffic.db"
+    _database(source, (_experience("developer"), _experience("other")))
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--source",
+            "gateway",
+            "--identity",
+            "developer",
+            "--root",
+            str(root),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    imports = SQLiteTraceStore(trace_database_path(root)).list_imports("support")
+    assert len(imports) == 1
+    imported = read_ingested_traces(root, imports[0])
+    assert imported == load_gateway_capture(source, identity_id="developer")
+    project = ProjectStore(root, "support")
+    selected = project.load_project().build
+    assert selected is not None
+    assert project.load_project().trace_import_id == imports[0]
+    dataset = load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id)
+    assert dataset.traces == imported.traces
+    assert dataset.traces[0].tools[0].name == "lookup"
+    assert len(load_task_set(project.artifacts, selected.task_set.artifact_id).tasks) == 1
 
 
 def test_wizard_preconsent_plan_persists_only_provider_free_unselected_evidence(
@@ -1408,7 +1542,7 @@ def test_wizard_preconsent_plan_persists_only_provider_free_unselected_evidence(
         maximum_build_cost_usd=5.0,
         code_revision="a" * 40,
         providers=(),
-        console=Console(file=StringIO(), force_terminal=False),
+        console=ScriptedConsole("\n" * 5 + "y\n"),
     )
 
     store = ProjectStore(root, "support")
@@ -1605,3 +1739,55 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "unsupported trace source 'helicone'" in unstyle(result.output)
     assert "posthog" in unstyle(result.output)
+
+
+def test_build_pins_stored_import_after_original_source_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The downstream build consumes the exact ingestion receipt without rereading a path."""
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    _, receipt = ingest_traces("support", root=root, source_format="otlp", path=source)
+    assert receipt is not None
+    source.unlink()
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--import-id", receipt.import_id, "--root", str(root), "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    store = ProjectStore(root, "support")
+    assert store.load_project().trace_import_id == receipt.import_id
+    assert store.artifacts.list_ids()
+    assert not (store.paths.project_directory / "project.toml").exists()
+
+
+def test_replacement_import_is_selected_with_its_completed_build(tmp_path: Path) -> None:
+    """A new corpus can replace a build while old configuration snapshots remain replayable."""
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    source = _otlp_export(tmp_path, count=1)
+    _, first = ingest_traces("support", root=root, source_format="otlp", path=source)
+    assert first is not None
+    command = ["build", "support", "--root", str(root), "--import-id"]
+    result = _RUNNER.invoke(app, [*command, first.import_id])
+    assert result.exit_code == 0, result.output
+    store = ProjectStore(root, "support")
+    original = store.load_project()
+    assert original.trace_import_id == first.import_id
+    frozen = store.snapshot(sha256_json(original))
+    source = _otlp_export(tmp_path, count=2)
+    _, second = ingest_traces("support", root=root, source_format="otlp", path=source)
+    assert second is not None and second.import_id != first.import_id
+    source.unlink()
+    preflight = _RUNNER.invoke(app, [*command, second.import_id, "--dry-run"])
+    assert preflight.exit_code == 0, preflight.output
+    assert store.load_project() == original
+    replaced = _RUNNER.invoke(app, [*command, second.import_id])
+    assert replaced.exit_code == 0, replaced.output
+    assert store.load_project().trace_import_id == second.import_id
+    assert store.load_project().build != original.build
+    assert frozen.load_project() == original

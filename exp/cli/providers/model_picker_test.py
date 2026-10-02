@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from exp.cli.providers.model_picker import (
     GatewayModelSelection,
+    _ask_role_reasoning_effort,
     assign_roles,
     build_result,
     configured_models,
     declare_model,
+    model_selection,
     render_summary,
     select_gateway_model,
     select_models,
@@ -110,6 +114,39 @@ def test_model_screen_spans_providers_and_reports_roles_and_pricing_source() -> 
 def test_model_screen_back_navigation_returns_to_provider_selection() -> None:
     """Going back from the model screen reselects providers without cancelling."""
     assert select_models(_session(_CHAT), console=ScriptedConsole("b\n")) is None
+
+
+def test_effort_picker_rejects_stale_unsupported_default_and_preserves_native_max() -> None:
+    """A saved ultra choice cannot survive when the selected deployment does not support it."""
+    item = replace(
+        _CHAT,
+        model="deepseek-v4.1-flash",
+        capabilities=ModelCapabilities(supports_reasoning=True, reasoning_effort="high"),
+        supported_reasoning_efforts=("none", "low", "high", "max"),
+    )
+    console = ScriptedConsole("4\n")
+    assert (
+        _ask_role_reasoning_effort(
+            (item,),
+            alias=item.alias,
+            role_name="world model",
+            default="ultra",
+            console=console,
+        )
+        == "max"
+    )
+    assert "ultra" not in console.output
+    assert "minimal" not in console.output
+    assert (
+        _ask_role_reasoning_effort(
+            (item,),
+            alias=item.alias,
+            role_name="world model",
+            default="ultra",
+            console=ScriptedConsole("\n"),
+        )
+        == "high"
+    )
 
 
 def test_model_screen_cancellation_ends_setup() -> None:
@@ -589,6 +626,24 @@ def test_a_connection_only_used_by_unselected_models_is_not_written() -> None:
     )
 
     assert [connection.name for connection in result.setup.connections] == ["openai"]
+
+
+def test_selected_models_keep_published_denials_in_the_catalog_record() -> None:
+    """Saving a selected model retains explicit false flags for the next setup session."""
+    item = replace(
+        _CHAT,
+        published=DiscoveredModel(
+            provider=_CHAT.provider,
+            model=_CHAT.model,
+            supports_structured_output=False,
+        ),
+    )
+
+    record = model_selection(item).catalog_record()
+
+    assert record.discovery == item.published
+    with pytest.raises(ValueError, match="same provider model"):
+        ModelRecord.model_validate({**record.model_dump(), "model": "different-model"})
 
 
 def test_duplicate_provider_model_names_receive_distinct_aliases() -> None:

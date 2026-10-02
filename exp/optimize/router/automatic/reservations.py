@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -66,7 +67,7 @@ def simulation_input_token_estimate(
     The estimate sums explicit deterministic components instead of a model's full context
     window: one median-length trace for the visible episode transcript, one median-length trace
     for each of the world model's retrieved fit-RAG transitions rendered into the prompt (one
-    whole trace bounds one transition), the explicit retrieval query token budget, one full
+    whole trace bounds one transition), the full resolved query input ceiling, one full
     output turn echoed back into the next request, and a fixed prompt-framing allowance.
 
     The estimate prices provider reservations only. It never bounds an individual request:
@@ -75,7 +76,7 @@ def simulation_input_token_estimate(
     Args:
         traces: Verified traces persisted by the completed build.
         retrieved_transition_count: Frozen world-model retrieval count rendered per prediction.
-        maximum_retrieval_query_tokens: Explicit rendered RAG query token budget.
+        maximum_retrieval_query_tokens: Explicit or capacity-derived aggregate query ceiling.
         maximum_output_tokens: Per-turn completion output ceiling echoed into later prompts.
 
     Returns:
@@ -102,13 +103,28 @@ def simulation_input_token_estimate(
 
 @dataclass(frozen=True)
 class AutomaticRouterOptions:
-    """Tasteful bounded controls for one automatic router optimization."""
+    """Bounded controls for one automatic router optimization.
+
+    Attributes:
+        maximum_provider_cost_usd: Aggregate provider allowance, default 25 dollars.
+        maximum_judgments: Durable judgment count ceiling, default 100.
+        maximum_model_calls: Candidate turn ceiling, default 50.
+        maximum_router_feature_tokens: Router feature input limit, default 8,192.
+        maximum_retrieval_query_tokens: Optional query input ceiling; omission derives it from
+            the world model's available input capacity. Individual chunks obey embedder capacity.
+        router_embedding_maximum_attempts: Embedding retry allowance, default three.
+        completion_maximum_attempts: Completion retry allowance, default three.
+        simulation_maximum_output_tokens: Per-turn generation allowance, default 16,000.
+        maximum_concurrency: Simultaneous rollout allowance, default one.
+        seed: Deterministic scheduling seed, default zero.
+        stop_on_overspend: Whether to stop when reconciled costs reach the allowance.
+    """
 
     maximum_provider_cost_usd: float = 25.0
     maximum_judgments: int = 100
     maximum_model_calls: int = 50
     maximum_router_feature_tokens: int = 8_192
-    maximum_retrieval_query_tokens: int = 32_768
+    maximum_retrieval_query_tokens: int | None = None
     router_embedding_maximum_attempts: int = 3
     completion_maximum_attempts: int = 3
     simulation_maximum_output_tokens: int = 16_000
@@ -290,7 +306,7 @@ def simulation_completion_reservations(
     world_alias: str | None,
     world: ModelSnapshot | None,
     maximum_attempts: int,
-    estimated_input_tokens: int,
+    estimated_input_tokens: int | Mapping[str, int],
     maximum_output_tokens: int,
 ) -> tuple[tuple[CandidateCompletionReservation, ...], CompletionCostReservation | None]:
     """Freeze candidate and world call reservations from exact catalog declarations.
@@ -302,7 +318,7 @@ def simulation_completion_reservations(
         world_alias: Build-frozen world-model alias.
         world: Exact world-model snapshot.
         maximum_attempts: Active completion retry ceiling.
-        estimated_input_tokens: Trace-derived realistic per-call input planning size.
+        estimated_input_tokens: Uniform or alias-specific per-call input planning estimates.
         maximum_output_tokens: Per-turn candidate and world output ceiling.
 
     Returns:
@@ -317,7 +333,11 @@ def simulation_completion_reservations(
             model=candidate.model,
             label="candidate",
             maximum_attempts=maximum_attempts,
-            estimated_input_tokens=estimated_input_tokens,
+            estimated_input_tokens=(
+                estimated_input_tokens
+                if isinstance(estimated_input_tokens, int)
+                else estimated_input_tokens[candidate.alias]
+            ),
             maximum_output_tokens=maximum_output_tokens,
         )
         if request is not None:
@@ -335,7 +355,11 @@ def simulation_completion_reservations(
             model=world,
             label="world model",
             maximum_attempts=maximum_attempts,
-            estimated_input_tokens=estimated_input_tokens,
+            estimated_input_tokens=(
+                estimated_input_tokens
+                if isinstance(estimated_input_tokens, int)
+                else estimated_input_tokens[world_alias]
+            ),
             maximum_output_tokens=maximum_output_tokens,
         )
         if world_alias is not None and world is not None
@@ -344,12 +368,52 @@ def simulation_completion_reservations(
     return tuple(candidate_requests), world_request
 
 
+def retrieval_query_input_limit(
+    problems: list[str],
+    *,
+    catalog: ModelCatalog,
+    world_alias: str | None,
+    maximum_output_tokens: int,
+    configured_limit: int | None,
+) -> int | None:
+    """Derive omitted aggregate query limits from the required world prompt's input capacity.
+
+    A query contains task, initial context and one action, all of which also belong to the
+    required world prompt. Its lossless embedding chunks have separate per-input bounds;
+    their aggregate allowance must not be confused with one embedding context window.
+
+    Args:
+        problems: Mutable aggregate preflight problem list.
+        catalog: Verified model metadata.
+        world_alias: World-model alias, or None when role selection is incomplete.
+        maximum_output_tokens: Requested per-call world output reservation.
+        configured_limit: Explicit user ceiling, retained exactly when supplied.
+
+    Returns:
+        Finite aggregate input bound, or None after reporting unavailable world capacity.
+    """
+    if configured_limit is not None:
+        return configured_limit
+    record = catalog.models.get(world_alias) if world_alias is not None else None
+    capabilities = record.capabilities if record is not None else None
+    context = capabilities.context_window_tokens if capabilities is not None else None
+    if capabilities is None or context is None:
+        problems.append("retrieval query capacity requires world-model context metadata")
+        return None
+    output = capabilities.maximum_output_tokens
+    available = context if output is None else context - min(output, maximum_output_tokens)
+    if available <= 0:
+        problems.append("world-model output reservation leaves no capacity for a retrieval query")
+        return None
+    return available
+
+
 def retrieval_embedding_reservation(
     problems: list[str],
     catalog: ModelCatalog,
     alias: str | None,
     model: ModelSnapshot | None,
-    maximum_input_tokens: int,
+    maximum_input_tokens: int | None,
     maximum_attempts: int,
 ) -> EmbeddingCostReservation | None:
     """Freeze one query-embedding price, retry, and input ceiling.
@@ -359,13 +423,13 @@ def retrieval_embedding_reservation(
         catalog: Verified local model catalog.
         alias: Build-frozen embedder alias.
         model: Exact embedder model identity.
-        maximum_input_tokens: Maximum rendered RAG query input.
+        maximum_input_tokens: Maximum rendered RAG query input, or unavailable capacity.
         maximum_attempts: Active embedding retry ceiling.
 
     Returns:
         Exact retrieval reservation, or ``None`` when metadata is unavailable.
     """
-    if alias is None or model is None:
+    if alias is None or model is None or maximum_input_tokens is None:
         return None
     capabilities = catalog.models[alias].capabilities
     price = capabilities.input_cost_per_million_tokens_usd if capabilities is not None else None
@@ -397,7 +461,11 @@ def completion_reservation_from_catalog(
     """Create one completion reservation from exact capacity and pricing metadata.
 
     The hard per-request admission ceiling is the model's full context capacity after its
-    per-turn output budget. The trace-derived estimate prices the reservation only.
+    per-turn output budget. The trace-derived estimate prices the reservation only and cannot
+    exceed that physically admissible input size. A whole captured episode can contain many
+    requests, so its planning estimate is not evidence that an individual request overflows.
+    Without a published output limit, input and output are independently bounded by context;
+    simulation fits the requested output budget around the full input before dispatch.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -414,24 +482,28 @@ def completion_reservation_from_catalog(
     """
     capabilities = catalog.models[alias].capabilities
     if capabilities is None:
+        problems.append(f"{label} alias {alias!r} has no capability or pricing metadata")
         return None
     context = capabilities.context_window_tokens
-    if (
-        context is None
-        or capabilities.maximum_output_tokens is None
-        or maximum_output_tokens > capabilities.maximum_output_tokens
-        or maximum_output_tokens >= context
-    ):
-        problems.append(
-            f"{label} alias {alias!r} cannot reserve {maximum_output_tokens} output tokens "
-            "inside its explicit capacity"
-        )
+    if context is None:
+        problems.append(f"{label} alias {alias!r} has no context-window metadata")
         return None
-    maximum_input_tokens = context - maximum_output_tokens
-    if estimated_input_tokens <= 0 or estimated_input_tokens > maximum_input_tokens:
+    if capabilities.maximum_output_tokens is None:
+        maximum_output_tokens = min(maximum_output_tokens, context)
+        maximum_input_tokens = context
+    else:
+        maximum_output_tokens = min(maximum_output_tokens, capabilities.maximum_output_tokens)
+        if maximum_output_tokens >= context:
+            problems.append(
+                f"{label} alias {alias!r} cannot reserve {maximum_output_tokens} output tokens "
+                "inside its explicit capacity"
+            )
+            return None
+        maximum_input_tokens = context - maximum_output_tokens
+    if estimated_input_tokens <= 0:
         problems.append(
-            f"{label} alias {alias!r} cannot fit the estimated {estimated_input_tokens} input "
-            f"plus {maximum_output_tokens} output tokens inside its {context}-token context window"
+            f"{label} alias {alias!r} requires a positive input estimate; "
+            f"got {estimated_input_tokens}"
         )
         return None
     prices = (
@@ -441,6 +513,17 @@ def completion_reservation_from_catalog(
         capabilities.cache_write_cost_per_million_tokens_usd,
     )
     if any(value is None for value in prices):
+        missing = ", ".join(
+            name
+            for name, value in zip(
+                ("input", "output", "cached input", "cache write"), prices, strict=True
+            )
+            if value is None
+        )
+        problems.append(
+            f"{label} alias {alias!r} is missing {missing} prices; "
+            "refresh Cloud metadata with exp login or configure prices with exp config providers"
+        )
         return None
     input_price, output_price, cached_input_price, cache_write_price = prices
     assert input_price is not None and output_price is not None
@@ -455,7 +538,7 @@ def completion_reservation_from_catalog(
             maximum_attempts=maximum_attempts,
             maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
-            estimated_input_tokens=estimated_input_tokens,
+            estimated_input_tokens=min(estimated_input_tokens, maximum_input_tokens),
         )
     except ValueError as exc:
         problems.append(f"{label} alias {alias!r} reservation: {exc}")
@@ -628,7 +711,13 @@ def plan_automatic_router_cost(
         catalog,
         embedder_alias,
         embedder,
-        options.maximum_retrieval_query_tokens,
+        retrieval_query_input_limit(
+            problems,
+            catalog=catalog,
+            world_alias=world_model_alias,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+            configured_limit=options.maximum_retrieval_query_tokens,
+        ),
         options.router_embedding_maximum_attempts,
     )
     candidates, world_request = simulation_completion_reservations(

@@ -1,9 +1,11 @@
 """Type stubs for the exp_gateway_native extension module."""
 
 from collections.abc import Callable, Mapping
-from typing import Protocol
+from typing import Literal, Protocol, overload
 
 __version__: str
+MODEL_STAGE_CONTRACT_VERSION: int
+AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION: int
 
 class _ControlPlane(Protocol):
     """The callback surface the data plane requires (see NativeControlPlane)."""
@@ -44,6 +46,51 @@ class ShutdownHandle:
 
     def request_shutdown(self) -> None: ...
 
+class CaptureResponse:
+    """Observed provider output and terminal evidence shared with gateway capture."""
+
+    def __init__(self, protocol: str, body: bytes, sse: bool) -> None: ...
+    @property
+    def body_json(self) -> str: ...
+    @property
+    def completed(self) -> bool: ...
+    @property
+    def events_json(self) -> str | None: ...
+
+class CaptureCollector:
+    """Bounded native content capture with an off-path persistence destination."""
+
+    def __init__(self, config_json: str, sink: Callable[[str], None]) -> None: ...
+    @staticmethod
+    @overload
+    def batched(
+        config_json: str,
+        sink: Callable[[tuple[str, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
+        bytes_output: Literal[False] = False,
+    ) -> CaptureCollector: ...
+    @staticmethod
+    @overload
+    def batched(
+        config_json: str,
+        sink: Callable[[tuple[bytes, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
+        bytes_output: Literal[True],
+    ) -> CaptureCollector: ...
+    @staticmethod
+    def sqlite(config_json: str, local_json: str) -> CaptureCollector | None: ...
+    def begin(self, request_json: str) -> bool: ...
+    def begin_bytes(self, request_json: bytes) -> bool: ...
+    def select_model(self, request_id: str, model_id: str) -> None: ...
+    def claim_relay(self, request_id: str) -> bool: ...
+    def finish_relay(self, request_id: str, metadata_json: str, body: bytes) -> bool: ...
+    def settle(self, request_id: str, keep_prompt: bool, keep_response: bool) -> None: ...
+    def close(self, timeout_seconds: float = 10.0) -> bool: ...
+    def counts(self) -> tuple[int, int, int, int, int, int]: ...
+    def maintenance_failures(self) -> int: ...
+
 def shutdown_handle() -> ShutdownHandle: ...
 def serve(
     control_plane: _ControlPlane,
@@ -51,6 +98,7 @@ def serve(
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
     guardrail_detectors: Mapping[str, _DeterministicDetector] | None = None,
+    capture: CaptureCollector | None = None,
 ) -> None: ...
 def metrics_snapshot_json() -> str: ...
 def encode_chat_fixture(
@@ -74,16 +122,5 @@ def completed_responses_fixture(
     envelope_json: str,
     events_json: str,
 ) -> str: ...
-def encode_messages_fixture(
-    request_id: str,
-    model: str,
-    events_json: str,
-) -> list[str]: ...
-def completed_messages_fixture(
-    request_id: str,
-    model: str,
-    events_json: str,
-) -> str: ...
-def anthropic_error_fixture(public_error_json: str) -> str: ...
 def normalize_stream_fixture(dialect: str, chunks_json: str) -> str: ...
 def failure_public_error_fixture(failure_class: str, safe_message: str) -> str: ...

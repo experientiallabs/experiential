@@ -48,6 +48,9 @@ class DiscoveredModel(ContractModel):
 
     Every optional field carries provider-published metadata. An omitted field means the provider
     published nothing for it, never that the capability, limit, or price is absent.
+
+    Attributes:
+        supported_reasoning_efforts: Published caller choices, or ``None`` when not declared.
     """
 
     provider: str = Field(min_length=1, max_length=128)
@@ -64,6 +67,7 @@ class DiscoveredModel(ContractModel):
     supports_presence_penalty: bool | None = None
     supports_reasoning: bool | None = None
     reasoning_effort: ReasoningEffort | None = None
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
     sampling_requires_reasoning_none: bool | None = None
     chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)

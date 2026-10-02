@@ -89,6 +89,7 @@ def gemini_generate_request(
     Raises:
         ValueError: A visible request message cannot preserve its tool linkage on Gemini's wire.
     """
+    json_object_output = json_object_output or request.json_object_output
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
@@ -97,7 +98,7 @@ def gemini_generate_request(
     # (consecutive user contents are accepted on this wire); only the leading
     # run is hoisted.
     for message in fold_instruction_turns_after_the_leading_run(request.messages):
-        if message.role == "system":
+        if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append({"text": message.content})
@@ -207,7 +208,19 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     action = message.assistant_action
     text = message.content if message.content is not None else action.content if action else None
     parts: list[JsonObject] = []
-    if text is not None:
+    if message.content_parts:
+        for part in message.content_parts:
+            if part.kind == "text":
+                parts.append({"text": part.text})
+            elif part.kind == "image":
+                parts.append(gemini_image_part(part))
+            else:
+                raise ValueError("Gemini assistant history supports text and image parts")
+        # Chat history carries caller-owned content rather than Gemini's opaque
+        # signatures, as with replayed function calls below.
+        for part in parts:
+            part["thoughtSignature"] = GEMINI_THOUGHT_SIGNATURE_BYPASS
+    elif text is not None:
         parts.append({"text": text})
     if action is not None:
         for call in action.tool_calls:

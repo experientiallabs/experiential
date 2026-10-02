@@ -25,6 +25,7 @@ from exp.common.models import (
 )
 from exp.common.project import artifact_input
 from exp.common.rollouts import RolloutArtifact
+from exp.optimize.router.errors import JudgeTranscriptAdmissionError
 from exp.optimize.router.judging.artifacts import write_production_rollout
 from exp.optimize.router.judging.contracts import ManualJudgeError, judge_feedback_schema
 from exp.optimize.router.judging.protocol import (
@@ -42,7 +43,8 @@ from exp.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from exp.optimize.router.judging.service_test import _TIME, _built_store, _catalog, _template
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.runtime.models.providers.openai_compatible import openai_compatible_request
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 def _response(content: str) -> ModelResponse:
@@ -292,10 +294,10 @@ def _oversized_rollout(rollout: RolloutArtifact) -> RolloutArtifact:
     return rollout.model_copy(update={"spans": (first, *rollout.spans[1:])})
 
 
-def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
+def test_long_transcript_keeps_full_evidence_within_model_capacity(
     tmp_path: Path,
 ) -> None:
-    """A transcript above the reserved input ceiling dispatches within the ceiling.
+    """Long transcripts retain tool evidence and work with reasoning-only sampling constraints.
 
     Args:
         tmp_path: Isolated project root.
@@ -352,31 +354,28 @@ def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
         rubric,
         oversized,
         None,
-        maximum_input_tokens=32_768,
+        maximum_input_tokens=1_000_000,
         maximum_output_tokens=16_384,
     )
-    replayed = _bounded_judge_request(
-        setup.prompt_template,
-        rubric,
-        oversized,
-        None,
-        maximum_input_tokens=32_768,
-        maximum_output_tokens=16_384,
+    assert bounded == unbounded
+    assert "x" * 200_000 in (bounded.messages[1].content or "")
+    assert "payload_elided" not in (bounded.messages[1].content or "")
+    payload = openai_compatible_request(
+        "gpt-6-luna",
+        bounded,
+        supports_reasoning=True,
+        reasoning_effort="high",
+        sampling_requires_reasoning_none=True,
     )
-
-    assert counter.count(bounded) <= 32_768
-    assert bounded == replayed
-    body = bounded.messages[1].content or ""
-    assert '"payload_elided": true' in body or '"payload_elided":true' in body
-    assert '"payload_sha256"' in body
-    assert oversized.spans[0].span_id in body
-    with pytest.raises(ManualJudgeError, match="every span"):
+    assert "temperature" not in payload
+    assert payload["reasoning_effort"] == "high"
+    with pytest.raises(JudgeTranscriptAdmissionError, match="full.*evidence"):
         _bounded_judge_request(
             setup.prompt_template,
             rubric,
             oversized,
             None,
-            maximum_input_tokens=16,
+            maximum_input_tokens=32_768,
             maximum_output_tokens=16_384,
         )
 
@@ -437,9 +436,9 @@ def test_template_client_dispatch_respects_the_reserved_input_ceiling(
         reference_input=None,
         created_at=_TIME,
         code_revision="test-revision",
-        maximum_input_tokens=32_768,
+        maximum_input_tokens=1_000_000,
         maximum_output_tokens=16_384,
     ).complete(_scalar_request(setup.prompt_template.prompt.text))
 
     assert len(client.requests) == 1
-    assert Utf8UpperBoundTokenCounter().count(client.requests[0]) <= 32_768
+    assert Utf8UpperBoundTokenCounter().count(client.requests[0]) <= 1_000_000

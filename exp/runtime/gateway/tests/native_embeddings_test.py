@@ -107,7 +107,9 @@ class _EmbeddingsUpstream(BaseHTTPRequestHandler):
             data.append({"object": "embedding", "index": position, "embedding": embedding})
         if selector == "short-count":
             data.pop()
-        prompt_tokens = sum(len(text.split()) for text in inputs)
+        prompt_tokens = sum(
+            len(item.split()) if isinstance(item, str) else len(item) for item in inputs
+        )
         body: JsonObject = {"object": "list", "data": data, "model": payload["model"]}
         if selector != "unbilled":
             body["usage"] = {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}
@@ -272,6 +274,60 @@ def test_official_client_round_trips_base64_vectors_and_settles(engine: _Serving
     assert _total(engine.base, "requests") == requests_before + 1
     assert _total(engine.base, "input_tokens") == input_before + 3
     assert _total(engine.base, "output_tokens") == output_before
+
+
+@pytest.mark.parametrize("inputs", [[0, 42, 100257], [[1, 2], [3]]])
+def test_official_client_token_arrays_cross_native_serving(
+    engine: _ServingEngine, inputs: list[int] | list[list[int]]
+) -> None:
+    """Single and batched IDs retain their values, vector count, and input-only settlement."""
+    input_before = _total(engine.base, "input_tokens")
+    output_before = _total(engine.base, "output_tokens")
+    completed_before = _terminal_attempts(engine.base, "completed")
+    count = 1 if isinstance(inputs[0], int) else len(inputs)
+    batch = [inputs] if isinstance(inputs[0], int) else inputs
+    with openai.OpenAI(
+        base_url=f"{engine.base}/v1", api_key=engine.raw_key, max_retries=0
+    ) as client:
+        response = client.embeddings.create(
+            model="embedder", input=inputs, extra_body={"stream": False}
+        )
+    assert [item.index for item in response.data] == list(range(count))
+    assert [item.embedding for item in response.data] == [_vector(i) for i in range(count)]
+    assert response.usage.prompt_tokens == response.usage.total_tokens == 3
+    assert _last_upstream_payload() == {
+        "model": "embedder-model-exact",
+        "input": batch,
+        "encoding_format": "base64",
+    }
+    assert _terminal_attempts(engine.base, "completed") == completed_before + 1
+    assert _total(engine.base, "input_tokens") == input_before + 3
+    assert _total(engine.base, "output_tokens") == output_before
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"input": [True]},
+        {"input": [1.0]},
+        {"input": [[1], []]},
+        {"input": ["x", [1]]},
+        {"stream": True},
+        {"stream": 0},
+        {"temperature": 0},
+    ],
+)
+def test_invalid_token_or_stream_requests_never_dispatch(
+    engine: _ServingEngine, patch: JsonObject
+) -> None:
+    """The real native route refuses malformed inputs before provider work or acceptance."""
+    payloads_before = len(_EmbeddingsUpstream.payloads)
+    requests_before = _total(engine.base, "requests")
+    response = _post(engine, {"model": "embedder", "input": "hello", **patch})
+    assert response.status_code == 400
+    assert response.json()["error"]["param"]
+    assert len(_EmbeddingsUpstream.payloads) == payloads_before
+    assert _total(engine.base, "requests") == requests_before
 
 
 def test_raw_float_request_forwards_every_field_and_ignores_idempotency_key(

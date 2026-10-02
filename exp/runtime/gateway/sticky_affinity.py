@@ -56,11 +56,24 @@ class AffinityPlacement:
     or not the binding had to move that rung to the front: the conversation's
     warm provider cache lives there, which admission-time policy (the
     throttle redial budget) reads as cache evidence.
+
+    Attributes:
+        recovery_reason: Optional content-free reason for this admission's recovery placement.
+        verified_warm_deployment_id: Exact tenant/prefix/credential-verified warm rung, or None.
+        verified_warm_until_monotonic: Nonrenewable warmth expiry, initially zero.
+        recovery_scoped: Whether unscoped sticky evidence is insufficient, default False.
     """
 
     fingerprint: bytes | None = None
     sticky_preferred: bool = False
     sticky_deployment_id: str | None = None
+    recovery_reason: str | None = None
+    # Scoped recovery verifies the exact tenant, session prefix and credential at
+    # admission. Its selected warm rung travels only with this request, never
+    # through the conversation-only sticky registry.
+    verified_warm_deployment_id: str | None = None
+    verified_warm_until_monotonic: float = 0
+    recovery_scoped: bool = False
 
 
 def sticky_first_order(

@@ -14,6 +14,7 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
     Admission,
 };
+use crate::capture::reasoning::{checkpoint_winner, observe_winner};
 use crate::encode::{
     compact_json, completed_chat_body_with_carrier, completed_chat_body_with_ignored,
     reasoning_carrier_candidate, ChatSseEncoder, ReasoningCarrierCandidate,
@@ -120,6 +121,7 @@ pub(crate) async fn chat(
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
         "client_ip": client_ip(&headers),
+        "capture_session_id": crate::capture::session_id(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
@@ -221,13 +223,24 @@ pub(crate) async fn chat(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    won = checkpoint_winner(
+        state.capture.as_ref(),
+        &admission,
+        &mut guard,
+        won,
+        deadline,
+    )
+    .await;
+    observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    match won {
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
+    let response = match won {
         Won::Failed(error) => {
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
@@ -280,7 +293,8 @@ pub(crate) async fn chat(
                 .await
             }
         }
-    }
+    };
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Answer one attempt that the waterfall already settled: a successful
@@ -626,7 +640,7 @@ async fn respond_from_chat_events(
     }
     if let Some(mut owner) = lease.take() {
         // Publish the exact response body and headers, then answer from the
-        // stored copy, matching the python engine's `_cached_response`.
+        // stored copy (`respond::cached_response`).
         let mut sorted = headers.clone();
         sorted.sort();
         let cached = CachedResponse {

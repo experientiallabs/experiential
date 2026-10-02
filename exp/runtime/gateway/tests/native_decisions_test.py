@@ -39,12 +39,12 @@ from exp.common.models import (
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import (
-    upsert_certified_pool,
     upsert_connection,
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.tests.native_messages_test import _DRIVER_SOURCE, _HOST, _ServingEngine
 
 pytest.importorskip("exp_gateway_native")
@@ -127,6 +127,29 @@ def _answers() -> JsonObject:
     }
 
 
+_ROUNDING_LEVELS = [
+    "No urgency",
+    "Low urgency",
+    "Moderate urgency",
+    "High urgency",
+    "Critical urgency",
+]
+
+
+def _rounded_answer(selector: str) -> JsonObject:
+    """Reproduce numeric answers from small synthetic jev-1.13.0 requests."""
+    low = selector == "rounded-low"
+    return {
+        "type": "score",
+        "score": 1.12 if low else 3.88,
+        "confidence": 0.89 if low else 0.9,
+        "legend": {str(index): level for index, level in enumerate(_ROUNDING_LEVELS)},
+        "probabilities": {"0": 0.0, "1": 0.87, "2": 0.13, "3": 0.0, "4": 0.0}
+        if low
+        else {"0": 0.01, "1": 0.0, "2": 0.01, "3": 0.07, "4": 0.91},
+    }
+
+
 class _DecisionsUpstream(BaseHTTPRequestHandler):
     """Serve bounded synthetic answers, recording only loopback test traffic."""
 
@@ -165,6 +188,20 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
             cast(JsonObject, answers["department"])["probabilities"] = {"billing": 1.0}
         elif selector == "wrong-legend":
             cast(JsonObject, answers["quantity"])["legend"] = {"0": "wrong criteria"}
+        elif selector == "inconsistent-score":
+            cast(JsonObject, answers["quantity"])["score"] = 0.2
+        elif selector == "precise-score":
+            cast(JsonObject, answers["quantity"])["score"] = 1.740000000005
+        elif selector == "precise-probabilities":
+            quantity = cast(JsonObject, answers["quantity"])
+            quantity["score"] = 1.74
+            quantity["probabilities"] = {"0": 0.05 + 1e-12, "1": 0.15 - 1e-12, "2": 0.8}
+        elif selector in {"rounded-low", "rounded-high"}:
+            answers["quantity"] = _rounded_answer(selector)
+            body["usage"] = {
+                "input_tokens": 443 if selector == "rounded-low" else 436,
+                "output_tokens": 69,
+            }
         encoded = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -548,6 +585,34 @@ def test_typed_answers_preserve_alias_and_settle_exact_owned_usage(engine: _Serv
     _assert_budget_accounted(engine)
 
 
+@pytest.mark.parametrize("selector", ["rounded-low", "rounded-high"])
+def test_rounded_provider_score_is_preserved_and_settled_once(
+    engine: _ServingEngine, selector: str
+) -> None:
+    """Real synthetic response numbers cross Rust unchanged with one exact charge."""
+    before = _request_ids(engine)
+    calls_before = _provider_calls()
+    body = _body(selector)
+    questions = cast(JsonObject, body["questions"])
+    cast(JsonObject, questions["quantity"])["criteria"] = list(_ROUNDING_LEVELS)
+    response = _post(engine, body)
+    assert response.status_code == 200, response.text
+    assert response.json()["answers"]["quantity"] == _rounded_answer(selector)
+    input_tokens = 443 if selector == "rounded-low" else 436
+    assert response.json()["usage"] == {"input_tokens": input_tokens, "output_tokens": 69}
+    assert _provider_calls() == calls_before + 1
+    [(request, attempts)] = _settled(engine, before)
+    assert request["terminal_state"] == "completed"
+    [attempt] = attempts
+    assert attempt["state"] == "completed"
+    assert attempt["failure_class"] is None
+    assert attempt["usage_source"] == "observed"
+    assert attempt["input_tokens"] == input_tokens
+    assert attempt["output_tokens"] == 69
+    assert attempt["budget_settled_nano_usd"] == input_tokens * 42
+    _assert_budget_accounted(engine)
+
+
 def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEngine) -> None:
     """Unbillable answers and mismatched types/probabilities/legends never escape."""
     cases = (
@@ -555,6 +620,9 @@ def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEng
         ("wrong-type", "decision"),
         ("wrong-probabilities", "decision"),
         ("wrong-legend", "decision"),
+        ("inconsistent-score", "decision-failover"),
+        ("precise-score", "decision-failover"),
+        ("precise-probabilities", "decision-failover"),
         ("wrong-type", "decision-failover"),
     )
     for selector, alias in cases:

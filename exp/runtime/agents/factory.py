@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from importlib import import_module
 from typing import cast
 
@@ -16,6 +17,21 @@ AgentFactory = Callable[[], AgentRuntime]
 
 class AgentFactoryError(ValueError):
     """A configured customer agent factory cannot provide the runtime contract."""
+
+
+def is_builtin_chat_factory(factory: AgentFactory) -> bool:
+    """Recognize explicit built-in construction without calling arbitrary customer code.
+
+    Args:
+        factory: Constructor selected for each agent episode.
+
+    Returns:
+        True only for the built-in class or a partial applying arguments to that exact class.
+        Custom wrappers and subclasses cannot assert built-in continuation semantics.
+    """
+    return factory is ChatAgentRuntime or (
+        type(factory) is partial and factory.func is ChatAgentRuntime
+    )
 
 
 def agent_factory_sha256(
@@ -37,8 +53,8 @@ def agent_factory_sha256(
     Raises:
         ValueError: The built-in request ceiling or system prompt is invalid.
     """
-    if not 1 <= maximum_model_calls <= 64:
-        raise ValueError("maximum_model_calls must be between 1 and 64")
+    if maximum_model_calls < 1:
+        raise ValueError("maximum_model_calls must be positive")
     if configuration is not None and configuration.code_revision is None:
         raise ValueError(
             "custom agent configuration requires an immutable code_revision for exact replay"
@@ -88,7 +104,8 @@ def resolve_agent_factory(
     """
     if configuration is None:
         prompt = normalize_chat_system_prompt(system_prompt)
-        return lambda: ChatAgentRuntime(
+        return partial(
+            ChatAgentRuntime,
             maximum_model_calls=maximum_model_calls,
             system_prompt=prompt,
         )

@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_reasoning import (
+    authenticate_reasoning_history,
     rung_provider_request,
     strip_active_reasoning_history,
     strip_stale_reasoning_history,
@@ -72,6 +73,13 @@ def test_new_user_strips_stale_decrypted_fireworks_reasoning_before_mixed_routin
     assert prepared.messages[1].provider_reasoning == ()
     items = cast("list[JsonObject]", payload["input"])
     assert all("reasoning_content" not in str(item) for item in items)
+    authenticated, pinned = authenticate_reasoning_history(
+        cast("NativeGatewayComponents", object()),
+        cast("AuthorizationSnapshot", object()),
+        request,
+    )
+    assert pinned is None
+    assert authenticated.messages[1].provider_reasoning == request.messages[1].provider_reasoning
 
 
 def test_guardrail_appended_user_recloses_decrypted_reasoning_path() -> None:

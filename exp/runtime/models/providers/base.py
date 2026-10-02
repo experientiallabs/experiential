@@ -8,7 +8,7 @@ import math
 import time
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 from uuid import uuid4
 
 from exp.common.core.artifacts import JsonObject
@@ -19,8 +19,10 @@ from exp.common.models import (
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
+    ProviderDeadlineExceeded,
     RequestDeadline,
     as_async_transport,
     post_json_async,
@@ -37,7 +39,12 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    is_unbilled_attempt,
+    propagate_request_attempt_evidence,
 )
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_RETRY_POLICY = RetryPolicy()
@@ -98,6 +105,14 @@ class GatewayWireProfile:
     that only the resolved Python client knows.
 
     Attributes:
+        credential_receipt: Optional worker-private source-credential receipt,
+            excluded from diagnostics and never serialized onto the native wire.
+            On Vertex this identifies the resolved service account, not a rotating
+            OAuth bearer, and does not authorize static-auth recovery.
+        recovery_binding: Optional private scope frozen from this exact profile
+            before recovery selection, excluded from diagnostics.
+        operational_region: Verified region or named global service scope for
+            this exact endpoint, or None when its scope is unknown.
         supports_logprobs: Verified Chat probability support on this exact model.
         supports_responses_logprobs: Native Responses probability support, opt-in.
         logprobs_reasoning_efforts: Qualified efforts; empty means unknown support.
@@ -112,6 +127,10 @@ class GatewayWireProfile:
 
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     """Authenticated request headers for every dispatch, excluded from diagnostics."""
+
+    credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
+    recovery_binding: FrozenRecoveryBinding | None = field(default=None, repr=False)
+    operational_region: str | None = None
 
     inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
     """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
@@ -298,6 +317,14 @@ class GatewayWireProfile:
     serialized body bytes (SigV4). When true the admission response carries a
     pre-serialized body the data plane must send verbatim, and the resolved
     client exposes ``sign_gateway_dispatch``."""
+
+    omits_output_token_limit: bool = False
+    """Whether this rung's payload must carry no output-token ceiling.
+
+    The ChatGPT plan backend rejects ``max_output_tokens`` outright (400
+    "Unsupported parameter"). A ceiling is caller authority, so a request that
+    carries one narrows the plan rung out at admission (the route keeps any
+    API-key rung that honors it) and the payload never carries the field."""
 
     embeddings_url: str | None = None
     """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
@@ -528,31 +555,66 @@ class ProviderHttpClient(abc.ABC):
         }
         request_headers["Idempotency-Key"] = idempotency_key or f"exp-{uuid4().hex}"
 
+        attempts = 0
+        unbilled_attempts = 0
+
         async def attempt(timeout_seconds: float) -> ModelResponse:
             """Send and parse one provider attempt under its remaining time bound."""
+            nonlocal attempts, unbilled_attempts
+            attempts += 1
             started_at = time.monotonic()
-            response = await self._transport.post(
-                url,
-                headers=request_headers,
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                response = await self._transport.post(
+                    url,
+                    headers=request_headers,
+                    payload=payload,
+                    timeout_seconds=timeout_seconds,
+                )
+            except ProviderTransportError as error:
+                unbilled_attempts += int(is_unbilled_attempt(error))
+                raise
             if not 200 <= response.status_code < 300:
+                unbilled_attempts += int(response.known_unbilled)
+                error = response.body.get("error")
+                if (
+                    idempotency_key is None
+                    and response.status_code == 409
+                    and isinstance(error, dict)
+                    and error.get("code") == "idempotency_replay_unavailable"
+                ):
+                    # The gateway confirms this completed operation cannot be replayed. A new
+                    # client-owned attempt gets a new key and remains inside the retry allowance.
+                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
+                    retry_after_seconds=response.retry_after_seconds,
+                    known_unbilled=response.known_unbilled,
                 )
-            return self._parse_response(
-                response.body,
-                latency_seconds=time.monotonic() - started_at,
-            )
+            try:
+                return self._parse_response(
+                    response.body,
+                    latency_seconds=time.monotonic() - started_at,
+                )
+            except ProviderRetryableResponseError:
+                if idempotency_key is None:
+                    # Replaying a cached, completed empty response cannot produce usable output.
+                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
+                raise
 
-        return await run_with_retry_async(
+        result = await run_with_retry_async(
             attempt,
             policy=self._retry_policy,
             deadline=request_deadline,
             attempt_timeout_seconds=completion_timeout,
             classify=_classify_complete_retry,
+        )
+        return result.model_copy(
+            update={
+                "economics": result.economics.model_copy(
+                    update={"provider_attempts": attempts, "unbilled_attempts": unbilled_attempts}
+                )
+            }
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
@@ -692,5 +754,14 @@ async def _wait_for[ResultT](
     Returns:
         The provider result before timeout.
     """
-    async with asyncio.timeout(timeout_seconds):
-        return await operation
+    timeout = asyncio.timeout(timeout_seconds)
+    try:
+        async with timeout:
+            return await operation
+    except TimeoutError as error:
+        if not timeout.expired():
+            raise
+        failure = ProviderDeadlineExceeded("provider request deadline exceeded")
+        if isinstance(error.__cause__, asyncio.CancelledError):
+            propagate_request_attempt_evidence(error.__cause__, failure)
+        raise failure from error

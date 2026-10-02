@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -47,8 +47,10 @@ from exp.common.models.catalog_prices import (
     NanoUsdRatePerMillionTokens as NanoUsdRatePerMillionTokens,
 )
 from exp.common.models.catalog_roles import ModelRoles
+from exp.common.models.discovery import DiscoveredModel
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.failover_tokens import FailoverToken
+from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
@@ -56,7 +58,10 @@ from exp.common.models.model import (
     ModelSnapshot,
     ReasoningEffort,
 )
-from exp.common.models.nano_usd_upgrade import upgrade_model_catalog_document
+from exp.common.models.nano_usd_upgrade import (
+    upgrade_legacy_billing_source,
+    upgrade_model_catalog_document,
+)
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -163,6 +168,22 @@ class ModelCatalogError(ValueError):
     """A local model catalog was malformed or named a credential value."""
 
 
+SubscriptionKind = Literal["chatgpt", "anthropic"]
+"""Consumer plan a connection signs in with instead of an API key.
+
+``chatgpt`` is a ChatGPT plan reaching the Codex Responses backend; ``anthropic`` is a Claude
+plan reaching the Messages API through the OAuth application Anthropic issued to the operator.
+The connection stores no credential NAME: the sign-in lives under the connection ID and the
+gateway mints a fresh bearer per dispatch from it.
+"""
+
+SUBSCRIPTION_PROVIDERS: dict[SubscriptionKind, str] = {
+    "chatgpt": "openai",
+    "anthropic": "anthropic",
+}
+"""The one catalog provider each plan kind is a sign-in for."""
+
+
 class ConnectionConfig(ContractModel):
     """Local provider connection metadata, with an optional credential environment name only."""
 
@@ -178,6 +199,8 @@ class ConnectionConfig(ContractModel):
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
     trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
+    """Consumer plan sign-in this connection dispatches on, instead of an API key."""
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -203,6 +226,8 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.subscription is not None:
+            self._require_bare_subscription_connection()
         if self.inference_geo is not None and self.provider != "anthropic":
             raise ValueError("inference_geo is only accepted for provider='anthropic'")
         if self.provider != "azure" and self.azure_api_surface is not None:
@@ -307,6 +332,40 @@ class ConnectionConfig(ContractModel):
             raise ValueError("connection metadata must not contain credential values") from exc
         return self
 
+    def _require_bare_subscription_connection(self) -> None:
+        """Reject credential names or endpoint overrides on a plan sign-in.
+
+        Raises:
+            ValueError: The plan names another provider, or the connection also carries an
+                API-key locator, an inference geography, or any endpoint override.
+        """
+        if self.subscription is None:
+            return
+        expected = SUBSCRIPTION_PROVIDERS[self.subscription]
+        if self.provider != expected:
+            raise ValueError(
+                f"subscription {self.subscription!r} is a sign-in for provider {expected!r}, "
+                f"not {self.provider!r}"
+            )
+        if self.api_key_env is not None or self.aws_access_key_id_env is not None:
+            raise ValueError(
+                "a subscription connection signs in through the browser and stores no "
+                "credential environment name; omit api_key_env"
+            )
+        if (
+            self.base_url is not None
+            or self.api_version is not None
+            or self.region is not None
+            or self.inference_geo is not None
+            or self.trusted_custom_origin
+        ):
+            # inference_geo is refused rather than ignored: the plan client never sends it,
+            # so accepting it would silently drop a data-residency constraint.
+            raise ValueError(
+                "a subscription connection reaches its plan's fixed backend; omit base_url, "
+                "inference_geo, and every endpoint override"
+            )
+
     def identity_sha256(self) -> Sha256:
         """Return a deterministic digest of the secret-free provider endpoint identity.
 
@@ -331,6 +390,8 @@ class ConnectionConfig(ContractModel):
             identity["region"] = self.region
         if self.trusted_custom_origin:  # endpoint identity; added only when set
             identity["trusted_custom_origin"] = True
+        if self.subscription is not None:  # a different backend than the API-key origin
+            identity["subscription"] = self.subscription
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -369,6 +430,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("bedrock_auth_mode", None)
         if not self.trusted_custom_origin:
             serialized.pop("trusted_custom_origin", None)
+        if self.subscription is None:
+            serialized.pop("subscription", None)
         return serialized
 
 
@@ -637,7 +700,12 @@ class GatewayDeploymentCapabilities(ContractModel):
 
 
 class GatewayDeploymentMetadata(ContractModel):
-    """Optional gateway-only metadata authored beside one existing model record."""
+    """Optional gateway-only metadata authored beside one existing model record.
+
+    Attributes:
+        cache_retention_seconds: Declared positive cache lifetime, at most one hour;
+            None supplies no plausible warmth claim.
+    """
 
     exact_model_id: ArtifactId | None = None
     capabilities: GatewayDeploymentCapabilities = Field(
@@ -647,7 +715,7 @@ class GatewayDeploymentMetadata(ContractModel):
     pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
     pricing_effective_at: AwareDatetime | None = None
     dispatch: GatewayRungDispatchPolicy | None = None
-    """Optional dispatch policy for this rung; ``None`` is fully inert."""
+    cache_retention_seconds: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
 
 
 class ModelRecord(ContractModel):
@@ -661,6 +729,12 @@ class ModelRecord(ContractModel):
     ``served_model_id`` accepts an alternate identifier the provider echoes in responses when it
     differs from the requested ``model``, for example a vLLM endpoint that publishes an alias in
     ``/models`` but reports its canonical served name in every completion.
+
+    ``supported_reasoning_efforts`` preserves discovery choices for setup without changing
+    the identity-bearing capability snapshot. ``None`` means the listing did not declare them.
+
+    ``discovery`` retains published tri-state flags so an explicit denial survives reload
+    and remains distinguishable from an undeclared capability's default value.
     """
 
     connection: str = Field(min_length=1, max_length=128)
@@ -669,12 +743,16 @@ class ModelRecord(ContractModel):
     served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
+    discovery: DiscoveredModel | None = None
     gateway: GatewayDeploymentMetadata | None = None
     sft_provenance: SFTModelProvenance | None = None
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
         """Reject contradictory reasoning metadata and credential-bearing identity fields."""
+        if self.discovery is not None and self.discovery.model != self.model:
+            raise ValueError("discovery metadata must describe the same provider model")
         if (
             self.gateway is not None
             and self.gateway.capabilities.declares_reasoning_contract
@@ -705,6 +783,11 @@ class ModelRecord(ContractModel):
                     "gateway": (
                         self.gateway.model_dump(mode="json") if self.gateway is not None else None
                     ),
+                    "discovery": (
+                        self.discovery.model_dump(mode="json")
+                        if self.discovery is not None
+                        else None
+                    ),
                     "sft_provenance": (
                         self.sft_provenance.model_dump(mode="json")
                         if self.sft_provenance is not None
@@ -730,7 +813,11 @@ and fails closed rather than being read as a future contract.
 
 
 class ModelCatalog(ContractModel):
-    """The local model aliases, connection metadata, and project role assignments."""
+    """The local model aliases, connection metadata, and project role assignments.
+
+    Attributes:
+        gateway_model_chains: Authored chains keyed by canonical model ID; empty by default.
+    """
 
     schema_version: int = Field(
         default=MODEL_CATALOG_SCHEMA_VERSION, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
@@ -749,11 +836,12 @@ class ModelCatalog(ContractModel):
     safe by construction; a revision that REINTERPRETS existing fields must not
     reuse this channel — it needs a new field name or a fleet-first tolerance
     release. Version 1 stays rejected here: it is only readable through
-    ``_migrate_legacy_model_catalog`` on the TOML load path.
+    ``upgrade_legacy_billing_source`` on the TOML load path.
     """
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
     gateway_pools: dict[str, GatewayPoolRecord] = Field(default_factory=dict)
+    gateway_model_chains: dict[str, GatewayModelChain] = Field(default_factory=dict)
     roles: ModelRoles = Field(default_factory=ModelRoles)
 
     @field_validator("schema_version", mode="before")
@@ -872,56 +960,10 @@ def load_model_catalog(path: Path) -> ModelCatalog:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
         return ModelCatalog.model_validate(
-            upgrade_model_catalog_document(_migrate_legacy_model_catalog(raw_catalog))
+            upgrade_model_catalog_document(upgrade_legacy_billing_source(raw_catalog))
         )
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
-
-
-def _migrate_legacy_model_catalog(raw_catalog: JsonObject) -> JsonObject:
-    """Upgrade only schema-v1 local catalogs with conservative customer-owned billing.
-
-    Args:
-        raw_catalog: Parsed secret-free TOML payload.
-
-    Returns:
-        A schema-v2 payload. Current schema records are returned unchanged so a missing
-        ``billing_source`` remains a validation error.
-    """
-    raw_version = raw_catalog.get("schema_version", 1)
-    if type(raw_version) is not int or raw_version != 1:
-        return raw_catalog
-    payload = cast(JsonObject, dict(raw_catalog))
-    models = raw_catalog.get("models")
-    if isinstance(models, dict):
-        migrated_models: JsonObject = {}
-        for alias, value in models.items():
-            if isinstance(value, dict):
-                record = cast(JsonObject, dict(value))
-                if "billing_source" in record:
-                    raise ValueError(
-                        "schema-v1 model record must not declare current billing_source"
-                    )
-                record["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                provenance = record.get("sft_provenance")
-                if isinstance(provenance, dict):
-                    migrated_provenance = cast(JsonObject, dict(provenance))
-                    base_model = provenance.get("base_model")
-                    if isinstance(base_model, dict):
-                        migrated_base = cast(JsonObject, dict(base_model))
-                        if "billing_source" in migrated_base:
-                            raise ValueError(
-                                "schema-v1 SFT base model must not declare current billing_source"
-                            )
-                        migrated_base["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                        migrated_provenance["base_model"] = migrated_base
-                    record["sft_provenance"] = migrated_provenance
-                migrated_models[str(alias)] = record
-            else:
-                migrated_models[str(alias)] = value
-        payload["models"] = migrated_models
-    payload["schema_version"] = 2
-    return payload
 
 
 def write_model_catalog(path: Path, catalog: ModelCatalog) -> None:

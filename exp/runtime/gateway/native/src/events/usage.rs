@@ -7,6 +7,10 @@ use serde_json::{Map, Value};
 use super::Usage;
 
 impl Usage {
+    pub fn has_token_counts(&self) -> bool {
+        self.input_tokens.is_some() && self.output_tokens.is_some()
+    }
+
     /// Coalesce cumulative reports from one attempt, never adding snapshots or
     /// replacing an observed count with an absent leg. A lower stale snapshot
     /// cannot reduce an already witnessed count; explicit zero stays known.
@@ -158,13 +162,34 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
 
 /// Raw per-dial counters retained before additive reasoning normalization.
 /// Sparse reports must be combined before deciding whether reasoning is extra.
+///
+/// `writes_within_reads` selects the rung's cache-write accounting. By default
+/// reads and writes are disjoint slices of input. A rung whose provider creates
+/// the cache and then reads the written tokens back in the same call (Google
+/// explicit caching relayed by OpenRouter reports `cached_tokens` and
+/// `cache_write_tokens` over the same prefix) reports writes as a subset of
+/// reads; its counts are normalized to the disjoint contract, so written
+/// tokens leave the read leg and are priced once at the cache-write rate.
+/// The provider bills both legs for those tokens, so that rung's authored
+/// cache-write rate must be its write rate plus its read rate.
 #[derive(Clone, Default)]
 pub(crate) struct OpenAiUsageAccumulator {
     reported: Usage,
     total_tokens: Option<u64>,
+    writes_within_reads: bool,
 }
 
 impl OpenAiUsageAccumulator {
+    /// Select the rung's cache-write accounting before any usage arrives.
+    pub(crate) fn set_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.writes_within_reads = writes_within_reads;
+    }
+
+    /// Whether reported cache writes are a subset of reported cache reads.
+    pub(crate) fn writes_within_reads(&self) -> bool {
+        self.writes_within_reads
+    }
+
     pub(crate) fn update_chat(&mut self, value: &Value) -> Result<Usage, String> {
         let object = value
             .as_object()
@@ -210,8 +235,12 @@ impl OpenAiUsageAccumulator {
             "OpenAI reasoning_tokens",
         )?;
         let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
-        let (cached_input_tokens, cache_creation_input_tokens) =
-            cache_subsets(object, input_details, input_tokens)?;
+        let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
+            object,
+            input_details,
+            input_tokens,
+            self.writes_within_reads,
+        )?;
         let mut candidate = self.clone();
         candidate.reported.merge_observed(&Usage {
             input_tokens,
@@ -223,6 +252,9 @@ impl OpenAiUsageAccumulator {
         });
         candidate.total_tokens = candidate.total_tokens.max(total_tokens);
         let mut normalized = candidate.reported.clone();
+        if self.writes_within_reads {
+            separate_written_reads(&mut normalized)?;
+        }
         validate_cache_subsets(&normalized)?;
         normalized.output_tokens = normalized
             .output_tokens
@@ -312,11 +344,14 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     OpenAiUsageAccumulator::default().update_chat(value)
 }
 
-/// Cache reads and writes are disjoint subsets of OpenAI-shaped total input.
+/// Read the cache subsets of OpenAI-shaped total input. Disjoint reads and
+/// writes must fit input together; writes reported within reads must fit the
+/// reads, which must fit input.
 fn cache_subsets(
     object: &Map<String, Value>,
     detail_key: &str,
     input_tokens: Option<u64>,
+    writes_within_reads: bool,
 ) -> Result<(Option<u64>, Option<u64>), String> {
     let reads = optional_usage_detail(object, detail_key, "cached_tokens", "cached_tokens")?;
     let writes = optional_usage_detail(
@@ -325,11 +360,36 @@ fn cache_subsets(
         "cache_write_tokens",
         "cache_write_tokens",
     )?;
+    // A write not covered by its read count is reported the ordinary disjoint
+    // way; it must then fit input like any other rung. Usage arrives after the
+    // content already streamed, so a placeable report never fails the stream.
+    if writes_within_reads && writes.unwrap_or(0) <= reads.unwrap_or(0) {
+        if input_tokens.is_some_and(|input| reads.unwrap_or(0) > input) {
+            return Err("cache read tokens exceed total input tokens".to_string());
+        }
+        return Ok((reads, writes));
+    }
     let subsets = bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?;
     if input_tokens.is_some_and(|input| subsets > input) {
         return Err("cache read and write tokens exceed total input tokens".to_string());
     }
     Ok((reads, writes))
+}
+
+/// Move tokens written and read back in one call out of the read leg, so the
+/// coalesced counts satisfy the disjoint contract every settlement prices.
+/// A write without a covering read count cannot be placed and is malformed.
+fn separate_written_reads(usage: &mut Usage) -> Result<(), String> {
+    let writes = usage.cache_creation_input_tokens.unwrap_or(0);
+    if writes == 0 {
+        return Ok(());
+    }
+    // Uncovered writes are the disjoint shape: leave them for the ordinary check.
+    let Some(reads) = usage.cached_input_tokens.filter(|reads| *reads >= writes) else {
+        return Ok(());
+    };
+    usage.cached_input_tokens = Some(reads - writes);
+    Ok(())
 }
 
 /// Parse a present Gemini `usageMetadata`: its non-optional proto3 int32

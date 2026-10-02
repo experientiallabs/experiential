@@ -12,6 +12,7 @@ from exp.common.judging import (
     HumanScoreReview,
     JudgeCalibration,
     JudgeCalibrationService,
+    JudgeDefinition,
     JudgeScoreObservation,
     RouterLineageAssignment,
     RouterLineageSplit,
@@ -84,6 +85,7 @@ from exp.optimize.router.judging.template_bind import (
     DEFAULT_JUDGE_TEMPLATE,
     bind_prompt_template,
     default_judge_dimensions,
+    judge_template,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -141,6 +143,7 @@ def prepare_manual_judge_setup(
     catalog: ModelCatalog,
     *,
     judge_alias: str | None = None,
+    definition: JudgeDefinition | None = None,
     dimensions: Sequence[RubricDimension] | None = None,
     prompt_template: JudgePromptTemplate = DEFAULT_JUDGE_TEMPLATE,
     preview_count: int = 3,
@@ -153,6 +156,7 @@ def prepare_manual_judge_setup(
         store: Existing project with completed deterministic build evidence.
         catalog: Local secret-free model catalog.
         judge_alias: Optional explicit alias, otherwise the configured judge role.
+        definition: Reusable named syllabus and axes, mutually exclusive with custom raw fields.
         dimensions: Optional complete rubric replacement.
         prompt_template: Versioned prompt, variable mapping, and response schema.
         preview_count: Maximum number of distinct fit-lineage traces to render.
@@ -167,9 +171,16 @@ def prepare_manual_judge_setup(
     """
     if preview_count < 1:
         raise ManualJudgeError("judge setup preview count must be positive")
+    if definition is not None:
+        if dimensions is not None or prompt_template != DEFAULT_JUDGE_TEMPLATE:
+            raise ManualJudgeError("supply a judge definition or raw dimensions/template, not both")
+        dimensions = definition.dimensions
+        prompt_template = judge_template(definition)
     project = store.load_project()
     build = _load_build_review(store)
-    if build.project_config != project.model_copy(update={"build": None}):
+    if build.project_config.model_copy(update={"hosted_judge": None}) != project.model_copy(
+        update={"build": None, "hosted_judge": None}
+    ):
         raise ManualJudgeError("completed build belongs to a different project configuration")
     selected_alias = judge_alias or catalog.roles.judge
     if selected_alias is None:
@@ -869,6 +880,7 @@ def write_lineage_split(
     split_id = stable_id(
         "router-lineage-split",
         {
+            "setup_id": setup.setup_id,
             "task_set": setup.task_set.model_dump(mode="json"),
             "fit": list(fit),
             "held_out": list(held_out),
@@ -886,6 +898,17 @@ def write_lineage_split(
         held_out_lineage_ids=held_out,
         assignments=assignments,
     )
+    if store.artifacts.exists(split_id):
+        existing, _ = read_artifact_json(
+            store,
+            artifact_id=split_id,
+            expected_artifact_type="router-lineage-split",
+            relative_path="split.json",
+            model_type=RouterLineageSplit,
+        )
+        # Reusing identical partitions retains their original producer provenance.
+        # The writer still verifies every input, assignment, and persisted payload.
+        split = split.model_copy(update={"code_revision": existing.code_revision})
     return write_router_lineage_split(store, split)
 
 

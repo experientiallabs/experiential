@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 from rich.text import Text
 
+from exp.cli.evaluation.app import evaluate
 from exp.cli.gateway.serve import (
     DEFAULT_GATEWAY_PORT,
     DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
@@ -32,6 +33,9 @@ _MENU_OPTIONS = (
         value="setup",
         label="Setup Gateway",
         detail="choose providers, a model, an alias, and a key",
+    ),
+    PickerOption(
+        value="evaluate", label="Model evaluations", detail="ingest, compare, and inspect projects"
     ),
     PickerOption(value="exit", label="Exit"),
 )
@@ -122,6 +126,21 @@ def default_gateway(
                 max_active_requests=max_active_requests,
             ):
                 return
+        elif choice == "evaluate":
+            evaluate(
+                project=None,
+                models=None,
+                root=root,
+                repeats=None,
+                concurrency=None,
+                maximum_steps=None,
+                maximum_output_tokens=None,
+                resume=None,
+                report=None,
+                dry_run=False,
+                yes=False,
+                non_interactive=False,
+            )
         elif choice == "setup":
             _setup_from_menu(output, root=root, port=port)
         else:

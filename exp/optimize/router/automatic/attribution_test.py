@@ -15,17 +15,17 @@ from exp.common.models import (
 )
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace, TraceSource, TraceSpan
-from exp.optimize.router.automatic.attribution import (
-    RouterAttributionError,
-    resolve_router_observed_attributions,
-)
-from exp.simulation.ingest.model_identity import (
+from exp.common.traces.ingest.model_identity import (
     CAPABILITIES_DIGEST_ATTRIBUTE,
     CONNECTION_DIGEST_ATTRIBUTE,
     IdentityComponentProvenance,
     TraceModelIdentityEvidence,
     TraceModelIdentityEvidenceSet,
     normalized_capabilities_sha256,
+)
+from exp.optimize.router.automatic.attribution import (
+    RouterAttributionError,
+    resolve_router_observed_attributions,
 )
 
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)

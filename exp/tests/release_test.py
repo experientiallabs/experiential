@@ -14,12 +14,16 @@ import sys
 import tarfile
 import termios
 import time
+import tomllib
 import zipfile
 from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import cast
+from unittest.mock import Mock
 
 from click import unstyle
+
+from exp.common.core.artifacts import canonical_json_bytes
 
 if sys.platform != "win32":
     import fcntl
@@ -27,6 +31,8 @@ if sys.platform != "win32":
 
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENTS = frozenset(
@@ -42,6 +48,7 @@ FORBIDDEN_REQUIREMENTS = frozenset(
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
+        "anyio",
         "boto3",
         "botocore",
         "click",
@@ -50,6 +57,8 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "google-auth",
         "google-re2",
         "httpx",
+        "httpx2",
+        "ijson",
         "numpy",
         "openai",
         "posthog",
@@ -57,8 +66,12 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "rich",
         "tiktoken",
         "tomli-w",
+        "truststore",
         "typer",
     }
+)
+REQUIRED_CAPTURE_REQUIREMENTS = frozenset(
+    {"brotli", "cryptography", "exp-mitmproxy", "exp-mitmproxy-rs", "zstandard"}
 )
 REQUIRED_WHEEL_MODULES = frozenset(
     {
@@ -94,6 +107,8 @@ REQUIRED_SDIST_MEMBERS = frozenset(
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
+        "docs/reference/gateway-egress.md",
+        "docs/reference/gateway-request-policy.md",
         "docs/release-scope.md",
         "docs/usage.md",
         "pyproject.toml",
@@ -243,6 +258,42 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
     )
 
 
+def _assert_core_requirements(metadata: str) -> None:
+    """Check SDK requirements, the HTTPX2 security floor and Python-gated Capture."""
+    _assert_allowed_requirements(metadata)
+    requirements: dict[str, str] = {}
+    for name, marker in _metadata_requirements(metadata):
+        if re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker):
+            continue
+        assert name not in requirements, f"duplicate core dependency: {name}"
+        requirements[name] = re.sub(r"\s+", "", marker).replace("'", '"')
+    assert frozenset(requirements) == REQUIRED_CORE_REQUIREMENTS | REQUIRED_CAPTURE_REQUIREMENTS
+    for name, marker in requirements.items():
+        expected = 'python_version>="3.13"' if name in REQUIRED_CAPTURE_REQUIREMENTS else ""
+        assert marker == expected, f"unexpected dependency marker for {name}: {marker!r}"
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for value in headers.get_all("Requires-Dist", []):
+        requirement = Requirement(re.sub(r"\s+", " ", value))
+        if requirement.name.casefold() == "httpx2" and requirement.marker is None:
+            assert requirement.specifier == SpecifierSet(">=2.12,<3"), (
+                f"unexpected HTTPX2 security constraint: {requirement.specifier}"
+            )
+
+
+def test_core_dependency_markers_preserve_sdk_python_312() -> None:
+    """Gate Capture's TLS dependencies without silently narrowing SDK compatibility."""
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
+    assert project["requires-python"] == ">=3.12"
+    metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
+    _assert_core_requirements(metadata)
+    _assert_core_requirements(metadata + "\n\nRequires-Dist: anthropic>=1.2")
+    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    for marker in ("", '; python_version >= "3.13"'):
+        with pytest.raises(AssertionError, match="forbidden release requirement"):
+            _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
+
+
 def _assert_current_archive_members(
     names: tuple[str, ...],
     *,
@@ -286,6 +337,8 @@ def _tracked_sdist_members() -> frozenset[str]:
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
+            "docs/reference/gateway-egress.md",
+            "docs/reference/gateway-request-policy.md",
             "docs/release-scope.md",
             "docs/usage.md",
             "pyproject.toml",
@@ -486,7 +539,9 @@ def _run_tty_child(
         os.close(master)
     assert process.returncode == 0, transcript
     assert not pending, f"unanswered prompts {pending}:\n{transcript}"
-    assert completion_seen, f"missing completion marker {completion_marker!r}:\n{transcript}"
+    assert completion_marker is None or completion_marker in transcript, (
+        f"missing completion marker {completion_marker!r}:\n{transcript}"
+    )
     return transcript
 
 
@@ -517,6 +572,7 @@ def _installed_release_driver() -> None:
 
     import exp
     from exp.cli.gateway.key_output import key_output_marker_path
+    from exp.common.core.locks import file_write_lock
     from exp.common.models import (
         BillingSource,
         CandidateTokenPrice,
@@ -547,7 +603,8 @@ def _installed_release_driver() -> None:
     from exp.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from exp.optimize.router.judging.service import prepare_manual_judge_calibration
     from exp.runtime.gateway.catalog_authority import (
-        upsert_certified_pool,
+        apply_certified_pool_update,
+        plan_certified_pool_update,
         upsert_connection,
         upsert_singleton_deployment,
     )
@@ -1450,7 +1507,7 @@ def _installed_release_driver() -> None:
         raise AssertionError(f"exp gateway did not listen on port {port}")
 
     def start_gateway(root: Path) -> tuple[subprocess.Popen[str], int, str]:
-        """Start one installed gateway subprocess on an unused loopback port.
+        """Start the accounting-only privacy canary with explicit content opt-out.
 
         Args:
             root: Configured gateway root.
@@ -1462,6 +1519,7 @@ def _installed_release_driver() -> None:
         process = subprocess.Popen(
             [
                 str(executable),
+                "--ghost",
                 "--root",
                 str(root),
                 "--port",
@@ -2299,20 +2357,23 @@ def _installed_release_driver() -> None:
             replace=False,
         )
     assert project_catalog is not None
-    project_catalog, project_snapshot, _changed = upsert_certified_pool(
-        project_root,
-        pool_id="project-pool",
-        exact_model_id="project-exact-model",
-        deployment_aliases=("cheap", "baseline"),
-        certification=GatewayEquivalenceCertification(
-            certification_id="installed-project-certification",
-            provenance="installed deterministic exact-model fixture",
-            evidence_sha256="c" * 64,
-            certified_at=datetime(2026, 8, 19, tzinfo=UTC),
-        ),
-        expected_catalog_sha256=project_catalog.identity_sha256(),
-        replace=False,
-    )
+    with file_write_lock(project_root / "models.toml", what="the installed project pool catalog"):
+        pool_update = plan_certified_pool_update(
+            project_root,
+            pool_id="project-pool",
+            exact_model_id="project-exact-model",
+            deployment_aliases=("cheap", "baseline"),
+            certification=GatewayEquivalenceCertification(
+                certification_id="installed-project-certification",
+                provenance="installed deterministic exact-model fixture",
+                evidence_sha256="c" * 64,
+                certified_at=datetime(2026, 8, 19, tzinfo=UTC),
+            ),
+            expected_catalog_sha256=project_catalog.identity_sha256(),
+            replace=False,
+        )
+        apply_certified_pool_update(project_root, pool_update)
+    project_catalog, project_snapshot = pool_update.normalized, pool_update.snapshot
     project_manager.activate_project_alias(
         alias_id="project-coding",
         alias_name="project-coding",
@@ -2457,7 +2518,6 @@ def _installed_release_driver() -> None:
     assert state.count_containing("project-secondary-model") == project_secondary_before + 1
     assert learned_client.embed_calls == 0
     assert learned_client.complete_calls == 0
-    assert learned_runtime.records_decisions is False
     assert not (project_root / "projects").exists()
     with sqlite3.connect(project_manager.database_path) as connection:
         project_attempts = connection.execute(
@@ -2614,7 +2674,7 @@ def _installed_release_driver() -> None:
             "world model  core-model (core-model)",
             "embedder     core-model (core-model)",
             "embedding    at most $0.000000",
-            "ceiling      $5.000000",
+            "budget       $5.000000",
         ):
             assert expected in plain_build_output, build_output
         assert "Proceed?" not in plain_build_output
@@ -2660,7 +2720,7 @@ def _installed_release_driver() -> None:
             session.id,
             {"role": "assistant", "content": "What account email is associated?"},
         )
-        assert observation.message == {
+        assert observation.messages[0] == {
             "role": "user",
             "content": "P17 generated world observation",
         }
@@ -2788,10 +2848,13 @@ def _installed_release_driver() -> None:
         assert "candidates: candidate-b, core-model" in optimization_output
         assert "incumbent: core-model" in optimization_output
         assert "Complete" in optimization_output
-        optimized_artifacts = directory_digest(support_store.paths.artifacts_directory)
+        optimized_artifacts = tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        )
         optimized_catalog = (root / "models.toml").read_bytes()
-        optimized_project = support_store.paths.project_toml.read_bytes()
-        optimized_review = support_store.paths.review_json.read_bytes()
+        optimized_project = canonical_json_bytes(support_store.load_project())
+        optimized_review = canonical_json_bytes(support_store.read_review())
         optimized_provider_requests = state.snapshot()
         replay_result = run_cli(
             *optimize_arguments[:-1],
@@ -2800,9 +2863,15 @@ def _installed_release_driver() -> None:
         assert "replay: verified completed optimization" in replay_result.stdout
         assert state.snapshot() == optimized_provider_requests
         assert (root / "models.toml").read_bytes() == optimized_catalog
-        assert support_store.paths.project_toml.read_bytes() == optimized_project
-        assert support_store.paths.review_json.read_bytes() == optimized_review
-        assert directory_digest(support_store.paths.artifacts_directory) == optimized_artifacts
+        assert canonical_json_bytes(support_store.load_project()) == optimized_project
+        assert canonical_json_bytes(support_store.read_review()) == optimized_review
+        assert (
+            tuple(
+                (artifact_id, support_store.artifacts.read(artifact_id))
+                for artifact_id in support_store.artifacts.list_ids()
+            )
+            == optimized_artifacts
+        )
 
         router_port = unused_loopback_port()
         provider_calls_before_run = state.snapshot()
@@ -2922,8 +2991,11 @@ def _installed_release_driver() -> None:
         events_before_public_replay = journal.read_events()
         provider_before_public_replay = state.snapshot()
         gateway_database = root / "gateway" / "gateway.db"
-        artifacts_before_public_replay = directory_digest(support_store.paths.artifacts_directory)
-        project_before_public_replay = support_store.paths.project_toml.read_bytes()
+        artifacts_before_public_replay = tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        )
+        project_before_public_replay = canonical_json_bytes(support_store.load_project())
         with sqlite3.connect(gateway_database) as connection:
             gateway_requests_before_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"
@@ -2965,10 +3037,11 @@ def _installed_release_driver() -> None:
             assert duplicate_second.choices[0].message.content == "Duplicate routed target"
         assert journal.read_events() == events_before_public_replay
         assert state.snapshot() != provider_before_public_replay
-        assert support_store.paths.project_toml.read_bytes() == project_before_public_replay
-        assert directory_digest(support_store.paths.artifacts_directory) == (
-            artifacts_before_public_replay
-        )
+        assert canonical_json_bytes(support_store.load_project()) == project_before_public_replay
+        assert tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        ) == (artifacts_before_public_replay)
         with sqlite3.connect(gateway_database) as connection:
             gateway_requests_after_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"
@@ -3011,6 +3084,44 @@ def _installed_release_driver() -> None:
         server.server_close()
         server_thread.join(timeout=5)
         assert not server_thread.is_alive()
+
+
+def test_tty_child_checks_marker_after_draining_exited_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check the final transcript when a child exits before the first poll.
+
+    Args:
+        tmp_path: Isolated child working directory.
+        monkeypatch: Fixture forcing child exit before the interactive polling loop.
+    """
+    for output in ("NO MARKER", "COMPLETE"):
+        process = Mock(returncode=0)
+        process.poll.return_value = 0
+        selector = Mock()
+        selector.select.return_value = [(None, selectors.EVENT_READ)]
+        monkeypatch.setattr(subprocess, "Popen", Mock(return_value=process))
+        monkeypatch.setattr(selectors, "DefaultSelector", Mock(return_value=selector))
+        monkeypatch.setattr(os, "read", Mock(side_effect=[output.encode(), b""]))
+        command = [sys.executable, "-c", "pass"]
+        if output == "NO MARKER":
+            with pytest.raises(AssertionError, match="missing completion marker"):
+                _run_tty_child(
+                    command,
+                    cwd=tmp_path,
+                    environment=os.environ.copy(),
+                    answers=[],
+                    completion_marker="COMPLETE",
+                )
+        else:
+            transcript = _run_tty_child(
+                command,
+                cwd=tmp_path,
+                environment=os.environ.copy(),
+                answers=[],
+                completion_marker="COMPLETE",
+            )
+            assert "COMPLETE" in transcript
 
 
 def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
@@ -3144,6 +3255,64 @@ def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     assert 'dist/*.whl "openai==3.0.0"' in workflow
 
 
+def test_capture_release_imports_cannot_modify_the_publish_artifact() -> None:
+    """Public Capture dependencies execute only against an isolated artifact copy."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text()
+    build, smoke = workflow.split("  build:\n", 1)[1].split("  capture-release-smoke:\n", 1)
+    smoke, publish = smoke.split("  publish:\n", 1)
+    assert "uv venv --python 3.12 /tmp/exp-wheel-smoke" in build
+    assert "import mitmproxy" not in build
+    assert "    needs: build\n" in smoke
+    assert "if: github.event_name == 'release' || inputs.publish == true" in smoke
+    assert "import mitmproxy, mitmproxy_rs" in smoke
+    assert "upload-artifact" not in smoke
+    assert "id-token: write" not in smoke
+    assert "contents: write" not in smoke
+    assert "    needs: [build, capture-release-smoke]\n" in publish
+    assert "name: python-dist" in smoke and "name: python-dist" in publish
+
+
+def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture() -> None:
+    """Windows needs executed kernel tests, while whole-package Capture stays on 3.13."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "gate.yml").read_text()
+    windows = workflow.split("  windows-snapshot-authority:\n", 1)[1].split(
+        "  w16-darwin-evidence:\n", 1
+    )[0]
+    assert "runs-on: windows-latest" in windows
+    assert 'UV_PYTHON: "3.12"' in windows
+    assert 'EXP_TELEMETRY: "0"' in windows
+    job_configuration = windows.split("    steps:\n", 1)[0]
+    assert "runner." not in job_configuration, "runner context is unavailable before job routing"
+    test_step = windows.split("      - name: Verify real Windows snapshot authority\n", 1)[1]
+    test_step = test_step.split("      - name:", 1)[0]
+    assert (
+        "        env:\n          XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth"
+        in test_step
+    )
+    assert "pytest --noconftest" in windows
+    selectors = tuple(
+        line.strip() for line in test_step.splitlines() if line.strip().startswith("exp/")
+    )
+    assert selectors == (
+        "exp/runtime/gateway/snapshot_file_windows_test.py",
+        "exp/runtime/gateway/snapshot_file_test.py::test_snapshot_resource_budget_is_a_strict_positive_integer",
+        "exp/runtime/gateway/snapshot_file_test.py::test_bounded_reader_accepts_limit_and_rejects_growth",
+        "exp/runtime/gateway/snapshot_file_test.py::test_growth_after_initial_stat_still_obeys_the_read_budget",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_resource_override_and_reachable_authority",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_refuses_unauthorized_targets",
+        "exp/runtime/gateway/budget_authority_test.py::test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch",
+        "exp/common/config/settings_test.py",
+    )
+    assert "exp/cli/" not in windows, "Windows authority proof does not import the Unix-only CLI"
+    assert "assert len(kernel) == 25" in windows
+    assert '("skipped", "failure", "error")' in windows
+    for job in ("  gate:\n", "  w16-darwin-evidence:\n"):
+        assert 'UV_PYTHON: "3.13"' in workflow.split(job, 1)[1].split("    steps:", 1)[0]
+    assert "uv run pytest -q exp/runtime/capture exp/cli/capture" in workflow
+
+
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 
@@ -3187,6 +3356,17 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
         environment=environment,
     )
     installed_python = virtual_environment / "bin" / "python"
+    # Exercise the exact prerelease forks in the isolated installation. The publishing
+    # workflow separately requires their normal PyPI requirements to resolve on 3.13.
+    capture_sources: list[str] = []
+    if sys.version_info >= (3, 13):
+        project = tomllib.loads((repository / "pyproject.toml").read_text(encoding="utf-8"))
+        for name in ("exp-mitmproxy", "exp-mitmproxy-rs"):
+            source = project["tool"]["uv"]["sources"][name]
+            location = f"git+{source['git']}@{source['rev']}"
+            if "subdirectory" in source:
+                location += f"#subdirectory={source['subdirectory']}"
+            capture_sources.append(f"{name} @ {location}")
     _run_checked(
         [
             uv,
@@ -3195,6 +3375,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             "--python",
             str(installed_python),
             *(str(wheel) for wheel in wheels),
+            *capture_sources,
             "openai==3.0.0",
         ],
         cwd=execution,
@@ -3311,8 +3492,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        _assert_allowed_requirements(metadata)
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         names = tuple(
@@ -3323,8 +3503,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        _assert_allowed_requirements(metadata)
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:

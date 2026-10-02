@@ -23,6 +23,11 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
+)
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.attempt_tokens import (
     worst_case_attempt_tokens,
@@ -30,6 +35,7 @@ from exp.runtime.gateway.attempt_tokens import (
 )
 from exp.runtime.gateway.budgets import (
     LONG_CONTEXT_TIER_MARGIN_PERCENT,
+    MAXIMUM_NANO_USD,
     BudgetReservationRejected,
     BudgetScope,
     BudgetScopeKind,
@@ -57,7 +63,13 @@ from exp.runtime.gateway.decisions_contracts import (
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.model_plan import model_execution_snapshot
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    ChainAttemptLedger,
+    ChainControlStore,
+    publish_chain_fixture,
+)
 from exp.runtime.models.providers.errors import ProviderParameterError
 
 
@@ -145,8 +157,8 @@ def _authority(
 ) -> tuple[SQLiteGatewayStore, SQLiteAttemptLedger, SQLiteBudgetStore, str]:
     """Create real SQLite authority, ledger, budget store, and one granted key."""
     path = tmp_path / "gateway.db"
-    store = SQLiteGatewayStore(path, clock=clock)
-    ledger = SQLiteAttemptLedger(path, clock=clock)
+    store = ChainControlStore(path, clock=clock)
+    ledger = ChainAttemptLedger(path, clock=clock)
     budgets = SQLiteBudgetStore(path, clock=clock)
     store.create_organization(organization_id="org", slug="org", display_name="Org")
     store.create_identity(organization_id="org", identity_id="identity", display_name="Identity")
@@ -196,6 +208,421 @@ def _accepted(
         pool_id="pool",
         deployment_ids=("primary", "secondary"),
     )
+
+
+def _chain_catalog() -> NormalizedGatewayCatalog:
+    """Build a pinned root pool with one reachable child of a different exact model."""
+    catalog = _catalog()
+    return NormalizedGatewayCatalog(
+        deployments=(
+            *catalog.deployments,
+            _deployment(deployment_id="child").model_copy(update={"exact_model_id": "exact-child"}),
+        ),
+        pools=(
+            *catalog.pools,
+            ExactModelPool(
+                pool_id="child-pool", exact_model_id="exact-child", deployment_ids=("child",)
+            ),
+        ),
+        model_chains=(
+            GatewayModelChain(
+                model_id="exact-one",
+                pool_id="pool",
+                revision="chain-one",
+                rungs=(
+                    GatewayDeploymentRung(deployment_id="primary"),
+                    GatewayModelReferenceRung(model_id="exact-child"),
+                    GatewayDeploymentRung(deployment_id="secondary"),
+                ),
+            ),
+        ),
+    )
+
+
+def _activate_chain(
+    store: SQLiteGatewayStore,
+    tmp_path: Path,
+    *,
+    organization_id: str = "org",
+    alias_id: str = "coding",
+    revision_id: str = "chain-revision",
+    pool_id: str = "pool",
+) -> NormalizedGatewayCatalog:
+    """Activate one alias against a real digest-pinned local chain snapshot."""
+    catalog = _chain_catalog()
+    snapshot_ref = f"chain-snapshot-{organization_id}"
+    if not (tmp_path / snapshot_ref).exists():
+        (tmp_path / snapshot_ref).write_bytes(canonical_json_bytes(catalog.model_dump(mode="json")))
+    publish_chain_fixture(
+        store,
+        catalog,
+        organization_id=organization_id,
+        alias_id=alias_id,
+        revision_id=revision_id,
+        pool_id=pool_id,
+        snapshot_ref=snapshot_ref,
+    )
+    return catalog
+
+
+def _accepted_chain(
+    store: SQLiteGatewayStore,
+    ledger: SQLiteAttemptLedger,
+    clock: _Clock,
+    key: str,
+    catalog: NormalizedGatewayCatalog,
+    *,
+    alias: str = "coding",
+) -> ExecutionSnapshot:
+    """Accept and freeze the real authored chain for the alias's current root."""
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias=alias,
+        request=_request("chain-budget"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    assert isinstance(authorization.target, DirectTarget)
+    root = next(pool for pool in catalog.pools if pool.pool_id == authorization.target.pool_id)
+    return model_execution_snapshot(catalog, authorization, root)
+
+
+@pytest.mark.parametrize("estimated", [False, True])
+def test_child_disconnect_settles_actual_stage_price_once_in_both_budget_scopes(
+    tmp_path: Path, estimated: bool
+) -> None:
+    """An estimate prices the selected child; an unknown multi-dial meter keeps both holds."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    scopes = [
+        BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id=pool)
+        for pool in ("pool", "child-pool")
+    ]
+    for scope in scopes:
+        budgets.set_limit(organization_id="org", period="2026-08", scope=scope, limit_nano_usd=1000)
+    snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    child = next(value for value in catalog.deployments if value.deployment_id == "child")
+    child = child.model_copy(
+        update={
+            "gateway": child.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=5_000_000,
+                    )
+                }
+            )
+        }
+    )
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=child,
+        attempt_ordinal=0,
+        route_depth=snapshot.deployment_ids.index("child"),
+        maximum_cost_nano_usd=300,
+    )
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cut")
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        usage=GatewayUsage(input_tokens=13, output_tokens=7) if estimated else None,
+        usage_incomplete_due_to_disconnect=True,
+        usage_estimated=estimated,
+    )
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=failure)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=failure)
+    expected = 13 * 3 + 7 * 5 if estimated else 300
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT usage_source, estimated_cost_nano_usd, budget_settled_nano_usd "
+            "FROM gateway_attempts"
+        ).fetchone() == (
+            "estimated" if estimated else "unknown",
+            expected if estimated else None,
+            expected,
+        )
+        charges = connection.execute(
+            "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges "
+            "WHERE attempt_id=?",
+            (attempt,),
+        ).fetchall()
+        assert charges == [(300, expected), (300, expected)]
+    for remaining in budgets.remaining(organization_id="org", period="2026-08"):
+        assert remaining.reserved_nano_usd == 0
+        assert remaining.settled_nano_usd == expected
+        assert remaining.remaining_nano_usd == 1000 - expected
+
+
+@pytest.mark.parametrize("destination", ["primary", "child"])
+@pytest.mark.parametrize("cost_state", ["settled", "reserved", "unknown"])
+def test_new_root_limit_backfills_each_attempt_once(
+    tmp_path: Path, destination: str, cost_state: str
+) -> None:
+    """A new root cap adopts direct and child money or unknown cost before admitting more."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    deployment = next(item for item in catalog.deployments if item.deployment_id == destination)
+    unknown = cost_state == "unknown"
+    if unknown:
+        deployment = deployment.model_copy(
+            update={
+                "gateway": deployment.gateway.model_copy(update={"prices": GatewayTokenPrices()})
+            }
+        )
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=snapshot.deployment_ids.index(destination),
+        maximum_cost_nano_usd=None if unknown else 90,
+    )
+    terminal = GatewayEvent(
+        kind=GatewayEventKind.COMPLETED,
+        sequence_number=0,
+        usage=GatewayUsage(input_tokens=80, output_tokens=5),
+    )
+    if cost_state != "reserved":
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=None)
+    scope = BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool")
+    _, limit = budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=scope,
+        limit_nano_usd=100,
+        strict_unknown_cost=unknown,
+    )
+
+    remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
+    assert remaining.settled_nano_usd == (90 if cost_state == "settled" else 0)
+    assert remaining.reserved_nano_usd == (90 if cost_state == "reserved" else 0)
+    assert remaining.unknown_cost_attempts == int(unknown)
+    assert remaining.unknown_cost_input_tokens == (80 if unknown else 0)
+    assert remaining.unknown_cost_output_tokens == (5 if unknown else 0)
+    next_snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    with pytest.raises(BudgetReservationRejected):
+        ledger.start_attempt(
+            snapshot=next_snapshot,
+            deployment=catalog.deployments[-1],
+            attempt_ordinal=0,
+            route_depth=1,
+            maximum_cost_nano_usd=50,
+        )
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT attempt_id FROM gateway_attempt_budget_charges WHERE budget_id = ?",
+            (limit.budget_id,),
+        ).fetchall() == [(attempt,)]
+    if unknown:
+        count, _ = budgets.reconcile_unknown_costs(
+            organization_id="org",
+            period="2026-08",
+            scope=scope,
+            assigned_cost_nano_usd=90,
+        )
+        assert count == 1
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=None)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=None)
+    remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
+    assert remaining.settled_nano_usd == 90
+    assert remaining.reserved_nano_usd == 0
+    assert remaining.unknown_cost_attempts == 0
+    assert remaining.remaining_nano_usd == 10
+
+
+def test_root_backfill_uses_accepted_revision_after_alias_retargets(tmp_path: Path) -> None:
+    """Retargets cannot move old root spend or make deployment limits include child spend."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    accepted_root = _accepted_chain(store, ledger, clock, key, catalog)
+    _activate_chain(store, tmp_path, revision_id="child-revision", pool_id="child-pool")
+    accepted_child = _accepted_chain(store, ledger, clock, key, catalog)
+    for snapshot, cost in ((accepted_root, 90), (accepted_child, 30)):
+        attempt = ledger.start_attempt(
+            snapshot=snapshot,
+            deployment=catalog.deployments[-1],
+            attempt_ordinal=0,
+            route_depth=snapshot.deployment_ids.index("child"),
+            maximum_cost_nano_usd=cost,
+        )
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=0,
+                usage=GatewayUsage(input_tokens=cost, output_tokens=0),
+            ),
+            failure=None,
+        )
+    child_pool = BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="child-pool")
+    child_deployment = BudgetScope(
+        kind=BudgetScopeKind.DEPLOYMENT,
+        alias_id="coding",
+        pool_id="child-pool",
+        deployment_id="child",
+    )
+    for scope in (child_pool, child_deployment):
+        budgets.set_limit(
+            organization_id="org", period="2026-08", scope=scope, limit_nano_usd=1_000
+        )
+    _activate_chain(store, tmp_path, revision_id="root-again")
+    root_pool = BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool")
+    root_deployment = BudgetScope(
+        kind=BudgetScopeKind.DEPLOYMENT,
+        alias_id="coding",
+        pool_id="pool",
+        deployment_id="primary",
+    )
+    for scope in (root_pool, root_deployment):
+        budgets.set_limit(organization_id="org", period="2026-08", scope=scope, limit_nano_usd=100)
+
+    balances = {
+        item.budget.scope.key(): item.settled_nano_usd
+        for item in budgets.remaining(organization_id="org", period="2026-08")
+    }
+    assert balances == {
+        child_pool.key(): 120,
+        child_deployment.key(): 120,
+        root_pool.key(): 90,
+        root_deployment.key(): 0,
+    }
+    next_snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    with pytest.raises(BudgetReservationRejected, match="pool allocation is exhausted"):
+        ledger.start_attempt(
+            snapshot=next_snapshot,
+            deployment=catalog.deployments[-1],
+            attempt_ordinal=0,
+            route_depth=1,
+            maximum_cost_nano_usd=50,
+        )
+
+
+def test_root_backfill_preserves_tenant_alias_and_attempt_month_scopes(tmp_path: Path) -> None:
+    """Historical child spend cannot leak into other tenants, aliases, or attempt months."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    _activate_chain(store, tmp_path, alias_id="other", revision_id="other-revision")
+    store.grant_alias(organization_id="org", identity_id="identity", alias_id="other")
+    store.create_organization(organization_id="other-org", slug="other-org", display_name="Other")
+    store.create_identity(
+        organization_id="other-org", identity_id="other-identity", display_name="Other"
+    )
+    _activate_chain(
+        store,
+        tmp_path,
+        organization_id="other-org",
+        alias_id="foreign",
+        revision_id="foreign-revision",
+    )
+    store.grant_alias(organization_id="other-org", identity_id="other-identity", alias_id="foreign")
+    foreign_key = store.issue_virtual_key(
+        organization_id="other-org", identity_id="other-identity", key_id="foreign-key"
+    ).raw_key
+    # All requests are accepted in August, but the last attempt starts in September.
+    snapshots = [
+        _accepted_chain(store, ledger, clock, token, catalog, alias=alias)
+        for token, alias in (
+            (key, "coding"),
+            (key, "other"),
+            (foreign_key, "foreign"),
+            (key, "coding"),
+        )
+    ]
+    for snapshot, cost in zip(snapshots, (10, 20, 30, 40), strict=True):
+        if cost == 40:
+            clock.advance(timedelta(minutes=2))
+        attempt = ledger.start_attempt(
+            snapshot=snapshot,
+            deployment=catalog.deployments[-1],
+            attempt_ordinal=0,
+            route_depth=1,
+            maximum_cost_nano_usd=cost,
+        )
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=0,
+                usage=GatewayUsage(input_tokens=cost, output_tokens=0),
+            ),
+            failure=None,
+        )
+    for organization_id, alias, period, expected in (
+        ("org", "coding", "2026-08", 10),
+        ("org", "other", "2026-08", 20),
+        ("other-org", "foreign", "2026-08", 30),
+        ("org", "coding", "2026-09", 40),
+    ):
+        scope = BudgetScope(kind=BudgetScopeKind.POOL, alias_id=alias, pool_id="pool")
+        _, limit = budgets.set_limit(
+            organization_id=organization_id, period=period, scope=scope, limit_nano_usd=1_000
+        )
+        remaining = next(
+            item
+            for item in budgets.remaining(organization_id=organization_id, period=period)
+            if item.budget.budget_id == limit.budget_id
+        )
+        assert remaining.settled_nano_usd == expected
+        assert remaining.reserved_nano_usd == 0
+
+
+def test_root_backfill_overflow_rolls_back_limit_and_partial_charges(tmp_path: Path) -> None:
+    """An unrepresentable aggregate cannot leave a partial root budget or charge rows."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    for _ in range(2):
+        snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+        ledger.start_attempt(
+            snapshot=snapshot,
+            deployment=catalog.deployments[-1],
+            attempt_ordinal=0,
+            route_depth=1,
+            maximum_cost_nano_usd=MAXIMUM_NANO_USD,
+        )
+    with pytest.raises(ValueError, match="historical monthly gateway cost exceeds SQLite integer"):
+        budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool"),
+            limit_nano_usd=MAXIMUM_NANO_USD,
+        )
+    assert budgets.limits(organization_id="org", period="2026-08") == ()
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (2,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM gateway_attempt_budget_charges"
+        ).fetchone() == (0,)
+
+
+def test_reachable_child_budget_authoring_uses_pinned_graph(tmp_path: Path) -> None:
+    """Only reachable child pools and their actual leaves can receive allocations."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    assert snapshot.stage_for_depth(1).pool_id == "child-pool"
+    for kind in (BudgetScopeKind.POOL, BudgetScopeKind.DEPLOYMENT):
+        changed, limit = budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(
+                kind=kind,
+                alias_id="coding",
+                pool_id="child-pool",
+                deployment_id="child" if kind is BudgetScopeKind.DEPLOYMENT else None,
+            ),
+            limit_nano_usd=100,
+        )
+        assert changed and limit.scope.pool_id == "child-pool"
+    assert len(budgets.limits(organization_id="org", period="2026-08")) == 2
 
 
 def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_closed() -> None:
@@ -988,14 +1415,14 @@ def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) 
     _store, _ledger, budgets, _key = _authority(tmp_path, clock)
     _write_snapshot(tmp_path)
 
-    with pytest.raises(ValueError, match="pool is not the active revision target"):
+    with pytest.raises(ValueError, match="not reachable|root pool is missing"):
         budgets.set_limit(
             organization_id="org",
             period="2026-08",
             scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="ghost"),
             limit_nano_usd=100,
         )
-    with pytest.raises(ValueError, match="deployment is not in its pool"):
+    with pytest.raises(ValueError, match="not reachable"):
         budgets.set_limit(
             organization_id="org",
             period="2026-08",
@@ -1043,7 +1470,7 @@ def test_retargeted_alias_rejects_previous_pool_scope(tmp_path: Path) -> None:
         catalog_sha256=_catalog().identity_sha256(),
     )
 
-    with pytest.raises(ValueError, match="pool is not the active revision target"):
+    with pytest.raises(ValueError, match="not reachable|root pool is missing"):
         budgets.set_limit(
             organization_id="org",
             period="2026-08",

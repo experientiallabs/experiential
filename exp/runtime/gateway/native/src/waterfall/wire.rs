@@ -20,6 +20,9 @@ use crate::tool_search::ToolSearchAdmission;
 pub struct DeploymentWire {
     pub provider: String,
     pub deployment_id: String,
+    /// Canonical identity of this actual stage, not the requested root model.
+    #[serde(default)]
+    pub exact_model_id: String,
     pub dialect: String,
     pub url: String,
     pub headers: HashMap<String, String>,
@@ -33,6 +36,20 @@ pub struct DeploymentWire {
     /// deadness that fails over.
     #[serde(default)]
     pub billing_customer_managed: bool,
+    /// Host-authorized Google explicit-cache execution for this attempt.
+    /// The host still reserves and settles each cache operation separately.
+    #[serde(default)]
+    pub explicit_cache: bool,
+    /// Gateway-selected automatic prefix cache the client never asked for. Any
+    /// cache failure then falls back to the plain generation instead of failing it.
+    #[serde(default)]
+    pub automatic_cache: bool,
+    /// Prompt tokens this attempt's own automatic create wrote into the cache
+    /// its generation reads. Usage then reports them as cache writes read back
+    /// in the same call (OpenRouter's shape), priced at the lane's write rate.
+    /// Set only on the overlaid wire, never by the host.
+    #[serde(skip)]
+    pub automatic_cache_written_tokens: Option<u64>,
     pub timeout_seconds: f64,
     /// Structured payload the data plane serializes itself; null for
     /// body-signing dialects, whose route entry carries `upstream_body`.
@@ -67,6 +84,11 @@ pub struct DeploymentWire {
     /// no such control: the relay serializes the turn to one tool call.
     #[serde(default)]
     pub serialize_tool_calls: bool,
+    /// This rung's provider reports Chat Completions cache writes as a subset
+    /// of cache reads: it created the cache and read the written tokens back
+    /// in the same call. Usage normalization separates the two legs.
+    #[serde(default)]
+    pub cache_writes_within_reads: bool,
     /// Codex native-tool inversion map for this request (provider-facing
     /// mangled name -> origin name, namespace, is-custom). Empty unless the
     /// request carried translated Codex native tools; see
@@ -107,6 +129,9 @@ pub struct DeploymentWire {
     /// ladder advances; zero keeps the rung's throttle failover-only.
     #[serde(default)]
     pub throttle_redial_budget: u32,
+    /// Stage-local schedule; its budget is zero when this stage disables redial.
+    #[serde(default)]
+    pub throttle_redial: Option<ThrottleRedial>,
     /// The rung's payload was tightened to OpenRouter's zero-data-retention
     /// routing constraint at admission; an answer it serves carries
     /// `x-gateway-zdr-constrained: true` so the host can attest it.
@@ -130,12 +155,34 @@ pub struct RoutePolicy {
     /// The pool's backoff-and-redial schedule for throttled rungs, when
     /// authored.
     pub throttle_redial: Option<ThrottleRedial>,
+    pub physical_route_cap: Option<u32>,
+    pub backoff: Option<crate::request_policy::Backoff>,
+}
+
+impl RoutePolicy {
+    /// Every dispatch must fit the server caps and any explicit caller cap.
+    pub fn permits(self, total: u32, physical_at_route: u32) -> bool {
+        total < self.maximum_total_attempts.min(8)
+            && self
+                .physical_route_cap
+                .is_none_or(|cap| physical_at_route < cap.min(4))
+    }
+
+    /// Reject a malformed internal admission rather than silently widening it.
+    pub fn valid(self) -> bool {
+        (1..=8).contains(&self.maximum_total_attempts)
+            && (1..=4).contains(&self.maximum_same_deployment_attempts)
+            && self
+                .physical_route_cap
+                .is_none_or(|cap| (1..=4).contains(&cap))
+            && self.backoff.is_none_or(|backoff| backoff.valid())
+    }
 }
 
 /// Everything one waterfall run needs besides its request guard.
 pub struct WaterfallContext<'a> {
     pub bridge: &'a Arc<Bridge>,
-    pub http: &'a reqwest::Client,
+    pub http: &'a crate::upstream::UpstreamClient,
     pub request_id: &'a str,
     /// The presented virtual key, forwarded so hosted budget-error policy
     /// can shape a rejected reservation for the caller.

@@ -1,7 +1,4 @@
-//! Incremental upstream relay: one provider response decoded and normalized
-//! into gateway events, plus the shared collection helpers that bound and
-//! classify what the relay yields. The waterfall commits a relay to one
-//! deployment; the HTTP surfaces then drain it live or to completion.
+//! Bounded provider events, committed to one deployment and drained by HTTP surfaces.
 
 mod progress;
 
@@ -24,8 +21,7 @@ use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
 use crate::tool_serialization::ToolCallSerializer;
 use crate::waterfall::CommittedAttempt;
 
-/// Map one collection failure to its public error, honoring the shared
-/// aggregate-output overflow contract.
+/// Map collection failures to public errors, honoring aggregate-output bounds.
 pub fn collection_public_error(failure: &Failure) -> PublicError {
     if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
         return PublicError::provider_output_too_large();
@@ -33,13 +29,13 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
     failure.public_error()
 }
 
-/// Approximate retained size of one aggregated event, in bytes. Completed
-/// tool calls charge their full argument text, matching the python engine's
-/// bounded aggregation, which also charges the completed call after its
-/// streamed deltas.
+/// Approximate retained event bytes. Completed calls charge their full arguments
+/// again after streamed deltas, matching the Python bounded aggregator.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
-        Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
+        Event::GeminiThoughtPart(part) => crate::dialects::records_retained_bytes(part)
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
+        Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()
         }
@@ -98,18 +94,10 @@ pub fn stream_timeout_failure(deadline: Instant) -> Failure {
     }
 }
 
-/// Classify a provider that accepted the connection but did not stream its
-/// first TOKEN (the first semantic event) within the fail-fast first-token
-/// bound. Headers, keepalive comments and role-only frames do not count. A
-/// stalled lead deployment must not hold the request for its full per-chunk
-/// timeout, so this is a transient, capacity-shaped failure that is
-/// failover-eligible.
-///
-/// It is deliberately *not* same-deployment retryable: a lane that accepted
-/// the connection but never answered is the clearest dead-lane signal, and
-/// redialing it would only stall again for another window. Skipping the redial
-/// and advancing straight to the next certified deployment is what keeps a
-/// fresh pod's cost on a dead lane near one fail-fast window instead of several.
+/// Classify a provider missing its first semantic token within the fail-fast bound.
+/// Headers, keepalives and role-only frames do not count. Advance to the next
+/// certified deployment without redialing the stalled lane, limiting its cost
+/// to one first-token window rather than the full per-chunk timeout.
 pub fn first_byte_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
@@ -220,14 +208,18 @@ pub struct UpstreamRelay {
     /// carrying only role/lifecycle scaffolding, so time-to-first-token is
     /// stamped on the first event that carries visible model output.
     first_token_at: Option<SystemTime>,
-    /// Tokens an earlier, refused dial of the same attempt was billed for,
-    /// folded once into each cumulative usage snapshot this relay yields so
-    /// the reservation settles both dials' tokens as one.
-    carried_usage: Option<Usage>,
     observation: Option<crate::settlement::Observation>,
+    capture_reasoning: Option<crate::capture::reasoning::Observer>,
 }
 
 impl UpstreamRelay {
+    /// Image models put a complete encoded image in one SSE frame.
+    pub fn allow_image_output(&mut self) {
+        if let FrameDecoder::Sse(decoder) = &mut self.decoder {
+            decoder.allow_image_output();
+        }
+    }
+
     pub fn new(
         response: reqwest::Response,
         dialect: Dialect,
@@ -288,8 +280,8 @@ impl UpstreamRelay {
             first_token_at: None,
             native_tool_inverter: NativeToolInverter::default(),
             tool_search: ToolSearchWithholder::default(),
-            carried_usage: None,
             observation: None,
+            capture_reasoning: None,
         }
     }
 
@@ -297,15 +289,32 @@ impl UpstreamRelay {
         self.observation = Some(observation);
     }
 
+    pub(crate) fn set_capture_reasoning(&mut self, observer: crate::capture::reasoning::Observer) {
+        self.capture_reasoning = Some(observer);
+    }
+
     /// Close the network body before any settlement callback is awaited.
     /// Already normalized usage and terminals remain in the guard snapshot.
     pub(crate) fn close_transport(&mut self) {
         self.stream = futures_util::stream::empty().boxed();
         self.eof = true;
+        let events = self.normalizer.finish_metadata_drain();
+        self.queue_events(events);
         // Drain only already decoded events through effective stop/tool rules.
         // This never polls the provider and retains a stop-adjusted terminal.
-        while self.guard_next_pending() {}
-        if let Some(observation) = &self.observation {
+        let mut drain_failure = None;
+        loop {
+            match self.guard_next_pending() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(failure) => {
+                    self.pending.clear();
+                    drain_failure = Some(failure);
+                    break;
+                }
+            }
+        }
+        if let Some(observation) = self.observation.take() {
             for event in &self.ready {
                 // queue_events already recorded the newest meter, folded
                 // across dials. A raw buffered report can be older or partial.
@@ -315,37 +324,28 @@ impl UpstreamRelay {
                 observation.record_effective_terminal(event);
             }
         }
+        if let Some(failure) = drain_failure {
+            self.ready.push_back(Event::Failed(failure));
+        }
     }
 
     fn queue_events(&mut self, events: Vec<Event>) {
         self.observe_unexposed_reasoning_progress();
         if let Some(observation) = &self.observation {
+            observation.record_service_tier(&self.normalizer.service_tier);
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
             if let Some(usage) = self.normalizer.observed_usage() {
-                let usage = match self.carried_usage.as_ref() {
-                    Some(carried) => fold_usage(carried, usage.clone()),
-                    None => usage.clone(),
-                };
-                if self.carried_usage.is_some() {
-                    observation.record_dial_total(usage);
+                if self.normalizer.meter_replaces_earlier() {
+                    observation.replace_usage(usage);
                 } else {
-                    observation.record(&Event::Usage(usage));
+                    observation.record(&Event::Usage(usage.clone()));
                 }
             }
-            if self.normalizer.observed_usage().is_none()
-                && self.carried_usage.is_some()
-                && events.iter().any(Event::is_terminal)
-            {
-                observation.record_dial_total(Usage::default());
-            }
             for event in &events {
-                match (event, self.carried_usage.as_ref()) {
-                    (Event::Usage(usage), Some(carried)) => {
-                        observation.record_dial_total(fold_usage(carried, usage.clone()));
-                    }
-                    (Event::Usage(_), _) => observation.record(event),
-                    (Event::Failed(failure), _) => {
+                match event {
+                    Event::Usage(_) => observation.record(event),
+                    Event::Failed(failure) => {
                         let failure = match self.customer_managed_provider.as_deref() {
                             Some(provider) => crate::stream_errors::customer_credential_failure(
                                 failure.clone(),
@@ -404,19 +404,9 @@ impl UpstreamRelay {
     }
 
     /// Prefer the normalizer's latest cumulative report on an abnormal end.
-    /// Add the earlier dial exactly once, never to an already folded report.
     /// Dialects that yield usage directly keep their last yielded report.
     pub fn usage_before_failure(&self, reported: Option<Usage>) -> Option<Usage> {
-        self.normalizer
-            .observed_usage()
-            .map(|observed| match self.carried_usage.as_ref() {
-                Some(carried) => fold_usage(carried, observed.clone()),
-                None => observed.clone(),
-            })
-            .or(reported)
-            // The current dial was dispatched too. Without its report, the
-            // earlier dial is only a subtotal, never the attempt's full meter.
-            .or_else(|| self.carried_usage.as_ref().map(|_| Usage::default()))
+        self.normalizer.observed_usage().cloned().or(reported)
     }
 
     /// The wall-clock time this relay yielded its first output token, or
@@ -440,6 +430,17 @@ impl UpstreamRelay {
         S: Into<String>,
     {
         self.normalizer.set_request_words(words);
+    }
+
+    /// Carry the rung's cache-write accounting into usage normalization.
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.normalizer
+            .set_cache_writes_within_reads(writes_within_reads);
+    }
+
+    /// Carry the tokens this attempt's own automatic cache create wrote.
+    pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
+        self.normalizer.set_gemini_cache_writes(written);
     }
 
     /// Carry the Codex native-tool inversion map (see
@@ -491,17 +492,7 @@ impl UpstreamRelay {
         self.tool_serializer = serialize.then(ToolCallSerializer::new);
     }
 
-    /// Carry the tokens a refused earlier dial of this attempt was billed
-    /// for; they join each cumulative usage report once.
-    pub fn set_carried_usage(&mut self, carried: Option<Usage>) {
-        if let (Some(observation), Some(_)) = (&self.observation, &carried) {
-            observation.record_dial_total(Usage::default());
-        }
-        self.carried_usage = carried;
-    }
-
-    /// Enforce the caller's stop sequences on this relay's visible text.
-    /// Installed before the first event is yielded; an empty set is a no-op.
+    /// Enable the probability output requested in the frozen provider payload.
     pub fn set_probability_output(&mut self, chat: bool, payload: &serde_json::Value) {
         self.normalizer.enable_chat_logprobs(
             chat && payload.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true),
@@ -515,6 +506,7 @@ impl UpstreamRelay {
         );
     }
 
+    /// Enforce stop sequences before yielding events; an empty set is a no-op.
     pub fn set_stop_sequences<I, S>(&mut self, sequences: I)
     where
         I: IntoIterator<Item = S>,
@@ -525,9 +517,9 @@ impl UpstreamRelay {
 
     /// Move one normalized event through the stop-sequence guard (if any)
     /// onto the ready queue.
-    fn guard_next_pending(&mut self) -> bool {
+    fn guard_next_pending(&mut self) -> Result<bool, Failure> {
         let Some(mut event) = self.pending.pop_front() else {
-            return false;
+            return Ok(false);
         };
         if let (Some(provider), Event::Failed(failure)) =
             (self.customer_managed_provider.as_deref(), &event)
@@ -551,21 +543,21 @@ impl UpstreamRelay {
         // the caller's tools, so it never counts toward one-call-per-turn
         // serialization and never reaches the Codex inversion or the caller.
         let Some(mut event) = self.tool_search.filter(event) else {
-            return true;
+            return Ok(true);
         };
         if let Some(serializer) = self.tool_serializer.as_mut() {
             let Some(kept) = serializer.filter(event) else {
-                return true;
+                return Ok(true);
             };
             event = kept;
         }
-        for event in self.native_tool_inverter.filter(event) {
+        for event in self.native_tool_inverter.filter(event)? {
             match self.stop_guard.as_mut() {
                 Some(guard) => self.ready.extend(guard.filter(event)),
                 None => self.ready.push_back(event),
             }
         }
-        true
+        Ok(true)
     }
 
     /// Route an abnormal stream termination through the normalizer's recovery.
@@ -575,6 +567,7 @@ impl UpstreamRelay {
     /// propagates. See `Normalizer::recover_abnormal_end`.
     fn recover_or_fail(&mut self, failure: Failure) -> Result<(), Failure> {
         self.eof = true;
+        self.stream = futures_util::stream::empty().boxed();
         let events = self.normalizer.recover_abnormal_end(failure)?;
         self.queue_events(events);
         Ok(())
@@ -596,7 +589,7 @@ impl UpstreamRelay {
             *last += yielded.elapsed();
         }
         loop {
-            if let Some(mut event) = self.ready.pop_front() {
+            if let Some(event) = self.ready.pop_front() {
                 // Every yielded event exits here, so this is the one place that
                 // stamps time-to-first-token: the first event carrying visible
                 // model output. Prefix events peeked during commit also passed
@@ -608,19 +601,17 @@ impl UpstreamRelay {
                         observation.record_first_token(self.first_token_at);
                     }
                 }
-                if let (Event::Usage(usage), Some(carried)) =
-                    (&mut event, self.carried_usage.as_ref())
-                {
-                    *usage = fold_usage(carried, usage.clone());
-                }
                 if let Some(observation) = &self.observation {
                     observation.record(&event);
                     observation.record_effective_terminal(&event);
                 }
                 self.yielded_at = Some(Instant::now());
+                if let Some(observer) = &self.capture_reasoning {
+                    observer.observe(&event);
+                }
                 return Ok(Some(event));
             }
-            if self.guard_next_pending() {
+            if self.guard_next_pending()? {
                 continue;
             }
             if self.eof {
@@ -629,13 +620,24 @@ impl UpstreamRelay {
             // Already decoded events, especially a terminal with usage, are
             // drained first. A slow downstream consumer cannot turn a received
             // terminal into a provider stall. No fresh read may bypass expiry.
-            if let Some(failure) = self.read_failure(deadline, phase_timeout) {
+            let drain_started = self.normalizer.metadata_drain_started();
+            if let Some(started) = drain_started {
+                // One existing body-read allowance from declared finish, never
+                // renewed by trailers, keepalives or downstream backpressure.
+                // EOF ends immediately; the total request deadline still wins.
+                if remaining(deadline).is_zero() || started.elapsed() >= phase_timeout {
+                    self.close_transport();
+                    continue;
+                }
+            } else if let Some(failure) = self.read_failure(deadline, phase_timeout) {
                 return Err(failure);
             }
             // Bytes never renew either bound. Genuine progress renews the
             // generation idle window, while the total request deadline stays
             // fixed across progress and all physical attempts.
-            let progress_deadline = if self.provider_tools.active() {
+            let progress_deadline = if let Some(started) = drain_started {
+                started + phase_timeout
+            } else if self.provider_tools.active() {
                 Instant::now() + phase_timeout
             } else if self.stall_bound_armed {
                 self.first_token_deadline
@@ -709,11 +711,21 @@ impl UpstreamRelay {
                     continue;
                 }
                 Err(_) => {
+                    if drain_started.is_some() {
+                        self.close_transport();
+                        continue;
+                    }
                     return Err(self
                         .read_failure(deadline, phase_timeout)
                         .unwrap_or_else(|| stream_timeout_failure(deadline)));
                 }
             };
+            if drain_started.is_some_and(|started| {
+                remaining(deadline).is_zero() || started.elapsed() >= phase_timeout
+            }) {
+                self.close_transport();
+                continue;
+            }
             if !self.first_byte_recorded {
                 METRICS
                     .time_to_first_byte_ms
@@ -743,6 +755,11 @@ impl UpstreamRelay {
                     }
                 }
             }
+            if self.normalizer.metadata_drain_started().is_some() {
+                // An always-ready stream of trailers must not prevent the
+                // request owner from cancelling its pending read.
+                tokio::task::yield_now().await;
+            }
         }
     }
 }
@@ -753,8 +770,7 @@ impl Drop for UpstreamRelay {
     }
 }
 
-/// Drain one committed attempt to completion for non-streaming responses,
-/// bounding total retained output like the python service's aggregation.
+/// Drain one non-streaming attempt, bounding output like the Python aggregation.
 pub async fn collect_committed(
     committed: &mut CommittedAttempt,
     deadline: Instant,
@@ -802,6 +818,8 @@ pub async fn collect_committed(
     }
 }
 
+#[cfg(test)]
+mod gemini_usage_tests;
 #[cfg(test)]
 mod progress_tests;
 #[cfg(test)]
@@ -922,73 +940,6 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible);
-    }
-}
-
-/// The tokens of two physical dials of one attempt, summed leg by leg; a leg
-/// neither reported stays absent.
-fn fold_usage(carried: &Usage, current: Usage) -> Usage {
-    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
-        (Some(a), Some(b)) => Some(a + b),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
-    // Across physical dials, an absent leg means the total is unknown, not
-    // that this dial contributed zero. Cumulative reports within one dial use
-    // Usage::merge_observed instead of this sum.
-    let total = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a + b);
-    Usage {
-        input_tokens: total(carried.input_tokens, current.input_tokens),
-        output_tokens: total(carried.output_tokens, current.output_tokens),
-        cached_input_tokens: add(carried.cached_input_tokens, current.cached_input_tokens),
-        cache_creation_input_tokens: add(
-            carried.cache_creation_input_tokens,
-            current.cache_creation_input_tokens,
-        ),
-        cache_creation_1h_input_tokens: match (
-            carried.cache_creation_input_tokens.unwrap_or(0),
-            carried.cache_creation_1h_input_tokens,
-            current.cache_creation_input_tokens.unwrap_or(0),
-            current.cache_creation_1h_input_tokens,
-        ) {
-            (a, None, _, _) if a > 0 => None,
-            (_, _, b, None) if b > 0 => None,
-            (_, a, _, b) => add(a, b),
-        },
-        reasoning_tokens: add(carried.reasoning_tokens, current.reasoning_tokens),
-    }
-}
-
-#[cfg(test)]
-mod cache_write_tests {
-    use super::{fold_usage, Usage};
-
-    #[test]
-    fn redial_preserves_unknown_ttl_until_every_write_leg_is_observed() {
-        let known = Usage {
-            cache_creation_input_tokens: Some(10),
-            cache_creation_1h_input_tokens: Some(4),
-            ..Usage::default()
-        };
-        let unknown = Usage {
-            cache_creation_input_tokens: Some(20),
-            ..Usage::default()
-        };
-        let folded = fold_usage(&known, known.clone());
-        assert_eq!(folded.cache_creation_input_tokens, Some(20));
-        assert_eq!(folded.cache_creation_1h_input_tokens, Some(8));
-        assert_eq!(
-            fold_usage(&known, unknown.clone()).cache_creation_1h_input_tokens,
-            None
-        );
-        assert_eq!(
-            fold_usage(&unknown, known.clone()).cache_creation_1h_input_tokens,
-            None
-        );
-        assert_eq!(
-            fold_usage(&Usage::default(), known).cache_creation_1h_input_tokens,
-            Some(4)
-        );
     }
 }
 

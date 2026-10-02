@@ -97,6 +97,8 @@ from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import provider_free_build_review, select_build_review
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.retrieval import RAGEmbedderBinding, RAGLineageBinding, persist_trace_rag
+from exp.simulation.retrieval.embedding import RAGEmbeddingCache
+from exp.simulation.retrieval.embedding_inputs import embedding_chunk_bytes
 from exp.simulation.world_model import persist_grounded_world_model
 
 
@@ -121,11 +123,23 @@ class HostedRouterWorkflowSetup(ContractModel):
 
 
 class HostedRouterWorkflowOptions(ContractModel):
-    """Bounded noninteractive controls below the Project-owned spend ceiling."""
+    """Bounded noninteractive controls below the Project-owned spend ceiling.
+
+    Attributes:
+        maximum_judgments: Positive durable judgment ceiling, default 100.
+        maximum_router_feature_tokens: Router feature input ceiling, default 8,192.
+        maximum_retrieval_query_tokens: Optional aggregate query ceiling; omission derives it
+            from world input capacity while each chunk obeys embedding input capacity.
+        maximum_judge_input_tokens: Judge input ceiling, default 32,768.
+        maximum_judge_output_tokens: Judge output reservation, default 4,096.
+        simulation_maximum_output_tokens: Per-call output reservation, default 16,000.
+        maximum_concurrency: Simultaneous rollout allowance, default one.
+        seed: Reproducible execution seed, default zero.
+    """
 
     maximum_judgments: int = Field(default=100, gt=0)
     maximum_router_feature_tokens: int = Field(default=8_192, gt=0)
-    maximum_retrieval_query_tokens: int = Field(default=32_768, gt=0)
+    maximum_retrieval_query_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_input_tokens: int = Field(default=32_768, gt=0)
     maximum_judge_output_tokens: int = Field(default=4_096, ge=4_096)
     simulation_maximum_output_tokens: int = Field(default=16_000, gt=0)
@@ -652,6 +666,10 @@ def _ensure_grounded_build(
         snapshot=embedder.snapshot,
         maximum_attempts=RetryPolicy().maximum_attempts,
         input_usd_per_million_tokens=price,
+        maximum_input_tokens=embedder.capabilities.context_window_tokens,
+    )
+    embedding_cache = RAGEmbeddingCache(
+        binding, maximum_chunk_bytes=embedding_chunk_bytes(binding.maximum_input_tokens)
     )
     try:
         serving = persist_trace_rag(
@@ -663,6 +681,7 @@ def _ensure_grounded_build(
             embedder=binding,
             default_top_k=setup.retrieval.top_k,
             included_partitions=frozenset({"fit", "held_out"}),
+            embedding_cache=embedding_cache,
         )
         fit = persist_trace_rag(
             project.artifacts,
@@ -673,6 +692,7 @@ def _ensure_grounded_build(
             embedder=binding,
             default_top_k=setup.retrieval.top_k,
             included_partitions=frozenset({"fit"}),
+            embedding_cache=embedding_cache,
         )
         world = persist_grounded_world_model(
             project.artifacts,

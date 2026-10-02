@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     CatalogSnapshotUnitError,
     ConnectionConfig,
@@ -36,9 +37,28 @@ from exp.common.models.nano_usd_upgrade import (
     LAST_MICRO_USD_SNAPSHOT_SCHEMA_VERSION,
     MICRO_TO_NANO_PRICE_KEYS,
     NANO_USD_PER_MICRO_USD,
+    upgrade_legacy_billing_source,
     upgrade_model_catalog_document,
     upgrade_normalized_snapshot_document,
 )
+
+
+def test_legacy_billing_upgrade_keeps_current_records_strict() -> None:
+    """Moving the existing schema-v1 read step preserves ownership and source data."""
+    original: JsonObject = {"schema_version": 1, "models": {"one": {"connection": "provider"}}}
+    upgraded = upgrade_legacy_billing_source(original)
+    assert upgraded == {
+        "schema_version": 2,
+        "models": {"one": {"connection": "provider", "billing_source": "customer_managed"}},
+    }
+    assert original == {"schema_version": 1, "models": {"one": {"connection": "provider"}}}
+    current: JsonObject = {"schema_version": 3, "models": {"one": {"connection": "provider"}}}
+    assert upgrade_legacy_billing_source(current) is current
+    with pytest.raises(ValueError, match="must not declare current billing_source"):
+        upgrade_legacy_billing_source(
+            {"schema_version": 1, "models": {"one": {"billing_source": "platform_managed"}}}
+        )
+
 
 _DIGEST = "a" * 64
 

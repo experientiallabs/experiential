@@ -6,7 +6,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
-from exp.common.models.content import DocumentContentPart, TextContentPart
+from exp.common.models.content import DocumentContentPart, ImageContentPart, TextContentPart
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.gemini_requests import (
     GEMINI_THOUGHT_SIGNATURE_BYPASS,
@@ -254,4 +254,24 @@ def test_gemini_folds_a_mid_conversation_system_turn_into_user_text_in_place() -
         {"role": "model", "parts": [{"text": "hello"}]},
         {"role": "user", "parts": [{"text": "<total_tokens>1</total_tokens>"}]},
         {"role": "user", "parts": [{"text": "go"}]},
+    ]
+
+
+def test_assistant_image_history_preserves_bytes_and_uses_signature_bypass() -> None:
+    """Caller-owned chat image history is rebuilt in Gemini's model role."""
+    image = ImageContentPart(media_type="image/png", data="iVBORw0KGgo=")
+    request = ModelRequest(
+        messages=(ModelMessage(role="assistant", content="", content_parts=(image,)),)
+    )
+    payload = gemini_generate_request("gemini-3.1-flash-image", request)
+    assert payload["contents"] == [
+        {
+            "role": "model",
+            "parts": [
+                {
+                    "inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgo="},
+                    "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
+                }
+            ],
+        }
     ]

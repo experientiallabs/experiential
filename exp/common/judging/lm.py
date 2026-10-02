@@ -6,8 +6,6 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from pydantic import Field
-
 from exp.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
@@ -53,10 +51,15 @@ class RawDimensionJudgment(ContractModel):
 
     Retired citation-era fields such as ``feedback`` and ``evidence_span_ids``
     are rejected. Rebuild or re-run the judge under the current schema.
+
+    Attributes:
+        dimension_id: Identity of the axis assessed by the model.
+        raw_score: Signed integer validated against the frozen rubric before acceptance.
+        rationale: Optional explanation, defaulting to None.
     """
 
     dimension_id: ArtifactId
-    raw_score: int = Field(ge=0)
+    raw_score: int
     rationale: str | None = None
 
 
@@ -105,7 +108,7 @@ def judge_response_schema() -> JsonObject:
                     "additionalProperties": False,
                     "properties": {
                         "dimension_id": {"type": "string"},
-                        "raw_score": {"type": "integer", "minimum": 0},
+                        "raw_score": {"type": "integer"},
                         "rationale": PORTABLE_RATIONALE_JSON_SCHEMA,
                     },
                     "required": ["dimension_id", "raw_score"],
@@ -211,7 +214,6 @@ class LMJudge:
                         content=_render_judgment_request(rollout, rubric),
                     ),
                 ),
-                temperature=0.0,
                 maximum_output_tokens=self._maximum_output_tokens,
             )
         )

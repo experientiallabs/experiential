@@ -9,7 +9,6 @@ from pydantic import BaseModel
 
 from exp.common.core.artifacts import (
     ArtifactInput,
-    sha256_json,
     sorted_unique_inputs,
 )
 from exp.common.evaluations import load_evaluation_dataset
@@ -36,6 +35,7 @@ from exp.common.routing.decision import policy_content_sha256
 from exp.optimize.router.automatic.execution_contract import (
     load_router_execution_contract,
 )
+from exp.optimize.router.automatic.preflight import simulation_configuration_sha256
 from exp.optimize.router.composition import RouterPolicyLock
 from exp.optimize.router.fit.report import HeldOutRouterReport
 from exp.optimize.router.hosted_spend import provider_spend_source_pairs
@@ -191,6 +191,7 @@ def _verify_grounded_build(
         or serving.index.included_lineage_ids != expected_all_lineages
         or fit.index.included_lineage_ids != expected_fit_lineages
         or serving.index.embedding_dimension != fit.index.embedding_dimension
+        or serving.index.embedding_chunk_bytes != fit.index.embedding_chunk_bytes
         or not _transitions_match_bindings(serving.transitions, binding_by_trace, fit_only=False)
         or not _transitions_match_bindings(fit.transitions, binding_by_trace, fit_only=True)
         or world.world_model_id != build.world_model.artifact_id
@@ -403,12 +404,13 @@ def _verify_policy_execution(
         maximum_model_calls=config.system.maximum_model_calls,
         system_prompt=config.system.system_prompt,
     )
-    expected_simulation = sha256_json(
-        {
-            "version": "automatic-router-simulation-configuration-v1",
-            "agent_factory_sha256": expected_agent,
-            "redacted_field_names": list(config.redacted_field_names),
-        }
+    expected_simulation = simulation_configuration_sha256(
+        config,
+        agent_identity=expected_agent,
+        candidate_aliases=config.models.candidates,
+        world_model_reasoning_effort=catalog.world_model_reasoning_effort,
+        judge_reasoning_effort=catalog.judge_reasoning_effort,
+        candidate_reasoning_efforts=catalog.candidate_reasoning_efforts,
     )
     build_ledger = _verify_stage_ledger(
         project,

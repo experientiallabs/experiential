@@ -34,12 +34,21 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_fallback_rules import require_unrestricted_rung
+from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.native_reasoning import rung_provider_request
+from exp.runtime.gateway.native_request_policy import restrict_fallbacks
 from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.native_stage_admission import (
+    require_native_model_stage_contract,
+    stage_affinity_ordered_rungs,
+)
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
+from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
+from exp.runtime.gateway.tool_search.plan import plan_tool_search
+from exp.runtime.gateway.web_search.plan import strip_search_carriers
 from exp.runtime.models.providers import (
     emulated_gateway_capabilities,
     preflight_gateway_request,
@@ -52,6 +61,7 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_structured_text_schema,
     reserve_thinking_headroom,
 )
+from exp.runtime.models.providers.dialect_dispatch import CACHE_CONTROL_NOT_FORWARDED_SUFFIX
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -63,7 +73,6 @@ from exp.runtime.models.providers.generation_route_compat import (
 )
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import (
-    dialect_stream_payload,
     route_generation_parameter_requests,
 )
 from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespace
@@ -132,21 +141,125 @@ def admitted_route_requests(
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
-    # flex/priority are the tiers we price as an OPT-IN pass-through, so they
-    # fail CLOSED before any reservation when no rung can BILL the requested one:
-    # a BYOK rung forwards any tier (customer pays the provider directly, no
-    # platform card needed), while a house rung must carry a per-tier card for
-    # THIS tier (`forwards_tier`). A model carded for flex only therefore rejects
-    # a priority request instead of forwarding it and silently billing the base
-    # rate while the provider charges the priority premium (underbill). Every
-    # OTHER tier (auto/default carry no price; scale and any future value) is
-    # never rejected here — a non-billable candidate simply strips it at payload
-    # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
-    # A rung whose declared context window cannot hold the prompt plus the
-    # requested output budget is dropped HERE, before a reservation or a
-    # provider call (the provider would only 400 it back, after a round trip,
-    # with an opaque message); the request falls to a rung that can hold it
-    # and is refused only when none can.
+    route, resolved_wires, public_request, provider_request, disclosures = prepare_route_requests(
+        route, resolved_wires, request
+    )
+    if disclosures:
+        record_admission_coercions(accounting, authorization, disclosures)
+    provider_request = _with_cache_affinity(provider_request, authorization)
+    resolved_wires = bind_recovery_profiles(
+        route.deployments,
+        resolved_wires,
+        authorization.organization_id,
+        accounting.recovery_host,
+        request_region=provider_request.inference_geo,
+    )
+    route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
+    scheduled_count = len(route.deployments)
+    route, resolved_wires, placement = _affinity_ordered_rungs(
+        route,
+        resolved_wires,
+        provider_request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=continuation,
+    )
+    if len(route.deployments) != scheduled_count and request_carries_cache_markers(
+        provider_request
+    ):
+        # Only disclosures are projected after recovery narrows the route. Keep
+        # already-shaped provider input and its tool identities exactly frozen.
+        selected_public, _ = route_generation_parameter_requests(
+            tuple(profile for profile, _client in resolved_wires), public_request
+        )
+        public_request = public_request.model_copy(
+            update={
+                "ignored_parameters": tuple(
+                    dict.fromkeys(
+                        (
+                            *public_request.ignored_parameters,
+                            *(
+                                item
+                                for item in selected_public.ignored_parameters
+                                if item.endswith(CACHE_CONTROL_NOT_FORWARDED_SUFFIX)
+                            ),
+                        )
+                    )
+                )
+            }
+        )
+    # Every surviving rung failover-only would leave nothing to dial first:
+    # fail closed here, named, instead of exhausting a ladder that dialed nothing.
+    require_unrestricted_rung(route)
+    return route, resolved_wires, public_request, provider_request, placement
+
+
+def select_single_route_before_search(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    request: GatewayRequest,
+    *,
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    continuation: ContinuationContext | None,
+) -> tuple[GatewayRoute, _ResolvedWires, AffinityPlacement | None]:
+    """Select a no-fallback route before search can perform work or drop native tools.
+
+    A pure preview removes web-search carriers and shapes emulated tool discovery
+    solely for capability eligibility. Its disclosures never escape and it calls no
+    backend. After filtering and the normal route ordering, only the winner reaches
+    effectful search planning with the original request. Final admission runs once
+    on that singleton, recording only its actual coercions.
+    """
+    routing = None if request.gateway is None else request.gateway.routing
+    if routing is None or routing.allow_fallbacks:
+        return route, resolved_wires, None
+    if route.snapshot.model_stages:
+        root_indexes = tuple(
+            index
+            for index in range(len(route.deployments))
+            if route.snapshot.stage_for_depth(index).exact_model_id == route.snapshot.exact_model_id
+        )
+        if not root_indexes:
+            raise GatewayRoutingError("no-fallback routing requires an eligible root-model route")
+        route = select_route_deployments(route, root_indexes)
+        resolved_wires = tuple(resolved_wires[index] for index in root_indexes)
+    if route.resolved_route_id is not None:
+        return restrict_fallbacks(request, route), resolved_wires[:1], None
+    preview = strip_search_carriers(request) if request.web_search is not None else request
+    preview = plan_tool_search(preview, [profile.dialect for profile, _ in resolved_wires]).request
+    route, resolved_wires, _, prepared, _ = prepare_route_requests(route, resolved_wires, preview)
+    route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, prepared)
+    route, resolved_wires, placement = _affinity_ordered_rungs(
+        route,
+        resolved_wires,
+        prepared,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=continuation,
+    )
+    require_unrestricted_rung(route)
+    restricted = restrict_fallbacks(request, route)
+    index = route.deployments.index(restricted.deployment)
+    return restricted, (resolved_wires[index],), placement
+
+
+def prepare_route_requests(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    request: GatewayRequest,
+) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest, tuple[str, ...]]:
+    """Pure capability filtering and shaping, with disclosures returned but never recorded.
+
+    This is the shared selection primitive for final admission and no-fallback
+    preselection. It executes no provider or search work and mutates no accounting,
+    affinity, health or request state.
+    """
+    require_native_model_stage_contract(route)
+    # Priced house tiers require a card for that exact tier; BYOK needs only
+    # wire support. Explicit priority keeps those candidates ahead of standard
+    # lanes. Flex and BYOK-only routes retain their disclosed coercion policy.
+    # Narrow impossible context windows before reserving or calling a provider.
     chat_indexes = tuple(
         index
         for index, (profile, _client) in enumerate(resolved_wires)
@@ -167,7 +280,12 @@ def admitted_route_requests(
 
     if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
-        if not any(profile.forwards_tier(tier) for profile, _client in resolved_wires):
+        tier_indexes = tuple(
+            index
+            for index, (profile, _client) in enumerate(resolved_wires)
+            if profile.forwards_tier(tier)
+        )
+        if not tier_indexes:
             raise ProviderCapabilityError(
                 capability="service_tier",
                 detail=(
@@ -175,6 +293,13 @@ def admitted_route_requests(
                     "Remove service_tier, or choose a model with tiered pricing enabled."
                 ),
             )
+
+        if tier == "priority" and any(
+            not profile.billing_customer_managed and profile.forwards_tier(tier)
+            for profile, _client in resolved_wires
+        ):
+            route = select_route_deployments(route, tier_indexes)
+            resolved_wires = tuple(resolved_wires[index] for index in tier_indexes)
 
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = ()
@@ -328,7 +453,6 @@ def admitted_route_requests(
             update={"stream": True, "include_usage": True}
         )
     if coercion_disclosures:
-        record_admission_coercions(accounting, authorization, coercion_disclosures)
         public_request = public_request.model_copy(
             update={
                 "ignored_parameters": tuple(
@@ -336,20 +460,7 @@ def admitted_route_requests(
                 )
             }
         )
-    provider_request = _with_cache_affinity(provider_request, authorization)
-    route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
-    route, resolved_wires, placement = _affinity_ordered_rungs(
-        route,
-        resolved_wires,
-        provider_request,
-        accounting=accounting,
-        authorization=authorization,
-        continuation=continuation,
-    )
-    # Every surviving rung failover-only would leave nothing to dial first:
-    # fail closed here, named, instead of exhausting a ladder that dialed nothing.
-    require_unrestricted_rung(route)
-    return route, resolved_wires, public_request, provider_request, placement
+    return route, resolved_wires, public_request, provider_request, coercion_disclosures
 
 
 def route_rejection(
@@ -399,11 +510,14 @@ def _prefer_cache_capable_rungs(
     ``cache_control`` ``ignored_parameters`` entries. ``maximize_availability``
     pools keep their certified order untouched.
     """
+    if _keeps_issuing_rung_first(route):
+        return route, resolved_wires
+    if route.snapshot.model_stages:
+        # The stage scheduler ranks markers once, after stage-local affinity.
+        return route, resolved_wires
     if route.snapshot.failover_mode != "maximize_cache":
         return route, resolved_wires
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
-        return route, resolved_wires
-    if _keeps_issuing_rung_first(route):
         return route, resolved_wires
     marker_capable = tuple(
         index
@@ -431,6 +545,8 @@ def _keeps_issuing_rung_first(route: GatewayRoute) -> bool:
     dead the pin is stale: every surviving rung runs without the reasoning,
     so the pool's normal ordering applies to them.
     """
+    if route.resolved_route_id is not None:
+        return True
     pinned = route.reasoning_pinned_deployment_id
     return pinned is not None and any(
         deployment.deployment_id == pinned for deployment in route.deployments
@@ -462,6 +578,15 @@ def _affinity_ordered_rungs(
     wires still dispatches the marker-honoring group first, ordered within
     each group. The other two failover modes are untouched.
     """
+    if route.snapshot.model_stages or accounting.recovery_host is not None:
+        return stage_affinity_ordered_rungs(
+            route,
+            resolved_wires,
+            provider_request,
+            accounting=accounting,
+            authorization=authorization,
+            continuation=continuation,
+        )
     if route.snapshot.failover_mode != "maximize_cache_affinity":
         return route, resolved_wires, AffinityPlacement()
     material = affinity_seed_material(
@@ -648,7 +773,7 @@ def protocol_compatible_indexes(
                     profile.dialect, emulate_parallel_tool_calls=emulate_parallel_tool_calls
                 ),
             )
-            dialect_stream_payload(profile, rung_request)
+            image_aware_stream_payload(profile, rung_request, capabilities, deployment.provider)
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             errors.append(exc)
             continue

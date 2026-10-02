@@ -9,6 +9,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: "d".to_string(),
+        exact_model_id: "fixture-model".into(),
         dialect: "openai_compatible".to_string(),
         url: "https://provider.test".to_string(),
         headers: HashMap::new(),
@@ -20,14 +21,19 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        cache_writes_within_reads: false,
         image_output: false,
         model_id: String::new(),
         billing_customer_managed: false,
+        explicit_cache: false,
+        automatic_cache: false,
+        automatic_cache_written_tokens: None,
         idempotency_key: "op".to_string(),
         time_to_first_byte_base_seconds: base,
         time_to_first_byte_seconds_per_million_input_tokens: slope,
         time_to_first_token_base_seconds: None,
         throttle_redial_budget: 0,
+        throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
     }
@@ -92,6 +98,8 @@ fn policy(refusal_failover: bool) -> RoutePolicy {
         maximum_same_deployment_attempts: 2,
         refusal_failover,
         throttle_redial: None,
+        physical_route_cap: None,
+        backoff: None,
     }
 }
 

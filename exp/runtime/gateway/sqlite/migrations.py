@@ -5,19 +5,18 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-import threading
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.sqlite.cache_write_migration import migrate_cache_write
 from exp.runtime.gateway.sqlite.nano_usd_migration import (
     NanoUsdMigrationError,
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 
 
 class GatewaySchemaError(RuntimeError):
@@ -665,23 +664,16 @@ _MIGRATION_15 = (
     "DROP TABLE gateway_schema_refresh_v15",
 )
 
-# v16: retain the provider's own sanitized explanation of a failed attempt.
-# The Rust upstream already extracts one bounded, single-line, credential- and
-# infrastructure-free sentence from a client-error body (param_attribution);
-# this column persists that text on the failed attempt so an operator can see
-# WHY a provider rejected the call without re-deriving it from logs. It is the
-# same sanitized text the caller already receives, so it does not widen the
-# ledger's content-free posture.
+# v16: persist the provider's own sanitized one-sentence explanation of a failed attempt (the
+# credential-free text the Rust upstream's param_attribution extracts and the caller already
+# receives), so an operator sees WHY a provider rejected the call without re-deriving it from logs.
 _MIGRATION_16 = ("ALTER TABLE gateway_attempts ADD COLUMN failure_message TEXT",)
 
-# v17: cost-optimality disclosure for policy-routed dispatches. When a rung
-# dispatch policy or an affinity pool bypasses the route's preferred rung,
-# dispatch_reason names why the chosen rung serves (affinity, fair_share_shed,
-# queue_bound, rung_dead, saturated_overflow) and the preferred_* columns
-# freeze the bypassed rung's identity and base token rates at reservation, so
-# settle can price the SAME observed usage counterfactually
-# (counterfactual_cost_micro_usd, renamed counterfactual_cost_nano_usd at v20)
-# without any content or re-derivation.
+# v17: cost-optimality disclosure for policy-routed dispatches. When a rung dispatch policy or an
+# affinity pool bypasses the route's preferred rung, dispatch_reason names why the chosen rung
+# serves (affinity, fair_share_shed, queue_bound, rung_dead, saturated_overflow) and preferred_*
+# freeze the bypassed rung's identity and base rates at reservation, so settle prices the SAME
+# usage counterfactually (counterfactual_cost_micro_usd, renamed ..._nano_usd at v20).
 _MIGRATION_17 = (
     "ALTER TABLE gateway_attempts ADD COLUMN dispatch_reason TEXT",
     "ALTER TABLE gateway_attempts ADD COLUMN preferred_deployment_id TEXT",
@@ -692,10 +684,8 @@ _MIGRATION_17 = (
     "ALTER TABLE gateway_attempts ADD COLUMN counterfactual_cost_micro_usd INTEGER",
 )
 
-# v18: a native provider (anthropic/openai/gemini/openrouter) may carry a
-# custom base_url when trusted_custom_origin is set, so the flag rides the
-# revision alongside base_url or a reconstructed connection defaults it to 0
-# and the fixed-origin validator rejects the reload.
+# v18: a native provider may carry a custom base_url when trusted_custom_origin is set, so the
+# flag rides the revision beside base_url (else a reload defaults it to 0 and is rejected).
 _MIGRATION_18 = (
     """
     ALTER TABLE provider_connection_revisions
@@ -704,12 +694,9 @@ _MIGRATION_18 = (
     """,
 )
 
-# v19: per-attempt provider rate-limit observability. The data plane harvests
-# the allowlisted rate-limit response headers (retry-after, x-ratelimit-*,
-# anthropic-ratelimit-*) on successes and failures alike; these columns
-# persist the normalized integers so throttle calibration can be audited
-# against what the provider actually said, per attempt. Header names and
-# numbers only: no content, no credentials.
+# v19: per-attempt rate-limit observability. The data plane harvests the allowlisted rate-limit
+# headers (retry-after, x-ratelimit-*, anthropic-ratelimit-*) on every attempt; these columns keep
+# the normalized integers so throttle calibration is auditable. Numbers only, no content.
 _MIGRATION_19 = (
     "ALTER TABLE gateway_attempts ADD COLUMN retry_after_seconds INTEGER",
     "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_limit_requests INTEGER",
@@ -750,98 +737,15 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     ),
     22: ("ALTER TABLE gateway_attempts ADD COLUMN upstream_provider TEXT",),  # aggregator label
     23: (migrate_cache_write,),
+    25: (
+        "ALTER TABLE gateway_attempts ADD COLUMN service_tier_admission TEXT",
+        "ALTER TABLE gateway_attempts ADD COLUMN service_tier_settlement TEXT",
+    ),
+    24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
+        "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "
+        "CHECK (subscription IN ('chatgpt', 'anthropic'))",
+    ),
 }
-
-
-def connect_database(
-    path: Path, *, busy_timeout_ms: int = 5_000, enable_wal: bool = True
-) -> sqlite3.Connection:
-    """Open one configured SQLite connection with mandatory safety pragmas.
-
-    Args:
-        path: Gateway database path.
-        busy_timeout_ms: Bounded lock wait in milliseconds.
-        enable_wal: Whether to assert the supported journal mode after version checks.
-
-    Returns:
-        Configured connection with row-name access.
-    """
-    connection = sqlite3.connect(path, timeout=busy_timeout_ms / 1_000, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-    if enable_wal:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-    return connection
-
-
-class _ThreadConnectionCache(threading.local):
-    """Per-thread idle SQLite connections keyed by path and busy timeout."""
-
-    def __init__(self) -> None:
-        """Start each thread with an empty idle-connection map."""
-        self.idle: dict[tuple[str, int], sqlite3.Connection] = {}
-
-
-_connection_cache = _ThreadConnectionCache()
-
-
-@contextmanager
-def persistent_connection(
-    path: Path, *, busy_timeout_ms: int = 5_000
-) -> Iterator[sqlite3.Connection]:
-    """Yield one reusable per-thread connection for repeated gateway operations.
-
-    Opening a SQLite connection pays file open, pragma, and WAL setup costs on
-    every call, which dominates hot request paths. This checkout keeps one idle
-    connection per thread, path, and timeout so sequential operations reuse it,
-    while overlapping checkouts on the same thread fall back to a fresh
-    connection instead of sharing an in-flight transaction.
-
-    Args:
-        path: Gateway database path.
-        busy_timeout_ms: Bounded lock wait in milliseconds.
-
-    Yields:
-        A configured connection; it returns to the idle cache on clean exit.
-    """
-    key = (str(path), busy_timeout_ms)
-    connection = _connection_cache.idle.pop(key, None)
-    if connection is None:
-        connection = connect_database(path, busy_timeout_ms=busy_timeout_ms)
-    try:
-        yield connection
-    except BaseException:
-        connection.close()
-        raise
-    if connection.in_transaction:
-        connection.close()
-        return
-    previous = _connection_cache.idle.get(key)
-    if previous is not None:
-        connection.close()
-        return
-    _connection_cache.idle[key] = connection
-
-
-def close_idle_connections() -> int:
-    """Close and forget the calling thread's cached idle connections.
-
-    A long-lived worker thread that stops servicing gateway operations calls
-    this before it exits, so the database descriptors held by its
-    ``persistent_connection`` cache release with the worker instead of
-    lingering for the life of the interpreter.
-
-    Returns:
-        Number of connections closed.
-    """
-    idle = _connection_cache.idle
-    closed = len(idle)
-    for connection in idle.values():
-        connection.close()
-    idle.clear()
-    return closed
 
 
 def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | None:

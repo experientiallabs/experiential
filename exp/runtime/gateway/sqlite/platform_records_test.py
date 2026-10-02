@@ -139,6 +139,20 @@ def test_disconnect_settlement_replay_keeps_unknown_cost_and_budget_fallback(
     assert settlement.estimated_cost_nano_usd is None
     assert settlement.settled_nano_usd == reservation.reserved_nano_usd == 300
     assert platform.settle_attempt(request) == settlement
+    # An estimate completing the same disconnect is a different settlement:
+    # it prices the meter and labels itself estimated, never observed.
+    estimated_request = request.model_copy(
+        update={
+            "terminal_event": terminal.model_copy(
+                update={
+                    "usage": GatewayUsage(input_tokens=19, output_tokens=max(output_tokens, 1)),
+                    "usage_estimated": True,
+                }
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="differs from durable accounting evidence"):
+        platform.settle_attempt(estimated_request)
     # Public event serialization deliberately omits the trusted native marker.
     # Once settled, even this replay must retain the durable unknown-cost outcome.
     public_replay = AttemptSettlementRequest.model_validate_json(request.model_dump_json())

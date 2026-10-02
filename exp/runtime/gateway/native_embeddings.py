@@ -30,6 +30,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
+from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -141,6 +142,7 @@ class NativeEmbeddingsMixin:
                 request=request,
                 deadline_monotonic=deadline,
             )
+            authorization = authorize_serving_model_chains(self._components, authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise authority_error(exc) from exc
         try:

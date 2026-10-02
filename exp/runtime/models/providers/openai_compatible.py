@@ -43,6 +43,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderRetryableResponseError,
     require_array,
     require_integer,
     require_object,
@@ -177,6 +178,8 @@ def openai_compatible_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
+    if request.json_object_output:
+        payload["response_format"] = {"type": "json_object"}
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
@@ -189,16 +192,17 @@ def openai_compatible_request(
 
 def openai_embedding_request(
     model_id: str,
-    texts: Sequence[str],
+    texts: Sequence[str] | Sequence[Sequence[int]],
     *,
     dimensions: int | None = None,
     encoding_format: Literal["float", "base64"] | None = None,
 ) -> JsonObject:
-    """Convert ordered text into one OpenAI-compatible embedding request.
+    """Convert ordered text or token inputs into an OpenAI-compatible embedding request.
 
     Args:
         model_id: Served embedding model id.
-        texts: Ordered visible text values to embed.
+        texts: Homogeneous ordered text values or token sequences to embed. Token IDs
+            are passed unchanged and must use the served model's tokenizer.
         dimensions: Optional output dimensionality the caller requested. Omitted
             from the wire when absent so the provider's native width applies.
         encoding_format: Optional caller vector encoding. Omitted when absent so
@@ -207,7 +211,10 @@ def openai_embedding_request(
     Returns:
         The OpenAI-compatible ``/embeddings`` request body.
     """
-    request: JsonObject = {"model": model_id, "input": list(texts)}
+    request: JsonObject = {
+        "model": model_id,
+        "input": [item if isinstance(item, str) else list(item) for item in texts],
+    }
     if dimensions is not None:
         request["dimensions"] = dimensions
     if encoding_format is not None:
@@ -266,7 +273,7 @@ def openai_compatible_response(
     """
     choices = require_array(payload.get("choices"), "choices")
     if not choices:
-        raise OpenAICompatibleResponseError("OpenAI-compatible response has no choices")
+        raise ProviderRetryableResponseError("OpenAI-compatible response has no choices")
     choice = require_object(choices[0], "choices[0]")
     message = require_object(choice.get("message"), "choices[0].message")
     if choice.get("finish_reason") in {"content_filter", "safety"} or isinstance(
@@ -285,7 +292,7 @@ def openai_compatible_response(
     try:
         output = AssistantAction(content=content, tool_calls=tool_calls)
     except ValueError as exc:
-        raise OpenAICompatibleResponseError(
+        raise ProviderRetryableResponseError(
             "OpenAI-compatible response has neither text nor a complete tool call"
         ) from exc
     return ModelResponse.completed(

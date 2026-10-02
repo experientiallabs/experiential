@@ -23,6 +23,7 @@ use crate::waterfall::CommittedAttempt;
 #[path = "settlement_observation.rs"]
 mod observation;
 pub(crate) use observation::Observation;
+use observation::StreamedOutput;
 
 /// Settle one guarded attempt as failed and release its owner lease.
 pub(crate) async fn settle_guarded_failure(
@@ -302,7 +303,12 @@ impl AttemptGuard {
     }
 
     pub(crate) fn begin_dial_observation(&mut self) -> Observation {
-        self.observation = Observation::default();
+        self.observation = self.observation.next_dial();
+        self.observation.clone()
+    }
+
+    /// Share the selected attempt's meter without another JSON boundary or token count.
+    pub(crate) fn capture_observation(&self) -> Observation {
         self.observation.clone()
     }
 
@@ -316,6 +322,10 @@ impl AttemptGuard {
                 && observed.usage.as_ref().is_some_and(Usage::has_token_counts),
             "input_tokens": observed.usage.as_ref().and_then(|usage| usage.input_tokens),
             "output_tokens": observed.usage.as_ref().and_then(|usage| usage.output_tokens),
+            "streamed_text_chars": observed.streamed_output.text.chars().count() as u64
+                + observed.streamed_output.text_overflow_chars,
+            "streamed_reasoning_chars": observed.streamed_output.reasoning.chars().count() as u64
+                + observed.streamed_output.reasoning_overflow_chars,
         });
         eprintln!("exp-gateway-native: {line}");
     }
@@ -443,12 +453,14 @@ impl AttemptGuard {
             self.web_search_requests,
             self.tool_search_requests,
         );
+        let argument = tier_provenance(argument, &observed.service_tier);
         let argument = disconnect_provenance(
             argument,
             self.dispatched,
             self.dispatched
                 && observed.terminal.is_none()
                 && failure.is_some_and(|failure| failure.failure_class == FailureClass::Cancelled),
+            &observed.streamed_output,
         );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
@@ -535,11 +547,38 @@ impl AttemptGuard {
 }
 
 /// Stamp trusted dispatch evidence without changing the base settlement vocabulary.
-fn disconnect_provenance(argument: String, dispatched: bool, incomplete: bool) -> String {
+///
+/// An incomplete meter also carries the generated output observed so far
+/// (always present, empty when nothing was generated) so the control plane
+/// can estimate the output the provider billed for with its own tokenizer
+/// instead of settling a caller's disconnect as unknown. Its absence means
+/// the data plane predates the field, and the control plane keeps the
+/// unknown policy.
+fn tier_provenance(argument: String, tier: &crate::service_tier::ServiceTierObservation) -> String {
+    let mut payload: Value = serde_json::from_str(&argument).expect("locally encoded settlement");
+    payload["service_tier"] = json!(tier);
+    compact_json(&payload)
+}
+
+fn disconnect_provenance(
+    argument: String,
+    dispatched: bool,
+    incomplete: bool,
+    streamed: &StreamedOutput,
+) -> String {
     let mut payload: Value =
         serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
     payload["dispatched"] = json!(dispatched);
     payload["usage_incomplete_due_to_disconnect"] = json!(incomplete);
+    if incomplete {
+        payload["streamed_output"] = json!({
+            "text": streamed.text,
+            "reasoning": streamed.reasoning,
+            "text_overflow_chars": streamed.text_overflow_chars,
+            "reasoning_overflow_chars": streamed.reasoning_overflow_chars,
+            "images": streamed.images,
+        });
+    }
     compact_json(&payload)
 }
 
@@ -618,9 +657,10 @@ impl Drop for AttemptGuard {
             // settlements identify only genuinely dispatched cancellation.
             let observed = self.observation.snapshot();
             disconnect_provenance(
-                argument,
+                tier_provenance(argument, &observed.service_tier),
                 self.dispatched,
                 self.dispatched && observed.terminal.is_none(),
+                &observed.streamed_output,
             )
         } else {
             argument

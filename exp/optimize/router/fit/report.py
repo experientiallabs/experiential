@@ -129,12 +129,18 @@ class CoverageReason(ContractModel):
 
 
 class HeldOutCoverage(ContractModel):
-    """All planned held-out row statuses retained without denominator collapse."""
+    """All planned held-out row statuses retained without denominator collapse.
+
+    Attributes:
+        incomplete_row_count: Nonnegative count of budget- or length-limited rows, default 0.
+            These retain incurred spend but have no judgment or fabricated zero score.
+    """
 
     planned_row_count: int = Field(ge=0)
     observed_row_count: int = Field(ge=0)
     completed_row_count: int = Field(ge=0)
     failed_row_count: int = Field(ge=0)
+    incomplete_row_count: int = Field(default=0, ge=0)
     not_run_row_count: int = Field(ge=0)
     missing_score_row_count: int = Field(ge=0)
     missing_cost_row_count: int = Field(ge=0)
@@ -154,6 +160,7 @@ class HeldOutCoverage(ContractModel):
         statuses = (
             self.observed_row_count
             + self.completed_row_count
+            + self.incomplete_row_count
             + self.failed_row_count
             + self.not_run_row_count
         )
@@ -362,6 +369,8 @@ def _held_out_coverage(dataset: EvaluationDataset) -> HeldOutCoverage:
         reason = None
         if row.status == "failed":
             reason = f"failed:{row.error.code if row.error is not None else 'unknown'}"
+        elif row.status == "incomplete":
+            reason = "incomplete"
         elif row.status == "not_run":
             reason = "not_run"
         elif row.score is None:
@@ -377,6 +386,7 @@ def _held_out_coverage(dataset: EvaluationDataset) -> HeldOutCoverage:
         observed_row_count=sum(row.status == "observed" for row in rows),
         completed_row_count=sum(row.status == "completed" for row in rows),
         failed_row_count=sum(row.status == "failed" for row in rows),
+        incomplete_row_count=sum(row.status == "incomplete" for row in rows),
         not_run_row_count=sum(row.status == "not_run" for row in rows),
         missing_score_row_count=sum(row.score is None for row in rows),
         missing_cost_row_count=sum(row.candidate_cost_usd is None for row in rows),

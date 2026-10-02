@@ -74,7 +74,7 @@ def optimize_model(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm an in-budget estimate when the shared policy requires it.",
+        help="Confirm the estimate, including any budget warning.",
     ),
     tinker_connection: str | None = typer.Option(
         None,
@@ -125,7 +125,7 @@ def optimize_model(
     Args:
         project: Local project ID below ``<root>/projects``.
         root: Local ``.exp`` root containing the project and ``models.toml``.
-        yes: Explicit confirmation for an in-budget estimate, never a validation or risk bypass.
+        yes: Explicit confirmation for the estimate, never a validation or risk bypass.
         tinker_connection: Native Tinker connection name used for first-run setup.
         tinker_api_key_env: Environment-variable name used by training and later sampling.
         base_model_alias: Local alias for the exact first-run Tinker base model.

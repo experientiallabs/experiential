@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, runtim
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
     AssistantAction,
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
     ToolCall,
     Usage,
 )
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.errors import ProviderResponseError
 from exp.runtime.models.providers.openai_compatible import parse_openai_wire_tool_call
 
@@ -228,6 +230,15 @@ class TinkerSamplingClient:
             A shared response carrying the served model identity and observed latency.
         """
         started_at = time.monotonic()
+        if request.json_object_output:
+            request = request.model_copy(
+                update={
+                    "messages": (
+                        ModelMessage(role="system", content=JSON_OBJECT_SYSTEM_INSTRUCTION),
+                        *request.messages,
+                    )
+                }
+            )
         sample = self._sampler.sample(request)
         return ModelResponse.completed(
             output=sample.output,

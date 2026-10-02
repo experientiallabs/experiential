@@ -1,11 +1,5 @@
-//! Provider wire dialects: SSE normalizers mirroring the event mappers in
-//! `exp.runtime.models.providers.streaming`. Upstream payloads are built by
-//! the python control plane with the shared `streaming_requests` builders and
-//! arrive fully formed in the admission response.
-//!
-//! This module owns the dialect registry, the dialect-selected frame decoder,
-//! and the shared `Normalizer` state machine; each provider's frame mapping
-//! lives in its own submodule as `Normalizer` methods.
+//! Wire registry, frame decoding, and normalization of Python-built upstream payloads.
+//! Provider frame mappings live in submodules as `Normalizer` methods.
 
 mod anthropic;
 mod bedrock;
@@ -212,20 +206,42 @@ impl Normalizer {
         self.request_words = words.into_iter().map(Into::into).collect();
     }
 
-    /// Build the provider-declared stream failure: classified by what the
-    /// provider said (a caller's over-long prompt is a 400 that relays the
-    /// sentence; a rate limit is a throttle; only a provider fault stays
-    /// `provider stream failed`), carrying its bounded detail, and emitting
-    /// the structured operator line naming it.
+    /// Select the rung's Chat Completions cache-write accounting: when set,
+    /// reported cache writes are a subset of reported cache reads (see
+    /// `OpenAiUsageAccumulator`). Only a Chat Completions normalizer honours
+    /// it; every other dialect keeps disjoint cache accounting.
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.openai_usage.set_writes_within_reads(
+            writes_within_reads && self.dialect == Dialect::OpenAiCompatible,
+        );
+    }
+
+    /// Report reads of the cache this attempt just created as cache writes.
+    /// Only the Gemini usage observer honours it.
+    pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
+        self.gemini_cache_writes =
+            written.filter(|_| self.dialect == Dialect::GeminiGenerateContent);
+    }
+
+    /// Whether the latest normalized meter replaces earlier ones instead of
+    /// merging by maximum. A writes-within-reads accumulator already coalesces
+    /// every report and lowers the read leg once a write arrives, so a
+    /// max-merge would restore the read tokens it moved to the write leg.
+    pub(crate) fn meter_replaces_earlier(&self) -> bool {
+        self.openai_usage.writes_within_reads()
+    }
+
+    /// Classify a provider failure and retain bounded detail; exact relay verdicts
+    /// require the raw envelope sentence, never a metadata-derived replacement.
     fn provider_stream_failure(
         &self,
         dialect: &str,
         code: Option<&str>,
-        message: Option<&str>,
+        raw_message: Option<&str>,
+        relayed_message: Option<&str>,
     ) -> Failure {
         let words: Vec<&str> = self.request_words.iter().map(String::as_str).collect();
-        // A relay's decode-failure sentence embeds the upstream error it could
-        // not parse: classify and relay THAT (see rejection_shapes).
+        let message = relayed_message.or(raw_message);
         let unwrapped = message.and_then(crate::rejection_shapes::relayed_decode_failure);
         let (code, message): (Option<&str>, Option<&str>) = match &unwrapped {
             Some((upstream_code, upstream_sentence)) => (
@@ -238,7 +254,11 @@ impl Normalizer {
         if let Some(detail) = &detail {
             log_provider_declared_failure(dialect, detail);
         }
-        let kind = crate::stream_errors::classify_stream_error(code, message);
+        let kind = crate::stream_errors::classify_stream_error_with_raw_message(
+            code,
+            message,
+            raw_message,
+        );
         // A Responses relay that refuses replayed encrypted reasoning INSIDE
         // the stream (200, then `response.failed`) carries the same repair
         // mark as the pre-stream 4xx, so the waterfall can strip and re-dial.
@@ -406,6 +426,7 @@ pub struct Normalizer {
     // terminal frame can then finish normally instead of failing malformed.
     emitted_output: bool,
     accumulated_tool_bytes: usize,
+    accumulated_image_bytes: usize,
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
     openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, Option<String>)>,
@@ -426,6 +447,10 @@ pub struct Normalizer {
     // provider supplies no tool index; assignment order mirrors the python
     // mapper's local counter.
     gemini_tool_index: u32,
+    gemini: gemini::StreamState,
+    // Tokens this attempt's own automatic Google cache create wrote; reported
+    // cache reads up to this count settle as writes read back in the same call.
+    gemini_cache_writes: Option<u64>,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
     // Private generation can advance without an authorized replay carrier.
@@ -450,6 +475,7 @@ pub struct Normalizer {
     // opted into its response metadata. First non-empty value wins; a label
     // only (bounded, printable ASCII), never content.
     upstream_provider: Option<String>,
+    pub(crate) service_tier: crate::service_tier::ServiceTierObservation,
     chat_logprobs: bool,
     responses_logprobs: bool,
 }
@@ -473,6 +499,7 @@ impl Normalizer {
             terminal: false,
             emitted_output: false,
             accumulated_tool_bytes: 0,
+            accumulated_image_bytes: 0,
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
             openai_output_items: BTreeMap::new(),
@@ -488,6 +515,8 @@ impl Normalizer {
             openai_usage: crate::events::OpenAiUsageAccumulator::default(),
             finish_reason: None,
             gemini_tool_index: 0,
+            gemini: gemini::StreamState::default(),
+            gemini_cache_writes: None,
             reasoning_content_route_sha256,
             unexposed_reasoning_progress: false,
             request_words: Vec::new(),
@@ -496,6 +525,7 @@ impl Normalizer {
             anthropic_stopped_tools: BTreeSet::new(),
             dropped_cut_call: false,
             upstream_provider: None,
+            service_tier: crate::service_tier::ServiceTierObservation::default(),
             chat_logprobs: false,
             responses_logprobs: false,
         }
@@ -537,12 +567,19 @@ impl Normalizer {
         self.upstream_provider = Some(trimmed.to_string());
     }
 
+    /// Bound aggregate image output even when images are delivered incrementally.
+    fn reserve_image_bytes(&mut self, additional: usize) -> Result<(), Failure> {
+        self.accumulated_image_bytes = self.accumulated_image_bytes.saturating_add(additional);
+        self.reserve_tool_bytes(0)
+    }
+
     /// Reserve retained-output budget for accumulated tool-argument text.
     fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
         self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
         if self
             .accumulated_tool_bytes
             .saturating_add(self.accumulated_summary_bytes)
+            .saturating_add(self.accumulated_image_bytes)
             > MAXIMUM_RETAINED_OUTPUT_BYTES
         {
             return Err(Failure::new(
@@ -559,6 +596,7 @@ impl Normalizer {
         if self
             .accumulated_tool_bytes
             .saturating_add(self.accumulated_summary_bytes)
+            .saturating_add(self.accumulated_image_bytes)
             > MAXIMUM_RETAINED_OUTPUT_BYTES
         {
             return Err(Failure::new(
@@ -641,59 +679,16 @@ impl Normalizer {
         ))
     }
 
-    /// Recover a Gemini stream that emitted content and then terminated
-    /// *abnormally* — a broken transport read, a malformed frame, or a decoder
-    /// error — rather than closing cleanly. `on_stream_end` covers the clean
-    /// end (last content frame, then EOF, no terminal frame); this covers the
-    /// abnormal end, where the underlying failure would otherwise discard a
-    /// real partial answer.
-    ///
-    /// Scoped to Gemini: Gemini uniquely ends legitimate turns without a
-    /// terminal frame, so a break after content is far more likely a
-    /// truncated-but-usable answer than corruption. When content was already
-    /// emitted, synthesize an `Incomplete` terminal (folding last-seen usage)
-    /// so the caller receives the partial content with an early-termination
-    /// finish reason and a retryable settlement (`incomplete`, not `failed`),
-    /// and the delivered tokens still bill. Before any content there is nothing
-    /// to preserve, so reclassify the abnormal end as a retryable transport
-    /// failure (retry same deployment, then fail over) instead of a hard
-    /// malformed reject. Any non-Gemini dialect, or a stream already terminated,
-    /// keeps the original failure unchanged.
-    ///
-    /// A retained-output overflow is never recovered: it is a deliberate gateway
-    /// limit (`provider_output_too_large`), not a provider abnormality, so
-    /// converting it to `Incomplete` would deliver and bill an over-limit partial
-    /// instead of surfacing the overflow — regardless of dialect or content.
-    pub fn recover_abnormal_end(&mut self, failure: Failure) -> Result<Vec<Event>, Failure> {
-        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
-            return Err(failure);
-        }
-        if self.terminal || self.dialect != Dialect::GeminiGenerateContent {
-            return Err(failure);
-        }
-        if !self.emitted_output {
-            return Err(Failure::new(
-                FailureClass::Transport,
-                "provider transport failed; retry the request",
-            )
-            .with_retry(true, true)
-            .with_provider_detail(failure.provider_detail));
-        }
-        let mut events = Vec::new();
-        if let Some(usage) = self.usage.take() {
-            events.push(Event::Usage(usage));
-        }
-        events.push(Event::Incomplete);
-        self.terminal = true;
-        Ok(events)
-    }
-
     /// Feed one decoded SSE frame; a terminal event ends the stream.
     pub fn feed(&mut self, frame: &SseEvent) -> Result<Vec<Event>, Failure> {
         if self.terminal {
             return Ok(Vec::new());
         }
-        let previous_usage = self.usage.clone();
+        let previous_usage = if self.meter_replaces_earlier() {
+            None
+        } else {
+            self.usage.clone()
+        };
         let result = match self.dialect {
             Dialect::OpenAiResponses => self.feed_openai_responses(frame),
             Dialect::AnthropicMessages => self.feed_anthropic(frame),

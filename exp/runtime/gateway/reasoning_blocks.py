@@ -40,11 +40,13 @@ class EncryptedReasoningBlock(ContractModel):
 
     ``encrypted_content`` is the provider-issued opaque payload a stateless
     caller (``store: false``) replays so the model can resume its own prior
-    reasoning; it must reach the provider byte-exact.
+    reasoning; it must reach the provider byte-exact. Some clients omit the
+    output item's ``id`` while preserving that encrypted payload, which is
+    sufficient for replay and remains absent on the provider wire.
     """
 
     kind: Literal["encrypted_reasoning"] = "encrypted_reasoning"
-    id: str = Field(min_length=1, max_length=256)
+    id: str | None = Field(default=None, min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
     output_index: int | None = Field(default=None, ge=0, exclude=True)
     status: Literal["in_progress", "completed", "incomplete"] | None = Field(

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+import json
 from collections.abc import Callable
 from typing import cast
 
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models.content import (
@@ -24,7 +26,10 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
-from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.gateway.replay_identity import (
+    canonical_request_sha256,
+    provider_replay_authority,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
@@ -1207,13 +1212,52 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
     ]
 
 
-def test_responses_decoder_rejects_reasoning_without_item_id() -> None:
-    """Opaque reasoning replay requires the provider-issued item identity."""
+def test_responses_decoder_accepts_encrypted_reasoning_without_item_id() -> None:
+    """Encrypted reasoning remains replayable when the client omits its item ID."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-reasoning",
+                    "status": "completed",
+                }
+            ],
+        }
+    )
+
+    block = decoded.request.messages[0].provider_reasoning[0]
+    assert isinstance(block, EncryptedReasoningBlock)
+    assert block.id is None
+    authority = provider_replay_authority(decoded.request)
+    assert authority is not None
+    authority_json = json.dumps(authority)
+    assert '"encrypted_content": "opaque-reasoning"' in authority_json
+    assert '"id": null' not in authority_json
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        decoded.request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    assert payload["input"] == [
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "opaque-reasoning",
+        }
+    ]
+
+
+def test_responses_decoder_rejects_reasoning_without_id_or_encrypted_content() -> None:
+    """A reasoning input still needs a usable ID or its encrypted replay payload."""
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_responses(
             {
                 "model": "coding",
-                "input": [{"type": "reasoning", "summary": [], "encrypted_content": "blob=="}],
+                "input": [{"type": "reasoning", "summary": []}],
             }
         )
 
@@ -2178,20 +2222,14 @@ def test_chat_decoder_accepts_image_parts_inside_a_tool_message() -> None:
     assert decoded.request.images == tool_message.images
 
 
-def test_chat_decoder_still_rejects_image_parts_on_an_assistant_message() -> None:
-    """No wire carries an image inside an assistant turn; the 400 names the tool exception."""
+def test_chat_decoder_preserves_generated_assistant_image_parts() -> None:
+    """A generated image can be replayed in a following chat turn."""
     part: JsonObject = {
         "type": "image_url",
         "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
     }
-
-    with pytest.raises(OpenAIProtocolError) as captured:
-        decode_chat(_copilot_tool_screenshot_body("assistant", part))
-
-    assert captured.value.detail.code == "invalid_parameter"
-    assert captured.value.detail.param == "messages.2"
-    assert "valid only for user messages" in captured.value.detail.message
-    assert "tool message may carry image parts" in captured.value.detail.message
+    decoded = decode_chat(_copilot_tool_screenshot_body("assistant", part))
+    assert decoded.request.messages[2].images[0].data == _PNG_BASE64
 
 
 @pytest.mark.parametrize(
@@ -2388,25 +2426,25 @@ def test_malformed_chat_image_url_is_rejected_with_its_field() -> None:
     assert error.value.detail.param == "messages.0.content.0.image_url"
 
 
-def test_assistant_image_parts_are_rejected() -> None:
-    """Only a caller message may carry an image."""
-    with pytest.raises(OpenAIProtocolError):
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
-                            }
-                        ],
-                    }
-                ],
-            }
-        )
+def test_assistant_image_only_history_is_preserved() -> None:
+    """Image-only assistant content remains available to the next turn."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert decoded.request.messages[0].images[0].data == _PNG_BASE64
 
 
 _PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
@@ -2706,12 +2744,54 @@ def test_embeddings_decoder_rejects_unknown_and_streaming_fields() -> None:
     assert "stream" in rejection.value.detail.message
 
 
-def test_embeddings_decoder_rejects_token_array_input() -> None:
-    """Pre-tokenized id arrays pass official validation but this text surface rejects them."""
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [([0, 42, 100257], ((0, 42, 100257),)), ([[1, 2], [3]], ((1, 2), (3,)))],
+)
+def test_embeddings_decoder_accepts_token_inputs(
+    value: JsonValue, expected: tuple[tuple[int, ...], ...]
+) -> None:
+    """A flat token sequence is one input; a token batch retains its item order."""
+    decoded = decode_embeddings({"model": "m", "input": value})
+    assert decoded.request.inputs == expected
+    assert len(decoded.request.inputs) == len(expected)
+
+
+def test_embeddings_decoder_accepts_explicit_nonstreaming() -> None:
+    """An explicit false is equivalent to omitting stream, not a streaming request."""
+    ordinary = decode_embeddings({"model": "m", "input": [[1, 2], [3]]})
+    explicit = decode_embeddings({"model": "m", "input": [[1, 2], [3]], "stream": False})
+    assert explicit == ordinary
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_embeddings_decoder_rejects_nonboolean_stream(value: JsonValue) -> None:
+    """Only the JSON boolean false can spell the non-streaming compatibility option."""
     with pytest.raises(OpenAIProtocolError) as rejection:
-        decode_embeddings({"model": "m", "input": [1, 2, 3]})
+        decode_embeddings({"model": "m", "input": "hello", "stream": value})
     assert rejection.value.status_code == 400
-    assert "input" in (rejection.value.detail.param or "")
+    assert rejection.value.detail.param == "stream"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[True], [False, 2], [1.0], [-1], [[1], []], [[True]], [[1.5]], ["a", 1], ["a", [1]], [1, [2]]],
+)
+def test_embeddings_decoder_rejects_malformed_token_inputs(value: JsonValue) -> None:
+    """Token inputs never coerce booleans, floats, negative IDs, or heterogeneous batches."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": value})
+    assert rejection.value.status_code == 400
+    assert (rejection.value.detail.param or "").startswith("input")
+
+
+@pytest.mark.parametrize("field", ["temperature", "tools", "prompt_cache_key", "gateway", "typo"])
+def test_embeddings_decoder_retains_strict_unknown_fields(field: str) -> None:
+    """Accepting stream false does not make unrelated request fields silently disappear."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": "hello", field: False})
+    assert rejection.value.status_code == 400
+    assert rejection.value.detail.param == field
 
 
 def test_embeddings_decoder_rejects_empty_and_malformed_inputs() -> None:
@@ -3289,9 +3369,7 @@ def test_non_default_values_of_accepted_no_op_fields_stay_named_rejections(
 
 
 def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values() -> None:
-    """Doubleword's tier passthrough (PR #728): valid tiers land on the
-    carrier for BYOK forwarding; unknown values (including Anthropic's
-    'fast', which is a speed selector, not an OpenAI tier) reject by name."""
+    """Valid tiers land on the carrier; Fast normalizes before provider forwarding."""
     chat = decode_chat(
         {
             "model": "coding",
@@ -3309,7 +3387,7 @@ def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values
             {
                 "model": "coding",
                 "messages": [{"role": "user", "content": "x"}],
-                "service_tier": "fast",
+                "service_tier": "turbo",
             },
             decode_chat,
         ),
@@ -4232,6 +4310,39 @@ def test_oversized_plaintext_reasoning_names_limit_and_remedy() -> None:
     assert error.value.detail.param == "messages.0.reasoning_content"
     assert "8,388,608 characters" in error.value.detail.message
     assert "Shorten" in error.value.detail.message
+
+
+@pytest.mark.parametrize("role", ("user", "system", "developer"))
+@pytest.mark.parametrize("status", ("completed", "in_progress", "incomplete"))
+def test_responses_input_status_does_not_require_output_identity(role: str, status: str) -> None:
+    """Official non-assistant input messages allow lifecycle status without an id."""
+    item: JsonObject = {
+        "type": "message",
+        "role": role,
+        "content": [{"type": "input_text", "text": "Follow this instruction."}],
+    }
+    plain = decode_responses({"model": "coding", "input": [item]})
+    with_status = decode_responses({"model": "coding", "input": [{**item, "status": status}]})
+    assert with_status.request == plain.request
+    assert with_status.request.messages[0].provider_item_id is None
+
+
+def test_responses_assistant_output_status_still_requires_identity() -> None:
+    """An output lifecycle marker does not become anonymous input history."""
+    with pytest.raises(OpenAIProtocolError, match="status requires an item id"):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "Done",
+                        "status": "completed",
+                    }
+                ],
+            }
+        )
 
 
 def test_responses_decoder_accepts_an_assistant_history_message_without_an_item_id() -> None:

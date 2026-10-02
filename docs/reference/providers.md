@@ -4,6 +4,16 @@ Experiential resolves models from a secret-free `.exp/models.toml` catalog. `Run
 only construction service. Provider names do not imply capabilities or prices. Every completion or
 embedding alias must declare the protocol features and token prices it uses.
 
+Python applications can set `RuntimeModelCatalog(catalog, http_timeout_seconds=120.0)`
+when a custom HTTP transport performs durable work around dispatch. This finite, positive
+timeout covers the entire client operation, including the injected transport. Its default
+is 60 seconds; completion requests keep a longer output-derived allowance when needed.
+Values above the operating system's `threading.TIMEOUT_MAX` are rejected before resolution,
+so configured timeouts remain representable in Python and native dispatch.
+`with_catalog()` preserves the setting. A transport that needs a shorter network deadline
+must enforce that deadline separately. Bedrock, Tinker, and native-only TypeSafe execution
+retain their own timeout policies.
+
 Configure connections with `exp config providers` or the first `exp build` on a clean checkout.
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with
@@ -54,6 +64,8 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Provider | Catalog `provider` | Credential | Endpoint identity |
 |---|---|---|---|
 | OpenAI | `openai` | `api_key_env` (suggested `OPENAI_API_KEY`) | Official OpenAI origin |
+| ChatGPT plan | `openai` with `subscription = "chatgpt"` | Browser sign-in stored under the connection ID; no `api_key_env` | `https://chatgpt.com/backend-api/codex` |
+| Claude plan | `anthropic` with `subscription = "anthropic"` | Sign-in through the operator's Anthropic OAuth app; no `api_key_env` | Official Anthropic origin |
 | OpenRouter | `openrouter` | `api_key_env` (suggested `OPENROUTER_API_KEY`) | Official OpenRouter origin |
 | Anthropic | `anthropic` | `api_key_env` (suggested `ANTHROPIC_API_KEY`) | Official Anthropic origin |
 | Gemini | `gemini` | `api_key_env` (suggested `GEMINI_API_KEY`) | Official Gemini origin |
@@ -67,6 +79,92 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
+
+## Claude Sonnet 5.5
+
+The exact `claude-sonnet-5-5` release uses adaptive thinking with a `high` default effort.
+Its supported effort levels are `low`, `medium`, `high`, `xhigh`, and `max`. Discovery keeps
+Sonnet 5's defaults separate. The published window is 1,000,000 tokens and synchronous output
+is bounded at 128,000 tokens. Base prices per million tokens are $2 input, $10 output, $0.20
+cache reads, $2.50 five-minute cache writes, and $4 one-hour cache writes; a hosted deployment
+must author its complete schedule rather than infer it from the provider name.
+
+On the gateway's Messages endpoint, turn off up-front thinking with the type-only object:
+
+```json
+{
+  "model": "sonnet",
+  "max_tokens": 512,
+  "thinking": {"type": "between_tools"},
+  "output_config": {"effort": "high"},
+  "messages": [{"role": "user", "content": "Summarize this in one sentence."}]
+}
+```
+
+Here `sonnet` is an alias configured for Sonnet 5.5 on an Anthropic Messages wire. Between-tools
+thinking works only at `low`, `medium`, or `high`; additional thinking fields, including null
+fields, are rejected. Use `output_config.effort` with this mode: the `reasoning` extension's
+depth controls are refused rather than allowed to replace it. A visibility-only `reasoning`
+object retains the mode. It is never translated to an effort-only request on another dialect.
+Use adaptive thinking for `xhigh` or `max`. `thinking.type=disabled` is rejected with a remedy
+naming `between_tools`, and explicit numeric thinking budgets are refused. The gateway's
+existing disclosed translation of bare `enabled` to `adaptive` remains available.
+
+Sonnet 5.5 does not support forced tool choice or non-default sampling controls. The gateway
+retains its existing capability-preservation policy: it prefers a route that preserves caller
+controls and otherwise discloses permitted substitutions, including forced tool choice to
+`auto`, rather than send a known-invalid upstream request. Use `auto` with strict tool schemas
+or structured output when schema validity is required. This does not guarantee a tool call.
+The exact model's forced-tool restriction applies on Messages, relayed OpenAI-compatible,
+and Bedrock wires alike.
+Assistant prefill is also unsupported: end the conversation with a user message. Admission
+excludes Sonnet 5.5 from a prefill request's route before dispatch and retains compatible rungs.
+
+Thinking blocks remain opaque and are replayed unchanged on their issuing wire. Keep history
+append-only: the provider binds Sonnet 5.5 blocks to their model, account, and conversation.
+The gateway does not claim support for new provider beta features merely because this model
+supports them. See the official [model specifications](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
+and [migration contract](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5).
+
+## Plan connections (ChatGPT and Claude)
+
+A connection may dispatch on a consumer plan instead of an API key: `subscription = "chatgpt"`
+(provider `openai`) or `subscription = "anthropic"` (provider `anthropic`). The connection names
+no credential and accepts no endpoint override. Its sign-in is an OAuth token pair stored under
+the connection ID (a `type = "oauth"` record in the user-only credential file for the local
+gateway; an embedder's own secret store when it supplies `subscription_token_source_factory`).
+The gateway mints a fresh bearer for every physical dispatch through the body-signing seam,
+refreshing five minutes ahead of expiry and persisting the rotated refresh token.
+
+Several plan connections certified into one exact-model pool are a rotating pool. Each response
+carries the plan's rolling usage windows (`x-codex-{primary,secondary}-*` for ChatGPT,
+`anthropic-ratelimit-unified-{5h,7d}-*` for Claude). The gateway reads them as a short and a
+long window, and a window at 100 percent (or a Claude `rejected` status) throttles that plan
+until the stated reset, so traffic moves to the next plan before the first 429 while sticky
+affinity keeps a conversation on one plan while it has room.
+
+```console
+exp config gateway provider add plan-a --provider openai --subscription chatgpt --root ROOT
+exp config gateway provider add plan-b --provider openai --subscription chatgpt \
+  --codex-auth-file ~/.codex/auth.json --non-interactive --root ROOT
+exp config gateway provider add claude-a --provider anthropic --subscription anthropic --root ROOT
+```
+
+A ChatGPT plan signs in through the public Codex OAuth client on its registered loopback callback
+(`localhost:1455`) or imports an existing Codex sign-in. An import hands the sign-in over: the
+refresh token rotates on every use, so sign Codex in again afterwards. The gateway sends its own
+`originator`. A Claude plan signs in through the OAuth application Anthropic issued to the
+OPERATOR of the gateway, configured with `EXP_ANTHROPIC_OAUTH_CLIENT_ID` and
+`EXP_ANTHROPIC_OAUTH_REDIRECT_URI` (optional: `_AUTHORIZE_URL`, `_TOKEN_URL`, `_SCOPES`, and
+`_BETA`, sent as `anthropic-beta` when the approval names one). Without that app a Claude plan
+connection refuses to resolve. The gateway never presents another client's identity: the app
+refuses Claude Code's public client ID and any `claude-code`/`claude-cli` identity header.
+
+Plan backends differ from the API-key origins. The ChatGPT backend streams only, requires provider
+storage off, and rejects `max_output_tokens`, so its wire profile drops the ceiling structurally.
+A plan rung pre-serializes its body for the per-dispatch bearer, so the engine's
+encrypted-reasoning replay repair does not run on it. Plan connections serve the gateway only;
+`exp config providers`, build, and optimize keep using API keys.
 
 ## TypeSafe SystemOne decisions
 
@@ -118,8 +216,15 @@ The response contains `id`, the requested public `model` alias, `answers` under 
 question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
 values, not assistant text. Probabilities and confidence must be finite values from 0 to 1,
 distributions must sum to 1 within validation tolerance, the selected choice must have the highest
-probability, and a score must match the distribution's weighted zero-based index. Missing answers, mismatched types or criteria, and missing or invalid
-usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
+probability, and a score must be consistent with the distribution's weighted zero-based index.
+Scores and probabilities retain their provider values: they are never recomputed or normalized.
+Exact numeric consistency uses a `1e-6` tolerance. If the score and every probability are
+hundredth-valued, the score may instead match a unit distribution within their independently
+rounded half-hundredth intervals, clipped to `[0, 1]`. This bounded check respects the shared
+probability mass and admits closed interval endpoints because rounding ties are unspecified.
+Finer-precision inconsistent scores remain invalid. Probability totals still use the `1e-6`
+normalization check; category winners must still have the greatest published probability.
+Missing answers, mismatched types or criteria, and missing or invalid usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
 
 Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
 name, and at most 262,144 bytes for both the raw body and the normalized request. Duplicate JSON

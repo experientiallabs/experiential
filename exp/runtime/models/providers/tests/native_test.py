@@ -456,6 +456,7 @@ def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> No
                     "usageMetadata": {
                         "promptTokenCount": 12,
                         "candidatesTokenCount": 6,
+                        "thoughtsTokenCount": 14,
                         "cachedContentTokenCount": 4,
                     },
                 },
@@ -490,7 +491,7 @@ def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> No
     )
     assert response.economics.usage == Usage(
         input_tokens=12,
-        output_tokens=6,
+        output_tokens=20,
         cached_input_tokens=4,
     )
     assert tuple(item.values for item in embeddings) == ((0.6, 0.8), (0.0, 1.0))
@@ -590,7 +591,7 @@ def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() 
     assert len(transport.requests) == 2
     assert (
         transport.requests[0].headers["Idempotency-Key"]
-        == transport.requests[1].headers["Idempotency-Key"]
+        != transport.requests[1].headers["Idempotency-Key"]
     )
 
 

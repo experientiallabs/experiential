@@ -6,9 +6,9 @@ from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.errors import RouterCompositionError
 from exp.simulation.build import BuildReviewReadiness, ProjectBuild, build_project
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 
 
 def completed_project_build(project: ProjectStore) -> ProjectBuildArtifacts:

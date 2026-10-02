@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput
+from exp.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from exp.common.judging.provenance import read_artifact_json
 from exp.common.models import ModelSnapshot
 from exp.common.rollouts import RolloutArtifact
@@ -135,3 +137,39 @@ def test_attribution_still_requires_both_candidate_and_attribution_input(tmp_pat
             attributed_candidate=candidate,
             allow_provider_free_source=True,
         )
+
+
+@pytest.mark.parametrize("omit_optional_fields", [False, True])
+def test_production_evidence_replays_across_package_revisions_without_rewriting(
+    tmp_path: Path,
+    omit_optional_fields: bool,
+) -> None:
+    """A new judge reuses identical trace evidence while changed evidence stays an error."""
+    store = _built_store(tmp_path)
+    setup = _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=1)
+    task, trace = plan.tasks[0], plan.traces[0]
+    legacy = (
+        patch(
+            "exp.optimize.router.judging.artifacts.canonical_json_bytes",
+            side_effect=lambda value: canonical_json_bytes(
+                value.model_dump(mode="json", exclude_none=True)
+            ),
+        )
+        if omit_optional_fields
+        else nullcontext()
+    )
+    with legacy:
+        first = write_production_rollout(store, setup, task, trace, _TIME, "old-package")
+    before = store.artifacts.read_bytes(first.artifact_id, "rollout.json")
+    replay = write_production_rollout(store, setup, task, trace, _TIME, "new-package")
+    assert replay == first
+    assert store.artifacts.read_bytes(first.artifact_id, "rollout.json") == before
+    changed = (
+        RolloutArtifact.model_validate_json(before)
+        .spans[0]
+        .model_copy(update={"payload": {"changed": True}})
+    )
+    with patch("exp.optimize.router.judging.artifacts._rollout_span", return_value=changed):
+        with pytest.raises(ManualJudgeError, match="conflicts"):
+            write_production_rollout(store, setup, task, trace, _TIME, "new-package")

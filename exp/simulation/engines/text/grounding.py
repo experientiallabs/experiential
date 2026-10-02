@@ -13,13 +13,14 @@ from exp.common.models import (
     EmbeddingCostReservation,
     NumericMeasurement,
     OperationEconomics,
+    combine_economics,
     verify_completion_reservation,
 )
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from exp.common.tasks import LoadedTaskSet, load_task_set
 from exp.runtime.models import ResolvedModel
 from exp.simulation.engines.text.errors import SimulationConfigurationError
-from exp.simulation.retrieval import TraceRAGRetriever
+from exp.simulation.retrieval import RAGQuery, TraceRAGRetriever
 from exp.simulation.specs import (
     SimulationCompletionContract,
     SimulationSpec,
@@ -172,6 +173,30 @@ def require_grounding_settings(
             "query-embedding price reservation differs from the active catalog"
         )
     return settings
+
+
+def estimate_retrieval_economics(
+    queries: tuple[RAGQuery, ...],
+    retriever: TraceRAGRetriever,
+    reservation: EmbeddingCostReservation,
+) -> OperationEconomics:
+    """Price exactly the retrieval calls needed for one candidate turn.
+
+    Args:
+        queries: Ordered queries for visible text or parallel tool actions.
+        retriever: Grounded project's immutable retrieval binding.
+        reservation: Frozen embedding price and retry bounds.
+
+    Returns:
+        Combined conservative query cost, or a zero bound when no retrieval is needed.
+        Missing economics from an actual query remain unknown.
+    """
+    if not queries:
+        return OperationEconomics(cost_usd=NumericMeasurement(value=0, provenance="estimated"))
+    return combine_economics(
+        tuple(retriever.estimate_query_economics(query, reservation) for query in queries),
+        require_complete_usage=False,
+    )
 
 
 def maximum_query_reservation(

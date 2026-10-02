@@ -6,10 +6,9 @@ alias points at a local OpenAI-compatible SSE mock upstream. The tests drive
 ``POST /v1/messages`` with Anthropic-shaped requests through the real Rust
 data plane and shared python control plane.
 
-The Anthropic passthrough upstream dialect is deliberately not driven here:
-``anthropic`` is a fixed-origin provider whose connection config rejects a
-custom ``base_url``, so it cannot be pointed at a loopback mock without
-weakening that production invariant.
+Budget tests redirect only an already-admitted fixed-origin destination to
+loopback. Decoding, route validation, frozen payloads, dispatch and settlement
+remain real; provider configuration still enforces its production origin.
 """
 
 from __future__ import annotations
@@ -75,22 +74,19 @@ _DRIVER_SOURCE = textwrap.dedent(
             environment=environment,
         )
         control_plane_type = NativeControlPlane
-        if "qwen_mock_url" in config:
-            class LoopbackQwenControlPlane(NativeControlPlane):
+        if "mock_destination" in config:
+            class LoopbackControlPlane(NativeControlPlane):
                 """Redirect only the admitted network destination to the local mock."""
 
                 def admit(self, argument: str) -> str:
                     """Keep real decoding, admission and frozen payloads; replace the URL."""
                     admitted = json.loads(super().admit(argument))
                     for rung in admitted["route"]:
-                        assert rung["url"] == (
-                            "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
-                            "/compatible-mode/v1/chat/completions"
-                        )
-                        rung["url"] = config["qwen_mock_url"]
+                        assert rung["url"] == config["expected_destination"]
+                        rung["url"] = config["mock_destination"]
                     return json.dumps(admitted)
 
-            control_plane_type = LoopbackQwenControlPlane
+            control_plane_type = LoopbackControlPlane
         control_plane = control_plane_type(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
@@ -261,6 +257,40 @@ def _zero_output_terminal_frames(finish_reason: str) -> bytes:
     )
 
 
+def _anthropic_budget_frames(model: str) -> bytes:
+    """Return a complete Anthropic text stream with terminal usage."""
+    events = (
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg-budget",
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "usage": {"input_tokens": 9, "output_tokens": 0},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hello world"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 4},
+        },
+        {"type": "message_stop"},
+    )
+    return b"".join(
+        b"event: " + str(event["type"]).encode() + b"\n" + _sse_frame(event) for event in events
+    )
+
+
 class _SseUpstream(BaseHTTPRequestHandler):
     """OpenAI-compatible SSE mock whose shape is selected by the prompt."""
 
@@ -273,6 +303,38 @@ class _SseUpstream(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length))
         with self.payloads_lock:
             self.payloads.append(payload)
+        if self.path == "/v1/gemini":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(
+                _sse_frame(
+                    {
+                        "candidates": [
+                            {
+                                "content": {"role": "model", "parts": [{"text": "hello world"}]},
+                                "finishReason": "STOP",
+                                "index": 0,
+                            }
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 9,
+                            "candidatesTokenCount": 4,
+                            "thoughtsTokenCount": 2,
+                            "totalTokenCount": 15,
+                        },
+                    }
+                )
+            )
+            self.wfile.flush()
+            return
+        if self.path == "/v1/messages":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(_anthropic_budget_frames(payload["model"]))
+            self.wfile.flush()
+            return
         prompt = payload["messages"][-1]["content"]
         if prompt in {"reject-param-token", "reject-dump-token"}:
             # A client error the caller can act on, and one whose message is a
@@ -957,7 +1019,11 @@ def _engine(
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
-    qwen_budget = getattr(request, "param", None) == "qwen-budget"
+    variant = str(getattr(request, "param", ""))
+    qwen_budget = variant.startswith("qwen-budget")
+    qwen_model = variant.partition(":")[2] or "qwen3.8-max"
+    gemini_budget = variant == "gemini-budget"
+    anthropic_route = variant.startswith("anthropic:")
     root = tmp_path_factory.mktemp("native-messages-root")
     with _SseUpstream.payloads_lock:
         _SseUpstream.payloads.clear()
@@ -972,12 +1038,25 @@ def _engine(
             if qwen_budget
             else mock_url
         ),
-        provider_model="qwen3.8-max" if qwen_budget else "provider-model-exact",
+        provider="anthropic"
+        if anthropic_route
+        else "gemini"
+        if gemini_budget
+        else "openai-compatible",
+        provider_model=(
+            variant.partition(":")[2]
+            if anthropic_route
+            else "gemini-2.5-flash"
+            if gemini_budget
+            else qwen_model
+            if qwen_budget
+            else "provider-model-exact"
+        ),
         capabilities=ModelCapabilities(
             chat_max_tokens_field="max_completion_tokens",
-            maximum_output_tokens=128,
+            maximum_output_tokens=8192 if anthropic_route or qwen_budget or gemini_budget else 128,
             maximum_temperature=1.0,
-            supports_reasoning=qwen_budget,
+            supports_reasoning=qwen_budget or anthropic_route or gemini_budget,
         ),
     )
     driver = root / "native_messages_driver.py"
@@ -986,7 +1065,30 @@ def _engine(
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-            **({"qwen_mock_url": f"{mock_url}/chat/completions"} if qwen_budget else {}),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/chat/completions",
+                    "expected_destination": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                }
+                if qwen_budget
+                else {}
+            ),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/gemini",
+                    "expected_destination": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                }
+                if gemini_budget
+                else {}
+            ),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/messages",
+                    "expected_destination": "https://api.anthropic.com/v1/messages",
+                }
+                if anthropic_route
+                else {}
+            ),
         }
     )
     stderr_log = root / "driver-stderr.log"
@@ -3062,3 +3164,331 @@ def test_chat_thinking_budget_survives_native_http_dispatch(
     assert "max_output_tokens" not in captured[0]
     assert "reasoning_effort" not in captured[0]
     assert "reasoning" not in captured[0]
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high"))
+def test_sonnet_55_between_tools_survives_native_http_dispatch(
+    engine: _ServingEngine, stream: bool, effort: str | None
+) -> None:
+    """The served Messages endpoint preserves mode and effort through native dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "between_tools"},
+        "reasoning": {"exclude": True},
+        "stream": stream,
+    }
+    if effort is not None:
+        body["output_config"] = {"effort": effort}
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "event: message_stop" in response.text
+        assert "hello world" in response.text
+    else:
+        assert response.json()["content"] == [{"type": "text", "text": "hello world"}]
+        assert response.json()["stop_reason"] == "end_turn"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "claude-sonnet-5-5"
+    assert captured[0]["thinking"] == {"type": "between_tools"}
+    if effort is not None:
+        assert captured[0]["output_config"] == {"effort": effort}
+    else:
+        assert captured[0].get("output_config", {}) in ({}, {"effort": "high"})
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
+)
+@pytest.mark.parametrize(
+    "controls",
+    (
+        {"thinking": {"type": "disabled"}},
+        {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+        {"thinking": {"type": "between_tools"}, "output_config": {"effort": "xhigh"}},
+        {"thinking": {"type": "between_tools"}, "output_config": {"effort": "max"}},
+        {"thinking": {"type": "between_tools"}, "reasoning": {"effort": "max"}},
+        {"thinking": {"type": "between_tools", "display": "omitted"}},
+        {
+            "messages": [
+                {"role": "user", "content": "Say a colour."},
+                {"role": "assistant", "content": "The colour is"},
+            ]
+        },
+    ),
+)
+def test_sonnet_55_invalid_input_never_dispatches(
+    engine: _ServingEngine, controls: JsonObject
+) -> None:
+    """Invalid thinking controls and assistant prefills fail before upstream dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json={
+            "model": "coding",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}],
+            **controls,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),), indirect=True
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("output_limit", (None, 8192))
+def test_chat_nested_budget_survives_native_http_dispatch(
+    engine: _ServingEngine,
+    stream: bool,
+    output_limit: int | None,
+) -> None:
+    """The served Chat endpoint delivers the exact budget on the Anthropic wire."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "stream": stream,
+    }
+    if output_limit is not None:
+        body["max_tokens"] = output_limit
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        assert "hello world" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "claude-sonnet-4-6"
+    assert captured[0]["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    assert captured[0]["max_tokens"] == 8192
+    assert "reasoning_effort" not in captured[0]
+    assert "thinking_budget" not in captured[0]
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),), indirect=True
+)
+def test_chat_nested_budget_above_rung_default_never_dispatches(engine: _ServingEngine) -> None:
+    """An omitted caller cap cannot bypass the selected rung's output bound."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "thinking.budget_tokens"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []
+
+
+@pytest.mark.parametrize(
+    "engine",
+    (
+        pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),
+        "gemini-budget",
+        "qwen-budget",
+        "qwen-budget:qwen3.8-27b",
+        "qwen-budget:glm-5.2",
+        "qwen-budget:kimi-k2.5",
+    ),
+    indirect=True,
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("control", ("thinking_budget", "thinking"))
+def test_numeric_budget_cross_provider_http_dispatch(
+    engine: _ServingEngine,
+    stream: bool,
+    control: str,
+) -> None:
+    """The same client budget is frozen into each provider's exact native control."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8192,
+        "stream": stream,
+    }
+    body[control] = (
+        2048 if control == "thinking_budget" else {"type": "enabled", "budget_tokens": 2048}
+    )
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert (
+            "".join(
+                choice.get("delta", {}).get("content", "")
+                for chunk in chunks
+                for choice in chunk.get("choices", [])
+            )
+            == "hello world"
+        )
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    payload = captured[0]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    elif "thinking" in payload:
+        assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        assert payload["max_tokens"] == 8192
+    else:
+        assert payload["thinking_budget"] == 2048
+        if payload["model"] == "qwen3.8-max":
+            assert payload["max_completion_tokens"] == 8192
+            assert "max_tokens" not in payload
+        else:
+            assert payload["max_tokens"] == 6144
+            assert "max_completion_tokens" not in payload
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget",), indirect=True)
+@pytest.mark.parametrize("budget", (0, -1, 24576))
+def test_gemini_sentinels_survive_native_http(engine: _ServingEngine, budget: int) -> None:
+    """Zero and dynamic thinking remain explicit controls rather than omissions."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    assert payload["generationConfig"] == {
+        "thinkingConfig": {"thinkingBudget": budget},
+        "maxOutputTokens": 8192,
+    }
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget", "qwen-budget:kimi-k2.5"), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+def test_messages_budget_crosses_native_non_anthropic_routes(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Messages clients preserve nested budgets when the selected native wire supports them."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8192,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        events = [
+            json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+        assert "".join(event.get("delta", {}).get("text", "") for event in events) == "hello world"
+        assert events[-1]["type"] == "message_stop"
+    else:
+        assert response.json()["content"][0]["text"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    else:
+        assert payload["thinking_budget"] == 2048
+        assert payload["max_tokens"] == 6144
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize(
+    "engine,budget",
+    (("gemini-budget", 24577), ("qwen-budget:kimi-k3", 2048), ("qwen-budget:glm-5.3", 2048)),
+    indirect=("engine",),
+)
+def test_incapable_numeric_budget_never_reaches_upstream(
+    engine: _ServingEngine, budget: int
+) -> None:
+    """An invalid range or a model that ignores budgets fails before network dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+            "max_tokens": 8192,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "thinking_budget"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []

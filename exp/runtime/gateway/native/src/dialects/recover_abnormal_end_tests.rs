@@ -89,7 +89,10 @@ fn an_already_terminal_stream_keeps_the_original_failure() {
         event: None,
         data: serde_json::json!({"candidates": [{"finishReason": "STOP"}]}).to_string(),
     };
-    normalizer.feed(&terminal).expect("terminal normalizes");
+    normalizer.feed(&terminal).expect("finish normalizes");
+    normalizer
+        .on_stream_end()
+        .expect("transport finalizes the declared finish");
     assert!(normalizer.saw_terminal());
     let failure = normalizer
         .recover_abnormal_end(incoming())

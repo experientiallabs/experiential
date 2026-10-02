@@ -10,6 +10,11 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, ModelCatalog
 from exp.common.models.dispatch_policy import FailoverMode, GatewayThrottleRedialPolicy
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    expand_model_chain,
+)
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.common.models.model import ModelAlias, ModelCapabilities
 from exp.common.models.nano_usd_upgrade import (
@@ -142,11 +147,16 @@ class ExactModelPool(ContractModel):
 
 
 class NormalizedGatewayCatalog(ContractModel):
-    """Immutable gateway deployment and singleton-pool view of one model catalog."""
+    """Immutable gateway deployment and singleton-pool view of one model catalog.
+
+    Attributes:
+        model_chains: Validated ordered canonical-model chains; empty for plain catalogs.
+    """
 
     schema_version: int = Field(default=SNAPSHOT_SCHEMA_VERSION, ge=1)
     deployments: tuple[ExactModelDeployment, ...] = ()
     pools: tuple[ExactModelPool, ...] = ()
+    model_chains: tuple[GatewayModelChain, ...] = ()
 
     @model_validator(mode="after")
     def _require_closed_pool_references(self) -> NormalizedGatewayCatalog:
@@ -177,7 +187,63 @@ class NormalizedGatewayCatalog(ContractModel):
                         f"exact-model pool {pool.pool_id!r} contains deployment "
                         f"{deployment_id!r} for another exact model"
                     )
+        chains = {chain.model_id: chain for chain in self.model_chains}
+        if len(chains) != len(self.model_chains):
+            raise ValueError("model chain canonical IDs must be unique")
+        pools = {pool.pool_id: pool for pool in self.pools}
+        for chain in self.model_chains:
+            pool = pools.get(chain.pool_id)
+            if pool is None and not chain.available and not chain.rungs:
+                continue
+            if pool is None or pool.exact_model_id != chain.model_id:
+                raise ValueError("model chain must name its same-exact certified pool")
+            for rung in chain.rungs:
+                if rung.kind == "deployment" and rung.deployment_id not in pool.deployment_ids:
+                    raise ValueError("model chain deployment must belong to its certified pool")
+        if chains:
+            complete = self.chains_by_model()
+            for model_id in chains:
+                expand_model_chain(model_id, complete)
         return self
+
+    def requires_model_chain_authority(self, *, pool_id: str) -> bool:
+        """Classify one authoritative selected pool, including explicitly unavailable chains.
+
+        Unrelated chains in a shared document do not change this pool's serving
+        semantics. Hosts separately enforce the selected alias's retained floor.
+        Unknown pools and a chain attached to another same-model pool are errors,
+        never evidence of an independently plain route.
+        """
+        pool = next((item for item in self.pools if item.pool_id == pool_id), None)
+        if pool is None:
+            raise ValueError("authorized pool is absent from the exact catalog")
+        chain = next(
+            (item for item in self.model_chains if item.model_id == pool.exact_model_id), None
+        )
+        if chain is None:
+            return False
+        if chain.pool_id != pool.pool_id:
+            raise ValueError("authorized chain root does not match its exact pool")
+        return True
+
+    def chains_by_model(self) -> dict[str, GatewayModelChain]:
+        """Index authored chains, filling unambiguous direct-only model defaults."""
+        chains = {chain.model_id: chain for chain in self.model_chains}
+        by_model: dict[str, list[ExactModelPool]] = {}
+        for pool in self.pools:
+            by_model.setdefault(pool.exact_model_id, []).append(pool)
+        for model_id, pools in by_model.items():
+            if model_id not in chains and len(pools) == 1:
+                pool = pools[0]
+                chains[model_id] = GatewayModelChain(
+                    model_id=model_id,
+                    pool_id=pool.pool_id,
+                    revision="direct",
+                    rungs=tuple(
+                        GatewayDeploymentRung(deployment_id=d) for d in pool.deployment_ids
+                    ),
+                )
+        return chains
 
     def identity_sha256(self) -> Sha256:
         """Return the deterministic digest pinned by a later gateway activation.
@@ -272,6 +338,9 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
     return NormalizedGatewayCatalog(
         deployments=tuple(deployments),
         pools=tuple(pools),
+        model_chains=tuple(
+            catalog.gateway_model_chains[key] for key in sorted(catalog.gateway_model_chains)
+        ),
     )
 
 

@@ -8,14 +8,13 @@ use crate::errors::{Failure, FailureClass, PublicError};
 
 const REFUSAL_MESSAGE: &str = "provider refused the request";
 
-/// The sanitized failure for provider refusals on this surface, mirroring
-/// `refusal_failure` in the python encoder.
+/// The sanitized failure for provider refusals on this surface.
 pub fn refusal_failure() -> Failure {
     Failure::new(FailureClass::Refusal, REFUSAL_MESSAGE)
 }
 
-/// Render one sanitized public error as the Anthropic error envelope,
-/// mirroring `anthropic_error_body`: status decides the Anthropic type
+/// Render one sanitized public error as the Anthropic error envelope:
+/// status decides the Anthropic type
 /// first, then the OpenAI envelope type, and a present `param` pointer is
 /// folded into the message text.
 pub fn anthropic_error_body(error: &PublicError) -> Value {

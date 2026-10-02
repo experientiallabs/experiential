@@ -21,9 +21,10 @@ pub struct AggregatedMessage {
     pub tool_names: Vec<String>,
 }
 
-/// Build one non-streaming Anthropic message from ordered events, mirroring
-/// the python `completed_messages_body`. Provider refusal content has no
-/// Anthropic message shape, so it aggregates as a sanitized failure.
+/// Build one non-streaming Anthropic message from ordered events (the
+/// aggregate counterpart of `MessagesSseEncoder`). Provider refusal content
+/// has no Anthropic message shape, so it aggregates as a sanitized failure.
+#[cfg(test)]
 pub fn completed_messages_body(
     request_id: &str,
     model: &str,
@@ -212,8 +213,7 @@ pub fn completed_messages_body_with_reasoning(
                     saw_tool_use = true;
                     // The raw argument text was validated as one JSON object
                     // by the normalizer; preserve_order keeps its key order,
-                    // matching the python engine's parsed-object
-                    // serialization.
+                    // so the parsed object serializes in the provider's order.
                     let input: Value = serde_json::from_str(&call.raw_arguments)
                         .map_err(|_| PublicError::internal())?;
                     slots[*position] = Some(json!({

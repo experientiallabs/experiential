@@ -82,10 +82,4 @@ mod tests {
         // Nothing handled since the last trim.
         assert!(!trim_due(64, 64, 0, 10, 10));
     }
-
-    #[test]
-    fn release_free_memory_is_safe_to_call() {
-        release_free_memory();
-        release_free_memory();
-    }
 }

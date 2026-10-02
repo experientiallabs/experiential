@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_catalog import ExactModelDeployment, NormalizedGatewayCatalog
 from exp.common.models.model import BillingSource
-from exp.runtime.models import ResolvedModel
+from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 
@@ -54,6 +55,9 @@ def _resolved_wire_profile(
         )
         return replace(
             profile,
+            credential_receipt=runtime_model.credential_receipt
+            if not profile.signs_request_body
+            else None,
             model_id=profile.model_id or runtime_model.snapshot.model_id,
             supports_responses_logprobs=(
                 gateway_capabilities.supports_responses_logprobs
@@ -140,3 +144,51 @@ def _require_deployment_identity(
         )
     ):
         raise ValueError("resolved runtime client differs from the frozen gateway deployment")
+
+
+def alias_native_blockers(
+    alias: str,
+    normalized: NormalizedGatewayCatalog,
+    runtime_catalog: RuntimeModelCatalog,
+) -> tuple[str, ...]:
+    """Name why the native engine cannot serve one alias, or ``()`` if it can.
+
+    Every deployment reachable from the alias's catalog snapshot (direct pools
+    and project candidates alike) must resolve to a provider client with a
+    native wire dialect and a valid wire contract, since no other engine exists
+    to serve the request. This is the per-alias servability check the catalog
+    build runs so a structurally unservable alias is excluded (marked
+    UNAVAILABLE) rather than aborting the whole build; the same check names the
+    fleet-level startup blockers.
+
+    Args:
+        alias: Public alias name, used only for the returned reason text.
+        normalized: The alias's normalized catalog snapshot.
+        runtime_catalog: The frozen runtime catalog for the alias's revision.
+
+    Returns:
+        Display-safe reasons the alias cannot be served natively, deduplicated,
+        or an empty tuple when every deployment resolves to a native wire.
+    """
+    reasons: list[str] = []
+    for deployment in normalized.deployments:
+        try:
+            resolved = runtime_catalog.resolve(deployment.source_alias)
+        except Exception:  # noqa: BLE001 - name the deployment, not the internals.
+            reasons.append(f"deployment {deployment.deployment_id!r} does not resolve")
+            continue
+        client = resolved.client
+        if not isinstance(client, NativeWireClient):
+            reasons.append(f"provider {deployment.provider!r} has no native wire profile")
+            continue
+        try:
+            _resolved_wire_profile(deployment, resolved)
+        except ProviderCapabilityError as exc:
+            if exc.capability != "native_data_plane":
+                raise
+            reasons.append(f"provider {deployment.provider!r} has no native dialect implementation")
+        except GatewayWireContractError:
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} has an invalid reasoning wire contract"
+            )
+    return tuple(dict.fromkeys(reasons))

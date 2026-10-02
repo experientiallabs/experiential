@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,7 @@ import pytest
 
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -32,6 +34,12 @@ from exp.runtime.gateway.group_commit import (
     abandoned_write_outcome,
 )
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
+from exp.runtime.gateway.model_chain_authority import (
+    ChainOperation,
+    ModelChainAuthorityError,
+    SQLiteChainPreflight,
+)
+from exp.runtime.gateway.snapshot_file import PreparedSnapshotFile
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 _CATALOG_DIGEST = "a" * 64
@@ -152,6 +160,166 @@ def _execution(authorization: AuthorizationSnapshot) -> ExecutionSnapshot:
         pool_id="pool-one",
         deployment_ids=("deployment-one",),
     )
+
+
+@pytest.mark.parametrize("outcome", ["success", "refusal", "batch_failure", "cancelled"])
+def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outcome: str) -> None:
+    """The writer owns all retained proof handles through cancellation, refusal and rollback."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    (tmp_path / "snapshot-one").write_text("{}")
+    authorization = _authorize(store, clock, raw_key, "proof-lifetime")
+    original = core.prepare_chain_authority
+    proofs: list[SQLiteChainPreflight] = []
+    entered, release = threading.Event(), threading.Event()
+
+    @contextmanager
+    def tracked(
+        auth: AuthorizationSnapshot,
+        operation: ChainOperation,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> Iterator[SQLiteChainPreflight | None]:
+        """Pause only outside the transaction and retain each real production proof."""
+        with original(auth, operation, connection=connection) as proof:
+            assert proof is not None
+            proofs.append(proof)
+            entered.set()
+            if outcome == "cancelled":
+                assert release.wait(5)
+            yield proof
+
+    def fail_fence(prepared: PreparedSnapshotFile) -> None:
+        """Refuse an actual apply fence after the real out-of-lock preparation completed."""
+        if entered.is_set():
+            raise ValueError("controlled generation change")
+
+    def fail_batch(connection: sqlite3.Connection, batch: list[object]) -> None:
+        """Simulate a writer failure after preflight but before a transaction starts."""
+        raise sqlite3.OperationalError("controlled writer failure")
+
+    grouped = GroupCommitAttemptLedger(core)
+    try:
+        with mock.patch.object(core, "prepare_chain_authority", tracked):
+            if outcome == "batch_failure":
+                with (
+                    mock.patch.object(grouped, "_commit_batch", fail_batch),
+                    pytest.raises(sqlite3.OperationalError),
+                ):
+                    SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+            elif outcome == "refusal":
+                with (
+                    mock.patch.object(PreparedSnapshotFile, "validate_current", fail_fence),
+                    pytest.raises(ModelChainAuthorityError),
+                ):
+                    SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+            elif outcome == "cancelled":
+
+                async def cancel_waiter() -> None:
+                    """Cancel only the waiter, then let its queued operation finish durably."""
+                    task = asyncio.create_task(grouped.accept_request(authorization=authorization))
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    release.set()
+                    await grouped.flush()
+
+                asyncio.run(cancel_waiter())
+            else:
+                SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+    finally:
+        release.set()
+        grouped.close()
+    assert proofs and all(proof._closed for proof in proofs)
+    assert all(
+        file._closed and (file._stream is None or file._stream.closed)
+        for proof in proofs
+        for file in proof.files
+    )
+    with sqlite3.connect(core.database_path) as connection:
+        count = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0]
+    assert count == (1 if outcome in ("success", "cancelled") else 0)
+    with pytest.raises(RuntimeError, match="closed"):
+        SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+    assert len(proofs) == 1
+
+
+@pytest.mark.parametrize("batch_size", [1, 16])
+def test_group_preflight_reuses_the_writer_database_connection(
+    tmp_path: Path,
+    batch_size: int,
+) -> None:
+    """Prepared batch size never allocates cached or concurrently held reader connections."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    authorizations = [
+        _authorize(store, clock, raw_key, f"request-{index}") for index in range(batch_size)
+    ]
+    entered, release = threading.Event(), threading.Event()
+    grouped = GroupCommitAttemptLedger(core, max_batch_size=batch_size)
+
+    def pause(connection: sqlite3.Connection) -> None:
+        """Hold a preceding writer operation while the next exact batch is queued."""
+        entered.set()
+        assert release.wait(5)
+
+    blocker = grouped._enqueue(pause)
+    assert entered.wait(5)
+    try:
+        with mock.patch.object(core, "_connect", wraps=core._connect) as reader_checkouts:
+            writes = [
+                grouped._enqueue_chain(
+                    auth,
+                    "accept",
+                    lambda connection, proof, auth=auth: core.apply_accept_request(
+                        connection, authorization=auth, chain_preflight=proof
+                    ),
+                )
+                for auth in authorizations
+            ]
+            release.set()
+            blocker.result(timeout=5)
+            for write in writes:
+                write.result(timeout=5)
+            assert reader_checkouts.call_count == 0
+    finally:
+        release.set()
+        grouped.close()
+
+
+def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:
+    """Every JSON classification can obtain another write lock because BEGIN has not started."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    (tmp_path / "snapshot-one").write_text("{}")
+    authorization = _authorize(store, clock, raw_key, "before-begin")
+    original = authority.json.loads
+    reads = 0
+
+    def classify(content: bytes) -> dict[str, object]:
+        """Probe actual writer-lock availability around each real catalog parse."""
+        nonlocal reads
+        with sqlite3.connect(core.database_path, timeout=0) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+        reads += 1
+        return original(content)
+
+    grouped = GroupCommitAttemptLedger(core)
+    try:
+        with mock.patch.object(authority.json, "loads", classify):
+            sync = SyncGroupCommitLedger(grouped)
+            sync.accept_request(authorization=authorization)
+            sync.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+            )
+    finally:
+        grouped.close()
+    assert reads == 1  # Reservation reuses only the already classified, still-current plain pair.
 
 
 def test_full_request_lifecycle_commits_durably_through_group_writer(tmp_path: Path) -> None:
@@ -569,8 +737,10 @@ def test_cancelled_write_task_yields_none() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("writes", [None, 0, 3])
 def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
     tmp_path: Path,
+    writes: int | None,
 ) -> None:
     """The hosted-ledger seam probes the host's apply hook, not the engine facade.
 
@@ -582,6 +752,8 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     recorded: list[dict[str, object]] = []
     original = core.apply_finish_attempt
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
+    usage = GatewayUsage(input_tokens=10, output_tokens=4, cache_creation_input_tokens=writes)
 
     def legacy_apply(
         connection: sqlite3.Connection,
@@ -598,6 +770,8 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        assert terminal_event is not None and terminal_event.usage == usage
+        assert first_token_at == observed
         recorded.append({"attempt_id": attempt_id, "finalize": finalize_request})
         original(
             connection,
@@ -631,9 +805,10 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
             terminal_event=GatewayEvent(
                 kind=GatewayEventKind.COMPLETED,
                 sequence_number=1,
-                usage=GatewayUsage(input_tokens=10, output_tokens=4),
+                usage=usage,
             ),
             failure=None,
+            first_token_at=observed,
             upstream_provider="Azure",
         )
         facade.flush()
@@ -666,9 +841,10 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         terminal_event=GatewayEvent(
             kind=GatewayEventKind.COMPLETED,
             sequence_number=1,
-            usage=GatewayUsage(input_tokens=10, output_tokens=4),
+            usage=usage,
         ),
         failure=None,
+        first_token_at=observed,
         upstream_provider="Azure",
     )
     facade.flush()
@@ -682,7 +858,10 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         connection.close()
 
 
-def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_path: Path) -> None:
+@pytest.mark.parametrize("writes", [None, 0, 3])
+def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(
+    tmp_path: Path, writes: int | None
+) -> None:
     """``GroupCommitAttemptLedger.finish_attempt`` probes the host hook the same way.
 
     The async facade captures the hook, probes it and queues its own lambda
@@ -694,6 +873,8 @@ def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_pa
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     recorded: list[str] = []
     original = core.apply_finish_attempt
+    usage = GatewayUsage(input_tokens=10, output_tokens=4, cache_creation_input_tokens=writes)
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
 
     def legacy_apply(
         connection: sqlite3.Connection,
@@ -710,6 +891,8 @@ def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_pa
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        assert terminal_event is not None and terminal_event.usage == usage
+        assert first_token_at == observed
         recorded.append(attempt_id)
         original(
             connection,
@@ -745,9 +928,10 @@ def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_pa
                 terminal_event=GatewayEvent(
                     kind=GatewayEventKind.COMPLETED,
                     sequence_number=1,
-                    usage=GatewayUsage(input_tokens=10, output_tokens=4),
+                    usage=usage,
                 ),
                 failure=None,
+                first_token_at=observed,
                 upstream_provider="Azure",
             )
             await grouped.flush()

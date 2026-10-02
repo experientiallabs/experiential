@@ -50,6 +50,10 @@ pub struct ServeConfig {
     /// Fail-fast bound on the TCP+TLS connect phase of every provider call.
     #[serde(default = "default_connect_timeout_seconds")]
     pub connect_timeout_seconds: f64,
+    /// Restrict native provider sockets to public HTTPS destinations. Local
+    /// embedders retain access to their own loopback/private model servers.
+    #[serde(default)]
+    pub public_upstreams_only: bool,
     /// Fail-fast bound on the wait for a provider's first streamed byte. This
     /// never caps total generation time: once the first byte arrives, reads
     /// are paced by the deployment's own per-chunk timeout.
@@ -117,7 +121,7 @@ fn default_native_usage_enabled() -> bool {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) bridge: Arc<Bridge>,
-    pub(crate) http: reqwest::Client,
+    pub(crate) http: crate::upstream::UpstreamClient,
     pub(crate) permits: Arc<Semaphore>,
     pub(crate) request_timeout: Duration,
     /// Fail-fast flat bound on the wait for the provider's response headers
@@ -138,6 +142,7 @@ pub(crate) struct AppState {
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
+    pub(crate) capture: Option<Arc<crate::capture::collector::Collector>>,
     /// Deterministic guardrail rules compiled once by the control plane,
     /// keyed by policy `adapter_id`. An admission whose output chain names
     /// only these adapters is enforced here instead of in python.
@@ -154,9 +159,10 @@ pub async fn run(
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Arc<DetectorMap>,
+    capture: Option<Arc<crate::capture::collector::Collector>>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
-    let http = crate::upstream::build_client(connect_timeout)?;
+    let http = crate::upstream::build_client(connect_timeout, config.public_upstreams_only)?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
     let handled_requests = Arc::new(AtomicUsize::new(0));
@@ -179,6 +185,7 @@ pub async fn run(
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
+        capture: capture.clone(),
         guardrail_detectors,
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
@@ -245,6 +252,11 @@ pub async fn run(
     let drain_deadline = Instant::now() + graceful;
     while pending_settlements.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if let Some(capture) = capture {
+        if !capture.close_until(drain_deadline) {
+            eprintln!("capture delivery exceeded the graceful shutdown deadline");
+        }
     }
     outcome
 }

@@ -258,9 +258,10 @@ def test_response_without_choices_fails_closed_without_exposing_the_key() -> Non
         base_url="https://example.test/v1",
         api_key=secret,
         transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=1),
     )
 
-    with pytest.raises(OpenAICompatibleResponseError, match="no choices") as captured:
+    with pytest.raises(ProviderResponseError, match="no choices") as captured:
         client.complete(_request())
     assert secret not in str(captured.value)
     assert secret not in repr(captured.value)
@@ -306,6 +307,15 @@ def test_openai_embedding_request_carries_optional_dimensions_and_encoding() -> 
         "input": ["a"],
         "dimensions": 256,
         "encoding_format": "float",
+    }
+
+
+def test_openai_embedding_request_preserves_pretokenized_inputs() -> None:
+    """The provider wire receives exact numeric tokens, never decoded text or extra flags."""
+    assert openai_embedding_request("m", ((0, 42, 100257), (3,)), encoding_format="base64") == {
+        "model": "m",
+        "input": [[0, 42, 100257], [3]],
+        "encoding_format": "base64",
     }
 
 

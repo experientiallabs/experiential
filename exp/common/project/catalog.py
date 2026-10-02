@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.models import ModelCapabilities, ModelSnapshot
+from exp.common.models.model import ReasoningEffort
 from exp.common.project.manifests import artifact_input
 
 if TYPE_CHECKING:
@@ -45,11 +46,39 @@ class ProjectCatalogModel(ContractModel):
 
 
 class ProjectModelCatalog(ContractModel):
-    """The exact credential-free model metadata selected by one Project."""
+    """The exact credential-free model metadata selected by one Project.
+
+    Attributes:
+        schema_version: Catalog payload schema, fixed at one.
+        project_id: Project owning the immutable model selection.
+        models: Nonempty model snapshots in unique alias order.
+        world_model_reasoning_effort: Explicit world-model override, or alias default.
+        judge_reasoning_effort: Explicit judge override, or alias default.
+        candidate_reasoning_efforts: Explicit overrides for included candidate aliases;
+            omitted aliases retain their capability-pinned effort.
+    """
 
     schema_version: Literal[1] = 1
     project_id: ArtifactId
     models: Annotated[tuple[ProjectCatalogModel, ...], Field(min_length=1)]
+    world_model_reasoning_effort: ReasoningEffort | None = None
+    judge_reasoning_effort: ReasoningEffort | None = None
+    candidate_reasoning_efforts: dict[ArtifactId, ReasoningEffort] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _require_known_reasoning_aliases(self) -> ProjectModelCatalog:
+        """Bind candidate reasoning selections to the portable model snapshots.
+
+        Returns:
+            The unchanged catalog after checking every reasoning alias.
+
+        Raises:
+            ValueError: A reasoning selection names a model absent from the catalog.
+        """
+        aliases = {item.alias for item in self.models}
+        if set(self.candidate_reasoning_efforts).difference(aliases):
+            raise ValueError("project reasoning efforts name unknown model aliases")
+        return self
 
     @field_validator("models")
     @classmethod

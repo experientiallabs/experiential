@@ -13,10 +13,6 @@ from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, 
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import ToolCall
-from exp.runtime.gateway.compatibility import (
-    CompatibilityDisposition,
-    CompatibilityManifest,
-)
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     ExposedReasoningContentBlock,
@@ -28,7 +24,11 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
     SealedReasoningContentBlock,
 )
-from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
+from exp.runtime.gateway.embeddings_contracts import (
+    EmbeddingInputs,
+    EmbeddingsRequest,
+    EmbeddingTokenIds,
+)
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
@@ -45,7 +45,7 @@ from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
     RESPONSES_MANIFEST,
-    disposition_map,
+    validate_manifest,
 )
 from exp.runtime.openai_protocol.media_parts import message_content
 from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
@@ -101,33 +101,56 @@ from exp.runtime.openai_protocol.wire_models import (
 
 
 class _EmbeddingsRequest(_WireModel):
-    """Closed gateway embeddings request profile.
+    """Closed OpenAI embeddings profile with text and pre-tokenized inputs.
 
-    ``input`` narrows the official OpenAI union to text only: the token-array
-    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
-    are rejected here with a field-specific 400, since this surface serves
-    visible text, not pre-tokenized ids.
+    Attributes:
+        model: Public model alias requested by the caller.
+        input: One text/token input or a homogeneous batch of either form.
+        dimensions: Optional positive vector width requested from the provider.
+        encoding_format: Optional float or base64 response encoding.
+        user: Optional gateway-only attribution, at most 1,024 characters.
+        stream: Literal false convenience, validated and omitted upstream.
     """
 
     model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[str, ...]
+    input: str | EmbeddingTokenIds | EmbeddingInputs
     dimensions: int | None = Field(default=None, gt=0)
     encoding_format: Literal["float", "base64"] | None = None
     user: str | None = Field(default=None, max_length=1024)
+    stream: Literal[False] = False
+
+    @field_validator("stream", mode="before")
+    @classmethod
+    def _require_nonstreaming(cls, value: JsonValue) -> Literal[False]:
+        """Accept only literal false, without coercing zero or string values."""
+        if value is not False:
+            raise ValueError("embeddings do not stream; omit stream or set it to false")
+        return False
 
     @field_validator("input")
     @classmethod
-    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
-        """Reject empty text, an empty array, or empty array members."""
+    def _require_nonempty_input(
+        cls, value: str | EmbeddingTokenIds | EmbeddingInputs
+    ) -> str | EmbeddingTokenIds | EmbeddingInputs:
+        """Reject empty texts or batches without treating token ID zero as empty."""
         if isinstance(value, str):
             if not value:
                 raise ValueError("input must not be an empty string")
             return value
         if not value:
             raise ValueError("input must not be an empty array")
-        if any(not text for text in value):
-            raise ValueError("input array must not contain empty strings")
+        if any(not item for item in value if not isinstance(item, int)):
+            raise ValueError("input array must not contain empty inputs")
         return value
+
+    def batch_inputs(self) -> EmbeddingInputs:
+        """Normalize one string or flat token sequence to one logical batch item."""
+        if isinstance(self.input, str):
+            return (self.input,)
+        if isinstance(self.input[0], int):
+            # The validated union is homogeneous; a flat sequence contains only token IDs.
+            return (cast(EmbeddingTokenIds, self.input),)
+        return cast(EmbeddingInputs, self.input)
 
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
@@ -228,7 +251,7 @@ def decode_chat(
     payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
     cache_payload = payload
     payload = drop_opencode_cache_control(payload)
-    _validate_manifest(payload, CHAT_MANIFEST)
+    validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     _validate_official(
@@ -241,6 +264,7 @@ def decode_chat(
             "thinking_budget",
             "max_output_tokens",
             "provider",
+            "gateway",
             "plugins",
         },
     )
@@ -286,6 +310,7 @@ def decode_chat(
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
+            gateway=request.gateway,
             web_search=chat_web_search(
                 options=request.web_search_options,
                 plugins=request.plugins,
@@ -302,6 +327,7 @@ def decode_chat(
                 else None
             ),
             thinking_budget=request.thinking_budget,
+            provider_thinking_config=thinking.thinking_config,
             stop=stop,
             temperature=request.temperature,
             top_p=request.top_p,
@@ -346,13 +372,14 @@ def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    _validate_manifest(payload, EMBEDDINGS_MANIFEST)
-    _validate_official(_EMBEDDINGS_OFFICIAL, payload)
+    validate_manifest(payload, EMBEDDINGS_MANIFEST)
+    if payload.get("stream") is True:
+        raise unsupported_field("stream")
+    _validate_official(_EMBEDDINGS_OFFICIAL, payload, extension_fields={"stream"})
     request = _validate_wire(_EmbeddingsRequest, payload)
-    inputs = (request.input,) if isinstance(request.input, str) else request.input
     try:
         canonical = EmbeddingsRequest(
-            inputs=inputs,
+            inputs=request.batch_inputs(),
             dimensions=request.dimensions,
             encoding_format=request.encoding_format,
             user=request.user,
@@ -382,7 +409,7 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
-    _validate_manifest(payload, RESPONSES_MANIFEST)
+    validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
@@ -396,7 +423,7 @@ def decode_responses(
     _validate_official(
         _RESPONSES_OFFICIAL,
         official_probe,
-        extension_fields={"top_k", "reasoning", "client_metadata", "provider"},
+        extension_fields={"top_k", "reasoning", "client_metadata", "provider", "gateway"},
     )
     include_encrypted_reasoning, include_output_text_logprobs = _responses_include_options(
         request.include
@@ -458,6 +485,7 @@ def decode_responses(
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
+            gateway=request.gateway,
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None
@@ -544,15 +572,6 @@ def _provider_preferences(
         return None
     raw = payload.get("provider")
     return dict(raw) if isinstance(raw, dict) else None
-
-
-def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
-    """Reject unsupported and unknown top-level fields before responder work."""
-    decisions = disposition_map(manifest)
-    for field in payload:
-        disposition = decisions.get(field)
-        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
-            raise unsupported_field(field)
 
 
 def _validate_official(
@@ -841,6 +860,11 @@ def _response_input_messages(
             )
         elif isinstance(item, _ResponseReasoningItem):
             if item.encrypted_content is None:
+                if item.id is None:
+                    raise invalid_field(
+                        f"input.{index}.id",
+                        "A reasoning input item requires an id or encrypted_content.",
+                    )
                 # A store=true flow replays reasoning by item id alone (the
                 # SDK marks encrypted_content optional); only the issuing
                 # native Responses wire can resolve the id, so the item is

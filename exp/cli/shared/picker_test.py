@@ -848,6 +848,29 @@ def test_keyboard_multi_select_search_narrows_and_keeps_hidden_selections() -> N
     assert "Filter: model-12" in console.output
 
 
+def test_multi_select_can_search_and_select_two_models_then_clear_the_filter() -> None:
+    """Esc after selection clears a filter without cancelling or losing selected models."""
+    result = select_many_list(
+        _console(""),
+        title="Models to configure",
+        options=_options(20),
+        read_key=_keys(
+            *_typed("/model-12"),
+            PickerKey.ENTER,
+            PickerKey.SPACE,
+            PickerKey.ESCAPE,
+            *_typed("/model-14"),
+            PickerKey.ENTER,
+            PickerKey.SPACE,
+            PickerKey.ESCAPE,
+            PickerKey.UP,
+            PickerKey.ENTER,
+        ),
+    )
+
+    assert result.values == ("model-12", "model-14")
+
+
 def test_keyboard_multi_select_escape_clears_the_search_and_restores_the_list() -> None:
     """A query without matches is explained, and Esc returns to the full list."""
     console = _console("")

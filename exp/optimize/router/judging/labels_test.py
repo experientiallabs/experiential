@@ -128,3 +128,19 @@ def test_sample_digest_covers_trace_order_and_pairwise_references(tmp_path: Path
     assert calibration_sample_digest(setup, sample) != calibration_sample_digest(
         setup, tuple((trace_id, "reference") for trace_id, _reference in sample)
     )
+
+
+@pytest.mark.parametrize("score", [-1, 2, 10**9])
+def test_partial_label_draft_rejects_scores_outside_the_actual_axis(
+    tmp_path: Path, score: int
+) -> None:
+    """A partial draft cannot persist a score merely because it is an integer."""
+    store = _built_store(tmp_path)
+    setup = _setup(store)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+    digest = calibration_sample_digest(setup, calibration_sample(plan))
+    bad = _labels(store)[0].model_copy(update={"score": score})
+    before = store.read_review()
+    with pytest.raises(ManualJudgeError, match="must be from 0 through 1"):
+        save_label_draft(store, setup, digest, (bad,), _TIME)
+    assert store.read_review() == before

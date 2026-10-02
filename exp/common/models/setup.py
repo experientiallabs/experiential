@@ -20,6 +20,7 @@ from exp.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.models.discovery import DiscoveredModel
 from exp.common.models.model import BillingSource, ModelCapabilities, ReasoningEffort
 
 SETUP_PROVIDERS = frozenset(
@@ -162,6 +163,10 @@ class ProviderModelSelection(ContractModel):
 
     ``served_model_id`` optionally pins the provider-reported response identity when the
     endpoint reports a served-model name that differs from the requested model ID.
+
+    Attributes:
+        supported_reasoning_efforts: Discovery choices retained for future setup screens.
+        discovery: Published flags and prices retained without losing explicit false values.
     """
 
     alias: str = Field(min_length=1, max_length=128)
@@ -170,6 +175,8 @@ class ProviderModelSelection(ContractModel):
     served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED
     capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
+    discovery: DiscoveredModel | None = None
 
     @model_validator(mode="after")
     def _require_explicit_prices(self) -> ProviderModelSelection:
@@ -220,6 +227,8 @@ class ProviderModelSelection(ContractModel):
             served_model_id=self.served_model_id,
             billing_source=self.billing_source,
             capabilities=self.capabilities,
+            supported_reasoning_efforts=self.supported_reasoning_efforts,
+            discovery=self.discovery,
         )
 
 

@@ -250,6 +250,7 @@ fn classify(event: &Event) -> StreamAdmission {
         ),
         Event::ChoiceLogprobsDelta(_)
         | Event::ProviderResponsesLogprobs { .. }
+        | Event::Image(_)
         | Event::ReasoningSummaryDelta { .. }
         | Event::ThinkingDelta { .. }
         | Event::ReasoningContentDelta { .. }
@@ -278,6 +279,7 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::Incomplete
         | Event::StoppedAtSequence(_)
         | Event::PausedTurn
+        | Event::GeminiThoughtPart(_)
         | Event::Failed(_) => StreamAdmission::Passthrough,
     }
 }
@@ -417,6 +419,9 @@ pub async fn enforce_collected_output(
     request_id: &str,
     events: Vec<Event>,
 ) -> Result<Vec<Event>, Failure> {
+    if events.iter().any(|event| matches!(event, Event::Image(_))) {
+        return Err(closed_failure());
+    }
     let argument = output_argument(request_id, &events);
     let payload = bridge
         .call("enforce_output", argument)

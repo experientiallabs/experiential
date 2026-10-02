@@ -10,7 +10,7 @@ from exp.common.models import AssistantAction
 from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase
 from exp.runtime.agents import AgentEpisode, AgentRuntime, execute_agent_episode
-from exp.simulation.engines.text.environment import TextOnlyEnvironmentRuntime
+from exp.simulation.engines.text.environment import SimulatedEnvironmentRuntime
 from exp.simulation.engines.text.recording import RecordingCandidateClient
 
 
@@ -38,14 +38,12 @@ def execute_text_episode_loop(
     normal customer runtime seam while making the simulator, rather than a one-turn adapter,
     authoritative for scenario termination.
 
-    Exhausting the pinned candidate turn ceiling is a judgeable episode outcome, not an
-    infrastructure failure: the recorded transcript is complete evidence that the candidate did
-    not finish the task within the pinned budget, so the cell stops with ``MAXIMUM_STEPS`` and
-    no structured failure.
+    Exhausting an execution budget is incomplete evidence. The evaluation layer excludes it
+    from judging and model quality; the simulator retains a checkpoint when safe to continue.
 
     Args:
         agent_factory: Creates one isolated customer runtime for the simulation cell.
-        task: Canonical text-only representative task.
+        task: Canonical task and declared simulated tool schemas.
         recorder: Candidate client that records each candidate and world-model transition.
 
     Returns:
@@ -57,7 +55,7 @@ def execute_text_episode_loop(
         prior_turn_count = recorder.candidate_turn_count
         episode = execute_agent_episode(
             agent,
-            TextOnlyEnvironmentRuntime(),
+            SimulatedEnvironmentRuntime(recorder.observe_tool),
             task,
             recorder,
         )

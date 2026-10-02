@@ -6,12 +6,32 @@ on the exact release checkout.
 
 ## Supported and verified
 
-- Root CLI commands are exactly `build`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
+- Root CLI commands are exactly `build`, `capture`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
   opens the default gateway home screen. Optimizer commands are exactly `router` and `model`.
 - `exp login` opens the Platform approval flow for Experiential Cloud, stores the returned
   organization key in the user-data credential file, and synchronizes the authenticated account's
   hosted provider/model identities into the secret-free project catalog; no credential value is
   written to the project.
+- `exp capture` is an experimental foreground macOS HTTPS collector on Python 3.13+ with normal
+  Platform login, streamed OpenAI/Anthropic protocol capture, asynchronous trace uploads, and
+  bounded private retry files. It uses pinned Experiential mitmproxy forks and defaults to supported
+  provider hosts across all apps, with an optional exact-host override. The signed Mitmproxy
+  Redirector app and its approved Network Extension own interception. Capture does not edit
+  hosts, DNS, or system proxy settings and has no reset subcommand. Each selected host set gets
+  a CA with critical certificate-level name constraints and persistent current-user SSL trust.
+  Explicit client certificate rejection switches the affected process and
+  host to encrypted pass-through for the run; missing process identity or exhausted capacity
+  uses an explicit host-wide exclusion. Other capture continues, and the terminal names excluded
+  targets and retains a partial-capture indicator. Backend failure still stops Capture. A quiet
+  DNS guard checks selected providers before startup, stops after repeated lookup failures, and
+  checks recovery after shutdown. The native selector excludes the macOS DNS responder process,
+  but app-attributed DNS can still be intercepted. macOS UDP sockets follow application closure
+  rather than idle expiry, and native EOF releases their forwarding tasks. A separate watchdog
+  is armed before interception and disables it when the owner exits or its heartbeat expires.
+  Live Codex capture, idle DNS reuse, owner crash, frozen-owner recovery, restart, and Ctrl+C
+  shutdown have been exercised. These tests do not establish universal client compatibility or
+  guaranteed network recovery. Fork distributions must be published before a package release;
+  development checkouts use immutable source pins.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket
@@ -83,6 +103,12 @@ incremental tool-argument streaming. A direct TypeSafe success verifies that req
 reported usage, not account limits, price-invoice agreement, production availability, or latency.
 
 ## Explicitly excluded
+
+- System-wide Capture has not been certified against live Codex or Claude Code sessions. Their
+  process trust stores and existing connections may require configuration or a restart. The
+  signed macOS Network Extension requires user approval; synthetic tests do not establish that
+  a real machine has approved it. The feature does not bypass certificate pinning or claim
+  complete capture of unselected domains or unsupported protocols.
 
 - There is no budgets dashboard. Monthly allocation management and remaining-allocation reporting
   are explicit interactive or non-interactive CLI operations.

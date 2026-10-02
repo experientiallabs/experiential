@@ -12,12 +12,14 @@ second, so the test proves the retry carried a freshly minted signature.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
 import subprocess
 import sys
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
@@ -37,7 +39,35 @@ from exp.runtime.gateway.catalog_authority import (
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
-from exp.runtime.gateway.tests.native_dialect_parity_test import _eventstream_message
+
+
+def _eventstream_message(
+    name: str, payload: dict[str, object], *, exception: bool = False
+) -> bytes:
+    """Encode one AWS event-stream message the way Bedrock frames its stream.
+
+    Args:
+        name: Event-type (or exception-type) header value.
+        payload: JSON payload object.
+        exception: Whether to frame the message as a service exception.
+
+    Returns:
+        One complete binary event-stream message with valid checksums.
+    """
+    headers = [
+        (":message-type", "exception" if exception else "event"),
+        (":exception-type" if exception else ":event-type", name),
+    ]
+    block = b""
+    for header_name, value in headers:
+        block += bytes([len(header_name)]) + header_name.encode()
+        block += bytes([7]) + len(value).to_bytes(2, "big") + value.encode()
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    total = 12 + len(block) + len(body) + 4
+    prelude = total.to_bytes(4, "big") + len(block).to_bytes(4, "big")
+    message = prelude + zlib.crc32(prelude).to_bytes(4, "big") + block + body
+    return message + zlib.crc32(message).to_bytes(4, "big")
+
 
 _CHILD_SOURCE = """\
 import json

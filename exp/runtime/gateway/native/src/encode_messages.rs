@@ -114,7 +114,7 @@ impl PendingBlock {
 }
 
 /// Stateful Anthropic Messages SSE encoder with one open block and one
-/// terminal, emitting byte-identical frames to the python encoder.
+/// terminal.
 ///
 /// Blocks are scheduled in start order (see [`PendingBlock`]): the earliest
 /// block streams live while content for later blocks buffers within the
@@ -163,6 +163,7 @@ pub struct MessagesSseEncoder {
 }
 
 impl MessagesSseEncoder {
+    #[cfg(test)]
     pub fn new(request_id: &str, model: &str) -> Self {
         Self::new_with_ignored(request_id, model, Vec::new())
     }
@@ -354,6 +355,9 @@ impl MessagesSseEncoder {
             Event::ChoiceLogprobsDelta(_) => Err(invalid_provider_stream(
                 "Chat token probabilities cannot be projected on this surface.",
             )),
+            Event::Image(_) => Err(invalid_provider_stream(
+                "Generated image output requires Chat Completions or the Images API.",
+            )),
             Event::TextDelta(text) => self.text_delta(text),
             Event::ProviderTextDelta { delta, .. } => self.text_delta(delta),
             Event::RefusalDelta(_) => {
@@ -381,6 +385,7 @@ impl MessagesSseEncoder {
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
+            | Event::GeminiThoughtPart(_)
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
             Event::ThinkingSignature { index, signature } => {
@@ -948,9 +953,9 @@ mod usage;
 
 pub use errors::{anthropic_error_body, refusal_failure};
 
-pub use aggregate::{
-    completed_messages_body, completed_messages_body_with_reasoning, AggregatedMessage,
-};
+#[cfg(test)]
+pub use aggregate::completed_messages_body;
+pub use aggregate::{completed_messages_body_with_reasoning, AggregatedMessage};
 pub(crate) use usage::messages_usage;
 
 /// Attach the `x-experiential-ignored-parameters` disclosure to one message
@@ -974,3 +979,5 @@ mod tests;
 mod tests_claude_code;
 #[cfg(test)]
 mod tests_usage;
+#[cfg(test)]
+mod tests_wire;

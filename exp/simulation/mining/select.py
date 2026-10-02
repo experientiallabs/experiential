@@ -88,7 +88,8 @@ def select_partition_representatives(
     """Select a deterministic weighted core set within one frozen partition.
 
     The function first reserves available rare-tool, failure, escalation, long-episode, and
-    cluster-boundary slots. It then adds real cluster medoids and farthest-first coverage points.
+    cluster-boundary slots while protecting capacity for uncovered lineages. It then adds
+    lineage anchors, real cluster medoids, and farthest-first coverage points.
     Every unselected candidate is assigned to its nearest retained representative so workload mass
     remains visible rather than disappearing with duplicate removal.
 
@@ -118,14 +119,34 @@ def select_partition_representatives(
     reasons: dict[str, list[str]] = defaultdict(list)
     missing_slots: list[str] = []
     by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
+    lineage_ids = {candidate.lineage_group_id for candidate in candidates}
 
     for slot_name in _RESERVED_SLOT_NAMES:
         if len(selected_ids) >= target:
             missing_slots.append(f"{slot_name}: budget exhausted")
             continue
-        candidate_id = _reserved_candidate(slot_name, candidates, clusters, selected_ids)
+        covered_lineages = {by_id[selected_id].lineage_group_id for selected_id in selected_ids}
+        uncovered_count = len(lineage_ids - covered_lineages)
+        protected_ids = (
+            tuple(
+                candidate.representative_trace_id
+                for candidate in candidates
+                if candidate.lineage_group_id in covered_lineages
+            )
+            if target - len(selected_ids) <= uncovered_count
+            else ()
+        )
+        candidate_id = _reserved_candidate(
+            slot_name, candidates, clusters, (*selected_ids, *protected_ids)
+        )
         if candidate_id is None:
-            missing_slots.append(f"{slot_name}: no eligible source trace")
+            reason = (
+                "capacity reserved for uncovered lineages"
+                if protected_ids
+                and _reserved_candidate(slot_name, candidates, clusters, selected_ids) is not None
+                else "no eligible source trace"
+            )
+            missing_slots.append(f"{slot_name}: {reason}")
             continue
         _select(selected_ids, reasons, candidate_id, f"reserved:{slot_name}")
 
@@ -431,17 +452,11 @@ def _assign_workload(
     clusters: dict[str, int],
     partition: Literal["fit", "held_out"],
 ) -> list[SelectedRepresentative]:
-    """Assign every candidate's full duplicate workload to its nearest selected task."""
+    """Keep each selected case's own mass and assign unselected cases by distance."""
     by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
     mass: dict[str, int] = dict.fromkeys(selected_ids, 0)
     for candidate in candidates:
-        selected_id = min(
-            selected_ids,
-            key=lambda selected: (
-                -_cosine(candidate.vector, by_id[selected].vector),
-                selected,
-            ),
-        )
+        selected_id = nearest_representative(candidate, selected_ids, by_id)
         mass[selected_id] += candidate.workload_mass
     return [
         SelectedRepresentative(
@@ -455,6 +470,31 @@ def _assign_workload(
         )
         for selected_id in selected_ids
     ]
+
+
+def nearest_representative(
+    candidate: DeduplicatedTrace,
+    selected_ids: Sequence[str],
+    by_id: dict[str, DeduplicatedTrace],
+) -> str:
+    """Keep selected cases with themselves and assign other cases by distance and identity.
+
+    Args:
+        candidate: Source case whose workload and coverage need one consistent assignment.
+        selected_ids: Nonempty set of selected representative identities.
+        by_id: Source candidates keyed by their representative trace identity.
+
+    Returns:
+        The selected identity receiving this case's workload and coverage records.
+    """
+    return min(
+        selected_ids,
+        key=lambda selected: (
+            selected != candidate.representative_trace_id,
+            -_cosine(candidate.vector, by_id[selected].vector),
+            selected,
+        ),
+    )
 
 
 def _cluster_summaries(

@@ -30,14 +30,15 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`. An invocation without a
-  subcommand opens the default gateway home screen. `exp/cli/app_test.py` and the release tests
+- The root CLI command set is exact: `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`.
+  An invocation without a subcommand opens the default gateway home screen.
+  `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
 
 ## CLI package ownership
 
 - `exp/cli/app.py` owns root command composition only. Command implementations live in the
-  `build/`, `config/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
+  `build/`, `capture/`, `config/`, `evaluation/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
   default home screen live under `gateway/`.
 - `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
@@ -50,17 +51,27 @@ uv run pytest -q
 
 ## Evidence, simulation, and routing lifecycle
 
-- `exp/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
-  current engines, orchestration, artifact construction, and comparisons. New modules for those
-  responsibilities go inside `exp/simulation/`, never at the flat `exp/` root.
-- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` is the only CLI path
-  from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
-  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, builds both
-  RAG indexes under a strict embedding-cost ceiling, and binds the grounded world model without a
-  completion or judge call. Route each corpus through an explicit canonical source loader.
-- New trace sources belong in `exp/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
-  contracts in `exp/common/traces/`, support file ingestion, and register from
-  `exp/simulation/ingest/__init__.py`.
+- `exp/common/traces/ingest/` owns reusable source parsing, trace normalization, provenance,
+  streaming and import persistence. Gateway-specific capture/protocol adapters live under
+  `exp/runtime/gateway/ingest/` and supply canonical evidence to the shared ingestion layer.
+- `exp/simulation/` owns representative-task mining, typed simulation specs, current engines,
+  orchestration, artifact construction, and comparisons. New modules for those responsibilities
+  go inside `exp/simulation/`, never at the flat `exp/` root.
+- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` imports canonical traces
+  into shared `<root>/gateway/traffic.db` SQLite storage, then mines scenarios from that exact
+  saved evidence. `--source gateway --identity ID` selects retained captures for one explicit
+  identity. Imports preserve source provenance, prompts, tools, results, normalization exclusions
+  and model identity; immutable import IDs and project associations are transactional and
+  idempotent. Ingestion remains a common Python operation, not a separate CLI command.
+  Build writes manifest-bound fit and held-out tasks plus
+  `proposals_pending` review state, builds both RAG indexes with cost-aware spend consent,
+  and binds the grounded world model without a completion or judge call. Route each corpus
+  through an explicit canonical source loader. The interactive wizard defaults to provider
+  configuration and build preparation; router optimization requires an explicit selection.
+- New file trace sources belong in `exp/common/traces/ingest/`, normalize into the `Trace` and
+  `TraceSpan` contracts in `exp/common/traces/`, and register with the explicit shared source table.
+  Runtime-specific source adapters stay with their runtime owner. Common ingestion never imports
+  runtime or simulation code; source selection is composed by the consuming command.
 - Python applications use `exp.compose_router` to complete review, plan-bound simulation,
   judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
   approved review and setup suppliers, simulator factory, judge, runtime catalog, and finite
@@ -129,14 +140,18 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `optimize`, `config`, and `run`. The optimize group is locked
+- The root CLI is locked to `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`. Capture runs
+  in the foreground with no management subcommands. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
 - Every paid CLI command uses `exp.cli.shared.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
-  `.exp/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
-  higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
+  `.exp/settings.toml` is a per-command warning budget. Estimates at or below half run automatically;
+  higher estimates need explicit confirmation. An over-budget estimate must warn and offer a
+  default-no proceed choice instead of rejecting the command. `--yes` is explicit authorization
+  for the displayed estimate, including budget overruns. Component budgets use this same consent
+  path, and execution must honor the approved estimate without changing saved warning budgets.
 - Long-lived gateway serving is exempt from one-shot spend consent. Startup performs no provider
   call; every later request requires key-derived authority and content-free attempt accounting.
 - `exp optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
@@ -144,7 +159,7 @@ uv run pytest -q
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
   digest, and credential-reference digest without persisting any secret. A finite cap requires a
   conservative estimate for every exact scheduled batch before shared cost authorization;
-  `--yes` confirms only an in-budget estimate after those checks. Completed W13 artifacts are
+  `--yes` confirms the displayed estimate after those checks. Completed W13 artifacts are
   recursively verified before an opaque sampling handle is atomically registered in `models.toml`.
 - Changes to this composition seam require focused persisted-dataset, resume, budget, immutable
   pointer, drift, and catalog-provenance coverage. The seam composes a persisted dataset into an
@@ -153,6 +168,9 @@ uv run pytest -q
 
 ## Python
 
+- Use Python 3.13+ for whole-repository development and quality gates so Capture's conditional
+  dependencies are installed. Published SDK and Capture command help support remains Python 3.12;
+  CI checks that minimum separately.
 - Every Python file must have a module docstring.
 - Every class, function, and method uses a Google-style docstring, including private helpers,
   nested functions, and test helpers, so each callable states its contract locally. An absolutely
@@ -273,8 +291,11 @@ uv run pytest -q
    implementation when requirements differ materially and document the boundary.
 
 8. **Keep imports explicit and fail-fast.** Put imports at module scope unless moving them is
-   required to break a real circular dependency. Do not use lazy imports for optional convenience,
-   and do not catch `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
+   required to break a real circular dependency. Declaration-only CLI command modules may defer
+   their execution-module import until command dispatch to satisfy the startup-isolation gate:
+   help and configuration must not load optimization machinery. Execution modules keep imports
+   at module scope. Do not defer imports for optional convenience, and do not catch
+   `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
 
 9. **Design every public surface from the perspective of a dev using it.** Before implementing a
    feature, write the call site first — the Python snippet or CLI invocation an outside developer

@@ -157,6 +157,10 @@ def _decoded_request(line: BatchLine) -> GatewayRequest:
             asks for streaming or a ``previous_response_id`` continuation,
             neither of which exists inside a batch.
     """
+    if "gateway" in line.body:
+        raise BatchSubmitError(
+            "gateway is not supported on batch lines; remove gateway and resubmit"
+        )
     decoder = decode_chat if line.surface == "/v1/chat/completions" else decode_responses
     try:
         decoded = decoder({**line.body, "model": line.model})

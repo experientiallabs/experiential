@@ -469,7 +469,10 @@ def test_haiku_thinking_off_temperature_is_honored_under_the_srn_hatch() -> None
     # Contrast: with thinking ENABLED, Anthropic requires temperature 1, so the
     # same control is a disclosed drop, not a rejection — srn is per request.
     thinking_on = honored.model_copy(
-        update={"provider_thinking_config": {"type": "enabled", "budget_tokens": 2_048}}
+        update={
+            "provider_thinking_config": {"type": "enabled", "budget_tokens": 2_048},
+            "maximum_output_tokens": 4096,
+        }
     )
     public_on, provider_on = route_generation_parameter_requests((profile,), thinking_on)
     assert provider_on.temperature is None
@@ -2628,6 +2631,8 @@ def test_route_shaping_rejects_thinking_by_name_so_admission_can_coerce() -> Non
         dialect="anthropic_messages",
         url="https://anthropic.test",
         reasoning_wire_format="anthropic_adaptive",
+        model_id="claude-sonnet-4-6",
+        supports_reasoning=True,
         maximum_output_tokens=128_000,
     )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
@@ -2641,7 +2646,7 @@ def test_route_shaping_rejects_thinking_by_name_so_admission_can_coerce() -> Non
     route_generation_parameter_requests((anthropic,), request)
     with pytest.raises(ProviderParameterError) as raised:
         route_generation_parameter_requests((anthropic, fallback), request)
-    assert raised.value.param == "thinking"
+    assert raised.value.param == "thinking.budget_tokens"
     assert raised.value.code == "unsupported_parameter"
     # History thinking blocks no longer reject at shaping: they are signed
     # provider state a foreign wire drops with disclosure (see

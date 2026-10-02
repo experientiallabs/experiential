@@ -45,6 +45,7 @@ from exp.common.models import (
     RoutedCandidateSnapshot,
 )
 from exp.common.project import ArtifactStore, ProjectPaths, artifact_input
+from exp.common.project.testing import RawArtifact
 from exp.common.rollouts import (
     ProductionSimulatorSnapshot,
     RolloutArtifact,
@@ -213,7 +214,10 @@ def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
     with pytest.raises(ValueError, match="manifest differs from exact replay"):
         optimizer.fit(spec.model_copy(update={"code_revision": "changed-revision"}))
 
-    report_path = store.read(result.report.report_id).directory / "report.json"
+    report_path = (
+        RawArtifact(store._paths, store.read(result.report.report_id).manifest.artifact_id)
+        / "report.json"
+    )
     report_path.write_bytes(report_path.read_bytes() + b"corruption")
     with pytest.raises(RouterOptimizationError, match="digest mismatch"):
         optimizer.report(

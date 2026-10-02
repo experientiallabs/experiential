@@ -1,5 +1,5 @@
 //! OpenAI frame mappings: the Responses SSE dialect and the Chat-Completions
-//! compatible dialect, mirroring the python event mappers.
+//! compatible dialect.
 
 use serde_json::Value;
 
@@ -132,6 +132,18 @@ impl Normalizer {
             .or_else(|| frame.event.clone())
             .unwrap_or_default();
         let mut events = Vec::new();
+        // Created/in-progress envelopes can echo the request. Only a terminal
+        // response is evidence of which processing tier actually served it.
+        if matches!(
+            event_type.as_str(),
+            "response.completed" | "response.incomplete" | "response.failed"
+        ) {
+            self.service_tier.observe(
+                payload
+                    .get("response")
+                    .and_then(|response| response.get("service_tier")),
+            );
+        }
         match event_type.as_str() {
             "response.output_text.delta" => {
                 events.extend(self.responses_probability_text_delta(&payload)?);
@@ -837,6 +849,7 @@ impl Normalizer {
                     "openai_responses",
                     code.as_deref(),
                     message,
+                    None,
                 )));
             }
             "error" => {
@@ -876,6 +889,7 @@ impl Normalizer {
                     "openai_responses",
                     code.as_deref(),
                     message,
+                    None,
                 )));
             }
             other if is_openai_hosted_progress_event(other) => {

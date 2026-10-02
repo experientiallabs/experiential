@@ -57,6 +57,8 @@ impl ImagesAdmission {
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: false,
             throttle_redial: None,
+            physical_route_cap: None,
+            backoff: None,
         }
     }
 }
@@ -255,7 +257,7 @@ async fn run_ladder(
 /// POST one admitted payload and validate the buffered answer; the error
 /// carries whether the provider dispatch opened.
 async fn dispatch(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &ImagesAdmission,

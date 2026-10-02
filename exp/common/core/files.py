@@ -19,9 +19,11 @@ setting of this one.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import stat
+from ctypes import wintypes
 from pathlib import Path
 from uuid import uuid4
 
@@ -80,17 +82,127 @@ def write_bytes_atomic(path: Path, payload: bytes, *, follow_symlinks: bool = Tr
         except FileNotFoundError:
             destination_stat = None
         if destination_stat is not None and stat.S_ISREG(destination_stat.st_mode):
+            if os.name == "nt" and not destination_stat.st_mode & stat.S_IWRITE:
+                raise PermissionError(f"atomic destination is read-only: {path}")
             # `replace` installs the staging inode, so the destination's mode has to be carried
             # over explicitly or a restricted file silently widens to the umask default. The
             # no-follow stat matters under `follow_symlinks=False`: the rename replaces a swapped
             # destination symlink itself, and copying the LINK TARGET's mode would let whoever
             # planted the link pick the replacement file's permissions.
             staging.chmod(destination_stat.st_mode & 0o7777)
-        staging.replace(path)
+        try:
+            staging.replace(path)
+        except OSError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) != 5:
+                raise
+            _windows_replace_open_target(staging, path)
     except BaseException:
-        staging.unlink(missing_ok=True)  # never leave a stray staging file beside the real one
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove unpublished staging file %s", staging, exc_info=True)
         raise
     fsync_directory_best_effort(path.parent)
+
+
+class _WindowsRenameInfo(ctypes.Structure):
+    """FILE_RENAME_INFO layout with a variable-length UTF-16 filename tail."""
+
+    _fields_ = [
+        ("flags", wintypes.DWORD),
+        ("root", wintypes.HANDLE),
+        ("name_bytes", wintypes.DWORD),
+        ("name", wintypes.WCHAR * 1),
+    ]
+
+
+class _WindowsAttributeTag(ctypes.Structure):
+    """FILE_ATTRIBUTE_TAG_INFO validates the staging handle before publication."""
+
+    _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
+
+
+def _windows_replace_open_target(staging: Path, destination: Path) -> None:
+    """Atomically replace a delete-shared open destination after ordinary Windows rename refused.
+
+    FileRenameInfoEx with POSIX semantics preserves open destination handles while
+    redirecting future opens to the staged inode. It does not ignore read-only or
+    delete-sharing restrictions. Unsupported kernels or filesystems fail without a
+    copy/delete fallback; the caller removes the unpublished staging file.
+
+    Args:
+        staging: Fully flushed same-directory regular staging file, owned by the caller.
+        destination: Destination path after the caller's explicit symlink policy.
+
+    Raises:
+        OSError: The handle, file type, or atomic rename is refused before publication.
+    """
+    if os.name != "nt":
+        raise OSError("Windows open-target replacement requires Windows")
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    api.CreateFileW.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    api.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    api.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    api.GetFileType.argtypes = [wintypes.HANDLE]
+    api.GetFileType.restype = wintypes.DWORD
+    api.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    api.SetFileInformationByHandle.restype = wintypes.BOOL
+    # DELETE access, all sharing, OPEN_EXISTING, and no-follow inspection.
+    handle = api.CreateFileW(str(staging.absolute()), 0x10000, 7, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value or handle is None:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = _WindowsAttributeTag()
+        if not api.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes.attributes & (0x10 | 0x400) or api.GetFileType(handle) != 1:
+            raise OSError("atomic staging handle must name a regular non-reparse disk file")
+        # Absolute spelling retains the selected destination leaf, including a
+        # symlink when follow_symlinks=False; resolving it here would defeat that policy.
+        name = str(destination.absolute()).encode("utf-16-le")
+        size = max(
+            ctypes.sizeof(_WindowsRenameInfo), _WindowsRenameInfo.name.offset + len(name) + 2
+        )
+        if size > 0xFFFFFFFF:
+            raise OSError("atomic rename path exceeds the Windows information buffer limit")
+        buffer = ctypes.create_string_buffer(size)
+        info = _WindowsRenameInfo.from_buffer(buffer)
+        info.flags = 3  # FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS.
+        info.root = None
+        info.name_bytes = len(name)
+        ctypes.memmove(ctypes.addressof(buffer) + _WindowsRenameInfo.name.offset, name, len(name))
+        if not api.SetFileInformationByHandle(handle, 22, buffer, size):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        if not api.CloseHandle(handle):
+            logger.warning(
+                "could not close atomic staging handle for %s: Windows error %s",
+                destination,
+                ctypes.get_last_error(),
+            )
 
 
 def resolve_write_target(path: Path) -> Path:

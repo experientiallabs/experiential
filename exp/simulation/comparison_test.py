@@ -478,7 +478,7 @@ def _persist_spec(
             WorldModelSettings(
                 world_model_alias="world-model-a",
                 grounded_world_model_input=grounded_world_model_input,
-                prompt_version="text-world-model-v1",
+                prompt_version="text-world-model-v2",
                 query_embedding=EmbeddingCostReservation(
                     model=_world_model(),
                     input_usd_per_million_tokens=0.0,
@@ -736,7 +736,7 @@ def _text_simulator() -> WorldModelSimulatorSnapshot:
     return WorldModelSimulatorSnapshot(
         simulator_id="world-model-v1",
         prompt_id="world-model-text-system",
-        prompt_version="text-world-model-v1",
+        prompt_version="text-world-model-v2",
         prompt_sha256=_PROMPT_SHA256,
         world_model=_world_model(),
     )

@@ -18,11 +18,11 @@ async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
         );
         guard.rebind(format!("attempt-{ordinal}"));
         guard.mark_opened();
-        guard.begin_dial_observation().record_dial_total(Usage {
+        guard.begin_dial_observation().record(&Event::Usage(Usage {
             input_tokens: Some(13),
             output_tokens: fresh,
             ..Usage::default()
-        });
+        }));
         let stale = Usage {
             input_tokens: Some(13),
             output_tokens: Some(0),
@@ -146,10 +146,71 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
     );
     guard.rebind("one".into());
     let old = guard.begin_dial_observation();
+    old.record(&Event::TextDelta("first physical attempt".into()));
     old.record(&Event::Completed);
     guard.rebind("two".into());
     assert!(guard.observation.snapshot().terminal.is_none());
+    assert!(guard.observation.snapshot().streamed_output.text.is_empty());
+    old.record(&Event::TextDelta("late first attempt".into()));
+    assert!(guard.observation.snapshot().streamed_output.text.is_empty());
     guard.disarm_finalized("completed");
+}
+
+#[tokio::test]
+async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal() {
+    Python::initialize();
+    let plane = Python::attach(|py| {
+        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"streamed_plane.py", c"streamed_plane")
+            .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+    });
+    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    for (name, terminal) in [("cut", false), ("done", true)] {
+        let mut guard = AttemptGuard::new(
+            bridge.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            name.into(),
+            Instant::now(),
+        );
+        guard.rebind(name.into());
+        guard.mark_dispatched();
+        guard.mark_opened();
+        let observation = guard.begin_dial_observation();
+        observation.record(&Event::ReasoningContentDelta {
+            route_sha256: "route".into(),
+            delta: "let me think".into(),
+        });
+        observation.record(&Event::TextDelta("Hello, ".into()));
+        observation.record(&Event::TextDelta("world".into()));
+        if terminal {
+            observation.record(&Event::Usage(Usage {
+                input_tokens: Some(19),
+                output_tokens: Some(7),
+                ..Usage::default()
+            }));
+            observation.record(&Event::Completed);
+        }
+        assert!(guard.settle_cancelled(None, &[]).await);
+    }
+    let writes: String = Python::attach(|py| {
+        py.import("json")
+            .unwrap()
+            .call_method1("dumps", (plane.bind(py).getattr("writes").unwrap(),))
+            .unwrap()
+            .extract()
+            .unwrap()
+    });
+    let writes: Value = serde_json::from_str(&writes).unwrap();
+    assert_eq!(writes[0]["usage_incomplete_due_to_disconnect"], true);
+    assert!(writes[0]["usage"].is_null());
+    assert_eq!(writes[0]["streamed_output"]["text"], "Hello, world");
+    assert_eq!(writes[0]["streamed_output"]["reasoning"], "let me think");
+    assert_eq!(writes[0]["streamed_output"]["text_overflow_chars"], 0);
+    assert_eq!(writes[0]["streamed_output"]["reasoning_overflow_chars"], 0);
+    assert_eq!(writes[0]["streamed_output"]["images"], 0);
+    // An observed provider terminal is the final meter: nothing to estimate.
+    assert_eq!(writes[1]["outcome"], "completed");
+    assert_eq!(writes[1]["usage_incomplete_due_to_disconnect"], false);
+    assert!(writes[1].get("streamed_output").is_none());
 }
 
 #[test]

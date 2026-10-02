@@ -13,22 +13,24 @@
 //! connection prewarm: it is answered with an empty completed response
 //! envelope and never touches admission or the ledger.
 
+use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Method};
 use axum::response::Response;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 
 use crate::encode::compact_json;
 use crate::encode_responses::{ResponsesEnvelope, ResponsesSseEncoder};
 use crate::errors::PublicError;
 use crate::events::Event;
-use crate::respond::{bearer_key, error_response};
+use crate::respond::{bearer_key, error_response, MAXIMUM_REQUEST_BODY_BYTES};
 use crate::route_responses::responses;
 use crate::server::AppState;
 use crate::sse::SseDecoder;
@@ -36,6 +38,85 @@ use crate::sse::SseDecoder;
 /// Bound on a buffered non-streaming (error) response body read back from
 /// the HTTP handler; its bodies are single compact JSON envelopes.
 const MAXIMUM_ADAPTED_BODY_BYTES: usize = 1_000_000;
+const MAXIMUM_PENDING_FRAMES: usize = 8;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded FIFO of follow-up requests, never dispatched alongside the active one.
+#[derive(Default)]
+struct PendingFrames {
+    frames: VecDeque<Message>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl PendingFrames {
+    fn push(&mut self, message: Message) -> Result<(), ()> {
+        let bytes = message_bytes(&message);
+        if self.frames.len() >= MAXIMUM_PENDING_FRAMES
+            || bytes > MAXIMUM_REQUEST_BODY_BYTES.saturating_sub(self.bytes)
+        {
+            self.overflowed = true;
+            return Err(());
+        }
+        self.bytes += bytes;
+        self.frames.push_back(message);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<Message> {
+        let message = self.frames.pop_front()?;
+        self.bytes -= message_bytes(&message);
+        Some(message)
+    }
+}
+
+fn message_bytes(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
+
+/// Poll one owned future while retaining pipelined requests and observing close.
+/// Dropping this wait drops startup/body work before a close reply is flushed.
+async fn while_connected<F: Future>(
+    socket: &mut WebSocket,
+    pending: &mut PendingFrames,
+    deadline: Instant,
+    future: F,
+) -> Result<F::Output, ()> {
+    tokio::pin!(future);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(());
+        }
+        tokio::select! {
+            message = socket.recv() => match message {
+                Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) => pending.push(message)?,
+                Some(Ok(Message::Ping(_))) => {
+                    tokio::time::timeout_at(write_deadline(deadline), socket.flush())
+                        .await.map_err(|_| ())?.map_err(|_| ())?;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                _ => return Err(()),
+            },
+            result = &mut future => return Ok(result),
+            _ = tokio::time::sleep_until(deadline.into()) => return Err(()),
+        }
+    }
+}
+
+fn write_deadline(deadline: Instant) -> tokio::time::Instant {
+    deadline.min(Instant::now() + SOCKET_SEND_TIMEOUT).into()
+}
+
+async fn send_frame(socket: &mut WebSocket, deadline: Instant, message: Message) -> Result<(), ()> {
+    tokio::time::timeout_at(write_deadline(deadline), socket.send(message))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
 
 /// Byte-compatible rejection for `"stream": false`, which the WebSocket
 /// transport cannot honor (api.openai.com answers this exact message).
@@ -112,20 +193,46 @@ fn request_headers(headers: &HeaderMap) -> HeaderMap {
     carried
 }
 
-/// Serve one accepted connection: sequential request frames, each answered
-/// with its full event stream before the next frame is read.
+/// Serve sequential requests while retaining bounded follow-ups during active work.
 async fn serve_socket(state: AppState, headers: HeaderMap, mut socket: WebSocket) {
-    while let Some(message) = socket.recv().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(_) => return,
+    let mut pending = PendingFrames::default();
+    loop {
+        let message = match pending.pop() {
+            Some(message) => message,
+            None => match socket.recv().await {
+                Some(Ok(message)) => message,
+                _ => return,
+            },
         };
+        let deadline = Instant::now() + state.request_timeout;
         match message {
             Message::Text(text) => {
-                if handle_frame(&state, &headers, &mut socket, text.as_str())
-                    .await
-                    .is_err()
+                if handle_frame(
+                    &state,
+                    &headers,
+                    &mut socket,
+                    &mut pending,
+                    deadline,
+                    text.as_str(),
+                )
+                .await
+                .is_err()
                 {
+                    // HTTP work has dropped before a bounded close/automatic reply flush.
+                    if pending.overflowed {
+                        let _ = send_frame(
+                            &mut socket,
+                            deadline,
+                            Message::Close(Some(CloseFrame {
+                                code: close_code::SIZE,
+                                reason: "Pending request limit exceeded".into(),
+                            })),
+                        )
+                        .await;
+                    } else {
+                        let _ =
+                            tokio::time::timeout_at(write_deadline(deadline), socket.flush()).await;
+                    }
                     return;
                 }
             }
@@ -137,7 +244,10 @@ async fn serve_socket(state: AppState, headers: HeaderMap, mut socket: WebSocket
                      response.create object per text frame.",
                     "invalid_request_error",
                 );
-                if send_public_error(&mut socket, &error).await.is_err() {
+                if send_public_error(&mut socket, deadline, &error)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -156,11 +266,13 @@ async fn handle_frame(
     state: &AppState,
     headers: &HeaderMap,
     socket: &mut WebSocket,
+    pending: &mut PendingFrames,
+    deadline: Instant,
     text: &str,
 ) -> Result<(), ()> {
     let mut value: Value = match serde_json::from_str(text) {
         Ok(Value::Object(entries)) => Value::Object(entries),
-        _ => return send_public_error(socket, &PublicError::invalid_json()).await,
+        _ => return send_public_error(socket, deadline, &PublicError::invalid_json()).await,
     };
     let body = value.as_object_mut().expect("frame decoded as an object");
     match body.remove("type") {
@@ -173,13 +285,23 @@ async fn handle_frame(
                  \"response.create\".",
                 "invalid_request_error",
             );
-            return send_public_error(socket, &error).await;
+            return send_public_error(socket, deadline, &error).await;
         }
     }
     // `generate: false` is the transport prewarm: acknowledge the connection
     // with an empty completed response and perform no model work.
     if let Some(generate) = body.remove("generate") {
         if generate == Value::Bool(false) {
+            if body.contains_key("gateway") {
+                let mut error = PublicError::new(
+                    400,
+                    "unsupported_parameter",
+                    "gateway requires generate=true. Remove gateway for a prewarm request.",
+                    "invalid_request_error",
+                );
+                error.param = Some("gateway".to_string());
+                return send_public_error(socket, deadline, &error).await;
+            }
             let probability_include =
                 body.get("include")
                     .and_then(Value::as_array)
@@ -198,9 +320,9 @@ async fn handle_frame(
                     "Responses probability output requires generate=true.",
                     "invalid_request_error",
                 );
-                return send_public_error(socket, &error).await;
+                return send_public_error(socket, deadline, &error).await;
             }
-            return send_prewarm_ack(socket, &value).await;
+            return send_prewarm_ack(socket, deadline, &value).await;
         }
     }
     // The WebSocket surface always streams; only an explicit opt-out is a
@@ -213,7 +335,7 @@ async fn handle_frame(
                 STREAM_FALSE_MESSAGE,
                 "invalid_request_error",
             );
-            return send_public_error(socket, &error).await;
+            return send_public_error(socket, deadline, &error).await;
         }
         _ => {
             body.insert("stream".to_string(), Value::Bool(true));
@@ -226,14 +348,25 @@ async fn handle_frame(
         .body(axum::body::Body::from(compact_json(&value)))
         .expect("static request line is valid");
     *request.headers_mut() = headers.clone();
-    let response = responses(State(state.clone()), request).await;
-    relay_response(socket, response).await
+    let response = while_connected(
+        socket,
+        pending,
+        deadline,
+        responses(State(state.clone()), request),
+    )
+    .await?;
+    relay_response(socket, pending, deadline, response).await
 }
 
 /// Re-frame one HTTP handler response onto the socket: an event-stream body
 /// becomes one text frame per SSE event; anything else becomes one wrapped
 /// in-band error frame.
-async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<(), ()> {
+async fn relay_response(
+    socket: &mut WebSocket,
+    pending: &mut PendingFrames,
+    deadline: Instant,
+    response: Response,
+) -> Result<(), ()> {
     let status = response.status();
     let is_event_stream = response
         .headers()
@@ -246,26 +379,24 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
         // Dropping the body mid-stream cancels the in-flight attempt through
         // the same disconnect guards an HTTP client disconnect triggers.
         let mut body = response.into_body().into_data_stream();
-        while let Some(chunk) = body.next().await {
+        while let Some(chunk) = while_connected(socket, pending, deadline, body.next()).await? {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(_) => {
                     let error = PublicError::internal();
-                    return send_public_error(socket, &error).await;
+                    return send_public_error(socket, deadline, &error).await;
                 }
             };
             let events = match decoder.feed(&chunk) {
                 Ok(events) => events,
                 Err(_) => {
                     let error = PublicError::internal();
-                    return send_public_error(socket, &error).await;
+                    return send_public_error(socket, deadline, &error).await;
                 }
             };
             for event in events {
                 saw_terminal = saw_terminal || is_terminal_event(event.event.as_deref());
-                if socket.send(Message::Text(event.data.into())).await.is_err() {
-                    return Err(());
-                }
+                send_frame(socket, deadline, Message::Text(event.data.into())).await?;
             }
         }
         if !saw_terminal {
@@ -279,7 +410,7 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
                 "The response stream ended before its terminal event. Resend the request.",
                 "server_error",
             );
-            return send_public_error(socket, &error).await;
+            return send_public_error(socket, deadline, &error).await;
         }
         return Ok(());
     }
@@ -289,9 +420,16 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
         .get(header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let body = match axum::body::to_bytes(response.into_body(), MAXIMUM_ADAPTED_BODY_BYTES).await {
+    let body = match while_connected(
+        socket,
+        pending,
+        deadline,
+        axum::body::to_bytes(response.into_body(), MAXIMUM_ADAPTED_BODY_BYTES),
+    )
+    .await?
+    {
         Ok(body) => body,
-        Err(_) => return send_public_error(socket, &PublicError::internal()).await,
+        Err(_) => return send_public_error(socket, deadline, &PublicError::internal()).await,
     };
     let error = serde_json::from_slice::<Value>(&body)
         .ok()
@@ -301,13 +439,17 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
                 .and_then(|entries| entries.remove("error"))
         })
         .unwrap_or_else(|| error_object(&PublicError::internal()));
-    send_wrapped_error(socket, status.as_u16(), error, retry_after).await
+    send_wrapped_error(socket, deadline, status.as_u16(), error, retry_after).await
 }
 
 /// Answer one prewarm frame with created, in-progress, and empty completed
 /// lifecycle events reflecting the request envelope, without admission,
 /// ledger, or provider work.
-async fn send_prewarm_ack(socket: &mut WebSocket, request: &Value) -> Result<(), ()> {
+async fn send_prewarm_ack(
+    socket: &mut WebSocket,
+    deadline: Instant,
+    request: &Value,
+) -> Result<(), ()> {
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -323,23 +465,17 @@ async fn send_prewarm_ack(socket: &mut WebSocket, request: &Value) -> Result<(),
     let mut encoder = ResponsesSseEncoder::new(&request_id, &model, created_at, envelope);
     let mut frames = match encoder.start() {
         Ok(frames) => frames,
-        Err(error) => return send_public_error(socket, &error).await,
+        Err(error) => return send_public_error(socket, deadline, &error).await,
     };
     match encoder.feed(&Event::Completed) {
         Ok(terminal) => frames.extend(terminal),
-        Err(error) => return send_public_error(socket, &error).await,
+        Err(error) => return send_public_error(socket, deadline, &error).await,
     }
     for frame in frames {
         let Some(data) = sse_frame_data(&frame) else {
-            return send_public_error(socket, &PublicError::internal()).await;
+            return send_public_error(socket, deadline, &PublicError::internal()).await;
         };
-        if socket
-            .send(Message::Text(data.to_string().into()))
-            .await
-            .is_err()
-        {
-            return Err(());
-        }
+        send_frame(socket, deadline, Message::Text(data.to_string().into())).await?;
     }
     Ok(())
 }
@@ -376,16 +512,21 @@ fn error_object(error: &PublicError) -> Value {
 }
 
 /// Send one wrapped in-band error frame built from a `PublicError`.
-async fn send_public_error(socket: &mut WebSocket, error: &PublicError) -> Result<(), ()> {
+async fn send_public_error(
+    socket: &mut WebSocket,
+    deadline: Instant,
+    error: &PublicError,
+) -> Result<(), ()> {
     let envelope = error_object(error);
     let retry_after = error.retry_after_seconds.map(|wait| wait.to_string());
-    send_wrapped_error(socket, error.status_code, envelope, retry_after).await
+    send_wrapped_error(socket, deadline, error.status_code, envelope, retry_after).await
 }
 
 /// Send the wrapped `{"type": "error", "error": ..., "status": ...}` frame
 /// the Responses-over-WebSocket contract uses for request-level failures.
 async fn send_wrapped_error(
     socket: &mut WebSocket,
+    deadline: Instant,
     status: u16,
     error: Value,
     retry_after: Option<String>,
@@ -398,15 +539,48 @@ async fn send_wrapped_error(
         frame.insert("headers".to_string(), json!({ "retry-after": wait }));
     }
     let payload = compact_json(&Value::Object(frame));
-    socket
-        .send(Message::Text(payload.into()))
-        .await
-        .map_err(|_| ())
+    send_frame(socket, deadline, Message::Text(payload.into())).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_fifo_bounds_count_and_bytes_and_releases_capacity() {
+        let mut pending = PendingFrames::default();
+        for index in 0..MAXIMUM_PENDING_FRAMES {
+            pending
+                .push(Message::Text(index.to_string().into()))
+                .unwrap();
+        }
+        assert!(pending.push(Message::Text("overflow".into())).is_err());
+        for index in 0..MAXIMUM_PENDING_FRAMES {
+            assert_eq!(
+                message_bytes(&pending.pop().unwrap()),
+                index.to_string().len()
+            );
+        }
+        assert_eq!(pending.bytes, 0);
+        let mut pending = PendingFrames::default();
+        let block = bytes::Bytes::from(vec![0; MAXIMUM_REQUEST_BODY_BYTES / 4]);
+        for _ in 0..4 {
+            pending.push(Message::Binary(block.clone())).unwrap();
+        }
+        assert!(pending.push(Message::Text("x".into())).is_err());
+        pending.pop();
+        assert!(pending.push(Message::Text("x".into())).is_ok());
+    }
+
+    #[test]
+    fn socket_write_bound_never_extends_the_request_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(10);
+        assert_eq!(write_deadline(deadline), deadline.into());
+        assert!(
+            write_deadline(Instant::now() + Duration::from_secs(60))
+                <= (Instant::now() + SOCKET_SEND_TIMEOUT).into()
+        );
+    }
 
     #[test]
     fn sse_frame_data_extracts_the_payload() {

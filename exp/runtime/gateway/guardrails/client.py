@@ -197,8 +197,3 @@ def assert_not_internal_classification() -> None:
         raise GuardrailRecursionError(
             "classifier adapters cannot recurse through the public gateway route"
         )
-
-
-def internal_classification_active() -> bool:
-    """Return whether the current task is inside a classifier call."""
-    return _INTERNAL_CLASSIFICATION.get()

@@ -57,13 +57,23 @@ def test_spec_preserves_only_the_selected_mode_settings_and_is_digest_stable() -
     assert simulation_spec_digest(first) == simulation_spec_digest(second)
 
 
-def test_v1_world_model_spec_preserves_exact_identity_payload() -> None:
-    """A pre-extension v1 specification retains its exact serialized fields and digest."""
+def test_world_model_spec_binds_rollout_budget_and_continuation_identity() -> None:
+    """Budget and continuation fields participate in the exact serialized identity."""
     payload = _spec().model_dump(mode="json")
     parsed = SimulationSpec.model_validate(payload)
 
     assert parsed.model_dump(mode="json") == payload
     assert parsed.world_model is not None
+    assert parsed.world_model.json_object_output is False
+    assert parsed.world_model.maximum_transition_attempts == 1
+    retry_world = parsed.world_model.model_copy(update={"maximum_transition_attempts": 3})
+    assert simulation_spec_digest(parsed) != simulation_spec_digest(
+        parsed.model_copy(update={"world_model": retry_world})
+    )
+    json_world = parsed.world_model.model_copy(update={"json_object_output": True})
+    assert simulation_spec_digest(parsed) != simulation_spec_digest(
+        parsed.model_copy(update={"world_model": json_world})
+    )
     assert set(parsed.world_model.model_dump(mode="json")) == {
         "world_model_alias",
         "grounded_world_model_input",
@@ -72,8 +82,13 @@ def test_v1_world_model_spec_preserves_exact_identity_payload() -> None:
         "maximum_output_tokens",
         "allow_tools",
     }
-    assert simulation_spec_digest(parsed) == (
-        "d254c9c2087e0b6364696bd361bbc4ab5691a1860c50fd9752651f213e4702f1"
+    assert parsed.maximum_rollout_output_tokens == 1_000_000
+    assert parsed.continuation_of is None
+    assert simulation_spec_digest(parsed) != simulation_spec_digest(
+        parsed.model_copy(update={"maximum_rollout_output_tokens": 2_000_000})
+    )
+    assert simulation_spec_digest(parsed) != simulation_spec_digest(
+        parsed.model_copy(update={"continuation_of": _PLAN_INPUT})
     )
 
 

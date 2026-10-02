@@ -1,24 +1,36 @@
 //! Gemini `streamGenerateContent` frame mapping plus its golden-fixture tests.
 
+#[path = "gemini_usage.rs"]
+mod usage;
+pub(super) use usage::StreamState;
+
 use serde_json::Value;
 
 use super::{malformed, parse_object, Normalizer};
 use crate::errors::{Failure, FailureClass};
-use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
+use crate::events::{require_string, Event, ToolAccumulator};
 
 impl Normalizer {
-    /// Normalize one Gemini `streamGenerateContent` SSE frame: reasoning parts
-    /// are skipped, whole function calls expand to start/arguments/completed,
-    /// and the terminal candidate flushes the latest usage before its finish
-    /// reason maps to the shared completion, incomplete, refusal, or
-    /// provider-internal outcome. A prompt-level block (`promptFeedback.
-    /// blockReason`, delivered with no candidates at all) is the same
+    /// Normalize one Gemini `streamGenerateContent` SSE frame: thought parts
+    /// stay capture-only, whole function calls expand to start/arguments/completed,
+    /// and the terminal candidate freezes content while metadata trailers can
+    /// complete the meter. Its declared outcome is emitted once transport ends.
+    /// A prompt-level block (`promptFeedback.blockReason`, delivered with no
+    /// candidates at all) is the same
     /// content-free refusal a candidate-level safety finish produces.
     pub(super) fn feed_gemini(
         &mut self,
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
+        if self.metadata_drain_started().is_some() {
+            if let Some(raw) = payload.get("usageMetadata").filter(|raw| !raw.is_null()) {
+                self.observe_gemini_usage(raw)?;
+            }
+            // The first finish is authoritative. Late content, tools, errors,
+            // refusals and further finish reasons cannot reopen the answer.
+            return Ok(Vec::new());
+        }
         if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
             // Google's error envelope ({"error":{"code":503,"status":"UNAVAILABLE"}})
             // arrives as a candidate-less frame; without this branch it reads
@@ -38,11 +50,12 @@ impl Normalizer {
                 "gemini_generate_content",
                 code,
                 message,
+                None,
             ))]);
         }
         if let Some(raw_usage) = payload.get("usageMetadata") {
             if !raw_usage.is_null() {
-                self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
+                self.observe_gemini_usage(raw_usage)?;
             }
         }
         if gemini_prompt_blocked(&payload)? {
@@ -98,8 +111,19 @@ impl Normalizer {
                     let part = raw_part
                         .as_object()
                         .ok_or_else(|| malformed("Gemini candidate part must be an object"))?;
-                    // Reasoning parts (thought text and thought signatures)
-                    // are not gateway-visible output.
+                    // Google exposes thought summaries, not full CoT. Preserve the
+                    // whole signed part so a signature remains paired with its
+                    // text or functionCall, without treating it as readable output.
+                    if part.get("thought") == Some(&Value::Bool(true))
+                        || part.contains_key("thoughtSignature")
+                    {
+                        let bytes = crate::dialects::records_retained_bytes(raw_part)
+                            .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
+                        self.reserve_summary_bytes(bytes.max(64))?;
+                        events.push(Event::GeminiThoughtPart(std::sync::Arc::new(
+                            raw_part.clone(),
+                        )));
+                    }
                     if part.get("thought") == Some(&Value::Bool(true)) {
                         continue;
                     }
@@ -108,6 +132,23 @@ impl Normalizer {
                             events.extend(self.gemini_tool_events(call)?);
                             continue;
                         }
+                    }
+                    if let Some(image) = part.get("inlineData") {
+                        let media_type =
+                            image
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    malformed("Gemini image requires a media type")
+                                        .with_retry(false, false)
+                                })?;
+                        let data = image.get("data").and_then(Value::as_str).ok_or_else(|| {
+                            malformed("Gemini image requires base64 data").with_retry(false, false)
+                        })?;
+                        let url = crate::image_output::inline_image(media_type, data)?;
+                        self.reserve_image_bytes(url.len())?;
+                        events.push(Event::Image(url));
+                        continue;
                     }
                     match part.get("text") {
                         Some(Value::String(text)) => {
@@ -129,35 +170,30 @@ impl Normalizer {
             Some(Value::String(reason)) => reason.clone(),
             Some(_) => return Err(malformed("Gemini finishReason must be text")),
         };
-        if let Some(usage) = self.usage.take() {
-            events.push(Event::Usage(usage));
-        }
-        match finish_reason.as_str() {
-            "STOP" | "FINISH_REASON_UNSPECIFIED" => events.push(Event::Completed),
-            "MAX_TOKENS" => events.push(Event::Incomplete),
-            // The python mapper's refusal signal table: safety, copyright,
+        let terminal = match finish_reason.as_str() {
+            "STOP" | "FINISH_REASON_UNSPECIFIED" => Event::Completed,
+            "MAX_TOKENS" => Event::Incomplete,
+            // The refusal signal table: safety, copyright,
             // and sensitive-information stops are content-free refusals. The
             // finish token names the category (RECITATION, SPII, SAFETY), so
             // the caller sees which policy declined without any provider prose.
             "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII"
-            | "IMAGE_SAFETY" => {
-                events.push(Event::Failed(Failure::refusal(
-                    crate::stream_errors::refusal_reason(Some(&finish_reason), None),
-                )));
-            }
-            _ => {
-                events.push(Event::Failed(Failure::new(
-                    FailureClass::ProviderInternal,
-                    "provider ended the stream unexpectedly",
-                )));
-            }
-        }
+            | "IMAGE_SAFETY" => Event::Failed(Failure::refusal(
+                crate::stream_errors::refusal_reason(Some(&finish_reason), None),
+            )),
+            _ => Event::Failed(Failure::new(
+                FailureClass::ProviderInternal,
+                "provider ended the stream unexpectedly",
+            )),
+        };
+        self.gemini.finish = Some(terminal);
+        self.gemini.finished_at = Some(std::time::Instant::now());
         Ok(events)
     }
 
     /// Expand one complete Gemini function call into the canonical tool-call
     /// lifecycle, assigning the deterministic local call-ID fallback and the
-    /// canonical compact JSON argument text the python mapper produces.
+    /// canonical compact JSON argument text.
     fn gemini_tool_events(&mut self, value: &Value) -> Result<Vec<Event>, Failure> {
         let call = value
             .as_object()
@@ -232,6 +268,10 @@ fn gemini_block_reason(payload: &serde_json::Map<String, Value>) -> Option<Strin
 }
 
 #[cfg(test)]
+#[path = "gemini_usage_tests.rs"]
+mod usage_tests;
+
+#[cfg(test)]
 mod gemini_tests {
     use super::super::{drain_stream_fixture, Dialect};
     use super::*;
@@ -247,9 +287,38 @@ mod gemini_tests {
     }
 
     #[test]
+    fn thought_summaries_and_signatures_keep_their_exact_part_association() {
+        let parts = vec![
+            json!({"thought":true,"text":"Summary, not full CoT. 雪"}),
+            json!({"functionCall":{"name":"lookup","args":{"id":"a"}},"thoughtSignature":"tool-signature=="}),
+            json!({"text":"answer","thoughtSignature":"text-signature=="}),
+            json!({"thoughtSignature":"standalone=="}),
+        ];
+        let chunk = sse(&json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]}));
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &[chunk.as_slice()]);
+        assert!(failure.is_none());
+        let captured: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "gemini_thought_part")
+            .map(|event| event["part"].clone())
+            .collect();
+        assert_eq!(captured, parts);
+        assert!(!events
+            .iter()
+            .any(|event| event["kind"] == "reasoning_content_delta"));
+        let visible: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "text_delta")
+            .collect();
+        assert_eq!(visible, vec![&json!({"kind":"text_delta","text":"answer"})]);
+        let private = Event::GeminiThoughtPart(std::sync::Arc::new(parts[0].clone()));
+        assert!(!private.is_output_token());
+        assert!(private.is_generation_progress());
+    }
+
+    #[test]
     fn gemini_golden_stream_normalizes_text_tools_usage_and_completion() {
         // Golden fixture: raw provider bytes in, exact canonical events out.
-        // `native_dialect_parity_test.py` holds the python-mapper comparison.
         let chunks = [
             sse(&json!({"candidates": [{"content": {"parts": [{"text": "Hel"}]}}]})),
             sse(&json!({"candidates": [{"content": {"parts": [
@@ -281,6 +350,7 @@ mod gemini_tests {
             events,
             vec![
                 json!({"kind": "text_delta", "text": "Hel"}),
+                json!({"kind": "gemini_thought_part", "part": {"thought":true,"text":"hidden reasoning"}}),
                 json!({"kind": "text_delta", "text": "lo"}),
                 json!({"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"}),
                 json!({"kind": "tool_arguments_delta", "index": 0, "text": raw_arguments}),
@@ -351,6 +421,7 @@ mod gemini_tests {
             events,
             vec![
                 json!({"kind": "text_delta", "text": "Sunlight scatters off air "}),
+                json!({"kind": "gemini_thought_part", "part": {"text":"molecules.","thoughtSignature":"CikB"}}),
                 json!({"kind": "text_delta", "text": "molecules."}),
                 json!({
                     "kind": "usage",
@@ -823,8 +894,14 @@ mod gemini_tests {
             data: json!({"candidates": [{"content": {"parts": [{"text": "late"}]}}]}).to_string(),
         };
         let events = normalizer.feed(&terminal).expect("terminal frame");
-        assert!(events.iter().any(Event::is_terminal));
-        assert!(normalizer.saw_terminal());
+        assert!(!events.iter().any(Event::is_terminal));
+        assert!(!normalizer.saw_terminal());
+        assert!(normalizer.metadata_drain_started().is_some());
         assert!(normalizer.feed(&trailing).expect("ignored").is_empty());
+        assert!(matches!(
+            normalizer.on_stream_end().unwrap().as_slice(),
+            [Event::Completed]
+        ));
+        assert!(normalizer.saw_terminal());
     }
 }

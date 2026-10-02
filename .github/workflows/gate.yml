@@ -10,12 +10,31 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the running gate; main
+# pushes and manual runs each keep their own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   gate:
     runs-on: ubuntu-latest
+    env:
+      # Type-check and exercise the complete package, including the capture engine.
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
+      - name: Key the uv cache on the git-pinned source builds
+        # What the uv cache holds across runs is the wheels uv built from
+        # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
+        # (~3 min). Keying on all of uv.lock went cold on every release bump.
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key || true
       - uses: astral-sh/setup-uv@v6
+        with:
+          # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
+          # by whichever finishes first, holding the wrong interpreter's builds.
+          cache-dependency-glob: .uv-cache-key
+          cache-suffix: py313-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,15 +49,48 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # Published wheels are immutable per version, so any change under the
-          # crate must move the crate version. GitHub's merge-base file list is
-          # authoritative and needs no local history (the checkout is shallow).
+          # Published wheels are immutable. An explicit unreleased stack may
+          # defer its bump, but cannot publish until the deferral is removed.
+          # GitHub's merge-base file list needs no local checkout history.
+          marker=.github/deferred-native-release.toml
+          if [ -f "$marker" ]; then
+            uv run python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          marker = tomllib.loads(Path(".github/deferred-native-release.toml").read_text())
+          for name, path in (("experiential", "pyproject.toml"),
+                             ("exp-gateway-native", "exp/runtime/gateway/native/pyproject.toml")):
+              version = tomllib.loads(Path(path).read_text())["project"]["version"]
+              assert version == marker[name], "remove release deferral before bumping versions"
+          PY
+            for path in pyproject.toml exp/runtime/gateway/native/Cargo.toml; do
+              head_version="$(grep -m1 '^version = ' "$path")"
+              base_version="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_BASE_REF}" \
+                -q .content | base64 -d | grep -m1 '^version = ')"
+              test "$head_version" = "$base_version" || {
+                echo "release deferral must preserve both base versions" >&2
+                exit 1
+              }
+            done
+            echo "unreleased native changes: package publication is blocked"
+            exit 0
+          fi
           files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
             --paginate -q '.[].filename')" || {
             echo "could not list the pull request's files; failing closed" >&2
             exit 1
           }
           changed="$(printf '%s\n' "${files}" | grep -c '^exp/runtime/gateway/native/' || true)"
+          if printf '%s\n' "${files}" | grep -qx '.github/deferred-native-release.toml'; then
+            changed=1
+            head_project="$(grep -m1 '^version = ' pyproject.toml)"
+            base_project="$(gh api "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=${GITHUB_BASE_REF}" \
+              -q .content | base64 -d | grep -m1 '^version = ')"
+            test "$head_project" != "$base_project" || {
+              echo "ending a release deferral requires a new flagship version" >&2
+              exit 1
+            }
+          fi
           if [ "${changed}" = "0" ]; then
             echo "crate untouched"
             exit 0
@@ -67,6 +119,15 @@ jobs:
         run: >-
           cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml
           --no-default-features
+      - name: Explicit cache crosses the real Python and native bridge
+        run: |
+          export PYO3_PYTHON="$PWD/.venv/bin/python"
+          export PYTHONPATH="$PWD:$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+          export LD_LIBRARY_PATH="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml \
+            --no-default-features \
+            waterfall::attempt::google_cache::bridge_tests::real_python_control_plane_creates_and_reuses_through_bridge \
+            -- --ignored --exact
       - name: Native parity tests are present, not skipped
         run: >-
           uv run pytest -q exp/runtime/gateway/native_bridge_test.py
@@ -81,23 +142,217 @@ jobs:
         run: >-
           uv run pytest -q -k "not live"
           exp/optimize/model/sft/tinker_test.py
+
+  gate-shards:
+    # Standard runners are free on this public repository, so running the
+    # non-live suite as parallel shards beside the lint/cargo gate job cuts
+    # the critical path at no cost.
+    name: gate tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Balanced on measured test time; each shard is ~2-3 minutes of tests on
+        # four workers. A path a shard ignores must be another shard's path, or
+        # run by a dedicated step (Tinker in gate, the evidence suites on macOS).
+        include:
+          - name: rest
+            paths: exp --ignore=exp/optimize/router --ignore=exp/runtime/gateway --ignore=exp/optimize/evaluation --ignore=exp/optimize/model/sft/tinker_test.py --ignore=exp/simulation/tests/comparison_evidence_test.py --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
+          - name: router-hosted
+            paths: exp/optimize/router/hosted_test.py exp/optimize/router/automatic
+          - name: router
+            paths: exp/optimize/router --ignore=exp/optimize/router/hosted_test.py --ignore=exp/optimize/router/automatic
+          - name: gateway
+            paths: exp/runtime/gateway
+          - name: evaluation
+            paths: exp/optimize/evaluation
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Key the uv cache on the git-pinned source builds
+        # What the uv cache holds across runs is the wheels uv built from
+        # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
+        # (~3 min). Keying on all of uv.lock went cold on every release bump.
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key || true
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
+          # by whichever finishes first, holding the wrong interpreter's builds.
+          cache-dependency-glob: .uv-cache-key
+          cache-suffix: py313-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: exp/runtime/gateway/native
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
       - name: non-live tests
         run: >-
           uv run pytest -n 4 --dist worksteal -q -k "not live"
-          exp
-          --ignore=exp/optimize/model/sft/tinker_test.py
+          ${{ matrix.paths }}
           --ignore=exp/optimize/router/tests/composition_evidence_test.py
-          --ignore=exp/simulation/tests/comparison_evidence_test.py
-          --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
+
+  sdk-python312:
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: exp/runtime/gateway/native
+      - name: Install the minimum-version SDK without capture engine dependencies
+        run: uv sync --extra dev
+      - name: SDK and Capture command help remain available
+        run: |
+          uv run exp --help
+          uv run exp capture --help
+          uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
+            exp/tests/release_test.py -k "not installed_wheel"
+
+  darwin-scope:
+    # The macOS evidence job is the most expensive check here (macOS bills 10x)
+    # while few pull requests touch what it covers. The Linux gate still runs
+    # the Capture suites on every PR, and main pushes always run the macOS job.
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - name: Does this pull request touch the Darwin evidence scope
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" != pull_request ]; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate \
+            -q '.[] | {filename, previous_filename, patch}' > files.jsonl || {
+            echo "could not list the pull request's files; running the macOS job" >&2
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          SCOPE = re.compile(
+              r"^(exp/runtime/capture/|exp/cli/capture/|exp/runtime/environments/"
+              r"|exp/runtime/router/|exp/optimize/router/|exp/simulation/"
+              # Shared files the evidence suites load directly. exp/common/ is
+              # deliberately out (a quarter of all merges); main pushes cover it.
+              r"|conftest\.py$|exp/__init__\.py$|exp/conftest\.py$"
+              r"|exp/tests/release_revision_test\.py$"
+              r"|\.github/workflows/gate\.yml$)"
+          )
+          MANIFESTS = {"pyproject.toml", "uv.lock"}
+          # Every release bumps both manifests; only a dependency change matters here.
+          VERSION_ONLY = re.compile(
+              r'^[+-](version = "[0-9][0-9a-z.+-]*"'
+              r'|\s*"exp-gateway-native>=[0-9][0-9.]*,<[0-9][0-9.]*",(\s*#.*)?)$'
+          )
+
+          def needs_macos(changed: dict) -> bool:
+              name = changed["filename"]
+              # A rename out of the scope still removes a file the job covers.
+              if SCOPE.match(name) or SCOPE.match(changed.get("previous_filename") or ""):
+                  return True
+              if name not in MANIFESTS:
+                  return False
+              patch = changed.get("patch")
+              if not patch:  # GitHub omits very large patches
+                  return True
+              lines = [
+                  line
+                  for line in patch.splitlines()
+                  if line[:1] in "+-" and not line.startswith(("+++", "---"))
+              ]
+              return not all(VERSION_ONLY.match(line) for line in lines)
+
+          with open("files.jsonl") as handle:
+              required = any(needs_macos(json.loads(line)) for line in handle if line.strip())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"required={str(required).lower()}\n")
+          PY
+
+  windows-snapshot-authority:
+    name: Windows snapshot authority
+    runs-on: windows-latest
+    env:
+      # Exercise the supported SDK on real Windows; Linux/Darwin retain complete 3.13 Capture gates.
+      UV_PYTHON: "3.12"
+      EXP_TELEMETRY: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: Verify real Windows snapshot authority
+        # These tests use built-in fixtures only. The suite conftest owns Unix PTY fixtures;
+        # its provider-auth isolation is replaced by the empty step-local XDG_DATA_HOME.
+        # CLI imports remain Unix-only; this job proves snapshot authority, not Windows CLI support.
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth
+        run: >-
+          uv run pytest --noconftest -q -rs --junitxml=windows-snapshot-authority.xml
+          exp/runtime/gateway/snapshot_file_windows_test.py
+          exp/runtime/gateway/snapshot_file_test.py::test_snapshot_resource_budget_is_a_strict_positive_integer
+          exp/runtime/gateway/snapshot_file_test.py::test_bounded_reader_accepts_limit_and_rejects_growth
+          exp/runtime/gateway/snapshot_file_test.py::test_growth_after_initial_stat_still_obeys_the_read_budget
+          exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_resource_override_and_reachable_authority
+          exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_refuses_unauthorized_targets
+          exp/runtime/gateway/budget_authority_test.py::test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch
+          exp/common/config/settings_test.py
+      - name: Require executed Windows kernel and graph cases
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse("windows-snapshot-authority.xml").findall(".//testcase")
+          kernel = [case for case in cases if "snapshot_file_windows_test" in case.get("classname", "")]
+          assert len(kernel) == 25, f"expected 25 Windows kernel cases, got {len(kernel)}"
+          required = {
+              "test_pinned_graph_file_resource_override_and_reachable_authority": 1,
+              "test_pinned_graph_file_refuses_unauthorized_targets": 4,
+              "test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch": 1,
+              "test_snapshot_resource_budget_is_a_strict_positive_integer": 8,
+              "test_gateway_resource_setting_survives_other_settings_updates": 1,
+          }
+          for name, minimum in required.items():
+              matching = [case for case in cases if case.get("name", "").split("[", 1)[0] == name]
+              assert len(matching) >= minimum, (name, len(matching))
+          for case in cases:
+              assert not any(case.find(tag) is not None for tag in ("skipped", "failure", "error")), case.attrib
+          PY
+      - name: Upload Windows authority test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-snapshot-authority
+          path: windows-snapshot-authority.xml
 
   w16-darwin-evidence:
+    needs: darwin-scope
+    if: needs.darwin-scope.outputs.required == 'true'
     runs-on: macos-latest
+    env:
+      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
         run: uv sync --extra dev
+      - name: Capture selective TLS streaming and local redirector lifecycle
+        run: uv run pytest -q exp/runtime/capture exp/cli/capture
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}

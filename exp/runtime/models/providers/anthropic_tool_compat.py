@@ -21,21 +21,20 @@ from exp.common.core.artifacts import JsonObject
 _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES = (
     "claude-fable-5-1",
     "claude-mythos-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
 )
 """Exact point releases whose ``tool_choice`` ``any``/``tool`` return a 400 by name.
 
-The provider's tool-use documentation ("Forcing tool use") states two rules:
-(1) "Claude Fable 5.1 and Claude Mythos 5.1: ``any`` and ``tool`` return a 400
-error", and (2) "Manual extended thinking (``thinking: {type: enabled}``):
-``any`` and ``tool`` are not supported ... Adaptive thinking supports forced
-tool use". Rule (1) is this table; rule (2) is a per-request check in the
-Anthropic payload builder. Verified live 2026-09-05: fable-5-1 rejects with no
-thinking config and under adaptive thinking, while fable-5, opus-5, sonnet-5,
-opus-4-8, sonnet-4-6, sonnet-4-5, and haiku-4-5 all accept ``any`` and ``tool``.
-Entries are therefore exact RELEASES, never generation prefixes: a new point
-release (claude-fable-5-2) matches nothing here and must be probed live and
-added deliberately, not assumed from its generation. A dated snapshot id
-(``claude-fable-5-1-20260901``) inherits its release's rule."""
+Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 reject forced tool use with or
+without thinking. Manual budgeted thinking also excludes forced tools; the payload
+builder checks that independent per-request constraint. Older adaptive
+releases can force tools, so entries are exact releases rather than generation
+prefixes. A new point release must have its own verified contract. A dated
+snapshot id inherits its release's rule.
+
+Provider contract: https://platform.claude.com/docs/en/models/opus-5-5/migration-guide
+"""
 
 
 def anthropic_rejects_forced_tool_choice(model_id: str) -> bool:
@@ -54,15 +53,7 @@ def anthropic_rejects_forced_tool_choice(model_id: str) -> bool:
     # "Azure: tool_choice: type \"tool\" and \"any\" are not supported for this
     # model" through OpenRouter, 154 attempts / 5 orgs in 12h), so the fact is
     # the model's, not the wire's. A later point release never inherits.
-    normalized = model_id.lower().replace(".", "-").replace("_", "-")
-    return any(
-        re.search(
-            rf"(?:^|[^a-z0-9]){re.escape(release)}(?![a-z0-9])(?!-\d{{1,7}}(?![0-9]))",
-            normalized,
-        )
-        is not None
-        for release in _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES
-    )
+    return matches_anthropic_release(model_id, _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES)
 
 
 _ANTHROPIC_PREFILL_REJECTING_RELEASES = (
@@ -71,6 +62,7 @@ _ANTHROPIC_PREFILL_REJECTING_RELEASES = (
     "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-fable-5",
     "claude-fable-5-1",
@@ -78,15 +70,13 @@ _ANTHROPIC_PREFILL_REJECTING_RELEASES = (
 """Exact releases that answer a trailing assistant turn with a 400 by name.
 
 "This model does not support assistant message prefill. The conversation
-must end with a user message." Live-verified with the house key on
-2026-09-07: every release above rejects a two-turn user/assistant prefill,
-while claude-sonnet-4-5 and claude-haiku-4-5 answer it. Entries are exact
-RELEASES matched as a whole id segment (so a dated snapshot and a Bedrock
-``anthropic.claude-opus-5-v1:0`` spelling inherit their release's rule) and
-never generation prefixes: a new point release must be probed and added
-deliberately. The ledger for the 48h to 2026-09-07 00:30 UTC carried 128
-such provider 400s across 64 orgs, each dispatched before the caller learned
-the conversation shape was the problem."""
+must end with a user message." Entries are exact releases matched as a whole
+id segment, so a dated snapshot and a Bedrock spelling inherit their release's
+rule but an unknown point release does not. Restricting known-invalid rungs
+before dispatch preserves a route's prefill-compatible alternatives.
+
+Sonnet 5.5's provider contract:
+https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide#migrating-from-sonnet-45"""
 
 
 def anthropic_rejects_assistant_prefill(model_id: str) -> bool:
@@ -99,6 +89,19 @@ def anthropic_rejects_assistant_prefill(model_id: str) -> bool:
     Returns:
         ``True`` when the model answers assistant prefill with a 400.
     """
+    return matches_anthropic_release(model_id, _ANTHROPIC_PREFILL_REJECTING_RELEASES)
+
+
+def matches_anthropic_release(model_id: str, releases: tuple[str, ...]) -> bool:
+    """Match exact Claude releases across provider spellings and dated snapshots.
+
+    Args:
+        model_id: Provider identifier, optionally namespaced or snapshot-qualified.
+        releases: Normalized release IDs whose restrictions are known.
+
+    Returns:
+        Whether one release matches without claiming a later point release.
+    """
     normalized = model_id.lower().replace(".", "-").replace("_", "-")
     # A listed release matches as a whole segment: what follows may be the
     # end, a non-alphanumeric separator, a dated snapshot (8+ digits), or a
@@ -110,7 +113,7 @@ def anthropic_rejects_assistant_prefill(model_id: str) -> bool:
             normalized,
         )
         is not None
-        for release in _ANTHROPIC_PREFILL_REJECTING_RELEASES
+        for release in releases
     )
 
 

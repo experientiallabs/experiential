@@ -16,10 +16,9 @@ from exp.common.rollouts import (
     unknown_spend_failure,
 )
 from exp.optimize.router.errors import RouterCompositionError
-from exp.simulation.engines.text.bindings import rollout_id_for_binding
 from exp.simulation.engines.text.errors import SimulationConfigurationError
 from exp.simulation.engines.text.grounding import load_completion_contract
-from exp.simulation.engines.text.rollout_support import rollout_spend
+from exp.simulation.engines.text.lineage_spend import lineage_spend
 
 
 def observed_rollout_spend(rollout: RolloutArtifact) -> float:
@@ -149,51 +148,14 @@ def verified_simulation_spend(
     )
     if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
         raise RouterCompositionError("simulation spend index digest has drifted")
-    values: list[float] = []
-    for rollout_id in artifact_set.artifact_ids:
-        rollout = read_rollout(project.artifacts, rollout_id)[0]
-        values.append(observed_rollout_spend(rollout))
-        values.extend(superseded_attempt_spend(project, rollout, completion_contract_input))
-    return math.fsum(values)
-
-
-def superseded_attempt_spend(
-    project: ProjectStore,
-    rollout: RolloutArtifact,
-    completion_contract_input: ArtifactInput | None,
-) -> tuple[float, ...]:
-    """Return conservative charges for every superseded retry attempt behind one rollout.
-
-    Args:
-        project: Project store containing the immutable prior-attempt artifacts.
-        rollout: Final rollout selected for its cell, possibly after retries.
-        completion_contract_input: Reviewed completion reservation contract reference.
-
-    Returns:
-        One worst-case charge per superseded attempt, so retried dispatches with unknown
-        spend still count against the phase ceiling.
-
-    Raises:
-        RouterCompositionError: A superseded attempt cannot be reconciled conservatively.
-    """
-    if rollout.retry_attempt == 0:
-        return ()
-    binding = rollout.simulation_binding
-    if binding is None:
-        raise RouterCompositionError("retried simulation rollout lacks its cell binding")
     try:
         load_completion_contract(project.artifacts, completion_contract_input)
     except SimulationConfigurationError as exc:
         raise RouterCompositionError(str(exc)) from exc
-    charges = []
-    for attempt in range(rollout.retry_attempt):
-        prior, _input = read_rollout(
-            project.artifacts, rollout_id_for_binding(binding, attempt=attempt)
-        )
-        spend = rollout_spend(prior)
-        if spend is None:
-            raise RouterCompositionError(
-                "superseded simulation attempt spend cannot be reconciled conservatively"
-            )
-        charges.append(spend)
-    return tuple(charges)
+    rollouts = tuple(
+        read_rollout(project.artifacts, identity)[0] for identity in artifact_set.artifact_ids
+    )
+    total = lineage_spend(project.artifacts, rollouts, measure=observed_rollout_spend)
+    if total is None:
+        raise RouterCompositionError("simulation lineage spend is unknown")
+    return total

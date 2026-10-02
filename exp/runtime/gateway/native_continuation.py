@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from exp.runtime.gateway.model_plan import stage_start_authorized
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.native_responses import continuation_route_binding, remember_turn
@@ -44,7 +45,9 @@ def select_bound_continuation_route(
         if deployment.deployment_id == binding.deployment_id
         and deployment.connection_sha256 == binding.connection_sha256
     )
-    if len(indexes) != 1:
+    if len(indexes) != 1 or not stage_start_authorized(
+        route.snapshot, route.snapshot.stage_for_depth(indexes[0])
+    ):
         raise continuation_binding_error()
     return select_route_deployments(route, indexes)
 

@@ -46,6 +46,10 @@ pub(crate) struct Admission {
     pub maximum_total_attempts: u32,
     pub maximum_same_deployment_attempts: u32,
     #[serde(default)]
+    pub physical_route_cap: Option<u32>,
+    #[serde(default)]
+    pub backoff: Option<crate::request_policy::Backoff>,
+    #[serde(default)]
     pub refusal_failover: bool,
     /// The pool's backoff-and-redial schedule for throttled rungs; absent on
     /// pools that keep throttles failover-only, so their waterfall is
@@ -145,10 +149,12 @@ impl Admission {
 
     pub(crate) fn policy(&self) -> RoutePolicy {
         RoutePolicy {
-            maximum_total_attempts: self.maximum_total_attempts.max(1),
-            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
+            maximum_total_attempts: self.maximum_total_attempts,
+            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts,
             refusal_failover: self.refusal_failover,
             throttle_redial: self.throttle_redial,
+            physical_route_cap: self.physical_route_cap,
+            backoff: self.backoff,
         }
     }
 
@@ -198,7 +204,7 @@ impl Admission {
     }
 }
 
-/// Commit-independent headers, mirroring `commit_independent_headers`,
+/// Headers every admitted response carries whatever rung serves it,
 /// including the caller's echoed request identity when one was supplied.
 pub(crate) fn commit_independent(
     admission: &Admission,
@@ -218,7 +224,7 @@ pub(crate) fn commit_independent(
     headers
 }
 
-/// Commit-dependent headers, mirroring `commit_dependent_headers`: the
+/// Headers that depend on the committed rung: the
 /// deployment identity and route depth that actually served the request.
 pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
     let served = admission.route.get(depth);
@@ -228,7 +234,12 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
     let mut headers = vec![
         (
             "x-gateway-canonical-model".to_string(),
-            admission.exact_model_id.clone(),
+            admission
+                .route
+                .get(depth)
+                .filter(|wire| !wire.exact_model_id.is_empty())
+                .map(|wire| wire.exact_model_id.clone())
+                .unwrap_or_else(|| admission.exact_model_id.clone()),
         ),
         ("x-gateway-provider".to_string(), provider),
         ("x-gateway-deployment".to_string(), deployment_id),

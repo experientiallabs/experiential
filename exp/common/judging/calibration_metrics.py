@@ -15,23 +15,41 @@ from exp.common.judging.rubric import DimensionScoreMap, Rubric, identity_score_
 
 
 class CalibrationDatum(ContractModel):
-    """One active human score joined to one verified raw judge observation."""
+    """One active human score joined to one verified raw judge observation.
+
+    Attributes:
+        human_score: Active human label on the frozen rubric axis.
+        raw_score: Verified signed judge score in that axis's units.
+    """
 
     human_score: HumanScore
-    raw_score: int = Field(ge=0)
+    raw_score: int
 
 
 class OutOfFoldPrediction(ContractModel):
-    """One valid lineage-grouped held-out calibration prediction."""
+    """One valid lineage-grouped held-out calibration prediction.
+
+    Attributes:
+        label_id: Held-out human label identity.
+        rollout_id: Assessed rollout identity.
+        lineage_id: Lineage excluded from this fold's fitting evidence.
+        dimension_id: Scored rubric axis.
+        fold_index: Nonnegative index of the held-out fold.
+        raw_score: Signed uncalibrated judge score.
+        human_score: Signed human reference score.
+        calibrated_score: Finite held-out prediction in the axis's units.
+        absolute_error: Nonnegative absolute distance from the human score.
+        optimistic_error: Nonnegative amount by which the prediction exceeds the human score.
+    """
 
     label_id: ArtifactId
     rollout_id: ArtifactId
     lineage_id: ArtifactId
     dimension_id: ArtifactId
     fold_index: int = Field(ge=0)
-    raw_score: int = Field(ge=0)
-    human_score: int = Field(ge=0)
-    calibrated_score: float = Field(ge=0)
+    raw_score: int
+    human_score: int
+    calibrated_score: float
     absolute_error: float = Field(ge=0)
     optimistic_error: float = Field(ge=0)
 

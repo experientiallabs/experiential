@@ -11,12 +11,27 @@ pub struct SseEvent {
 }
 
 /// Incremental SSE frame decoder over provider response chunks.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseDecoder {
+    maximum_event_bytes: usize,
+    scanned: usize,
     buffer: Vec<u8>,
     event_name: Option<String>,
     data_lines: Vec<String>,
     current_event_bytes: usize,
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self {
+            maximum_event_bytes: MAXIMUM_SSE_EVENT_BYTES,
+            scanned: 0,
+            buffer: Vec::new(),
+            event_name: None,
+            data_lines: Vec::new(),
+            current_event_bytes: 0,
+        }
+    }
 }
 
 impl SseDecoder {
@@ -24,15 +39,25 @@ impl SseDecoder {
         Self::default()
     }
 
+    /// Raise the frame bound for an admitted image-output lane before reading bytes.
+    pub fn allow_image_output(&mut self) {
+        self.maximum_event_bytes = crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
+    }
+
     /// Feed one network chunk, returning every complete event it closes.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, String> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+        while let Some(offset) = self.buffer[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let newline = self.scanned + offset;
+            self.scanned = 0;
             let raw_line: Vec<u8> = self.buffer.drain(..=newline).collect();
             let raw_line = &raw_line[..raw_line.len() - 1];
             self.current_event_bytes += raw_line.len() + 1;
-            if self.current_event_bytes > MAXIMUM_SSE_EVENT_BYTES {
+            if self.current_event_bytes > self.maximum_event_bytes {
                 return Err("provider stream event exceeds the size limit".to_string());
             }
             let line = decode_line(raw_line)?;
@@ -63,7 +88,8 @@ impl SseDecoder {
                 self.data_lines.push(value.to_string());
             }
         }
-        if self.current_event_bytes + self.buffer.len() > MAXIMUM_SSE_EVENT_BYTES {
+        self.scanned = self.buffer.len();
+        if self.current_event_bytes + self.buffer.len() > self.maximum_event_bytes {
             return Err("provider stream event exceeds the size limit".to_string());
         }
         Ok(events)
@@ -73,7 +99,7 @@ impl SseDecoder {
     pub fn finish(&mut self) -> Result<Option<SseEvent>, String> {
         if !self.buffer.is_empty() {
             self.current_event_bytes += self.buffer.len();
-            if self.current_event_bytes > MAXIMUM_SSE_EVENT_BYTES {
+            if self.current_event_bytes > self.maximum_event_bytes {
                 return Err("provider stream event exceeds the size limit".to_string());
             }
             let trailing: Vec<u8> = std::mem::take(&mut self.buffer);
@@ -135,5 +161,17 @@ mod tests {
         let mut chunk = b"data: ".to_vec();
         chunk.extend_from_slice(&oversized);
         assert!(decoder.feed(&chunk).is_err());
+    }
+    #[test]
+    fn large_image_frames_are_opt_in_and_incremental() {
+        let mut decoder = SseDecoder::new();
+        decoder.allow_image_output();
+        assert!(decoder.feed(b"data: ").unwrap().is_empty());
+        for _ in 0..500 {
+            assert!(decoder.feed(&vec![b'x'; 10_000]).unwrap().is_empty());
+        }
+        let events = decoder.feed(b"\n\n").unwrap();
+        assert_eq!(events[0].data.len(), 5_000_000);
+        assert_eq!(decoder.feed(b"data: next\n\n").unwrap()[0].data, "next");
     }
 }

@@ -186,14 +186,14 @@ const SEARCH_TURN: &[&str] = &[
 
 struct SearchHarness {
     bridge: Arc<Bridge>,
-    http: reqwest::Client,
+    http: crate::upstream::UpstreamClient,
 }
 
 impl SearchHarness {
     fn new() -> Self {
         Self {
             bridge: Arc::new(Bridge::new(plane(), 2).expect("bridge starts")),
-            http: build_client(Duration::from_secs(2)).expect("client"),
+            http: build_client(Duration::from_secs(2), false).expect("client"),
         }
     }
 
@@ -227,6 +227,8 @@ impl SearchHarness {
                 maximum_same_deployment_attempts: 2,
                 refusal_failover: false,
                 throttle_redial: None,
+                physical_route_cap: None,
+                backoff: None,
             },
             deadline: Instant::now() + Duration::from_secs(60),
             time_to_first_byte: Duration::from_secs(5),

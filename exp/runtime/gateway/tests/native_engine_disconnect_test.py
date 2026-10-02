@@ -48,6 +48,7 @@ from exp.runtime.gateway.lifecycle_test import (
     _configured_gateway,
 )
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 
 if sys.platform != "win32":
     import resource
@@ -566,6 +567,11 @@ def _abort(client: socket.socket) -> None:
     client.close()
 
 
+def _tokens(text: str) -> int:
+    """The gateway tokenizer's count for one streamed leg."""
+    return len(reservation_encoder().encode_ordinary(text))
+
+
 def _attempt(engine: _ServingEngine, request_id: str) -> sqlite3.Row:
     """Await exactly one durable terminal row without relying on sweep cleanup."""
     deadline = time.monotonic() + 2
@@ -588,9 +594,16 @@ def test_quiet_disconnect_closes_transport_before_settlement(
     surface: str,
     known: bool,
 ) -> None:
-    """Cancel while next_event waits; retain the meter or honest unknown."""
+    """Cancel while next_event waits; keep the reported meter, estimate the rest.
+
+    The provider's running report wins where it exists (19 input, 7 output);
+    the gateway's own tokenizer fills what it never sent (the prompt, the
+    streamed partial answer). Either way the row is labelled estimated.
+    """
     prompt = f"quiet-{'known' if known else 'unknown'}-{surface}"
-    client, request_id, _ = _open_quiet(engine, prompt, surface=surface)
+    client, request_id, received = _open_quiet(engine, prompt, surface=surface)
+    while b"usable partial answer" not in received:
+        received += client.recv(4096)
     started = time.monotonic()
     _abort(client)
     assert _PROVIDER_CLOSED[prompt].wait(0.25), "provider socket outlived delayed settlement"
@@ -598,30 +611,38 @@ def test_quiet_disconnect_closes_transport_before_settlement(
     row = _attempt(engine, request_id)
     assert row["state"] == "cancelled"
     assert row["failure_class"] == "cancelled"
-    assert row["input_tokens"] == (19 if known else None)
-    assert row["output_tokens"] == (7 if known else None)
-    assert row["usage_source"] == ("observed" if known else "unknown")
+    if known:
+        assert row["input_tokens"] == 19
+        assert row["output_tokens"] == 7
+    else:
+        assert row["input_tokens"] > 0
+        assert row["output_tokens"] == _tokens("usable partial answer")
+    assert row["usage_source"] == "estimated"
     payloads = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
     writes = [entry for entry in payloads if entry["request_id"] == request_id]
     assert len(writes) == 1
     assert writes[0]["dispatched"] is True
     assert writes[0]["usage_incomplete_due_to_disconnect"] is True
+    assert writes[0]["streamed_output"]["text"] == "usable partial answer"
+    assert writes[0]["streamed_output"]["reasoning"] == ""
 
 
 @pytest.mark.parametrize("surface", ["chat", "messages"])
-def test_partial_meter_disconnect_preserves_unknown_output(
+def test_partial_meter_disconnect_estimates_the_unreported_output(
     engine: _ServingEngine, surface: str
 ) -> None:
-    """The real wire's input-only report cannot become free zero-output final usage."""
+    """The real wire's input-only report keeps its input; the streamed text prices the output."""
     prompt = f"quiet-partial-{surface}"
-    client, request_id, _ = _open_quiet(engine, prompt, surface=surface)
+    client, request_id, received = _open_quiet(engine, prompt, surface=surface)
+    while b"usable partial answer" not in received:
+        received += client.recv(4096)
     _abort(client)
     assert _PROVIDER_CLOSED[prompt].wait(0.25)
     row = _attempt(engine, request_id)
     assert row["state"] == "cancelled"
     assert row["input_tokens"] == 19
-    assert row["output_tokens"] is None
-    assert row["estimated_cost_nano_usd"] is None
+    assert row["output_tokens"] == _tokens("usable partial answer")
+    assert row["usage_source"] == "estimated"
     writes = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
     own = [entry for entry in writes if entry["request_id"] == request_id]
     assert len(own) == 1
@@ -648,7 +669,11 @@ def test_hidden_thinking_has_heartbeats_and_retains_input_meter(
     row = _attempt(engine, request_id)
     assert row["state"] == "cancelled"
     assert row["input_tokens"] == 19
-    assert row["output_tokens"] == 0
+    # Private reasoning is generated output the provider bills: it is
+    # estimated into the meter without ever reaching the caller or a log.
+    assert row["reasoning_tokens"] == _tokens("private canary")
+    assert row["output_tokens"] == _tokens("public prefix") + _tokens("private canary")
+    assert row["usage_source"] == "estimated"
     logs = engine.stderr_log.read_text()
     assert '"usage_final":false' in logs
     assert "private canary" not in logs
@@ -691,7 +716,7 @@ def test_provider_close_observation_handles_file_descriptors_above_select_limit(
 
 
 def test_anthropic_start_meter_survives_chat_disconnect(engine: _ServingEngine) -> None:
-    """Retain native provider start usage before a delayed terminal meter."""
+    """Retain native provider start usage; the thinking streamed after it prices the output."""
     prompt = "anthro-start-usage"
     client, request_id, _ = _open_quiet(engine, prompt)
     _abort(client)
@@ -699,7 +724,8 @@ def test_anthropic_start_meter_survives_chat_disconnect(engine: _ServingEngine) 
     row = _attempt(engine, request_id)
     assert row["state"] == "cancelled"
     assert row["input_tokens"] == 19
-    assert row["output_tokens"] == 0
+    assert row["output_tokens"] == row["reasoning_tokens"] == _tokens("private canary")
+    assert row["usage_source"] == "estimated"
 
 
 @pytest.mark.parametrize("known", [False, True])
@@ -790,8 +816,11 @@ def test_private_preheaders_disconnect_stops_uncommitted_provider(
     assert "private canary" not in engine.stderr_log.read_text()
 
 
-def test_repeated_partial_answer_drops_never_fabricate_final_usage(engine: _ServingEngine) -> None:
-    """Adversarial drops retain UNKNOWN; they require platform unresolved-budget protection."""
+def test_repeated_partial_answer_drops_settle_the_same_streamed_estimate(
+    engine: _ServingEngine,
+) -> None:
+    """Adversarial drops each meter the prompt and the text they pulled, never a final report."""
+    meters: set[tuple[int, int]] = set()
     for index in range(3):
         prompt = f"quiet-unknown-repeat-{index}"
         client, request_id, received = _open_quiet(engine, prompt)
@@ -801,13 +830,15 @@ def test_repeated_partial_answer_drops_never_fabricate_final_usage(engine: _Serv
         assert _PROVIDER_CLOSED[prompt].wait(0.25)
         row = _attempt(engine, request_id)
         assert row["state"] == "cancelled"
-        assert row["usage_source"] == "unknown"
-        assert row["estimated_cost_nano_usd"] is None
+        assert row["usage_source"] == "estimated"
+        meters.add((row["input_tokens"], row["output_tokens"]))
         assert _PROVIDER_CALLS[prompt] == 1
         writes = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
         own = [entry for entry in writes if entry["request_id"] == request_id]
         assert len(own) == 1
         assert own[0]["usage_incomplete_due_to_disconnect"] is True
+    assert len(meters) == 1
+    assert next(iter(meters))[1] == _tokens("usable partial answer")
 
 
 def test_keyed_retry_replays_one_completed_provider_without_heartbeats(

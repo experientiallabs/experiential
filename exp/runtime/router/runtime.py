@@ -177,11 +177,6 @@ class RouterRuntime:
         self._embedder_billing_source = embedder.snapshot.billing_source
         self._embedder_input_price = embedder.capabilities.input_cost_per_million_tokens_usd
 
-    @property
-    def records_decisions(self) -> bool:
-        """Return whether selections are sent to an injected decision recorder."""
-        return self._decision_sink is not None
-
     @classmethod
     def load(
         cls,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from rich.console import Console
@@ -31,6 +32,7 @@ def sync_account_models(
     api_key: str,
     console: Console,
     lister: ProviderModelLister | None = None,
+    on_commit: Callable[[], None] | None = None,
 ) -> tuple[str, ...]:
     """Register a hosted provider and every model visible to its authenticated account.
 
@@ -40,6 +42,8 @@ def sync_account_models(
         api_key: Credential used only for the bounded model-listing request.
         console: Terminal receiving a secret-free synchronization summary.
         lister: Optional model-listing seam used by deterministic tests.
+        on_commit: Save matching credentials while the catalog write lock is held. A
+            reported failure restores the previous catalog before releasing that lock.
 
     Returns:
         Stable local aliases for every synchronized model identity.
@@ -53,6 +57,7 @@ def sync_account_models(
             provider=connection.provider,
             api_key=api_key,
             base_url=connection.base_url,
+            catalog="experiential",
         )
     )
     if not discovered:
@@ -88,6 +93,8 @@ def sync_account_models(
             model=item.model,
             billing_source=BillingSource.HOST_MANAGED,
             capabilities=resolved.capabilities,
+            supported_reasoning_efforts=item.supported_reasoning_efforts,
+            discovery=item,
         )
 
     sync_provider_models(
@@ -98,6 +105,7 @@ def sync_account_models(
             authority.connection_id: authority.config
             for authority in GatewayManagement(root).provider_connections()
         },
+        on_commit=on_commit,
     )
     console.print(f"[green]Synced Experiential Cloud: {len(aliases)} models.[/green]")
     return tuple(aliases)

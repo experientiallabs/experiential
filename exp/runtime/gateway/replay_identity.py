@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import assert_never
 
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
@@ -9,6 +10,27 @@ from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayReques
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+
+
+def caller_operation_sha256(request: GatewayRequest) -> Sha256 | None:
+    """Hash an opted-in caller operation without retaining the raw identifier.
+
+    Only the standard ``Idempotency-Key`` names a retriable operation.
+    ``client_request_id`` is a caller correlation identity that real
+    sessions reuse across distinct sequential requests, so it never keys
+    duplicate detection.
+
+    Args:
+        request: Canonical gateway request.
+
+    Returns:
+        Namespaced caller-operation digest, or ``None`` for ordinary requests.
+    """
+    if request.idempotency_key is None:
+        return None
+    return hashlib.sha256(
+        f"gateway-caller-operation-v1\0{request.idempotency_key}".encode()
+    ).hexdigest()
 
 
 def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
@@ -46,6 +68,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
             for block in message.provider_reasoning:
                 serialized = block.model_dump(mode="json")
                 if isinstance(block, EncryptedReasoningBlock):
+                    if block.id is None:
+                        serialized.pop("id", None)
                     serialized["output_index"] = block.output_index
                     serialized["status"] = block.status
                 blocks.append(serialized)
@@ -197,8 +221,12 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
             return sha256_json(request)
         case GatewayRequest():
             envelope = provider_replay_authority(request)
-            if envelope is None:
+            policy = None if request.gateway is None else request.gateway.replay_identity()
+            if envelope is None and not policy:
                 return sha256_json(request)
-            return sha256_json({"request_sha256": sha256_json(request), **envelope})
+            identity: JsonObject = {"request_sha256": sha256_json(request), **(envelope or {})}
+            if policy:
+                identity["gateway"] = policy
+            return sha256_json(identity)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)

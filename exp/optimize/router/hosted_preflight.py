@@ -31,9 +31,14 @@ from exp.common.project import (
 from exp.common.routing import router_embedding_reservation
 from exp.common.tasks import TaskCase, load_task_set
 from exp.common.traces import Trace, load_trace_dataset
+from exp.common.traces.ingest.dataset import (
+    read_trace_model_identity_evidence,
+    verify_current_trace_dataset,
+)
 from exp.optimize.router.automatic.attribution import resolve_router_observed_attributions
 from exp.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
+    retrieval_query_input_limit,
     simulation_completion_reservations,
     simulation_input_token_estimate,
 )
@@ -44,12 +49,12 @@ from exp.optimize.router.spend import (
 )
 from exp.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
-from exp.simulation.ingest.dataset import (
-    read_trace_model_identity_evidence,
-    verify_current_trace_dataset,
-)
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.retrieval import RAGLineageBinding
+from exp.simulation.retrieval.embedding_inputs import (
+    embedding_chunk_bytes,
+    plan_rag_embedding_inputs,
+)
 from exp.simulation.retrieval.transitions import extract_real_transitions
 
 if TYPE_CHECKING:
@@ -195,16 +200,16 @@ def preflight_hosted(
                 bindings,
                 included_partitions=frozenset({"fit", "held_out"}),
             )
-            fit = extract_real_transitions(
-                traces,
-                bindings,
-                included_partitions=frozenset({"fit"}),
-            )
             price = embedder_capabilities.input_cost_per_million_tokens_usd
             if price is not None:
-                tokens = sum(len(item.key_text.encode("utf-8")) for item in (*serving, *fit))
+                plan = plan_rag_embedding_inputs(
+                    tuple(item.key_text for item in serving),
+                    maximum_chunk_bytes=embedding_chunk_bytes(
+                        embedder_capabilities.context_window_tokens
+                    ),
+                )
                 build_cost = reserve_usd(
-                    tokens * RetryPolicy().maximum_attempts * price / 1_000_000
+                    plan.maximum_input_tokens * RetryPolicy().maximum_attempts * price / 1_000_000
                 )
         except ValueError as exc:
             problems.append(f"grounded build inputs: {exc}")
@@ -259,6 +264,13 @@ def preflight_hosted(
     if len(snapshots) == len(required_aliases):
         project_catalog = ProjectModelCatalog(
             project_id=config.project_id,
+            world_model_reasoning_effort=active.roles.world_model_reasoning_effort,
+            judge_reasoning_effort=active.roles.judge_reasoning_effort,
+            candidate_reasoning_efforts={
+                alias: effort
+                for alias, effort in active.roles.candidate_reasoning_efforts.items()
+                if alias in setup.models.candidates
+            },
             models=tuple(
                 ProjectCatalogModel(
                     alias=alias,
@@ -381,10 +393,19 @@ def _router_stage_reservations(
         maximum_input_tokens=options.maximum_judge_input_tokens,
         maximum_output_tokens=options.maximum_judge_output_tokens,
     )
+    query_limit = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias=world_model.alias,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
+        configured_limit=options.maximum_retrieval_query_tokens,
+    )
+    if query_limit is None:
+        return (), ()
     estimated_input_tokens = simulation_input_token_estimate(
         traces,
         retrieved_transition_count=setup.retrieval.top_k,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+        maximum_retrieval_query_tokens=query_limit,
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     if estimated_input_tokens is None:
@@ -404,7 +425,7 @@ def _router_stage_reservations(
         catalog,
         embedder.alias,
         embedder.model,
-        options.maximum_retrieval_query_tokens,
+        query_limit,
         RetryPolicy().maximum_attempts,
     )
     if len(candidate_requests) != len(candidates) or world_request is None or retrieval is None:

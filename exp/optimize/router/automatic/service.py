@@ -20,6 +20,7 @@ from exp.common.models import (
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.routing import KnnGuard
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.automatic.artifacts import (
     AutomaticRouterArtifacts,
     materialize_automatic_router_artifacts,
@@ -62,7 +63,6 @@ from exp.simulation.engines.text import (
     WORLD_MODEL_TEXT_PROMPT_VERSION,
     WorldModelSimulator,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
 from exp.simulation.specs import WorldModelSettings
 from exp.simulation.world_model import bind_fit_grounded_world_model
@@ -635,6 +635,7 @@ def _workflow_services(
             input_usd_per_million_tokens=(
                 preflight.retrieval_embedding_reservation.input_usd_per_million_tokens
             ),
+            maximum_input_tokens=embedder.capabilities.context_window_tokens,
         )
         retriever = load_fit_rag_retriever(
             project.artifacts,
@@ -656,6 +657,7 @@ def _workflow_services(
                     project.artifacts,
                     preflight.completed_build.world_model,
                     client=world.client,
+                    capabilities=world.capabilities,
                     fit_retriever=retriever,
                 )
             },

@@ -18,7 +18,7 @@ source and the python enums.
 
 from __future__ import annotations
 
-from typing import Literal, get_args
+from typing import Literal
 
 FailoverToken = Literal[
     "throttled",
@@ -42,21 +42,8 @@ FailoverToken = Literal[
 ]
 """One authored failover token; the type the catalog field validates against."""
 
-FAILOVER_TOKENS: tuple[str, ...] = get_args(FailoverToken)
-"""The canonical ordered vocabulary, importable by the platform's authoring surfaces."""
-
 REFUSAL_TOKEN = "refusal"
 """The bare refusal token: matches a provider refusal of any bounded reason."""
 
 REFUSAL_TOKEN_PREFIX = "refusal:"
 """Prefix of the per-reason refusal tokens (``refusal:cyber_policy``)."""
-
-FAILOVER_CLASS_TOKENS: tuple[str, ...] = tuple(
-    token for token in FAILOVER_TOKENS if not token.startswith(REFUSAL_TOKEN)
-)
-"""The failure-class tokens alone: every class the waterfall may fail over from."""
-
-REFUSAL_REASON_TOKENS: tuple[str, ...] = tuple(
-    token for token in FAILOVER_TOKENS if token.startswith(REFUSAL_TOKEN_PREFIX)
-)
-"""The per-reason refusal tokens alone, one per bounded refusal category."""

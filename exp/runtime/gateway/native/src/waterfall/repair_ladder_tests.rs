@@ -2,7 +2,7 @@
 //! scripted control plane and local rungs as `ladder_tests`: a refusal before
 //! the stream (OpenAI's 400) or inside it (OpenRouter's 200 then
 //! `response.failed`) strips the refused payloads and re-dials the same rung
-//! within one reservation; the per-request and per-caller memories spare the
+//! through a new reservation; the per-request and per-caller memories spare the
 //! refused dial afterwards; unrelated failures keep their verdict.
 
 use std::time::Duration;
@@ -16,12 +16,66 @@ use super::ladder_tests::{
 use super::*;
 
 #[test]
+fn explicit_one_blocks_every_repair_and_operator_throttle_redial() {
+    block_on(async {
+        for per_route in [false, true] {
+            for in_stream in [false, true] {
+                let harness = Harness::new();
+                let rung = spawn_rung(vec![if in_stream {
+                    Answer::ResponsesFailed(RESPONSES_FAILED_ENCRYPTED_FRAME)
+                } else {
+                    Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY)
+                }])
+                .await;
+                let token = format!("rsn_cap_{per_route}_{in_stream}_hA==");
+                let route = [responses_wire("a", &rung.url, &[&token])];
+                let policy = RoutePolicy {
+                    maximum_total_attempts: if per_route { 8 } else { 1 },
+                    maximum_same_deployment_attempts: 2,
+                    physical_route_cap: per_route.then_some(1),
+                    refusal_failover: false,
+                    throttle_redial: Some(SCHEDULE),
+                    backoff: None,
+                };
+                let (won, guard) = harness
+                    .run_with_policy("key", None, &route, policy, Duration::from_secs(30))
+                    .await;
+                assert!(matches!(finish(guard, won).await, Won::Failed(_)));
+                assert_eq!(rung.accepted.lock().unwrap().len(), 1);
+                let story = harness.story().await;
+                assert_eq!(story["starts"].as_array().unwrap().len(), 1);
+                assert_eq!(story["settles"].as_array().unwrap().len(), 1);
+                if in_stream {
+                    assert_eq!(story["settles"][0]["usage"]["input_tokens"], 30);
+                }
+            }
+            let harness = Harness::new();
+            let rung = spawn_rung(vec![Answer::Throttle(Some(1))]).await;
+            let route = [super::ladder_tests::wire("a", &rung.url, 2)];
+            let policy = RoutePolicy {
+                maximum_total_attempts: if per_route { 8 } else { 1 },
+                maximum_same_deployment_attempts: 2,
+                physical_route_cap: per_route.then_some(1),
+                refusal_failover: false,
+                throttle_redial: Some(SCHEDULE),
+                backoff: None,
+            };
+            let (won, guard) = harness
+                .run_with_policy("key", None, &route, policy, Duration::from_secs(30))
+                .await;
+            assert!(matches!(finish(guard, won).await, Won::Failed(_)));
+            assert_eq!(rung.accepted.lock().unwrap().len(), 1);
+        }
+    });
+}
+
+#[test]
 fn a_refused_encrypted_reasoning_item_is_stripped_and_the_same_rung_redialed() {
     block_on(async {
         let harness = Harness::new();
         let before = METRICS.snapshot()["encrypted_reasoning_stripped"]
             .as_u64()
-            .expect("counter");
+            .unwrap();
         // The rung refuses the sealed-elsewhere payload, then serves the
         // stripped replay on its second connection.
         let rung_a = spawn_rung(vec![
@@ -69,18 +123,20 @@ fn a_refused_encrypted_reasoning_item_is_stripped_and_the_same_rung_redialed() {
         assert_eq!(repaired["include"], json!(["reasoning.encrypted_content"]));
         assert!(rung_b.accepted.lock().expect("lock").is_empty());
 
-        // One reservation covers both dials: the ledger sees one attempt,
-        // settled completed, never a failed 400 and never a failover.
+        // Each physical dial owns exactly one reservation and settlement.
         let story = harness.story().await;
-        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 2);
         let settles = story["settles"].as_array().expect("settles");
-        assert_eq!(settles.len(), 1);
-        assert_eq!(settles[0]["outcome"], "completed");
-        assert_eq!(story["counts"], json!([1, 0]));
-        let after = METRICS.snapshot()["encrypted_reasoning_stripped"]
-            .as_u64()
-            .expect("counter");
-        assert!(after > before);
+        assert_eq!(settles.len(), 2);
+        assert_eq!(settles[0]["outcome"], "failed");
+        assert_eq!(settles[1]["outcome"], "completed");
+        assert_eq!(story["counts"], json!([2, 0]));
+        assert!(
+            METRICS.snapshot()["encrypted_reasoning_stripped"]
+                .as_u64()
+                .unwrap()
+                > before
+        );
     });
 }
 
@@ -115,12 +171,11 @@ fn a_second_refusal_of_the_stripped_replay_surfaces_the_providers_400() {
         // Exactly one repair: the rung was dialed twice and no other rung.
         assert_eq!(rung_a.accepted.lock().expect("lock").len(), 2);
         assert!(rung_b.accepted.lock().expect("lock").is_empty());
-        // Both dials ran under the one reservation, and a client error asks
-        // the control plane for no successor.
+        // The two refused physical dials settle separately, with no fallback.
         let story = harness.story().await;
-        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 2);
         let settles = story["settles"].as_array().expect("settles");
-        assert_eq!(settles.len(), 1);
+        assert_eq!(settles.len(), 2);
         assert_eq!(settles[0]["outcome"], "failed");
         assert_eq!(settles[0]["failure"]["failure_class"], "invalid_request");
     });
@@ -162,6 +217,7 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
             DeploymentWire {
                 native_tool_translation: Default::default(),
                 throttle_redial_budget: 2,
+                throttle_redial: None,
                 ..responses_wire("a", &rung_a.url, &["rsn_a_remembered_repair_is_redialed_without_earning_the_refusal_again_hA=="])
             },
             responses_wire("b", &rung_b.url, &["rsn_a_remembered_repair_is_redialed_without_earning_the_refusal_again_hA=="]),
@@ -194,19 +250,19 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
         assert!(!has_encrypted(&bodies[2]));
         assert!(rung_b.accepted.lock().expect("lock").is_empty());
 
-        // Two reservations: the first covers the refusal and its stripped
-        // re-dial (settled failed on the throttle), the second is the
-        // post-backoff redial of the same depth that served.
+        // Refusal, repaired throttle and successful redial each own a row.
         let story = harness.story().await;
         let starts = story["starts"].as_array().expect("starts");
-        assert_eq!(starts.len(), 2);
-        assert_eq!(starts[1]["throttle_backoff"], true);
-        assert_eq!(starts[1]["current_depth"], 0);
-        assert_eq!(starts[1]["failure"]["failure_class"], "throttled");
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[1]["reasoning_repair"], true);
+        assert_eq!(starts[2]["throttle_backoff"], true);
+        assert_eq!(starts[2]["current_depth"], 0);
+        assert_eq!(starts[2]["failure"]["failure_class"], "throttled");
         let settles = story["settles"].as_array().expect("settles");
-        assert_eq!(settles.len(), 2);
+        assert_eq!(settles.len(), 3);
         assert_eq!(settles[0]["outcome"], "failed");
-        assert_eq!(settles[1]["outcome"], "completed");
+        assert_eq!(settles[1]["outcome"], "failed");
+        assert_eq!(settles[2]["outcome"], "completed");
     });
 }
 
@@ -350,10 +406,11 @@ fn repaired_dial_open_failure_does_not_settle_prior_usage_as_the_full_total() {
         assert_eq!(rung.bodies.lock().unwrap().len(), 2);
         let story = harness.story().await;
         let settles = story["settles"].as_array().unwrap();
-        assert_eq!(settles.len(), 1);
-        assert!(settles[0]["usage"]["input_tokens"].is_null());
-        assert!(settles[0]["usage"]["output_tokens"].is_null());
-        assert_eq!(settles[0]["usage_incomplete_due_to_disconnect"], false);
+        assert_eq!(settles.len(), 2);
+        assert_eq!(settles[0]["usage"]["input_tokens"], 30);
+        assert!(settles[1]["usage"]["input_tokens"].is_null());
+        assert!(settles[1]["usage"]["output_tokens"].is_null());
+        assert_eq!(settles[1]["usage_incomplete_due_to_disconnect"], false);
     });
 }
 
@@ -397,9 +454,11 @@ fn repaired_first_dial_without_usage_keeps_aggregate_unknown() {
             .await;
         let story = harness.story().await;
         let settles = story["settles"].as_array().unwrap();
-        assert_eq!(settles.len(), 1);
+        assert_eq!(settles.len(), 2);
         assert!(settles[0]["usage"]["input_tokens"].is_null(), "{story}");
         assert!(settles[0]["usage"]["output_tokens"].is_null(), "{story}");
+        assert_eq!(settles[1]["usage"]["input_tokens"], 12);
+        assert_eq!(settles[1]["usage"]["output_tokens"], 3);
         assert_eq!(settles[0]["usage_incomplete_due_to_disconnect"], false);
         assert_eq!(rung.bodies.lock().unwrap().len(), 2);
     });
@@ -427,8 +486,7 @@ fn an_in_stream_refusal_of_encrypted_reasoning_is_repaired_like_a_pre_stream_one
         };
         assert_eq!(committed.depth, 0);
         assert!(committed.encrypted_reasoning_stripped);
-        // The served stream's usage report carries the refused dial's billed
-        // tokens too (30 refused + 12 served input; 0 + 3 output).
+        // The served stream carries only its own physical attempt's meter.
         let far = std::time::Instant::now() + Duration::from_secs(30);
         let folded = loop {
             match committed
@@ -441,7 +499,7 @@ fn an_in_stream_refusal_of_encrypted_reasoning_is_repaired_like_a_pre_stream_one
                 other => panic!("the served stream reports usage: {other:?}"),
             }
         };
-        assert_eq!(folded.input_tokens, Some(42));
+        assert_eq!(folded.input_tokens, Some(12));
         assert_eq!(folded.output_tokens, Some(3));
         let won = finish(guard, Won::Committed(committed)).await;
         drop(won);
@@ -455,13 +513,14 @@ fn an_in_stream_refusal_of_encrypted_reasoning_is_repaired_like_a_pre_stream_one
         assert!(repaired_input
             .iter()
             .all(|item| item.get("encrypted_content").is_none()));
-        // One reservation covers the refused stream and its re-dial, and the
-        // settle carries every token both dials billed (30 refused + 12 served).
+        // The refusal's billed usage remains on its own failed attempt.
         let story = harness.story().await;
-        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 2);
         let settles = story["settles"].as_array().expect("settles");
-        assert_eq!(settles.len(), 1);
-        assert_eq!(settles[0]["outcome"], "completed");
+        assert_eq!(settles.len(), 2);
+        assert_eq!(settles[0]["outcome"], "failed");
+        assert_eq!(settles[0]["usage"]["input_tokens"], 30);
+        assert_eq!(settles[1]["outcome"], "completed");
 
         // Another in-stream failure keeps the ordinary verdict: no re-dial.
         let plain = Harness::new();

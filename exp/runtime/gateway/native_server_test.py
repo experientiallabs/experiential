@@ -16,7 +16,10 @@ from exp.runtime.gateway.native_server import (
 )
 
 
-def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("public_only", [False, True])
+def test_host_passes_the_serve_configuration(
+    monkeypatch: pytest.MonkeyPatch, public_only: bool
+) -> None:
     """The host serializes the exact serve configuration for the extension."""
     captured: dict[str, object] = {}
 
@@ -26,6 +29,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         shutdown: object,
         on_listening: object,
         guardrail_detectors: object,
+        capture: object,
     ) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
@@ -33,6 +37,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         captured["shutdown"] = shutdown
         captured["on_listening"] = on_listening
         captured["guardrail_detectors"] = guardrail_detectors
+        captured["capture"] = capture
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
@@ -45,6 +50,7 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         max_active_requests=23,
         graceful_timeout_seconds=45.0,
         connect_timeout_seconds=4.0,
+        public_upstreams_only=public_only,
         time_to_first_byte_seconds=12.0,
         native_usage_enabled=False,
     )
@@ -58,9 +64,11 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
     assert config["request_timeout_seconds"] == 37.0
     assert config["graceful_timeout_seconds"] == 45.0
     assert config["connect_timeout_seconds"] == 4.0
+    assert config["public_upstreams_only"] is public_only
     assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
     assert captured["guardrail_detectors"] == {}
+    assert captured["capture"] is None
 
 
 def test_host_forwards_an_embedder_owned_shutdown_handle(
@@ -75,9 +83,10 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
         shutdown: object,
         on_listening: object,
         guardrail_detectors: object,
+        capture: object,
     ) -> None:
         """Capture the extension boundary call."""
-        del control_plane, config_json, on_listening, guardrail_detectors
+        del control_plane, config_json, on_listening, guardrail_detectors, capture
         captured["shutdown"] = shutdown
 
     native = SimpleNamespace(serve=serve)

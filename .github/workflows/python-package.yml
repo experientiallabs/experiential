@@ -37,25 +37,74 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the running build; main
+# pushes, releases, and replays each keep their own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
+  native-targets:
+    # The four cross-platform wheels only change when the crate does, and
+    # macOS bills 10x and Windows 2x the Linux rate. Pull requests and main
+    # pushes that leave the crate alone build only the linux-x86_64 wheel that
+    # `build` smokes. Releases and replays always build every target.
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - name: Detect native crate changes
+        id: native
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # Any lookup failure builds every target (fail closed).
+          if [ "${GITHUB_EVENT_NAME}" = pull_request ]; then
+            files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+              --paginate -q '.[] | .filename, (.previous_filename // empty)')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          else
+            # Compare lists at most 300 files; a list that long builds everything.
+            files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
+              -q '.files[] | .filename, (.previous_filename // empty)')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+            if [ "$(printf '%s\n' "${files}" | grep -c .)" -ge 300 ]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          if printf '%s\n' "${files}" \
+            | grep -qE '^(exp/runtime/gateway/native/|\.github/workflows/python-package\.yml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Select wheel targets
+        id: targets
+        env:
+          NATIVE_CHANGED: ${{ steps.native.outputs.changed || 'true' }}
+        run: |
+          # macos-x86_64 is cross-compiled from the arm runner; macos-13 (the
+          # last intel runner) is being retired and queues for hours.
+          all='[
+            {"runner": "ubuntu-latest", "target": "linux-x86_64"},
+            {"runner": "ubuntu-24.04-arm", "target": "linux-aarch64"},
+            {"runner": "macos-14", "target": "macos-x86_64", "cargo-target": "x86_64-apple-darwin"},
+            {"runner": "macos-14", "target": "macos-arm64"},
+            {"runner": "windows-latest", "target": "windows-x86_64"}
+          ]'
+          if [ "${NATIVE_CHANGED}" = true ]; then
+            targets="${all}"
+          else
+            targets="$(printf '%s' "${all}" | jq -c 'map(select(.target == "linux-x86_64"))')"
+          fi
+          echo "matrix=$(printf '%s' "${targets}" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+
   native-wheels:
+    needs: native-targets
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            target: linux-x86_64
-          - runner: ubuntu-24.04-arm
-            target: linux-aarch64
-          # Cross-compiled from the arm runner; macos-13 (the last intel
-          # runner) is being retired and queues for hours.
-          - runner: macos-14
-            target: macos-x86_64
-            cargo-target: x86_64-apple-darwin
-          - runner: macos-14
-            target: macos-arm64
-          - runner: windows-latest
-            target: windows-x86_64
+      matrix: ${{ fromJSON(needs.native-targets.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Resolve the latest published release
@@ -136,7 +185,7 @@ jobs:
           path: native-dist
       - name: Smoke test the wheel
         run: |
-          uv venv /tmp/exp-wheel-smoke
+          uv venv --python 3.12 /tmp/exp-wheel-smoke
           uv pip install --python /tmp/exp-wheel-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
           cd /tmp
           /tmp/exp-wheel-smoke/bin/python - <<'PY'
@@ -170,6 +219,9 @@ jobs:
           assert callable(exp_gateway_native.serve)
           PY
           /tmp/exp-wheel-smoke/bin/exp --help
+      - name: Block publishing unreleased native changes
+        if: github.event_name == 'release' || inputs.publish == true
+        run: test ! -e .github/deferred-native-release.toml
       - name: Installed-wheel no-spend release evidence
         env:
           PYTHONNOUSERSITE: "1"
@@ -187,6 +239,30 @@ jobs:
           name: python-dist
           path: dist/
 
+  capture-release-smoke:
+    if: github.event_name == 'release' || inputs.publish == true
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-dist-linux-x86_64
+          path: native-dist
+      - name: Require published Capture dependencies before release
+        # Test a downloaded copy after the publish artifact has been finalized.
+        # This job cannot replace that artifact and has no publishing credentials.
+        run: |
+          uv venv --python 3.13 /tmp/exp-capture-release-smoke
+          uv pip install --python /tmp/exp-capture-release-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
+          /tmp/exp-capture-release-smoke/bin/python -c "import mitmproxy, mitmproxy_rs"
+
   publish:
     if: >-
       github.event_name == 'release' ||
@@ -194,7 +270,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       inputs.source == 'latest-release' &&
       inputs.publish)
-    needs: build
+    needs: [build, capture-release-smoke]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

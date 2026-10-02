@@ -8,6 +8,8 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_METADATA_HEADER,
     constrain_openrouter_zero_data_retention,
+    openrouter_cache_writes_within_reads,
+    openrouter_chat_wire,
     openrouter_metadata_headers,
 )
 
@@ -70,3 +72,19 @@ def test_metadata_headers_add_the_opt_in_and_keep_the_rest() -> None:
         "X-Title": "t",
         OPENROUTER_METADATA_HEADER: "enabled",
     }
+
+
+def test_only_google_models_report_cache_writes_within_reads() -> None:
+    """Gemini explicit caching reads the written prefix back; other families write disjointly."""
+    assert openrouter_cache_writes_within_reads("google/gemini-3.1-flash-lite")
+    # Gemma is served by third parties with ordinary disjoint cache accounting.
+    assert not openrouter_cache_writes_within_reads("google/gemma-4-26b")
+    assert not openrouter_cache_writes_within_reads("anthropic/claude-opus-5")
+    assert not openrouter_cache_writes_within_reads("openai/gpt-5.6")
+
+
+def test_only_openrouter_chat_rungs_are_openrouter_chat_wires() -> None:
+    """The provider field exists only on OpenRouter's Chat Completions dialect."""
+    assert openrouter_chat_wire("openrouter", "openai_compatible")
+    assert not openrouter_chat_wire("openrouter", "openai_responses")
+    assert not openrouter_chat_wire("openai", "openai_compatible")

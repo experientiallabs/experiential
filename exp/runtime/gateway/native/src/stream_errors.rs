@@ -1,23 +1,6 @@
-//! Classification of provider-declared failures by what the provider said.
+//! Classify provider-declared failures from their raw code and message.
 //!
-//! Two failure sources reach the caller with the wrong shape without this:
-//!
-//! * A provider that opens the stream and then declares its own error inside a
-//!   frame (OpenAI `error` / `response.failed`, Anthropic `error`, Gemini's
-//!   error envelope, an OpenAI-compatible `error` object) used to become one
-//!   `provider_internal` 502 no matter what it said. Half of what providers say
-//!   there is the CALLER's fault ("Your input exceeds the context window",
-//!   "does not support max tokens > N", content filtering), a quarter is a
-//!   throttle, and only the rest is the provider failing. Filing a caller's
-//!   over-long prompt as a 502 hides the fix from them, pages the operator, and
-//!   burns a failover attempt that fails identically.
-//! * A customer-managed (BYOK) rung whose credential the provider rejects, or
-//!   whose account is out of quota, is the CUSTOMER's configuration problem.
-//!   The house wording ("ask the gateway operator to verify the provider
-//!   connection credential") tells them to ask someone else about their own key.
-//!
-//! Classification reads the RAW provider code and message (never relayed as
-//! such); the bounded, sanitized detail is attached separately.
+//! Public and retry policies are distinct from bounded, sanitized ledger detail.
 
 use crate::errors::{Failure, FailureClass, RefusalReason};
 use crate::upstream::transport_failure;
@@ -343,22 +326,29 @@ pub fn refusal_reason(code: Option<&str>, message: Option<&str>) -> RefusalReaso
     RefusalReason::Unspecified
 }
 
+/// Recognize the relay's complete Gemini content verdict, not quoted or
+/// incidental text. Only its 403 code is ambiguous; explicit auth, funding,
+/// and throttle codes retain their own meaning. Read the raw envelope message.
+pub(crate) fn relayed_gemini_refusal(
+    code: Option<&str>,
+    message: Option<&str>,
+) -> Option<RefusalReason> {
+    (code.map(str::trim) == Some("403")
+        && message == Some("Gemini blocked the request: PROHIBITED_CONTENT"))
+    .then_some(RefusalReason::ContentPolicy)
+}
+
 /// Classify one provider-declared error from its raw code and message.
-///
-/// A content-verdict CODE wins first (a content filter may arrive under an
-/// `invalid_request_error` type). Then every other authoritative provider
-/// code decides (an `authentication_error` whose sentence happens to say
-/// "must be provided" is still a credential failure; a `rate_limit_exceeded`
-/// whose sentence says "blocked by" is still a throttle), and a numeric code
-/// takes the shared HTTP mapping for the throttle, quota, credential, and
-/// not-found statuses. Only then does refusal PHRASING decide, ahead of the
-/// caller-input codes, because Azure and Gemini file a content filter under a
-/// 400 `invalid_request_error`. A 5xx numeric code does NOT end the search,
-/// because an aggregator often re-statuses an upstream 400 as its own 502 and
-/// only the sentence says so. Credential, quota, and throttle phrasing are
-/// read before caller-input phrasing so the broader input vocabulary never
-/// swallows them. Anything left is the provider failing.
 pub fn classify_stream_error(code: Option<&str>, message: Option<&str>) -> StreamErrorKind {
+    classify_stream_error_with_raw_message(code, message, message)
+}
+
+/// Keep exact envelope verdicts separate from a relay's expanded diagnostic sentence.
+pub(crate) fn classify_stream_error_with_raw_message(
+    code: Option<&str>,
+    message: Option<&str>,
+    raw_message: Option<&str>,
+) -> StreamErrorKind {
     let code_lower = code.map(|value| value.trim().to_ascii_lowercase());
     let message_lower = message.map(|value| value.to_ascii_lowercase());
     let code_ref = code_lower.as_deref().unwrap_or("");
@@ -378,6 +368,9 @@ pub fn classify_stream_error(code: Option<&str>, message: Option<&str>) -> Strea
     }
     if NOT_FOUND_CODES.contains(&code_ref) {
         return StreamErrorKind::ProviderNotFound;
+    }
+    if let Some(reason) = relayed_gemini_refusal(code, raw_message) {
+        return StreamErrorKind::Refusal(reason);
     }
     let numeric_class = code_ref
         .parse::<u16>()

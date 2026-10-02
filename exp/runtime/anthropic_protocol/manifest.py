@@ -41,6 +41,7 @@ MESSAGES_MANIFEST = CompatibilityManifest(
         # OpenRouter's routing-preference shape); Anthropic's own API has no
         # such field, so SDK callers send it through extra_body.
         _field("provider", CompatibilityDisposition.SUPPORTED),
+        _field("gateway", CompatibilityDisposition.SUPPORTED),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "extended_thinking"),

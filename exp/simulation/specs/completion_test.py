@@ -17,6 +17,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.common.project.manifests import file_digest
+from exp.common.project.testing import RawArtifact
 from exp.simulation.specs.completion import (
     CandidateCompletionReservation,
     load_simulation_completion_contract,
@@ -107,7 +108,7 @@ def test_completion_loader_rejects_unsupported_canonical_schema(
             "files": (file_digest("completion-contract.json", payload),),
         }
     )
-    artifact_directory = paths.artifact_directory(contract.completion_contract_id)
+    artifact_directory = RawArtifact(paths, contract.completion_contract_id)
     (artifact_directory / "completion-contract.json").write_bytes(payload)
     (artifact_directory / "manifest.json").write_bytes(canonical_json_bytes(manifest))
 

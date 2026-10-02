@@ -53,12 +53,6 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
-impl Usage {
-    pub fn has_token_counts(&self) -> bool {
-        self.input_tokens.is_some() && self.output_tokens.is_some()
-    }
-}
-
 /// One completed tool call with provider-order raw argument text.
 #[derive(Debug, Clone)]
 pub struct CompletedToolCall {
@@ -145,7 +139,11 @@ impl ProviderAssistantMessagePhase {
 /// One ordered provider-neutral stream event.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Capture-only Gemini part. Thought text is a summary; signatures are opaque.
+    GeminiThoughtPart(std::sync::Arc<Value>),
     TextDelta(String),
+    /// One complete generated image, encoded as a validated inline data URL.
+    Image(String),
     RefusalDelta(String),
     /// Ordered probability metadata for one Chat choice. This is independent
     /// of text because providers may send a metadata-only chunk.
@@ -357,6 +355,15 @@ impl Event {
             return true;
         }
         match self {
+            Event::GeminiThoughtPart(part) => {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+                    || part
+                        .get("thoughtSignature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            }
             Event::ThinkingSignature { signature, .. } => !signature.is_empty(),
             Event::RedactedThinking { data, .. } => !data.is_empty(),
             Event::EncryptedReasoning {
@@ -373,21 +380,15 @@ impl Event {
         }
     }
 
-    /// Whether this event carries the first visible model output, used to
-    /// stamp time-to-first-token. A content, refusal, reasoning, or tool-argument
-    /// delta counts only when it carries at least one character: an empty delta
-    /// (a role-establishing or empty refusal frame) is not a visible token and
-    /// must not stamp TTFT early. A tool-call start is itself the first token of
-    /// a tool-only turn, so it counts even before any arguments stream. Purely
-    /// structural frames are excluded so TTFT is not stamped early: the Responses
-    /// `ProviderOutputItemStarted` reserves a slot at the item-start boundary
-    /// *before* the first delta arrives, and the opaque reasoning-carrier frames
-    /// (`ThinkingSignature`, `RedactedThinking`, `EncryptedReasoning`) never lead
-    /// a turn on their own. Usage, item-close, and lifecycle/terminal frames are
-    /// not output tokens either.
+    /// Whether this event starts visible output for time-to-first-token accounting.
+    /// Empty text, refusal, reasoning, and tool-argument deltas do not count.
+    /// A tool-call or hosted-tool start counts even before arguments arrive.
+    /// Structural `ProviderOutputItemStarted` frames only reserve slots and do not
+    /// count. Neither do opaque reasoning carriers (`ThinkingSignature`,
+    /// `RedactedThinking`, `EncryptedReasoning`), usage, closes, or terminal frames.
     pub fn is_output_token(&self) -> bool {
         match self {
-            Event::TextDelta(text) | Event::RefusalDelta(text) => !text.is_empty(),
+            Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => !text.is_empty(),
             Event::ProviderTextDelta { delta, .. }
             | Event::ProviderRefusalDelta { delta, .. }
             | Event::ReasoningSummaryDelta { delta, .. }
@@ -410,6 +411,10 @@ impl Event {
 /// the failure class and safe message for terminal failures.
 pub fn simplified_event(event: &Event) -> Value {
     match event {
+        Event::GeminiThoughtPart(part) => {
+            serde_json::json!({"kind": "gemini_thought_part", "part": part})
+        }
+        Event::Image(url) => serde_json::json!({"kind": "image", "url": url}),
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
         Event::ChoiceLogprobsDelta(delta) => {
@@ -705,11 +710,7 @@ pub fn simplified_event(event: &Event) -> Value {
 
 mod item_metadata;
 use item_metadata::add_provider_item_metadata;
-
-/// Count hosted invocations only, not results, approvals, listings or opaque items.
-pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
-    item_type.ends_with("_call")
-}
+pub use item_metadata::hosted_item_type_is_invocation;
 
 /// Validate one raw tool-argument accumulation as a single JSON object.
 ///
@@ -908,31 +909,6 @@ impl ToolAccumulator {
         }
     }
 
-    /// Append one streamed argument fragment, returning the part the caller
-    /// may see: everything up to and including the byte that closes the
-    /// argument object. Whatever follows that byte is withheld (never
-    /// emitted) and judged at completion, so the deltas a client receives
-    /// always concatenate to the completed call's bytes. Custom (freeform)
-    /// input is opaque text and passes through whole.
-    pub fn push_arguments(&mut self, fragment: &str) -> Option<String> {
-        if self.custom {
-            self.raw_arguments.push_str(fragment);
-            return Some(fragment.to_string());
-        }
-        match self.scan.feed(fragment) {
-            None => {
-                self.raw_arguments.push_str(fragment);
-                Some(fragment.to_string())
-            }
-            Some(closed_at) => {
-                let (value, tail) = fragment.split_at(closed_at);
-                self.raw_arguments.push_str(value);
-                self.withheld_tail.push_str(tail);
-                (!value.is_empty()).then(|| value.to_string())
-            }
-        }
-    }
-
     pub fn complete(&self) -> Result<CompletedToolCall, String> {
         if !self.custom {
             if !self.withheld_tail.is_empty() {
@@ -991,6 +967,7 @@ impl ToolAccumulator {
     }
 }
 
+mod tool_arguments;
 mod usage;
 pub use usage::*;
 

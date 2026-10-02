@@ -16,6 +16,7 @@ from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
+from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
 
 _REJECTED_BLOCK_HINTS = {
     kind: (
@@ -59,6 +60,8 @@ def validate_wire[WireModelT: BaseModel](payload: JsonObject, wire: type[WireMod
         # block. The deepest location is the arm that actually matched the
         # payload's shape, so its error names the offending element.
         errors = exc.errors(include_url=False)
+        if any(error["loc"] and error["loc"][0] == "gateway" for error in errors):
+            raise validation_protocol_error(exc) from exc
         first = max(errors, key=lambda error: len(error["loc"]))
         raise validation_error(first) from exc
 

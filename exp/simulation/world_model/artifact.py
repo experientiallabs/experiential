@@ -21,23 +21,21 @@ from exp.common.project import (
     ArtifactStore,
     artifact_input,
 )
+from exp.simulation.engines.text.prompt import (
+    WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION,
+    WORLD_MODEL_TEXT_PROMPT_ID,
+    WORLD_MODEL_TEXT_PROMPT_VERSION,
+    WORLD_MODEL_TEXT_SYSTEM_PROMPT,
+)
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
 GROUNDED_WORLD_MODEL_ARTIFACT_TYPE = "grounded-world-model"
 WORLD_MODEL_ARTIFACT_PATH = "world-model.json"
-GROUNDED_WORLD_MODEL_PROMPT_ID = "world-model-text-v1"
-GROUNDED_WORLD_MODEL_PROMPT_VERSION = "text-world-model-v1"
-GROUNDED_WORLD_MODEL_GROUNDING_SCHEMA_VERSION = "fit-rag-examples-v1"
-GROUNDED_WORLD_MODEL_SYSTEM_PROMPT = """Protocol version: text-world-model-v1.
-You simulate the next visible user or environment message in a text-only
-customer-agent scenario. You receive the task, safe initial context, the candidate's visible
-conversation, and its latest visible assistant response. Do not execute, invent, or describe tools.
-Do not infer or reveal candidate hidden reasoning. You may reason internally if your provider
-supports it, but return only this JSON object:
-{"message":"the next visible user or environment message","terminal":false}
-Set terminal to true only when the scenario has reached a visible terminal state. The message may be
-empty only for a terminal state. Do not include markdown fences or other keys."""
+GROUNDED_WORLD_MODEL_PROMPT_ID = WORLD_MODEL_TEXT_PROMPT_ID
+GROUNDED_WORLD_MODEL_PROMPT_VERSION = WORLD_MODEL_TEXT_PROMPT_VERSION
+GROUNDED_WORLD_MODEL_GROUNDING_SCHEMA_VERSION = WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION
+GROUNDED_WORLD_MODEL_SYSTEM_PROMPT = WORLD_MODEL_TEXT_SYSTEM_PROMPT
 
 
 def grounded_world_model_prompt_sha256() -> str:

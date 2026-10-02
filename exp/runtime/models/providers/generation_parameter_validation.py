@@ -16,6 +16,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     supported_reasoning_efforts,
 )
+from exp.runtime.models.providers.thinking_budget import thinking_budget_value
 
 
 def output_limit_parameter(request: GatewayRequest) -> str:
@@ -95,7 +96,9 @@ def bounded_output_request(
             param=parameter,
             code="invalid_parameter",
         )
-    if request.maximum_output_tokens is None and profile.dialect == "anthropic_messages":
+    if request.maximum_output_tokens is None and (
+        profile.dialect == "anthropic_messages" or thinking_budget_value(request) is not None
+    ):
         if bound < (profile.minimum_output_tokens or 1):
             raise ProviderParameterError(
                 message=(
@@ -275,8 +278,8 @@ def anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
     """Whether an Anthropic dispatch will send no extended-thinking budget.
 
     On the native Messages wire the model reasons only when the caller asks:
-    a ``thinking`` config of type ``enabled``/``adaptive`` or a reasoning
-    effort turns it on, and their absence leaves thinking OFF. This is the
+    a numeric thinking budget, a ``thinking`` config of type ``enabled``/``adaptive``,
+    or a reasoning effort turns it on, and their absence leaves thinking OFF. This is the
     inverse of the OpenAI effort-native models, whose default IS reasoning, so
     it governs the srn sampling hatch ONLY for the anthropic_adaptive wire
     (a budgeted-enabled route such as haiku-4-5): with thinking off, Anthropic
@@ -285,7 +288,7 @@ def anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
     config = request.provider_thinking_config
     thinking_on = config is not None and config.get("type") in {"enabled", "adaptive"}
     effort_on = request.reasoning_effort is not None and request.reasoning_effort != "none"
-    return not thinking_on and not effort_on
+    return thinking_budget_value(request) is None and not thinking_on and not effort_on
 
 
 def require_assistant_prefill_supported(

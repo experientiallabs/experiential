@@ -71,7 +71,8 @@ pub(crate) fn is_semantic(event: &Event) -> bool {
     }
     matches!(
         event,
-        Event::TextDelta(_)
+        Event::Image(_)
+            | Event::TextDelta(_)
             | Event::RefusalDelta(_)
             | Event::ChoiceLogprobsDelta(_)
             | Event::ProviderTextDelta { .. }

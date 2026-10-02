@@ -14,6 +14,8 @@ import pytest
 from exp.common.core.artifacts import canonical_json_bytes, sha256_json, stable_id
 from exp.common.models import NumericMeasurement
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.project.database import project_connection
+from exp.common.project.records import ProjectRecords
 from exp.optimize.model.sft.builder import write_sft_dataset
 from exp.optimize.model.sft.builder_test import (
     _build as _build_fixture_dataset,
@@ -29,6 +31,7 @@ from exp.optimize.model.sft.rendering import (
     canonical_partitioned_rows_jsonl,
     partitioned_rows_sha256,
 )
+from exp.optimize.model.sft.run_manifest import sft_run_records
 from exp.optimize.model.sft.training import (
     TinkerSFTAmbiguousStepError,
     TinkerSFTBudgetExceeded,
@@ -270,6 +273,7 @@ def test_fake_backend_consumes_only_train_rows_and_writes_terminal_provenance(
 ) -> None:
     """The injected fake completes without a service client, credentials, or network call."""
     fixture = _persisted_dataset(tmp_path)
+    state = sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend()
     train_ids = tuple(
         row.example.example_id for row in fixture.artifact.rows if row.partition == "train"
@@ -283,10 +287,10 @@ def test_fake_backend_consumes_only_train_rows_and_writes_terminal_provenance(
     assert result.dataset_id == fixture.artifact.dataset.dataset_id
     assert result.training_step_count == 2
     assert result.total_cost_usd == NumericMeasurement(value=0.20, provenance="observed")
-    manifest = json.loads((tmp_path / "run" / "manifest.json").read_text(encoding="utf-8"))
-    model = json.loads((tmp_path / "run" / "model.json").read_text(encoding="utf-8"))
-    terminal = json.loads((tmp_path / "run" / "result.json").read_text(encoding="utf-8"))
-    metrics = (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    manifest = json.loads(_record(state, "manifest.json"))
+    model = json.loads(_record(state, "model.json"))
+    terminal = json.loads(_record(state, "result.json"))
+    metrics = b"".join(state.events()).decode().splitlines()
     assert manifest["dataset_build_sha256"] == fixture.artifact.dataset.build_sha256
     expected_dataset_input = artifact_input(
         fixture.store.artifacts.read(fixture.artifact.dataset.dataset_id).manifest
@@ -312,6 +316,7 @@ def test_resume_uses_last_durable_checkpoint_without_replaying_completed_batch(
 ) -> None:
     """A retry restores the recorded state before training only the remaining batch."""
     fixture = _persisted_dataset(tmp_path)
+    state = sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend(fail_on_cost_call=3)
     output_dir = tmp_path / "run"
 
@@ -326,10 +331,7 @@ def test_resume_uses_last_durable_checkpoint_without_replaying_completed_batch(
     assert len(backend.trained_example_ids) == 2
     assert len(set(backend.trained_example_ids)) == 2
     assert result.training_step_count == 2
-    records = [
-        json.loads(line)
-        for line in (output_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    records = [json.loads(line) for line in b"".join(state.events()).decode().splitlines()]
     assert [record["record_type"] for record in records] == [
         "metric",
         "checkpoint",
@@ -344,6 +346,7 @@ def test_crash_after_optimizer_dispatch_never_replays_and_reports_unknown_spend(
 ) -> None:
     """An unmatched pre-dispatch intent is an honest terminal ambiguity, never a retry cue."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend(fail_after_train_call=1)
     output_dir = tmp_path / "run"
 
@@ -362,6 +365,7 @@ def test_crash_after_optimizer_dispatch_never_replays_and_reports_unknown_spend(
 def test_completed_run_is_idempotent_and_does_not_open_another_trainer(tmp_path: Path) -> None:
     """A completed terminal result is returned from local provenance before backend composition."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend()
     output_dir = tmp_path / "run"
 
@@ -377,6 +381,7 @@ def test_budget_refuses_a_step_whose_upper_bound_exceeds_remaining_spend(
 ) -> None:
     """A $0.10 cap against a $0.20 bound dispatches no trainer or optimizer call."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend(cost_per_batch=0.20, conservative_cost_per_batch=0.20)
     output_dir = tmp_path / "run"
 
@@ -390,6 +395,7 @@ def test_budget_refuses_a_step_whose_upper_bound_exceeds_remaining_spend(
 def test_unknown_cost_refuses_before_open_or_optimizer_dispatch(tmp_path: Path) -> None:
     """A budgeted concrete-style backend with no supported bound performs zero remote work."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend(conservative_cost_per_batch=None)
 
     with pytest.raises(TinkerSFTBudgetExceeded, match="backend-proven"):
@@ -402,6 +408,7 @@ def test_unknown_cost_refuses_before_open_or_optimizer_dispatch(tmp_path: Path) 
 def test_changed_spec_cannot_reuse_an_append_only_run_directory(tmp_path: Path) -> None:
     """A run directory remains tied to its original frozen dataset and optimization settings."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend()
     output_dir = tmp_path / "run"
     _run(fixture, output_dir, backend)
@@ -413,6 +420,7 @@ def test_changed_spec_cannot_reuse_an_append_only_run_directory(tmp_path: Path) 
 def test_optimizer_delegates_to_the_same_injected_backend(tmp_path: Path) -> None:
     """The narrow optimizer seam adds no registry or alternate training implementation."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend()
     optimizer = TinkerSFTOptimizer(backend)
 
@@ -432,6 +440,7 @@ def test_optimizer_delegates_to_the_same_injected_backend(tmp_path: Path) -> Non
 def test_seed_deterministically_controls_schedule_order(tmp_path: Path) -> None:
     """The same seed repeats exact batch order while a selected alternate seed changes it."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     first = _FakeBackend()
     repeat = _FakeBackend()
     alternate = _FakeBackend()
@@ -447,6 +456,7 @@ def test_seed_deterministically_controls_schedule_order(tmp_path: Path) -> None:
 def test_forged_cross_split_persisted_input_never_opens_training(tmp_path: Path) -> None:
     """Even manifest-digested forged rows fail W12 invariants before backend composition."""
     fixture = _persisted_dataset(tmp_path)
+    sft_run_records(fixture.store, tmp_path / "run")
     original = fixture.artifact
     held_out = next(row for row in original.rows if row.partition == "held_out")
     forged_row = held_out.model_copy(
@@ -505,10 +515,11 @@ def test_forged_cross_split_persisted_input_never_opens_training(tmp_path: Path)
 def test_completed_reuse_refuses_when_event_log_is_deleted(tmp_path: Path) -> None:
     """A terminal result is not trusted without its hash-bound checkpoint event lineage."""
     fixture = _persisted_dataset(tmp_path)
+    state = sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend()
     output_dir = tmp_path / "run"
     _run(fixture, output_dir, backend)
-    (output_dir / "events.jsonl").unlink()
+    _replace_events(state, b"")
 
     with pytest.raises(TinkerSFTResumeError):
         _run(fixture, output_dir, backend)
@@ -519,17 +530,18 @@ def test_completed_reuse_rejects_coherent_result_dataset_build_input_edit(
 ) -> None:
     """A self-consistent mutable result cannot replace the canonical W12 manifest binding."""
     fixture = _persisted_dataset(tmp_path)
+    state = sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend()
     output_dir = tmp_path / "run"
     _run(fixture, output_dir, backend)
-    result_path = output_dir / "result.json"
-    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result_path = "result.json"
+    result = json.loads(_record(state, result_path))
     forged_build = "0" * 64
     result["dataset_build_sha256"] = forged_build
     for input_item in result["inputs"]:
         if input_item["artifact_id"] == fixture.artifact.dataset.dataset_id:
             input_item["sha256"] = forged_build
-    result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+    state.write(result_path, canonical_json_bytes(result) + b"\n")
 
     with pytest.raises(TinkerSFTResumeError):
         _run(fixture, output_dir, backend)
@@ -538,29 +550,30 @@ def test_completed_reuse_rejects_coherent_result_dataset_build_input_edit(
 def test_completed_reuse_rejects_coherently_truncated_schedule(tmp_path: Path) -> None:
     """A hash-consistent one-step terminal history cannot complete a frozen two-step run."""
     fixture = _persisted_dataset(tmp_path)
+    state = sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend()
     output_dir = tmp_path / "run"
     _run(fixture, output_dir, backend)
 
-    event_path = output_dir / "events.jsonl"
-    events = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    events = [json.loads(line) for line in b"".join(state.events()).decode().splitlines()]
     first_events = [event for event in events if event.get("step") == 1]
     first_checkpoint = next(event for event in first_events if event["record_type"] == "checkpoint")
     first_metric = next(event for event in first_events if event["record_type"] == "metric")
     event_payload = b"".join(canonical_json_bytes(event) + b"\n" for event in first_events)
-    event_path.write_bytes(event_payload)
+    _replace_events(state, event_payload)
     events_sha256 = hashlib.sha256(event_payload).hexdigest()
 
-    for path in output_dir.glob("*step-2.step-intent.json"):
-        path.unlink()
+    for key in state.list_ids():
+        if key.endswith("step-2.step-intent.json"):
+            _delete_record(state, key)
     second_checkpoint = next(
         event for event in events if event["record_type"] == "checkpoint" and event["step"] == 2
     )
-    (output_dir / f"{second_checkpoint['checkpoint_id']}.checkpoint-intent.json").unlink()
-    (output_dir / "model-intent.json").unlink()
+    _delete_record(state, f"{second_checkpoint['checkpoint_id']}.checkpoint-intent.json")
+    _delete_record(state, "model-intent.json")
 
-    model_path = output_dir / "model.json"
-    model = json.loads(model_path.read_text(encoding="utf-8"))
+    model_path = "model.json"
+    model = json.loads(_record(state, model_path))
     model.update(
         {
             "events_sha256": events_sha256,
@@ -579,11 +592,11 @@ def test_completed_reuse_rejects_coherently_truncated_schedule(tmp_path: Path) -
             "sampling_handle": model["sampling_handle"],
         },
     )
-    model_path.write_bytes(canonical_json_bytes(model) + b"\n")
+    state.write(model_path, canonical_json_bytes(model) + b"\n")
     model_sha256 = sha256_json(model)
 
-    result_path = output_dir / "result.json"
-    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result_path = "result.json"
+    result = json.loads(_record(state, result_path))
     result.update(
         {
             "events_sha256": events_sha256,
@@ -604,7 +617,7 @@ def test_completed_reuse_rejects_coherently_truncated_schedule(tmp_path: Path) -
         "tinker-sft-result",
         {"run_id": result["run_id"], "model_sha256": model_sha256},
     )
-    result_path.write_bytes(canonical_json_bytes(result) + b"\n")
+    state.write(result_path, canonical_json_bytes(result) + b"\n")
 
     with pytest.raises(TinkerSFTResumeError, match="frozen schedule"):
         _run(fixture, output_dir, backend)
@@ -614,9 +627,46 @@ def test_completed_reuse_rejects_coherently_truncated_schedule(tmp_path: Path) -
 def test_provider_token_url_is_rejected_before_checkpoint_persistence(tmp_path: Path) -> None:
     """Provider resource strings with token query material never enter local artifacts."""
     fixture = _persisted_dataset(tmp_path)
+    state = sft_run_records(fixture.store, tmp_path / "run")
     backend = _FakeBackend(state_resource="https://provider.test/state?token=secret-value")
 
     with pytest.raises(TinkerSFTError, match="opaque provider resource ID"):
         _run(fixture, tmp_path / "run", backend)
 
-    assert not (tmp_path / "run" / "result.json").exists()
+    assert state.read("result.json") is None
+
+
+def _record(state: ProjectRecords, key: str) -> bytes:
+    """Read exact SQLite metadata bytes for provenance assertions."""
+    payload = state.read(key)
+    assert payload is not None
+    return payload
+
+
+def _delete_record(state: ProjectRecords, key: str) -> None:
+    """Remove a completed record to simulate lost durable evidence."""
+    state.replace(key, expected=_record(state, key), replacement=None)
+
+
+def _replace_events(state: ProjectRecords, payload: bytes) -> None:
+    """Forge a hash-consistent event history to exercise schedule verification."""
+    with state.transaction():
+        with project_connection(state.root, write=True) as connection:
+            connection.execute(
+                "DELETE FROM project_state_events WHERE project_id=? AND namespace=?",
+                (state.project_id, state.namespace),
+            )
+        for line in payload.splitlines(keepends=True):
+            state.append(hashlib.sha256(line).hexdigest(), line)
+
+
+def test_distinct_run_locations_with_same_basename_do_not_share_checkpoints(tmp_path: Path) -> None:
+    """Caller-selected independent run locations retain separate dispatch and result history."""
+    fixture = _persisted_dataset(tmp_path)
+    first, second = _FakeBackend(), _FakeBackend()
+    _run(fixture, tmp_path / "one" / "run", first)
+    _run(fixture, tmp_path / "two" / "run", second)
+    assert first.train_calls == second.train_calls == 2
+    replay = _FakeBackend()
+    _run(fixture, tmp_path / "one" / "run", replay)
+    assert replay.open_resume_paths == []

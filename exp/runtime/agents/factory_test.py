@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from functools import partial
 from types import ModuleType
 
 import pytest
@@ -14,6 +15,7 @@ from exp.common.tasks import TaskCase
 from exp.runtime.agents import AgentEpisode, ChatAgentRuntime
 from exp.runtime.agents.factory import (
     AgentFactoryError,
+    is_builtin_chat_factory,
     preflight_agent_factory,
     resolve_agent_factory,
 )
@@ -27,7 +29,25 @@ def test_absent_project_factory_uses_bounded_chat_runtime() -> None:
     agent = factory()
 
     assert isinstance(agent, ChatAgentRuntime)
+    assert is_builtin_chat_factory(factory)
     preflight_agent_factory(factory)
+
+
+def test_builtin_identity_check_does_not_invoke_custom_code() -> None:
+    """Factory identity admits exact built-ins without constructing custom wrappers."""
+    calls = 0
+
+    def custom() -> ChatAgentRuntime:
+        """Track accidental initialization despite returning a built-in instance."""
+        nonlocal calls
+        calls += 1
+        return ChatAgentRuntime()
+
+    assert is_builtin_chat_factory(ChatAgentRuntime)
+    assert is_builtin_chat_factory(partial(ChatAgentRuntime, maximum_model_calls=1000))
+    assert not is_builtin_chat_factory(custom)
+    assert not is_builtin_chat_factory(partial(custom))
+    assert calls == 0
 
 
 def test_explicit_project_factory_remains_supported() -> None:

@@ -18,6 +18,7 @@ from exp.common.judging.calibration_metrics import (
 from exp.common.judging.calibration_provenance import (
     verify_persisted_calibration,
 )
+from exp.common.judging.definition import JudgeDefinition
 from exp.common.judging.display import render_rubric_table
 from exp.common.judging.interface import Judge
 from exp.common.judging.judgment import DimensionJudgment, Judgment
@@ -76,6 +77,7 @@ __all__ = [
     "HumanScoreReview",
     "InsufficientCalibrationRiskAcceptance",
     "Judge",
+    "JudgeDefinition",
     "JudgeProbe",
     "JudgeCalibration",
     "JudgeCalibrationService",

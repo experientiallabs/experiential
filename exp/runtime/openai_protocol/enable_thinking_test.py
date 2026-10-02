@@ -48,13 +48,58 @@ def test_thinking_adaptive_defers_to_the_model_default() -> None:
     assert request.ignored_parameters == ("thinking->translated(reasoning_effort)",)
 
 
-@pytest.mark.parametrize("mode", ("adaptive", "enabled"))
-def test_numeric_thinking_budget_is_refused_not_discarded(mode: str) -> None:
-    """Chat rejects a numerical budget its adapters cannot preserve."""
+def test_numeric_thinking_budget_is_preserved_for_route_admission() -> None:
+    """Chat retains the exact numeric budget instead of selecting an effort."""
+    request = _decode(thinking={"type": "enabled", "budget_tokens": 4096}, max_tokens=8192)
+    assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 4096}
+    assert request.reasoning_effort is None
+    assert request.thinking_default_enable is False
+    assert request.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("budget", (0, 1023, True, 4096.5, "4096"))
+def test_nested_budget_requires_an_anthropic_integer_budget(budget: object) -> None:
+    """Malformed or too-small budgets fail at the caller field."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "enabled", "budget_tokens": budget})
+    assert error.value.detail.param == "thinking.budget_tokens"
+
+
+@pytest.mark.parametrize("mode", ("adaptive", "disabled"))
+def test_nested_budget_requires_enabled_mode(mode: str) -> None:
+    """A numeric budget cannot be combined with an adaptive or off mode."""
     with pytest.raises(OpenAIProtocolError) as error:
         _decode(thinking={"type": mode, "budget_tokens": 4096})
     assert error.value.detail.param == "thinking.budget_tokens"
-    assert error.value.detail.code == "unsupported_parameter"
+
+
+@pytest.mark.parametrize(
+    "limit_field", ("max_tokens", "max_completion_tokens", "max_output_tokens")
+)
+@pytest.mark.parametrize("limit", (2048, 4096))
+def test_nested_budget_leaves_room_below_any_output_limit(limit_field: str, limit: int) -> None:
+    """All output-limit spellings apply the same numeric budget constraint."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "enabled", "budget_tokens": 4096}, **{limit_field: limit})
+    assert error.value.detail.param == "thinking.budget_tokens"
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"thinking_budget": 4096},
+        {"reasoning_effort": "high"},
+        {"reasoning": {"effort": "high"}},
+        {"reasoning": {"enabled": False}},
+        {"enable_thinking": False},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+    ],
+)
+def test_nested_budget_rejects_conflicting_controls(controls: dict[str, object]) -> None:
+    """Neither effort nor an off switch may erase the requested budget."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "enabled", "budget_tokens": 4096}, **controls)
+    assert error.value.detail.param == "thinking.budget_tokens"
 
 
 def test_thinking_unknown_type_names_the_members_not_the_json_type() -> None:

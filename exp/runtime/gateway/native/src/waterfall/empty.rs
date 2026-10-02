@@ -8,12 +8,9 @@ use crate::errors::Failure;
 use crate::events::{Event, Usage};
 use crate::settlement::AttemptGuard;
 
-/// The empty-completion failure for one rung. On an image-output rung the
-/// redial and the ladder are switched off: the chat normalizers carry no
-/// image event, so every image generation ends as an empty completion and a
-/// redial would bill the house a second image for the same nothing; the
-/// exhausted ladder then answers the typed 200 at once. Elsewhere the empty
-/// answer is not deterministic and one redial plus the ladder stay on.
+/// Do not regenerate an image when a provider reports success without any
+/// deliverable output. The first attempt may already have incurred image cost.
+/// Ordinary text lanes retain their empty-completion retry policy.
 pub(crate) fn empty_completion_failure(wire: &DeploymentWire) -> Failure {
     let failure = Failure::empty_completion();
     if wire.image_output {

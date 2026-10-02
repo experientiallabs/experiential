@@ -62,8 +62,8 @@ def router(
     maximum_router_feature_tokens: int = typer.Option(
         8_192, "--maximum-router-feature-tokens", min=1
     ),
-    maximum_retrieval_query_tokens: int = typer.Option(
-        32_768, "--maximum-retrieval-query-tokens", min=1
+    maximum_retrieval_query_tokens: int | None = typer.Option(
+        None, "--maximum-retrieval-query-tokens", min=1
     ),
     simulation_maximum_output_tokens: int = typer.Option(
         2_000, "--simulation-maximum-output-tokens", min=256
@@ -77,7 +77,7 @@ def router(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm an in-budget estimate when the shared policy requires it.",
+        help="Confirm the estimate, including any budget warning.",
     ),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
 ) -> None:
@@ -93,12 +93,12 @@ def router(
         maximum_judgments: Maximum rollout judgments admitted by composition.
         maximum_model_calls: Candidate turns admitted per simulation episode.
         maximum_router_feature_tokens: Input ceiling for each router feature embedding.
-        maximum_retrieval_query_tokens: Input ceiling for each grounded retrieval query.
+        maximum_retrieval_query_tokens: Optional input ceiling; omission uses world capacity.
         simulation_maximum_output_tokens: Candidate and world-model output ceiling per turn.
         maximum_concurrency: Maximum simulation workers.
         stop_on_overspend: Block the next paid dispatch once reconciled spend reaches the
             ceiling instead of warning and completing the authorized run.
-        yes: Explicit confirmation for an in-budget estimate above the automatic threshold.
+        yes: Explicit confirmation for the estimate, including any budget warning.
         non_interactive: Refuse prompts and require complete repeatable inputs.
 
     Raises:

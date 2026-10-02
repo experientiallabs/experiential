@@ -68,7 +68,7 @@ def _plan_and_setup() -> tuple[EvaluationPlan, EvaluationCell, RouterEvaluationS
         agent_id="agent-a",
         simulator_id="text-world-model-v1",
         world_model=_snapshot("world-model-a"),
-        simulator_prompt_id="world-model-text-v1",
+        simulator_prompt_id="world-model-text-v2",
         rubric_id="rubric-a",
         judge_calibration_id="calibration-a",
         pricing_snapshot_id="pricing-a",
@@ -92,7 +92,7 @@ def _plan_and_setup() -> tuple[EvaluationPlan, EvaluationCell, RouterEvaluationS
         world_model_settings=WorldModelSettings(
             world_model_alias="world-model-a",
             grounded_world_model_input=ArtifactInput(artifact_id="world-model-a", sha256=_DIGEST),
-            prompt_version="text-world-model-v1",
+            prompt_version="text-world-model-v2",
         ),
         agent_id="agent-a",
         seed=7,

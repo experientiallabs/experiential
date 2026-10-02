@@ -16,6 +16,9 @@ use crate::param_attribution::{
 };
 use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
+mod network;
+pub(crate) use network::UpstreamClient;
+
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
 /// provider 3xx can never re-send credentials to an attacker-chosen location.
@@ -23,14 +26,31 @@ use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds}
 /// `connect_timeout` bounds only the TCP+TLS connect phase; a dead lane whose
 /// host never accepts the connection fails over after this window instead of
 /// hanging on the per-deployment request timeout.
-pub fn build_client(connect_timeout: Duration) -> Result<reqwest::Client, String> {
+pub fn build_client(
+    connect_timeout: Duration,
+    public_only: bool,
+) -> Result<UpstreamClient, String> {
+    let builder = client_builder(connect_timeout);
+    let builder = if public_only {
+        network::restrict(builder)
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .map(|inner| UpstreamClient::new(inner, public_only))
+        .map_err(|error| format!("upstream client construction failed: {error}"))
+}
+
+/// One transport configuration shared by production and protocol-level tests.
+fn client_builder(connect_timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .pool_max_idle_per_host(64)
         .connect_timeout(connect_timeout)
         .redirect(reqwest::redirect::Policy::none())
+        // The waterfall owns every physical retry and its reservation, including H2 nacks.
+        .retry(reqwest::retry::never())
         .use_rustls_tls()
-        .build()
-        .map_err(|error| format!("upstream client construction failed: {error}"))
 }
 
 /// Classify one sanitized HTTP or connection failure by status only,
@@ -150,7 +170,7 @@ fn open_timeout_failure() -> Failure {
 /// verbatim with the signed headers instead of re-serializing `payload`.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_stream(
-    client: &reqwest::Client,
+    client: &UpstreamClient,
     url: &str,
     headers: &HashMap<String, String>,
     idempotency_key: &str,
@@ -159,7 +179,7 @@ pub async fn open_stream(
     phase_timeout: Duration,
     dialect: Dialect,
 ) -> Result<reqwest::Response, Failure> {
-    let mut request = client.post(url);
+    let mut request = client.post(url)?;
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("idempotency-key") {
             continue;
@@ -335,6 +355,31 @@ pub async fn open_stream(
                 let token = code.unwrap_or_default();
                 return Err(transport_failure(Some(402))
                     .with_provider_detail(Some(format!("{}: {token}", status_detail(status))))
+                    .with_rate_limit_facts(rate_limit.clone(), retry_after));
+            }
+            // A compatible relay can put Gemini's content verdict under 403.
+            // Read only the raw error envelope, never sanitized or echoed text.
+            let refusal = body.as_deref().and_then(|body| {
+                if !matches!(
+                    dialect,
+                    Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+                ) {
+                    return None;
+                }
+                let value = crate::error_envelope::parse_error_document(body)?;
+                let envelope = crate::error_envelope::openai_family_envelope(&value)?;
+                let reason = crate::stream_errors::relayed_gemini_refusal(
+                    envelope.code.as_deref(),
+                    envelope.message,
+                )?;
+                let detail = envelope
+                    .message
+                    .and_then(|message| sanitized_detail(message, &[]));
+                Some((reason, detail))
+            });
+            if let Some((reason, detail)) = refusal {
+                return Err(Failure::refusal(reason)
+                    .with_provider_detail(detail)
                     .with_rate_limit_facts(rate_limit.clone(), retry_after));
             }
             return Err(failure);

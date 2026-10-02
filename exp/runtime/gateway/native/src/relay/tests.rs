@@ -43,6 +43,36 @@ async fn first_token_at_is_stamped_on_the_first_output_delta() {
 }
 
 #[tokio::test]
+async fn discarded_reasoning_is_progress_without_a_first_token_measurement() {
+    let frames = vec![
+        Ok::<_, reqwest::Error>(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private thought\"}}]}\n\n",
+        )),
+        Ok::<_, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+    ];
+    let started = Instant::now();
+    let mut relay = UpstreamRelay::from_stream(
+        stream::iter(frames).boxed(),
+        Dialect::OpenAiCompatible,
+        started + Duration::from_secs(5),
+    );
+    let event = relay
+        .next_event(
+            started + Duration::from_secs(30),
+            Duration::from_secs(5),
+            started,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, Event::Completed));
+    assert!(relay.last_progress_at.is_some());
+    assert!(!relay.stall_bound_armed);
+    assert!(!relay.committed);
+    assert!(relay.first_token_at().is_none());
+}
+
+#[tokio::test]
 async fn stop_sequences_cut_the_relayed_text_and_keep_usage_and_settlement_exact() {
     // A Chat-compatible stream stands in for any dialect: "</block>" spans
     // two content deltas, more text follows it, then usage and the
@@ -213,6 +243,65 @@ async fn a_gemini_partial_then_abnormal_frame_ends_incomplete_not_failed() {
         matches!(seen.last(), Some(Event::Incomplete)),
         "the turn ends incomplete, not failed"
     );
+}
+
+#[tokio::test]
+async fn invalid_gemini_images_keep_their_nonretryable_failure_before_and_after_text() {
+    for preceding_text in [false, true] {
+        for (image, message) in [
+            (
+                serde_json::json!({"mimeType": "image/png", "data": "iVBORw0KGgo="}),
+                "provider returned an invalid generated image",
+            ),
+            (
+                serde_json::json!({"mimeType": "image/png"}),
+                "Gemini image requires base64 data",
+            ),
+            (
+                serde_json::json!({"data": "iVBORw0KGgo="}),
+                "Gemini image requires a media type",
+            ),
+        ] {
+            let mut frames = Vec::new();
+            if preceding_text {
+                frames.push(Ok::<_, reqwest::Error>(Bytes::from(
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+                )));
+            }
+            let payload = serde_json::json!({
+                "candidates": [{"content": {"parts": [{"inlineData": image}]}}],
+                "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 100}
+            });
+            frames.push(Ok(Bytes::from(format!("data: {payload}\n\n"))));
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(30);
+            let per_chunk = Duration::from_secs(5);
+            let mut relay = UpstreamRelay::from_stream(
+                stream::iter(frames).boxed(),
+                Dialect::GeminiGenerateContent,
+                deadline,
+            );
+            relay.allow_image_output();
+            if preceding_text {
+                assert!(matches!(
+                    relay.next_event(deadline, per_chunk, started).await.unwrap(),
+                    Some(Event::TextDelta(text)) if text == "partial"
+                ));
+            }
+            let failure = relay
+                .next_event(deadline, per_chunk, started)
+                .await
+                .expect_err("an invalid image must not recover to a partial completion");
+            assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+            assert_eq!(failure.safe_message, message);
+            assert!(!failure.retryable_same_deployment);
+            assert!(!failure.failover_eligible);
+            assert_eq!(
+                relay.usage_before_failure(None).unwrap().output_tokens,
+                Some(100)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -594,7 +683,7 @@ async fn provider_tool_phase_preserves_byte_idle_then_resumes_progress_idle() {
 }
 
 #[tokio::test]
-async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
+async fn failure_usage_prefers_latest_cumulative_counts() {
     let chunks = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from_static(
         b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
     ))]).chain(stream::pending()).boxed();
@@ -609,7 +698,6 @@ async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
         output_tokens: Some(20),
         ..Default::default()
     };
-    relay.set_carried_usage(Some(carried.clone()));
     relay
         .next_event(
             started + Duration::from_secs(2),
@@ -619,35 +707,23 @@ async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
         .await
         .unwrap_err();
     let observed = relay.usage_before_failure(Some(carried)).unwrap();
-    assert_eq!(observed.input_tokens, Some(17));
-    assert_eq!(observed.output_tokens, Some(29));
+    assert_eq!(observed.input_tokens, Some(7));
+    assert_eq!(observed.output_tokens, Some(9));
     let again = relay.usage_before_failure(Some(observed)).unwrap();
-    assert_eq!(again.input_tokens, Some(17));
-    assert_eq!(again.output_tokens, Some(29));
+    assert_eq!(again.input_tokens, Some(7));
+    assert_eq!(again.output_tokens, Some(9));
 }
 
 #[test]
 fn failure_without_current_usage_keeps_the_attempt_total_unknown() {
-    let mut relay = UpstreamRelay::from_stream(
+    let relay = UpstreamRelay::from_stream(
         stream::pending().boxed(),
         Dialect::OpenAiCompatible,
         Instant::now(),
     );
     assert!(relay.usage_before_failure(None).is_none());
-    relay.set_carried_usage(Some(Usage {
-        input_tokens: Some(10),
-        output_tokens: Some(20),
-        ..Default::default()
-    }));
-    // A repaired dial has also dispatched: its missing meter cannot be
-    // replaced by the earlier dial's subtotal as if that were a full total.
-    let unknown = relay.usage_before_failure(None).unwrap();
-    assert_eq!(unknown.input_tokens, None);
-    assert_eq!(unknown.output_tokens, None);
-    let again = relay.usage_before_failure(Some(unknown)).unwrap();
-    assert_eq!(again.input_tokens, None);
-    assert_eq!(again.output_tokens, None);
-    assert!(again.cached_input_tokens.is_none());
+    // A separate physical attempt cannot borrow another dial's usage.
+    assert!(relay.usage_before_failure(None).is_none());
 }
 
 #[test]

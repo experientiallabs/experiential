@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
-from exp.common.models.catalog import BillingSource
+from exp.common.models.catalog import BillingSource, SubscriptionKind
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelDeployment,
@@ -150,6 +150,7 @@ class ProviderConnectionRevision(ContractModel):
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
     connection_sha256: Sha256
     active: bool = True
     created_at: AwareDatetime
@@ -275,14 +276,20 @@ class AttemptReservationRequest(ContractModel):
     maximum_cost_nano_usd: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
-    def _require_matching_organization(self) -> AttemptReservationRequest:
-        """Reject tenant, deployment-list, or exact-model drift."""
+    def _require_matching_route(self) -> AttemptReservationRequest:
+        """Reject tenant, stage-cursor, or destination exact-model drift."""
         if self.organization_id != self.snapshot.authorization.organization_id:
             raise ValueError("attempt reservation organization differs from its snapshot")
         if self.deployment.deployment_id not in self.snapshot.deployment_ids:
             raise ValueError("attempt deployment is absent from its execution snapshot")
-        if self.deployment.exact_model_id != self.snapshot.exact_model_id:
-            raise ValueError("attempt deployment changes the selected exact model")
+        stage = self.snapshot.stage_for_depth(self.route_depth)
+        if (
+            self.deployment.deployment_id != self.snapshot.deployment_ids[self.route_depth]
+            or self.deployment.deployment_id not in stage.deployment_ids
+        ):
+            raise ValueError("attempt deployment differs from its authorized stage cursor")
+        if self.deployment.exact_model_id != stage.exact_model_id:
+            raise ValueError("attempt deployment changes the selected stage exact model")
         return self
 
 
@@ -568,7 +575,13 @@ GrantMutationCommand = Annotated[
 
 
 class UpsertProviderConnectionCommand(ContractModel):
-    """Create or explicitly revise one provider connection."""
+    """Create or explicitly revise one provider connection.
+
+    Attributes:
+        subscription: A plan connection's kind (``None`` for a key connection); dispatch mints a
+            per-request bearer from the plan sign-in the runtime's token source holds, so no
+            secret reference is carried. The remaining fields mirror ``ConnectionConfig``.
+    """
 
     kind: Literal["upsert_provider_connection"] = "upsert_provider_connection"
     organization_id: OrganizationId
@@ -583,6 +596,7 @@ class UpsertProviderConnectionCommand(ContractModel):
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
     replace: bool = False
 
 

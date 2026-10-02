@@ -63,7 +63,6 @@ from exp.runtime.anthropic_protocol.server_tools import (
     require_served_server_tool_types,
 )
 from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
-from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -74,6 +73,7 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy
 from exp.runtime.models.providers.cache_policy import (
     multimodal_text_cache_blocks,
     retain_multimodal_cache_boundaries,
@@ -81,7 +81,7 @@ from exp.runtime.models.providers.cache_policy import (
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
-from exp.runtime.openai_protocol.manifest import disposition_map
+from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
 
@@ -203,6 +203,9 @@ class _Tool(AnthropicWireModel):
     ``eager_input_streaming`` conditionally). They forward verbatim on
     Anthropic rungs, which own their validity rules, and drop with
     disclosure elsewhere.
+
+    Attributes:
+        description: Optional verbatim tool instructions; bounded by the aggregate request limit.
     """
 
     name: str = Field(min_length=1, max_length=256)
@@ -232,14 +235,18 @@ class _Metadata(AnthropicWireModel):
 
 
 class _ThinkingConfig(AnthropicWireModel):
-    """Extended-thinking configuration validated closed, then forwarded verbatim."""
+    """Extended-thinking configuration validated closed, then forwarded verbatim.
 
-    type: Literal["enabled", "disabled", "adaptive"]
+    Attributes:
+        type: Requested mode, validated against the selected model at admission.
+        budget_tokens: Positive manual thinking budget, only valid with enabled.
+        display: Optional provider display disposition. Between-tools thinking
+            accepts no fields besides type, including explicitly null fields.
+    """
+
+    type: Literal["enabled", "disabled", "adaptive", "between_tools"]
     budget_tokens: int | None = Field(default=None, gt=0)
     display: str | None = Field(default=None, max_length=64)
-    """Display disposition, forwarded verbatim (Claude Code sends "omitted";
-    accepted live without a beta, 2026-08-30). Bounded but deliberately not
-    enumerated: the value set is an evolving provider surface."""
 
     @model_validator(mode="after")
     def _require_budget_only_when_enabled(self) -> _ThinkingConfig:
@@ -252,6 +259,8 @@ class _ThinkingConfig(AnthropicWireModel):
         its default depth. Rejecting it here made every such session die at
         the gateway (Harbor, 2026-09-11).
         """
+        if self.type == "between_tools" and self.model_fields_set != {"type"}:
+            raise ValueError("thinking between_tools accepts only the type field")
         if self.type != "enabled" and self.budget_tokens is not None:
             raise ValueError("thinking.budget_tokens is valid only when thinking is enabled")
         return self
@@ -289,6 +298,7 @@ class _MessagesRequest(AnthropicWireModel):
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
     provider: ProviderRoutingPreferences | None = None
+    gateway: GatewayRequestPolicy | None = None
     """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
     """Inference-region selector, forwarded verbatim (accepted live without
     a beta, 2026-08-30). Bounded but deliberately not enumerated: the
@@ -358,6 +368,8 @@ def decode_messages_count_tokens(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
+    if "gateway" in payload:
+        raise unsupported_field("gateway")
     try:
         return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
     except ProviderParameterError as error:
@@ -371,7 +383,7 @@ def _decode(
     anthropic_beta: str | None,
 ) -> DecodedGatewayRequest:
     """Validate ``payload`` against ``wire`` and build the canonical request."""
-    _validate_manifest(payload)
+    validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
@@ -456,6 +468,7 @@ def _decode(
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            gateway=request.gateway,
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=(
                 cast(JsonObject, payload["provider"]) if request.provider is not None else None
@@ -541,15 +554,6 @@ def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
             if disclosure not in dropped:
                 dropped.append(disclosure)
     return tuple(forwarded), tuple(dropped)
-
-
-def _validate_manifest(payload: JsonObject) -> None:
-    """Reject unsupported and unknown top-level fields before decoding."""
-    decisions = disposition_map(MESSAGES_MANIFEST)
-    for field in payload:
-        disposition = decisions.get(field)
-        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
-            raise unsupported_field(field)
 
 
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
@@ -731,10 +735,15 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         if content is None and not tool_calls and not reasoning and not attachments:
             ordered_blocks.clear()
             return
+        capture_only_reasoning = ()
         if any(block.kind == "sealed_reasoning_content" for block in reasoning):
             # A gateway tool turn returned its reasoning twice: the unsigned
             # display block that streamed live and the sealed carrier that
-            # holds the same text authenticated. Only the carrier replays.
+            # holds the same text authenticated. Only the carrier replays;
+            # retain the already-visible copy separately for trace capture.
+            capture_only_reasoning = tuple(
+                block for block in reasoning if block.kind == "exposed_reasoning_content"
+            )
             reasoning[:] = [
                 block for block in reasoning if block.kind != "exposed_reasoning_content"
             ]
@@ -757,6 +766,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 content_parts=retained,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
+                capture_only_reasoning=capture_only_reasoning,
                 # The marked run is carried alongside the retained parts: its
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.

@@ -13,6 +13,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
     ProjectTarget,
 )
+from exp.runtime.gateway.ledger_valuation import usage_source_label
 from exp.runtime.gateway.platform import (
     AliasRevisionRecord,
     AttemptReservationRecord,
@@ -79,7 +80,12 @@ def require_settlement_replay(
             raise ValueError("attempt settlement needs a terminal event or failure")
         state = AttemptTerminalState(request.terminal_event.kind.value)
         failure_class = None
-    usage_source = AttemptUsageSource.OBSERVED if usage is not None else AttemptUsageSource.UNKNOWN
+    usage_source = AttemptUsageSource(
+        usage_source_label(
+            usage,
+            estimated=request.terminal_event is not None and request.terminal_event.usage_estimated,
+        )
+    )
     if (
         settlement.state is not state
         or settlement.failure_class is not failure_class
@@ -186,6 +192,7 @@ def require_reservation_replay(
     """
     record = reservation_record(row, organization_id=request.organization_id)
     authorization = request.snapshot.authorization
+    stage = request.snapshot.stage_for_depth(request.route_depth)
     prices = request.deployment.gateway.prices
     expected = (
         authorization.request_id,
@@ -196,8 +203,8 @@ def require_reservation_replay(
         authorization.canonical_request_sha256,
         authorization.caller_operation_sha256,
         authorization.catalog_sha256,
-        request.snapshot.pool_id,
-        request.snapshot.exact_model_id,
+        stage.pool_id,
+        stage.exact_model_id,
         request.deployment.deployment_id,
         request.deployment.provider,
         request.deployment.billing_source,

@@ -8,9 +8,13 @@ import logging
 import sqlite3
 import threading
 import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, cast
 from unittest import mock
+from uuid import uuid4
 
 import pytest
 
@@ -25,6 +29,11 @@ from exp.common.models.catalog import (
     GatewayRungDispatchPolicy,
     load_model_catalog,
     write_model_catalog,
+)
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.catalog_authority import (
@@ -41,6 +50,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
     LocalGatewayComponents,
@@ -56,12 +67,28 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_reasoning import (
+    CHANGED_TURN_CARRIER_DROPPED,
+    UNAVAILABLE_ISSUER_CARRIER_DROPPED,
+)
+from exp.runtime.gateway.native_recovery import session_cache_key
+from exp.runtime.gateway.native_stage_admission_test import Host
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    chain_components,
+    publish_authored_chain_fixture,
+)
+from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
+from exp.runtime.models.credentials_test import AtomicEnvironment
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.instruction_turns import (
     HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
     SYSTEM_FOLD_DISCLOSURE,
 )
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -497,10 +524,148 @@ def _admit_started(
     return _flatten_started(control, admission)
 
 
-def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
+def _seal_settled_tool_turn(
+    control: NativeControlPlane,
+    started: JsonObject,
+    *,
+    content: str,
+    call_id: str,
+    name: str,
+    raw_arguments: str,
+) -> str:
+    """Seal one started attempt's tool turn, settle it, and return the carrier."""
+    carrier = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": started["request_id"],
+                    "route_depth": started["route_depth"],
+                    "route_sha256": started["fireworks_reasoning_route_sha256"],
+                    "content": content,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": call_id, "name": name, "raw_arguments": raw_arguments}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": started["request_id"],
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [name],
+                "failure": None,
+            }
+        )
+    )
+    return carrier
+
+
+def _carrier_tool_turn(carrier: str, call_id: str, name: str, arguments: str) -> list[JsonObject]:
+    """Return one echoed assistant tool turn and its tool result."""
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": carrier,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": "done"},
+    ]
+
+
+def test_client_repaired_tool_call_drops_only_its_carrier_and_what_binds_to_it(
     tmp_path: Path,
 ) -> None:
-    """A second replica decrypts the exact turn while tamper and rotation fail closed."""
+    """An OpenCode-repaired tool call no longer ends the session.
+
+    OpenCode rewrites a tool call whose arguments fail schema validation into a
+    call to its ``invalid`` tool and echoes that call beside the carrier sealed
+    for the original one (production, glm-5.3 on Fireworks, 2026-09-28). The
+    edited turn's carrier is dropped and disclosed; an earlier intact carrier
+    still unseals and pins the issuing rung. When the EARLIER turn is the edited
+    one, the later carrier, whose prefix binds the earlier plaintext, drops too.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.fireworks.ai/inference/v1",
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fireworks-secret"})
+    )
+    first_hidden = "first turn private reasoning"
+    second_hidden = "second turn private reasoning"
+    first_carrier = _seal_settled_tool_turn(
+        control,
+        _admit_started(control, raw_key, _chat_body()),
+        content=first_hidden,
+        call_id="call-one",
+        name="lookup",
+        raw_arguments="{}",
+    )
+    first_turn = _carrier_tool_turn(first_carrier, "call-one", "lookup", "{}")
+    user: JsonObject = {"role": "user", "content": "hi"}
+    second_started = _admit_started(
+        control, raw_key, json.dumps({"model": "coding", "messages": [user, *first_turn]})
+    )
+    assert second_started["route_reason"] == "reasoning_continuation"
+    second_carrier = _seal_settled_tool_turn(
+        control,
+        second_started,
+        content=second_hidden,
+        call_id="call-two",
+        name="bash",
+        raw_arguments='{"command":42}',
+    )
+
+    repaired = _carrier_tool_turn(
+        second_carrier, "call-two", "invalid", '{"tool":"bash","error":"Invalid input"}'
+    )
+    served = _admit(
+        control,
+        raw_key,
+        json.dumps({"model": "coding", "messages": [user, *first_turn, *repaired]}),
+    )
+    assert served["route_reason"] == "reasoning_continuation"
+    assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
+    route = cast("list[JsonObject]", served["route"])
+    messages = cast(
+        "list[JsonObject]", cast("JsonObject", route[0]["upstream_payload"])["messages"]
+    )
+    assert messages[1]["reasoning_content"] == first_hidden
+    assert "reasoning_content" not in messages[3]
+    assert second_hidden not in json.dumps(route)
+
+    edited_first = _carrier_tool_turn(first_carrier, "call-one", "lookup", '{"q":"edited"}')
+    intact_second = _carrier_tool_turn(second_carrier, "call-two", "bash", '{"command":42}')
+    cascaded = _admit(
+        control,
+        raw_key,
+        json.dumps({"model": "coding", "messages": [user, *edited_first, *intact_second]}),
+    )
+    assert cascaded["route_reason"] == "direct"
+    assert cascaded["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
+    cascaded_route = json.dumps(cascaded["route"])
+    assert first_hidden not in cascaded_route
+    assert second_hidden not in cascaded_route
+    assert "reasoning_content" not in cascaded_route
+
+
+def test_fireworks_carrier_round_trip_drops_edited_turns_and_rejects_credential_rotation(
+    tmp_path: Path,
+) -> None:
+    """A second replica decrypts the exact turn; an edited turn drops, rotation fails closed."""
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.fireworks.ai/inference/v1",
@@ -582,20 +747,19 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     organization, identity = str(continued["caller_scope"]).split(":", maxsplit=1)
     assert organization and identity == "default"
 
+    # An authentic carrier echoed beneath an edited prompt or on an edited tool
+    # call is dropped, never unsealed: the request is served as if the caller had
+    # not replayed that turn's thinking, and the drop is disclosed.
     transplanted = json.loads(continuation_body)
     transplanted["messages"][0]["content"] = "Use this carrier under a different prompt"
-    with pytest.raises(NativeBridgeError) as transplanted_error:
-        _admit(replica, raw_key, json.dumps(transplanted))
-    assert (
-        json.loads(transplanted_error.value.public_error_json)["param"]
-        == "messages.reasoning_content"
-    )
-
     modified_turn = json.loads(continuation_body)
     modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
-    with pytest.raises(NativeBridgeError) as modified:
-        _admit(replica, raw_key, json.dumps(modified_turn))
-    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+    for edited in (transplanted, modified_turn):
+        served = _admit(replica, raw_key, json.dumps(edited))
+        assert served["route_reason"] == "direct"
+        assert hidden not in json.dumps(served["route"])
+        assert "reasoning_content" not in json.dumps(served["route"])
+        assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
 
     rotated = NativeControlPlane(
         load_gateway_components(
@@ -723,12 +887,13 @@ def test_hunyuan_tool_turn_reasoning_round_trips_as_a_sealed_carrier(
     assert messages[1]["reasoning_content"] == hidden
     assert "reasoning_history" not in payload
 
-    # A tampered tool turn fails closed at the carrier authority.
+    # An edited tool turn never unseals: the carrier is dropped and disclosed.
     modified_turn = json.loads(continuation_body)
     modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
-    with pytest.raises(NativeBridgeError) as modified:
-        _admit(replica, raw_key, json.dumps(modified_turn))
-    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+    served = _admit(replica, raw_key, json.dumps(modified_turn))
+    assert served["route_reason"] == "direct"
+    assert hidden not in json.dumps(served["route"])
+    assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
 
 
 @pytest.mark.parametrize("thinking", ["", "The user wants a directory listing; ls is the command."])
@@ -1047,6 +1212,218 @@ def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: P
     assert fallback_messages[2] == issuing_messages[2]
 
 
+def test_authenticated_child_reasoning_start_requires_fresh_host_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real child carrier does not authorize skipping root gates on the next request."""
+    manager, raw_key = _configured_pool_gateway(
+        tmp_path,
+        base_urls=("http://127.0.0.1:9/v1", "https://api.hunyuan.cloud.tencent.com/v1"),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+            ModelCapabilities(
+                supports_tools=True, reasoning_output_exposed=True, maximum_output_tokens=128_000
+            ),
+        ),
+    )
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    models = dict(catalog.models)
+    beta = models["beta"]
+    assert beta.gateway is not None
+    models["beta"] = beta.model_copy(
+        update={"gateway": beta.gateway.model_copy(update={"exact_model_id": "child-exact"})}
+    )
+    chains = {
+        "model-revision-exact": GatewayModelChain(
+            model_id="model-revision-exact",
+            pool_id="alpha",
+            revision="root-chain",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="alpha"),
+                GatewayModelReferenceRung(model_id="child-exact"),
+            ),
+        ),
+        "child-exact": GatewayModelChain(
+            model_id="child-exact",
+            pool_id="beta",
+            revision="child-chain",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="beta"),
+                GatewayModelReferenceRung(model_id="model-revision-exact"),
+            ),
+        ),
+    }
+    write_model_catalog(
+        tmp_path / "models.toml",
+        catalog.model_copy(
+            update={
+                "models": models,
+                "gateway_pools": {},
+                "gateway_model_chains": chains,
+            }
+        ),
+    )
+    publish_authored_chain_fixture(tmp_path, revision_id="revision-child-carrier", pool_id="alpha")
+    components = chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-secret"})
+    control = NativeControlPlane(components)
+    initial = _admit(control, raw_key, _chat_body())
+    first = _start_first(control, initial)
+    assert first["route_depth"] == 0
+    failure = {
+        "failure_class": "provider_quota",
+        "safe_message": "account quota exhausted",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": failure,
+                "finalize": False,
+            }
+        )
+    )
+    child = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert child["route_depth"] == 1
+    wires = cast("list[JsonObject]", initial["route"])
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": 1,
+                    "route_sha256": wires[1]["hunyuan_reasoning_route_sha256"],
+                    "content": "authenticated child reasoning",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": child["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, body)
+    assert isinstance(refused.value.__cause__, GatewayRoutingError)
+    assert (
+        str(refused.value.__cause__) == "descendant reasoning start requires explicit authorization"
+    )
+    public_error = json.loads(refused.value.public_error_json)
+    assert public_error == {
+        "status_code": 400,
+        "code": "invalid_parameter",
+        "error_type": "invalid_request_error",
+        "param": "messages.reasoning_content",
+        "message": "'messages.reasoning_content' must be an authentic continuation for this route.",
+        "retry_after_seconds": None,
+    }
+    with sqlite3.connect(manager.database_path) as database:
+        assert database.execute("SELECT count(*) FROM gateway_requests").fetchone() == (1,)
+        assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (2,)
+        assert database.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
+        ).fetchone() == (0,)
+    host_store = components.store
+    original = host_store.authorize_request
+
+    def authorize_child_start(
+        *,
+        raw_key: str,
+        alias: str,
+        request: ServingRequest,
+        deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
+        client_ip: str | None = None,
+    ) -> AuthorizationSnapshot:
+        """Inject only this host's explicit preflight decision after ordinary authorization."""
+        authority = original(
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+            app_referer=app_referer,
+            app_title=app_title,
+            client_ip=client_ip,
+        )
+        assert authority.descendant_start_authorized is False
+        return authority.model_copy(update={"descendant_start_authorized": True})
+
+    monkeypatch.setattr(host_store, "authorize_request", authorize_child_start)
+    continued = _admit(control, raw_key, body)
+    continued_wires = cast("list[JsonObject]", continued["route"])
+    assert [wire["deployment_id"] for wire in continued_wires] == ["beta"]
+    assert "authenticated child reasoning" in json.dumps(continued_wires[0]["upstream_payload"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    started = _start_first(control, continued)
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    with sqlite3.connect(manager.database_path) as database:
+        assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (3,)
+        assert database.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
+        ).fetchone() == (0,)
+
+
 def _reasoning_failover_pool(
     root: Path,
     *,
@@ -1159,6 +1536,80 @@ def _reasoning_failover_pool(
         }
     )
     return control, raw_key, body, cast("list[JsonObject]", initial["route"])
+
+
+def test_carrier_whose_issuing_rung_left_the_route_drops_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """A lane closed under an open conversation serves the next turn without its thinking.
+
+    Production 2026-09-30 01:49Z: the house Tencent account ran out, the catalog
+    closed its lane and republished glm-5.3 without the issuing rung, and the
+    OpenCode session's next turn was refused as an inauthentic continuation. The
+    carrier is untouched and no client retry could repair that, so admission now
+    drops it unrevealed, routes on the current pool, and discloses the drop.
+    """
+    from datetime import UTC, datetime
+
+    from exp.common.models import GatewayEquivalenceCertification
+    from exp.runtime.gateway.catalog_authority import (
+        upsert_singleton_deployment,
+    )
+    from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
+
+    _control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    # Re-certify the pool without the issuing rung (beta plus a new gamma), the
+    # shape a closed house lane publishes: the carrier's deployment is gone.
+    upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gamma",
+        connection_name="beta-provider",
+        provider_model="gamma-model-exact",
+        exact_model_id="model-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    _catalog, normalized, _snapshot = snapshot_current_catalog(tmp_path)
+    normalized, snapshot, _changed = upsert_certified_pool(
+        tmp_path,
+        pool_id="coding",
+        exact_model_id="model-revision-exact",
+        deployment_aliases=("beta", "gamma"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="certification-pool-without-issuer",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="b" * 64,
+            certified_at=datetime(2026, 9, 30, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=True,
+    )
+    GatewayManagement(tmp_path).activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-issuer-closed",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"}
+        )
+    )
+
+    served = _admit(control, raw_key, body)
+
+    route = cast("list[JsonObject]", served["route"])
+    assert [wire["deployment_id"] for wire in route] == ["beta", "gamma"]
+    assert served["route_reason"] == "direct"
+    assert served["ignored_parameters"] == [UNAVAILABLE_ISSUER_CARRIER_DROPPED]
+    assert "private reasoning only the issuing rung can unseal" not in json.dumps(route)
+    assert "reasoning_content" not in json.dumps(route[0]["upstream_payload"])
 
 
 def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list[tuple[int, str]]:
@@ -1696,20 +2147,88 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
 
 
-def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
-    """An admitted request the data plane never settles is closed by the sweep."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=1.0)
-    with mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=100.0):
-        abandoned = _admit_started(control, raw_key, _chat_body())
+@pytest.mark.parametrize("setup_elapsed", [0.0, 60.0])
+def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
+    tmp_path: Path, setup_elapsed: float, request: pytest.FixtureRequest
+) -> None:
+    """Share one clock across authority, ledger and native deadlines, including late setup."""
+
+    class DeadlineClock:
+        """Advance both time domains together without changing shared system time or sleeping."""
+
+        elapsed = 0.0
+        epoch = datetime(2026, 9, 19, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            """Return the deterministic wall time paired with the current monotonic instant."""
+            return self.epoch + timedelta(seconds=self.elapsed)
+
+        def monotonic(self) -> float:
+            """Use a distinct epoch so any accidental system-clock comparison fails immediately."""
+            return 100.0 + self.elapsed
+
+    clock = DeadlineClock()
+    manager, raw_key = _configured_gateway(tmp_path)
+    loaded = load_gateway_components(
+        tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+    )
+    ledger = SQLiteAttemptLedger(manager.database_path, clock=clock)
+    writer = GroupCommitAttemptLedger(ledger)
+    request.addfinalizer(writer.close)
+    request.addfinalizer(loaded.write_ledger.close)
+    components = cast(
+        NativeGatewayComponents,
+        SimpleNamespace(
+            store=SQLiteGatewayStore(manager.database_path, clock=clock),
+            ledger=ledger,
+            write_ledger=writer,
+            routes=loaded.routes,
+            runtime_catalogs=loaded.runtime_catalogs,
+            organization_id=manager.organization_id,
+            reconciled_expired_requests=loaded.reconciled_expired_requests,
+            reconciled_unknown_attempts=loaded.reconciled_unknown_attempts,
+        ),
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=0.01)
+    native_time = mock.Mock(wraps=time)
+    native_time.monotonic.side_effect = clock.monotonic
+    # Only these module references are replaced. SQLite auth and settlement use
+    # their constructor clock; shared timer, health and group-commit time stays real.
     with (
-        mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=102.0),
+        mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
+        mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
     ):
+        clock.elapsed += setup_elapsed
+        abandoned = _admit_started(control, raw_key, _chat_body())
+        request_id = str(abandoned["request_id"])
+        entry = control._accounting.entry(request_id)  # noqa: SLF001
+        assert entry is not None and entry.active_attempt_id == abandoned["attempt_id"]
+        assert clock.monotonic() < entry.deadline_monotonic
+        clock.elapsed += 0.009
+        control._accounting.sweep_expired()  # noqa: SLF001
+        assert control._accounting.entry(request_id) is entry  # noqa: SLF001
+        clock.elapsed += 0.002 + setup_elapsed
+        assert clock.monotonic() > entry.deadline_monotonic
         second = _admit(control, raw_key, _chat_body())
-    assert control._accounting.entry(str(abandoned["request_id"])) is None  # noqa: SLF001
-    assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
-    report = json.loads(control.usage_json("{}"))
-    assert report["totals"]["requests"] == 2
+        assert control._accounting.entry(request_id) is None  # noqa: SLF001
+        assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
+        control._accounting.sweep_expired()  # noqa: SLF001
+        report = json.loads(control.usage_json("{}"))
+        assert report["totals"]["requests"] == 2
+        assert report["totals"]["terminal_counts"] == [{"state": "cancelled", "attempts": 1}]
+        metrics = control.metrics_snapshot()["control_plane"]
+        assert isinstance(metrics, dict)
+        assert metrics["sweep_abandoned_attempts_cancelled"] == 1
+        with sqlite3.connect(manager.database_path) as connection:
+            rows = connection.execute(
+                "SELECT accepted_at,deadline_at FROM gateway_requests ORDER BY accepted_at"
+            ).fetchall()
+        assert len(rows) == 2
+        for accepted_at, deadline_at in rows:
+            assert (datetime.fromisoformat(deadline_at) - datetime.fromisoformat(accepted_at)) == (
+                timedelta(milliseconds=10)
+            )
 
 
 @pytest.mark.parametrize(
@@ -2100,10 +2619,10 @@ def _configured_pool_gateway(
     from exp.common.models import GatewayEquivalenceCertification
     from exp.runtime.gateway.catalog_authority import (
         ConnectionConfig,
-        upsert_certified_pool,
         upsert_connection,
         upsert_singleton_deployment,
     )
+    from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 
     manager = GatewayManagement(root)
     manager.initialize()
@@ -2200,6 +2719,116 @@ def _pool_control_plane(
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
     return NativeControlPlane(components), raw_key
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("native_root", [False, True])
+def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
+    tmp_path: Path, staged: bool, native_root: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Actual admission freezes tool inversion alongside unchanged stage and replay authority."""
+
+    declared = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_streaming_tool_arguments=True
+    )
+    manager, raw_key = _configured_pool_gateway(tmp_path, gateway_capabilities=(declared, declared))
+    if staged:
+        catalog = load_model_catalog(tmp_path / "models.toml")
+        models = dict(catalog.models)
+        beta = models["beta"]
+        assert beta.gateway is not None
+        models["beta"] = beta.model_copy(
+            update={
+                "gateway": beta.gateway.model_copy(
+                    update={
+                        "exact_model_id": "child-exact",
+                        "capabilities": declared.model_copy(
+                            update={"failover_only_on": ("provider_internal",)}
+                        ),
+                    }
+                )
+            }
+        )
+        root = GatewayModelChain(
+            model_id="model-revision-exact",
+            pool_id="alpha",
+            revision="tools-stage",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="alpha"),
+                GatewayModelReferenceRung(model_id="child-exact"),
+            ),
+        )
+        write_model_catalog(
+            tmp_path / "models.toml",
+            catalog.model_copy(
+                update={
+                    "models": models,
+                    "gateway_pools": {},
+                    "gateway_model_chains": {root.model_id: root},
+                }
+            ),
+        )
+        publish_authored_chain_fixture(tmp_path, revision_id="tools-stage", pool_id="alpha")
+    original = OpenAICompatibleClient.gateway_wire_profile
+
+    def profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
+        """Give only the actual root fixture a native Responses dialect."""
+        resolved = original(client)
+        return (
+            replace(resolved, dialect="openai_responses")
+            if native_root and resolved.model_id == "alpha-model-exact"
+            else resolved
+        )
+
+    monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", profile)
+    components = (
+        chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+        if staged
+        else load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+    )
+    control = NativeControlPlane(components)
+    body: JsonObject = {
+        "model": "coding",
+        "input": "continue",
+        "stream": False,
+        "tools": [
+            {"type": "custom", "name": "apply_patch"},
+            {
+                "type": "namespace",
+                "name": "agents",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "close",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ],
+    }
+    canonical = decode_responses(body).request
+    digest = canonical_request_sha256(canonical)
+    admission = _admit(control, raw_key, json.dumps(body), surface="responses")
+    entry = control._accounting.entry(str(admission["request_id"]))
+    assert entry is not None
+    assert entry.authorization.canonical_request_sha256 == digest
+    assert canonical_request_sha256(canonical) == digest
+    assert canonical.native_tool_translation is None
+    wires = cast("list[JsonObject]", admission["route"])
+    assert [wire["deployment_id"] for wire in wires] == ["alpha", "beta"]
+    for wire in wires:
+        assert wire["native_tool_translation"] == {
+            "apply_patch": ["apply_patch", None, True],
+            "agents__close": ["close", "agents", False],
+        }
+        assert wire["exact_model_id"] == (
+            "child-exact" if staged and wire["deployment_id"] == "beta" else "model-revision-exact"
+        )
+        assert wire["failover_only_on"] == (
+            ["provider_internal"] if staged and wire["deployment_id"] == "beta" else None
+        )
+    assert bool(entry.route.snapshot.model_stages) is staged
+    assert _start_first(control, admission)["route_depth"] == 0
 
 
 def test_admit_returns_the_full_ordered_route_without_starting_attempts(
@@ -4658,199 +5287,6 @@ def test_hosted_components_without_group_commit_writer_settle(
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
 
 
-def _messages_fixture_json() -> str:
-    """Return the Rust fixture-event JSON for the shared Messages stream."""
-    return json.dumps(
-        [
-            {"kind": "text_delta", "text": "Hel"},
-            {"kind": "text_delta", "text": "lo é"},
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
-            {"kind": "tool_arguments_delta", "index": 0, "text": '{"q": '},
-            {"kind": "tool_arguments_delta", "index": 0, "text": '"x"}'},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-1",
-                "name": "search",
-                "raw_arguments": '{"q": "x"}',
-            },
-            {"kind": "usage", "input_tokens": 10, "output_tokens": 4, "cached_input_tokens": 3},
-            {"kind": "completed"},
-        ]
-    )
-
-
-def test_rust_messages_sse_frames_match_the_committed_golden() -> None:
-    """Rust Messages SSE frames equal the committed golden fixture."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    actual = native.encode_messages_fixture("request-abc", "coding", _messages_fixture_json())
-    assert list(actual) == _parity_golden("messages_tool_stream_frames")
-
-
-def test_rust_messages_drop_reasoning_summary_deltas_without_changing_the_golden() -> None:
-    """The Messages surface has no reasoning-summary shape, so deltas emit nothing.
-
-    A stream carrying a reasoning summary produces exactly the committed golden
-    frames of the same stream without one.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    events = json.loads(_messages_fixture_json())
-    events.insert(
-        0,
-        {
-            "kind": "reasoning_summary_delta",
-            "output_index": 0,
-            "summary_index": 0,
-            "text": "Checked the plan.",
-        },
-    )
-    actual = native.encode_messages_fixture("request-abc", "coding", json.dumps(events))
-    assert list(actual) == _parity_golden("messages_tool_stream_frames")
-
-
-def test_rust_messages_failure_frames_match_the_committed_golden() -> None:
-    """A failed Messages terminal equals the committed golden error event."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "text_delta", "text": "oops"},
-            {"kind": "failed", "text": "provider stream failed"},
-        ]
-    )
-    actual = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert list(actual) == _parity_golden("messages_failure_frames")
-
-
-def test_rust_messages_completed_body_matches_the_committed_golden() -> None:
-    """The Rust non-streaming Anthropic message equals the committed golden body."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    actual = native.completed_messages_fixture("request-abc", "coding", _messages_fixture_json())
-    assert actual == _parity_golden("messages_tool_stream_body")
-
-
-def test_rust_anthropic_error_translation_matches_the_committed_goldens() -> None:
-    """The Rust Anthropic error envelope equals the committed translations.
-
-    Every failure class is exercised through one committed OpenAI-shaped
-    input and its committed Anthropic envelope, plus one param-carrying
-    protocol error to prove the param folding. The committed inputs also pin
-    the OpenAI-side taxonomy for classes whose live rendering is wall-clock
-    dependent (quota reset boundaries).
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    inputs = cast("dict[str, JsonObject]", _parity_golden("anthropic_error_inputs"))
-    envelopes = cast("dict[str, JsonObject]", _parity_golden("anthropic_error_envelopes"))
-    assert set(inputs) == {failure_class.value for failure_class in GatewayFailureClass}
-    assert set(envelopes) == set(inputs)
-
-    for failure_class in GatewayFailureClass:
-        payload = inputs[failure_class.value]
-        translated = json.loads(native.anthropic_error_fixture(json.dumps(payload)))
-        assert translated == envelopes[failure_class.value], failure_class
-    with_param = cast("JsonObject", _parity_golden("anthropic_error_with_param_input"))
-    translated = json.loads(native.anthropic_error_fixture(json.dumps(with_param)))
-    assert translated == _parity_golden("anthropic_error_with_param")
-
-
-def test_rust_messages_body_preserves_interleaved_block_order() -> None:
-    """The native body keeps provider block order in the non-streaming shape."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-1",
-                "name": "search",
-                "raw_arguments": "{}",
-            },
-            {"kind": "text_delta", "text": "after"},
-            {"kind": "completed"},
-        ]
-    )
-    actual = native.completed_messages_fixture("request-abc", "coding", fixture)
-    assert actual == _parity_golden("messages_block_order_body")
-    assert json.loads(actual)["content"][0]["type"] == "tool_use"
-    assert json.loads(actual)["content"][1] == {"type": "text", "text": "after"}
-
-
-def test_rust_messages_deferred_tool_completion_matches_the_committed_goldens() -> None:
-    """Deferred completions (OpenAI-compatible [DONE] ordering) hold parity.
-
-    Text arriving between a tool's arguments and its completion must stream
-    and aggregate exactly as the committed goldens recorded, with the tool
-    block anchored at its start position.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
-            {"kind": "tool_arguments_delta", "index": 0, "text": "{}"},
-            {"kind": "text_delta", "text": "after"},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-1",
-                "name": "search",
-                "raw_arguments": "{}",
-            },
-            {"kind": "completed"},
-        ]
-    )
-    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert list(actual_frames) == _parity_golden("messages_deferred_frames")
-    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
-    assert actual_body == _parity_golden("messages_deferred_body")
-
-
-def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
-    """Interleaved parallel tool calls stay in byte parity with the goldens.
-
-    The canonical stream may legally interleave tool A arguments, tool B
-    start, and more tool A arguments; the encoder must schedule blocks in
-    start order, streaming the open block live and buffering the rest.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-a", "name": "alpha"},
-            {"kind": "tool_arguments_delta", "index": 0, "text": '{"a": '},
-            {"kind": "tool_call_started", "index": 1, "call_id": "call-b", "name": "beta"},
-            {"kind": "tool_arguments_delta", "index": 1, "text": '{"b": 2}'},
-            {"kind": "tool_arguments_delta", "index": 0, "text": "1}"},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-a",
-                "name": "alpha",
-                "raw_arguments": '{"a": 1}',
-            },
-            {
-                "kind": "tool_call_completed",
-                "index": 1,
-                "call_id": "call-b",
-                "name": "beta",
-                "raw_arguments": '{"b": 2}',
-            },
-            {"kind": "usage", "input_tokens": 6, "output_tokens": 3},
-            {"kind": "completed"},
-        ]
-    )
-    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert list(actual_frames) == _parity_golden("messages_interleaved_frames")
-    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
-    assert actual_body == _parity_golden("messages_interleaved_body")
-
-
 def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     """A store:false response is never remembered, so continuing from it fails
     closed with the shared previous_response_not_found error."""
@@ -4901,38 +5337,6 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     ]
 
 
-def _thinking_fixture_json() -> str:
-    """Return the Rust fixture-event JSON for the thinking Messages stream."""
-    return json.dumps(
-        [
-            {"kind": "thinking_delta", "index": 0, "text": "Let me "},
-            {"kind": "thinking_delta", "index": 0, "text": "check."},
-            {"kind": "thinking_signature", "index": 0, "signature": "c2lnbmF0dXJl"},
-            {"kind": "redacted_thinking", "index": 1, "data": "b3BhcXVl"},
-            {"kind": "text_delta", "text": "Hello"},
-            {"kind": "usage", "input_tokens": 12, "output_tokens": 7, "cached_input_tokens": 2},
-            {"kind": "completed"},
-        ]
-    )
-
-
-def test_rust_messages_thinking_stream_matches_the_hand_authored_goldens() -> None:
-    """Thinking blocks stream and aggregate exactly as the Anthropic spec fixes.
-
-    The golden frames were hand-authored against the public Messages
-    streaming contract: the thinking block opens with empty fields, streams
-    thinking_delta fragments, closes with one signature_delta, redacted
-    thinking travels whole in its start frame, and the non-streaming body
-    carries the same blocks in order with the byte-exact signature.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    frames = native.encode_messages_fixture("request-abc", "coding", _thinking_fixture_json())
-    assert list(frames) == _parity_golden("messages_thinking_frames")
-    body = native.completed_messages_fixture("request-abc", "coding", _thinking_fixture_json())
-    assert body == _parity_golden("messages_thinking_body")
-
-
 def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -> None:
     """Requested encrypted reasoning lands verbatim on the reasoning item."""
     native = pytest.importorskip("exp_gateway_native")
@@ -4971,108 +5375,6 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
         fixture,
     )
     assert body == _parity_golden("responses_encrypted_reasoning_body")
-
-
-def test_thinking_bytes_round_trip_the_native_pipeline_exactly() -> None:
-    """Non-ASCII thinking text and a multi-kilobyte signature survive the full
-    provider-frames-to-public-frames pipeline byte-identically.
-
-    The signature is an opaque cryptographic value the provider verifies on
-    replay, so any re-encoding drift (Unicode escaping, truncation, split
-    handling) would break every continued Claude Code conversation.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    thinking_one = "Grüß 事實 مرحبا  "
-    thinking_two = "🤔🧠 σκέψη ⇒ done"
-    signature = "Eq" + "A0b/+=" * 700  # ~4.2 KB, base64-shaped.
-    redacted = "R3" * 1500
-    provider_chunks = [
-        json.dumps({"type": "message_start", "message": {"usage": {"input_tokens": 3}}}),
-        json.dumps(
-            {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-            }
-        ),
-        json.dumps(
-            {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": thinking_one},
-            },
-            ensure_ascii=False,
-        ),
-        json.dumps(
-            {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": thinking_two},
-            },
-            ensure_ascii=False,
-        ),
-        json.dumps(
-            {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "signature_delta", "signature": signature},
-            }
-        ),
-        json.dumps({"type": "content_block_stop", "index": 0}),
-        json.dumps(
-            {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {"type": "redacted_thinking", "data": redacted},
-            }
-        ),
-        json.dumps({"type": "content_block_stop", "index": 1}),
-        json.dumps(
-            {
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn"},
-                "usage": {"output_tokens": 9},
-            }
-        ),
-        json.dumps({"type": "message_stop"}),
-    ]
-    # The fixture boundary carries raw stream bytes as latin-1 code points.
-    frames_json = json.dumps(
-        [f"data: {chunk}\n\n".encode().decode("latin-1") for chunk in provider_chunks]
-    )
-    normalized = json.loads(native.normalize_stream_fixture("anthropic_messages", frames_json))
-    assert normalized["failure"] is None
-    events = normalized["events"]
-    streamed_thinking = "".join(
-        event["text"] for event in events if event["kind"] == "thinking_delta"
-    )
-    assert streamed_thinking.encode() == (thinking_one + thinking_two).encode()
-    assert [event["signature"] for event in events if event["kind"] == "thinking_signature"] == [
-        signature
-    ]
-
-    fixture = json.dumps(events, ensure_ascii=False)
-    public_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    payloads = [json.loads(frame.split("data: ", 1)[1].strip()) for frame in public_frames if frame]
-    out_thinking = "".join(
-        payload["delta"]["thinking"]
-        for payload in payloads
-        if payload["type"] == "content_block_delta" and payload["delta"]["type"] == "thinking_delta"
-    )
-    out_signature = "".join(
-        payload["delta"]["signature"]
-        for payload in payloads
-        if payload["type"] == "content_block_delta"
-        and payload["delta"]["type"] == "signature_delta"
-    )
-    assert out_thinking.encode() == (thinking_one + thinking_two).encode()
-    assert out_signature.encode() == signature.encode()
-
-    body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
-    assert body["content"][0]["thinking"].encode() == (thinking_one + thinking_two).encode()
-    assert body["content"][0]["signature"].encode() == signature.encode()
-    assert body["content"][1]["data"].encode() == redacted.encode()
 
 
 def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None:
@@ -5335,37 +5637,16 @@ def _zero_argument_tool_fixture_json() -> str:
     )
 
 
-def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
-    """The zero-argument completion sequence serves both lanes, both modes.
+def test_zero_argument_tool_calls_encode_on_the_chat_and_responses_lanes() -> None:
+    """The zero-argument completion sequence serves the Chat and Responses lanes.
 
     Production incident (2026-08-28): every zero-argument tool failed as
     malformed_response. The normalizer fix seeds `{}` at completion; these
-    assertions pin that the seeded sequence encodes as a valid Anthropic
-    tool_use block and a valid Chat tool call, streaming and non-streaming.
+    assertions pin that the seeded sequence encodes as a valid Chat tool call
+    and Responses function call (the Messages lane is pinned in Rust).
     """
     native = pytest.importorskip("exp_gateway_native")
     fixture = _zero_argument_tool_fixture_json()
-
-    frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert any('"type":"tool_use"' in frame for frame in frames)
-    assert frames[-1].startswith("event: message_stop")
-    streamed_input = "".join(
-        payload["delta"]["partial_json"]
-        for payload in (
-            json.loads(frame.split("data: ", 1)[1].strip()) for frame in frames if frame
-        )
-        if payload["type"] == "content_block_delta"
-        and payload["delta"]["type"] == "input_json_delta"
-    )
-    assert streamed_input == "{}"
-    messages_body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
-    assert messages_body["content"][0] == {
-        "type": "tool_use",
-        "id": "call-1",
-        "name": "get_time",
-        "input": {},
-    }
-    assert messages_body["stop_reason"] == "tool_use"
 
     chat_frames = native.encode_chat_fixture("request-abc", "coding", 1_700_000_000, True, fixture)
     assert chat_frames[-1] == "data: [DONE]\n\n"
@@ -5635,87 +5916,6 @@ def test_open_response_format_schema_closes_on_an_anthropic_rung(tmp_path: Path)
     assert schema["required"] == ["city", "geo"]
 
 
-def _web_search_fixture_json() -> str:
-    """One WebSearch event stream in the fixture-event vocabulary."""
-    result_block = (
-        '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1",'
-        '"content":[{"type":"web_search_result","encrypted_content":"Et8Q"}],'
-        '"caller":{"type":"direct"}}'
-    )
-    citation = '{"type":"web_search_result_location","cited_text":"3.14.7"}'
-    return json.dumps(
-        [
-            {
-                "kind": "server_tool_use_started",
-                "index": 0,
-                "call_id": "srvtoolu_1",
-                "name": "web_search",
-            },
-            {"kind": "server_tool_arguments_delta", "index": 0, "text": '{"query": "python"}'},
-            {
-                "kind": "server_tool_use_completed",
-                "index": 0,
-                "call_id": "srvtoolu_1",
-                "name": "web_search",
-                "raw_arguments": '{"query": "python"}',
-            },
-            {"kind": "server_tool_result", "index": 1, "block": result_block},
-            {"kind": "text_block_started", "index": 2},
-            {"kind": "citation_delta", "index": 2, "citation": citation},
-            {"kind": "text_delta", "text": "It is 3.14.7."},
-            {"kind": "usage", "input_tokens": 12284, "output_tokens": 103},
-            {"kind": "completed"},
-        ]
-    )
-
-
-def test_rust_messages_streams_server_tool_blocks_intact() -> None:
-    """Server tool events stream back as their native Anthropic blocks."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    frames = list(
-        native.encode_messages_fixture("request-abc", "coding", _web_search_fixture_json())
-    )
-    joined = "".join(frames)
-    assert '"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"' in joined
-    assert '"type":"web_search_tool_result"' in joined
-    assert '"caller":{"type":"direct"}' in joined
-    assert '"type":"citations_delta"' in joined
-    # Provider-executed tool use never becomes the tool_use stop reason.
-    assert '"stop_reason":"end_turn"' in joined
-
-
-def test_rust_messages_completed_body_carries_server_tool_blocks() -> None:
-    """The non-streaming aggregation keeps every server-tool block in order."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    body = json.loads(
-        native.completed_messages_fixture("request-abc", "coding", _web_search_fixture_json())
-    )
-    kinds = [block["type"] for block in body["content"]]
-    assert kinds == ["server_tool_use", "web_search_tool_result", "text"]
-    assert body["content"][2]["citations"] == [
-        {"type": "web_search_result_location", "cited_text": "3.14.7"}
-    ]
-    assert body["stop_reason"] == "end_turn"
-
-
-def test_rust_messages_paused_turn_keeps_its_stop_reason() -> None:
-    """A pause_turn terminal survives to the caller instead of end_turn."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "text_delta", "text": "searching"},
-            {"kind": "paused_turn"},
-        ]
-    )
-    frames = "".join(native.encode_messages_fixture("request-abc", "coding", fixture))
-    assert '"stop_reason":"pause_turn"' in frames
-    body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
-    assert body["stop_reason"] == "pause_turn"
-
-
 def test_internal_admission_failures_log_the_real_exception(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5762,7 +5962,9 @@ def test_internal_admission_failures_log_the_real_exception(
     assert fields["operation"] == "native_admit"
 
 
-def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, Path]:
+def _affinity_pool_control_plane(
+    root: Path, environment: dict[str, str] | None = None
+) -> tuple[NativeControlPlane, str, Path]:
     """Load the control plane over a pool opted into cache-affinity routing.
 
     Seeds the standard certified two-deployment pool, then authors the opt-in
@@ -5809,7 +6011,9 @@ def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, P
     )
     components = load_gateway_components(
         root,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        if environment is None
+        else environment,
     )
     return NativeControlPlane(components), raw_key, manager.database_path
 
@@ -5849,6 +6053,128 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
             (str(started["attempt_id"]),),
         ).fetchone()
     assert row == ("affinity", None)
+
+
+@pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])
+@pytest.mark.parametrize("known_region", [False, True], ids=["unknown-region", "known-region"])
+def test_bridge_carries_scoped_verified_warmth_to_registered_request(
+    tmp_path: Path, trial: bool, known_region: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real admission preserves proven warmth but unknown geography only serves normally."""
+
+    original_profile = OpenAICompatibleClient.gateway_wire_profile
+
+    def declared_profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
+        """Declare fixture topology without changing its actual endpoint or authentication."""
+        return replace(original_profile(client), operational_region="region")
+
+    if known_region:
+        monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", declared_profile)
+    environment = AtomicEnvironment(
+        CredentialResolution(
+            "provider-secret-canary", "environment", receipt=DispatchCredentialReceipt(uuid4())
+        )
+    )
+    control, raw_key, _database = _affinity_pool_control_plane(tmp_path, environment)
+    accounting = control._accounting  # noqa: SLF001 - inspect the native reservation boundary.
+    host = Host()
+    accounting.recovery_host = host
+    body = _chat_body()
+    initial = _admit(control, raw_key, body, client_request_id="warm-session")
+    original = accounting.entry(str(initial["request_id"]))
+    assert original is not None
+    key = session_cache_key(original)
+    assert key is not None
+    lead, fallback = original.route.deployments
+    if not known_region:
+        assert not original.recovery_bindings
+        # Even plausible cached history cannot prove this custom wire's region.
+        accounting.recovery.record_success(
+            key,
+            fallback.deployment_id,
+            host.scope_for(fallback, original.authorization.organization_id),
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+        admission = _admit(control, raw_key, body, client_request_id="warm-session")
+        entry = accounting.entry(str(admission["request_id"]))
+        assert entry is not None and entry.recovery_scoped
+        assert entry.route.deployments == original.route.deployments
+        assert not entry.recovery_bindings
+        assert entry.verified_warm_deployment_id is None and entry.recovery_reason is None
+        assert _start_first(control, admission)["route_depth"] == 0
+        return
+    assert all(
+        binding.scope.region_scope == "region" for binding in original.recovery_bindings.values()
+    )
+    for deployment in (lead, fallback) if trial else (fallback,):
+        accounting.recovery.record_success(
+            key,
+            deployment.deployment_id,
+            original.recovery_bindings[deployment.deployment_id].scope,
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+    if trial:
+        accounting.recovery.depart(
+            key,
+            lead.deployment_id,
+            original.recovery_bindings[lead.deployment_id].scope,
+            "local_capacity",
+            retry_after_seconds=0,
+        )
+        # Expire only the registry's local trial cooldown, not cache evidence.
+        accounting.recovery._clock = lambda: time.time() + 6  # noqa: SLF001
+    admission = _admit(control, raw_key, body, client_request_id="warm-session")
+    entry = accounting.entry(str(admission["request_id"]))
+    assert entry is not None and entry.recovery_scoped
+    expected = lead if trial else fallback
+    assert entry.route.deployment == expected
+    assert entry.verified_warm_deployment_id == expected.deployment_id
+    assert time.monotonic() < entry.verified_warm_until_monotonic
+    assert entry.recovery_reason == (
+        "recovered_preferred_route" if trial else "retained_warm_fallback"
+    )
+    assert accounting.sticky.size() == 0
+    started = _start_first(control, admission)
+    assert started["route_depth"] == 0
+    assert accounting.sticky.size() == 0
+
+
+def test_mutable_host_scope_without_atomic_credential_receipt_cannot_recover(
+    tmp_path: Path,
+) -> None:
+    """An uninstrumented environment serves normally but cannot borrow fabricated warmth."""
+    control, raw_key, _database = _affinity_pool_control_plane(tmp_path)
+    accounting = control._accounting
+    host = Host()
+    accounting.recovery_host = host
+    first = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
+    entry = accounting.entry(str(first["request_id"]))
+    assert entry is not None
+    assert not entry.recovery_bindings
+    key = session_cache_key(entry)
+    assert key is not None
+    fallback = entry.route.deployments[-1]
+    accounting.recovery.record_success(
+        key,
+        fallback.deployment_id,
+        host.scope_for(fallback, entry.authorization.organization_id),
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    second = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
+    next_entry = accounting.entry(str(second["request_id"]))
+    assert next_entry is not None
+    assert next_entry.route.deployment == entry.route.deployment
+    assert next_entry.verified_warm_deployment_id is None and next_entry.recovery_reason is None
+    assert _start_first(control, second)["route_depth"] == 0
 
 
 def test_foundry_deepseek_zero_argument_call_with_a_stray_empty_string_delta_completes() -> None:
@@ -6174,11 +6500,13 @@ def test_hunyuan_tool_turn_redacted_carrier_round_trips_on_messages(tmp_path: Pa
     assert isinstance(first_call, dict)
     assert first_call["id"] == "call-one"
 
-    # A tampered tool turn fails closed at the carrier authority, as on Chat.
+    # An edited tool turn drops its carrier, as on Chat.
     tampered = json.loads(body)
     tampered["messages"][1]["content"][1]["input"] = {"tampered": True}
-    with pytest.raises(NativeBridgeError):
-        _admit(control, raw_key, json.dumps(tampered), surface="messages")
+    served = _admit(control, raw_key, json.dumps(tampered), surface="messages")
+    assert served["route_reason"] == "direct"
+    assert "reasoning_content" not in _payload_messages(served)[1]
+    assert served["ignored_parameters"] == [CHANGED_TURN_CARRIER_DROPPED]
 
 
 def test_claude_code_tool_continuation_with_trailing_system_reminder_serves_on_messages(

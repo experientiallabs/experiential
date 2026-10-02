@@ -1,8 +1,9 @@
-"""Bind a judge prompt contract to one shared rubric axis range."""
+"""Bind a judge prompt contract to independently bounded rubric axes."""
 
 from __future__ import annotations
 
 from exp.common.judging import RubricDimension, default_task_success_axis, score_bounds
+from exp.common.judging.definition import JudgeDefinition
 from exp.common.judging.prompts import PromptDefinition
 from exp.optimize.router.judging.contracts import JudgePromptTemplate, judge_feedback_schema
 
@@ -47,11 +48,32 @@ def default_judge_template(
 DEFAULT_JUDGE_TEMPLATE = default_judge_template()
 
 
+def judge_template(definition: JudgeDefinition) -> JudgePromptTemplate:
+    """Bind reusable authored criteria to the canonical executable scalar judge contract.
+
+    Args:
+        definition: Immutable named syllabus and complete per-axis score meanings.
+
+    Returns:
+        A prompt and response schema for setup, simulation judging or calibration. The prompt
+        identity pins the entire definition; changing any criterion invalidates calibration reuse.
+    """
+    template = default_judge_template(definition.dimensions)
+    return template.model_copy(
+        update={
+            "prompt": PromptDefinition.from_text(
+                f"judge-{definition.revision}",
+                f"{_PROMPT_TEXT}\n\nSyllabus:\n{definition.syllabus}",
+            ),
+        }
+    )
+
+
 def bind_prompt_template(
     template: JudgePromptTemplate,
     dimensions: tuple[RubricDimension, ...],
 ) -> JudgePromptTemplate:
-    """Bind a prompt contract to the shared inclusive axis range.
+    """Bind a prompt contract to independently bounded rubric axes.
 
     Args:
         template: Current prompt contract.
@@ -62,10 +84,11 @@ def bind_prompt_template(
         the unchanged non-scalar contract after projection checks.
 
     Raises:
-        ValueError: The axes are empty, mixed, or a custom projection leaves the range.
+        ValueError: The axes are empty or a custom projection leaves any axis range.
     """
     lowest, highest = score_bounds(dimensions)
-    _require_projection_in_range(template, lowest, highest)
+    for axis in dimensions:
+        _require_projection_in_range(template, axis.min_score, axis.max_score)
     if template.response_shape != "scalar":
         return template
     return template.model_copy(

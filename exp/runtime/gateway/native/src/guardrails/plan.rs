@@ -177,6 +177,10 @@ pub fn enforce(
     events: Vec<Event>,
     deadline: Instant,
 ) -> Result<Vec<Event>, Failure> {
+    if !plan.checks.is_empty() && events.iter().any(|event| matches!(event, Event::Image(_))) {
+        record(plan, None, "error", Duration::ZERO);
+        return Err(error_failure());
+    }
     let completion = projection(&events);
     if content_bytes(&completion) > plan.max_response_bytes {
         record(plan, None, "error", Duration::ZERO);
@@ -412,6 +416,17 @@ mod tests {
             &detectors("pii", "[REDACTED]"),
             events,
             expired,
+        )
+        .is_err());
+    }
+    #[test]
+    fn image_content_fails_closed_before_text_only_detectors() {
+        let events = vec![Event::Image("data:image/png;base64,AAAA".to_string())];
+        assert!(enforce(
+            &plan("block", true),
+            &detectors("pii", "[REDACTED]"),
+            events,
+            deadline()
         )
         .is_err());
     }
