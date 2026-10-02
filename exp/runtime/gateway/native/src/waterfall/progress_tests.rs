@@ -7,6 +7,10 @@ use tokio::io::AsyncWriteExt;
 
 const REASONING: &str =
     "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private thought\"}}]}\n\n";
+const REASONING_ALIAS: &str =
+    "data: {\"choices\":[{\"delta\":{\"reasoning\":\"private thought\"}}]}\n\n";
+const REASONING_NULL_ALIAS: &str =
+    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"reasoning\":\"private thought\"}}]}\n\n";
 const TEXT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n";
 const DONE: &str = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\ndata: [DONE]\n\n";
 const SECONDARY: &[&str] = &["{\"choices\":[{\"delta\":{\"content\":\"secondary\"}}]}"];
@@ -129,12 +133,19 @@ fn active_private_reasoning_survives_first_token_window_and_retains_the_winner()
 #[test]
 fn unexposed_compatible_reasoning_keeps_generation_alive_without_a_carrier() {
     block_on(async {
-        for after_visible_output in [false, true] {
+        for (reasoning, after_visible_output) in [
+            (REASONING, false),
+            (REASONING, true),
+            (REASONING_ALIAS, false),
+            (REASONING_ALIAS, true),
+            (REASONING_NULL_ALIAS, false),
+            (REASONING_NULL_ALIAS, true),
+        ] {
             let mut frames = Vec::new();
             if after_visible_output {
                 frames.push(TEXT);
             }
-            frames.extend(std::iter::repeat_n(REASONING, 12));
+            frames.extend(std::iter::repeat_n(reasoning, 12));
             frames.extend([TEXT, DONE]);
             let primary = paced_rung(frames).await;
             let harness = Harness::new();
@@ -192,10 +203,12 @@ fn unexposed_compatible_reasoning_keeps_generation_alive_without_a_carrier() {
 fn empty_unexposed_reasoning_and_usage_do_not_renew_progress() {
     block_on(async {
         let empty = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"}}]}\n\n";
+        let empty_alias =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":null,\"reasoning\":\"\"}}]}\n\n";
         let usage =
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n";
         let mut frames = vec![REASONING];
-        frames.extend([empty, usage, ": ping\n\n"].repeat(7));
+        frames.extend([empty, empty_alias, usage, ": ping\n\n"].repeat(7));
         let primary = paced_rung(frames).await;
         let secondary = spawn_rung(vec![Answer::Stream(SECONDARY)]).await;
         let harness = Harness::new();

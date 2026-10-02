@@ -257,12 +257,12 @@ impl Normalizer {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
+        let reasoning = delta
+            .get("reasoning_content")
+            .filter(|value| !value.is_null())
+            .or_else(|| delta.get("reasoning"));
         if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
-            if let Some(value) = delta
-                .get("reasoning_content")
-                .filter(|value| !value.is_null())
-                .or_else(|| delta.get("reasoning"))
-            {
+            if let Some(value) = reasoning {
                 let reasoning = match value {
                     Value::Null => None,
                     Value::String(text) => Some(text),
@@ -276,8 +276,7 @@ impl Normalizer {
                     });
                 }
             }
-        } else if delta
-            .get("reasoning_content")
+        } else if reasoning
             .and_then(Value::as_str)
             .is_some_and(|text| !text.is_empty())
         {
