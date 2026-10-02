@@ -19,6 +19,8 @@ from exp.common.core.artifacts import ContractModel, JsonObject
 
 MAXIMUM_BATCH_LINES = 50_000
 MAXIMUM_INPUT_FILE_BYTES = 100 * 1024 * 1024
+MAXIMUM_CUSTOM_ID_CHARACTERS = 256
+MAXIMUM_FILENAME_CHARACTERS = 512
 COMPLETION_WINDOW = "24h"
 COMPLETION_WINDOW_SECONDS = 24 * 60 * 60
 
@@ -105,7 +107,7 @@ class BatchLine(ContractModel):
     at: the caller's own value, else the deployment default.
     """
 
-    custom_id: str = Field(min_length=1, max_length=256)
+    custom_id: str = Field(min_length=1, max_length=MAXIMUM_CUSTOM_ID_CHARACTERS)
     surface: BatchSurface
     model: str = Field(min_length=1, max_length=256)
     provider_model: str = Field(min_length=1, max_length=2_048)
@@ -297,7 +299,7 @@ class BatchFile(ContractModel):
 
     file_id: str = Field(min_length=1, max_length=128)
     organization_id: str = Field(min_length=1, max_length=128)
-    filename: str = Field(min_length=1, max_length=512)
+    filename: str = Field(min_length=1, max_length=MAXIMUM_FILENAME_CHARACTERS)
     purpose: Literal["batch", "batch_output"] = "batch"
     size_bytes: int = Field(ge=0)
     created_at: AwareDatetime
