@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from botocore.exceptions import (
+    CredentialRetrievalError,
+    EndpointConnectionError,
+    NoCredentialsError,
+    ParamValidationError,
+    PartialCredentialsError,
+)
 
 import exp.runtime.models.providers.bedrock_endpoints as bedrock_endpoints
 from exp.common.models import (
@@ -48,7 +55,11 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalSignal,
     ProviderResponseError,
 )
-from exp.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import (
+    ProviderTransportError,
+    RetryPolicy,
+    ScriptedJsonTransport,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
 
 
@@ -96,6 +107,22 @@ class _FakeBedrockRuntime:
         if not self._invoke_bodies:
             raise AssertionError("test made an unexpected embedding request")
         return {"body": json.dumps(self._invoke_bodies.pop(0))}
+
+
+class _FailingBedrockRuntime(_FakeBedrockRuntime):
+    """Raise one fixed botocore failure and count Converse attempts."""
+
+    def __init__(self, failure: Exception) -> None:
+        """Store the botocore failure raised by every Converse call."""
+        super().__init__()
+        self.failure = failure
+        self.attempts = 0
+
+    def converse(self, **request: object) -> Mapping[str, object]:
+        """Count one attempted call and raise the configured failure."""
+        del request
+        self.attempts += 1
+        raise self.failure
 
 
 def _snapshot(model_id: str = "us.anthropic.claude-sonnet-4-5") -> ModelSnapshot:
@@ -316,6 +343,85 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
     assert response.output.content == "ok"
     assert runtime.attempts == 2
     assert runtime.converse_calls[0]["modelId"] == "exact-model"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_message"),
+    [
+        (
+            NoCredentialsError(),
+            "Bedrock has no AWS credentials. Configure the standard chain",
+        ),
+        (
+            PartialCredentialsError(provider="fixture", cred_var="secret_access_key"),
+            "Bedrock has no AWS credentials. Configure the standard chain",
+        ),
+        (
+            CredentialRetrievalError(provider="fixture", error_msg="sensitive detail"),
+            "Bedrock has no AWS credentials. Configure the standard chain",
+        ),
+    ],
+)
+def test_local_credential_failures_are_actionable_and_not_retried(
+    failure: Exception,
+    expected_message: str,
+) -> None:
+    """Local botocore credential failures retain safe guidance and stop after one attempt."""
+    runtime = _FailingBedrockRuntime(failure)
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-east-1",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+    )
+
+    with pytest.raises(ProviderTransportError, match=expected_message) as captured:
+        client.complete(_request())
+
+    assert captured.value.status_code == 401
+    assert runtime.attempts == 1
+    assert "sensitive detail" not in str(captured.value)
+
+
+def test_local_parameter_validation_failure_is_redacted_and_not_retried() -> None:
+    """Botocore request validation becomes one safe invalid-request failure."""
+    runtime = _FailingBedrockRuntime(ParamValidationError(report="sensitive request value"))
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-east-1",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+    )
+
+    with pytest.raises(ProviderTransportError, match="local validation") as captured:
+        client.complete(_request())
+
+    assert captured.value.status_code == 400
+    assert runtime.attempts == 1
+    assert "sensitive request value" not in str(captured.value)
+
+
+def test_endpoint_connection_failure_names_the_region() -> None:
+    """An unreachable Bedrock endpoint is not mislabeled as a timeout."""
+    runtime = _FailingBedrockRuntime(
+        EndpointConnectionError(endpoint_url="https://unreachable.example")
+    )
+    client = BedrockClient(
+        model=_snapshot(),
+        region="eu-west-3",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+        retry_policy=RetryPolicy(maximum_attempts=1),
+    )
+
+    with pytest.raises(
+        ProviderTransportError,
+        match="could not connect to its endpoint for region eu-west-3",
+    ) as captured:
+        client.complete(_request())
+
+    assert captured.value.status_code is None
+    assert runtime.attempts == 1
 
 
 def test_catalog_requires_a_complete_bedrock_access_key_pair_and_resolves_ambient() -> None:
