@@ -254,6 +254,35 @@ def test_normalizes_w3c_genai_trace_and_exp_outcome_extensions() -> None:
     assert trace.spans[1].parent_span_id == _CALL_SPAN_ID
 
 
+def test_empty_parent_span_id_marks_an_otlp_root() -> None:
+    """An emitted empty parent value means the span has no parent."""
+    payload = _payload()
+    _span(payload, 0)["parentSpanId"] = ""
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    assert len(result.traces) == 1
+    assert result.traces[0].spans[0].parent_span_id is None
+    assert result.traces[0].spans[1].parent_span_id == _CALL_SPAN_ID
+
+
+@pytest.mark.parametrize(
+    ("parent", "message"),
+    [(None, "non-empty text"), (" ", "non-empty text"), ("xyz", "W3C ID"), (42, "non-empty text")],
+)
+def test_invalid_parent_span_id_still_excludes_otlp_trace(parent: object, message: str) -> None:
+    """Only the exact empty parent value is accepted as a root marker."""
+    payload = _payload()
+    _span(payload, 0)["parentSpanId"] = parent
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert message in result.issues[0].message
+
+
 def test_otlp_retains_a_declared_model_connection_digest() -> None:
     """An exporter can retain exact secret-free connection evidence without an endpoint URL."""
     payload = _payload()
