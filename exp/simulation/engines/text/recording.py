@@ -153,7 +153,7 @@ class RecordingCandidateClient:
         self._task = task
         self._candidate = candidate
         self._world_model = world_model
-        self._grounded_world_model = grounded_world_model
+        self._grounded_world_model = replace(grounded_world_model, token_counter=token_counter)
         self._query_embedding = query_embedding
         self._candidate_request = candidate_request
         self._world_model_request = world_model_request

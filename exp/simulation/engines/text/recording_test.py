@@ -40,6 +40,7 @@ from exp.simulation.engines.text.recording import (
     TextSimulationError,
     _require_response_identity,
 )
+from exp.simulation.engines.text.tokens import TokenCounter
 from exp.simulation.retrieval import RAGMatch, RAGQuery, TraceRAGRetriever
 from exp.simulation.retrieval.contracts import RAGAction, RAGObservation, RAGTransition
 from exp.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
@@ -253,6 +254,8 @@ def _recorder(
     task: TaskCase | None = None,
     world_context_window: int = 100_000,
     retrieval_matches: tuple[RAGMatch, ...] = (),
+    token_counter: TokenCounter | None = None,
+    grounded_world_model: GroundedWorldModel | None = None,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -273,6 +276,8 @@ def _recorder(
         task: Optional task carrying declared tools for observation-boundary tests.
         world_context_window: Exact world-model context ceiling for retry admission tests.
         retrieval_matches: Whole observed examples returned by the scripted retriever.
+        token_counter: Optional request counter owned by this recording session.
+        grounded_world_model: Optional shared executor whose counter may differ from the recorder.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -296,7 +301,7 @@ def _recorder(
         completion_pricing=world_request is not None,
         output_limit=output_limit,
     )
-    grounded = GroundedWorldModel(
+    grounded = grounded_world_model or GroundedWorldModel(
         artifact_input=ArtifactInput(artifact_id="grounded-world-model", sha256="d" * 64),
         artifact=GroundedWorldModelArtifact(
             schema_version=1,
@@ -314,7 +319,6 @@ def _recorder(
         retriever=retriever,
         client=world_client,
         capabilities=world_model.capabilities,
-        token_counter=_Utf8Counter(),
     )
     return RecordingCandidateClient(
         task=task or _task(),
@@ -339,7 +343,7 @@ def _recorder(
         maximum_transition_attempts=maximum_transition_attempts,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
-        token_counter=_Utf8Counter(),
+        token_counter=token_counter or _Utf8Counter(),
     )
 
 
@@ -396,6 +400,60 @@ def _grounding_example(identifier: str, size: int) -> RAGMatch:
             key_sha256="f" * 64,
         ),
     )
+
+
+def test_recorder_uses_one_injected_counter_without_mutating_the_shared_executor() -> None:
+    """Counter ownership preserves the actually dispatched grounding and its recorded provenance."""
+
+    class FixtureTokenizer:
+        """Count four encoded bytes per fixture token instead of the default upper bound."""
+
+        def count(self, request: ModelRequest) -> int:
+            """Return the deterministic request count used for both admission passes."""
+            return (len(request.model_dump_json().encode("utf-8")) + 3) // 4
+
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"","terminal":true}',
+                model=_snapshot(
+                    "world-model-a",
+                    capabilities=ModelCapabilities(
+                        context_window_tokens=24_000, maximum_output_tokens=16_000
+                    ),
+                ),
+            ),
+        ]
+    )
+    matches = (_grounding_example("larger", 6_000), _grounding_example("small", 50))
+    original = _recorder(
+        candidate, world, world_context_window=24_000, retrieval_matches=matches
+    )._grounded_world_model
+    original_counter = original.token_counter
+    counter = FixtureTokenizer()
+    recorder = _recorder(
+        candidate,
+        world,
+        world_context_window=24_000,
+        token_counter=counter,
+        grounded_world_model=original,
+    )
+    recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Question"),)))
+    sent = world.requests[0]
+    evidence = json.loads(sent.messages[1].content or "")
+    included = tuple(item["transition_id"] for item in evidence["grounded_examples"])
+    assert included == ("larger", "small")
+    assert recorder.recorded.retrieved_transition_ids == (included,)
+    assert counter.count(sent) + 16_000 <= 24_000
+    assert original_counter.count(sent) + 16_000 > 24_000
+    assert sent.maximum_output_tokens == 16_000
+    assert recorder._grounded_world_model.token_counter is counter
+    assert recorder._grounded_world_model is not original
+    assert original.token_counter is original_counter
+    assert recorder._grounded_world_model.artifact is original.artifact
+    assert recorder._grounded_world_model.client is original.client
+    assert recorder._grounded_world_model.retriever is original.retriever
 
 
 def test_world_context_packs_whole_examples_and_records_only_dispatched_grounding() -> None:
