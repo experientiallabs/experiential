@@ -71,6 +71,7 @@ def prepare_judging_revision(
     request = _judge_request_reservation(
         caps,
         judge_model=model,
+        token_prices=catalog.models[selected.judge_alias].token_prices,
         maximum_input_tokens=None,
         maximum_output_tokens=prepared.judge_request.maximum_output_tokens,
         maximum_attempts=RetryPolicy().maximum_attempts,

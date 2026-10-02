@@ -11,7 +11,11 @@ import pytest
 
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse, Usage
 from exp.common.models.catalog import GatewayDeploymentMetadata
-from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayTokenPrices
+from exp.common.models.catalog_prices import (
+    GatewayLongContextTier,
+    GatewayServiceTierPrices,
+    GatewayTokenPrices,
+)
 from exp.common.progress import ProgressEvent
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions, prepare_model_evaluation
@@ -171,6 +175,8 @@ def test_full_schedule_preparation_execution_report_and_lower_cap_replay(
         cache_creation_1h_input_nano_usd_per_million_tokens=2_500_000_000,
         output_nano_usd_per_million_tokens=2_000_000_000,
         reasoning_nano_usd_per_million_tokens=3_000_000_000,
+        flex=GatewayServiceTierPrices(input_nano_usd_per_million_tokens=90_000_000_000),
+        priority=GatewayServiceTierPrices(output_nano_usd_per_million_tokens=90_000_000_000),
         long_context=GatewayLongContextTier(
             input_threshold_tokens=8,
             input_nano_usd_per_million_tokens=2_000_000_000,
@@ -242,7 +248,7 @@ def test_full_schedule_preparation_execution_report_and_lower_cap_replay(
         project,
         prepared,
         runtime,
-        budget=EvaluationBudget(maximum_cost_usd=None, maximum_judgments=100),
+        budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
         provider_spend_consented=True,
         created_at=_TIME,
         code_revision=_REVISION,

@@ -432,7 +432,7 @@ def _judge_request_reservation(
     maximum_input_tokens: int | None,
     maximum_output_tokens: int,
     maximum_attempts: int,
-    token_prices: GatewayTokenPrices | None = None,
+    token_prices: GatewayTokenPrices | None,
 ) -> CompletionCostReservation:
     """Build one complete judge request reservation from static catalog declarations.
 
@@ -442,6 +442,7 @@ def _judge_request_reservation(
         maximum_input_tokens: Input ceiling, or None to use model capacity minus output.
         maximum_output_tokens: Per-call output ceiling.
         maximum_attempts: Per-call retry ceiling.
+        token_prices: Exact authored judge schedule, or explicit None for four-rate pricing.
 
     Returns:
         Conservative retry-inclusive completion reservation.

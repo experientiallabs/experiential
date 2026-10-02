@@ -23,7 +23,11 @@ from exp.common.models import (
     reconcile_completion_economics,
     verify_completion_reservation,
 )
-from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayTokenPrices
+from exp.common.models.catalog_prices import (
+    GatewayLongContextTier,
+    GatewayServiceTierPrices,
+    GatewayTokenPrices,
+)
 from exp.common.models.token_cost_test import prices
 from exp.common.project import ProjectConfig, ProjectStore
 
@@ -121,6 +125,36 @@ def test_completion_reservation_covers_cache_write_output_and_retries() -> None:
     )
 
     assert reservation.estimated_maximum_call_cost_usd == pytest.approx(0.012)
+
+
+@pytest.mark.parametrize("tier", ["flex", "priority"])
+@pytest.mark.parametrize("complete", [False, True])
+def test_ordinary_reservation_excludes_unrequested_service_tiers(tier: str, complete: bool) -> None:
+    """Unused tier metadata neither raises the ordinary bound nor makes it incomplete."""
+    card = tiered_prices()
+    override = GatewayServiceTierPrices(
+        input_nano_usd_per_million_tokens=90_000_000_000,
+        cached_input_nano_usd_per_million_tokens=90_000_000_000 if complete else None,
+        cache_creation_input_nano_usd_per_million_tokens=90_000_000_000 if complete else None,
+        cache_creation_1h_input_nano_usd_per_million_tokens=90_000_000_000 if complete else None,
+        output_nano_usd_per_million_tokens=90_000_000_000 if complete else None,
+        reasoning_nano_usd_per_million_tokens=90_000_000_000 if complete else None,
+    )
+    selected = card.model_copy(update={tier: override})
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=100,
+        token_prices=selected,
+    )
+    assert reservation.token_prices == selected
+    assert reservation.maximum_is_upper_bound()
+    assert reservation.absolute_maximum_call_cost_usd() == pytest.approx(0.021)
 
 
 def test_unpublished_output_reservation_still_checks_context_prices_and_known_limits() -> None:

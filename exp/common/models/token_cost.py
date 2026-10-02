@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exp.common.models.catalog_prices import GatewayTokenPrices
+from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayTokenPrices
 from exp.common.models.model import Usage
 
 
@@ -126,7 +126,10 @@ def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> in
 def schedule_maximum_cost_nano_usd(
     prices: GatewayTokenPrices, *, input_tokens: int, output_tokens: int
 ) -> int:
-    """Estimate the maximum known charge across every reachable request schedule.
+    """Estimate the maximum known charge for an ordinary ModelRequest.
+
+    ModelRequest cannot select flex or priority. Those authored cards remain
+    available for actual returned-tier valuation, but are not reachable here.
 
     Each conditional schedule replaces the entire request. This prices the
     maximum over schedules, not an invented combination of their dimensions.
@@ -134,73 +137,67 @@ def schedule_maximum_cost_nano_usd(
     Callers must separately prove ``schedule_prices_complete`` before treating
     this estimate as a strict bound. Actual unpriced usage remains unknown.
     """
-    schedules = [prices]
-    for tier in ("flex", "priority"):
-        if prices.service_tier(tier) is not None:
-            schedules.append(prices.for_service_tier(tier))
+    schedules: list[GatewayTokenPrices | GatewayLongContextTier] = [prices]
+    if (
+        prices.long_context is not None
+        and input_tokens >= prices.long_context.input_threshold_tokens
+    ):
+        schedules.append(prices.long_context)
     candidates = []
-    for selected in schedules:
-        applicable = [selected]
-        if (
-            selected.long_context is not None
-            and input_tokens >= selected.long_context.input_threshold_tokens
-        ):
-            applicable.append(selected.long_context)
-        for schedule in applicable:
-            input_rate = max(
-                (
-                    rate
-                    for rate in (
-                        schedule.input_nano_usd_per_million_tokens,
-                        schedule.cached_input_nano_usd_per_million_tokens,
-                        schedule.cache_creation_input_nano_usd_per_million_tokens,
-                        schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
-                    )
-                    if rate is not None
-                ),
-                default=0,
-            )
-            output_rate = max(
-                (
-                    rate
-                    for rate in (
-                        schedule.output_nano_usd_per_million_tokens,
-                        schedule.reasoning_nano_usd_per_million_tokens,
-                    )
-                    if rate is not None
-                ),
-                default=0,
-            )
-            candidates.append(
-                (input_tokens * input_rate + output_tokens * output_rate + 999_999) // 1_000_000
-            )
-    return max(candidates)
-
-
-def schedule_prices_complete(prices: GatewayTokenPrices, *, maximum_input_tokens: int) -> bool:
-    """Prove all possible subsets have prices before enforcing a strict dollar bound."""
-    schedules = [prices]
-    for tier in ("flex", "priority"):
-        if prices.service_tier(tier) is not None:
-            schedules.append(prices.for_service_tier(tier))
-    for selected in schedules:
-        applicable = [selected]
-        if (
-            selected.long_context is not None
-            and maximum_input_tokens >= selected.long_context.input_threshold_tokens
-        ):
-            applicable.append(selected.long_context)
-        for schedule in applicable:
-            if any(
-                rate is None
+    for schedule in schedules:
+        input_rate = max(
+            (
+                rate
                 for rate in (
                     schedule.input_nano_usd_per_million_tokens,
                     schedule.cached_input_nano_usd_per_million_tokens,
                     schedule.cache_creation_input_nano_usd_per_million_tokens,
                     schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
+                )
+                if rate is not None
+            ),
+            default=0,
+        )
+        output_rate = max(
+            (
+                rate
+                for rate in (
                     schedule.output_nano_usd_per_million_tokens,
                     schedule.reasoning_nano_usd_per_million_tokens,
                 )
-            ):
-                return False
+                if rate is not None
+            ),
+            default=0,
+        )
+        candidates.append(
+            (input_tokens * input_rate + output_tokens * output_rate + 999_999) // 1_000_000
+        )
+    return max(candidates)
+
+
+def schedule_prices_complete(prices: GatewayTokenPrices, *, maximum_input_tokens: int) -> bool:
+    """Prove ordinary-request subsets and reachable context tiers have complete prices.
+
+    Unrequested flex and priority cards do not constrain ModelRequest admission.
+    Actual responses still select their explicitly returned processing tier.
+    """
+    schedules: list[GatewayTokenPrices | GatewayLongContextTier] = [prices]
+    if (
+        prices.long_context is not None
+        and maximum_input_tokens >= prices.long_context.input_threshold_tokens
+    ):
+        schedules.append(prices.long_context)
+    for schedule in schedules:
+        if any(
+            rate is None
+            for rate in (
+                schedule.input_nano_usd_per_million_tokens,
+                schedule.cached_input_nano_usd_per_million_tokens,
+                schedule.cache_creation_input_nano_usd_per_million_tokens,
+                schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
+                schedule.output_nano_usd_per_million_tokens,
+                schedule.reasoning_nano_usd_per_million_tokens,
+            )
+        ):
+            return False
     return True

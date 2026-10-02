@@ -510,6 +510,9 @@ output subset. Launch estimates also price each captured request before averagin
 episodes. Explicitly returned service tiers select their authored schedule. When no tier
 is returned, valuation uses the ordinary request contract. Native gateway relays currently do
 not preserve returned service-tier metadata, so their reports cannot establish a different tier.
+`ModelRequest` cannot select flex or priority, so its estimates and finite admission checks use
+the ordinary schedule and reachable long-context tier. The other authored cards remain frozen
+for actual returned-tier valuation. Judging retries retain the original complete judge card.
 These frozen attribution rates are separate from provider invoices, account discounts, and any
 gateway debit. Current four-rate and full-schedule requests use the same wrapped response
 contract. Receipts from a different response contract remain untouched and fail before dispatch;
