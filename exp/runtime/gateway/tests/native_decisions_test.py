@@ -151,6 +151,46 @@ def _rounded_answer(selector: str) -> JsonObject:
     }
 
 
+# Choice answers from bounded synthetic jev-1.13.0 calls: hundredth bins totalling
+# 0.99, and a unit total whose winner sits one hundredth below another bin.
+_ROUNDED_CHOICES: dict[str, JsonObject] = {
+    "rounded-choice-total": {
+        "type": "choice",
+        "choice": "white",
+        "confidence": 0.27,
+        "probabilities": {
+            "brown": 0.01,
+            "red": 0.34,
+            "blue": 0.1,
+            "yellow": 0.04,
+            "orange": 0.01,
+            "black": 0.08,
+            "white": 0.34,
+            "purple": 0.02,
+            "green": 0.04,
+            "pink": 0.01,
+        },
+    },
+    "rounded-choice-rank": {
+        "type": "choice",
+        "choice": "white",
+        "confidence": 0.24,
+        "probabilities": {
+            "green": 0.05,
+            "white": 0.3,
+            "black": 0.1,
+            "orange": 0.01,
+            "brown": 0.01,
+            "red": 0.31,
+            "yellow": 0.04,
+            "blue": 0.14,
+            "pink": 0.01,
+            "purple": 0.03,
+        },
+    },
+}
+
+
 class _DecisionsUpstream(BaseHTTPRequestHandler):
     """Serve bounded synthetic answers, recording only loopback test traffic."""
 
@@ -197,6 +237,18 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
             quantity = cast(JsonObject, answers["quantity"])
             quantity["score"] = 1.74
             quantity["probabilities"] = {"0": 0.05 + 1e-12, "1": 0.15 - 1e-12, "2": 0.8}
+        elif selector == "infeasible-choice-total":
+            cast(JsonObject, answers["department"])["probabilities"] = {
+                "billing": 0.33,
+                "technical": 0.33,
+                "sales": 0.32,
+            }
+        elif selector == "infeasible-choice-rank":
+            department = cast(JsonObject, answers["department"])
+            department["choice"] = "technical"
+            department["probabilities"] = {"billing": 0.5, "technical": 0.49, "sales": 0.0}
+        elif selector in _ROUNDED_CHOICES:
+            answers["department"] = _ROUNDED_CHOICES[selector]
         elif selector in {"rounded-low", "rounded-high"}:
             answers["quantity"] = _rounded_answer(selector)
             body["usage"] = {
@@ -617,6 +669,34 @@ def test_rounded_provider_score_is_preserved_and_settled_once(
     _assert_budget_accounted(engine)
 
 
+@pytest.mark.parametrize("selector", sorted(_ROUNDED_CHOICES))
+def test_rounded_provider_choice_is_preserved_and_settled_once(
+    engine: _ServingEngine, selector: str
+) -> None:
+    """Real synthetic choice numbers cross Rust unchanged with one exact charge."""
+    before = _request_ids(engine)
+    calls_before = _provider_calls()
+    body = _body(selector)
+    answer = _ROUNDED_CHOICES[selector]
+    questions = cast(JsonObject, body["questions"])
+    cast(JsonObject, questions["department"])["criteria"] = dict.fromkeys(
+        cast(JsonObject, answer["probabilities"])
+    )
+    response = _post(engine, body)
+    assert response.status_code == 200, response.text
+    assert response.json()["answers"]["department"] == answer
+    assert response.json()["usage"] == {"input_tokens": 451, "output_tokens": 68}
+    assert _provider_calls() == calls_before + 1
+    [(request, attempts)] = _settled(engine, before)
+    assert request["terminal_state"] == "completed"
+    [attempt] = attempts
+    assert attempt["state"] == "completed"
+    assert attempt["failure_class"] is None
+    assert attempt["usage_source"] == "observed"
+    assert attempt["budget_settled_nano_usd"] == _COST_NANO_USD
+    _assert_budget_accounted(engine)
+
+
 def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEngine) -> None:
     """Unbillable answers and mismatched types/probabilities/legends never escape."""
     cases = (
@@ -627,6 +707,8 @@ def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEng
         ("inconsistent-score", "decision-failover"),
         ("precise-score", "decision-failover"),
         ("precise-probabilities", "decision-failover"),
+        ("infeasible-choice-total", "decision-failover"),
+        ("infeasible-choice-rank", "decision-failover"),
         ("wrong-type", "decision-failover"),
     )
     for selector, alias in cases:

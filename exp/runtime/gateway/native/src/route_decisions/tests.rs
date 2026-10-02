@@ -149,6 +149,125 @@ fn choice_requires_a_maximum_probability_and_allows_tied_winners() {
     }
 }
 
+fn choice_payload(probabilities: Value, choice: &str) -> (DecisionsAdmission, Value) {
+    let mut admitted = admission();
+    let criteria = probabilities.as_object().unwrap().keys();
+    admitted.questions["department"]["criteria"] = json!(criteria
+        .map(|key| (key.clone(), Value::Null))
+        .collect::<Map<_, _>>());
+    let mut provider = payload();
+    provider["answers"]["department"] = json!({"type": "choice", "choice": choice,
+        "confidence": 0.3, "probabilities": probabilities});
+    (admitted, provider)
+}
+
+#[test]
+fn independently_rounded_live_choices_preserve_provider_answers_and_usage() {
+    // Numeric values from bounded synthetic jev-1.13.0 calls, never customer data.
+    for (probabilities, choice) in [
+        // Hundredth bins totalling 0.99 (the last with a published top tie), then a unit
+        // total whose rounded winner sits one hundredth below another bin.
+        (
+            json!({"black": 0.17, "orange": 0.02, "green": 0.07, "purple": 0.03,
+                "red": 0.41000000000000003, "blue": 0.19, "yellow": 0.1}),
+            "red",
+        ),
+        (
+            json!({"black": 0.01, "green": 0.1, "purple": 0.01, "pink": 0.0, "blue": 0.11,
+                "white": 0.02, "brown": 0.01, "orange": 0.01, "red": 0.67, "yellow": 0.05}),
+            "red",
+        ),
+        (
+            json!({"orange": 0.01, "purple": 0.03, "yellow": 0.04, "white": 0.4, "black": 0.08,
+                "red": 0.28, "green": 0.04, "pink": 0.01, "blue": 0.1}),
+            "white",
+        ),
+        (
+            json!({"brown": 0.01, "red": 0.34, "blue": 0.1, "yellow": 0.04, "orange": 0.01,
+                "black": 0.08, "white": 0.34, "purple": 0.02, "green": 0.04, "pink": 0.01}),
+            "white",
+        ),
+        (
+            json!({"green": 0.05, "white": 0.3, "black": 0.1, "orange": 0.01, "brown": 0.01,
+                "red": 0.31, "yellow": 0.04, "blue": 0.14, "pink": 0.01, "purple": 0.03}),
+            "white",
+        ),
+    ] {
+        let (admitted, provider) = choice_payload(probabilities, choice);
+        let (public, usage) = public_decisions(provider.clone(), &admitted)
+            .expect("independently rounded choice compatible with a unit distribution");
+        assert_eq!(public["answers"], provider["answers"]);
+        assert_eq!(usage.input_tokens, Some(451));
+        assert_eq!(usage.output_tokens, Some(68));
+    }
+}
+
+#[test]
+fn rounding_never_excuses_infeasible_choices_or_high_precision_disagreement() {
+    for (probabilities, choice) in [
+        // Infeasible or finer-precision totals, then winner gaps no unit distribution closes.
+        (json!({"a": 0.33, "b": 0.33, "c": 0.32}), "a"),
+        (json!({"a": 0.34, "b": 0.34, "c": 0.34}), "a"),
+        (json!({"a": 1.0, "b": 0.01, "c": 0.01}), "a"),
+        (json!({"a": 0.335, "b": 0.33, "c": 0.33}), "a"),
+        (json!({"a": 0.5 - 1e-12, "b": 0.49, "c": 0.0}), "a"),
+        (json!({"a": 0.31, "b": 0.33, "c": 0.36}), "b"),
+        (json!({"a": 0.0, "b": 0.49, "c": 0.5}), "b"),
+        (json!({"a": 0.0, "b": 0.495, "c": 0.505}), "b"),
+        (json!({"a": 0.0, "b": 0.5, "c": 0.51}), "b"),
+    ] {
+        let (admitted, provider) = choice_payload(probabilities, choice);
+        let failure = public_decisions(provider, &admitted).expect_err("inconsistent choice");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        assert!(!failure.retryable_same_deployment);
+        assert!(!failure.failover_eligible);
+    }
+    // Feasible 0.99 and 1.01 totals; a one-hundredth gap closes only with spare mass.
+    for (probabilities, choice) in [
+        (json!({"a": 0.34, "b": 0.33, "c": 0.32}), "a"),
+        (json!({"a": 0.34, "b": 0.34, "c": 0.33}), "b"),
+        (json!({"a": 0.0, "b": 0.49, "c": 0.5}), "c"),
+        (json!({"a": 0.01, "b": 0.49, "c": 0.5}), "b"),
+    ] {
+        let (admitted, provider) = choice_payload(probabilities, choice);
+        public_decisions(provider, &admitted).expect("feasible rounded choice");
+    }
+}
+
+#[test]
+fn choice_rounding_matches_an_independent_three_bin_enumeration() {
+    for probabilities in [
+        [0.33, 0.33, 0.33],
+        [0.34, 0.33, 0.32],
+        [0.0, 0.49, 0.5],
+        [0.01, 0.49, 0.5],
+        [0.3, 0.31, 0.38],
+        [0.0, 0.0, 1.0],
+    ] {
+        let bins = probabilities.map(|p| (p * 400.0_f64).round() as i64);
+        let range = |bin: i64| (bin - 2).max(0)..=(bin + 2).min(400);
+        for selected in 0..3 {
+            let mut feasible = false;
+            for a in range(bins[0]) {
+                for b in range(bins[1]) {
+                    let c = 400 - a - b;
+                    let values = [a, b, c];
+                    if range(bins[2]).contains(&c)
+                        && values.iter().all(|value| *value <= values[selected])
+                    {
+                        feasible = true;
+                    }
+                }
+            }
+            assert_eq!(
+                choice_can_be_highest(selected, &probabilities),
+                feasible,
+                "{probabilities:?}, selected={selected}"
+            );
+        }
+    }
+}
+
 #[test]
 fn score_requires_exact_legend_index_set_and_expected_value() {
     for (field, value) in [
@@ -237,7 +356,7 @@ fn rounding_never_excuses_infeasible_scores_or_high_precision_disagreement() {
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.120000000005),
         (vec![0.0, 0.870001, 0.129999, 0.0, 0.0], 1.12),
         (vec![1e-12, 0.87 - 1e-12, 0.13, 0.0, 0.0], 1.12),
-        (vec![0.33, 0.33, 0.33], 1.0),
+        (vec![0.33, 0.33, 0.32], 0.99),
         (vec![0.34, 0.34, 0.34, 0.0, 0.0], 1.02),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], -0.01),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 4.01),
@@ -250,6 +369,10 @@ fn rounding_never_excuses_infeasible_scores_or_high_precision_disagreement() {
     }
     let (admitted, provider) = score_payload(&[0.0, 0.870001, 0.129999], 1.129999);
     public_decisions(provider, &admitted).expect("consistent higher precision is still valid");
+    // Three rounded thirds total 0.99, yet (0.33, 0.335, 0.335) explains both them
+    // and a 1.0 score, so the total no longer rejects this hundredth answer.
+    let (admitted, provider) = score_payload(&[0.33, 0.33, 0.33], 1.0);
+    public_decisions(provider, &admitted).expect("feasible rounded total and score");
 }
 
 #[test]

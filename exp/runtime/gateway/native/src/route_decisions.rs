@@ -491,7 +491,7 @@ fn public_decisions(
                     .get("criteria")
                     .and_then(Value::as_object)
                     .ok_or_else(wire_failure)?;
-                distribution(
+                let probabilities = distribution(
                     &answer["probabilities"],
                     criteria.keys().map(String::as_str),
                 )?;
@@ -501,13 +501,14 @@ fn public_decisions(
                     .filter(|choice| criteria.contains_key(*choice))
                     .ok_or_else(|| malformed("decision choice is not a requested category"))?;
                 probability(&answer["confidence"])?;
-                let selected = probability(&answer["probabilities"][choice])?;
-                for key in criteria.keys() {
-                    if probability(&answer["probabilities"][key])? > selected {
-                        return Err(malformed(
-                            "decision choice is not a highest-probability category",
-                        ));
-                    }
+                let selected = criteria
+                    .keys()
+                    .position(|key| key == choice)
+                    .ok_or_else(wire_failure)?;
+                if !choice_can_be_highest(selected, &probabilities) {
+                    return Err(malformed(
+                        "decision choice is not a highest-probability category",
+                    ));
                 }
                 json!({"type": kind, "choice": choice, "confidence": answer["confidence"],
                     "probabilities": answer["probabilities"]})
@@ -595,21 +596,15 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
     let Some(score_hundredths) = hundredths(score) else {
         return false;
     };
-    // Half-hundredth integer units avoid floating-point boundary tolerances.
     // A single unit distribution must explain all bins together, not a separate
-    // error allowance for each weighted term. Clamp at the probability endpoints.
-    let Some(bounds) = probabilities
-        .iter()
-        .map(|value| hundredths(*value).map(|bin| ((2 * bin - 1).max(0), (2 * bin + 1).min(200))))
-        .collect::<Option<Vec<_>>>()
-    else {
+    // error allowance for each weighted term.
+    let Some(bounds) = rounding_bounds(probabilities) else {
         return false;
     };
-    let lower_sum: i64 = bounds.iter().map(|(low, _)| low).sum();
-    let upper_sum: i64 = bounds.iter().map(|(_, high)| high).sum();
-    if lower_sum > 200 || upper_sum < 200 {
+    if !admits_unit_total(&bounds) {
         return false;
     }
+    let lower_sum: i64 = bounds.iter().map(|(low, _)| low).sum();
     let base: i64 = bounds
         .iter()
         .enumerate()
@@ -620,6 +615,55 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
     // Closed envelopes admit unspecified half-way rounding. No output is repaired
     // or normalized, and structurally invalid distributions never reach this check.
     2 * score_hundredths + 1 >= minimum && 2 * score_hundredths - 1 <= maximum
+}
+
+/// Check a selected category without treating rounded wire probabilities as exact.
+fn choice_can_be_highest(selected: usize, probabilities: &[f64]) -> bool {
+    if probabilities
+        .iter()
+        .all(|value| *value <= probabilities[selected])
+    {
+        return true;
+    }
+    // Rounding to hundredths can split a near tie, so only hundredth-valued bins
+    // get an envelope. One unit distribution must make the selected bin highest
+    // while every bin stays inside its own rounding interval.
+    let Some(bounds) = rounding_bounds(probabilities) else {
+        return false;
+    };
+    let (low, high) = bounds[selected];
+    (low..=high).any(|level| {
+        let mut lower_sum = level;
+        let mut upper_sum = level;
+        for (index, (low, high)) in bounds.iter().enumerate() {
+            if index == selected {
+                continue;
+            }
+            if *low > level {
+                return false;
+            }
+            lower_sum += low;
+            upper_sum += (*high).min(level);
+        }
+        lower_sum <= 200 && upper_sum >= 200
+    })
+}
+
+/// Half-hundredth rounding intervals of hundredth-valued probabilities, clipped to
+/// `[0, 1]`. Integer units avoid floating-point boundary tolerances; finer data
+/// gets no interval and stays strict.
+fn rounding_bounds(probabilities: &[f64]) -> Option<Vec<(i64, i64)>> {
+    probabilities
+        .iter()
+        .map(|value| hundredths(*value).map(|bin| ((2 * bin - 1).max(0), (2 * bin + 1).min(200))))
+        .collect()
+}
+
+/// Whether one unit distribution fits inside every closed rounding interval.
+fn admits_unit_total(bounds: &[(i64, i64)]) -> bool {
+    let lower_sum: i64 = bounds.iter().map(|(low, _)| low).sum();
+    let upper_sum: i64 = bounds.iter().map(|(_, high)| high).sum();
+    lower_sum <= 200 && upper_sum >= 200
 }
 
 /// Recognize decimal hundredths, including their binary floating-point residue.
@@ -655,22 +699,30 @@ fn probability(value: &Value) -> Result<f64, Failure> {
         })
 }
 
-fn distribution<'a>(value: &Value, keys: impl Iterator<Item = &'a str>) -> Result<(), Failure> {
+/// Validate exact keys and a unit total, returning probabilities in key order.
+fn distribution<'a>(
+    value: &Value,
+    keys: impl Iterator<Item = &'a str>,
+) -> Result<Vec<f64>, Failure> {
     let probabilities = value
         .as_object()
         .ok_or_else(|| malformed("decision omitted its probability object"))?;
-    let mut count = 0;
-    let mut sum = 0.0;
-    for key in keys {
-        count += 1;
-        sum += probability(probabilities.get(key).unwrap_or(&Value::Null))?;
-    }
-    if probabilities.len() != count || (sum - 1.0).abs() > PROBABILITY_TOLERANCE {
+    let values = keys
+        .map(|key| probability(probabilities.get(key).unwrap_or(&Value::Null)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sum: f64 = values.iter().sum();
+    // Independently rounded hundredth bins may publish 0.99 or 1.01; accept that
+    // total only when one unit distribution fits every bin's rounding interval.
+    // Finer-precision totals keep the exact normalization check.
+    if probabilities.len() != values.len()
+        || ((sum - 1.0).abs() > PROBABILITY_TOLERANCE
+            && !rounding_bounds(&values).is_some_and(|bounds| admits_unit_total(&bounds)))
+    {
         return Err(malformed(
             "decision probability keys or total do not match the request",
         ));
     }
-    Ok(())
+    Ok(values)
 }
 
 fn token_count(value: &Value) -> Result<u64, Failure> {
