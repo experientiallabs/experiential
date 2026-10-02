@@ -7,6 +7,9 @@ import pytest
 from exp.common.models import ModelCatalog
 from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.traces import load_trace_dataset
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_schema import trace_database_path
 from exp.optimize.evaluation.prepare import (
     ModelEvaluationOptions,
     PreparedModelEvaluation,
@@ -126,6 +129,18 @@ def test_new_prompt_preparation_reuses_immutable_build_evidence_without_calls(
         project, catalog, state = _completed_project(tmp_path)
     build = project.load_project().build
     assert build is not None
+    traces = load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id)
+    assert traces.dataset.source is not None
+    imports = SQLiteTraceStore(trace_database_path(project.paths.root))
+    receipt = imports.write_import(
+        project.load_project().project_id,
+        source_format="fixture",
+        source=traces.dataset.source,
+        traces=traces.traces,
+        metadata={"schema_version": 1, "issues": [], "identity_evidence": None},
+    )
+    project.bind_completed_build(build, trace_import_id=receipt.import_id)
+    original_config = project.load_project()
     old_bytes = project.artifacts.read_bytes(
         build.world_model.artifact_id, WORLD_MODEL_ARTIFACT_PATH
     )
@@ -182,8 +197,13 @@ def test_new_prompt_preparation_reuses_immutable_build_evidence_without_calls(
     review = project.read_review()
     assert isinstance(review, dict)
     select_completed_build(
-        project, new_build, BuildReviewReadiness.model_validate(review["build_review"])
+        project,
+        new_build,
+        BuildReviewReadiness.model_validate(review["build_review"]),
+        trace_import_id=original_config.trace_import_id,
     )
+    assert project.load_project().trace_import_id == original_config.trace_import_id
+    assert imports.read_import(receipt.import_id).traces == traces.traces
     prepared = prepare()
     assert current.artifact.prompt_version == "text-world-model-v3"
     assert current.artifact.world_model_id != old_world.world_model_id

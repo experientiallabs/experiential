@@ -39,7 +39,9 @@ Prompt identity is immutable. An older grounded-world artifact is rejected with 
 to prepare a new one; its saved evaluations and receipts are not rewritten. Python applications
 can call `persist_grounded_world_model` with the unchanged serving RAG pointer, then
 `select_completed_build` with the same trace, task, fit/serving RAG and review pointers plus the new
-world-model manifest. This materializes the current prompt without re-embedding source evidence.
+world-model manifest. Pass `trace_import_id=project.load_project().trace_import_id` to retain the
+project's existing import association; omitting it clears that association. This materializes the
+current prompt without re-embedding source evidence.
 Prepare a new evaluation afterward; never resume a frozen preparation under a different prompt.
 
 Before a text-world request is dispatched, optional retrieved examples are packed in priority
