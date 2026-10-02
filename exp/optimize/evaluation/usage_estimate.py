@@ -18,6 +18,19 @@ from exp.simulation.retrieval.transitions import extract_real_transitions
 
 
 @dataclass(frozen=True)
+class ExpectedCompletion:
+    """One request's size, retained before applying nonlinear price schedules.
+
+    Attributes:
+        input_tokens: Measured or estimated input size of this request.
+        output_tokens: Measured or estimated generated output of this request.
+    """
+
+    input_tokens: float
+    output_tokens: float
+
+
+@dataclass(frozen=True)
 class ExpectedUsage:
     """Expected tokens for one captured episode, without multiplying execution ceilings.
 
@@ -30,6 +43,10 @@ class ExpectedUsage:
         judge_input: Estimated final transcript and rubric input.
         turns: Distinct captured assistant requests.
         measured_turns: Requests with recorded provider token usage.
+        assistant_requests: Individual requests from all captured source episodes.
+        world_requests: Individual world requests estimated from each captured turn.
+        judge_inputs: Final transcript size for each captured source episode.
+        episode_count: Number of source episodes used for the average.
     """
 
     assistant_input: float
@@ -40,6 +57,10 @@ class ExpectedUsage:
     judge_input: float
     turns: float
     measured_turns: float
+    assistant_requests: tuple[ExpectedCompletion, ...]
+    world_requests: tuple[ExpectedCompletion, ...]
+    judge_inputs: tuple[float, ...]
+    episode_count: int
 
 
 def token_estimate(value: JsonValue) -> int:
@@ -157,6 +178,8 @@ def task_usage(
         inputs = outputs = world_inputs = world_outputs = queries = 0.0
         measured = 0
         transcript = 0.0
+        assistant_requests = []
+        world_requests = []
         for group in groups:
             first = group[0]
             attrs = first.attributes
@@ -182,14 +205,18 @@ def task_usage(
             queries += query_count * min(
                 maximum_query_tokens, task_size + output_tokens / max(1, query_count)
             )
-            world_inputs += (
+            world_input = (
                 input_tokens
                 + output_tokens
                 + task_size
                 + token_estimate(WORLD_MODEL_TEXT_SYSTEM_PROMPT)
                 + example_size * min(len(evidence), top_k if query_count else 0)
             )
-            world_outputs += observation_tokens + 64 + 16 * len(calls)
+            world_output = observation_tokens + 64 + 16 * len(calls)
+            world_inputs += world_input
+            world_outputs += world_output
+            assistant_requests.append(ExpectedCompletion(input_tokens, output_tokens))
+            world_requests.append(ExpectedCompletion(world_input, world_output))
             inputs += input_tokens
             outputs += output_tokens
             transcript += output_tokens + observation_tokens
@@ -203,6 +230,10 @@ def task_usage(
                 task_size + transcript + 1024,
                 len(groups),
                 measured,
+                tuple(assistant_requests),
+                tuple(world_requests),
+                (task_size + transcript + 1024,),
+                1,
             )
         )
     if not episodes:
@@ -210,8 +241,23 @@ def task_usage(
     return ExpectedUsage(
         **{
             field: mean(getattr(item, field) for item in episodes)
-            for field in ExpectedUsage.__dataclass_fields__
-        }
+            for field in (
+                "assistant_input",
+                "assistant_output",
+                "world_input",
+                "world_output",
+                "query_input",
+                "judge_input",
+                "turns",
+                "measured_turns",
+            )
+        },
+        assistant_requests=tuple(
+            call for episode in episodes for call in episode.assistant_requests
+        ),
+        world_requests=tuple(call for episode in episodes for call in episode.world_requests),
+        judge_inputs=tuple(value for episode in episodes for value in episode.judge_inputs),
+        episode_count=len(episodes),
     )
 
 
@@ -219,22 +265,18 @@ def expected_completion_cost(
     request: CompletionCostReservation,
     input_tokens: float,
     output_tokens: float,
-    *,
-    request_count: float = 1,
 ) -> float:
-    """Price ordinary-tier expected requests without assuming retries or cache hits.
+    """Price one ordinary-tier expected request without assuming retries or cache hits.
 
-    Full schedules select a context tier from the mean request size. This remains
-    a planning estimate; actual report prices use individual saved calls.
+    Context tiers apply before source-episode averaging. This remains a planning
+    estimate; actual report prices use individual saved calls and observed subsets.
     """
     if request.token_prices is not None:
-        if request_count <= 0:
-            return 0
         cost = schedule_usage_cost_nano_usd(
             request.token_prices,
             Usage(
-                input_tokens=math.ceil(input_tokens / request_count),
-                output_tokens=math.ceil(output_tokens / request_count),
+                input_tokens=math.ceil(input_tokens),
+                output_tokens=math.ceil(output_tokens),
                 cached_input_tokens=0,
                 cache_write_input_tokens=0,
                 reasoning_tokens=0,
@@ -242,7 +284,7 @@ def expected_completion_cost(
         )
         if cost is None:
             raise ValueError("expected ordinary completion usage has no authored price")
-        return request_count * cost / 1_000_000_000
+        return cost / 1_000_000_000
     return (
         input_tokens * request.input_usd_per_million_tokens
         + output_tokens * request.output_usd_per_million_tokens

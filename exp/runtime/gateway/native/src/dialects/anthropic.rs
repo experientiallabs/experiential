@@ -25,7 +25,7 @@ impl Normalizer {
             .input_tokens
             .map(|fresh| {
                 bounded_ledger_sum(
-                    &[fresh, self.cache_read, self.cache_write],
+                    &[fresh, self.cache_read, self.cache_write.unwrap_or(0)],
                     "Anthropic input",
                 )
             })
@@ -35,10 +35,11 @@ impl Normalizer {
             input_tokens,
             output_tokens: self.output_tokens,
             cached_input_tokens: Some(self.cache_read),
-            // Keep the cache-less wire shape; thinking is billed inside output
-            // and has no provider-reported subset to expose here.
-            cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
-            cache_creation_1h_input_tokens: self.cache_write_1h.filter(|_| self.cache_write > 0),
+            cache_creation_input_tokens: self.cache_write,
+            cache_creation_1h_input_tokens: self
+                .cache_write_1h
+                .filter(|_| self.cache_write.is_some_and(|count| count > 0)),
+            // Thinking is billed inside output with no reported subset.
             reasoning_tokens: None,
         })
     }
@@ -67,8 +68,8 @@ impl Normalizer {
                     .get("usage")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("Anthropic message_start.usage must be an object"))?;
-                // Primary omissions are unknown. Optional cache legs use the
-                // provider's zero-when-omitted convention.
+                // Primary omissions are unknown. An input-bearing report uses
+                // the provider's zero-when-omitted cache-write convention.
                 self.input_tokens = count_if_present(usage, "input_tokens", "Anthropic usage")
                     .map_err(|message| malformed(&message))?;
                 self.cache_read = count_or_zero(
@@ -77,13 +78,15 @@ impl Normalizer {
                     "Anthropic cache_read_input_tokens",
                 )
                 .map_err(|message| malformed(&message))?;
-                self.cache_write = count_or_zero(
+                self.cache_write = count_if_present(
                     usage,
                     "cache_creation_input_tokens",
                     "Anthropic cache_creation_input_tokens",
                 )
-                .map_err(|message| malformed(&message))?;
-                self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
+                .map_err(|message| malformed(&message))?
+                .or(self.input_tokens.map(|_| 0));
+                self.cache_write_1h =
+                    cache_write::hour_subset(usage, self.cache_write.unwrap_or(0))?;
                 self.output_tokens = self.output_tokens.max(
                     count_if_present(usage, "output_tokens", "Anthropic usage")
                         .map_err(|message| malformed(&message))?,
@@ -308,20 +311,25 @@ impl Normalizer {
                     count_if_present(usage, "input_tokens", "Anthropic message_delta")
                         .map_err(|message| malformed(&message))?,
                 );
-                for (key, slot) in [
-                    ("cache_read_input_tokens", &mut self.cache_read),
-                    ("cache_creation_input_tokens", &mut self.cache_write),
-                ] {
-                    if let Some(value) = count_if_present(usage, key, "Anthropic message_delta")
+                if let Some(value) =
+                    count_if_present(usage, "cache_read_input_tokens", "Anthropic message_delta")
                         .map_err(|message| malformed(&message))?
-                    {
-                        *slot = value;
-                    }
+                {
+                    self.cache_read = value;
                 }
+                self.cache_write = count_if_present(
+                    usage,
+                    "cache_creation_input_tokens",
+                    "Anthropic message_delta",
+                )
+                .map_err(|message| malformed(&message))?
+                .or(self.cache_write)
+                .or(self.input_tokens.map(|_| 0));
                 if usage.contains_key("cache_creation_input_tokens")
                     || usage.contains_key("cache_creation")
                 {
-                    self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
+                    self.cache_write_1h =
+                        cache_write::hour_subset(usage, self.cache_write.unwrap_or(0))?;
                 }
                 // The relay may be cancelled before message_stop arrives.
                 // Retain these decoded meters without changing event timing.

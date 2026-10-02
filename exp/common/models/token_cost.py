@@ -126,11 +126,13 @@ def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> in
 def schedule_maximum_cost_nano_usd(
     prices: GatewayTokenPrices, *, input_tokens: int, output_tokens: int
 ) -> int:
-    """Bound known authored rates across every reachable request schedule.
+    """Estimate the maximum known charge across every reachable request schedule.
 
     Each conditional schedule replaces the entire request. This prices the
     maximum over schedules, not an invented combination of their dimensions.
-    Unknown subset rates remain unknown during observed-usage valuation.
+    Unpriced dimensions contribute no known amount, not a claim of free usage.
+    Callers must separately prove ``schedule_prices_complete`` before treating
+    this estimate as a strict bound. Actual unpriced usage remains unknown.
     """
     schedules = [prices]
     for tier in ("flex", "priority"):
@@ -145,30 +147,29 @@ def schedule_maximum_cost_nano_usd(
         ):
             applicable.append(selected.long_context)
         for schedule in applicable:
-            if (
-                schedule.input_nano_usd_per_million_tokens is None
-                or schedule.output_nano_usd_per_million_tokens is None
-            ):
-                raise ValueError(
-                    "completion schedule needs input and output prices; refresh the catalog"
-                )
             input_rate = max(
-                rate
-                for rate in (
-                    schedule.input_nano_usd_per_million_tokens,
-                    schedule.cached_input_nano_usd_per_million_tokens,
-                    schedule.cache_creation_input_nano_usd_per_million_tokens,
-                    schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
-                )
-                if rate is not None
+                (
+                    rate
+                    for rate in (
+                        schedule.input_nano_usd_per_million_tokens,
+                        schedule.cached_input_nano_usd_per_million_tokens,
+                        schedule.cache_creation_input_nano_usd_per_million_tokens,
+                        schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
+                    )
+                    if rate is not None
+                ),
+                default=0,
             )
             output_rate = max(
-                rate
-                for rate in (
-                    schedule.output_nano_usd_per_million_tokens,
-                    schedule.reasoning_nano_usd_per_million_tokens,
-                )
-                if rate is not None
+                (
+                    rate
+                    for rate in (
+                        schedule.output_nano_usd_per_million_tokens,
+                        schedule.reasoning_nano_usd_per_million_tokens,
+                    )
+                    if rate is not None
+                ),
+                default=0,
             )
             candidates.append(
                 (input_tokens * input_rate + output_tokens * output_rate + 999_999) // 1_000_000

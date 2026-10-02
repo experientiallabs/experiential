@@ -26,6 +26,8 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
 )
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayTokenPrices
 from exp.common.project import (
     ExportedProjectBundle,
     ProjectBudgetConfiguration,
@@ -732,6 +734,96 @@ def test_hosted_preflight_reserves_full_simulation_before_build_dispatch(tmp_pat
     assert state.completion_calls == []
     assert prepared.load_project() == before_config
     assert prepared.artifacts.list_ids() == before_artifacts
+
+
+@pytest.mark.parametrize("role", ["candidate-a", "world", "judge"])
+def test_hosted_preflight_rejects_incomplete_full_tariffs_before_build(
+    tmp_path: Path, role: str
+) -> None:
+    """Every paid completion role needs a complete bound before hosted build admission."""
+    project, catalog = _restored_prepared_project(tmp_path)
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+    )
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                role: catalog.models[role].model_copy(
+                    update={"gateway": GatewayDeploymentMetadata(prices=card)}
+                ),
+            }
+        }
+    )
+    state = _ProviderState()
+    attempt_store = FileHostedAttemptAuthorityStore(tmp_path / "incomplete-price-authority")
+    authority = attempt_store.create()
+    before = (project.load_project(), project.artifacts.list_ids())
+    with pytest.raises(HostedRouterPreflightError, match="complete.*tariff"):
+        run_hosted_router_workflow(
+            project,
+            _setup(),
+            catalog,
+            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+            attempt_store,
+            bundle_directory=tmp_path / "unused-bundles",
+            attempt_id=authority.attempt_id,
+            created_at=_TIME,
+            code_revision=_REVISION,
+            options=_options(),
+        )
+    assert (
+        state.credential_resolutions == 0 and state.completion_calls == state.embedding_calls == []
+    )
+    assert not (tmp_path / "incomplete-price-authority" / "attempt-state.json").exists()
+    assert before == (project.load_project(), project.artifacts.list_ids())
+
+
+def test_hosted_preflight_judge_hazard_includes_full_schedule(tmp_path: Path) -> None:
+    """The persisted stage reservation covers the judge's reachable premium rates."""
+    project, catalog = _restored_prepared_project(tmp_path)
+    options = _options()
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=2_000_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=3_000_000_000,
+        long_context=GatewayLongContextTier(
+            input_threshold_tokens=100,
+            input_nano_usd_per_million_tokens=2_000_000_000,
+            cached_input_nano_usd_per_million_tokens=1_000_000_000,
+            cache_creation_input_nano_usd_per_million_tokens=3_000_000_000,
+            cache_creation_1h_input_nano_usd_per_million_tokens=4_000_000_000,
+            output_nano_usd_per_million_tokens=4_000_000_000,
+            reasoning_nano_usd_per_million_tokens=6_000_000_000,
+        ),
+    )
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "judge": catalog.models["judge"].model_copy(
+                    update={"gateway": GatewayDeploymentMetadata(prices=card)}
+                ),
+            }
+        }
+    )
+    result = preflight_hosted(project, _setup(), catalog, options)
+    expected = reserve_usd(
+        3
+        * options.maximum_judgments
+        * (options.maximum_judge_input_tokens * 4 + options.maximum_judge_output_tokens * 6)
+        / 1_000_000
+    )
+    for entries in (result.fit_reservations, result.report_reservations):
+        judgments = [entry for entry in entries if entry.component == ProviderSpendComponent.JUDGE]
+        assert len(judgments) == 1
+        assert judgments[0].amount_usd == expected
 
 
 def test_hosted_build_uses_one_bounded_embedding_plan_for_cost_and_both_indexes(

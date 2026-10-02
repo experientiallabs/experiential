@@ -385,6 +385,7 @@ def _router_stage_reservations(
     assert cached_price is not None and write_price is not None
     judgment = completion_cost_reservation(
         model=judge.model,
+        token_prices=catalog.models[judge.alias].token_prices,
         input_usd_per_million_tokens=input_price,
         output_usd_per_million_tokens=output_price,
         cached_input_usd_per_million_tokens=cached_price,
@@ -429,6 +430,18 @@ def _router_stage_reservations(
         RetryPolicy().maximum_attempts,
     )
     if len(candidate_requests) != len(candidates) or world_request is None or retrieval is None:
+        return (), ()
+    for alias, request in (
+        *((item.candidate_alias, item.request) for item in candidate_requests),
+        (world_model.alias, world_request),
+        (judge.alias, judgment),
+    ):
+        if not request.maximum_is_upper_bound():
+            problems.append(
+                f"hosted completion alias {alias!r} requires a complete token tariff "
+                "at its maximum request size; refresh the catalog before hosted execution"
+            )
+    if problems:
         return (), ()
     retrieval_call = (
         retrieval.maximum_input_tokens

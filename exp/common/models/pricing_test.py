@@ -630,3 +630,46 @@ def test_known_success_with_no_paid_retries_can_settle_an_incomplete_tariff(
     assert reconciled.cost_usd.value == pytest.approx(0.00005)
     assert reconciled.provider_attempts == provider_attempts
     assert reconciled.unbilled_attempts == unbilled_attempts
+
+
+@pytest.mark.parametrize(
+    "missing", ["input_nano_usd_per_million_tokens", "output_nano_usd_per_million_tokens"]
+)
+def test_incomplete_reachable_context_tier_retains_a_known_rate_estimate(missing: str) -> None:
+    """A short planning size cannot turn an incomplete reachable tier into a dollar ceiling."""
+    card = tiered_prices()
+    assert card.long_context is not None
+    card = card.model_copy(
+        update={"long_context": card.long_context.model_copy(update={missing: None})}
+    )
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=100,
+        estimated_input_tokens=50,
+        token_prices=card,
+    )
+    assert reservation.estimated_maximum_call_cost_usd == pytest.approx(0.00195)
+    assert (
+        reservation.absolute_maximum_call_cost_usd() > reservation.estimated_maximum_call_cost_usd
+    )
+    assert not reservation.maximum_is_upper_bound()
+    with pytest.raises(ValueError, match="price"):
+        reconcile_completion_economics(
+            reservation,
+            OperationEconomics(
+                usage=Usage(
+                    input_tokens=100,
+                    output_tokens=10,
+                    cached_input_tokens=0,
+                    cache_write_input_tokens=0,
+                    reasoning_tokens=0,
+                ),
+                provider_attempts=1,
+            ),
+        )

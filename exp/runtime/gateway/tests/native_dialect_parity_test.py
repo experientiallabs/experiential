@@ -113,6 +113,7 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 8,
         "output_tokens": 9,
         "cached_input_tokens": 2,
+        "cache_creation_input_tokens": 0,
         # Anthropic reports thinking inside output_tokens with no separate
         # count, so the reasoning subset stays unknown.
         "reasoning_tokens": None,
@@ -135,6 +136,7 @@ def _anthropic_start_usage(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_input_tokens": cached,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": None,
     }
 
@@ -193,6 +195,7 @@ ANTHROPIC_LIVE_TOOL_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 663,
         "output_tokens": 33,
         "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": None,
     },
     {"kind": "completed"},
@@ -257,6 +260,7 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
             "input_tokens": 550,
             "output_tokens": 37,
             "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
             "reasoning_tokens": None,
         },
         {"kind": "completed"},
@@ -362,6 +366,7 @@ ANTHROPIC_LIVE_WEB_SEARCH_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 12284,
         "output_tokens": 103,
         "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": None,
     },
     {"kind": "completed"},

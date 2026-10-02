@@ -113,6 +113,14 @@ def run_prepared_model_evaluation(
         selected, judge_request, judging_protocol = revised_judge_setup(
             project, prepared, judging_revision
         )
+    if budget.maximum_cost_usd is not None and (
+        not quote.maximum_is_upper_bound or not judge_request.maximum_is_upper_bound()
+    ):
+        raise ValueError(
+            "a finite spending limit requires complete tariffs for every evaluation stage; "
+            "refresh the catalog and prepare again, or use maximum_cost_usd=None "
+            "to retain uncapped execution and replay"
+        )
     report(progress, "Verifying built project")
     completed = completed_project_build(project)
     completion_input = setup.simulation_completion_input

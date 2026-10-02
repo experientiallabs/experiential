@@ -5,8 +5,9 @@ from pathlib import Path
 import pytest
 
 from exp.common.judging import verify_persisted_calibration
-from exp.common.models import ModelSnapshot, completion_cost_reservation
-from exp.common.models.catalog_prices import GatewayTokenPrices
+from exp.common.models import ModelCatalog, ModelSnapshot, Usage, completion_cost_reservation
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayTokenPrices
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
 from exp.optimize.evaluation.planning import estimate_model_evaluation
@@ -17,6 +18,67 @@ from exp.optimize.router.composition_test import _completion_reservation
 from exp.simulation.engines.text.grounding import maximum_query_reservation
 from exp.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
 from exp.simulation.specs import load_simulation_completion_contract
+
+
+def test_launch_estimate_prices_each_captured_request_before_averaging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requests on opposite sides of a whole-input tier cannot be priced at their mean size."""
+    original_trace = build_fixtures._trace
+    original_catalog = build_fixtures._catalog
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=1_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=2_000_000_000,
+        long_context=GatewayLongContextTier(
+            input_threshold_tokens=100,
+            input_nano_usd_per_million_tokens=10_000_000_000,
+            cached_input_nano_usd_per_million_tokens=5_000_000_000,
+            cache_creation_input_nano_usd_per_million_tokens=15_000_000_000,
+            cache_creation_1h_input_nano_usd_per_million_tokens=15_000_000_000,
+            output_nano_usd_per_million_tokens=20_000_000_000,
+            reasoning_nano_usd_per_million_tokens=20_000_000_000,
+        ),
+    )
+
+    def catalog() -> ModelCatalog:
+        """Publish one tiered worker beside an unchanged flat worker."""
+        value = original_catalog()
+        return value.model_copy(
+            update={
+                "models": {
+                    **value.models,
+                    "candidate-a": value.models["candidate-a"].model_copy(
+                        update={"gateway": GatewayDeploymentMetadata(prices=card)}
+                    ),
+                }
+            }
+        )
+
+    def trace(index: int, model: ModelSnapshot) -> Trace:
+        """Keep actual source content while recording two distinctly sized requests."""
+        value = original_trace(index, model)
+        return value.model_copy(
+            update={
+                "spans": tuple(
+                    span.model_copy(update={"usage": Usage(input_tokens=tokens, output_tokens=0)})
+                    for span, tokens in zip(value.spans, (1, 101), strict=True)
+                )
+            }
+        )
+
+    monkeypatch.setattr(build_fixtures, "_catalog", catalog)
+    monkeypatch.setattr(build_fixtures, "_trace", trace)
+    project, _, _, prepared = _prepare(tmp_path)
+    setup = prepared.setup.model_copy(update={"maximum_steps": 2})
+    quote = estimate_model_evaluation(project, setup, judge_request=prepared.judge_request)
+    expected_per_scenario = (1 + 101 * 10 + 1 + 101) / 1_000_000
+    assert quote.workers.estimated_cost_usd == pytest.approx(
+        expected_per_scenario * quote.scenario_count * setup.repeats
+    )
 
 
 @pytest.mark.parametrize("tools", [False, True])
@@ -106,7 +168,13 @@ def test_quote_refuses_unbound_or_wrong_judge_pricing(tmp_path: Path) -> None:
         )
 
 
-def test_incomplete_schedule_quote_cannot_claim_a_strict_spending_bound(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "unknown",
+    ["subsets", "input_nano_usd_per_million_tokens", "output_nano_usd_per_million_tokens"],
+)
+def test_incomplete_schedule_quote_cannot_claim_a_strict_spending_bound(
+    tmp_path: Path, unknown: str
+) -> None:
     """Known ordinary rates support an estimate without pretending missing subsets are free."""
     project, setup = _prepared(tmp_path, multiple=True)
     original = _completion_reservation("judge-model")
@@ -120,6 +188,22 @@ def test_incomplete_schedule_quote_cannot_claim_a_strict_spending_bound(tmp_path
             original.cache_write_usd_per_million_tokens * 1e9
         ),
     )
+    if unknown != "subsets":
+        card = card.model_copy(
+            update={
+                "reasoning_nano_usd_per_million_tokens": 1_000_000_000,
+                "cache_creation_1h_input_nano_usd_per_million_tokens": 1_000_000_000,
+                "long_context": GatewayLongContextTier(
+                    input_threshold_tokens=50_000,
+                    input_nano_usd_per_million_tokens=1_000_000_000,
+                    cached_input_nano_usd_per_million_tokens=1_000_000_000,
+                    cache_creation_input_nano_usd_per_million_tokens=1_000_000_000,
+                    cache_creation_1h_input_nano_usd_per_million_tokens=1_000_000_000,
+                    output_nano_usd_per_million_tokens=1_000_000_000,
+                    reasoning_nano_usd_per_million_tokens=1_000_000_000,
+                ).model_copy(update={unknown: None}),
+            }
+        )
     request = completion_cost_reservation(
         model=original.model,
         token_prices=card,
@@ -130,6 +214,7 @@ def test_incomplete_schedule_quote_cannot_claim_a_strict_spending_bound(tmp_path
         maximum_attempts=original.maximum_attempts,
         maximum_input_tokens=original.maximum_input_tokens,
         maximum_output_tokens=original.maximum_output_tokens,
+        estimated_input_tokens=original.estimated_input_tokens,
     )
     quote = estimate_model_evaluation(project, setup, judge_request=request)
     assert not quote.maximum_is_upper_bound and not quote.judge.maximum_is_upper_bound

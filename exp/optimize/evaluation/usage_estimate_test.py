@@ -59,6 +59,61 @@ def test_identical_messages_without_source_identity_are_distinct_requests() -> N
     assert len(model_turns(trace)) == 2
 
 
+def test_source_episode_means_retain_individual_worker_world_and_judge_requests() -> None:
+    """Different episode lengths and parallel normalization do not erase pricing coordinates."""
+    trace = _trace(1, _completion_reservation("candidate").model)
+    first, second = trace.spans
+    first = first.model_copy(
+        update={
+            "usage": Usage(input_tokens=1, output_tokens=10),
+            "attributes": {**first.attributes, "exp.source.span.id": "first-request"},
+        }
+    )
+    second = second.model_copy(update={"usage": Usage(input_tokens=101, output_tokens=20)})
+    first_episode = trace.model_copy(
+        update={
+            "spans": (
+                first,
+                first.model_copy(update={"span_id": "parallel-copy"}),
+                second,
+            )
+        }
+    )
+    second_episode = trace.model_copy(
+        update={
+            "trace_id": "second-episode",
+            "spans": (first.model_copy(update={"usage": Usage(input_tokens=50, output_tokens=5)}),),
+        }
+    )
+    task = TaskCase(
+        task_id="case",
+        lineage_group_id="lineage",
+        partition="fit",
+        instruction=trace.task,
+        source_trace_ids=(trace.trace_id, "second-episode"),
+        workload_weight=1,
+    )
+    usage = task_usage(
+        task,
+        (first_episode, second_episode),
+        (),
+        top_k=2,
+        maximum_steps=100,
+        maximum_query_tokens=32_768,
+    )
+    assert usage.episode_count == 2
+    assert [(call.input_tokens, call.output_tokens) for call in usage.assistant_requests] == [
+        (1, 10),
+        (101, 20),
+        (50, 5),
+    ]
+    assert usage.assistant_input == 76 and usage.assistant_output == 17.5
+    assert len(usage.world_requests) == 3 and len(usage.judge_inputs) == 2
+    assert sum(call.input_tokens for call in usage.world_requests) / 2 == usage.world_input
+    assert sum(call.output_tokens for call in usage.world_requests) / 2 == usage.world_output
+    assert sum(usage.judge_inputs) / 2 == usage.judge_input
+
+
 def test_vendor_tool_arguments_count_without_full_output_messages() -> None:
     """Grouped normalized tool output contributes to assistant, world and judge estimates."""
     trace = _trace(1, _completion_reservation("candidate").model)

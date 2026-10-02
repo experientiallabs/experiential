@@ -12,6 +12,102 @@ fn frame(payload: serde_json::Value) -> SseEvent {
 }
 
 #[test]
+fn anthropic_cache_write_observations_survive_sparse_usage() {
+    for (start, delta, expected) in [
+        (
+            serde_json::json!({"input_tokens":13,"output_tokens":1}),
+            serde_json::json!({"output_tokens":7}),
+            Some(0),
+        ),
+        (
+            serde_json::json!({"input_tokens":13,"cache_creation_input_tokens":0}),
+            serde_json::json!({"output_tokens":7}),
+            Some(0),
+        ),
+        (
+            serde_json::json!({"cache_creation_input_tokens":0}),
+            serde_json::json!({"output_tokens":7}),
+            Some(0),
+        ),
+        (
+            serde_json::json!({"input_tokens":13,"cache_creation_input_tokens":5}),
+            serde_json::json!({"output_tokens":7}),
+            Some(5),
+        ),
+        (
+            serde_json::json!({}),
+            serde_json::json!({"input_tokens":13,"output_tokens":7}),
+            Some(0),
+        ),
+        (
+            serde_json::json!({}),
+            serde_json::json!({"cache_creation_input_tokens":0,"output_tokens":7}),
+            Some(0),
+        ),
+        (
+            serde_json::json!({}),
+            serde_json::json!({"output_tokens":7}),
+            None,
+        ),
+        (
+            serde_json::json!({"output_tokens":1}),
+            serde_json::json!({"output_tokens":7}),
+            None,
+        ),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        normalizer
+            .feed(&frame(serde_json::json!({
+                "type":"message_start","message":{"usage":start},
+            })))
+            .unwrap();
+        normalizer
+            .feed(&frame(serde_json::json!({
+                "type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":delta,
+            })))
+            .unwrap();
+        let observed = normalizer.observed_usage().unwrap();
+        assert_eq!(observed.cache_creation_input_tokens, expected);
+        assert_eq!(
+            observed
+                .unreported_token_details()
+                .contains(&"cache_write_tokens"),
+            expected.is_none()
+        );
+        let events = normalizer
+            .feed(&frame(serde_json::json!({"type":"message_stop"})))
+            .unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Usage(usage), Event::Completed]
+            if usage.cache_creation_input_tokens == expected)
+        );
+    }
+}
+
+#[test]
+fn anthropic_output_only_delta_preserves_positive_cache_write_ttl() {
+    let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+    normalizer
+        .feed(&frame(serde_json::json!({
+            "type":"message_start","message":{"usage":{
+                "input_tokens":13,"output_tokens":1,"cache_creation_input_tokens":5,
+                "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2},
+            }},
+        })))
+        .unwrap();
+    normalizer
+        .feed(&frame(serde_json::json!({
+            "type":"message_delta","delta":{"stop_reason":"end_turn"},
+            "usage":{"output_tokens":7},
+        })))
+        .unwrap();
+    let observed = normalizer.observed_usage().unwrap();
+    assert_eq!(observed.input_tokens, Some(18));
+    assert_eq!(observed.cache_creation_input_tokens, Some(5));
+    assert_eq!(observed.cache_creation_1h_input_tokens, Some(2));
+}
+
+#[test]
 fn anthropic_partial_usage_never_resets_or_invents_primary_counts() {
     for (start, delta, expected) in [
         (serde_json::json!({}), serde_json::json!({}), (None, None)),

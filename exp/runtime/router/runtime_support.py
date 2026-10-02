@@ -16,6 +16,11 @@ from exp.common.models import (
     OperationEconomics,
     Usage,
 )
+from exp.common.models.token_cost import (
+    schedule_maximum_cost_nano_usd,
+    schedule_prices_complete,
+    schedule_usage_cost_nano_usd,
+)
 from exp.common.routing import KnnRouterPolicy, RoutingDecision, router_feature_token_upper_bound
 from exp.common.routing.bank import KnnEvidenceBank
 from exp.common.routing.decision import policy_content_sha256
@@ -85,6 +90,23 @@ def candidate_reservation_economics(
     )
     if price is None:
         return OperationEconomics(usage=usage)
+    if price.token_prices is not None:
+        if not schedule_prices_complete(
+            price.token_prices, maximum_input_tokens=maximum_input_tokens
+        ):
+            return OperationEconomics(usage=usage)
+        return OperationEconomics(
+            usage=usage,
+            cost_usd=NumericMeasurement(
+                value=schedule_maximum_cost_nano_usd(
+                    price.token_prices,
+                    input_tokens=maximum_input_tokens,
+                    output_tokens=maximum_output_tokens,
+                )
+                / 1_000_000_000,
+                provenance="estimated",
+            ),
+        )
     input_rate = max(
         price.input_usd_per_million_tokens,
         price.cached_input_usd_per_million_tokens or 0.0,
@@ -113,6 +135,8 @@ def candidate_success_disposition(
     Returns:
         The durable disposition describing the source of the final economics.
     """
+    if observed.cost_usd is not None and reconciled.cost_usd is None:
+        return RoutedSpendDisposition.RESERVED_AMBIGUOUS
     if reconciled != observed or (
         reconciled.cost_usd is not None and reconciled.cost_usd.provenance == "estimated"
     ):
@@ -178,6 +202,17 @@ def candidate_completion_economics(
         ValueError: Provider cache counters are inconsistent with total input usage.
     """
     usage = economics.usage
+    if (
+        price is not None
+        and price.token_prices is not None
+        and (
+            economics.provider_attempts is None
+            or economics.provider_attempts - economics.unbilled_attempts != 1
+        )
+    ):
+        # Provider response meters and charges cover only the returned attempt.
+        # The original response retains that evidence beside this unknown total.
+        return economics.model_copy(update={"cost_usd": None})
     if economics.cost_usd is not None or usage is None or price is None:
         return economics
     cached = usage.cached_input_tokens
@@ -188,6 +223,18 @@ def candidate_completion_economics(
         raise ValueError("candidate cache-write input exceeds total input usage")
     if cached is not None and written is not None and cached + written > usage.input_tokens:
         raise ValueError("candidate cache counters overlap beyond total input usage")
+    if price.token_prices is not None:
+        cost = schedule_usage_cost_nano_usd(price.token_prices, usage)
+        if cost is None:
+            return economics
+        return economics.model_copy(
+            update={
+                "cost_usd": NumericMeasurement(
+                    value=cost / 1_000_000_000,
+                    provenance="estimated",
+                )
+            }
+        )
     input_cost = _candidate_input_cost_usd(price, usage)
     output_cost = usage.output_tokens * price.output_usd_per_million_tokens / 1_000_000
     return economics.model_copy(

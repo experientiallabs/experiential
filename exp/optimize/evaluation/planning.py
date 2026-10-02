@@ -162,9 +162,11 @@ def estimate_model_evaluation(
         for task in tasks
     )
     worker_estimate = setup.repeats * math.fsum(
-        expected_completion_cost(
-            request, item.assistant_input, item.assistant_output, request_count=item.turns
+        math.fsum(
+            expected_completion_cost(request, call.input_tokens, call.output_tokens)
+            for call in item.assistant_requests
         )
+        / item.episode_count
         for request in requests.values()
         for item in usage
     )
@@ -219,12 +221,13 @@ def estimate_model_evaluation(
             setup.repeats
             * workers
             * math.fsum(
-                expected_completion_cost(
-                    contract.world_model_request,
-                    item.world_input,
-                    item.world_output,
-                    request_count=item.turns,
+                math.fsum(
+                    expected_completion_cost(
+                        contract.world_model_request, call.input_tokens, call.output_tokens
+                    )
+                    for call in item.world_requests
                 )
+                / item.episode_count
                 for item in usage
             ),
         ),
@@ -268,11 +271,15 @@ def estimate_model_evaluation(
             * setup.repeats
             * judge_calls_per_rollout
             * math.fsum(
-                expected_completion_cost(
-                    judge_request,
-                    min(item.judge_input, judge_request.maximum_input_tokens),
-                    min(512, judge_request.maximum_output_tokens),
+                math.fsum(
+                    expected_completion_cost(
+                        judge_request,
+                        min(input_tokens, judge_request.maximum_input_tokens),
+                        min(512, judge_request.maximum_output_tokens),
+                    )
+                    for input_tokens in item.judge_inputs
                 )
+                / item.episode_count
                 for item in usage
             ),
         ),
@@ -283,7 +290,7 @@ def estimate_model_evaluation(
     return EvaluationCostPlan(
         quote_sha256=sha256_json(
             {
-                "version": 2,
+                "version": 3,
                 "trace_dataset": completed.trace_dataset.model_dump(mode="json"),
                 "task_set": completed.task_set.model_dump(mode="json"),
                 "calibration": calibration_input.model_dump(mode="json"),
@@ -297,6 +304,7 @@ def estimate_model_evaluation(
         estimate_basis=(
             "Captured requests and tool responses; missing usage uses approximately four "
             "UTF-8 bytes/token. World prompts include average eligible RAG examples. "
+            "Each request is priced before averaging source episodes. "
             "Judge assumes a transcript plus 1,024 framing tokens and 512 output tokens. "
             "No assumed cache savings or retries. Future reasoning, world state and "
             "model behavior may change usage."

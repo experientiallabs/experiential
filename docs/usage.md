@@ -506,7 +506,8 @@ When a catalog model carries `gateway.prices`, preparation freezes the complete
 `GatewayTokenPrices` in its request reservations and `CandidateTokenPrice.token_prices`.
 Long-context thresholds apply to each request's original input total, never to the sum of a
 rollout's calls. Cache reads and writes remain disjoint input subsets; reasoning remains an
-output subset. Explicitly returned service tiers select their authored schedule. When no tier
+output subset. Launch estimates also price each captured request before averaging source
+episodes. Explicitly returned service tiers select their authored schedule. When no tier
 is returned, valuation uses the ordinary request contract. Native gateway relays currently do
 not preserve returned service-tier metadata, so their reports cannot establish a different tier.
 These frozen attribution rates are separate from provider invoices, account discounts, and any
@@ -520,8 +521,13 @@ no one-hour split is priceable only when both write rates are known and equal. N
 is inferred from a provider name. A missing applicable rate makes the quote's
 `maximum_is_upper_bound` false; an aggregate cap cannot authorize that request. Uncapped
 execution still saves paid responses and unknown liability before surfacing a valuation error.
-Automatic router optimization requires a finite allowance and rejects an incomplete candidate,
-world, or judge tariff during planning. A priceable successful response cannot settle unbounded
+Prepared evaluation with a finite cap rejects any incomplete stage before constructing provider
+clients. Replaying a preparation with incomplete tariffs requires uncapped mode; saved receipts
+remain untouched. Automatic and hosted router optimization require a finite allowance and reject
+an incomplete candidate, world, or judge tariff during planning.
+A priceable successful response cannot settle unbounded
 liability from earlier potentially paid retries; certified unpaid attempts do not add liability.
-Exact replay returns the saved result or pricing error without another call, including after
-the operator adds a lower cap. Unpriceable assistant usage cannot create a known report cost.
+Request-receipt replay returns the saved result or pricing error without another call, including
+after the operator adds a lower cap. Online routed accounting retains an unknown total when
+the final reply cannot account for earlier potentially paid attempts, preserving the original
+response beside that total. Unpriceable assistant usage cannot create a known report cost.

@@ -42,6 +42,120 @@ class _ScheduledRuntimeCatalog(_RuntimeCatalog):
         )
 
 
+def test_finite_preflight_rejects_incomplete_judge_before_any_runtime_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A priceable simulation cannot run first when the later judge lacks a finite bound."""
+    project, catalog, state = _completed_project(tmp_path)
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+    )
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "judge": catalog.models["judge"].model_copy(
+                    update={"gateway": GatewayDeploymentMetadata(prices=card)}
+                ),
+            }
+        }
+    )
+    judge = prepare_hosted_provisional_judge(
+        project,
+        catalog,
+        maximum_input_tokens=32_768,
+        maximum_output_tokens=8_192,
+        maximum_attempts=3,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    prepared = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        judge_setup=judge.setup_input,
+        calibration_id=judge.calibration_id,
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(maximum_steps=1),
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert prepared.cost.workers.maximum_is_upper_bound
+    assert not prepared.cost.judge.maximum_is_upper_bound
+    before = (
+        project.artifacts.list_ids(),
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    )
+    with pytest.raises(ValueError, match="finite spending limit requires complete"):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            cast(RuntimeModelCatalog, _ScheduledRuntimeCatalog(catalog, state)),
+            budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    assert before == (
+        project.artifacts.list_ids(),
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    )
+    original_complete = _CompletionClient.complete
+
+    def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Give uncapped execution actual zero subset meters, without filling unknown prices."""
+        response = original_complete(client, request)
+        assert response.economics.usage is not None
+        return response.model_copy(
+            update={
+                "economics": response.economics.model_copy(
+                    update={
+                        "provider_attempts": 1,
+                        "usage": response.economics.usage.model_copy(
+                            update={
+                                "cached_input_tokens": 0,
+                                "cache_write_input_tokens": 0,
+                                "reasoning_tokens": 0,
+                            }
+                        ),
+                    }
+                )
+            }
+        )
+
+    monkeypatch.setattr(_CompletionClient, "complete", complete)
+    runtime = cast(RuntimeModelCatalog, _ScheduledRuntimeCatalog(catalog, state))
+    budget = EvaluationBudget(maximum_cost_usd=None, maximum_judgments=100)
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    calls = (len(state.completion_calls), len(state.embedding_calls))
+    replay = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert replay == result
+    assert calls == (len(state.completion_calls), len(state.embedding_calls))
+
+
 def test_full_schedule_preparation_execution_report_and_lower_cap_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
