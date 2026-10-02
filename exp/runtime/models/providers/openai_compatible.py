@@ -24,7 +24,10 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
-from exp.common.models.usage_observability import unreported_token_details
+from exp.common.models.usage_observability import (
+    fold_openai_shaped_reasoning,
+    unreported_token_details,
+)
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
@@ -764,6 +767,15 @@ def _usage(payload: JsonObject) -> Usage | None:
         value = require_object(raw, f"usage.{group}").get(field)
         return None if value is None else require_integer(value, f"usage.{group}.{field}")
 
+    reasoning = detail("completion_tokens_details", "reasoning_tokens")
+    raw_total = usage.get("total_tokens")
+    total = None if raw_total is None else require_integer(raw_total, "usage.total_tokens")
+    try:
+        completion_tokens = fold_openai_shaped_reasoning(
+            prompt_tokens, completion_tokens, reasoning, total
+        )
+    except ValueError as error:
+        raise OpenAICompatibleResponseError(str(error)) from error
     tier = payload.get("service_tier")
     return Usage(
         input_tokens=prompt_tokens,
@@ -771,7 +783,7 @@ def _usage(payload: JsonObject) -> Usage | None:
         cached_input_tokens=detail("prompt_tokens_details", "cached_tokens"),
         cache_write_input_tokens=detail("prompt_tokens_details", "cache_write_tokens"),
         cache_write_1h_input_tokens=detail("prompt_tokens_details", "cache_write_1h_tokens"),
-        reasoning_tokens=detail("completion_tokens_details", "reasoning_tokens"),
+        reasoning_tokens=reasoning,
         service_tier=None if tier is None else require_string(tier, "service_tier"),
     )
 

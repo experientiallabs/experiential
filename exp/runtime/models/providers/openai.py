@@ -25,7 +25,10 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
-from exp.common.models.usage_observability import unreported_token_details
+from exp.common.models.usage_observability import (
+    fold_openai_shaped_reasoning,
+    unreported_token_details,
+)
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
@@ -37,6 +40,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalSignal,
     ProviderResponseError,
     ProviderRetryableResponseError,
+    require_integer,
     require_object,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
@@ -401,9 +405,18 @@ def _usage(
         return None
     try:
         unknown = unreported_token_details(require_object(raw, "usage"), responses=True)
+        raw_hour = (usage.input_tokens_details.model_extra or {}).get("cache_write_1h_tokens")
+        hour = (
+            None if raw_hour is None else require_integer(raw_hour, "OpenAI cache_write_1h_tokens")
+        )
+        reasoning = (
+            None if "reasoning_tokens" in unknown else usage.output_tokens_details.reasoning_tokens
+        )
         return Usage(
             input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
+            output_tokens=fold_openai_shaped_reasoning(
+                usage.input_tokens, usage.output_tokens, reasoning, usage.total_tokens
+            ),
             cached_input_tokens=(
                 None if "cached_tokens" in unknown else usage.input_tokens_details.cached_tokens
             ),
@@ -412,16 +425,8 @@ def _usage(
                 if "cache_write_tokens" in unknown
                 else usage.input_tokens_details.cache_write_tokens
             ),
-            cache_write_1h_input_tokens=(
-                None
-                if "cache_write_1h_tokens" in unknown
-                else (usage.input_tokens_details.model_extra or {}).get("cache_write_1h_tokens")
-            ),
-            reasoning_tokens=(
-                None
-                if "reasoning_tokens" in unknown
-                else usage.output_tokens_details.reasoning_tokens
-            ),
+            cache_write_1h_input_tokens=(None if "cache_write_1h_tokens" in unknown else hour),
+            reasoning_tokens=reasoning,
             service_tier=service_tier,
         )
     except ValueError as exc:

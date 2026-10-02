@@ -494,6 +494,16 @@ def reconcile_completion_economics(
         raise ValueError("successful completion requires at least one potentially billed attempt")
     if attempts > reservation.maximum_attempts:
         raise ValueError("observed provider attempts exceed the request reservation")
+    if (
+        attempts > 1
+        and reservation.token_prices is not None
+        and not schedule_prices_complete(
+            reservation.token_prices, maximum_input_tokens=usage.input_tokens
+        )
+    ):
+        raise ValueError(
+            "earlier completion attempts have unbounded tariff liability; preserve the response"
+        )
     retry_inclusive_cost = successful_cost + (attempts - 1) * maximum_attempt_cost
     derived_cost = max(
         retry_inclusive_cost,

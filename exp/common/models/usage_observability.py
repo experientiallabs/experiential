@@ -7,6 +7,28 @@ UNREPORTED_TOKEN_DETAILS = frozenset(
 )
 
 
+def fold_openai_shaped_reasoning(
+    input_tokens: int, output_tokens: int, reasoning_tokens: int | None, total_tokens: int | None
+) -> int:
+    """Normalize additive reasoning with the same evidence rule as the native mapper.
+
+    A matching provider total decides subset versus additive accounting. Without
+    a decisive total, reasoning larger than output must be additive. This does
+    not fabricate an absent reasoning meter.
+    """
+    if not reasoning_tokens:
+        return output_tokens
+    subset_total = input_tokens + output_tokens
+    if total_tokens == subset_total:
+        return output_tokens
+    if total_tokens == subset_total + reasoning_tokens or reasoning_tokens > output_tokens:
+        combined = output_tokens + reasoning_tokens
+        if combined > 2**63 - 1:
+            raise ValueError("OpenAI output token total overflows a persistable count")
+        return combined
+    return output_tokens
+
+
 def unreported_token_details(usage: JsonObject, *, responses: bool = False) -> frozenset[str]:
     """Read the additive unknown-meter marker without trusting contradictory token values.
 

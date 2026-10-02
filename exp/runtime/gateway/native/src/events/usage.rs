@@ -350,6 +350,210 @@ fn unreported_token_details(
     Ok(unreported)
 }
 
+fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
+    if let (Some(hour), Some(written)) = (
+        usage.cache_creation_1h_input_tokens,
+        usage.cache_creation_input_tokens,
+    ) {
+        if hour > written {
+            return Err("one-hour cache writes exceed total cache writes".into());
+        }
+    }
+    let subsets = bounded_ledger_sum(
+        &[
+            usage.cached_input_tokens.unwrap_or(0),
+            usage.cache_creation_input_tokens.unwrap_or(0),
+        ],
+        "cache subsets",
+    )?;
+    if usage.input_tokens.is_some_and(|input| subsets > input) {
+        return Err("cache read and write tokens exceed total input tokens".into());
+    }
+    Ok(())
+}
+
+/// Parse a Chat Completions usage object: a malformed object fails the stream
+/// instead of silently dropping token accounting.
+/// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
+/// when the provider's `total_tokens` shows it was reported additively.
+#[cfg(test)]
+pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
+    OpenAiUsageAccumulator::default().update_chat(value)
+}
+
+/// Read the cache subsets of OpenAI-shaped total input. Disjoint reads and
+/// writes must fit input together; writes reported within reads must fit the
+/// reads, which must fit input.
+fn cache_subsets(
+    object: &Map<String, Value>,
+    detail_key: &str,
+    input_tokens: Option<u64>,
+    writes_within_reads: bool,
+) -> Result<(Option<u64>, Option<u64>), String> {
+    let reads = optional_usage_detail(object, detail_key, "cached_tokens", "cached_tokens")?;
+    let writes = optional_usage_detail(
+        object,
+        detail_key,
+        "cache_write_tokens",
+        "cache_write_tokens",
+    )?;
+    // A write not covered by its read count is reported the ordinary disjoint
+    // way; it must then fit input like any other rung. Usage arrives after the
+    // content already streamed, so a placeable report never fails the stream.
+    if writes_within_reads && writes.unwrap_or(0) <= reads.unwrap_or(0) {
+        if input_tokens.is_some_and(|input| reads.unwrap_or(0) > input) {
+            return Err("cache read tokens exceed total input tokens".to_string());
+        }
+        return Ok((reads, writes));
+    }
+    let subsets = bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?;
+    if input_tokens.is_some_and(|input| subsets > input) {
+        return Err("cache read and write tokens exceed total input tokens".to_string());
+    }
+    Ok((reads, writes))
+}
+
+/// Move tokens written and read back in one call out of the read leg, so the
+/// coalesced counts satisfy the disjoint contract every settlement prices.
+/// A write without a covering read count cannot be placed and is malformed.
+fn separate_written_reads(usage: &mut Usage) -> Result<(), String> {
+    let writes = usage.cache_creation_input_tokens.unwrap_or(0);
+    if writes == 0 {
+        return Ok(());
+    }
+    // Uncovered writes are the disjoint shape: leave them for the ordinary check.
+    let Some(reads) = usage.cached_input_tokens.filter(|reads| *reads >= writes) else {
+        return Ok(());
+    };
+    usage.cached_input_tokens = Some(reads - writes);
+    Ok(())
+}
+
+/// Parse a present Gemini `usageMetadata`: its non-optional proto3 int32
+/// fields have implicit presence, so omitted scalar counts mean zero.
+/// See google/ai/generativelanguage/v1beta/generative_service.proto in
+/// https://github.com/googleapis/googleapis and ProtoJSON default-value rules:
+/// https://protobuf.dev/programming-guides/json/#presence-and-default-values
+/// The dialect keeps an absent usage object unknown. This provider-specific
+/// scalar rule also covers an omitted thinking count, without asserting that
+/// any reasoning tokens were generated.
+///
+/// Google defines thinking tokens as ADDITIVE to `candidatesTokenCount`
+/// (`totalTokenCount` = prompt + candidates + thoughts, and response pricing
+/// is the sum of output and thinking tokens), so a reported
+/// `thoughtsTokenCount` is folded into `output_tokens`; `reasoning_tokens`
+/// names the subset the ledger prices at the reasoning rate.
+pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
+    let reasoning_tokens =
+        count_or_zero(object, "thoughtsTokenCount", "Gemini thoughtsTokenCount")?;
+    let candidates_tokens = count_or_zero(
+        object,
+        "candidatesTokenCount",
+        "Gemini candidatesTokenCount",
+    )?;
+    let output_tokens =
+        bounded_ledger_sum(&[candidates_tokens, reasoning_tokens], "Gemini output")?;
+    Ok(Usage {
+        input_tokens: Some(count_or_zero(
+            object,
+            "promptTokenCount",
+            "Gemini promptTokenCount",
+        )?),
+        output_tokens: Some(output_tokens),
+        cached_input_tokens: Some(count_or_zero(
+            object,
+            "cachedContentTokenCount",
+            "Gemini cachedContentTokenCount",
+        )?),
+        cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
+        reasoning_tokens: Some(reasoning_tokens),
+    })
+}
+
+/// Parse Bedrock `metadata.usage`: cache read and write legs fold into total
+/// input, cached input reports the read leg, and omitted cache legs mean
+/// zero. Primary omissions stay unknown. Legs and the folded total beyond the
+/// persistable ledger range are provider contract violations and fail the
+/// stream rather than reaching settlement as a value the ledger could never
+/// write. Converse bills a reasoning model's thinking inside `outputTokens`
+/// and publishes no separate count, so `reasoning_tokens` stays unknown.
+pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
+    let usage = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Bedrock metadata.usage must be an object".to_string())?;
+    let fresh = count_if_present(usage, "inputTokens", "Bedrock usage")?;
+    let cache_read = count_or_zero(
+        usage,
+        "cacheReadInputTokens",
+        "Bedrock cacheReadInputTokens",
+    )?;
+    let cache_write = count_or_zero(
+        usage,
+        "cacheWriteInputTokens",
+        "Bedrock cacheWriteInputTokens",
+    )?;
+    let input_tokens = fresh
+        .map(|fresh| bounded_ledger_sum(&[fresh, cache_read, cache_write], "Bedrock input"))
+        .transpose()?;
+    Ok(Usage {
+        input_tokens,
+        output_tokens: count_if_present(usage, "outputTokens", "Bedrock usage")?,
+        cached_input_tokens: Some(cache_read),
+        cache_creation_input_tokens: count_if_present(
+            usage,
+            "cacheWriteInputTokens",
+            "Bedrock usage",
+        )?,
+        cache_creation_1h_input_tokens: None,
+        reasoning_tokens: None,
+    })
+}
+
+/// Fetch a required string field from a provider JSON object.
+pub fn require_string(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{label} must be text"))
+}
+
+/// Fetch a required provider identity with the public contract's character bound.
+pub fn require_bounded_string(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+    maximum_chars: usize,
+) -> Result<String, String> {
+    let value = require_string(object, key, label)?;
+    let length = value.chars().count();
+    if length == 0 || length > maximum_chars {
+        return Err(format!(
+            "{label} must contain between 1 and {maximum_chars} characters"
+        ));
+    }
+    Ok(value)
+}
+
+/// Fetch a required non-negative integer field from a provider JSON object,
+/// bounded like every parsed count so no downstream consumer can receive a
+/// value outside the persistable signed 64-bit range.
+pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
+    object
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
+        .ok_or_else(|| format!("{label} must be a non-negative integer"))
+}
+
 #[cfg(test)]
 mod sparse_tests {
     use super::*;
@@ -494,215 +698,4 @@ mod sparse_tests {
         assert_eq!(valid.input_tokens, Some(250));
         assert_eq!(valid.cached_input_tokens, Some(200));
     }
-}
-
-fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
-    if let (Some(hour), Some(written)) = (
-        usage.cache_creation_1h_input_tokens,
-        usage.cache_creation_input_tokens,
-    ) {
-        if hour > written {
-            return Err("one-hour cache writes exceed total cache writes".into());
-        }
-    }
-    let subsets = bounded_ledger_sum(
-        &[
-            usage.cached_input_tokens.unwrap_or(0),
-            usage.cache_creation_input_tokens.unwrap_or(0),
-        ],
-        "cache subsets",
-    )?;
-    if usage.input_tokens.is_some_and(|input| subsets > input) {
-        return Err("cache read and write tokens exceed total input tokens".into());
-    }
-    Ok(())
-}
-
-/// Parse a Chat Completions usage object: a malformed object fails the stream
-/// instead of silently dropping token accounting.
-/// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
-/// when the provider's `total_tokens` shows it was reported additively.
-#[cfg(test)]
-pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
-    OpenAiUsageAccumulator::default().update_chat(value)
-}
-
-/// Read the cache subsets of OpenAI-shaped total input. Disjoint reads and
-/// writes must fit input together; writes reported within reads must fit the
-/// reads, which must fit input.
-fn cache_subsets(
-    object: &Map<String, Value>,
-    detail_key: &str,
-    input_tokens: Option<u64>,
-    writes_within_reads: bool,
-) -> Result<(Option<u64>, Option<u64>), String> {
-    let reads = optional_usage_detail(object, detail_key, "cached_tokens", "cached_tokens")?;
-    let writes = optional_usage_detail(
-        object,
-        detail_key,
-        "cache_write_tokens",
-        "cache_write_tokens",
-    )?;
-    // A write not covered by its read count is reported the ordinary disjoint
-    // way; it must then fit input like any other rung. Usage arrives after the
-    // content already streamed, so a placeable report never fails the stream.
-    if writes_within_reads && writes.unwrap_or(0) <= reads.unwrap_or(0) {
-        if input_tokens.is_some_and(|input| reads.unwrap_or(0) > input) {
-            return Err("cache read tokens exceed total input tokens".to_string());
-        }
-        return Ok((reads, writes));
-    }
-    let subsets = bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?;
-    if input_tokens.is_some_and(|input| subsets > input) {
-        return Err("cache read and write tokens exceed total input tokens".to_string());
-    }
-    Ok((reads, writes))
-}
-
-/// Move tokens written and read back in one call out of the read leg, so the
-/// coalesced counts satisfy the disjoint contract every settlement prices.
-/// A write without a covering read count cannot be placed and is malformed.
-fn separate_written_reads(usage: &mut Usage) -> Result<(), String> {
-    let writes = usage.cache_creation_input_tokens.unwrap_or(0);
-    if writes == 0 {
-        return Ok(());
-    }
-    // Uncovered writes are the disjoint shape: leave them for the ordinary check.
-    let Some(reads) = usage.cached_input_tokens.filter(|reads| *reads >= writes) else {
-        return Ok(());
-    };
-    usage.cached_input_tokens = Some(reads - writes);
-    Ok(())
-}
-
-/// Parse a present Gemini `usageMetadata`: its non-optional proto3 int32
-/// fields have implicit presence, so omitted scalar counts mean zero.
-/// See google/ai/generativelanguage/v1beta/generative_service.proto in
-/// https://github.com/googleapis/googleapis and ProtoJSON default-value rules:
-/// https://protobuf.dev/programming-guides/json/#presence-and-default-values
-/// The dialect keeps an absent usage object unknown. An omitted thinking
-/// subset stays unspecified rather than asserting a model has reasoning.
-///
-/// Google defines thinking tokens as ADDITIVE to `candidatesTokenCount`
-/// (`totalTokenCount` = prompt + candidates + thoughts, and response pricing
-/// is the sum of output and thinking tokens), so a reported
-/// `thoughtsTokenCount` is folded into `output_tokens`; `reasoning_tokens`
-/// names the subset the ledger prices at the reasoning rate.
-pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
-    let reasoning_tokens = match object.get("thoughtsTokenCount") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(count_or_zero(
-            object,
-            "thoughtsTokenCount",
-            "Gemini thoughtsTokenCount",
-        )?),
-    };
-    let candidates_tokens = count_or_zero(
-        object,
-        "candidatesTokenCount",
-        "Gemini candidatesTokenCount",
-    )?;
-    let output_tokens = bounded_ledger_sum(
-        &[candidates_tokens, reasoning_tokens.unwrap_or(0)],
-        "Gemini output",
-    )?;
-    Ok(Usage {
-        input_tokens: Some(count_or_zero(
-            object,
-            "promptTokenCount",
-            "Gemini promptTokenCount",
-        )?),
-        output_tokens: Some(output_tokens),
-        cached_input_tokens: Some(count_or_zero(
-            object,
-            "cachedContentTokenCount",
-            "Gemini cachedContentTokenCount",
-        )?),
-        cache_creation_input_tokens: None,
-        cache_creation_1h_input_tokens: None,
-        reasoning_tokens,
-    })
-}
-
-/// Parse Bedrock `metadata.usage`: cache read and write legs fold into total
-/// input, cached input reports the read leg, and omitted cache legs mean
-/// zero. Primary omissions stay unknown. Legs and the folded total beyond the
-/// persistable ledger range are provider contract violations and fail the
-/// stream rather than reaching settlement as a value the ledger could never
-/// write. Converse bills a reasoning model's thinking inside `outputTokens`
-/// and publishes no separate count, so `reasoning_tokens` stays unknown.
-pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
-    let usage = value
-        .and_then(Value::as_object)
-        .ok_or_else(|| "Bedrock metadata.usage must be an object".to_string())?;
-    let fresh = count_if_present(usage, "inputTokens", "Bedrock usage")?;
-    let cache_read = count_or_zero(
-        usage,
-        "cacheReadInputTokens",
-        "Bedrock cacheReadInputTokens",
-    )?;
-    let cache_write = count_or_zero(
-        usage,
-        "cacheWriteInputTokens",
-        "Bedrock cacheWriteInputTokens",
-    )?;
-    let input_tokens = fresh
-        .map(|fresh| bounded_ledger_sum(&[fresh, cache_read, cache_write], "Bedrock input"))
-        .transpose()?;
-    Ok(Usage {
-        input_tokens,
-        output_tokens: count_if_present(usage, "outputTokens", "Bedrock usage")?,
-        cached_input_tokens: Some(cache_read),
-        cache_creation_input_tokens: count_if_present(
-            usage,
-            "cacheWriteInputTokens",
-            "Bedrock usage",
-        )?,
-        cache_creation_1h_input_tokens: None,
-        reasoning_tokens: None,
-    })
-}
-
-/// Fetch a required string field from a provider JSON object.
-pub fn require_string(
-    object: &Map<String, Value>,
-    key: &str,
-    label: &str,
-) -> Result<String, String> {
-    object
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("{label} must be text"))
-}
-
-/// Fetch a required provider identity with the public contract's character bound.
-pub fn require_bounded_string(
-    object: &Map<String, Value>,
-    key: &str,
-    label: &str,
-    maximum_chars: usize,
-) -> Result<String, String> {
-    let value = require_string(object, key, label)?;
-    let length = value.chars().count();
-    if length == 0 || length > maximum_chars {
-        return Err(format!(
-            "{label} must contain between 1 and {maximum_chars} characters"
-        ));
-    }
-    Ok(value)
-}
-
-/// Fetch a required non-negative integer field from a provider JSON object,
-/// bounded like every parsed count so no downstream consumer can receive a
-/// value outside the persistable signed 64-bit range.
-pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
-    object
-        .get(key)
-        .and_then(Value::as_u64)
-        .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
-        .ok_or_else(|| format!("{label} must be a non-negative integer"))
 }

@@ -468,7 +468,7 @@ mod gemini_tests {
                 "input_tokens": 1,
                 "output_tokens": 1,
                 "cached_input_tokens": 0,
-                "reasoning_tokens": null,
+                "reasoning_tokens": 0,
             })
         );
         assert_eq!(events[7], json!({"kind": "completed"}));
@@ -592,7 +592,7 @@ mod gemini_tests {
                         "input_tokens": 42,
                         "output_tokens": 0,
                         "cached_input_tokens": 0,
-                        "reasoning_tokens": null,
+                        "reasoning_tokens": 0,
                     }),
                     json!({
                         "kind": "failed",
@@ -817,7 +817,7 @@ mod gemini_tests {
                     "input_tokens": 9,
                     "output_tokens": 3,
                     "cached_input_tokens": 0,
-                    "reasoning_tokens": null,
+                    "reasoning_tokens": 0,
                 }),
                 json!({"kind": "incomplete"}),
             ]
@@ -846,7 +846,7 @@ mod gemini_tests {
                     "input_tokens": 7,
                     "output_tokens": 2,
                     "cached_input_tokens": 0,
-                    "reasoning_tokens": null,
+                    "reasoning_tokens": 0,
                 }),
                 json!({"kind": "completed"}),
             ]
@@ -875,7 +875,7 @@ mod gemini_tests {
                     "input_tokens": 4,
                     "output_tokens": 1,
                     "cached_input_tokens": 0,
-                    "reasoning_tokens": null,
+                    "reasoning_tokens": 0,
                 }),
                 json!({"kind": "completed"}),
             ]

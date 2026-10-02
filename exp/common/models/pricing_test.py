@@ -592,3 +592,41 @@ def test_price_snapshot_binds_full_schedule_without_mutating_previous_bytes(tmp_
     assert changed.pricing_snapshot_id != first.pricing_snapshot_id
     assert changed.candidate_prices[0].token_prices == tiered_prices()
     assert project.artifacts.read_bytes(first.pricing_snapshot_id, "pricing.json") == original
+
+
+@pytest.mark.parametrize("provider_attempts,unbilled_attempts", [(1, 0), (3, 2)])
+def test_known_success_with_no_paid_retries_can_settle_an_incomplete_tariff(
+    provider_attempts: int, unbilled_attempts: int
+) -> None:
+    """Observed zero reasoning is priceable when no earlier potentially paid call remains."""
+    card = prices().model_copy(update={"reasoning_nano_usd_per_million_tokens": None})
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+        token_prices=card,
+    )
+    assert not reservation.maximum_is_upper_bound()
+    reconciled = reconcile_completion_economics(
+        reservation,
+        OperationEconomics(
+            usage=Usage(
+                input_tokens=10,
+                output_tokens=10,
+                cached_input_tokens=0,
+                cache_write_input_tokens=0,
+                reasoning_tokens=0,
+            ),
+            provider_attempts=provider_attempts,
+            unbilled_attempts=unbilled_attempts,
+        ),
+    )
+    assert reconciled.cost_usd is not None
+    assert reconciled.cost_usd.value == pytest.approx(0.00005)
+    assert reconciled.provider_attempts == provider_attempts
+    assert reconciled.unbilled_attempts == unbilled_attempts

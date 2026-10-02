@@ -83,10 +83,8 @@ class BudgetedCompletion:
             "request": request.model_dump(mode="json"),
             "reservation": self._reservation.model_dump(mode="json"),
             "served_model": self._served_model.model_dump(mode="json"),
+            "response_contract": "priced-completion-v1",
         }
-        scheduled = self._reservation.token_prices is not None
-        if scheduled:
-            identity["response_contract"] = "priced-completion-v1"
         fingerprint = sha256_json(identity)
 
         def dispatch() -> _RecordedCompletion:
@@ -99,8 +97,6 @@ class BudgetedCompletion:
                 assert economics.cost_usd is not None
                 return _RecordedCompletion(response=response, charge_usd=economics.cost_usd.value)
             except ValueError as error:
-                if not scheduled:
-                    raise
                 # This is retained liability, not a measured price. Save the paid
                 # response before rejecting it, including across lower-cap replay.
                 return _RecordedCompletion(
@@ -112,18 +108,10 @@ class BudgetedCompletion:
             fingerprint=fingerprint,
             maximum_cost_usd=maximum,
             operation=dispatch,
-            # Existing flat-price runs retain their exact receipt encoding and
-            # fingerprint. The full schedule is a new frozen preparation contract.
-            encode=lambda result: (
-                result.model_dump_json() if scheduled else result.response.model_dump_json()
-            ),
-            decode=(
-                _RecordedCompletion.model_validate_json
-                if scheduled
-                else lambda payload: _RecordedCompletion(
-                    response=ModelResponse.model_validate_json(payload), charge_usd=None
-                )
-            ),
+            # One response contract covers all current tariffs. Old unwrapped
+            # receipts fail the fingerprint check without migration or dispatch.
+            encode=lambda result: result.model_dump_json(),
+            decode=_RecordedCompletion.model_validate_json,
             charge=lambda result: result.charge_usd,
             cost_is_upper_bound=(
                 self._reservation.token_prices is None

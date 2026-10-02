@@ -111,13 +111,52 @@ def test_budgeted_completion_accepts_only_the_configured_served_identity(
             "request": request.model_dump(mode="json"),
             "reservation": reservation.model_dump(mode="json"),
             "served_model": served.model_dump(mode="json"),
+            "response_contract": "priced-completion-v1",
         }
     )
-    assert store.response(receipt) == first.model_dump_json()
+    assert ModelResponse.model_validate(json.loads(store.response(receipt))["response"]) == first
     with budget.scope("cell"):
         assert wrapper.complete(request) == first
     assert first.model == served
     assert client.calls == 1
+
+
+def test_old_flat_receipt_binding_is_rejected_without_redispatch(tmp_path: Path) -> None:
+    """A stale raw-response contract stays untouched and cannot be silently re-executed."""
+    project = ProjectStore(tmp_path, "stale-flat")
+    reservation = _completion_reservation("candidate")
+    client = _Client(reservation.model)
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=1
+    )
+    budget = RequestBudget(project, identity="stale", maximum_cost_usd=100)
+    fingerprint = sha256_json(
+        {
+            "request": request.model_dump(mode="json"),
+            "reservation": reservation.model_dump(mode="json"),
+            "served_model": reservation.model.model_dump(mode="json"),
+        }
+    )
+    with budget.scope("cell"):
+        budget.call(
+            role="assistant",
+            fingerprint=fingerprint,
+            maximum_cost_usd=1,
+            operation=lambda: client.complete(request),
+            encode=lambda response: response.model_dump_json(),
+            decode=ModelResponse.model_validate_json,
+            charge=lambda _response: 0.001,
+        )
+    store = RequestBudgetStore(project, "stale")
+    key = sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0})
+    before = store.read(key)
+    assert before is not None
+    raw = store.response(before)
+    wrapper = BudgetedCompletion(client, budget, reservation, role="assistant")
+    with budget.scope("cell"), pytest.raises(ValueError, match="changed"):
+        wrapper.complete(request)
+    assert client.calls == 1
+    assert store.read(key) == before and store.response(before) == raw
 
 
 def test_pairwise_budget_resume_preserves_reverse_probe_identity(tmp_path: Path) -> None:
@@ -354,10 +393,24 @@ class _PaidClient:
         return self.response
 
 
-def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(tmp_path: Path) -> None:
-    """No second dispatch, false settled cost, or lost output after a missing-rate response."""
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("unknown_tariff", "not priceable"),
+        ("missing_usage", "unknown usage"),
+        ("input_overflow", "usage exceeds"),
+        ("attempt_overflow", "attempts exceed"),
+        ("retry_unknown_tariff", "earlier.*unbounded"),
+    ],
+)
+def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(
+    tmp_path: Path, failure: str, message: str
+) -> None:
+    """Invalid or incomplete paid evidence is retained, never falsely settled or repeated."""
     project = ProjectStore(tmp_path, "scheduled")
-    card = prices().model_copy(update={"reasoning_nano_usd_per_million_tokens": None})
+    card = prices()
+    if failure in ("unknown_tariff", "retry_unknown_tariff"):
+        card = card.model_copy(update={"reasoning_nano_usd_per_million_tokens": None})
     reservation = completion_cost_reservation(
         model=_model(),
         token_prices=card,
@@ -370,12 +423,37 @@ def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(tmp_
         maximum_output_tokens=100,
     )
     client = _PaidClient()
+    if failure != "unknown_tariff":
+        client.response = client.response.model_copy(
+            update={
+                "economics": OperationEconomics(
+                    usage=(
+                        None
+                        if failure == "missing_usage"
+                        else Usage(
+                            input_tokens=1_001 if failure == "input_overflow" else 10,
+                            output_tokens=10,
+                            cached_input_tokens=0,
+                            cache_write_input_tokens=0,
+                            reasoning_tokens=0 if failure == "retry_unknown_tariff" else 3,
+                        )
+                    ),
+                    provider_attempts=(
+                        4
+                        if failure == "attempt_overflow"
+                        else 2
+                        if failure == "retry_unknown_tariff"
+                        else 1
+                    ),
+                )
+            }
+        )
     request = ModelRequest(
         messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=100
     )
     original = RequestBudget(project, identity="schedule", maximum_cost_usd=None)
     wrapper = BudgetedCompletion(client, original, reservation, role="assistant")
-    with original.scope("cell"), pytest.raises(ValueError, match="not priceable"):
+    with original.scope("cell"), pytest.raises(ValueError, match=message):
         wrapper.complete(request)
     store = RequestBudgetStore(project, "schedule")
     key = sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0})
@@ -388,7 +466,7 @@ def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(tmp_
     assert saved["charge_usd"] is None
     resumed = RequestBudget(project, identity="schedule", maximum_cost_usd=0.0000001)
     resumed_wrapper = BudgetedCompletion(client, resumed, reservation, role="assistant")
-    with resumed.scope("cell"), pytest.raises(ValueError, match="not priceable"):
+    with resumed.scope("cell"), pytest.raises(ValueError, match=message):
         resumed_wrapper.complete(request)
     with resumed.scope("new-cell"), pytest.raises(ValueError, match="complete applicable"):
         resumed_wrapper.complete(request)

@@ -510,7 +510,9 @@ output subset. Explicitly returned service tiers select their authored schedule.
 is returned, valuation uses the ordinary request contract. Native gateway relays currently do
 not preserve returned service-tier metadata, so their reports cannot establish a different tier.
 These frozen attribution rates are separate from provider invoices, account discounts, and any
-gateway debit. Previously prepared four-rate runs keep their original contract and receipts.
+gateway debit. Current four-rate and full-schedule requests use the same wrapped response
+contract. Receipts from a different response contract remain untouched and fail before dispatch;
+create a fresh preparation instead of rebinding saved requests.
 
 Unknown meters remain distinct from measured zero. Missing subset counts are priceable only
 when every possible allocation has the same authored rate. A positive cache-write total with
@@ -518,5 +520,8 @@ no one-hour split is priceable only when both write rates are known and equal. N
 is inferred from a provider name. A missing applicable rate makes the quote's
 `maximum_is_upper_bound` false; an aggregate cap cannot authorize that request. Uncapped
 execution still saves paid responses and unknown liability before surfacing a valuation error.
+Automatic router optimization requires a finite allowance and rejects an incomplete candidate,
+world, or judge tariff during planning. A priceable successful response cannot settle unbounded
+liability from earlier potentially paid retries; certified unpaid attempts do not add liability.
 Exact replay returns the saved result or pricing error without another call, including after
 the operator adds a lower cap. Unpriceable assistant usage cannot create a known report cost.

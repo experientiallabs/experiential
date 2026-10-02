@@ -747,6 +747,17 @@ def plan_automatic_router_cost(
         problems.append("automatic cost plan lacks a request reservation for a candidate")
     if any(value is None for value in (router, query, world_request, judge_request)):
         problems.append("automatic cost plan has incomplete provider reservations")
+    completion_requests = [
+        *((item.candidate_alias, item.request) for item in candidates),
+        ("world model", world_request),
+        ("judge", judge_request),
+    ]
+    for label, request in completion_requests:
+        if request is not None and not request.maximum_is_upper_bound():
+            problems.append(
+                f"{label} has an incomplete token tariff; a finite router allowance "
+                "requires every reachable price dimension"
+            )
     if problems:
         raise ValueError("automatic router cost plan failed:\n- " + "\n- ".join(problems))
     assert router is not None and query is not None

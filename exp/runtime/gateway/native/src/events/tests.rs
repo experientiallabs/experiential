@@ -444,7 +444,7 @@ fn gemini_usage_folds_thoughts_into_output_tokens() {
     );
 
     // Verbatim from gemini-2.5-flash with thinkingBudget 0: no
-    // thoughtsTokenCount at all, so the reasoning subset stays unknown and
+    // thoughtsTokenCount at all, so proto3's implicit scalar value is zero and
     // output_tokens is the candidate count (11 + 9 = 20).
     let no_thinking = gemini_usage(&json!({
         "promptTokenCount": 11,
@@ -455,7 +455,7 @@ fn gemini_usage_folds_thoughts_into_output_tokens() {
     }))
     .expect("valid usage");
     assert_eq!(no_thinking.output_tokens, Some(9));
-    assert_eq!(no_thinking.reasoning_tokens, None);
+    assert_eq!(no_thinking.reasoning_tokens, Some(0));
 
     // Documented cached-content shape (cachedContentTokenCount plus
     // cacheTokensDetails): the cache leg stays an input subset while thoughts

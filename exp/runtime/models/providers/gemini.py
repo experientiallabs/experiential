@@ -250,9 +250,10 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
 
     Google defines ``thoughtsTokenCount`` as additive to ``candidatesTokenCount``
     (``totalTokenCount`` is prompt + candidates + thoughts, and response pricing
-    is the sum of output and thinking tokens). An omitted thoughts count stays
-    zero through the shared integer reader, matching the native mapper's fold
-    when the field is present.
+    is the sum of output and thinking tokens). In a present usage object, its
+    non-optional proto3 scalars have implicit presence, so omitted thoughts
+    mean a measured zero. This provider contract does not default missing
+    usage from other dialects to zero.
 
     Args:
         payload: Decoded completed Gemini response.
@@ -274,7 +275,7 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
     return Usage(
         input_tokens=require_integer(usage.get("promptTokenCount"), "Gemini promptTokenCount"),
         output_tokens=candidates_tokens + thoughts_tokens,
-        reasoning_tokens=(thoughts_tokens if usage.get("thoughtsTokenCount") is not None else None),
+        reasoning_tokens=thoughts_tokens,
         cached_input_tokens=require_integer(
             usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),
