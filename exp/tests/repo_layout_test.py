@@ -44,6 +44,16 @@ ALLOWED_TOP_FILES = {
     "SETUP.md",
     "uv.lock",
 }
+PULL_REQUEST_TRIGGER = re.compile(
+    r"(?m)^(?:  pull_request\s*:|on:\s*(?:pull_request\s*$|\[[^\]\n]*\bpull_request\b))"
+)
+PULL_REQUEST_CONCURRENCY_POLICY = "\n".join(
+    (
+        "concurrency:",
+        "  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}",
+        "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+    )
+)
 
 
 def _tracked_files() -> tuple[str, ...]:
@@ -111,6 +121,27 @@ def test_top_level_paths_are_allowlisted() -> None:
     actual_files = {path for path in tracked if "/" not in path}
     assert actual_dirs == ALLOWED_TOP_DIRS
     assert actual_files == ALLOWED_TOP_FILES
+
+
+def test_pull_request_workflows_cancel_only_superseded_pr_runs() -> None:
+    """Keep one current run per PR without cancelling other workflow events."""
+    discovered: list[str] = []
+    missing_policy: list[str] = []
+    for relative_path in _tracked_files():
+        path = Path(relative_path)
+        if path.parent != Path(".github/workflows") or path.suffix not in {".yaml", ".yml"}:
+            continue
+        workflow = (REPO_ROOT / path).read_text(encoding="utf-8")
+        if PULL_REQUEST_TRIGGER.search(workflow) is None:
+            continue
+        discovered.append(relative_path)
+        if PULL_REQUEST_CONCURRENCY_POLICY not in workflow:
+            missing_policy.append(relative_path)
+
+    assert discovered, "repository has no tracked pull-request workflows"
+    assert not missing_policy, (
+        f"pull-request workflows lack the cancellation policy: {missing_policy}"
+    )
 
 
 def test_package_wide_tests_live_in_tests_directories() -> None:
