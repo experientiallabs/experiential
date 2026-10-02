@@ -612,7 +612,7 @@ def _spec(
         "world_model": WorldModelSettings(
             world_model_alias="world-model-a",
             grounded_world_model_input=grounded_input,
-            prompt_version="text-world-model-v2",
+            prompt_version="text-world-model-v3",
             query_embedding=query_embedding or _query_embedding(),
         ),
         "seed": 11,
@@ -1058,7 +1058,7 @@ def test_worst_case_query_reservation_never_blocks_an_episode_with_spend_remaini
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v2",
+        prompt_version="text-world-model-v3",
         query_embedding=_query_embedding(price=100.0),
     )
 
@@ -1131,7 +1131,7 @@ def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ce
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v2",
+        prompt_version="text-world-model-v3",
         query_embedding=_query_embedding(),
     )
 
@@ -1197,7 +1197,7 @@ def test_query_embedding_catalog_drift_blocks_every_dispatch(
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v2",
+        prompt_version="text-world-model-v3",
         query_embedding=_query_embedding(
             price=price,
             maximum_attempts=maximum_attempts,

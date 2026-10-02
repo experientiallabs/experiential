@@ -475,6 +475,17 @@ def test_direct_runtime_rejects_capabilities_outside_frozen_identity(context: in
     assert client.requests == []
 
 
+@pytest.mark.parametrize("field", ["prompt_version", "prompt_sha256"])
+def test_direct_runtime_cannot_render_new_framing_under_stale_prompt_identity(field: str) -> None:
+    """Direct construction has the same immutable prompt boundary as the artifact loader."""
+    runtime, retriever, client = _runtime('{"message":"Next","terminal":false}')
+    value = "text-world-model-v2" if field == "prompt_version" else "0" * 64
+    with pytest.raises(ValueError, match="prompt"):
+        replace(runtime, artifact=runtime.artifact.model_copy(update={field: value}))
+    assert retriever.queries == []
+    assert client.requests == []
+
+
 def test_step_rejects_unsolicited_tool_results_for_text_action() -> None:
     """A valid transition envelope cannot invent tools the assistant never called."""
     runtime, _, _ = _runtime('{"tool_results":[{"call_id":"invented","content":"ok"}]}')

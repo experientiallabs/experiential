@@ -151,7 +151,8 @@ class GroundedWorldModel:
     token_counter: TokenCounter = field(default_factory=Utf8UpperBoundTokenCounter)
 
     def __post_init__(self) -> None:
-        """Reject a capacity binding that differs from the immutable build artifact."""
+        """Require the current prompt and the immutable build's exact capacity binding."""
+        _require_current_prompt(self.artifact)
         if self.capabilities.identity_sha256() != self.artifact.model.capabilities_sha256:
             raise ValueError(
                 "world-model capabilities differ from the frozen build artifact; "
@@ -578,8 +579,19 @@ def _load_verified_artifact(
     )
     if stable_id("grounded-world-model", content) != artifact_id:
         raise ValueError("grounded world-model artifact ID differs from its complete content")
-    if artifact.prompt_version != GROUNDED_WORLD_MODEL_PROMPT_VERSION:
-        raise ValueError("grounded world-model prompt version is not supported by this runtime")
-    if artifact.prompt_sha256 != grounded_world_model_prompt_sha256():
-        raise ValueError("grounded world-model prompt digest differs from this runtime")
+    _require_current_prompt(artifact)
     return artifact
+
+
+def _require_current_prompt(artifact: GroundedWorldModelArtifact) -> None:
+    """Require the frozen prompt identity before loading or directly constructing a runtime."""
+    if artifact.prompt_version != GROUNDED_WORLD_MODEL_PROMPT_VERSION:
+        raise ValueError(
+            "grounded world-model prompt version is not supported by this runtime; "
+            "persist a new world model over the unchanged RAG index and prepare a new evaluation"
+        )
+    if artifact.prompt_sha256 != grounded_world_model_prompt_sha256():
+        raise ValueError(
+            "grounded world-model prompt digest differs from this runtime; "
+            "persist a new world model over the unchanged RAG index and prepare a new evaluation"
+        )

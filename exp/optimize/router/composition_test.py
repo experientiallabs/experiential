@@ -441,7 +441,7 @@ class _SetupSupplier:
             world_model_settings=WorldModelSettings(
                 world_model_alias="world-model-a",
                 grounded_world_model_input=completed.world_model,
-                prompt_version="text-world-model-v2",
+                prompt_version="text-world-model-v3",
                 query_embedding=EmbeddingCostReservation(
                     model=fit_index.embedder,
                     input_usd_per_million_tokens=0.0,

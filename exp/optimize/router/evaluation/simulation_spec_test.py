@@ -92,7 +92,7 @@ def _plan_and_setup() -> tuple[EvaluationPlan, EvaluationCell, RouterEvaluationS
         world_model_settings=WorldModelSettings(
             world_model_alias="world-model-a",
             grounded_world_model_input=ArtifactInput(artifact_id="world-model-a", sha256=_DIGEST),
-            prompt_version="text-world-model-v2",
+            prompt_version="text-world-model-v3",
         ),
         agent_id="agent-a",
         seed=7,
