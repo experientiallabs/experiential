@@ -90,6 +90,7 @@ from exp.runtime.models.providers.instruction_turns import (
 )
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
+from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 from exp.runtime.openai_protocol.state import ProtocolNamespace
@@ -3401,6 +3402,33 @@ def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) ->
     # The narrowed route is what serves and anchors accounting.
     started = _start_first(control, admission)
     assert started["route_depth"] == 0
+
+
+def test_admit_skips_a_lead_with_a_profile_transport_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token-endpoint outage at profile resolution serves the live fallback."""
+    control, raw_key = _pool_control_plane(tmp_path)
+    original_profile = OpenAICompatibleClient.gateway_wire_profile
+
+    def profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
+        """Fail the lead profile like a Vertex token refresh transport error."""
+        resolved = original_profile(client)
+        if resolved.model_id == "alpha-model-exact":
+            raise ProviderTransportError("Vertex token endpoint request failed")
+        return resolved
+
+    monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", profile)
+
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert "escalate" not in admission
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["beta-model-exact"]
+    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+    assert control_plane["admission_lead_rungs_skipped"] == 1
+    assert control_plane["admission_dead_rungs_skipped"] == 1
 
 
 def test_admit_recovers_a_dead_lead_when_its_credential_heals(tmp_path: Path) -> None:
