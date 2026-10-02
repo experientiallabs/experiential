@@ -38,6 +38,11 @@ fails instead of truncating it. For models without a published output maximum, t
 remaining-context output binding happens after optional examples yield to the requested output. The
 100-step and 1,000,000-total-output-token rollout defaults are independent of this packing.
 
+Required prompt framing and output capacity are checked before query embedding or retrieval cost
+admission, then checked again before completion dispatch. Public `WorldModel.step` sessions report
+these local capacity failures as `WorldModelSessionError`; low-level grounded runtimes use
+`ValueError`. Provider failures retain their original exception types.
+
 Low-level `GroundedWorldModel` construction, `load_grounded_world_model`, and
 `bind_fit_grounded_world_model` require `capabilities=resolved_model.capabilities`. The metadata
 must match the model identity frozen into the build artifact before either serving or fit-only

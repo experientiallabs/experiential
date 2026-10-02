@@ -53,6 +53,7 @@ from exp.simulation.retrieval import (
 )
 from exp.simulation.world_model import (
     WorldModel,
+    WorldModelSessionError,
     bind_fit_grounded_world_model,
     load_grounded_world_model,
     persist_grounded_world_model,
@@ -71,6 +72,10 @@ from exp.simulation.world_model.runtime import GroundedWorldModel
 class _Embedder:
     """Stable local embedding client shared by index build and runtime query."""
 
+    def __init__(self) -> None:
+        """Retain every actual embedding batch for paid-work boundary checks."""
+        self.requests: list[tuple[str, ...]] = []
+
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
         """Return deterministic unit vectors.
 
@@ -80,6 +85,7 @@ class _Embedder:
         Returns:
             Stable unit vectors in input order.
         """
+        self.requests.append(tuple(texts))
         embedded = []
         for text in texts:
             digest = hashlib.sha256(text.encode()).digest()
@@ -173,7 +179,8 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
         capabilities_sha256=sha256_json(capabilities),
         connection_sha256=sha256_json({"connection": "fixture"}),
     )
-    binding = RAGEmbedderBinding(client=_Embedder(), snapshot=embedding_snapshot)
+    embedder = _Embedder()
+    binding = RAGEmbedderBinding(client=embedder, snapshot=embedding_snapshot)
     rag = persist_trace_rag(
         store.artifacts,
         (artifact_input(trace_manifest),),
@@ -271,14 +278,18 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     assert fit_runtime.capabilities == world_capabilities
     fit_runtime.step(task="Reset my password", action=AssistantAction(content="What email?"))
     assert len(client.requests) == 2
+    embedding_count = len(embedder.requests)
+    for maximum_output_tokens in (8_193, 0, -1):
+        with pytest.raises(ValueError):
+            fit_runtime.step(
+                task="Reset my password",
+                action=AssistantAction(content="Help"),
+                maximum_output_tokens=maximum_output_tokens,
+            )
+        assert len(embedder.requests) == embedding_count
     with pytest.raises(ValueError, match="required world-model input.*context"):
         fit_runtime.step(task="Required task " * 3_000, action=AssistantAction(content="Help"))
-    with pytest.raises(ValueError, match="lower maximum_output_tokens or choose a model"):
-        fit_runtime.step(
-            task="Reset my password",
-            action=AssistantAction(content="Help"),
-            maximum_output_tokens=8_193,
-        )
+    assert len(embedder.requests) == embedding_count
     assert len(client.requests) == 2
     for context in (None, 16_384, 65_536):
         with pytest.raises(ValueError, match="capabilities differ from.*artifact"):
@@ -496,9 +507,65 @@ def test_public_steps_pack_examples_and_reject_required_overflow(public_session:
     assert evidence["task"]["instruction"] == "Required task"
     assert request.maximum_output_tokens == 1_024
     assert Utf8UpperBoundTokenCounter().count(request) + 1_024 <= 24_000
-    with pytest.raises(ValueError, match="required world-model input.*context"):
+    error = WorldModelSessionError if public_session else ValueError
+    query_count = len(retriever.queries)
+    with pytest.raises(error, match="required world-model input.*context"):
         step("Required task " * 3_000)
+    assert len(retriever.queries) == query_count
     assert len(client.requests) == 1
+
+
+def test_session_capacity_rejection_keeps_transcript_and_lock_reusable() -> None:
+    """A local capacity failure keeps its public type and does not advance session evidence."""
+    runtime, retriever, client = _runtime(
+        '{"message":"Next","terminal":false}',
+        capabilities=ModelCapabilities(context_window_tokens=24_000, maximum_output_tokens=16_000),
+    )
+    world = WorldModel(runtime)
+    session = world.new_session(task="Required task")
+    with pytest.raises(WorldModelSessionError, match="required world-model input.*context"):
+        world.step(session.id, {"role": "assistant", "content": "Large action " * 3_000})
+    assert retriever.queries == []
+    assert client.requests == []
+    world.step(session.id, {"role": "assistant", "content": "Valid action"})
+    assert len(retriever.queries) == len(client.requests) == 1
+    assert json.loads(client.requests[0].messages[1].content or "")["visible_conversation"] == []
+
+
+def test_session_rejects_unsupported_output_before_retrieval() -> None:
+    """The public fixed output request respects known output limits even with unknown context."""
+    runtime, retriever, client = _runtime(
+        '{"message":"Next","terminal":false}',
+        capabilities=ModelCapabilities(maximum_output_tokens=1_023),
+    )
+    retriever.matches = (_grounding_example("eligible", 20),)
+    world = WorldModel(runtime)
+    session = world.new_session(task="Required task")
+    with pytest.raises(WorldModelSessionError, match="choose a model with a larger output"):
+        world.step(session.id, {"role": "assistant", "content": "Action"})
+    assert retriever.queries == []
+    assert client.requests == []
+
+
+@pytest.mark.parametrize("phase", ["retrieve", "complete"])
+def test_session_does_not_reclassify_provider_value_errors(
+    phase: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only known local capacity errors become session errors; provider failures retain identity."""
+    runtime, retriever, client = _runtime('{"message":"Next","terminal":false}')
+    failure = ValueError("provider fixture failure")
+
+    def fail(_request: ModelRequest | RAGQuery) -> None:
+        """Raise the exact provider-side exception after the local preflight."""
+        raise failure
+
+    monkeypatch.setattr(retriever if phase == "retrieve" else client, phase, fail)
+    world = WorldModel(runtime)
+    session = world.new_session(task="Required task")
+    with pytest.raises(ValueError) as raised:
+        world.step(session.id, {"role": "assistant", "content": "Action"})
+    assert raised.value is failure
+    world.end_session(session.id)
 
 
 def test_step_returns_exact_parallel_tool_results_with_canonical_grounding() -> None:

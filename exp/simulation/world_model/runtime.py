@@ -32,6 +32,7 @@ from exp.simulation.engines.text.prompt import (
 from exp.simulation.engines.text.tokens import (
     TokenCounter,
     Utf8UpperBoundTokenCounter,
+    WorldModelCapacityError,
     bound_unpublished_output,
 )
 from exp.simulation.retrieval import (
@@ -166,6 +167,7 @@ class GroundedWorldModel:
         excluded_lineage_ids: tuple[str, ...],
         maximum_output_tokens: int,
         state: JsonObject | None = None,
+        json_object_output: bool = False,
     ) -> PreparedGroundedWorldModelCall:
         """Retrieve and frame one fit- or serving-bound grounded text transition.
 
@@ -176,10 +178,19 @@ class GroundedWorldModel:
             excluded_lineage_ids: Source lineages forbidden from retrieval.
             maximum_output_tokens: Explicit provider output ceiling.
             state: Private environment state retained between simulated turns.
+            json_object_output: Provider JSON control included in required framing.
 
         Returns:
             Exact request and retrieved evidence before provider dispatch.
         """
+        self.preflight_turn(
+            task=task,
+            visible_messages=visible_messages,
+            candidate_response=candidate_response,
+            maximum_output_tokens=maximum_output_tokens,
+            state=state,
+            json_object_output=json_object_output,
+        )
         queries = tuple(
             RAGQuery(
                 task=task.instruction,
@@ -207,9 +218,75 @@ class GroundedWorldModel:
             maximum_output_tokens=maximum_output_tokens,
             state=state,
         )
+        request = request.model_copy(update={"json_object_output": json_object_output})
         return PreparedGroundedWorldModelCall(
             request=request, matches=matches, action=candidate_response
         )
+
+    def preflight_turn(
+        self,
+        *,
+        task: TaskCase,
+        visible_messages: Sequence[ModelMessage],
+        candidate_response: AssistantAction,
+        maximum_output_tokens: int,
+        state: JsonObject | None = None,
+        json_object_output: bool = False,
+        maximum_input_tokens: int | None = None,
+    ) -> None:
+        """Admit required framing before retrieval or its paid-work accounting window.
+
+        Args:
+            task: Complete canonical task, including tool schemas and initial context.
+            visible_messages: Candidate-visible transcript retained in the world prompt.
+            candidate_response: Exact assistant action and original tool-call identities.
+            maximum_output_tokens: Original requested output allowance.
+            state: Complete private environment state retained between simulated turns.
+            json_object_output: Provider JSON control included in token accounting.
+            maximum_input_tokens: Optional stricter frozen request reservation.
+
+        Raises:
+            ValueError: The output allowance is not positive.
+            WorldModelCapacityError: Required framing cannot fit the declared capacities.
+        """
+        request = build_world_model_request(
+            task,
+            visible_messages=visible_messages,
+            candidate_response=candidate_response,
+            grounded_examples=(),
+            maximum_output_tokens=maximum_output_tokens,
+            state=state,
+        ).model_copy(update={"json_object_output": json_object_output})
+        # Admission may bind unpublished output around required content. Retrieval still uses
+        # the original allowance so optional examples yield before actual output is bound.
+        request = bound_unpublished_output(request, self.capabilities, self.token_counter)
+        self._require_capacity(request, maximum_input_tokens=maximum_input_tokens)
+
+    def _require_capacity(
+        self, request: ModelRequest, *, maximum_input_tokens: int | None = None
+    ) -> None:
+        """Validate one fully rendered request without retrieval, dispatch, or accounting."""
+        output = request.maximum_output_tokens
+        if output is None or output <= 0:
+            raise WorldModelCapacityError("world-model maximum_output_tokens must be positive")
+        published_output = self.capabilities.maximum_output_tokens
+        if published_output is not None and output > published_output:
+            raise WorldModelCapacityError(
+                "world-model output exceeds the published model capacity; lower "
+                "maximum_output_tokens or choose a model with a larger output capacity"
+            )
+        required = self.token_counter.count(request)
+        context = self.capabilities.context_window_tokens
+        if required < 0 or (context is not None and required + output > context):
+            raise WorldModelCapacityError(
+                "required world-model input and output exceed the context capacity; "
+                "choose a larger-context world model"
+            )
+        if maximum_input_tokens is not None and required > maximum_input_tokens:
+            raise WorldModelCapacityError(
+                "required world-model input exceeds the frozen input reservation; "
+                "prepare a larger input reservation before retrying"
+            )
 
     def complete_turn(
         self,
@@ -227,20 +304,7 @@ class GroundedWorldModel:
             ValueError: Required evidence or output cannot fit the bound model capacity.
         """
         prepared = prepared.fit_context(self.capabilities, self.token_counter)
-        required = self.token_counter.count(prepared.request)
-        output = prepared.request.maximum_output_tokens or 0
-        context = self.capabilities.context_window_tokens
-        if required < 0 or (context is not None and required + output > context):
-            raise ValueError(
-                "required world-model input and output exceed the context capacity; "
-                "choose a larger-context world model"
-            )
-        published_output = self.capabilities.maximum_output_tokens
-        if published_output is not None and output > published_output:
-            raise ValueError(
-                "world-model output exceeds the published model capacity; lower "
-                "maximum_output_tokens or choose a model with a larger output capacity"
-            )
+        self._require_capacity(prepared.request)
         response = self.client.complete(prepared.request)
         return DispatchedGroundedWorldModelCall(
             request=prepared.request,

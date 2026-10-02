@@ -35,12 +35,13 @@ from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.engines.text.prompt import build_world_model_request
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TextSimulationError,
     _require_response_identity,
 )
-from exp.simulation.engines.text.tokens import TokenCounter
+from exp.simulation.engines.text.tokens import TokenCounter, Utf8UpperBoundTokenCounter
 from exp.simulation.retrieval import RAGMatch, RAGQuery, TraceRAGRetriever
 from exp.simulation.retrieval.contracts import RAGAction, RAGObservation, RAGTransition
 from exp.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
@@ -866,6 +867,55 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
         "output": {"content": "unfinished response", "tool_calls": []},
         "finish_reason": "length",
     }
+
+
+@pytest.mark.parametrize("boundary", ["required_content", "json_framing", "frozen_input"])
+def test_required_world_preflight_retains_candidate_without_claiming_retrieval_spend(
+    boundary: str,
+) -> None:
+    """Known required-input failures precede embedding admission and retain prior paid evidence."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient([])
+    request = ModelRequest(messages=(ModelMessage(role="user", content="Complete the task."),))
+    counter = Utf8UpperBoundTokenCounter()
+    required = build_world_model_request(
+        _task(),
+        visible_messages=request.messages,
+        candidate_response=AssistantAction(content="answer"),
+        grounded_examples=(),
+        maximum_output_tokens=16_000,
+        state={},
+    )
+    input_count = counter.count(required)
+    context = input_count + 16_000 if boundary == "json_framing" else 100_000
+    if boundary == "required_content":
+        context = input_count + 15_999
+    reservation = (
+        _completion_reservation("world-model-a", maximum_input_tokens=input_count - 1)
+        if boundary == "frozen_input"
+        else None
+    )
+    recorder = _recorder(
+        candidate,
+        world,
+        world_context_window=context,
+        world_model_json_object_output=boundary == "json_framing",
+        world_request=reservation,
+        token_counter=counter,
+    )
+    retriever = cast(_Retriever, recorder._grounded_world_model.retriever)
+    with pytest.raises(TextSimulationError) as raised:
+        recorder.complete(request)
+    assert raised.value.stop_reason == StopReason.CONTEXT_OVERFLOW
+    assert not raised.value.failure.details.get("provider_dispatch_unknown_spend", False)
+    assert retriever.queries == []
+    assert world.requests == []
+    assert len(candidate.requests) == len(recorder.recorded.candidate_spans) == 1
+    assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.10, provenance="observed"
+    )
+    assert recorder.recorded.retrieval_economics == OperationEconomics()
+    assert recorder.recorded.world_model_spans == ()
 
 
 def test_unpublished_output_limits_dispatch_full_requests_within_context_and_reservations() -> None:

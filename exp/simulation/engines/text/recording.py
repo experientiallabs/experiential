@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
 from threading import Lock
 from typing import TYPE_CHECKING, cast
@@ -61,13 +61,18 @@ from exp.simulation.engines.text.prompt import (
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.recording_payloads import (
+    RecordedTextCalls,
     bounded_candidate_request,
     delivered_world_span,
     model_span,
     world_retry_request,
 )
 from exp.simulation.engines.text.redaction import redact_json
-from exp.simulation.engines.text.tokens import TokenCounter, bound_unpublished_output
+from exp.simulation.engines.text.tokens import (
+    TokenCounter,
+    WorldModelCapacityError,
+    bound_unpublished_output,
+)
 from exp.simulation.retrieval import RAGQuery
 from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 
@@ -85,19 +90,6 @@ class TextSimulationError(RuntimeError):
         super().__init__(failure.message)
         self.stop_reason = stop_reason
         self.failure = failure
-
-
-@dataclass(frozen=True)
-class RecordedTextCalls:
-    """Immutable recorded calls, visible world transitions, and separated operation economics."""
-
-    candidate_spans: tuple[RolloutSpan, ...]
-    world_model_spans: tuple[RolloutSpan, ...]
-    candidate_economics: OperationEconomics
-    world_model_economics: OperationEconomics
-    retrieval_economics: OperationEconomics
-    transitions: tuple[TextWorldModelTransition, ...]
-    retrieved_transition_ids: tuple[tuple[str, ...], ...]
 
 
 class RecordingCandidateClient:
@@ -442,6 +434,31 @@ class RecordingCandidateClient:
                 "candidate tool calls require declared tool names and unique call IDs",
                 phase="candidate_tools",
             )
+        world_output = min(
+            self._maximum_output_tokens,
+            self._world_model.capabilities.maximum_output_tokens or self._maximum_output_tokens,
+        )
+        try:
+            self._grounded_world_model.preflight_turn(
+                task=self._task,
+                visible_messages=candidate_request.messages,
+                candidate_response=candidate_response.output,
+                maximum_output_tokens=world_output,
+                state=self._environment_state,
+                json_object_output=self._world_model_json_object_output,
+                maximum_input_tokens=(
+                    self._world_model_request.maximum_input_tokens
+                    if self._world_model_request
+                    else None
+                ),
+            )
+        except WorldModelCapacityError as exc:
+            raise _text_failure(
+                StopReason.CONTEXT_OVERFLOW,
+                FailureCode.CONTEXT_OVERFLOW,
+                str(exc),
+                phase="world_model_preflight",
+            ) from exc
         queries = tuple(
             RAGQuery(
                 task=self._task.instruction,
@@ -472,23 +489,14 @@ class RecordingCandidateClient:
                 candidate_response=candidate_response.output,
                 excluded_lineage_ids=(self._task.lineage_group_id,),
                 state=self._environment_state,
-                maximum_output_tokens=min(
-                    self._maximum_output_tokens,
-                    self._world_model.capabilities.maximum_output_tokens
-                    or self._maximum_output_tokens,
-                ),
+                maximum_output_tokens=world_output,
+                json_object_output=self._world_model_json_object_output,
             ),
             # The retained retrieval estimate above already covers this dispatch's worst case
             # in every reconciliation path, so the window's incremental reservation is zero.
             reserved_cost_usd=0.0,
         )
         self._clear_unknown_dispatch()
-        prepared = replace(
-            prepared,
-            request=prepared.request.model_copy(
-                update={"json_object_output": self._world_model_json_object_output}
-            ),
-        )
         transition = self._complete_world_turn(prepared, candidate_ended_at)
         self._transitions.append(transition)
         self._visible_transcript = (

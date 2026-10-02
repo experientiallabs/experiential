@@ -25,6 +25,7 @@ from exp.common.project import ProjectStore, ProjectStoreError
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.models import CapabilityRequirement, RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
+from exp.simulation.engines.text.tokens import WorldModelCapacityError
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.world_model.runtime import (
     GroundedWorldModel,
@@ -236,7 +237,8 @@ class WorldModel:
 
         Raises:
             WorldModelSessionError: The session is absent, expired, closed, unsupported, or would
-                exceed a transcript limit.
+                exceed a transcript or model capacity limit. Provider failures retain their
+                original exception types.
         """
         candidate_action = _assistant_action(action)
         action_message = (
@@ -263,15 +265,18 @@ class WorldModel:
             if len({call.call_id for call in calls}) != len(calls):
                 raise WorldModelSessionError("tool_calls require unique IDs")
             self._require_step_capacity(state, action_message)
-            prepared = self._runtime.prepare_turn(
-                task=state.task_case,
-                visible_messages=state.messages,
-                candidate_response=candidate_action,
-                state=state.environment_state,
-                excluded_lineage_ids=(),
-                maximum_output_tokens=1_024,
-            )
-            dispatched = self._runtime.complete_turn(prepared)
+            try:
+                prepared = self._runtime.prepare_turn(
+                    task=state.task_case,
+                    visible_messages=state.messages,
+                    candidate_response=candidate_action,
+                    state=state.environment_state,
+                    excluded_lineage_ids=(),
+                    maximum_output_tokens=1_024,
+                )
+                dispatched = self._runtime.complete_turn(prepared)
+            except WorldModelCapacityError as exc:
+                raise WorldModelSessionError(str(exc)) from exc
             if dispatched.response.model != self._runtime.artifact.model:
                 raise WorldModelSessionError(
                     "world-model response identity differs from its build artifact"

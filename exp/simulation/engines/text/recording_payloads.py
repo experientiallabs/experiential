@@ -1,5 +1,6 @@
 """Canonical visible transcripts and redacted model-call evidence for text rollouts."""
 
+from dataclasses import dataclass
 from datetime import datetime
 
 from pydantic import JsonValue
@@ -11,12 +12,36 @@ from exp.common.models import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    OperationEconomics,
 )
 from exp.common.rollouts import RolloutEventKind, RolloutSpan
 from exp.simulation.engines.text.packing import pack_world_model_request
-from exp.simulation.engines.text.prompt import retry_world_model_request
+from exp.simulation.engines.text.prompt import TextWorldModelTransition, retry_world_model_request
 from exp.simulation.engines.text.redaction import redact_json
 from exp.simulation.engines.text.tokens import TokenCounter
+
+
+@dataclass(frozen=True)
+class RecordedTextCalls:
+    """Immutable recorded calls, visible transitions, and separated operation economics.
+
+    Attributes:
+        candidate_spans: Retained candidate-call evidence in dispatch order.
+        world_model_spans: Retained world-call evidence in dispatch order.
+        candidate_economics: Combined candidate-only usage and cost.
+        world_model_economics: Combined world-only usage and cost, including invalid replies.
+        retrieval_economics: Combined retained retrieval accounting.
+        transitions: Accepted world transitions delivered to the candidate.
+        retrieved_transition_ids: Ordered grounding IDs actually dispatched per world response.
+    """
+
+    candidate_spans: tuple[RolloutSpan, ...]
+    world_model_spans: tuple[RolloutSpan, ...]
+    candidate_economics: OperationEconomics
+    world_model_economics: OperationEconomics
+    retrieval_economics: OperationEconomics
+    transitions: tuple[TextWorldModelTransition, ...]
+    retrieved_transition_ids: tuple[tuple[str, ...], ...]
 
 
 def world_retry_request(

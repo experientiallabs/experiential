@@ -6,6 +6,10 @@ from exp.common.models import ModelCapabilities, ModelRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 
 
+class WorldModelCapacityError(ValueError):
+    """A grounded request cannot fit its declared input or output capacity before dispatch."""
+
+
 @runtime_checkable
 class TokenCounter(Protocol):
     """Counts the full serialized request before a model client can send it."""
