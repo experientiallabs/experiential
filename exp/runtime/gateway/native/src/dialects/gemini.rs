@@ -123,7 +123,9 @@ impl Normalizer {
                             .get("text")
                             .and_then(Value::as_str)
                             .is_some_and(|text| !text.is_empty());
-                    if part.contains_key("thoughtSignature") || (thought && !thought_text) {
+                    let retained_whole =
+                        part.contains_key("thoughtSignature") || (thought && !thought_text);
+                    if retained_whole {
                         let bytes = crate::dialects::records_retained_bytes(raw_part)
                             .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
                         self.reserve_summary_bytes(bytes.max(64))?;
@@ -140,6 +142,10 @@ impl Normalizer {
                             .and_then(Value::as_str)
                             .filter(|text| !text.is_empty())
                         {
+                            // A signed part was charged whole above.
+                            if !retained_whole {
+                                self.reserve_summary_bytes(text.len())?;
+                            }
                             events.push(Event::ReasoningTextDelta(text.to_string()));
                         }
                         continue;
