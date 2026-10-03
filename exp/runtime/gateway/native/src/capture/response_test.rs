@@ -54,6 +54,7 @@ fn collector_with_relay(
                 relay_metadata,
                 truncate_request: false,
                 asynchronous_delivery: true,
+                capture_hidden_reasoning: true,
             },
             MemorySink(sender),
         )
@@ -134,6 +135,7 @@ async fn stalled_writer_only_backpressures_when_response_memory_is_reserved() {
                     relay_metadata: false,
                     truncate_request: false,
                     asynchronous_delivery: true,
+                    capture_hidden_reasoning: true,
                 },
                 HeldSink {
                     entered: Some(started),

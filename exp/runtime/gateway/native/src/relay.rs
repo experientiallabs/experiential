@@ -46,7 +46,9 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::EncryptedReasoning {
             encrypted_content, ..
         } => encrypted_content.len(),
-        Event::ReasoningContentDelta { delta, .. } => delta.len(),
+        Event::ReasoningContentDelta { delta, .. } | Event::ReasoningTextDelta(delta) => {
+            delta.len()
+        }
         Event::ToolArgumentsDelta { delta, .. } | Event::ServerToolArgumentsDelta { delta, .. } => {
             delta.len()
         }
@@ -330,7 +332,6 @@ impl UpstreamRelay {
     }
 
     fn queue_events(&mut self, events: Vec<Event>) {
-        self.observe_unexposed_reasoning_progress();
         if let Some(observation) = &self.observation {
             observation.record_service_tier(&self.normalizer.service_tier);
             // Several dialects retain a parsed meter until terminal encoding.

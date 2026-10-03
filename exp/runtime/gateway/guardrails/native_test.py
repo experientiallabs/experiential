@@ -38,6 +38,7 @@ from exp.runtime.gateway.guardrails.native import (
     enforce_native_output_segment,
     native_output_mode,
     parse_output_payload,
+    upstream_requests_reasoning,
 )
 from exp.runtime.gateway.guardrails.regex import (
     BuiltinPattern,
@@ -393,3 +394,14 @@ def test_output_segment_releases_redacted_text() -> None:
     assert decision["action"] == "allow"
     assert "ada@example.com" not in decision["release"]
     assert decision["flagged"] is True
+
+
+def test_upstream_reasoning_defaults_rule_out_incremental_streaming() -> None:
+    """A payload that asks for a summary or a thinking display is not reasoning-free."""
+    assert upstream_requests_reasoning([{"upstream_payload": {"reasoning": {"summary": "auto"}}}])
+    assert upstream_requests_reasoning(
+        [{"upstream_payload": {"thinking": {"type": "adaptive", "display": "summarized"}}}]
+    )
+    assert not upstream_requests_reasoning(
+        [{"upstream_payload": {"reasoning": {"effort": "high"}}}, {"upstream_payload": None}]
+    )

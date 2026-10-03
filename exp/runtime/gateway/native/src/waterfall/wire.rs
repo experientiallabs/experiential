@@ -74,6 +74,14 @@ pub struct DeploymentWire {
     /// stripped. Defaults false so every other provider is unchanged.
     #[serde(default)]
     pub reasoning_output_exposed: bool,
+    /// When true, this rung never renders the model's reasoning text to the
+    /// caller (an operator opt-out or the process-wide kill switch). Defaults
+    /// false: every rung returns the reasoning its provider streams, as
+    /// display copy beside the content (Chat `reasoning`, Messages unsigned
+    /// thinking, Responses summary text). Display never changes replay or the
+    /// sealed carrier, which `reasoning_output_exposed` alone governs.
+    #[serde(default)]
+    pub reasoning_output_hidden: bool,
     /// Caller stop sequences the data plane enforces on this rung's stream
     /// because the provider wire has no stop field (OpenAI Responses). The
     /// relay cuts visible text at the first match and terminates with

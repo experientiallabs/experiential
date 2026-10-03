@@ -58,6 +58,7 @@ def lineage_spend(
     pending = list(rollouts)
     seen: set[str] = set()
     increments: list[float] = []
+    unknown = False
     while pending:
         rollout = pending.pop()
         if rollout.rollout_id in seen:
@@ -65,7 +66,7 @@ def lineage_spend(
         seen.add(rollout.rollout_id)
         amount = measure(rollout)
         if amount is None:
-            return None
+            unknown = True
         pointer = rollout.continuation_of
         if pointer is not None:
             if artifact_input(store.read(pointer.artifact_id).manifest) != pointer:
@@ -73,12 +74,14 @@ def lineage_spend(
             parent = load_rollout(store, pointer.artifact_id)
             prefix = measure(parent)
             if prefix is None:
-                return None
-            amount -= prefix
-            if amount < -1e-12:
-                raise SimulationResumeError("continued rollout omitted retained prefix spend")
+                unknown = True
+            elif amount is not None:
+                amount -= prefix
+                if amount < -1e-12:
+                    raise SimulationResumeError("continued rollout omitted retained prefix spend")
             pending.append(parent)
-        increments.append(max(0.0, amount))
+        if amount is not None:
+            increments.append(max(0.0, amount))
         binding = rollout.simulation_binding
         if rollout.retry_attempt and binding is None:
             raise SimulationResumeError("retry spend requires a complete simulation binding")
@@ -88,7 +91,7 @@ def lineage_spend(
                 if prior.simulation_binding != binding or prior.retry_attempt != attempt:
                     raise SimulationResumeError("retry spend binding changed")
                 pending.append(prior)
-    return math.fsum(increments)
+    return None if unknown else math.fsum(increments)
 
 
 def prefix_retry_credit(parent: RolloutArtifact | None, attempt: int) -> float:

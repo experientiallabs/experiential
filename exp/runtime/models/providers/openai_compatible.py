@@ -48,6 +48,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalSignal,
     ProviderResponseError,
     ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
     require_array,
     require_integer,
     require_object,
@@ -295,7 +296,10 @@ def openai_compatible_response(
     content = content_value if isinstance(content_value, str) else None
     tool_call_values = _array_or_empty(message)
     tool_calls = tuple(
-        parse_openai_wire_tool_call(value, index) for index, value in enumerate(tool_call_values)
+        parse_openai_wire_tool_call(
+            value, index, hit_length_limit=choice.get("finish_reason") == "length"
+        )
+        for index, value in enumerate(tool_call_values)
     )
     try:
         output = AssistantAction(content=content, tool_calls=tool_calls)
@@ -707,12 +711,15 @@ def _openai_message(
     return payload
 
 
-def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
+def parse_openai_wire_tool_call(
+    value: object, index: int, *, hit_length_limit: bool = False
+) -> ToolCall:
     """Parse one OpenAI-wire tool call without accepting malformed JSON arguments.
 
     Args:
         value: One decoded ``tool_calls`` array element.
         index: Zero-based array position used in error messages.
+        hit_length_limit: Retained termination flag permits only EOF truncation classification.
 
     Returns:
         The typed tool call with its arguments decoded as a JSON object.
@@ -731,6 +738,13 @@ def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
     try:
         arguments = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
+        if hit_length_limit and (
+            exc.pos >= len(raw_arguments.rstrip()) or exc.msg == "Unterminated string starting at"
+        ):
+            raise ProviderTruncatedResponseError(
+                f"tool_calls[{index}].function.arguments ended inside JSON "
+                "at the response length boundary"
+            ) from exc
         raise OpenAICompatibleResponseError(
             f"tool_calls[{index}].function.arguments is not JSON"
         ) from exc

@@ -64,7 +64,7 @@ pub(super) async fn stream_response(
             admission.ignored_parameters.clone(),
         );
         configure_chat_encoder(&mut encoder, &admission);
-        encoder.set_reasoning_output_exposed(admission.reasoning_exposed_at(committed.depth));
+        encoder.set_reasoning_output(admission.reasoning_output_at(committed.depth));
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;

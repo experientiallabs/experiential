@@ -748,7 +748,7 @@ fn exposed_reasoning_streams_as_an_unsigned_thinking_block() {
     // empty (Anthropic always signs, so an unsigned block is recognizably the
     // gateway's plaintext when the caller replays it).
     let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
-    encoder.set_reasoning_output_exposed(true);
+    encoder.set_reasoning_output(true.into());
     let mut frames = encoder.start().expect("starts");
     for event in &exposed_reasoning_events() {
         frames.extend(encoder.feed(event).expect("streams reasoning"));
@@ -821,7 +821,7 @@ fn tool_turn_reasoning_round_trips_as_a_trailing_redacted_thinking_carrier() {
     // shape, which every Messages client (Claude Code) echoes untouched.
     let carrier = "x-experiential-hunyuan-reasoning-v1:ZGVw:c2VhbGVk";
     let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
-    encoder.set_reasoning_output_exposed(true);
+    encoder.set_reasoning_output(true.into());
     encoder.set_reasoning_content_carrier(carrier.to_string());
     let mut frames = encoder.start().expect("starts");
     for event in &tool_turn_reasoning_events() {

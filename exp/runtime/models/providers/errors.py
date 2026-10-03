@@ -20,6 +20,14 @@ class ProviderResponseError(ValueError):
     """A provider returned a completed response that violates EXP's typed contract."""
 
 
+class ProviderTruncatedResponseError(ProviderResponseError):
+    """A length-terminated tool response ended inside JSON, with no HTTP retry authority.
+
+    An explicitly uncapped evaluation may retain this invalid attempt and start a new bounded
+    rollout generation. The same request must not be resent by the provider client.
+    """
+
+
 class ProviderRetryableResponseError(ProviderResponseError):
     """A completed response decoded to no usable output and merits one bounded re-dispatch.
 

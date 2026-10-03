@@ -113,10 +113,18 @@ impl Normalizer {
                         .ok_or_else(|| malformed("Gemini candidate part must be an object"))?;
                     // Google exposes thought summaries, not full CoT. Preserve the
                     // whole signed part so a signature remains paired with its
-                    // text or functionCall, without treating it as readable output.
-                    if part.get("thought") == Some(&Value::Bool(true))
-                        || part.contains_key("thoughtSignature")
-                    {
+                    // text or functionCall; the part itself is capture and replay
+                    // evidence, never readable output. An unsigned thought
+                    // summary carries only display text, which streams below as
+                    // plaintext reasoning instead.
+                    let thought = part.get("thought") == Some(&Value::Bool(true));
+                    let thought_text = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| thought && !text.is_empty());
+                    let retained_whole = part.contains_key("thoughtSignature")
+                        || (thought && thought_text.is_none());
+                    if retained_whole {
                         let bytes = crate::dialects::records_retained_bytes(raw_part)
                             .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
                         self.reserve_summary_bytes(bytes.max(64))?;
@@ -124,7 +132,17 @@ impl Normalizer {
                             raw_part.clone(),
                         )));
                     }
-                    if part.get("thought") == Some(&Value::Bool(true)) {
+                    if thought {
+                        // The thought summary text is the model's displayable
+                        // reasoning: it renders as plaintext reasoning on rungs
+                        // whose reasoning display is on.
+                        if let Some(text) = thought_text {
+                            // A signed part was charged whole above.
+                            if !retained_whole {
+                                self.reserve_summary_bytes(text.len())?;
+                            }
+                            events.push(Event::ReasoningTextDelta(text.to_string()));
+                        }
                         continue;
                     }
                     if let Some(call) = part.get("functionCall") {
@@ -302,10 +320,22 @@ mod gemini_tests {
             .filter(|event| event["kind"] == "gemini_thought_part")
             .map(|event| event["part"].clone())
             .collect();
-        assert_eq!(captured, parts);
+        // Signed parts are retained whole; the unsigned summary is display
+        // text only.
+        assert_eq!(captured, parts[1..]);
         assert!(!events
             .iter()
             .any(|event| event["kind"] == "reasoning_content_delta"));
+        // Only the thought part's text is displayable reasoning; signed answer
+        // and tool parts never are.
+        let displayed: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "reasoning_text_delta")
+            .collect();
+        assert_eq!(
+            displayed,
+            vec![&json!({"kind":"reasoning_text_delta","text":"Summary, not full CoT. 雪"})]
+        );
         let visible: Vec<_> = events
             .iter()
             .filter(|event| event["kind"] == "text_delta")
@@ -350,7 +380,7 @@ mod gemini_tests {
             events,
             vec![
                 json!({"kind": "text_delta", "text": "Hel"}),
-                json!({"kind": "gemini_thought_part", "part": {"thought":true,"text":"hidden reasoning"}}),
+                json!({"kind": "reasoning_text_delta", "text": "hidden reasoning"}),
                 json!({"kind": "text_delta", "text": "lo"}),
                 json!({"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"}),
                 json!({"kind": "tool_arguments_delta", "index": 0, "text": raw_arguments}),

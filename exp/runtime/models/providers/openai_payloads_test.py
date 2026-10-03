@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
@@ -485,3 +487,78 @@ def test_replayed_message_strips_only_output_text_probabilities() -> None:
     assert isinstance(first, dict) and "logprobs" not in first
     assert isinstance(second, dict)
     assert second.get("logprobs") == {"customer": "keep"}
+
+
+def _reasoning_request(**overrides: object) -> GatewayRequest:
+    """Build one streaming Responses request for reasoning-summary checks."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        stream=True,
+        include_usage=True,
+    )
+    return request.model_copy(update=dict(overrides))
+
+
+def test_a_caller_summary_wins_over_the_auto_default() -> None:
+    """The caller's ``detailed`` selector forwards instead of the ``auto`` default."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high", reasoning_summary="detailed"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    assert payload["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+
+def test_a_reasoning_route_with_no_effort_still_asks_for_a_summary() -> None:
+    """Readable reasoning is requested even when no effort is pinned."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    assert payload["reasoning"] == {"summary": "auto"}
+
+
+def test_effort_none_asks_for_no_summary() -> None:
+    """A request that turns reasoning off is never asked for a summary."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="none"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    reasoning = cast("JsonObject", payload["reasoning"])
+    assert "summary" not in reasoning
+
+
+def test_the_display_kill_switch_stops_asking_for_a_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXP_GATEWAY_REASONING_DISPLAY=0`` restores the provider's no-summary default."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    assert payload["reasoning"] == {"effort": "high"}
+
+
+def test_a_customer_managed_rung_is_never_asked_for_a_summary() -> None:
+    """A BYOK key may belong to an unverified organization, which 400s on summaries."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=False,
+    )
+    assert payload["reasoning"] == {"effort": "high"}

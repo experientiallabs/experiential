@@ -63,12 +63,15 @@ impl StreamedOutput {
             }
             Event::ReasoningSummaryDelta { delta, .. }
             | Event::ThinkingDelta { delta, .. }
-            | Event::ReasoningContentDelta { delta, .. } => Self::append(
+            | Event::ReasoningContentDelta { delta, .. }
+            | Event::ReasoningTextDelta(delta) => Self::append(
                 &mut self.reasoning,
                 &mut self.reasoning_overflow_chars,
                 delta,
             ),
-            Event::GeminiThoughtPart(part) => {
+            // Thought-summary text arrives as `ReasoningTextDelta` too, so only
+            // a signed non-thought part's text is counted from the part.
+            Event::GeminiThoughtPart(part) if part.get("thought") != Some(&Value::Bool(true)) => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     Self::append(
                         &mut self.reasoning,
@@ -243,6 +246,15 @@ mod tests {
         let snapshot = observation.snapshot();
         assert!(snapshot.terminal_at.unwrap() >= first_token_at);
         assert!(snapshot.duration.unwrap() >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn gemini_thought_text_counts_once_from_its_display_event() {
+        let mut streamed = StreamedOutput::default();
+        let part = serde_json::json!({"thought": true, "text": "plan", "thoughtSignature": "s"});
+        streamed.record(&Event::GeminiThoughtPart(std::sync::Arc::new(part)));
+        streamed.record(&Event::ReasoningTextDelta("plan".into()));
+        assert_eq!(streamed.reasoning, "plan");
     }
 
     #[test]

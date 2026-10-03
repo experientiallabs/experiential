@@ -99,3 +99,29 @@ fn an_already_terminal_stream_keeps_the_original_failure() {
         .expect_err("a terminated stream does not re-recover");
     assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
 }
+
+#[test]
+fn gemini_after_only_thought_text_still_fails_over_as_transport() {
+    // Display-only thought text is held privately before real output, so a
+    // stream that dies mid-reasoning must stay failover-eligible instead of
+    // settling an empty Incomplete.
+    let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+    let frame = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "candidates": [{"content": {"parts": [{"thought": true, "text": "plan"}]}}]
+        })
+        .to_string(),
+    };
+    let events = normalizer.feed(&frame).expect("thought frame normalizes");
+    assert!(matches!(events.as_slice(), [Event::ReasoningTextDelta(text)] if text == "plan"));
+    let failure = normalizer
+        .recover_abnormal_end(incoming())
+        .expect_err("reasoning alone is nothing to salvage");
+    assert_eq!(failure.failure_class, FailureClass::Transport);
+    assert!(failure.failover_eligible);
+    assert!(normalizer
+        .on_stream_end()
+        .expect("a reasoning-only clean close is terminal-less")
+        .is_empty());
+}

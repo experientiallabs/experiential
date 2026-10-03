@@ -283,9 +283,38 @@ invalid after the final generation. Evaluation orchestration retries eligible ce
 current simulation phase completes.
 
 Finite budgets and simulations without a shared request ledger do not enable this retry.
+Reopening a retryable pricing failure rechecks the current budget before allocating a new
+generation. A finite cap preserves the original failure and receipt for a later uncapped retry;
+already completed generations still replay without spending under a finite cap.
 Generic `ValueError` failures, including previously saved ones, remain nonretryable. Identity,
 reservation-bound, and persistence failures must not be translated into the pricing-unavailable
 type. Missing usage is never replaced with zero or a measured charge.
+
+The same bounded fresh-generation policy applies when a paid cell's execution is interrupted
+before saving its rollout. Existing ownership checks must first prove the lease owner stopped.
+An uncapped shared ledger then permits a new generation while retaining the old lease tombstone,
+all paid responses, and any unknown request liabilities. The interrupted generation is recorded
+as infrastructure invalidity, not a model-quality or spending-limit failure. Its requests are
+never resent at the old coordinates.
+
+Catalog-backed evaluation supplies its shared ledger through `EvaluationServices.request_budget`.
+That current authority also permits recovery of saved stale-lease outcomes classified as budget
+failures by older executions, without rewriting those artifacts or their original selection.
+Finite budgets and callers without that ledger keep their existing stale-lease behavior. Completed
+successors replay for free even if the caller later lowers its cap. Interruptions count toward
+the same three-generation ceiling; an exhausted cell remains invalid.
+
+Without a retained whole-cell reservation, interrupted ancestors leave aggregate simulation
+spend and total execution cost unknown. Their lineage and receipts are still verified. Valid
+successor rollouts determine report costs. A completed report may replay under a lower cap;
+missing judgments with that unknown prior liability require explicit uncapped authorization.
+
+A Chat response with retained `finish_reason="length"` whose tool arguments end inside JSON
+raises `ProviderTruncatedResponseError`. EOF or an unterminated string is required; a length
+label alone does not upgrade structural tool errors or malformed complete values. This error
+never retries the HTTP request. Explicitly uncapped evaluations may instead use the same bounded
+fresh-generation policy, retaining prior raw receipts and invalid evidence. Malformed ordinary
+stop responses keep their existing behavior, and a valid length response retains its length flag.
 
 ## OpenAI-compatible listing metadata
 

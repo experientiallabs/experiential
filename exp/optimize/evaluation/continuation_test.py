@@ -182,6 +182,7 @@ def test_tool_result_checkpoint_continues_the_evaluation_without_replaying_paid_
     assert result.simulation_cost_usd == pytest.approx(
         sum(rollout_spend(rollout) or 0 for rollout in children)
     )
+    assert result.simulation_cost_usd is not None and parent.simulation_cost_usd is not None
     assert result.simulation_cost_usd > parent.simulation_cost_usd > 0
     before_replay = len(state.completion_calls), len(state.embedding_calls)
     assert (
@@ -320,6 +321,7 @@ def test_native_continuation_keeps_prefix_costs_and_excludes_incomplete_judgment
         child_cost = item.candidate_economics.cost_usd
         assert parent_cost is not None and child_cost is not None
         assert child_cost.value == pytest.approx(2 * parent_cost.value)
+    assert resumed.simulation_cost_usd is not None and result.simulation_cost_usd is not None
     assert resumed.simulation_cost_usd > result.simulation_cost_usd > 0
     assert all(
         item.candidate_economics.usage is not None

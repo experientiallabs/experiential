@@ -173,6 +173,7 @@ mod tests {
             fireworks_reasoning_route_sha256: None,
             hunyuan_reasoning_route_sha256: None,
             reasoning_output_exposed: false,
+            reasoning_output_hidden: false,
             stop_sequences: Vec::new(),
             serialize_tool_calls: false,
             cache_writes_within_reads: false,

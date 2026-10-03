@@ -250,7 +250,7 @@ def _recorder(
     maximum_cost_usd: float = 10.0,
     stop_on_overspend: bool = False,
     maximum_steps: int = 2,
-    retry_pricing_unavailable: bool = False,
+    retry_uncapped_infrastructure: bool = False,
     maximum_rollout_output_tokens: int = 1_000_000,
     output_limit: int | None = 16_000,
     world_model_json_object_output: bool = False,
@@ -274,7 +274,7 @@ def _recorder(
         active_input_price: Active catalog input price for secure reservation tests.
         maximum_cost_usd: Reconciled provider-spend ceiling for the recorded cell.
         stop_on_overspend: Fail before the next paid dispatch once spend reaches the ceiling.
-        retry_pricing_unavailable: Whether the caller owns explicitly uncapped authorization.
+        retry_uncapped_infrastructure: Whether the caller owns explicitly uncapped authorization.
         output_limit: Published candidate and world output limit, or ``None``.
         world_model_json_object_output: Explicit frozen world-only JSON output control.
         maximum_transition_attempts: Permitted simulator replies for the same candidate turn.
@@ -348,7 +348,7 @@ def _recorder(
         maximum_cost_usd=maximum_cost_usd,
         stop_on_overspend=stop_on_overspend,
         maximum_steps=maximum_steps,
-        retry_pricing_unavailable=retry_pricing_unavailable,
+        retry_uncapped_infrastructure=retry_uncapped_infrastructure,
         maximum_rollout_output_tokens=maximum_rollout_output_tokens,
         maximum_output_tokens=16_000,
         world_model_json_object_output=world_model_json_object_output,
@@ -722,7 +722,7 @@ def test_unpriceable_paid_response_is_retained_before_recorder_failure(
         world,
         candidate_request=reservations[0],
         world_request=reservations[1],
-        retry_pricing_unavailable=uncapped,
+        retry_uncapped_infrastructure=uncapped,
     )
     with pytest.raises(TextSimulationError) as raised:
         recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))

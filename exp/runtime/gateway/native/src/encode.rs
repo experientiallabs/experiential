@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, PublicError};
 use crate::events::{ChoiceLogprobs, Event, Usage};
+use crate::reasoning_display::{self, DisplayJoiner, ReasoningOutput};
 use crate::tool_search::annotate_tool_search_usage_details;
 use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
@@ -183,6 +184,8 @@ pub struct ChatSseEncoder {
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
     reasoning_output_exposed: bool,
+    reasoning_displayed: bool,
+    reasoning_display: DisplayJoiner,
     web_search: Option<ChatWebSearch>,
     /// Gateway-run tool-search rounds metered on the usage chunk; zero
     /// leaves every frame byte-identical.
@@ -212,6 +215,8 @@ impl ChatSseEncoder {
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
             reasoning_output_exposed: false,
+            reasoning_displayed: false,
+            reasoning_display: DisplayJoiner::default(),
             web_search: None,
             tool_search_requests: 0,
         }
@@ -234,15 +239,32 @@ impl ChatSseEncoder {
         self.web_search = web_search.map(ChatWebSearch::new);
     }
 
-    /// Expose the model's plaintext reasoning to the caller on output.
+    /// Set both reasoning facts of the winning rung; both are off by default.
     ///
-    /// Off by default so hidden-reasoning providers (OpenAI o-series, which
-    /// carry no plaintext reasoning event at all) never leak. Turned on only for
-    /// rungs the catalog marks `reasoning_output_exposed`, so a Tencent/DeepSeek
-    /// client sees the `reasoning_content` deltas it is already billed for. The
-    /// sealed round-trip carrier at the terminal is independent of this.
-    pub fn set_reasoning_output_exposed(&mut self, exposed: bool) {
-        self.reasoning_output_exposed = exposed;
+    /// Exposure is on only for rungs the catalog marks
+    /// `reasoning_output_exposed`, so a Tencent/DeepSeek client sees the
+    /// `reasoning_content` deltas it replays. Display returns the model's
+    /// reasoning text as `choices[].delta.reasoning` copy (thinking,
+    /// summaries, and plaintext reasoning alike); the serving route turns it
+    /// on for every rung that has not opted out. The sealed round-trip carrier
+    /// at the terminal is independent of both.
+    pub fn set_reasoning_output(&mut self, output: ReasoningOutput) {
+        self.reasoning_output_exposed = output.exposed;
+        self.reasoning_displayed = output.displayed;
+    }
+
+    /// One `delta.reasoning` chunk for `event`'s display text, if any.
+    fn displayed_reasoning(&mut self, event: &Event) -> Vec<String> {
+        if !self.reasoning_displayed {
+            return Vec::new();
+        }
+        match self
+            .reasoning_display
+            .delta(event, self.reasoning_output_exposed)
+        {
+            Some(text) => vec![self.chunk(json!({"reasoning": text}), None)],
+            None => Vec::new(),
+        }
     }
 
     /// Return the validated candidate accumulated by a live stream.
@@ -303,23 +325,25 @@ impl ChatSseEncoder {
             Event::ReasoningContentDelta { delta, .. } => {
                 // On an exposure-gated rung (Tencent/DeepSeek), the model's
                 // plaintext reasoning is returned to the caller as
-                // `choices[].delta.reasoning_content` — the tokens are already
-                // billed. Elsewhere it stays dropped (the Chat wire has no
-                // reasoning field by default); the sealed round-trip carrier at
-                // the terminal is emitted independently regardless.
+                // `choices[].delta.reasoning_content`, the field it replays.
+                // Elsewhere it is display copy on `delta.reasoning` when the
+                // rung displays reasoning; the sealed round-trip carrier at the
+                // terminal is emitted independently regardless.
                 if self.reasoning_output_exposed && !delta.is_empty() {
                     Ok(vec![self.chunk(json!({"reasoning_content": delta}), None)])
                 } else {
-                    Ok(Vec::new())
+                    Ok(self.displayed_reasoning(event))
                 }
             }
-            // The Chat wire has no reasoning representation, so provider summary
-            // and opaque reasoning follow the summary path and are dropped.
+            // Readable reasoning in every provider form is display copy on
+            // `delta.reasoning` when the rung displays it.
+            Event::ReasoningTextDelta(_)
+            | Event::ReasoningSummaryDelta { .. }
+            | Event::ThinkingDelta { .. } => Ok(self.displayed_reasoning(event)),
+            // Opaque reasoning has no Chat representation and is dropped.
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
             | Event::GeminiThoughtPart(_)
-            | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
@@ -610,7 +634,7 @@ pub fn completed_chat_body_with_ignored(
     created_at: i64,
     events: &[Event],
     ignored_parameters: &[String],
-    reasoning_output_exposed: bool,
+    reasoning: impl Into<ReasoningOutput>,
 ) -> Result<AggregatedCompletion, PublicError> {
     completed_chat_body_with_carrier(
         request_id,
@@ -619,7 +643,7 @@ pub fn completed_chat_body_with_ignored(
         events,
         ignored_parameters,
         None,
-        reasoning_output_exposed,
+        reasoning,
     )
 }
 
@@ -631,8 +655,10 @@ pub fn completed_chat_body_with_carrier(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
 ) -> Result<AggregatedCompletion, PublicError> {
+    let reasoning_output = reasoning_output.into();
+    let reasoning_output_exposed = reasoning_output.exposed;
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
         Some(event) => event,
@@ -777,6 +803,16 @@ pub fn completed_chat_body_with_carrier(
                     "reasoning_content".to_string(),
                     Value::String(reasoning_text),
                 );
+        }
+    }
+    if reasoning_output.displayed {
+        // OpenRouter's `message.reasoning`: display copy of every readable
+        // reasoning form, beside (never instead of) the carrier above.
+        if let Some(text) = reasoning_display::flattened(events, reasoning_output_exposed) {
+            message
+                .as_object_mut()
+                .expect("chat message is an object")
+                .insert("reasoning".to_string(), Value::String(text));
         }
     }
     let mut body = json!({

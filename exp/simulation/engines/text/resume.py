@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from exp.common.core.artifacts import ArtifactId, ArtifactInput, sorted_unique_inputs
+from exp.common.core.artifacts import (
+    ArtifactId,
+    ArtifactInput,
+    FailureAttribution,
+    FailureCode,
+    sorted_unique_inputs,
+)
 from exp.common.evaluations import EvaluationCell, EvaluationPlan
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from exp.common.rollouts import (
     RolloutArtifact,
     SimulationCellBinding,
     SimulationMode,
+    StopReason,
     retryable_dispatch_failure,
 )
+from exp.runtime.models.budget import RequestBudget
 from exp.simulation.engines.text.bindings import rollout_id_for_binding
 from exp.simulation.engines.text.errors import (
     SimulationConfigurationError,
@@ -25,7 +33,40 @@ MAXIMUM_CELL_ATTEMPTS = 3
 """Hard ceiling on immutable re-execution generations per bound simulation cell."""
 
 
-def reexecutable_dispatch_failure(rollout: RolloutArtifact) -> bool:
+def interrupted_cell_failure(rollout: RolloutArtifact) -> bool:
+    """Recognize exact stale-lease outcomes without changing their saved classification.
+
+    Args:
+        rollout: Immutable cell evidence, including legacy budget-classified interruption.
+
+    Returns:
+        True only for bound, lease-identified interrupted text-cell outcomes.
+    """
+    failure = rollout.failure
+    if (
+        failure is None
+        or rollout.simulation_binding is None
+        or failure.details.get("phase") != "paid_cell_stale_lease"
+        or not isinstance(failure.details.get("lease_id"), str)
+        or not failure.details["lease_id"]
+    ):
+        return False
+    return (
+        failure.code == FailureCode.CANCELLED
+        and failure.attribution == FailureAttribution.ENVIRONMENT
+        and failure.retryable
+        and rollout.stop_reason == StopReason.FAILURE
+    ) or (
+        failure.code == FailureCode.BUDGET
+        and failure.attribution == FailureAttribution.MODEL
+        and not failure.retryable
+        and rollout.stop_reason == StopReason.MAXIMUM_COST
+    )
+
+
+def reexecutable_dispatch_failure(
+    rollout: RolloutArtifact, *, retry_interrupted: bool = False
+) -> bool:
     """Return whether resume would supersede this rollout with another attempt.
 
     A retryable-class dispatch failure is re-executed only while the cell has generations
@@ -34,14 +75,19 @@ def reexecutable_dispatch_failure(rollout: RolloutArtifact) -> bool:
 
     Args:
         rollout: Persisted final-attempt rollout for one bound cell.
+        retry_interrupted: Current uncapped authority may supersede legacy interruption evidence.
 
     Returns:
         ``True`` when the rollout is a superseded retryable failure below the attempt cap.
     """
     return (
         retryable_dispatch_failure(rollout.failure)
-        and rollout.retry_attempt + 1 < MAXIMUM_CELL_ATTEMPTS
-    )
+        or (
+            interrupted_cell_failure(rollout)
+            and rollout.failure is not None
+            and (rollout.failure.retryable or retry_interrupted)
+        )
+    ) and rollout.retry_attempt + 1 < MAXIMUM_CELL_ATTEMPTS
 
 
 @dataclass(frozen=True)
@@ -164,6 +210,8 @@ def resolve_cell_attempt(
     cell: EvaluationCell,
     binding: SimulationCellBinding,
     pins: ResumePins,
+    *,
+    request_budget: RequestBudget | None,
 ) -> tuple[int, RolloutArtifact | None]:
     """Return the active attempt for one cell and its final rollout, if any.
 
@@ -179,22 +227,50 @@ def resolve_cell_attempt(
         cell: Requested evaluation cell.
         binding: Complete immutable cell binding.
         pins: Exact manifest pointers required for replay.
+        request_budget: Current operator authorization, rechecked before a fresh pricing retry.
 
     Returns:
         The first attempt without final evidence and ``None``, or an attempt paired with
         its final replayable rollout.
 
     Raises:
-        SimulationResumeError: A persisted attempt does not match its immutable pins.
+        SimulationResumeError: A persisted attempt mismatches its pins, or a fresh pricing
+            retry lacks current uncapped authorization. Existing evidence remains unchanged.
     """
     attempt = 0
+    requires_uncapped_budget = False
+    previous: RolloutArtifact | None = None
     while True:
         rollout = load_optional_rollout(store, rollout_id_for_binding(binding, attempt=attempt))
         if rollout is None:
+            if requires_uncapped_budget and (
+                request_budget is None or not request_budget.is_uncapped
+            ):
+                if (
+                    previous is not None
+                    and interrupted_cell_failure(previous)
+                    and previous.failure is not None
+                    and not previous.failure.retryable
+                ):
+                    return previous.retry_attempt, previous
+                raise SimulationResumeError(
+                    "retrying unpriceable or truncated responses or interrupted cells requires an "
+                    "explicitly uncapped request budget; saved response and rollout are unchanged"
+                )
             return attempt, None
         validate_resume_rollout(rollout, cell, binding, pins, attempt=attempt)
-        if not reexecutable_dispatch_failure(rollout):
+        if not reexecutable_dispatch_failure(rollout, retry_interrupted=True):
             return attempt, rollout
+        requires_uncapped_budget = (
+            requires_uncapped_budget
+            or interrupted_cell_failure(rollout)
+            or (
+                rollout.failure is not None
+                and rollout.failure.details.get("retry_classification")
+                in {"unpriceable_completed_response", "truncated_completed_response"}
+            )
+        )
+        previous = rollout
         attempt += 1
 
 

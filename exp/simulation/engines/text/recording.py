@@ -106,7 +106,7 @@ class RecordingCandidateClient:
         maximum_cost_usd: float,
         stop_on_overspend: bool,
         maximum_steps: int,
-        retry_pricing_unavailable: bool = False,
+        retry_uncapped_infrastructure: bool = False,
         maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
         world_model_json_object_output: bool = False,
@@ -130,7 +130,7 @@ class RecordingCandidateClient:
             stop_on_overspend: When true, reconciled spend reaching the ceiling blocks the
                 next dispatch; by default the authorized episode warns once and continues.
             maximum_steps: Maximum candidate model turns allowed in this episode.
-            retry_pricing_unavailable: Whether an uncapped ledger allows a fresh cell generation.
+            retry_uncapped_infrastructure: Whether uncapped authority permits a fresh generation.
             maximum_output_tokens: Per-call output budget used without silent truncation.
             world_model_json_object_output: Frozen provider JSON mode for simulation responses.
             maximum_transition_attempts: Bounded simulator attempts for each candidate action.
@@ -152,7 +152,7 @@ class RecordingCandidateClient:
         self._maximum_cost_usd = maximum_cost_usd
         self._stop_on_overspend = stop_on_overspend
         self._maximum_steps = maximum_steps
-        self._retry_pricing_unavailable = retry_pricing_unavailable
+        self._retry_uncapped_infrastructure = retry_uncapped_infrastructure
         self._maximum_rollout_output_tokens = maximum_rollout_output_tokens
         self._maximum_output_tokens = maximum_output_tokens
         self._world_model_json_object_output = world_model_json_object_output
@@ -293,7 +293,7 @@ class RecordingCandidateClient:
         except Exception as exc:  # noqa: BLE001 - provider exceptions become durable episode evidence
             failure = provider_call_failure(
                 exc,
-                retry_pricing_unavailable=self._retry_pricing_unavailable,
+                retry_uncapped_infrastructure=self._retry_uncapped_infrastructure,
                 unknown_spend=self._provider_dispatch_unknown_spend,
                 reserved_cost_usd=self._unknown_dispatch_reserved_cost_usd,
             )

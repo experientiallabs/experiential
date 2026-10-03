@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import math
+from typing import Literal, overload
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.evaluations.evidence import read_rollout
 from exp.common.project import ProjectStore
 from exp.common.rollouts import (
+    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutArtifact,
     RolloutEventKind,
     SimulationArtifactSet,
@@ -19,6 +21,7 @@ from exp.optimize.router.errors import RouterCompositionError
 from exp.simulation.engines.text.errors import SimulationConfigurationError
 from exp.simulation.engines.text.grounding import load_completion_contract
 from exp.simulation.engines.text.lineage_spend import lineage_spend
+from exp.simulation.engines.text.resume import interrupted_cell_failure
 
 
 def observed_rollout_spend(rollout: RolloutArtifact) -> float:
@@ -116,11 +119,37 @@ def _unknown_dispatch_charge(rollout: RolloutArtifact) -> float:
     return reserved
 
 
+@overload
 def verified_simulation_spend(
     project: ProjectStore,
     expected: SimulationArtifactSet,
     completion_contract_input: ArtifactInput | None,
+    *,
+    allow_unknown_interrupted: Literal[False] = False,
 ) -> float:
+    """Require a finite reconciled total for ordinary and finite-budget callers."""
+    ...
+
+
+@overload
+def verified_simulation_spend(
+    project: ProjectStore,
+    expected: SimulationArtifactSet,
+    completion_contract_input: ArtifactInput | None,
+    *,
+    allow_unknown_interrupted: Literal[True],
+) -> float | None:
+    """Preserve unknown interrupted spend for shared-ledger execution or free replay."""
+    ...
+
+
+def verified_simulation_spend(
+    project: ProjectStore,
+    expected: SimulationArtifactSet,
+    completion_contract_input: ArtifactInput | None,
+    *,
+    allow_unknown_interrupted: bool = False,
+) -> float | None:
     """Recompute one phase's spend from verified immutable rollouts.
 
     Args:
@@ -128,9 +157,11 @@ def verified_simulation_spend(
         expected: Exact artifact set returned for the simulation phase.
         completion_contract_input: Reviewed completion reservation contract reference used to
             charge superseded retry attempts conservatively.
+        allow_unknown_interrupted: Shared-ledger callers may retain unknown interrupted spend
+            for uncapped execution or free replay, without fabricating whole-cell reservations.
 
     Returns:
-        Finite total of candidate, world-model, and retrieval dispatch spend.
+        Reconciled total, or None for permitted interrupted spend with no retained reservation.
 
     Raises:
         RouterCompositionError: The set, index, rollout, or economics cannot be verified.
@@ -155,7 +186,19 @@ def verified_simulation_spend(
     rollouts = tuple(
         read_rollout(project.artifacts, identity)[0] for identity in artifact_set.artifact_ids
     )
-    total = lineage_spend(project.artifacts, rollouts, measure=observed_rollout_spend)
-    if total is None:
+
+    def measure(rollout: RolloutArtifact) -> float | None:
+        """Validate ordinary economics while leaving eligible interrupted liability unknown."""
+        if (
+            allow_unknown_interrupted
+            and interrupted_cell_failure(rollout)
+            and rollout.failure is not None
+            and UNKNOWN_DISPATCH_RESERVED_COST_KEY not in rollout.failure.details
+        ):
+            return None
+        return observed_rollout_spend(rollout)
+
+    total = lineage_spend(project.artifacts, rollouts, measure=measure)
+    if total is None and not allow_unknown_interrupted:
         raise RouterCompositionError("simulation lineage spend is unknown")
     return total

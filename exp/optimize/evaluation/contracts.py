@@ -13,6 +13,7 @@ from exp.common.evaluations import EvaluationProtocol, ObservedProductionCell
 from exp.common.judging import Judge
 from exp.common.models import ModelSnapshot, RoutedCandidateSnapshot
 from exp.optimize.evaluation.simulation import SimulatorFactory
+from exp.runtime.models.budget import RequestBudget
 from exp.simulation.specs import WorldModelSettings
 
 
@@ -127,6 +128,7 @@ class EvaluationServices:
         spending_limit_usd: Request-ledger allowance, independent of plan identity. Omitted
             uses the execution budget; explicit None removes the aggregate cap.
         judge_spend: Optional authoritative request-ledger reconciliation for saved rollouts.
+        request_budget: Current shared ledger authorizing interrupted-cell recovery, if supplied.
     """
 
     simulator_factory: SimulatorFactory
@@ -136,6 +138,7 @@ class EvaluationServices:
     judging_input: ArtifactInput | None = None
     spending_limit_usd: float | None | Literal["execution_budget"] = "execution_budget"
     judge_spend: Callable[[tuple[str, ...]], float] | None = None
+    request_budget: RequestBudget | None = None
 
 
 class EvaluationRuntimeJudge(Judge, Protocol):

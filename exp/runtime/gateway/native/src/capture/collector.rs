@@ -29,6 +29,11 @@ pub(crate) struct Configuration {
     pub truncate_request: bool,
     #[serde(default)]
     pub asynchronous_delivery: bool,
+    /// Retain reasoning text the caller did not see (a rung that opted out of
+    /// display, or a guardrailed request) as `provider_reasoning`. Displayed
+    /// reasoning is already retained in the captured response frames.
+    #[serde(default)]
+    pub capture_hidden_reasoning: bool,
 }
 
 impl Configuration {
@@ -682,6 +687,11 @@ impl Collector {
 
     /// Append only authorized winning-rung reasoning, charging allocated capacity.
     /// Overflow excludes the exchange instead of silently publishing partial evidence.
+    /// Whether reasoning the caller did not see is retained.
+    pub(crate) fn captures_hidden_reasoning(&self) -> bool {
+        self.config.capture_hidden_reasoning
+    }
+
     pub(crate) fn reasoning(&self, request_id: &str, delta: &str) {
         if delta.is_empty() {
             return;

@@ -487,6 +487,7 @@ def test_resumed_progress_retires_cap_hint_and_ledger_admits_lower_limit(
     if affordable:
         result = execute_run(project, lowered, runtime, provider_spend_consented=True)
         assert result.report.compared_cells == 20
+        assert result.simulation_cost_usd is not None
         assert result.simulation_cost_usd + result.judge_cost_usd < old_hint * 0.75
         assert load_run(project, run.run_id).status == "completed"
     else:

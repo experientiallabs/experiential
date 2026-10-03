@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Collection, Mapping, Sequence
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 from pydantic import JsonValue
 
@@ -21,6 +22,22 @@ if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
 _logger = logging.getLogger(__name__)
+
+REASONING_DISPLAY_ENVIRONMENT: Final = "EXP_GATEWAY_REASONING_DISPLAY"
+"""Process-wide reasoning display kill switch: ``0`` withholds every rung's
+reasoning display copy and stops asking providers for readable reasoning
+(Anthropic summarized display, Gemini thoughts, OpenAI summaries), restoring
+the provider defaults. Read per request."""
+
+
+def reasoning_display_enabled() -> bool:
+    """Return whether the reasoning display kill switch leaves display on.
+
+    Returns:
+        ``False`` only when ``EXP_GATEWAY_REASONING_DISPLAY`` is ``0``.
+    """
+    return os.environ.get(REASONING_DISPLAY_ENVIRONMENT, "1") != "0"
+
 
 REASONING_EFFORTS = (
     "none",
@@ -187,6 +204,13 @@ _ANTHROPIC_ALWAYS_THINKING_FAMILIES = (
 )
 # Opus 5.5 changes the off-switch contract without changing the whole generation.
 _ANTHROPIC_ALWAYS_THINKING_RELEASES = ("claude-opus-5-5",)
+# Generations that run adaptive thinking when the request carries no thinking
+# config. Opus 4.7 and 4.8 run WITHOUT thinking then, so they are absent.
+_ANTHROPIC_DEFAULT_THINKING_FAMILIES = (
+    *_ANTHROPIC_ALWAYS_THINKING_FAMILIES,
+    "claude-opus-5",
+    "claude-sonnet-5",
+)
 
 
 def anthropic_adaptive_only_thinking(model_id: str) -> bool:
@@ -205,6 +229,19 @@ def anthropic_adaptive_only_thinking(model_id: str) -> bool:
     """
     normalized = _normalized_model(model_id)
     return any(family in normalized for family in _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES)
+
+
+def anthropic_thinks_without_config(model_id: str) -> bool:
+    """Return whether a request with no thinking config still runs adaptive thinking.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+
+    Returns:
+        ``True`` for the generations whose omitted ``thinking`` means adaptive.
+    """
+    normalized = _normalized_model(model_id)
+    return any(family in normalized for family in _ANTHROPIC_DEFAULT_THINKING_FAMILIES)
 
 
 def anthropic_budgeted_enabled_only(model_id: str) -> bool:

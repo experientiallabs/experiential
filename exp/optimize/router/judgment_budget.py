@@ -501,6 +501,7 @@ def complete_cell_evidence(
     progress_detail: str | None = None,
     reconciled_spend: Callable[[], float] | None = None,
     maximum_concurrency: int = 1,
+    allow_judgment_dispatch: bool = True,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int, float]:
     """Verify evidence and reserve each bounded judgment dispatch durably before calling it.
 
@@ -542,6 +543,8 @@ def complete_cell_evidence(
         progress: Optional progress hook for judgment counting.
         progress_detail: Optional stable progress label.
         reconciled_spend: Optional authoritative ledger including incomplete paid responses.
+        allow_judgment_dispatch: False permits only verified judgments or terminal exclusions,
+            preserving free replay when unknown prior liability forbids more paid work.
         maximum_concurrency: Phase-wide judgment allowance, one by default. Concurrent judges
             must enforce provider spend with a shared request-admission budget.
 
@@ -685,6 +688,12 @@ def complete_cell_evidence(
                     judge_spend_usd = math.fsum((judge_spend_usd, exclusion.conservative_cost_usd))
                     return _unjudged_cell_evidence(cell, protocol, rollout)
                 if judgment is None:
+                    if not allow_judgment_dispatch:
+                        raise RouterCompositionError(
+                            "unknown prior simulation spend requires an explicitly uncapped "
+                            "request budget before new judgment dispatch; "
+                            "saved evidence is unchanged"
+                        )
                     # In parallel, the request ledger may include siblings' temporary
                     # reservations. Its atomic admission waits for those requests to settle;
                     # treating them here as final spend would pause an affordable run early.

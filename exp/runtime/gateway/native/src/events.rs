@@ -215,6 +215,11 @@ pub enum Event {
         item_id: String,
         encrypted_content: String,
     },
+    /// Plaintext reasoning from an OpenAI-compatible origin that has no
+    /// reasoning replay route (`reasoning_content` / `reasoning` deltas). It is
+    /// display copy only: it never seals a carrier and is never replayed, and
+    /// each encoder renders it only on a rung whose reasoning display is on.
+    ReasoningTextDelta(String),
     /// Opaque Fireworks Chat reasoning, bound to the exact issuing route.
     ReasoningContentDelta {
         route_sha256: String,
@@ -388,7 +393,10 @@ impl Event {
     /// `RedactedThinking`, `EncryptedReasoning`), usage, closes, or terminal frames.
     pub fn is_output_token(&self) -> bool {
         match self {
-            Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => !text.is_empty(),
+            Event::TextDelta(text)
+            | Event::RefusalDelta(text)
+            | Event::Image(text)
+            | Event::ReasoningTextDelta(text) => !text.is_empty(),
             Event::ProviderTextDelta { delta, .. }
             | Event::ProviderRefusalDelta { delta, .. }
             | Event::ReasoningSummaryDelta { delta, .. }
@@ -531,6 +539,9 @@ pub fn simplified_event(event: &Event) -> Value {
             "item_id": item_id,
             "encrypted_content": encrypted_content,
         }),
+        Event::ReasoningTextDelta(text) => {
+            serde_json::json!({"kind": "reasoning_text_delta", "text": text})
+        }
         Event::ReasoningContentDelta {
             route_sha256,
             delta,

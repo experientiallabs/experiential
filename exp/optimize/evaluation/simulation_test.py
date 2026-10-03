@@ -1,10 +1,13 @@
 """Fresh rollout generations preserve paid responses and unknown pricing evidence."""
 
+import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 
-from exp.common.core.artifacts import FailureAttribution, sha256_json
+from exp.common.core.artifacts import FailureAttribution, FailureCode, JsonObject, sha256_json
 from exp.common.models import ModelRequest, ModelResponse, NumericMeasurement, Usage
 from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.common.models.token_cost_test import prices
@@ -13,9 +16,23 @@ from exp.common.project.request_budget import RequestBudgetStore
 from exp.common.rollouts import StopReason
 from exp.optimize.evaluation.simulation import run_or_load_simulation
 from exp.runtime.models.budget import RequestBudget
-from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+from exp.runtime.models.providers.errors import (
+    ProviderPricingUnavailableError,
+    ProviderTruncatedResponseError,
+)
+from exp.runtime.models.providers.openai_compatible import (
+    OpenAICompatibleClient,
+    openai_compatible_response,
+)
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    RetryPolicy,
+    ScriptedJsonTransport,
+)
 from exp.simulation.engines.text.bindings import binding_digest
+from exp.simulation.engines.text.errors import SimulationResumeError
 from exp.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
+from exp.simulation.engines.text.simulator import WorldModelSimulator
 from exp.simulation.engines.text.simulator_test import (
     _cell,
     _persist_completion_contract,
@@ -100,6 +117,38 @@ class _DurableMeteredClient:
                     update={"cost_usd": NumericMeasurement(value=charge, provenance="observed")}
                 )
             }
+        )
+
+
+class _ExecutionPaused(BaseException):
+    """Interrupt after a paid receipt without converting the control signal to a failure."""
+
+
+class _InterruptedMeteredClient(_DurableMeteredClient):
+    """Interrupt at the durable-response boundary before a cell outcome can be persisted."""
+
+    interruption_calls = 0
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Retain the exact paid response and unknown liability before ending execution."""
+        try:
+            return super().complete(request)
+        except ProviderPricingUnavailableError:
+            pass
+
+        def interrupt() -> ModelResponse:
+            """Model a control interruption after admission, with no response to replay."""
+            self.interruption_calls += 1
+            raise _ExecutionPaused
+
+        return self.budget.call(
+            role="wire-interrupted",
+            fingerprint=sha256_json(request),
+            maximum_cost_usd=0.1,
+            operation=interrupt,
+            encode=lambda result: result.model_dump_json(),
+            decode=ModelResponse.model_validate_json,
+            charge=lambda response: None,
         )
 
 
@@ -194,6 +243,110 @@ def test_uncapped_pricing_failure_retries_only_fresh_cell_generations(
             assert final.final_output is None
 
 
+@pytest.mark.parametrize("role", ["candidate", "world-model"])
+def test_pricing_retry_rechecks_current_cap_without_consuming_a_generation(
+    tmp_path: Path, role: str
+) -> None:
+    """A finite reopen preserves the paid failure until an uncapped retry is authorized."""
+    project = ProjectStore(tmp_path, "project-a")
+    budget = RequestBudget(project, identity="cap-transition", maximum_cost_usd=None)
+    client = _DurableMeteredClient(budget, role=role, failures=1)
+    other_role = "world-model" if role == "candidate" else "candidate"
+    other = _ScriptedClient(
+        [
+            _response(
+                "I can help."
+                if other_role == "candidate"
+                else '{"message":"done","terminal":true}',
+                snapshot=_snapshot(f"{other_role}-a"),
+                cost=None,
+            )
+            for _ in range(MAXIMUM_CELL_ATTEMPTS)
+        ]
+    )
+    cell = _cell("cell-a", "task-a").model_copy(update={"repeat": 2})
+    plan = _plan((cell,))
+    plan_input = _persist_plan(project.artifacts, plan)
+    tasks = _persist_task_set(project.artifacts, {"task-a": _task("task-a")})
+    completion = _persist_completion_contract(project.artifacts)
+    spec = _spec(plan_input, tasks, (cell.cell_id,), completion_contract_input=completion)
+
+    def simulator(current_budget: RequestBudget | None) -> WorldModelSimulator:
+        """Reopen the same immutable execution with its current operator authorization."""
+        return _simulator(
+            project.artifacts,
+            plan,
+            plan_input,
+            tasks,
+            client if role == "candidate" else other,
+            other if role == "candidate" else client,
+            completion_contract_input=completion,
+            request_budget=current_budget,
+        )
+
+    first_set = simulator(budget).run(spec)
+    first = simulator(budget)._load_rollout(first_set.artifact_ids[0])
+    assert first.failure is not None and first.failure.retryable
+    assert first.simulation_binding is not None
+    identity = binding_digest(first.simulation_binding)
+    key = sha256_json({"scope": f"{identity}:0", "role": f"wire-{role}", "ordinal": 0})
+    receipts = RequestBudgetStore(project, "cap-transition")
+    receipt = receipts.read(key)
+    assert receipt is not None and receipt.state == "unknown"
+    raw_response = receipts.response(receipt)
+    assert raw_response == client.responses[0].model_dump_json()
+    artifacts_before = project.artifacts.list_ids()
+    rollout_before = project.artifacts.read_bytes(first.rollout_id, "rollout.json")
+    selection_before = project.artifacts.read_bytes(first_set.artifact_set_id, "artifact-set.json")
+    calls_before = (len(client.requests), len(other.requests))
+
+    finite = RequestBudget(project, identity="cap-transition", maximum_cost_usd=1)
+    client.budget = finite
+    for current_budget in (finite, None):
+        with pytest.raises(SimulationResumeError, match="explicitly uncapped request budget"):
+            run_or_load_simulation(
+                project,
+                plan,
+                spec,
+                lambda project, plan, current_budget=current_budget: simulator(current_budget),
+            )
+        assert project.artifacts.list_ids() == artifacts_before
+        assert project.artifacts.read_bytes(first.rollout_id, "rollout.json") == rollout_before
+        assert (
+            project.artifacts.read_bytes(first_set.artifact_set_id, "artifact-set.json")
+            == selection_before
+        )
+        assert receipts.read(key) == receipt and receipts.response(receipt) == raw_response
+        assert (len(client.requests), len(other.requests)) == calls_before
+
+    resumed = RequestBudget(project, identity="cap-transition", maximum_cost_usd=None)
+    client.budget = resumed
+    final_set = run_or_load_simulation(
+        project, plan, spec, lambda project, plan: simulator(resumed)
+    )
+    final = simulator(resumed)._load_rollout(final_set.artifact_ids[0])
+    assert final.stop_reason == StopReason.COMPLETED and final.retry_attempt == 1
+    assert final.simulation_binding == first.simulation_binding
+    assert (final.task_id, final.candidate, final.repeat) == (first.task_id, first.candidate, 2)
+    assert final.rollout_id != first.rollout_id and len(client.requests) == 2
+    assert project.artifacts.read_bytes(first.rollout_id, "rollout.json") == rollout_before
+    assert receipts.read(key) == receipt and receipts.response(receipt) == raw_response
+    assert receipts.has_unbounded_liability()
+    next_key = sha256_json({"scope": f"{identity}:1", "role": f"wire-{role}", "ordinal": 0})
+    next_receipt = receipts.read(next_key)
+    assert next_receipt is not None and next_receipt.response != receipt.response
+
+    finite_replay = RequestBudget(project, identity="cap-transition", maximum_cost_usd=0.01)
+    client.budget = finite_replay
+    assert simulator(finite_replay).run(spec) == final_set
+    assert (
+        run_or_load_simulation(project, plan, spec, lambda project, plan: simulator(finite_replay))
+        == final_set
+    )
+    assert len(client.requests) == 2
+    assert receipts.read(key) == receipt and receipts.response(receipt) == raw_response
+
+
 @pytest.mark.parametrize("finite", [False, True])
 def test_finite_or_untyped_pricing_failure_keeps_frozen_nonretryable_evidence(
     tmp_path: Path, finite: bool
@@ -236,3 +389,319 @@ def test_finite_or_untyped_pricing_failure_keeps_frozen_nonretryable_evidence(
         ):
             client.complete(client.requests[0])
         assert len(client.requests) == 1
+
+
+@pytest.mark.parametrize("legacy, interruptions", [(False, 1), (True, 1), (False, 3)])
+def test_uncapped_interrupted_cells_preserve_receipts_and_retry_fresh_generations(
+    tmp_path: Path, legacy: bool, interruptions: int
+) -> None:
+    """Interrupted generations, including saved legacy finals, recover only with current consent."""
+    project = ProjectStore(tmp_path, "project-a")
+    budget = RequestBudget(project, identity="interrupted-evaluation", maximum_cost_usd=None)
+    client = _InterruptedMeteredClient(budget, role="candidate", failures=interruptions)
+    world = _ScriptedClient(
+        [_response('{"message":"done","terminal":true}', snapshot=_snapshot("world-model-a"))]
+    )
+    cell = _cell("cell-a", "task-a").model_copy(update={"repeat": 2})
+    plan = _plan((cell,))
+    plan_input = _persist_plan(project.artifacts, plan)
+    tasks = _persist_task_set(project.artifacts, {"task-a": _task("task-a")})
+    completion = _persist_completion_contract(project.artifacts)
+    spec = _spec(plan_input, tasks, (cell.cell_id,), completion_contract_input=completion)
+
+    def simulator(current_budget: RequestBudget | None) -> WorldModelSimulator:
+        """Reuse the exact task, model and receipt bindings under current authorization."""
+        return _simulator(
+            project.artifacts,
+            plan,
+            plan_input,
+            tasks,
+            client,
+            world,
+            completion_contract_input=completion,
+            request_budget=current_budget,
+        )
+
+    receipts = RequestBudgetStore(project, "interrupted-evaluation")
+    retained: dict[str, bytes] = {}
+    tombstones: dict[str, bytes] = {}
+    for attempt in range(interruptions):
+        with pytest.raises(_ExecutionPaused):
+            run_or_load_simulation(
+                project,
+                plan,
+                spec,
+                lambda project, plan, budget=budget: simulator(budget),
+                request_budget=budget,
+            )
+        assert len(client.requests) == attempt + 1 and world.requests == []
+        recovery_budget = (
+            RequestBudget(project, identity="interrupted-evaluation", maximum_cost_usd=1)
+            if legacy
+            else budget
+        )
+        recovery = simulator(recovery_budget)
+        failed_set = recovery.run(spec)
+        failed = recovery._load_rollout(failed_set.artifact_ids[0])
+        assert failed.retry_attempt == attempt
+        assert failed.failure is not None
+        assert failed.failure.details["phase"] == "paid_cell_stale_lease"
+        assert (
+            failed.candidate_economics is not None and failed.candidate_economics.cost_usd is None
+        )
+        if legacy:
+            assert failed.stop_reason == StopReason.MAXIMUM_COST
+            assert failed.failure.code == FailureCode.BUDGET and not failed.failure.retryable
+        else:
+            assert failed.stop_reason == StopReason.FAILURE
+            assert failed.failure.code == FailureCode.CANCELLED and failed.failure.retryable
+            assert failed.failure.attribution == FailureAttribution.ENVIRONMENT
+        retained[failed.rollout_id] = project.artifacts.read_bytes(
+            failed.rollout_id, "rollout.json"
+        )
+        lease_id = failed.failure.details["lease_id"]
+        assert isinstance(lease_id, str)
+        tombstone = recovery._leases._records.read(lease_id)
+        assert tombstone is not None
+        tombstones[lease_id] = tombstone
+
+        if attempt == 0:
+            before = project.artifacts.list_ids()
+            finite = RequestBudget(project, identity="interrupted-evaluation", maximum_cost_usd=1)
+            for current_budget in (finite, None):
+                if legacy:
+                    assert (
+                        run_or_load_simulation(
+                            project,
+                            plan,
+                            spec,
+                            lambda project, plan, current_budget=current_budget: simulator(
+                                current_budget
+                            ),
+                            request_budget=current_budget,
+                        )
+                        == failed_set
+                    )
+                else:
+                    with pytest.raises(SimulationResumeError, match="explicitly uncapped"):
+                        simulator(current_budget).run(spec)
+                assert project.artifacts.list_ids() == before
+                assert len(client.requests) == 1 and world.requests == []
+            budget = RequestBudget(
+                project, identity="interrupted-evaluation", maximum_cost_usd=None
+            )
+            client.budget = budget
+
+    final_set = run_or_load_simulation(
+        project, plan, spec, lambda project, plan: simulator(budget), request_budget=budget
+    )
+    final = simulator(budget)._load_rollout(final_set.artifact_ids[0])
+    assert final.retry_attempt == min(interruptions, MAXIMUM_CELL_ATTEMPTS - 1)
+    assert final.stop_reason == (StopReason.COMPLETED if interruptions == 1 else StopReason.FAILURE)
+    assert (final.cell_id, final.task_id, final.repeat) == (cell.cell_id, cell.task_id, 2)
+    assert final.simulation_binding is not None
+    identity = binding_digest(final.simulation_binding)
+    for attempt, response in enumerate(client.responses):
+        key = sha256_json(
+            {"scope": f"{identity}:{attempt}", "role": "wire-candidate", "ordinal": 0}
+        )
+        receipt = receipts.read(key)
+        assert receipt is not None and receipts.response(receipt) == response.model_dump_json()
+        if attempt < interruptions:
+            assert receipt.state == "unknown" and not receipt.charge_is_upper_bound
+            assert response.economics.cost_usd is None
+            interrupted_key = sha256_json(
+                {"scope": f"{identity}:{attempt}", "role": "wire-interrupted", "ordinal": 0}
+            )
+            interrupted_receipt = receipts.read(interrupted_key)
+            assert interrupted_receipt is not None and interrupted_receipt.state == "unknown"
+            assert interrupted_receipt.response is None
+    assert len(client.requests) == min(interruptions + 1, MAXIMUM_CELL_ATTEMPTS)
+    assert client.interruption_calls == interruptions
+    assert receipts.has_unbounded_liability()
+    for rollout_id, contents in retained.items():
+        assert project.artifacts.read_bytes(rollout_id, "rollout.json") == contents
+    for lease_id, contents in tombstones.items():
+        assert simulator(budget)._leases._records.read(lease_id) == contents
+
+    finite = RequestBudget(project, identity="interrupted-evaluation", maximum_cost_usd=0.01)
+    client.budget = finite
+    assert (
+        run_or_load_simulation(
+            project, plan, spec, lambda project, plan: simulator(finite), request_budget=finite
+        )
+        == final_set
+    )
+    assert len(client.requests) == min(interruptions + 1, MAXIMUM_CELL_ATTEMPTS)
+
+
+class _DurableTruncatedTransport(ScriptedJsonTransport):
+    """Retain raw HTTP 200 bodies before the actual provider parser rejects a tool fragment."""
+
+    def __init__(self, budget: RequestBudget, failures: int) -> None:
+        """Bind one genuine request ledger and deterministic, provider-free raw responses."""
+        self.budget = budget
+        broken: JsonObject = {
+            "model": "candidate-a",
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-a",
+                                "function": {"name": "lookup", "arguments": '{"query":'},
+                            }
+                        ]
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+        }
+        self.bodies: list[JsonObject] = [broken] * failures + [
+            {
+                "model": "candidate-a",
+                "choices": [{"finish_reason": "stop", "message": {"content": "I can help."}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+            }
+        ]
+        super().__init__([JsonHttpResponse(status_code=200, body=body) for body in self.bodies])
+
+    def post(
+        self, url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        """Save or replay the exact raw body without reissuing a completed HTTP request."""
+        body = self.budget.call(
+            role="wire-candidate",
+            fingerprint=sha256_json(payload),
+            maximum_cost_usd=0.1,
+            operation=lambda: (
+                ScriptedJsonTransport.post(
+                    self, url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+                ).body
+            ),
+            encode=lambda value: json.dumps(value),
+            decode=lambda raw: cast(JsonObject, json.loads(raw)),
+            charge=lambda _: None,
+        )
+        return JsonHttpResponse(status_code=200, body=body)
+
+
+@pytest.mark.parametrize("authority, failures", [("uncapped", 1), ("uncapped", 3), ("finite", 1)])
+def test_truncated_tool_response_retries_only_fresh_uncapped_generations(
+    tmp_path: Path, authority: str, failures: int
+) -> None:
+    """Parser failures retain paid raw bodies, bounded invalidity and exact cell identity."""
+    project = ProjectStore(tmp_path, "project-a")
+    budget = RequestBudget(
+        project,
+        identity="truncated-evaluation",
+        maximum_cost_usd=1 if authority == "finite" else None,
+    )
+    transport = _DurableTruncatedTransport(budget, failures)
+    candidate = OpenAICompatibleClient(
+        model=_snapshot("candidate-a"),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=3, initial_delay_seconds=0),
+    )
+    world = _ScriptedClient(
+        [_response('{"message":"done","terminal":true}', snapshot=_snapshot("world-model-a"))]
+    )
+    cell = _cell("cell-a", "task-a").model_copy(update={"repeat": 2})
+    plan = _plan((cell,))
+    plan_input = _persist_plan(project.artifacts, plan)
+    tasks = _persist_task_set(project.artifacts, {"task-a": _task("task-a")})
+    completion = _persist_completion_contract(project.artifacts)
+    spec = _spec(plan_input, tasks, (cell.cell_id,), completion_contract_input=completion)
+    simulator = _simulator(
+        project.artifacts,
+        plan,
+        plan_input,
+        tasks,
+        candidate,
+        world,
+        completion_contract_input=completion,
+        request_budget=budget,
+    )
+    first_set = simulator.run(spec)
+    first = simulator._load_rollout(first_set.artifact_ids[0])
+    original = project.artifacts.read_bytes(first.rollout_id, "rollout.json")
+    assert (
+        first.failure is not None
+        and first.failure.exception_type == "ProviderTruncatedResponseError"
+    )
+    assert first.failure.attribution == FailureAttribution.ENVIRONMENT
+    assert first.failure.retryable is (authority == "uncapped")
+    assert first.simulation_binding is not None and len(transport.requests) == 1
+    identity = binding_digest(first.simulation_binding)
+    store = RequestBudgetStore(project, "truncated-evaluation")
+    key = sha256_json({"scope": f"{identity}:0", "role": "wire-candidate", "ordinal": 0})
+    receipt = store.read(key)
+    assert receipt is not None and receipt.state == "unknown" and receipt.response is not None
+    raw = store.response(receipt)
+    assert raw is not None and json.loads(raw) == transport.bodies[0]
+    with budget.scope(f"{identity}:0"), pytest.raises(ProviderTruncatedResponseError):
+        openai_compatible_response(
+            transport.post(
+                "https://example.test/v1/chat/completions",
+                headers={},
+                payload=transport.requests[0].payload,
+                timeout_seconds=1,
+            ).body,
+            configured_model=_snapshot("candidate-a"),
+            latency_seconds=0,
+        )
+    assert len(transport.requests) == 1
+    if authority == "uncapped":
+        before = project.artifacts.list_ids()
+        finite = RequestBudget(project, identity="truncated-evaluation", maximum_cost_usd=1)
+        finite_simulator = _simulator(
+            project.artifacts,
+            plan,
+            plan_input,
+            tasks,
+            candidate,
+            world,
+            completion_contract_input=completion,
+            request_budget=finite,
+        )
+        with pytest.raises(SimulationResumeError, match="explicitly uncapped"):
+            finite_simulator.run(spec)
+        assert project.artifacts.list_ids() == before and len(transport.requests) == 1
+        assert store.read(key) == receipt and store.response(receipt) == raw
+    final_set = run_or_load_simulation(
+        project,
+        plan,
+        spec,
+        lambda project, plan: simulator,
+        request_budget=budget,
+    )
+    final = simulator._load_rollout(final_set.artifact_ids[0])
+    expected_calls = min(failures + 1, MAXIMUM_CELL_ATTEMPTS) if authority == "uncapped" else 1
+    assert len(transport.requests) == expected_calls
+    assert final.retry_attempt == expected_calls - 1
+    assert final.simulation_binding == first.simulation_binding and final.repeat == 2
+    assert (final.failure is None) is (authority == "uncapped" and failures == 1)
+    if final.failure is not None:
+        assert final.stop_reason == StopReason.FAILURE
+        assert final.failure.attribution == FailureAttribution.ENVIRONMENT
+    assert project.artifacts.read_bytes(first.rollout_id, "rollout.json") == original
+    assert store.read(key) == receipt and store.response(receipt) == raw
+    for attempt in range(expected_calls):
+        saved = store.read(
+            sha256_json({"scope": f"{identity}:{attempt}", "role": "wire-candidate", "ordinal": 0})
+        )
+        assert saved is not None and saved.response is not None
+    assert (
+        run_or_load_simulation(
+            project,
+            plan,
+            spec,
+            lambda project, plan: simulator,
+            request_budget=budget,
+        )
+        == final_set
+    )
+    assert len(transport.requests) == expected_calls

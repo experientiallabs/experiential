@@ -771,7 +771,7 @@ reasoning. Missing or null values remain absent. Plaintext is bounded to 8,388,6
 values exceeding that limit receive a named error with the limit and a retry instruction.
 Route narrowing prefers exposing rungs and discloses
 `messages.reasoning_content->dropped(unsupported_by_provider)` when a rung cannot replay it,
-including routes with no exposing rung.
+including routes with no exposing rung. Reasoning display, which every rung does by default and which never changes replay, is described in [gateway-reasoning-display.md](gateway-reasoning-display.md).
 
 A rung whose chat template accepts a system message only as the very first message declares
 `system_messages_leading_only` (the official Qwen3.6+ `chat_template.jinja` raises

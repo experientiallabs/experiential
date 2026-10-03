@@ -22,6 +22,7 @@ use crate::encode::{
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
+use crate::reasoning_display::ReasoningOutput;
 use crate::relay::{collect_committed, collection_public_error};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
@@ -231,7 +232,7 @@ pub(crate) async fn chat(
         deadline,
     )
     .await;
-    observe_winner(state.capture.clone(), &admission, &guard, &mut won);
+    observe_winner(state.capture.clone(), &admission, &guard, &mut won, false);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -395,7 +396,7 @@ fn encode_chat_sse(
     created_at: i64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
 ) -> Result<Vec<u8>, PublicError> {
     let mut encoder = ChatSseEncoder::new_with_ignored(
         &admission.request_id,
@@ -405,7 +406,7 @@ fn encode_chat_sse(
         admission.ignored_parameters.clone(),
     );
     configure_chat_encoder(&mut encoder, admission);
-    encoder.set_reasoning_output_exposed(reasoning_output_exposed);
+    encoder.set_reasoning_output(reasoning_output.into());
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string());
     }
@@ -532,7 +533,7 @@ async fn respond_from_chat_events(
         &events,
         &admission.ignored_parameters,
         carrier.as_deref(),
-        admission.reasoning_exposed_at(depth),
+        admission.reasoning_output_at(depth),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
@@ -617,7 +618,7 @@ async fn respond_from_chat_events(
             created_at,
             &events,
             carrier.as_deref(),
-            admission.reasoning_exposed_at(depth),
+            admission.reasoning_output_at(depth),
         ) {
             Ok(body) => body,
             Err(error) => return error_response(&error),

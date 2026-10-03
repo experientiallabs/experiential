@@ -100,7 +100,8 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
             // Route reasoning too: an exposed rung would return it as plaintext
             // beside the rewrite, and the turn loses only its thinking carrier,
             // exactly like the Anthropic and Codex carriers above.
-            | Event::ReasoningContentDelta { .. } => {}
+            | Event::ReasoningContentDelta { .. }
+            | Event::ReasoningTextDelta(_) => {}
             // Server-tool activity and citations carry the fetched content
             // (queries, result payloads, cited text) that a rewrite must not
             // leak, so they drop with the reasoning channel. Hosted Responses
@@ -284,6 +285,10 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::StoppedAtSequence(_)
         | Event::PausedTurn
         | Event::GeminiThoughtPart(_)
+        // Display-only reasoning never renders on a guardrailed request
+        // (display is off whenever an output chain runs), so it carries no
+        // caller-visible text to judge.
+        | Event::ReasoningTextDelta(_)
         | Event::Failed(_) => StreamAdmission::Passthrough,
     }
 }

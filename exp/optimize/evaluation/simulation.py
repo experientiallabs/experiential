@@ -10,9 +10,14 @@ from exp.common.evaluations import EvaluationPlan
 from exp.common.evaluations.evidence import read_rollout
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore
-from exp.common.rollouts import SimulationArtifactSet
+from exp.common.rollouts import RolloutArtifact, SimulationArtifactSet
 from exp.optimize.router.errors import RouterCompositionError
-from exp.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS, reexecutable_dispatch_failure
+from exp.runtime.models.budget import RequestBudget
+from exp.simulation.engines.text.resume import (
+    MAXIMUM_CELL_ATTEMPTS,
+    interrupted_cell_failure,
+    reexecutable_dispatch_failure,
+)
 from exp.simulation.orchestration import Simulator
 from exp.simulation.specs import SimulationSpec, simulation_spec_digest
 
@@ -34,6 +39,7 @@ def run_or_load_simulation(
     *,
     progress: ProgressHook | None = None,
     progress_detail: str | None = None,
+    request_budget: RequestBudget | None = None,
 ) -> SimulationArtifactSet:
     """Load an exactly completed simulation set or run the simulator to a final one.
 
@@ -52,6 +58,7 @@ def run_or_load_simulation(
         simulator_factory: Injected constructor invoked only when no final set exists.
         progress: Optional observer of exact replayed evaluation-cell counts.
         progress_detail: Phase qualifier attached to replayed evaluation-cell counts.
+        request_budget: Current shared request authority for interrupted-cell recovery.
 
     Returns:
         Immutable index of one final rollout artifact for every selected cell.
@@ -61,6 +68,8 @@ def run_or_load_simulation(
             or retries did not converge within the attempt cap.
     """
     matches = []
+    evidence: dict[str, tuple[RolloutArtifact, ...]] = {}
+    retry_interrupted = request_budget is not None and request_budget.is_uncapped
     for artifact_id in project.artifacts.list_ids():
         stored = project.artifacts.read(artifact_id)
         if stored.manifest.artifact_type != "simulation-artifact-set":
@@ -94,9 +103,21 @@ def run_or_load_simulation(
             raise RouterCompositionError(
                 "completed simulation artifact set differs from phase spec"
             )
-        if any(reexecutable_dispatch_failure(rollout) for rollout in rollouts):
+        evidence[artifact_id] = rollouts
+        if any(
+            reexecutable_dispatch_failure(rollout, retry_interrupted=retry_interrupted)
+            for rollout in rollouts
+        ):
             continue
         matches.append(artifact_set)
+    matches = [
+        artifact_set
+        for artifact_set in matches
+        if not any(
+            _supersedes_interrupted_set(evidence[artifact_set.artifact_set_id], later)
+            for later in evidence.values()
+        )
+    ]
     if len(matches) > 1:
         raise RouterCompositionError("multiple completed artifact sets name one simulation phase")
     if matches:
@@ -111,7 +132,7 @@ def run_or_load_simulation(
         return matches[0]
     artifact_set = simulator_factory(project, plan).run(spec)
     for _ in range(MAXIMUM_CELL_ATTEMPTS - 1):
-        superseded = _reexecutable_cell_count(project, artifact_set)
+        superseded = _reexecutable_cell_count(project, artifact_set, retry_interrupted)
         if superseded == 0:
             return artifact_set
         logger.warning(
@@ -120,7 +141,7 @@ def run_or_load_simulation(
             superseded,
         )
         artifact_set = simulator_factory(project, plan).run(spec)
-    if _reexecutable_cell_count(project, artifact_set) > 0:
+    if _reexecutable_cell_count(project, artifact_set, retry_interrupted) > 0:
         raise RouterCompositionError(
             "simulation retries did not converge to final evidence within the attempt cap"
         )
@@ -130,12 +151,14 @@ def run_or_load_simulation(
 def _reexecutable_cell_count(
     project: ProjectStore,
     artifact_set: SimulationArtifactSet,
+    retry_interrupted: bool,
 ) -> int:
     """Count rollouts in one set that resume would supersede with another attempt.
 
     Args:
         project: Project store holding the set's immutable rollout artifacts.
         artifact_set: Simulation artifact set produced for one phase.
+        retry_interrupted: Current uncapped authority permits saved interrupted generations.
 
     Returns:
         Number of retryable dispatch failures still below the attempt cap.
@@ -143,5 +166,44 @@ def _reexecutable_cell_count(
     return sum(
         1
         for rollout_id in artifact_set.artifact_ids
-        if reexecutable_dispatch_failure(read_rollout(project.artifacts, rollout_id)[0])
+        if reexecutable_dispatch_failure(
+            read_rollout(project.artifacts, rollout_id)[0], retry_interrupted=retry_interrupted
+        )
     )
+
+
+def _supersedes_interrupted_set(
+    earlier: tuple[RolloutArtifact, ...], later: tuple[RolloutArtifact, ...]
+) -> bool:
+    """Recognize a saved successor without rewriting a legacy interrupted artifact set.
+
+    This also permits free replay after an authorized uncapped recovery when the caller later
+    lowers its cap. Every changed cell must be a later generation of the same interrupted binding.
+
+    Args:
+        earlier: Validated original phase selection, including interrupted outcomes.
+        later: Another saved selection of the exact same phase cells.
+
+    Returns:
+        True only when at least one interrupted cell has a later, identically bound generation.
+    """
+    latest = {rollout.cell_id: rollout for rollout in later}
+    if {rollout.cell_id for rollout in earlier} != set(latest):
+        return False
+    changed = False
+    for original in earlier:
+        successor = latest[original.cell_id]
+        if original.rollout_id == successor.rollout_id:
+            continue
+        if not (
+            interrupted_cell_failure(original)
+            and original.simulation_binding == successor.simulation_binding
+            and original.inputs == successor.inputs
+            and original.task_id == successor.task_id
+            and original.candidate == successor.candidate
+            and original.repeat == successor.repeat
+            and original.retry_attempt < successor.retry_attempt < MAXIMUM_CELL_ATTEMPTS
+        ):
+            return False
+        changed = True
+    return changed

@@ -16,6 +16,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
@@ -29,6 +30,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderTruncatedResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import (
     OPENROUTER_BASE_URL,
@@ -44,6 +46,7 @@ from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     RetryPolicy,
     ScriptedJsonTransport,
+    classify_retry,
 )
 
 
@@ -940,3 +943,102 @@ def test_buffered_request_folds_non_leading_system_turns_on_a_leading_only_rung(
     ]
     kept = cast(list[JsonObject], openai_compatible_request("qwen3.8-27b", request)["messages"])
     assert [message["role"] for message in kept] == ["system", "user", "system", "user"]
+
+
+@pytest.mark.parametrize("arguments", ['{"a":1', '{"a":', '{"a":"unfinished'])
+@pytest.mark.parametrize("finish_reason", ["length", "stop", "tool_calls"])
+def test_incomplete_tool_json_requires_retained_length_and_never_http_retries(
+    arguments: str, finish_reason: str
+) -> None:
+    """EOF tool fragments merit only a fresh rollout; normal-stop malformed data stays unchanged."""
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "choices": [
+                        {
+                            "finish_reason": finish_reason,
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call-a",
+                                        "function": {
+                                            "name": "create_ticket",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=3, initial_delay_seconds=0),
+    )
+    expected = (
+        ProviderTruncatedResponseError
+        if finish_reason == "length"
+        else OpenAICompatibleResponseError
+    )
+    with pytest.raises(expected) as caught:
+        client.complete(_request())
+    assert not classify_retry(caught.value).retryable
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("arguments", ['{"a": invalid}', "[]", '{"a":1,}', '{"a":"bad\\x"}'])
+def test_length_does_not_upgrade_malformed_or_structural_tool_arguments(arguments: str) -> None:
+    """A length label alone cannot turn an invalid complete value into infrastructure evidence."""
+    with pytest.raises(OpenAICompatibleResponseError):
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-a",
+                                    "function": {"name": "create_ticket", "arguments": arguments},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0,
+        )
+
+
+def test_length_keeps_valid_output_and_rejects_missing_tool_identity() -> None:
+    """Complete length output retains the native limit flag; absent call identity is unchanged."""
+    payload: JsonObject = {"choices": [{"finish_reason": "length", "message": {"content": "done"}}]}
+    response = openai_compatible_response(payload, configured_model=_snapshot(), latency_seconds=0)
+    assert response.finish_reason == ModelFinishReason.LENGTH
+    with pytest.raises(ProviderResponseError) as caught:
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "tool_calls": [
+                                {"function": {"name": "create_ticket", "arguments": "{"}}
+                            ]
+                        },
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0,
+        )
+    assert not isinstance(caught.value, ProviderTruncatedResponseError)

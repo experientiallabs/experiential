@@ -253,6 +253,7 @@ def test_lowered_cap_pauses_only_new_dispatch_and_preserves_paid_lineage(
     final_calls = state.completion_calls[initial_calls:]
     assert sum(alias.startswith("candidate") for alias, _ in final_calls) == 40
     assert sum(alias == "judge" for alias, _ in final_calls) == 40
+    assert result.simulation_cost_usd is not None
     assert result.simulation_cost_usd > 1e-12
     assert result.judge_cost_usd > 1e-12
 

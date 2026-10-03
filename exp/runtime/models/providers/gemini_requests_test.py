@@ -275,3 +275,44 @@ def test_assistant_image_history_preserves_bytes_and_uses_signature_bypass() -> 
             ],
         }
     ]
+
+
+def test_a_reasoning_route_with_no_effort_asks_only_for_thoughts() -> None:
+    """Thought summaries are requested even when no thinking level is pinned."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    payload = gemini_generate_request(
+        "gemini-2.5-pro",
+        request,
+        supports_reasoning=True,
+        default_maximum_output_tokens=None,
+    )
+    generation = cast("JsonObject", payload["generationConfig"])
+    assert generation["thinkingConfig"] == {"includeThoughts": True}
+
+
+def test_a_non_reasoning_route_sends_no_thinking_config() -> None:
+    """A route without reasoning support never carries a thinking config."""
+    request = ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    payload = gemini_generate_request(
+        "gemini-2.5-pro",
+        request,
+        reasoning_effort="high",
+        default_maximum_output_tokens=None,
+    )
+    generation = cast("JsonObject", payload.get("generationConfig", {}))
+    assert "thinkingConfig" not in generation
+
+
+def test_the_display_kill_switch_stops_asking_for_thoughts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXP_GATEWAY_REASONING_DISPLAY=0`` sends no thinking config without an effort."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    request = ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    payload = gemini_generate_request(
+        "gemini-2.5-pro",
+        request,
+        supports_reasoning=True,
+        default_maximum_output_tokens=None,
+    )
+    assert "thinkingConfig" not in cast("JsonObject", payload["generationConfig"])

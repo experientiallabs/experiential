@@ -5,15 +5,23 @@
 //! budget.
 //!
 //! The item always carries the sealed tool-turn carrier as `encrypted_content`.
-//! On a rung marked `reasoning_output_exposed` it also streams the model's
-//! plaintext reasoning as one `summary_text` part, the Responses twin of the
-//! Chat wire's `reasoning_content` and the Messages thinking block; elsewhere
-//! the plaintext never leaves the gateway.
+//! On a rung marked `reasoning_output_exposed`, or one whose reasoning display
+//! is on, it also streams the model's plaintext reasoning as one
+//! `summary_text` part, the Responses twin of the Chat wire's reasoning fields
+//! and the Messages thinking block; on an opted-out rung the plaintext never
+//! leaves the gateway. Display-only plaintext from an origin with no replay
+//! route streams into its own carrier-free reasoning item.
 
 use super::*;
 
 /// The one summary part an exposed route reasoning item streams into.
 const EXPOSED_SUMMARY_INDEX: u32 = 0;
+
+/// Reasoning-map key of the first item that carries display-only plaintext
+/// reasoning (OpenAI-compatible origins without a replay route, Gemini thought
+/// summaries); each resumed segment counts down from it. Provider output
+/// indices and Anthropic block indices never reach this range.
+const DISPLAYED_REASONING_OUTPUT_INDEX: u32 = u32::MAX - 1;
 
 impl ResponsesSseEncoder {
     /// Open the route reasoning item on its first delta and, on an exposed
@@ -56,7 +64,8 @@ impl ResponsesSseEncoder {
             self.fireworks_reasoning = Some(state);
             self.output_order.push(OutputSlot::FireworksReasoning);
         }
-        if !self.envelope.reasoning_output_exposed || delta.is_empty() {
+        let shown = self.envelope.reasoning_output_exposed || self.envelope.reasoning_displayed;
+        if !shown || delta.is_empty() {
             return Ok(frames);
         }
         let (item_id, output_index, new_part) = {
@@ -93,6 +102,31 @@ impl ResponsesSseEncoder {
             }),
         ));
         Ok(frames)
+    }
+
+    /// Stream display-only plaintext reasoning as summary text of one
+    /// reasoning item, on a rung whose reasoning display is on. The item has
+    /// no encrypted content, so a replayed copy carries nothing to the
+    /// provider.
+    pub(super) fn displayed_reasoning(&mut self, delta: &str) -> Result<Vec<String>, PublicError> {
+        if !self.envelope.reasoning_displayed || delta.is_empty() {
+            return Ok(Vec::new());
+        }
+        // An `item_` id marks the item as the gateway's own: a caller that
+        // echoes it back has it dropped instead of sent to a provider that
+        // never issued it.
+        // Reasoning that resumes after another output item opens a fresh item,
+        // so the response keeps provider order.
+        let key = match self.displayed_reasoning_key {
+            Some(key) if matches!(self.output_order.last(), Some(OutputSlot::Reasoning(last)) if *last == key) => {
+                key
+            }
+            Some(key) => key - 1,
+            None => DISPLAYED_REASONING_OUTPUT_INDEX,
+        };
+        self.displayed_reasoning_key = Some(key);
+        let item_id = stable_public_id("item", &format!("{}:reasoning:{key}", self.response_id));
+        self.reasoning_summary_delta(key, 0, &item_id, delta)
     }
 
     /// Complete the route reasoning item, closing its exposed summary part.

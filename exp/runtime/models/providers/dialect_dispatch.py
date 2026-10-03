@@ -185,6 +185,7 @@ def dialect_stream_payload(
             forwards_service_tier=profile.forwards_tier(provider_request.service_tier),
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
             omits_output_token_limit=profile.omits_output_token_limit,
+            requests_reasoning_summary=not profile.billing_customer_managed,
         )
     if profile.dialect == "anthropic_messages":
         payload = anthropic_messages_stream_payload(

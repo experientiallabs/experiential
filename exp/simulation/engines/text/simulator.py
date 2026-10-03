@@ -13,7 +13,6 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     FailureAttribution,
     FailureCode,
-    JsonValue,
     StructuredFailure,
 )
 from exp.common.evaluations import EvaluationCell, EvaluationPlan
@@ -26,7 +25,6 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.rollouts import (
-    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutArtifact,
     SimulationArtifactSet,
     SimulationCellBinding,
@@ -59,6 +57,7 @@ from exp.simulation.engines.text.errors import (
     SimulationConfigurationError,
     SimulationContentionError,
     SimulationResumeError,
+    stale_cell_failure,
 )
 from exp.simulation.engines.text.grounded_rollout import GroundedRolloutBuilder
 from exp.simulation.engines.text.grounding import (
@@ -486,7 +485,9 @@ class WorldModelSimulator:
         pins = self._pins(resolution_input)
         for cell in cells:
             binding = bindings[cell.cell_id]
-            _attempt, rollout = resolve_cell_attempt(self._store, cell, binding, pins)
+            _attempt, rollout = resolve_cell_attempt(
+                self._store, cell, binding, pins, request_budget=self._request_budget
+            )
             if rollout is not None:
                 completed[cell.cell_id] = rollout
         return completed
@@ -518,7 +519,9 @@ class WorldModelSimulator:
         rest: list[EvaluationCell] = []
         for cell in pending:
             binding = bindings[cell.cell_id]
-            attempt, _existing = resolve_cell_attempt(self._store, cell, binding, pins)
+            attempt, _existing = resolve_cell_attempt(
+                self._store, cell, binding, pins, request_budget=self._request_budget
+            )
             lease_id = lease_id_for_binding(resolution, binding, attempt=attempt)
             if self._leases.stale_recovery_pending(lease_id):
                 recovery.append(cell)
@@ -561,7 +564,9 @@ class WorldModelSimulator:
         """
         binding = bindings[cell.cell_id]
         pins = self._pins(resolution_input)
-        attempt, existing = resolve_cell_attempt(self._store, cell, binding, pins)
+        attempt, existing = resolve_cell_attempt(
+            self._store, cell, binding, pins, request_budget=self._request_budget
+        )
         if existing is not None:
             return existing
         rollout_id = rollout_id_for_binding(binding, attempt=attempt)
@@ -746,7 +751,7 @@ class WorldModelSimulator:
             ),
             maximum_cost_usd=maximum_cell_cost_usd,
             stop_on_overspend=spec.stop_on_overspend,
-            retry_pricing_unavailable=(
+            retry_uncapped_infrastructure=(
                 self._request_budget is not None and self._request_budget.is_uncapped
             ),
             maximum_steps=spec.maximum_steps,
@@ -925,26 +930,11 @@ class WorldModelSimulator:
         *,
         attempt: int = 0,
     ) -> RolloutArtifact:
-        """Record a non-replayed recovery outcome for an abandoned paid-cell claim.
-
-        The stale claim's whole-ceiling budget barrier persists into the failure evidence so
-        later spend reconciliation charges the exact durable reservation instead of aborting
-        on permanently ambiguous spend.
-        """
-        details: dict[str, JsonValue] = {
-            "phase": "paid_cell_stale_lease",
-            "lease_id": stale.lease_id,
-        }
-        if stale.reserved_cost_usd is not None:
-            details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = stale.reserved_cost_usd
-        failure = StructuredFailure(
-            code=FailureCode.BUDGET,
-            message=(
-                "a prior paid-cell execution ended before its rollout was saved; "
-                "EXP will not replay it"
-            ),
-            attribution=FailureAttribution.MODEL,
-            details=details,
+        """Retain the abandoned generation and its unknown spend before any fresh retry."""
+        failure = stale_cell_failure(
+            stale.lease_id,
+            stale.reserved_cost_usd,
+            retry_uncapped=self._request_budget is not None and self._request_budget.is_uncapped,
         )
         return self._failure_rollout(
             spec,
@@ -954,7 +944,7 @@ class WorldModelSimulator:
             binding,
             resolution_input,
             timestamp(self._clock),
-            StopReason.MAXIMUM_COST,
+            StopReason.FAILURE if failure.retryable else StopReason.MAXIMUM_COST,
             failure,
             duration_seconds=0.0,
             attempt=attempt,

@@ -54,7 +54,7 @@ class ModelEvaluationResult:
         simulation_spec: Exact executed simulation settings.
         evaluation_id: Persisted evaluation dataset identity.
         report: Shared-cohort model quality and operating-cost comparison.
-        simulation_cost_usd: Reconciled worker, world-model and retrieval spend.
+        simulation_cost_usd: Reconciled worker, world-model and retrieval spend, or unknown.
         judge_cost_usd: Reconciled durable judgment spend.
     """
 
@@ -62,12 +62,14 @@ class ModelEvaluationResult:
     simulation_spec: SimulationSpec
     evaluation_id: ArtifactId
     report: ModelEvaluationReport
-    simulation_cost_usd: float
+    simulation_cost_usd: float | None
     judge_cost_usd: float
 
     @property
-    def cost_usd(self) -> float:
+    def cost_usd(self) -> float | None:
         """Return this evaluation's cost, excluding separately accounted trace/build preparation."""
+        if self.simulation_cost_usd is None:
+            return None
         return math.fsum((self.simulation_cost_usd, self.judge_cost_usd))
 
 
@@ -180,12 +182,23 @@ def evaluate_models(
         services.simulator_factory,
         progress=progress,
         progress_detail="worker models",
+        request_budget=services.request_budget,
     )
-    simulation_cost = verified_simulation_spend(
-        project, simulated, setup.simulation_completion_input
+    shared_ledger = spending_limit is None and services.request_budget is not None
+    simulation_cost = (
+        verified_simulation_spend(
+            project, simulated, setup.simulation_completion_input, allow_unknown_interrupted=True
+        )
+        if shared_ledger
+        else verified_simulation_spend(project, simulated, setup.simulation_completion_input)
     )
-    if spending_limit is not None and simulation_cost > spending_limit:
-        raise ValueError("simulation exceeded the authorized budget before judging")
+    remaining_cost = None
+    if spending_limit is not None:
+        if simulation_cost is None:
+            raise ValueError("simulation spend must be known under a finite spending limit")
+        if simulation_cost > spending_limit:
+            raise ValueError("simulation exceeded the authorized budget before judging")
+        remaining_cost = spending_limit - simulation_cost
     report(progress, "judging")
     judging_setup = setup
     prior_judge_cost = 0.0
@@ -210,9 +223,7 @@ def evaluate_models(
         EvaluationJudge(calibration.rubric_id, calibration.calibration_id),
         services.judge,
         budget.maximum_judgments,
-        remaining_cost_usd=(
-            None if spending_limit is None else spending_limit - simulation_cost - prior_judge_cost
-        ),
+        remaining_cost_usd=(None if remaining_cost is None else remaining_cost - prior_judge_cost),
         stop_on_overspend=True,
         spend_ceiling_crossed=_reject_overspend,
         reconciled_spend=(
@@ -221,6 +232,10 @@ def evaluate_models(
             else None
         ),
         progress=progress,
+        allow_judgment_dispatch=(
+            simulation_cost is not None
+            or (services.request_budget is not None and services.request_budget.is_uncapped)
+        ),
         maximum_concurrency=(
             setup.maximum_concurrency
             if getattr(services.judge, "supports_concurrent_request_admission", False) is True
@@ -228,7 +243,7 @@ def evaluate_models(
         ),
     )
     judge_cost = math.fsum((judge_cost, prior_judge_cost))
-    if spending_limit is not None and math.fsum((simulation_cost, judge_cost)) > spending_limit:
+    if remaining_cost is not None and judge_cost > remaining_cost:
         raise ValueError("reconciled evaluation spend exceeds its authorized ceiling")
     dataset = build_evaluation_dataset(
         project.artifacts,

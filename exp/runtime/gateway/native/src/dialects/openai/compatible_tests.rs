@@ -770,10 +770,9 @@ fn compatible_reasoning_alias_preserves_text_and_obeys_route_authority() {
         assert!(
             matches!(normalizer.feed(&frame).unwrap().as_slice(), [Event::ReasoningContentDelta { delta, .. }] if delta == "exact reasoning\n雪")
         );
-        assert!(Normalizer::new(Dialect::OpenAiCompatible)
-            .feed(&frame)
-            .unwrap()
-            .is_empty());
+        assert!(
+            matches!(Normalizer::new(Dialect::OpenAiCompatible).feed(&frame).unwrap().as_slice(), [Event::ReasoningTextDelta(delta)] if delta == "exact reasoning\n雪")
+        );
     }
 }
 

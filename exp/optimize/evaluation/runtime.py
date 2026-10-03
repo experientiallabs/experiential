@@ -305,6 +305,7 @@ def run_prepared_model_evaluation(
             # replay of already-paid evidence when that cap is lowered on resume.
             spending_limit_usd=None,
             judge_spend=judge_spend,
+            request_budget=ledger,
         ),
         # Semantic execution bounds stay frozen across allowance changes. The request
         # ledger independently enforces an enabled aggregate cap before every paid dispatch.

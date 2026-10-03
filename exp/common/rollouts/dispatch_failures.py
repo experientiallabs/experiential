@@ -5,7 +5,8 @@ response arrived, so the exact spend of that dispatch is unknown. These helpers 
 spend reconciler one canonical way to recognize such evidence, read its persisted worst-case
 reservation, and decide whether the failed dispatch belongs to the transport-retryable class
 that resume may re-execute under fresh budget. A completed response whose pricing is
-unavailable may also qualify when an uncapped request ledger authorized the retry.
+unavailable or whose tool JSON is truncated may also qualify when an uncapped request ledger
+authorized the retry.
 """
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ def unknown_dispatch_reserved_cost_usd(failure: StructuredFailure | None) -> flo
 def retryable_dispatch_failure(failure: StructuredFailure | None) -> bool:
     """Return whether a persisted provider dispatch failure is stochastically retryable.
 
-    Candidate or world-model transport, explicitly uncapped pricing-unavailable, and
+    Candidate or world-model transport, explicitly uncapped pricing or truncation, and
     world-model protocol output failures qualify only when persisted as retryable.
     Budget, validation, and stale-lease failures never qualify.
 

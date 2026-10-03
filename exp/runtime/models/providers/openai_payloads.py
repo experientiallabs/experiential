@@ -23,6 +23,7 @@ from exp.runtime.models.providers.instruction_turns import (
 )
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
+    reasoning_display_enabled,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.wire_messages import (
@@ -92,6 +93,7 @@ def openai_responses_stream_payload(
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
     omits_output_token_limit: bool = False,
+    requests_reasoning_summary: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
 
@@ -103,6 +105,10 @@ def openai_responses_stream_payload(
         reasoning_effort: Optional catalog-pinned reasoning effort.
         omits_output_token_limit: Whether the wire rejects ``max_output_tokens`` (the
             ChatGPT plan backend), so the caller's ceiling is dropped structurally.
+        requests_reasoning_summary: Whether this rung asks for an ``auto``
+            reasoning summary when the caller chose none. Only host-managed
+            rungs do: OpenAI rejects summaries for unverified organizations,
+            so a customer's own key never receives one it did not ask for.
 
     Returns:
         Native Responses request with storage disabled and streaming enabled.
@@ -243,6 +249,16 @@ def openai_responses_stream_payload(
         reasoning["effort"] = openai_reasoning_effort(model_id, effective_reasoning_effort)
     if supports_reasoning and request.reasoning_summary is not None:
         reasoning["summary"] = request.reasoning_summary
+    elif (
+        supports_reasoning
+        and requests_reasoning_summary
+        and effective_reasoning_effort != "none"
+        and reasoning_display_enabled()
+    ):
+        # OpenAI returns readable reasoning only as summaries, and only when
+        # asked; the caller's own selector above always wins. Host-managed
+        # rungs only: an unverified customer key would 400 on a summary.
+        reasoning["summary"] = "auto"
     if supports_reasoning and request.reasoning_context is not None:
         # Forwarded verbatim: the value controls provider-side re-rendering
         # of prior turns' reasoning and has no gateway semantics.

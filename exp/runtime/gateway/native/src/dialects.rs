@@ -456,8 +456,6 @@ pub struct Normalizer {
     gemini_cache_writes: Option<u64>,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
-    // Private generation can advance without an authorized replay carrier.
-    unexposed_reasoning_progress: bool,
     // Caller-known label words (the dispatched model id) exempt from the
     // provider-identifier screen on stream-error detail.
     request_words: Vec<String>,
@@ -521,7 +519,6 @@ impl Normalizer {
             gemini: gemini::StreamState::default(),
             gemini_cache_writes: None,
             reasoning_content_route_sha256,
-            unexposed_reasoning_progress: false,
             request_words: Vec::new(),
             deferred_tool_failure: None,
             bedrock_empty_stopped_tools: BTreeSet::new(),
@@ -720,7 +717,13 @@ impl Normalizer {
             }
         }
         self.usage = observed;
-        if events.iter().any(Event::is_output_token) {
+        // Display-only reasoning is held privately until real output, so it
+        // must not turn a mid-reasoning abnormal end into a settled
+        // `Incomplete`: that turn still fails over as terminal-less.
+        if events
+            .iter()
+            .any(|event| event.is_output_token() && !matches!(event, Event::ReasoningTextDelta(_)))
+        {
             self.emitted_output = true;
         }
         if events.iter().any(Event::is_terminal) {

@@ -154,12 +154,21 @@ impl Normalizer {
         let raw_tool = match delta.get("toolUse") {
             None | Some(Value::Null) => {
                 // A reasoning model streams its thinking as its own indexed
-                // block ahead of the answer text. The canonical event stream
-                // carries answer text and tool calls, so the thinking block
-                // and its deltas are accepted and dropped instead of failing
-                // the stream.
-                if delta.contains_key("reasoningContent") {
-                    return Ok(Vec::new());
+                // block ahead of the answer text. Its readable text becomes
+                // display-only reasoning; signatures and redacted payloads have
+                // no Converse replay path here and are dropped.
+                if let Some(reasoning) = delta.get("reasoningContent") {
+                    let text = reasoning
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty());
+                    return Ok(match text {
+                        Some(text) => {
+                            self.reserve_summary_bytes(text.len())?;
+                            vec![Event::ReasoningTextDelta(text.to_string())]
+                        }
+                        None => Vec::new(),
+                    });
                 }
                 return Err(malformed(&format!(
                     "Bedrock content block delta is unsupported (key {})",
@@ -463,8 +472,8 @@ mod bedrock_tests {
 
     #[test]
     fn bedrock_reasoning_blocks_stream_without_failing_the_answer() {
-        // A reasoning model leads its turn with an indexed thinking block; only
-        // the answer text reaches the canonical stream.
+        // A reasoning model leads its turn with an indexed thinking block; its
+        // text is display reasoning and its signature is dropped.
         let chunks = vec![
             event("messageStart", &json!({"role": "assistant"})),
             event(
@@ -502,6 +511,7 @@ mod bedrock_tests {
         assert_eq!(
             events,
             vec![
+                json!({"kind": "reasoning_text_delta", "text": "a circle"}),
                 json!({"kind": "text_delta", "text": "Circle"}),
                 json!({
                     "kind": "usage",

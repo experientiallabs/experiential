@@ -6,6 +6,7 @@ from exp.runtime.models.providers.errors import (
     ProviderPricingUnavailableError,
     ProviderRefusalError,
     ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
 )
 from exp.runtime.models.providers.transport import classify_retry
 
@@ -22,10 +23,37 @@ class SimulationContentionError(SimulationResumeError):
     """Another live runner owns paid work, so this run may be retried without artifacts."""
 
 
+def stale_cell_failure(
+    lease_id: str, reserved_cost_usd: float | None, *, retry_uncapped: bool
+) -> StructuredFailure:
+    """Retain interrupted paid work without replaying its requests or pricing unknown effects.
+
+    Args:
+        lease_id: Exact tombstone whose owner is already proved to have stopped.
+        reserved_cost_usd: Existing whole-cell reservation, if any.
+        retry_uncapped: Whether current shared request authority permits a fresh generation.
+
+    Returns:
+        Infrastructure invalidity for uncapped recovery; unchanged budget failure otherwise.
+    """
+    details: JsonObject = {"phase": "paid_cell_stale_lease", "lease_id": lease_id}
+    if reserved_cost_usd is not None:
+        details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = reserved_cost_usd
+    return StructuredFailure(
+        code=FailureCode.CANCELLED if retry_uncapped else FailureCode.BUDGET,
+        message=(
+            "a prior paid-cell execution ended before its rollout was saved; EXP will not replay it"
+        ),
+        retryable=retry_uncapped,
+        attribution=FailureAttribution.ENVIRONMENT if retry_uncapped else FailureAttribution.MODEL,
+        details=details,
+    )
+
+
 def provider_call_failure(
     exception: Exception,
     *,
-    retry_pricing_unavailable: bool,
+    retry_uncapped_infrastructure: bool,
     unknown_spend: bool,
     reserved_cost_usd: float | None,
 ) -> StructuredFailure:
@@ -33,19 +61,23 @@ def provider_call_failure(
 
     Args:
         exception: Failure from the provider or the post-response valuation boundary.
-        retry_pricing_unavailable: True only with an explicitly uncapped shared request ledger.
+        retry_uncapped_infrastructure: True only with an explicitly uncapped shared request ledger.
         unknown_spend: Whether dispatched provider liability remains unresolved.
         reserved_cost_usd: Retained request reservation, never a measured charge.
 
     Returns:
-        Durable cell failure; pricing invalidity is infrastructure evidence, not model quality.
+        Durable cell failure; pricing and truncated-response failures are infrastructure evidence.
     """
     classification = classify_retry(exception)
     pricing_unavailable = isinstance(exception, ProviderPricingUnavailableError)
+    truncated = isinstance(exception, ProviderTruncatedResponseError)
+    infrastructure = pricing_unavailable or truncated
     details: JsonObject = {
         "phase": "candidate_or_world_model",
         "retry_classification": "unpriceable_completed_response"
         if pricing_unavailable
+        else "truncated_completed_response"
+        if truncated
         else classification.reason,
     }
     if unknown_spend:
@@ -56,14 +88,12 @@ def provider_call_failure(
         code=FailureCode.PROVIDER,
         message=f"text simulation provider call failed with {type(exception).__name__}",
         retryable=(
-            retry_pricing_unavailable
-            if pricing_unavailable
+            retry_uncapped_infrastructure
+            if infrastructure
             else classification.retryable
             or isinstance(exception, (ProviderRefusalError, ProviderRetryableResponseError))
         ),
         exception_type=type(exception).__name__,
-        attribution=FailureAttribution.ENVIRONMENT
-        if pricing_unavailable
-        else FailureAttribution.MODEL,
+        attribution=FailureAttribution.ENVIRONMENT if infrastructure else FailureAttribution.MODEL,
         details=details,
     )

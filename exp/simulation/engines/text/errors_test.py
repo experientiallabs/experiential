@@ -3,7 +3,10 @@
 import pytest
 
 from exp.common.core.artifacts import FailureAttribution
-from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+from exp.runtime.models.providers.errors import (
+    ProviderPricingUnavailableError,
+    ProviderTruncatedResponseError,
+)
 from exp.simulation.engines.text.errors import provider_call_failure
 
 
@@ -14,7 +17,7 @@ def test_metering_type_and_uncapped_policy_are_both_required(uncapped: bool, typ
     error = (ProviderPricingUnavailableError if typed else ValueError)("private response detail")
     failure = provider_call_failure(
         error,
-        retry_pricing_unavailable=uncapped,
+        retry_uncapped_infrastructure=uncapped,
         unknown_spend=True,
         reserved_cost_usd=2,
     )
@@ -25,3 +28,18 @@ def test_metering_type_and_uncapped_policy_are_both_required(uncapped: bool, typ
     )
     assert failure.details["provider_dispatch_unknown_spend"] is True
     assert failure.details["unknown_dispatch_reserved_cost_usd"] == 2
+
+
+@pytest.mark.parametrize("uncapped", [False, True])
+def test_truncated_response_is_infrastructure_but_only_uncapped_can_retry(uncapped: bool) -> None:
+    """The fresh-generation classifier does not grant the provider client HTTP retry authority."""
+    failure = provider_call_failure(
+        ProviderTruncatedResponseError("tool arguments ended inside JSON"),
+        retry_uncapped_infrastructure=uncapped,
+        unknown_spend=True,
+        reserved_cost_usd=None,
+    )
+    assert failure.retryable is uncapped
+    assert failure.attribution == FailureAttribution.ENVIRONMENT
+    assert failure.details["retry_classification"] == "truncated_completed_response"
+    assert "unknown_dispatch_reserved_cost_usd" not in failure.details

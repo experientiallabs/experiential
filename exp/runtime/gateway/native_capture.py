@@ -64,6 +64,10 @@ class CaptureConfiguration(ContractModel):
             The host owns draining. Admission and response-memory limits still apply.
         relay_metadata: Wait for an outer relay's caller-facing metadata, false by default.
         truncate_request: Preserve the hosted bounded-copy policy for oversized inputs.
+        capture_hidden_reasoning: Retain reasoning text the caller did not see (a
+            rung that withholds reasoning display, or a guardrailed request) as
+            ``provider_reasoning``, false by default. Displayed reasoning is
+            retained in the captured response frames either way.
     """
 
     delivery: CaptureDeliveryLimits = Field(default_factory=CaptureDeliveryLimits)
@@ -80,6 +84,7 @@ class CaptureConfiguration(ContractModel):
     asynchronous_delivery: bool = False
     relay_metadata: bool = False
     truncate_request: bool = False
+    capture_hidden_reasoning: bool = False
 
     @model_validator(mode="after")
     def _validate_pending_budget(self) -> CaptureConfiguration:

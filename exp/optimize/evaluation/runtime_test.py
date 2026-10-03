@@ -9,6 +9,8 @@ from typing import cast
 
 import pytest
 
+from exp.common.core.artifacts import FailureCode, StructuredFailure
+from exp.common.evaluations.evidence import read_rollout
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse, Usage
 from exp.common.models.catalog import GatewayDeploymentMetadata
 from exp.common.models.catalog_prices import (
@@ -30,9 +32,11 @@ from exp.optimize.router.automatic.service_test import (
     _CompletionClient,
     _RuntimeCatalog,
 )
+from exp.optimize.router.errors import RouterCompositionError
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
 from exp.simulation.engines.text import simulator
+from exp.simulation.engines.text.errors import stale_cell_failure
 
 
 class _ScheduledRuntimeCatalog(_RuntimeCatalog):
@@ -461,6 +465,123 @@ def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
     )
     assert replay == result
     assert before == (len(state.completion_calls), len(state.embedding_calls))
+
+
+def test_catalog_runtime_supersedes_legacy_interrupted_cells_with_its_actual_uncapped_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catalog-backed execution carries current ledger authority past saved legacy finals."""
+    project, catalog, state, prepared = _prepare(tmp_path)
+    original_complete = BudgetedCompletion.complete
+    paused = False
+    pause_before_judge = True
+    lock = threading.Lock()
+
+    class Paused(BaseException):
+        """Stop after one durably saved paid response, before its rollout is complete."""
+
+    def complete(client: BudgetedCompletion, request: ModelRequest) -> ModelResponse:
+        """Interrupt exactly one paid candidate call while retaining its actual ledger response."""
+        nonlocal paused
+        if client._role == "judge" and pause_before_judge:
+            raise Paused
+        response = original_complete(client, request)
+        with lock:
+            if client._role.startswith("assistant:") and not paused:
+                paused = True
+                raise Paused
+        return response
+
+    def legacy_failure(
+        lease_id: str, reserved_cost_usd: float | None, *, retry_uncapped: bool
+    ) -> StructuredFailure:
+        """Produce the exact historical stale outcome without altering any saved artifact."""
+        assert retry_uncapped
+        return stale_cell_failure(lease_id, reserved_cost_usd, retry_uncapped=False)
+
+    monkeypatch.setattr(BudgetedCompletion, "complete", complete)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    budget = EvaluationBudget(maximum_cost_usd=None, maximum_judgments=100)
+    with pytest.raises(Paused):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=budget,
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    monkeypatch.setattr(simulator, "stale_cell_failure", legacy_failure)
+    with pytest.raises(Paused):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=budget,
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    before_partial = (project.artifacts.list_ids(), len(state.completion_calls))
+    with pytest.raises(RouterCompositionError, match="before new judgment dispatch"):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=EvaluationBudget(maximum_cost_usd=0.01, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    assert before_partial == (project.artifacts.list_ids(), len(state.completion_calls))
+    pause_before_judge = False
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    rollouts = [
+        read_rollout(project.artifacts, artifact_id)[0]
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "rollout"
+    ]
+    legacy = [
+        rollout
+        for rollout in rollouts
+        if rollout.failure is not None
+        and rollout.failure.details.get("phase") == "paid_cell_stale_lease"
+    ]
+    assert len(legacy) == 1
+    assert legacy[0].failure is not None and legacy[0].failure.code == FailureCode.BUDGET
+    successors = [
+        rollout
+        for rollout in rollouts
+        if rollout.cell_id == legacy[0].cell_id and rollout.retry_attempt == 1
+    ]
+    assert len(successors) == 1 and successors[0].failure is None
+    assert result.simulation_cost_usd is None and result.cost_usd is None
+    assert successors[0].simulation_binding == legacy[0].simulation_binding
+    assert all(row.quality == 1 for row in result.report.models)
+    assert result.report.compared_cells == prepared.cost.scenario_count
+    before = len(state.completion_calls)
+    assert (
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=EvaluationBudget(maximum_cost_usd=0.01, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+        == result
+    )
+    assert len(state.completion_calls) == before
 
 
 @pytest.mark.parametrize("resumed_limit", [100, None])
