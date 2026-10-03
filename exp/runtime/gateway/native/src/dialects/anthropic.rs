@@ -7,6 +7,16 @@ use serde_json::Value;
 
 mod cache_write;
 
+/// Cache-write TTL evidence of one Anthropic stream.
+#[derive(Default)]
+pub(super) struct CacheWriteTtl {
+    /// One-hour subset of the current write total, when completely observed.
+    hour: Option<u64>,
+    /// A server tool result arrived: Anthropic's automatic five-minute
+    /// breakpoint is then the only source of writes after `message_start`.
+    after_server_tool_result: bool,
+}
+
 use super::{
     finish_open_tools, finish_open_tools_truncated, malformed, optional_text, parse_object,
     refusal_failure, Normalizer,
@@ -37,7 +47,8 @@ impl Normalizer {
             cached_input_tokens: Some(self.cache_read),
             cache_creation_input_tokens: self.cache_write,
             cache_creation_1h_input_tokens: self
-                .cache_write_1h
+                .cache_write_ttl
+                .hour
                 .filter(|_| self.cache_write.is_some_and(|count| count > 0)),
             // Thinking is billed inside output with no reported subset.
             reasoning_tokens: None,
@@ -85,7 +96,7 @@ impl Normalizer {
                 )
                 .map_err(|message| malformed(&message))?
                 .or(self.input_tokens.map(|_| 0));
-                self.cache_write_1h =
+                self.cache_write_ttl.hour =
                     cache_write::hour_subset(usage, self.cache_write.unwrap_or(0))?;
                 self.output_tokens = self.output_tokens.max(
                     count_if_present(usage, "output_tokens", "Anthropic usage")
@@ -159,7 +170,7 @@ impl Normalizer {
                         // provider produced.
                         let serialized = compact_json(&Value::Object(block.clone()));
                         self.reserve_tool_bytes(serialized.len())?;
-                        self.server_tool_result_seen = true;
+                        self.cache_write_ttl.after_server_tool_result = true;
                         events.push(Event::ServerToolResult {
                             index,
                             block: serialized,
@@ -335,16 +346,17 @@ impl Normalizer {
                 // results are cached automatically"). Any other growth, or a
                 // start report without a split, leaves the TTL unknown.
                 let start_split_covers = usage.get("cache_creation").is_none_or(Value::is_null)
-                    && self.cache_write_1h.is_some()
+                    && self.cache_write_ttl.hour.is_some()
                     && start_write.is_some_and(|start| {
                         self.cache_write == Some(start)
-                            || (self.server_tool_result_seen && self.cache_write > Some(start))
+                            || (self.cache_write_ttl.after_server_tool_result
+                                && self.cache_write > Some(start))
                     });
                 if !start_split_covers
                     && (usage.contains_key("cache_creation_input_tokens")
                         || usage.contains_key("cache_creation"))
                 {
-                    self.cache_write_1h =
+                    self.cache_write_ttl.hour =
                         cache_write::hour_subset(usage, self.cache_write.unwrap_or(0))?;
                 }
                 // The relay may be cancelled before message_stop arrives.
